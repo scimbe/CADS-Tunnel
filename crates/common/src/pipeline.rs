@@ -20,6 +20,8 @@
 //! wins each role.
 
 use crate::channel::{AgentCard, CapacityOffer, ChannelId, ServiceType, UnixSeconds};
+use crate::settlement::Hold;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 /// One role a pipeline requires. The `service` is the [`ServiceType`] the role's capacity
@@ -214,6 +216,62 @@ pub fn pipelines_supported_by_services(specs: &[PipelineSpec], my_services: &[Se
         .collect()
 }
 
+/// Domain separator for the per-role escrow match id, so a pipeline hold can never collide with an
+/// id minted for a different purpose (offer match, transfer, etc.).
+const PIPELINE_MATCH_DOMAIN: &[u8] = b"ct-pipeline-escrow-match-v1";
+
+/// The deterministic escrow `match_ref` for one convened role: the id that binds this role's escrow
+/// [`Hold`] to the [`UsageReceipt`](crate::channel::UsageReceipt) that later releases it. Derived
+/// from the pipeline id + the assignment's terms; because [`convene`](PipelineSpec::convene) gives
+/// each role a **distinct** provider (#172 cross-role exclusivity), `(pipeline_id, provider)` is
+/// unique per role, so no two roles of one convened pipeline share a match id.
+pub fn role_match_ref(pipeline_id: &str, assignment: &RoleAssignment) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(PIPELINE_MATCH_DOMAIN);
+    h.update((pipeline_id.len() as u64).to_le_bytes());
+    h.update(pipeline_id.as_bytes());
+    h.update(assignment.provider);
+    h.update(assignment.units.to_le_bytes());
+    h.update(assignment.price.to_le_bytes());
+    h.finalize().into()
+}
+
+/// **Settle a convened pipeline for real** (#175 gap 2, maintainer 2026-07-25: settlement is now):
+/// turn the [`RoleAssignment`]s that [`convene`](PipelineSpec::convene) cleared into the signed
+/// escrow [`Hold`]s that actually lock the money — one per role, not a mere display of who won.
+///
+/// Each hold locks the role's cleared `price` from the buyer (`buyer_key`'s account) to the winning
+/// `provider`, bound to this role's [`role_match_ref`], with sequential nonces from `first_nonce`
+/// (the buyer's next escrow nonce — 0 for a buyer that has never locked) and a shared `expires_at`.
+/// Feed the results straight to [`Escrow::lock`](crate::settlement::Escrow::lock): on a co-signed
+/// [`UsageReceipt`](crate::channel::UsageReceipt) for the same `match_ref` the provider is paid
+/// ([`release`](crate::settlement::Escrow::release)); if none arrives by `expires_at` the buyer is
+/// refunded ([`refund`](crate::settlement::Escrow::refund)) — so a convened role is a *held* amount
+/// (a cap), never a unilateral loss. The buyer signs, so it can only lock its own funds.
+pub fn holds_for_convened(
+    pipeline_id: &str,
+    assignments: &[RoleAssignment],
+    buyer_key: &SigningKey,
+    first_nonce: u64,
+    expires_at: UnixSeconds,
+) -> Vec<Hold> {
+    assignments
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            Hold::sign_new(
+                buyer_key,
+                a.provider,
+                a.price,
+                role_match_ref(pipeline_id, a),
+                first_nonce + i as u64,
+                expires_at as u64,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +457,66 @@ mod tests {
 
         // An agent that serves nothing the marketplace needs finds no pipelines (never a false claim).
         assert!(pipelines_supported_by_services(&[flappy, audit], &[CodeGeneration]).is_empty());
+    }
+
+    #[test]
+    fn convened_pipeline_opens_real_escrow_holds_paid_on_receipt_refunded_on_expiry() {
+        // #175 gap 2 (frozen, maintainer 2026-07-25 "settlement is now"): a convened pipeline opens
+        // REAL escrow holds — money actually locks — then a co-signed UsageReceipt pays the winning
+        // provider, or the buyer is refunded after expiry. The full convene→hold→lock→settle path.
+        use crate::channel::{CapacityKind, UsageReceipt};
+        use crate::settlement::Escrow;
+        use std::collections::BTreeMap;
+
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into() },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into() },
+            ],
+        };
+        let guard = offer(1, vec![SafetyCheck], 20, 50, 1000); // provider holder(1), price 50
+        let coder = offer(2, vec![CodeGeneration], 20, 40, 1000); // provider holder(2), price 40
+        let assignments = spec.convene(&[guard, coder], 100).expect("both roles clear");
+
+        // Buyer signs the holds → can only lock its OWN funds. Fund it in escrow genesis.
+        let buyer_key = SigningKey::from_bytes(&[9; 32]);
+        let buyer = buyer_key.verifying_key().to_bytes();
+        let holds = holds_for_convened("flappy", &assignments, &buyer_key, 0, 500);
+
+        assert_eq!(holds.len(), 2);
+        assert!(holds.iter().all(|h| h.verify()), "buyer's holds are authentically signed");
+        assert_eq!((holds[0].to, holds[0].amount), (holder(1), 50), "role 0 holds its cleared price to its provider");
+        assert_eq!((holds[1].to, holds[1].amount), (holder(2), 40));
+        assert_eq!(holds[0].match_ref, role_match_ref("flappy", &assignments[0]), "hold bound to the role's match id");
+        assert_ne!(holds[0].match_ref, holds[1].match_ref, "distinct roles → distinct escrow matches");
+        assert_eq!((holds[0].nonce, holds[1].nonce), (0, 1), "sequential buyer nonces");
+
+        // Lock both holds → the money really moves out of the buyer's available balance into escrow.
+        let mut escrow = Escrow::new(BTreeMap::from([(buyer, 1000)]));
+        for h in &holds {
+            escrow.lock(h).expect("hold locks against funded buyer");
+        }
+        assert_eq!(escrow.balance(&buyer), 1000 - 90, "90 locked (50 + 40) out of available");
+        assert_eq!(escrow.held_amount(&holds[0].match_ref), 50);
+        assert_eq!(escrow.held_amount(&holds[1].match_ref), 40);
+
+        // Role 0 delivers: a co-signed UsageReceipt for its match_ref RELEASES the funds to the provider.
+        let guard_key = SigningKey::from_bytes(&[1; 32]);
+        let receipt = UsageReceipt::co_sign(
+            &guard_key, &buyer_key, CapacityKind::CloudApiQuota, "m".into(), 5, holds[0].match_ref, 200,
+        );
+        escrow.release(&receipt).expect("valid receipt pays the provider");
+        assert_eq!(escrow.balance(&holder(1)), 50, "provider paid its cleared price");
+        assert_eq!(escrow.held_amount(&holds[0].match_ref), 0, "hold consumed on release");
+
+        // Role 1 never delivers: refund is blocked until expiry, then returns the funds to the buyer.
+        assert_eq!(
+            escrow.refund(&holds[1].match_ref, 100),
+            Err(crate::settlement::EscrowError::NotYetExpired { expires_at: 500, now: 100 }),
+            "no refund before expiry — the provider still has time to prove",
+        );
+        escrow.refund(&holds[1].match_ref, 500).expect("refund after expiry");
+        assert_eq!(escrow.balance(&buyer), 910 + 40, "unspent role refunded to the buyer");
     }
 }
