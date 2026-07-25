@@ -719,19 +719,37 @@ async function runBuild(bidsByRole, applyThen) {
 let CREW_URL = "crew/build";
 fetch("crew.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null))
   .then((j) => { if (j && j.url) CREW_URL = j.url; }).catch(() => {});
-async function liveBuild(prompt) {
+// STREAMING (#173 A): /crew/build streams newline-delimited JSON events as the crew runs — safety
+// start/ok → physics/art start → physics/art done → a terminal built|rejected|error — so the browser
+// shows the real role-chain live instead of one opaque ~28s wait. `onEvent` is called per event;
+// the resolved value is the terminal event (or null if the stream died before one). The real crew is
+// safety (~14s) + max(physics, art) (~14s concurrent) ≈ ~28–30s, so the abort sits well above at 45s.
+async function liveBuildStream(prompt, onEvent) {
   const ctrl = new AbortController();
-  // The real crew is 3 sequential-ish LLM calls: safety (~14s) + max(physics, art) (~14s, now run
-  // concurrently server-side, #173) ≈ ~28–30s. The abort must sit comfortably above that or a
-  // working live build gets cancelled and silently falls back to the offline stand-in.
   const to = setTimeout(() => ctrl.abort(), 45000);
   try {
     const res = await fetch(CREW_URL, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompt }), signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error("crew bridge " + res.status);
-    return await res.json();   // { safety:{ok,reason}, auction:[{role,bids}], config:{…} }
+    if (!res.ok || !res.body) throw new Error("crew bridge " + res.status);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "", terminal = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        onEvent(ev);
+        if (ev.stage === "built" || ev.stage === "rejected" || ev.stage === "error") terminal = ev;
+      }
+    }
+    return terminal;
   } finally { clearTimeout(to); }
 }
 // Apply the crew's real config to the form (arbitrary birdEmoji supported since #169).
@@ -764,26 +782,58 @@ $("buildBtn").addEventListener("click", async () => {
   $("build").style.display = "flex";
   const hideBuild = () => { $("build").style.display = "none"; };
   try {
-    // 1) LIVE path — the real crew over the tunnel (#169/#171). The authoritative safety_check
-    //    runs server-side; a rejection here is the live LLM guard, not the regex.
-    let data = null;
-    try { data = await liveBuild(p); } catch (e) { data = null; }
-    if (data && (data.safety || data.config || data.auction)) {
-      if (data.safety && data.safety.ok === false) {
-        hideBuild();
-        msg.className = "pmsg reject";
-        msg.textContent = "⛔ Rejected by the live safety agent — " + (data.safety.reason || "not a valid game request") + " Your current game is kept.";
-        return;
+    // 1) LIVE path — the real crew over the tunnel (#169/#171/#173 A), driven LIVE by the streamed
+    //    per-role events: each crew member lights up and the auction feed fills as the work actually
+    //    happens server-side, not as a canned replay afterwards. safety_check is authoritative.
+    const member = (role) => document.querySelector('.crew .member[data-role="' + role + '"]');
+    const onEvent = (ev) => {
+      if (ev.stage === "safety" && ev.status === "start") {
+        $("buildStep").textContent = "🛡️ safety agent reviewing your prompt over the tunnel…";
+        feedLine("abid", "🛡️ <b>safety</b> — reviewing the prompt");
+      } else if (ev.stage === "safety" && ev.status === "ok") {
+        feedLine("awin", "&nbsp;&nbsp;✓ safety cleared");
+      } else if (ev.stage === "physics" && ev.status === "start") {
+        const m = member("physics"); if (m) m.classList.add("active");
+        $("buildStep").textContent = "🕹️ source-2 is producing the physics…";
+        feedLine("abid", "🕹️ <b>physics</b> — source-2 building over the tunnel");
+      } else if (ev.stage === "art" && ev.status === "start") {
+        const m = member("art"); if (m) m.classList.add("active");
+        feedLine("abid", "🎨 <b>art</b> — sink building over the tunnel");
+      } else if (ev.stage === "physics" && ev.status === "done") {
+        const m = member("physics"); if (m) { m.classList.remove("active"); m.classList.add("done"); }
+        $("buildBar").style.width = "55%"; feedLine("awin", "&nbsp;&nbsp;✓ physics done");
+      } else if (ev.stage === "art" && ev.status === "done") {
+        const m = member("art"); if (m) { m.classList.remove("active"); m.classList.add("done"); }
+        $("buildBar").style.width = "80%"; feedLine("awin", "&nbsp;&nbsp;✓ art done");
       }
-      const bidsByRole = {};
-      (data.auction || []).forEach((a) => { if (a && a.role) bidsByRole[a.role] = a.bids; });
-      await runBuild(bidsByRole, () => applyLiveConfig(data.config));
+    };
+    let term = null;
+    try { term = await liveBuildStream(p, onEvent); } catch (e) { term = null; }
+    if (term && term.stage === "built") {
+      const mi = member("integration"); if (mi) mi.classList.add("done");
+      $("buildStep").textContent = "🧩 integration — assembling your game…";
+      (term.auction || []).forEach((a) => {
+        const w = (a.bids || []).find((b) => b.win) || (a.bids || [])[0];
+        if (w) feedLine("awin", "&nbsp;&nbsp;✓ " + a.role + " cleared → <span class='who'>" + w.who + "</span> · " + w.model);
+      });
+      $("buildBar").style.width = "100%";
+      applyLiveConfig(term.config);
+      startPreview();
+      await sleep(500);
+      hideBuild();
       msg.className = "pmsg ok";
       msg.textContent = "✓ Built live by the crew over the tunnel. Keep prompting to refine, or download below.";
       return;
     }
-    // 2) FALLBACK — the crew bridge is unreachable; use the local stand-in (its own regex guard
-    //    still applies, and #170's honest no-op for out-of-vocabulary prompts).
+    if (term && term.stage === "rejected") {
+      hideBuild();
+      msg.className = "pmsg reject";
+      msg.textContent = "⛔ Rejected by the live safety agent — " + ((term.safety && term.safety.reason) || "not a valid game request") + " Your current game is kept.";
+      return;
+    }
+    // 2) FALLBACK — the crew bridge is unreachable / errored (term is null or {stage:"error"}); use
+    //    the local stand-in (its own regex guard still applies, and #170's honest no-op for
+    //    out-of-vocabulary prompts).
     const g = guardPrompt(p);
     if (!g.ok) { hideBuild(); msg.className = "pmsg reject"; msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept."; return; }
     const changes = interpretPrompt(p);

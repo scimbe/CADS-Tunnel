@@ -17,9 +17,17 @@
 //! calls); a role command failing / malformed output → `502`, so the browser falls back to its
 //! local stand-in. Reuses the tested `ct_common::crew` assembly + contract.
 
-use axum::{http::StatusCode, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use ct_common::crew::{CrewBuildResponse, CrewConfig, RoleAuction, RoleBid};
-use serde_json::Value;
+use serde_json::{json, Value};
+use tokio::sync::mpsc::Sender;
+use tokio_stream::StreamExt;
 
 /// Run one role command with `input` on stdin, returning trimmed stdout. Blocking (run via
 /// `spawn_blocking`); a non-zero exit or spawn failure is an `Err` (the caller fails closed).
@@ -74,43 +82,100 @@ fn demo_auction() -> Vec<RoleAuction> {
     ]
 }
 
-/// The bridge core: safety → (physics, art) → assemble. `Err` = infrastructure failure (the HTTP
-/// layer 5xx's so the browser fails closed); `Ok(rejected)` = a safety rejection; `Ok(built)` = a
-/// clean build. Testable without the network by passing shell commands that emit fixed JSON.
-async fn run_crew(prompt: String, safety_cmd: String, physics_cmd: String, art_cmd: String) -> Result<CrewBuildResponse, String> {
-    let safety_out = run_cmd_async(safety_cmd, prompt.clone()).await.map_err(|e| format!("safety_check unreachable: {e}"))?;
-    let verdict: Value = serde_json::from_str(&safety_out).map_err(|e| format!("safety_check reply not JSON: {e}"))?;
-    if verdict.get("ok").and_then(Value::as_bool) != Some(true) {
-        let reason = verdict.get("reason").and_then(Value::as_str).unwrap_or("rejected by the safety agent");
-        return Ok(CrewBuildResponse::rejected(reason.to_string()));
-    }
-    // physics + art are independent once safety passes — run them CONCURRENTLY, not sequentially, so
-    // the wall-clock is safety + max(physics, art) rather than the sum. Each role command is a real
-    // `ct-agent channel … --call service/<slug>` that ends up doing a ~14s `claude -p` (#173,
-    // measured), so joining the two independent roles cuts a ~40s crew to ~28s. (run_cmd_async is a
-    // spawn_blocking, so two concurrent calls genuinely run their subprocesses in parallel.)
-    let (physics_out, art_out) = tokio::join!(
-        run_cmd_async(physics_cmd, prompt.clone()),
-        run_cmd_async(art_cmd, prompt),
-    );
-    let physics_out = physics_out.map_err(|e| format!("physics role unreachable: {e}"))?;
-    let art_out = art_out.map_err(|e| format!("art role unreachable: {e}"))?;
-    let cfg = CrewConfig::from_fragment_json(&physics_out, &art_out).map_err(|e| format!("crew fragments malformed: {e}"))?;
-    Ok(CrewBuildResponse::built(cfg, demo_auction()))
+/// Emit one NDJSON progress event (a JSON object + `\n`) to the response stream. Best-effort: if the
+/// browser has gone away the receiver is dropped and the send just fails, which is fine.
+async fn emit(tx: &Sender<String>, ev: Value) {
+    let _ = tx.send(ev.to_string() + "\n").await;
 }
 
-async fn build_handler(Json(body): Json<Value>) -> Result<Json<CrewBuildResponse>, (StatusCode, String)> {
+/// The bridge core, **streaming** (#173 A): drive the crew safety → (physics ∥ art) → assemble and
+/// emit a per-stage NDJSON event as each step starts/finishes, so the browser can show the real
+/// role-chain working live instead of one opaque ~28s wait. The stream's terminal event is exactly
+/// one of:
+///   * `{"stage":"built", safety, auction, config}` — a clean build (the full CrewBuildResponse),
+///   * `{"stage":"rejected", safety:{ok:false,reason}}` — the live safety guard refused,
+///   * `{"stage":"error", message}` — an infrastructure failure (browser falls back to its stand-in).
+/// Intermediate events: `{"stage":"safety|physics|art","status":"start|ok|done"}`.
+async fn run_crew_streaming(prompt: String, safety_cmd: String, physics_cmd: String, art_cmd: String, tx: Sender<String>) {
+    // 1. safety_check — authoritative live guard.
+    emit(&tx, json!({"stage": "safety", "status": "start"})).await;
+    let safety_out = match run_cmd_async(safety_cmd, prompt.clone()).await {
+        Ok(o) => o,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("safety_check unreachable: {e}")})).await,
+    };
+    let verdict: Value = match serde_json::from_str(&safety_out) {
+        Ok(v) => v,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("safety_check reply not JSON: {e}")})).await,
+    };
+    if verdict.get("ok").and_then(Value::as_bool) != Some(true) {
+        let reason = verdict.get("reason").and_then(Value::as_str).unwrap_or("rejected by the safety agent");
+        return emit(&tx, json!({"stage": "rejected", "safety": {"ok": false, "reason": reason}})).await;
+    }
+    emit(&tx, json!({"stage": "safety", "status": "ok"})).await;
+
+    // 2. physics + art — independent once safety clears, run CONCURRENTLY (each ~14s claude -p over
+    //    the tunnel; #173). Each branch emits its own start/done so the browser marks that crew
+    //    member live and done as it actually happens — the live role-chain, not a canned replay.
+    emit(&tx, json!({"stage": "physics", "status": "start"})).await;
+    emit(&tx, json!({"stage": "art", "status": "start"})).await;
+    let (tx_p, tx_a) = (tx.clone(), tx.clone());
+    let physics = async {
+        let r = run_cmd_async(physics_cmd, prompt.clone()).await;
+        if r.is_ok() {
+            emit(&tx_p, json!({"stage": "physics", "status": "done"})).await;
+        }
+        r
+    };
+    let art = async {
+        let r = run_cmd_async(art_cmd, prompt.clone()).await;
+        if r.is_ok() {
+            emit(&tx_a, json!({"stage": "art", "status": "done"})).await;
+        }
+        r
+    };
+    let (physics_out, art_out) = tokio::join!(physics, art);
+    let physics_out = match physics_out {
+        Ok(o) => o,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("physics role unreachable: {e}")})).await,
+    };
+    let art_out = match art_out {
+        Ok(o) => o,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("art role unreachable: {e}")})).await,
+    };
+    let cfg = match CrewConfig::from_fragment_json(&physics_out, &art_out) {
+        Ok(c) => c,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("crew fragments malformed: {e}")})).await,
+    };
+
+    // 3. terminal: the full CrewBuildResponse, tagged stage=built.
+    let mut built = serde_json::to_value(CrewBuildResponse::built(cfg, demo_auction())).unwrap_or_else(|_| json!({}));
+    if let Value::Object(m) = &mut built {
+        m.insert("stage".into(), json!("built"));
+    }
+    emit(&tx, built).await;
+}
+
+async fn build_handler(Json(body): Json<Value>) -> Response {
     let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if prompt.len() < 3 {
-        return Err((StatusCode::BAD_REQUEST, "say a bit more about the game you want".into()));
+        return (StatusCode::BAD_REQUEST, "say a bit more about the game you want").into_response();
     }
-    let env = |k: &str| std::env::var(k).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, format!("{k} not configured")));
-    let (safety, physics, art) = (env("CREW_SAFETY_CMD")?, env("CREW_PHYSICS_CMD")?, env("CREW_ART_CMD")?);
-    match run_crew(prompt, safety, physics, art).await {
-        Ok(resp) => Ok(Json(resp)),
-        // Infra failure → 502 so the browser fails closed to its local stand-in.
-        Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
-    }
+    let env = |k: &str| std::env::var(k).ok();
+    let (safety, physics, art) = match (env("CREW_SAFETY_CMD"), env("CREW_PHYSICS_CMD"), env("CREW_ART_CMD")) {
+        (Some(s), Some(p), Some(a)) => (s, p, a),
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, "crew role commands not configured").into_response(),
+    };
+    // Stream NDJSON progress events as the crew runs. run_crew_streaming pushes lines onto the
+    // channel; the response body drains them. On any failure it emits a terminal {"stage":"error"}
+    // and the browser falls back to its local stand-in — same fail-closed contract as before.
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+    tokio::spawn(run_crew_streaming(prompt, safety, physics, art, tx));
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
+    Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-store")
+        .body(Body::from_stream(stream))
+        .expect("valid streaming response")
 }
 
 #[tokio::main]
@@ -127,31 +192,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod tests {
     use super::*;
 
+    /// Drive run_crew_streaming to completion and collect its NDJSON events as parsed JSON objects.
+    async fn collect(prompt: &str, safety: String, physics: String, art: String) -> Vec<Value> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+        let h = tokio::spawn(run_crew_streaming(prompt.to_string(), safety, physics, art, tx));
+        let mut evs = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            for line in chunk.split('\n') {
+                let t = line.trim();
+                if !t.is_empty() {
+                    evs.push(serde_json::from_str::<Value>(t).expect("each streamed line is valid JSON"));
+                }
+            }
+        }
+        h.await.unwrap();
+        evs
+    }
+
     #[tokio::test]
-    async fn run_crew_assembles_from_role_commands_and_fails_closed() {
-        // #171/#173 c3 (frozen): the bridge core, exercised with shell commands that emit fixed
-        // JSON (local fakes) — no network. Happy build maps physics/art; safety reject carries no
-        // build; a failing role command → Err (→ 502 → browser fallback).
+    async fn streaming_crew_emits_stage_events_and_fails_closed() {
+        // #173 A (frozen): the streaming bridge emits per-role progress and exactly one terminal
+        // event — built / rejected / error — exercised with fixed-JSON local fakes (no network).
         let safety_ok = r#"printf '{"ok":true,"reason":""}'"#.to_string();
         let physics = r#"printf '{"gravity":2200,"flapPower":420,"pipeGap":115,"pipeSpeed":220}'"#.to_string();
         let art = r##"printf '{"theme":"night","birdColor":"#00ff41","birdEmoji":"X","title":"Neo"}'"##.to_string();
 
-        let r = run_crew("matrix".into(), safety_ok.clone(), physics.clone(), art.clone()).await.unwrap();
-        assert!(r.safety.ok, "built when safety passes");
-        let cfg = r.config.as_ref().expect("built carries config");
-        assert_eq!((cfg.speed, cfg.jump, cfg.gap), (220, 420, 115), "physics fragment mapped");
-        assert!(r.auction.as_ref().map(|a| !a.is_empty()).unwrap_or(false), "auction present");
+        let evs = collect("matrix", safety_ok.clone(), physics.clone(), art.clone()).await;
+        let stages: Vec<&str> = evs.iter().map(|e| e["stage"].as_str().unwrap_or("")).collect();
+        assert!(stages.contains(&"safety"), "a safety stage event is emitted");
+        assert!(stages.contains(&"physics") && stages.contains(&"art"), "per-role events for both roles");
+        let last = evs.last().unwrap();
+        assert_eq!(last["stage"], "built", "terminal event is a build");
+        assert_eq!(last["config"]["speed"], 220, "the built event carries the assembled config");
+        assert!(last["auction"].as_array().map(|a| !a.is_empty()).unwrap_or(false), "and the auction");
 
+        // safety reject → terminal 'rejected', and NO fragment calls happen after it.
         let safety_no = r#"printf '{"ok":false,"reason":"anti-prompt"}'"#.to_string();
-        let r2 = run_crew("evil".into(), safety_no, physics.clone(), art.clone()).await.unwrap();
-        assert!(!r2.safety.ok && r2.config.is_none(), "safety reject carries no build (short-circuit)");
+        let evs2 = collect("evil", safety_no, physics.clone(), art.clone()).await;
+        assert_eq!(evs2.last().unwrap()["stage"], "rejected");
+        assert_eq!(evs2.last().unwrap()["safety"]["ok"], false);
+        assert!(!evs2.iter().any(|e| e["stage"] == "physics"), "no physics/art after a safety reject");
 
-        let r3 = run_crew("x".into(), safety_ok, "false".into(), art).await;
-        assert!(r3.is_err(), "a failing role command → Err (fail closed)");
+        // a failing role command → terminal 'error' (→ browser falls back to its stand-in).
+        let evs3 = collect("x", safety_ok, "false".into(), art).await;
+        assert_eq!(evs3.last().unwrap()["stage"], "error");
     }
 
     #[tokio::test]
-    async fn run_crew_runs_physics_and_art_concurrently() {
+    async fn streaming_crew_runs_physics_and_art_concurrently() {
         // #173 (frozen, regression guard): the DEPLOYED bridge path must run physics ∥ art, not
         // sequentially (each role is a ~14s claude -p over the tunnel; serial ≈ 40s, concurrent ≈
         // 28s). Proven deterministically with a rendezvous BARRIER, not a timing margin: each role
@@ -171,13 +259,9 @@ mod tests {
         let safety = r#"printf '{"ok":true,"reason":""}'"#.to_string();
         let physics = barrier(r#"{"gravity":1800,"flapPower":430,"pipeGap":140,"pipeSpeed":130}"#);
         let art = barrier(r##"{"theme":"day","birdColor":"#f7d51d","birdEmoji":"","title":"T"}"##);
-        let res = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            run_crew("go".into(), safety, physics, art),
-        )
-        .await;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(3), collect("go", safety, physics, art)).await;
         let _ = std::fs::remove_dir_all(&dir);
-        let built = res.expect("physics+art must run concurrently — a serialized crew hangs on the barrier past 3s").unwrap();
-        assert!(built.config.is_some(), "the concurrently-produced fragments assemble into a build");
+        let evs = res.expect("physics+art must run concurrently — a serialized crew hangs on the barrier past 3s");
+        assert_eq!(evs.last().unwrap()["stage"], "built", "the concurrently-produced fragments assemble into a build");
     }
 }
