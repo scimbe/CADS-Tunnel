@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod noise;
 pub mod overlay;
+pub mod pipeline;
 pub mod policy;
 pub mod pow;
 pub mod ratelimit;
