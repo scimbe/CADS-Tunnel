@@ -19,14 +19,20 @@
 //! it decides, given the offers a discovery pass found, whether the pipeline can convene and who
 //! wins each role.
 
-use crate::channel::{CapacityOffer, ServiceType, UnixSeconds};
+use crate::channel::{AgentCard, CapacityOffer, ChannelId, ServiceType, UnixSeconds};
 use serde::{Deserialize, Serialize};
 
-/// One role a pipeline requires: the service the role performs, and the units the workflow needs.
+/// One role a pipeline requires. The `service` is the [`ServiceType`] the role's capacity
+/// [`CapacityOffer`] must declare (the auction/offer dimension); the `tag` is the human role name
+/// agents advertise in their [`AgentCard::role_tags`] (the invite-by-card dimension). The two are
+/// distinct on purpose — an offer says *what task-type it serves*, a card says *what role the agent
+/// plays* — so a pipeline can both auction offers AND invite by card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequiredRole {
     pub service: ServiceType,
     pub units: u64,
+    /// The role tag agents advertise on their `AgentCard` for this role (e.g. `"physics"`).
+    pub tag: String,
 }
 
 /// A workflow-pipeline spec — the roles that must ALL be filled for the pipeline to run. This is
@@ -71,7 +77,45 @@ pub struct RoleAssignment {
     pub price: u64,
 }
 
+/// An agent the pipeline can invite for a role (the PUSH path), with the channels its card
+/// advertises it is reachable via.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteCandidate {
+    pub holder: [u8; 32],
+    pub channels: Vec<ChannelId>,
+}
+
+/// The invite list for one role: the valid agents whose card advertises the role's tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleInvitation {
+    pub service: ServiceType,
+    pub tag: String,
+    pub candidates: Vec<InviteCandidate>,
+}
+
 impl PipelineSpec {
+    /// The **invite-by-card** (PUSH) discovery mode: given the [`AgentCard`]s a discovery pass found
+    /// (`/registry/agents`, #144), return per role the valid agents whose card advertises that role
+    /// (`role_tags` contains the role's `tag`) — the agents the pipeline can **invite** over their
+    /// advertised `channels`, rather than waiting for them to find the job. A role whose
+    /// `candidates` is empty has no invitable agent (the same underfilled signal
+    /// [`convene`](Self::convene) raises for offers, surfaced at discovery time). Only
+    /// [`is_valid`](AgentCard::is_valid) cards (signature + not expired) are considered — an expired
+    /// or forged card can't get its holder invited.
+    pub fn invitations(&self, cards: &[AgentCard], now: UnixSeconds) -> Vec<RoleInvitation> {
+        self.roles
+            .iter()
+            .map(|role| {
+                let candidates = cards
+                    .iter()
+                    .filter(|c| c.is_valid(now) && c.role_tags.iter().any(|t| t == &role.tag))
+                    .map(|c| InviteCandidate { holder: c.holder_pubkey, channels: c.channels.clone() })
+                    .collect();
+                RoleInvitation { service: role.service, tag: role.tag.clone(), candidates }
+            })
+            .collect()
+    }
+
     /// Convene the pipeline against the currently-online `offers`. Runs a per-role auction and
     /// returns the winning [`RoleAssignment`] for **every** role, or the first
     /// [`PipelineError::UnfilledRole`] if any role has no matchable offer online.
@@ -141,8 +185,8 @@ mod tests {
         let spec = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: SafetyCheck, units: 5 },
-                RequiredRole { service: CodeGeneration, units: 10 },
+                RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into() },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into() },
             ],
         };
         // Two agents online: #1 offers SafetyCheck, #2 offers CodeGeneration — both roles fillable.
@@ -197,5 +241,54 @@ mod tests {
             PipelineSpec { id: "e".into(), roles: vec![] }.convene(&[safety], 100),
             Err(PipelineError::Empty),
         );
+    }
+
+    #[test]
+    fn pipeline_invites_agents_by_their_card_role_tags() {
+        // Maintainer vision (frozen): the PUSH path — the pipeline invites agents using the info on
+        // their AgentCard (role_tags), returning who to invite per role over their advertised
+        // channels. A role no card advertises has no candidates (invitable-underfilled).
+        use crate::channel::AgentCard;
+        let card = |seed: u8, tags: Vec<&str>, chans: Vec<[u8; 32]>, expires: UnixSeconds| {
+            let sk = SigningKey::from_bytes(&[seed; 32]);
+            AgentCard::sign_new(
+                &sk,
+                tags.into_iter().map(String::from).collect(),
+                vec![],
+                vec![],
+                chans.into_iter().map(crate::channel::ChannelId).collect(),
+                0,
+                expires,
+            )
+        };
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: CodeGeneration, units: 10, tag: "physics".into() },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "art".into() },
+            ],
+        };
+        // source-2 advertises "physics" (+ an existing tag), sink advertises "art"; a stranger
+        // advertises neither.
+        let source2 = card(1, vec!["physics", "mechanics-design"], vec![[0x11; 32]], 1000);
+        let sink = card(2, vec!["art", "ux-design"], vec![[0x22; 32]], 1000);
+        let stranger = card(3, vec!["marketing"], vec![[0x33; 32]], 1000);
+        let expired_physics = card(4, vec!["physics"], vec![[0x44; 32]], 50); // expired at now=100
+
+        let inv = spec.invitations(&[source2, sink, stranger, expired_physics], 100);
+        assert_eq!(inv.len(), 2);
+        assert_eq!(inv[0].tag, "physics");
+        assert_eq!(inv[0].candidates.len(), 1, "only the valid physics card is invitable (expired one excluded)");
+        assert_eq!(inv[0].candidates[0].holder, holder(1));
+        assert_eq!(inv[0].candidates[0].channels, vec![crate::channel::ChannelId([0x11; 32])], "invite over the card's channel");
+        assert_eq!(inv[1].tag, "art");
+        assert_eq!(inv[1].candidates[0].holder, holder(2));
+
+        // A role no card advertises → no one to invite.
+        let spec2 = PipelineSpec {
+            id: "x".into(),
+            roles: vec![RequiredRole { service: SafetyCheck, units: 1, tag: "nobody-has-this".into() }],
+        };
+        assert!(spec2.invitations(&[card(5, vec!["physics"], vec![], 1000)], 100)[0].candidates.is_empty());
     }
 }
