@@ -57,9 +57,9 @@ binary.
    see D for the tunnel), and `POST` the card to `/registry/agents` to become discoverable.
    Self-check any card with `ct-agent channel agent-card --verify <file>`.
 4. **Serve a capability** — a closed `ServiceType`: `code_generation` | `security_review` |
-   `safety_check` | `text_generation`. Serve mode is a **persistent** request/response service
-   (`serve_request_loop` handles many calls per session); still wrap it in a restart loop for
-   resilience across reconnects. It runs over a real channel, so you need the join env from B:
+   `safety_check` | `text_generation`. In serve mode the accept side **re-admits successive peers
+   automatically** (#179) — it parks, serves a peer, then loops back to admit the next — so no
+   external restart loop is needed. It runs over a real channel, so you need the join env from B:
    ```
    CT_AGENT_SERVICE_HANDLER_CMD=./my-handler.sh \
    CT_AGENT_SERVICES=text_generation \

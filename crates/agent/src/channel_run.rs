@@ -1773,7 +1773,9 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // #121: a relay-only member advertises the sentinel instead of a dialable address — it
     // can't be reached directly, so it participates purely via the relay + `:443` fallback.
     let request = ChannelJoinRequest {
-        grant: cfg.grant,
+        // #179: clone (not move) the grant so `cfg` stays whole for the multi-session serve loop
+        // below, which re-runs admission for each successive peer.
+        grant: cfg.grant.clone(),
         endpoint: if cfg.relay_only {
             ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string()
         } else {
@@ -1812,60 +1814,92 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
     // blocks the channel port still reaches the broker (#106 client-dial-wire). Otherwise
     // the direct-QUIC broker join, unchanged. Borrow the cert so it survives for the relay
     // leg's ladder below.
-    let admission = match &front_door_cert {
+    // #179: an accept-side SERVE member must stay parked across MANY sequential peer sessions —
+    // admit one, serve it, loop back to admit the next — instead of exiting after the first. Exiting
+    // forced every operator (central, sink, source-2, …) into an external restart loop whose ~0.2s
+    // re-park gap dropped real user calls ("art role unreachable" on first try, ok on retry). A
+    // transient per-session error (admission stall #140, peer drop) is logged and retried, not fatal;
+    // one-shot roles (initiator / `--call` / non-serve) run exactly once, unchanged.
+    let serve_loop = should_serve_loop(cfg.role, std::env::var("CT_CHANNEL_SERVE").ok().as_deref());
+    eprintln!(
+        "ct-agent channel: plane-brokered {:?} (relay {}){}",
+        cfg.role,
+        cfg.relay_addr,
+        if serve_loop { " — persistent serve: re-admitting each peer (#179)" } else { "" }
+    );
+    loop {
+        let result = run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
+        if !serve_loop {
+            return result;
+        }
+        match result {
+            Ok(()) => eprintln!("ct-agent channel: peer session ended — re-admitting the next peer (#179)"),
+            Err(e) => {
+                eprintln!("ct-agent channel: serve session error, re-admitting (#179): {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// #179: should `ct-agent channel` stay parked and re-admit successive peers? Only the **accept**
+/// side in **serve** mode (`CT_CHANNEL_SERVE` truthy) — the parking side of a role a pipeline dials
+/// repeatedly. An initiator (or a non-serve accept) does exactly one session and exits. Pure.
+fn should_serve_loop(role: ChannelRole, serve_env: Option<&str>) -> bool {
+    role == ChannelRole::Accept
+        && serve_env
+            .map(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+}
+
+/// One admit→serve cycle of the plane-brokered flow: re-present the grant to the broker (a fresh
+/// admission per peer), build the relay fallback + optional direct listener, and run the session
+/// with a fresh local app stream. Factored out so [`run_channel_join_command`]'s #179 serve loop can
+/// repeat it for each successive peer without re-parsing config.
+async fn run_one_admission_session(
+    cfg: &ChannelJoinCliConfig,
+    request: &ChannelJoinRequest,
+    broker_ladder: &[ChannelDialRung],
+    relay_ladder: &[ChannelDialRung],
+    front_door_cert: &Option<CertificateDer<'static>>,
+) -> Result<(), BoxError> {
+    let admission = match front_door_cert {
         Some(edge_cert) => {
-            eprintln!(
-                "ct-agent channel: plane-brokered {:?}; broker ladder over {} (front door {:?})",
-                cfg.role, cfg.broker_addr, cfg.front_door
-            );
-            present_channel_join_via_ladder(
-                &broker_ladder,
-                &request,
-                &cfg.holder,
-                edge_cert.clone(),
-                DIRECT_DIAL_TIMEOUT,
-            )
-            .await?
+            present_channel_join_via_ladder(broker_ladder, request, &cfg.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await?
         }
         None => {
             let broker_conn = crate::transport::build_channel_dialer()?
                 .connect(cfg.broker_addr, "localhost")?
                 .await?;
-            present_channel_join(&broker_conn, &request, &cfg.holder).await?
+            present_channel_join(&broker_conn, request, &cfg.holder).await?
         }
     };
-    // The relay data leg mirrors the broker leg (#106 relay-leg-443): with a `:443`
-    // front-door cert, the relay fallback walks its own ladder — direct QUIC to the relay
-    // port, then the `:443` front door — so a member whose relay port is ALSO filtered
-    // (a fully `:443`-only network) can still relay. Without a cert, keep the eager
-    // direct-QUIC relay dial unchanged (nothing regresses for members that reach the port).
-    let relay = match &front_door_cert {
+    // The relay data leg mirrors the broker leg (#106 relay-leg-443): with a `:443` front-door cert
+    // the relay fallback walks its own ladder — direct QUIC to the relay port, then the `:443` front
+    // door — so a member whose relay port is ALSO filtered can still relay. Without a cert, the eager
+    // direct-QUIC relay dial is unchanged.
+    let relay = match front_door_cert {
         Some(edge_cert) => RelayFallback::Ladder {
-            rungs: &relay_ladder,
+            rungs: relay_ladder,
             edge_cert: edge_cert.clone(),
             direct_timeout: DIRECT_DIAL_TIMEOUT,
         },
-        // #103 fix: dial the relay LAZILY (only on direct-dial failure) instead of eagerly
-        // holding an idle connection the edge reaps as a spurious pre-admission close.
+        // #103: dial the relay LAZILY (only on direct-dial failure).
         None => RelayFallback::QuicLazy(cfg.relay_addr),
     };
-    // #121: a relay-only member skips binding the direct listener even in the Accept role —
-    // it can't be dialed, so `run_channel_join_with_admission` relays it directly.
+    // #121: a relay-only member skips binding the direct listener even in Accept — it can't be dialed.
     let listener = match cfg.role {
-        ChannelRole::Accept if !cfg.relay_only => {
-            Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0)
-        }
+        ChannelRole::Accept if !cfg.relay_only => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
         _ => None,
     };
-    eprintln!(
-        "ct-agent channel: plane-brokered {:?} (relay {})",
-        cfg.role, cfg.relay_addr
-    );
     let local = channel_local();
     run_channel_join_with_admission(
         admission,
         relay,
-        &request,
+        request,
         &cfg.holder,
         cfg.role,
         &cfg.own_noise_private,
@@ -3297,6 +3331,21 @@ mod tests {
             run_service_call(peer2, "safety_check", "x").await.is_err(),
             "an unoffered service fails closed",
         );
+    }
+
+    #[test]
+    fn serve_loop_only_for_accept_in_serve_mode() {
+        // #179 (frozen): the persistent re-admit loop engages ONLY for an accept-side serve member
+        // (the parking side a pipeline dials repeatedly). Truthy CT_CHANNEL_SERVE in {1,true,yes}.
+        assert!(should_serve_loop(ChannelRole::Accept, Some("1")));
+        assert!(should_serve_loop(ChannelRole::Accept, Some("true")));
+        assert!(should_serve_loop(ChannelRole::Accept, Some(" yes ")));
+        // Not the initiator (it does one call/session and exits), regardless of the env.
+        assert!(!should_serve_loop(ChannelRole::Initiate, Some("1")));
+        // Not a non-serve accept, and not unset/false.
+        assert!(!should_serve_loop(ChannelRole::Accept, None));
+        assert!(!should_serve_loop(ChannelRole::Accept, Some("0")));
+        assert!(!should_serve_loop(ChannelRole::Accept, Some("false")));
     }
 
     #[tokio::test]
