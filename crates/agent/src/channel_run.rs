@@ -854,7 +854,24 @@ impl ChannelJoinCliConfig {
         };
         let broker_addr = addr("CT_CHANNEL_BROKER", "edge rendezvous host:port")?;
         let relay_addr = addr("CT_CHANNEL_RELAY", "edge relay host:port")?;
-        let listen_addr = addr("CT_CHANNEL_LISTEN", "advertised host:port")?;
+        // #121/#173: relay-only mode. `CT_CHANNEL_RELAY_ONLY` forces it on; otherwise it is
+        // auto-detected below from the advertised listen address. Parsed BEFORE CT_CHANNEL_LISTEN
+        // because a relay-only member has no dialable address, so CT_CHANNEL_LISTEN is OPTIONAL in
+        // that mode — it's never bound or advertised (the relay-only sentinel stands in). #173: both
+        // source-2 and sink independently hit the old unconditional hard-error and had to invent a
+        // dummy value; a relay-only operator no longer has to.
+        let relay_only_explicit = f("CT_CHANNEL_RELAY_ONLY")
+            .map(|s| {
+                let t = s.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false);
+        let listen_addr = match f("CT_CHANNEL_LISTEN") {
+            Some(s) if !s.trim().is_empty() => s.trim().parse().map_err(|e| format!("CT_CHANNEL_LISTEN invalid: {e}"))?,
+            // Relay-only has no dialable address → an unbound placeholder is never used.
+            _ if relay_only_explicit => SocketAddr::from(([0, 0, 0, 0], 0)),
+            _ => return Err("CT_CHANNEL_LISTEN required (advertised host:port) — or set CT_CHANNEL_RELAY_ONLY=1 for a relay-only member with no dialable address".to_string()),
+        };
         let grant_bytes = f("CT_CHANNEL_GRANT")
             .as_deref()
             .and_then(hex_bytes)
@@ -890,15 +907,8 @@ impl ChannelJoinCliConfig {
             )),
             _ => None,
         };
-        // #121: relay-only mode. `CT_CHANNEL_RELAY_ONLY` forces it on; otherwise it is
-        // auto-detected when the advertised listen address is not globally routable (a
-        // NAT-only host that can't be dialed and the edge would refuse to advertise, #94).
-        let relay_only_explicit = f("CT_CHANNEL_RELAY_ONLY")
-            .map(|s| {
-                let t = s.trim();
-                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-            })
-            .unwrap_or(false);
+        // Auto-detect relay-only when not forced: a non-globally-routable advertised listen address
+        // (a NAT-only host the edge would refuse to advertise, #94) is treated as relay-only.
         let relay_only = relay_only_mode(relay_only_explicit, listen_addr);
         // #136 N-wire: optional libp2p circuit-relay multiaddr for the DCUtR NAT-to-NAT punch.
         let circuit_relay = parse_circuit_relay(f("CT_CHANNEL_CIRCUIT_RELAY"))?;
@@ -3418,6 +3428,17 @@ mod tests {
             let pruned: Vec<(&str, String)> = base.iter().filter(|(k, _)| *k != drop_key).cloned().collect();
             assert!(lookup(&pruned).is_err(), "missing {drop_key} must be rejected");
         }
+
+        // #173 (frozen): a relay-only member has no dialable address, so CT_CHANNEL_LISTEN is
+        // OPTIONAL when CT_CHANNEL_RELAY_ONLY=1 — dropping it must NOT error (both source-2 and sink
+        // hit the old hard-error and had to supply a dummy). It parses as relay-only with an unbound
+        // placeholder listen address that's never used.
+        let mut relay_only_no_listen: Vec<(&str, String)> =
+            base.iter().filter(|(k, _)| *k != "CT_CHANNEL_LISTEN").cloned().collect();
+        relay_only_no_listen.push(("CT_CHANNEL_RELAY_ONLY", "1".into()));
+        let ro = lookup(&relay_only_no_listen).expect("relay-only needs no CT_CHANNEL_LISTEN (#173)");
+        assert!(ro.relay_only, "explicit CT_CHANNEL_RELAY_ONLY=1 is relay-only");
+        assert_eq!(ro.listen_addr, SocketAddr::from(([0, 0, 0, 0], 0)), "unbound placeholder listen");
 
         // #106: without a front door, the dial ladder is direct-only.
         assert_eq!(cfg.front_door, None);
