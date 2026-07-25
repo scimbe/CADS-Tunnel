@@ -1394,6 +1394,59 @@ where
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("service/{slug} reply missing result.output")))
 }
 
+/// Crew-bridge c2 driver (#171/#173): given already-connected channel duplexes to the three role
+/// agents, run the crew end to end and return the browser's `{safety, auction, config}` — the
+/// orchestration the `/crew/build` server (c3) wraps.
+///
+/// Order + fail-closed semantics:
+/// 1. **safety_check** runs FIRST over the safety agent's channel; its output is `{ok, reason}`. A
+///    `false` verdict short-circuits to a **rejection** (no fragment calls, no build) — the
+///    authoritative live guard.
+/// 2. **physics** then **art** run over their agents' channels (`service/text_generation`), and the
+///    fragments are assembled by [`ct_common::crew`].
+///
+/// A transport/parse failure at any step returns `Err(reason)` — the c3 HTTP layer maps that to a
+/// 5xx so the **browser fails closed to its local stand-in**. A clean policy rejection is
+/// `Ok(rejected)`; a clean build is `Ok(built)`. `auction` (who won each role) is supplied by the
+/// caller — the bridge derives it from a real `match_offer`/`convene`; a demo may pass the fixed crew.
+pub async fn crew_build_over<S, P, A>(
+    prompt: &str,
+    safety_conn: S,
+    physics_conn: P,
+    art_conn: A,
+    auction: Vec<ct_common::crew::RoleAuction>,
+) -> Result<ct_common::crew::CrewBuildResponse, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    A: AsyncRead + AsyncWrite + Unpin,
+{
+    // 1. safety_check — the authoritative live guard.
+    let (mut sr, mut sw) = tokio::io::split(safety_conn);
+    let safety_out = call_role_service(&mut sw, &mut sr, "safety_check", prompt)
+        .await
+        .map_err(|e| format!("safety_check service unreachable: {e}"))?;
+    let verdict: serde_json::Value =
+        serde_json::from_str(&safety_out).map_err(|e| format!("safety_check reply not JSON: {e}"))?;
+    if verdict.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let reason = verdict.get("reason").and_then(|r| r.as_str()).unwrap_or("rejected by the safety agent");
+        return Ok(ct_common::crew::CrewBuildResponse::rejected(reason.to_string()));
+    }
+    // 2. physics + art fragments.
+    let (mut pr, mut pw) = tokio::io::split(physics_conn);
+    let physics_json = call_role_service(&mut pw, &mut pr, "text_generation", prompt)
+        .await
+        .map_err(|e| format!("physics role unreachable: {e}"))?;
+    let (mut ar, mut aw) = tokio::io::split(art_conn);
+    let art_json = call_role_service(&mut aw, &mut ar, "text_generation", prompt)
+        .await
+        .map_err(|e| format!("art role unreachable: {e}"))?;
+    // 3. assemble the real config from the fragments (fail-closed on a malformed fragment).
+    let cfg = ct_common::crew::CrewConfig::from_fragment_json(&physics_json, &art_json)
+        .map_err(|e| format!("crew fragments malformed: {e}"))?;
+    Ok(ct_common::crew::CrewBuildResponse::built(cfg, auction))
+}
+
 fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStream {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
@@ -3149,6 +3202,51 @@ mod tests {
             call_role_service(&mut w2, &mut r2, "safety_check", "x").await.is_err(),
             "an unoffered service fails closed"
         );
+    }
+
+    #[tokio::test]
+    async fn crew_build_over_runs_the_crew_and_fails_closed() {
+        // #171/#173 c2 driver (frozen): safety_check → physics → art over three role channels,
+        // assembled by ct_common::crew. Exercised against in-process serve peers (local fakes).
+        use ct_common::channel::ServiceType;
+        fn peer(services: &[ServiceType], out: &str) -> tokio::io::DuplexStream {
+            let mut reg = ct_common::mcp::default_registry();
+            let out = out.to_string();
+            ct_common::mcp::register_service_tools(&mut reg, services, move |_svc, _input| Ok(out.clone()));
+            let reg = std::sync::Arc::new(reg);
+            serve_local(move |req: Vec<u8>| {
+                let reg = reg.clone();
+                async move { reg.dispatch(&req) }
+            })
+        }
+        let auction: Vec<ct_common::crew::RoleAuction> = vec![];
+
+        // Happy path: safety OK → physics + art fragments assemble into a built config.
+        let safety = peer(&[ServiceType::SafetyCheck], r#"{"ok":true,"reason":""}"#);
+        let physics = peer(&[ServiceType::TextGeneration], r#"{"gravity":2200,"flapPower":420,"pipeGap":115,"pipeSpeed":220}"#);
+        let art = peer(&[ServiceType::TextGeneration], r##"{"theme":"night","birdColor":"#00ff41","birdEmoji":"🕶️","title":"Neo"}"##);
+        let resp = crew_build_over("matrix theme", safety, physics, art, auction.clone()).await.unwrap();
+        assert!(resp.safety.ok, "built when safety passes");
+        let cfg = resp.config.as_ref().expect("built carries config");
+        assert_eq!((cfg.speed, cfg.jump, cfg.gap), (220, 420, 115), "physics fragment mapped");
+        assert_eq!(cfg.bird_emoji, "🕶️", "art fragment carried (emoji intact)");
+
+        // Safety reject → Ok(rejected), no build.
+        let safety_r = peer(&[ServiceType::SafetyCheck], r#"{"ok":false,"reason":"anti-prompt"}"#);
+        let p2 = peer(&[ServiceType::TextGeneration], "{}");
+        let a2 = peer(&[ServiceType::TextGeneration], "{}");
+        let rej = crew_build_over("evil", safety_r, p2, a2, auction.clone()).await.unwrap();
+        assert!(!rej.safety.ok && rej.config.is_none(), "safety reject carries no build");
+
+        // A role unreachable (bare peer offers no service) → Err → the c3 layer 5xx's → browser falls back.
+        let safety3 = peer(&[ServiceType::SafetyCheck], r#"{"ok":true}"#);
+        let bare = std::sync::Arc::new(ct_common::mcp::default_registry());
+        let physics3 = serve_local(move |req: Vec<u8>| {
+            let bare = bare.clone();
+            async move { bare.dispatch(&req) }
+        });
+        let a3 = peer(&[ServiceType::TextGeneration], "{}");
+        assert!(crew_build_over("x", safety3, physics3, a3, auction).await.is_err(), "an unreachable role → Err (fail closed)");
     }
 
     #[test]
