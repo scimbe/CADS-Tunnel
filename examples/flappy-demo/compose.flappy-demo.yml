@@ -83,21 +83,29 @@ services:
       args:
         - CRATE=ct-agent
     command: ["ct-crew-bridge"]
+    # OPT-IN: the bridge only starts with `docker compose --profile crew up`. Without the profile the
+    # default `up` brings up just the origin + Browser-Plane agent (the demo page, which fails closed
+    # to its local stand-in) — so the demo is never held hostage to crew identities that don't exist
+    # yet. The per-role vars below therefore DEFAULT EMPTY (`:-`), never `:?`-required: a missing one
+    # must not break the whole stack's interpolation (compose interpolates the file before filtering
+    # by profile). Set them (in docker/deploy/.env) once central provisions the grants, then
+    # `--profile crew up`.
+    profiles: ["crew"]
     environment:
       - CREW_BRIDGE_LISTEN=0.0.0.0:8788
       # Shared edge rendezvous/relay for every role dial.
-      - CREW_EDGE_BROKER=${CREW_EDGE_BROKER:?edge rendezvous host:port, e.g. edge:4433}
-      - CREW_EDGE_RELAY=${CREW_EDGE_RELAY:?edge relay host:port}
+      - CREW_EDGE_BROKER=${CREW_EDGE_BROKER:-}
+      - CREW_EDGE_RELAY=${CREW_EDGE_RELAY:-}
       # Per-role channel-join identities (operator-supplied from central's provisioning; SECRET hex).
-      - CREW_PHYSICS_GRANT=${CREW_PHYSICS_GRANT:?source-2 (physics) channel grant hex}
-      - CREW_PHYSICS_HOLDER_KEY=${CREW_PHYSICS_HOLDER_KEY:?physics holder key hex}
-      - CREW_PHYSICS_NOISE_KEY=${CREW_PHYSICS_NOISE_KEY:?physics noise key hex}
-      - CREW_ART_GRANT=${CREW_ART_GRANT:?sink (art) channel grant hex}
-      - CREW_ART_HOLDER_KEY=${CREW_ART_HOLDER_KEY:?art holder key hex}
-      - CREW_ART_NOISE_KEY=${CREW_ART_NOISE_KEY:?art noise key hex}
-      - CREW_SAFETY_GRANT=${CREW_SAFETY_GRANT:?safety agent channel grant hex}
-      - CREW_SAFETY_HOLDER_KEY=${CREW_SAFETY_HOLDER_KEY:?safety holder key hex}
-      - CREW_SAFETY_NOISE_KEY=${CREW_SAFETY_NOISE_KEY:?safety noise key hex}
+      - CREW_PHYSICS_GRANT=${CREW_PHYSICS_GRANT:-}
+      - CREW_PHYSICS_HOLDER_KEY=${CREW_PHYSICS_HOLDER_KEY:-}
+      - CREW_PHYSICS_NOISE_KEY=${CREW_PHYSICS_NOISE_KEY:-}
+      - CREW_ART_GRANT=${CREW_ART_GRANT:-}
+      - CREW_ART_HOLDER_KEY=${CREW_ART_HOLDER_KEY:-}
+      - CREW_ART_NOISE_KEY=${CREW_ART_NOISE_KEY:-}
+      - CREW_SAFETY_GRANT=${CREW_SAFETY_GRANT:-}
+      - CREW_SAFETY_HOLDER_KEY=${CREW_SAFETY_HOLDER_KEY:-}
+      - CREW_SAFETY_NOISE_KEY=${CREW_SAFETY_NOISE_KEY:-}
       # One dial per role, each scoped to its own identity (see the note above re $$ expansion).
       - "CREW_PHYSICS_CMD=env CT_CHANNEL_ROLE=initiate CT_CHANNEL_CALL_SERVICE=text_generation CT_CHANNEL_BROKER=$$CREW_EDGE_BROKER CT_CHANNEL_RELAY=$$CREW_EDGE_RELAY CT_CHANNEL_LISTEN=0.0.0.0:0 CT_CHANNEL_GRANT=$$CREW_PHYSICS_GRANT CT_CHANNEL_HOLDER_KEY=$$CREW_PHYSICS_HOLDER_KEY CT_CHANNEL_NOISE_KEY=$$CREW_PHYSICS_NOISE_KEY ct-agent channel"
       - "CREW_ART_CMD=env CT_CHANNEL_ROLE=initiate CT_CHANNEL_CALL_SERVICE=text_generation CT_CHANNEL_BROKER=$$CREW_EDGE_BROKER CT_CHANNEL_RELAY=$$CREW_EDGE_RELAY CT_CHANNEL_LISTEN=0.0.0.0:0 CT_CHANNEL_GRANT=$$CREW_ART_GRANT CT_CHANNEL_HOLDER_KEY=$$CREW_ART_HOLDER_KEY CT_CHANNEL_NOISE_KEY=$$CREW_ART_NOISE_KEY ct-agent channel"
