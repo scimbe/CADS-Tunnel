@@ -84,8 +84,17 @@ async fn run_crew(prompt: String, safety_cmd: String, physics_cmd: String, art_c
         let reason = verdict.get("reason").and_then(Value::as_str).unwrap_or("rejected by the safety agent");
         return Ok(CrewBuildResponse::rejected(reason.to_string()));
     }
-    let physics_out = run_cmd_async(physics_cmd, prompt.clone()).await.map_err(|e| format!("physics role unreachable: {e}"))?;
-    let art_out = run_cmd_async(art_cmd, prompt).await.map_err(|e| format!("art role unreachable: {e}"))?;
+    // physics + art are independent once safety passes — run them CONCURRENTLY, not sequentially, so
+    // the wall-clock is safety + max(physics, art) rather than the sum. Each role command is a real
+    // `ct-agent channel … --call service/<slug>` that ends up doing a ~14s `claude -p` (#173,
+    // measured), so joining the two independent roles cuts a ~40s crew to ~28s. (run_cmd_async is a
+    // spawn_blocking, so two concurrent calls genuinely run their subprocesses in parallel.)
+    let (physics_out, art_out) = tokio::join!(
+        run_cmd_async(physics_cmd, prompt.clone()),
+        run_cmd_async(art_cmd, prompt),
+    );
+    let physics_out = physics_out.map_err(|e| format!("physics role unreachable: {e}"))?;
+    let art_out = art_out.map_err(|e| format!("art role unreachable: {e}"))?;
     let cfg = CrewConfig::from_fragment_json(&physics_out, &art_out).map_err(|e| format!("crew fragments malformed: {e}"))?;
     Ok(CrewBuildResponse::built(cfg, demo_auction()))
 }
@@ -139,5 +148,36 @@ mod tests {
 
         let r3 = run_crew("x".into(), safety_ok, "false".into(), art).await;
         assert!(r3.is_err(), "a failing role command → Err (fail closed)");
+    }
+
+    #[tokio::test]
+    async fn run_crew_runs_physics_and_art_concurrently() {
+        // #173 (frozen, regression guard): the DEPLOYED bridge path must run physics ∥ art, not
+        // sequentially (each role is a ~14s claude -p over the tunnel; serial ≈ 40s, concurrent ≈
+        // 28s). Proven deterministically with a rendezvous BARRIER, not a timing margin: each role
+        // records that it started, then waits for the OTHER to start. Run concurrently, both see the
+        // pair and finish in <1s. Serialized, physics can never see art start (art hasn't run yet),
+        // so it spins its full ~6s bound before emitting — blowing the 3s timeout and failing the test.
+        let dir = std::env::temp_dir().join(format!("crew_conc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let barrier = |emit: &str| {
+            format!(
+                "echo x >> {d}/started; for _ in $(seq 1 300); do [ \"$(wc -l < {d}/started)\" -ge 2 ] && break; sleep 0.02; done; printf '{}'",
+                emit,
+                d = dir.display(),
+            )
+        };
+        let safety = r#"printf '{"ok":true,"reason":""}'"#.to_string();
+        let physics = barrier(r#"{"gravity":1800,"flapPower":430,"pipeGap":140,"pipeSpeed":130}"#);
+        let art = barrier(r##"{"theme":"day","birdColor":"#f7d51d","birdEmoji":"","title":"T"}"##);
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_crew("go".into(), safety, physics, art),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let built = res.expect("physics+art must run concurrently — a serialized crew hangs on the barrier past 3s").unwrap();
+        assert!(built.config.is_some(), "the concurrently-produced fragments assemble into a build");
     }
 }
