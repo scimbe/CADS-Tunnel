@@ -616,6 +616,89 @@ impl SqliteAgentDirectory {
     }
 }
 
+/// SQLite-backed **pipeline registry** (#174 B): where a designer *publishes* a workflow
+/// [`PipelineSpec`](ct_common::pipeline::PipelineSpec) (#171/#172) so agents can discover it —
+/// the pipeline analogue of the #144 agent directory. The spec is stored as its canonical JSON,
+/// keyed by the spec's own `id`; publishing is owner-scoped so one designer can't overwrite
+/// another's spec.
+pub struct SqlitePipelineRegistry {
+    conn: Mutex<Connection>,
+}
+
+impl SqlitePipelineRegistry {
+    /// Open (creating if needed) a durable pipeline registry at `path`.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        Self::from_connection(open_tuned(path)?)
+    }
+
+    /// Open an ephemeral in-memory pipeline registry (for tests / stateless runs).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pipelines (
+                 id           TEXT PRIMARY KEY,
+                 owner        TEXT NOT NULL,
+                 spec_json    TEXT NOT NULL,
+                 published_at INTEGER NOT NULL
+             );",
+        )?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Publish (upsert) a workflow pipeline spec, keyed by its `id`. Re-publishing the same id by
+    /// the same `owner` updates it; a **different** owner cannot overwrite an existing spec
+    /// (owner-scoped — returns `false` on the ownership clash, leaving the published spec intact).
+    /// The spec is stored as its canonical JSON.
+    pub fn publish(
+        &self,
+        owner: &str,
+        spec: &ct_common::pipeline::PipelineSpec,
+        now: u64,
+    ) -> rusqlite::Result<bool> {
+        let json = serde_json::to_string(spec)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock_safe();
+        let existing_owner: Option<String> = conn
+            .query_row("SELECT owner FROM pipelines WHERE id = ?1", params![spec.id], |r| r.get(0))
+            .optional()?;
+        if let Some(o) = existing_owner {
+            if o != owner {
+                return Ok(false);
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO pipelines (id, owner, spec_json, published_at) VALUES (?1, ?2, ?3, ?4)",
+            params![spec.id, owner, json, now as i64],
+        )?;
+        Ok(true)
+    }
+
+    /// Fetch a published pipeline spec by `id`, or `None` if unknown (or its stored JSON no longer
+    /// parses — a forward-incompatible spec never crashes a reader).
+    pub fn get(&self, id: &str) -> rusqlite::Result<Option<ct_common::pipeline::PipelineSpec>> {
+        let json: Option<String> = self
+            .conn
+            .lock_safe()
+            .query_row("SELECT spec_json FROM pipelines WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        Ok(json.and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    /// List every published pipeline as `(id, owner)`, sorted by id — the discovery surface a
+    /// scanning agent reads to find workflows to join.
+    pub fn list(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare("SELECT id, owner FROM pipelines ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
 /// SQLite-backed tunnel registry (durable equivalent of
 /// [`crate::registry::TunnelRegistry`]). Can share the same database file as
 /// [`SqliteEnrollment`] — each store owns its tables and its own connection.
@@ -2202,6 +2285,39 @@ impl SqliteTopologyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_registry_publishes_and_discovers_specs_owner_scoped() {
+        // #174 B (frozen): a designer publishes a workflow PipelineSpec so agents can discover it —
+        // owner-scoped (a stranger can't overwrite), round-trips through JSON, unknown id → None.
+        use ct_common::channel::ServiceType;
+        use ct_common::pipeline::{PipelineSpec, RequiredRole};
+        let reg = SqlitePipelineRegistry::open_in_memory().unwrap();
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "physics".into() },
+                RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "art".into() },
+            ],
+        };
+        assert!(reg.publish("alice", &spec, 100).unwrap(), "owner publishes");
+        assert_eq!(reg.get("flappy").unwrap(), Some(spec.clone()), "published spec round-trips");
+        assert_eq!(reg.get("nope").unwrap(), None, "unknown id → None");
+        assert_eq!(reg.list().unwrap(), vec![("flappy".to_string(), "alice".to_string())], "discoverable in the list");
+
+        // Owner-scoped: a different owner cannot overwrite the published spec.
+        let hijack = PipelineSpec { id: "flappy".into(), roles: vec![] };
+        assert!(!reg.publish("mallory", &hijack, 200).unwrap(), "non-owner cannot overwrite");
+        assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 2, "spec unchanged after hijack attempt");
+
+        // The owner re-publishing updates it.
+        let updated = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![RequiredRole { service: ServiceType::SafetyCheck, units: 1, tag: "guard".into() }],
+        };
+        assert!(reg.publish("alice", &updated, 300).unwrap(), "owner re-publish");
+        assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 1, "owner re-publish updates the spec");
+    }
 
     #[test]
     fn topology_authorized_channels_fold_edges_through_link_derivation() {
