@@ -63,6 +63,51 @@ services:
     volumes:
       - flappy_agent_state:/var/lib/ct-agent
 
+  flappy-crew-bridge:
+    # #173 distributed crew: the HTTP bridge the origin reverse-proxies `POST /crew/build` to.
+    # It runs the crew — safety_check, then physics + art — by dialing each role's agent over the
+    # REAL Agent-Fabric tunnel with `ct-agent channel` in CT_CHANNEL_CALL_SERVICE mode. Each role
+    # needs its OWN channel identity (a different peer), so a single set of global CT_CHANNEL_* can't
+    # serve all three — instead each CREW_*_CMD carries its role's identity via an `env …` prefix
+    # that reads per-role vars ($$… = a literal $ so the bridge's own `sh -c` expands them at call
+    # time, keeping the grants/keys in their own env vars rather than inlined into the command).
+    #
+    # TARGET-STATE wiring (maintainer/central 2026-07-25 "wire it regardless"): the demo only goes
+    # live once sink/source-2 actually serve `text_generation`/`safety_check` and central provisions
+    # the per-role grants below (still #173's #1 blocker). A NAT'd bridge may also need
+    # CT_CHANNEL_RELAY_ONLY=1 per role. Until then this service starts but every /crew/build 502s
+    # (the browser fails closed to its local stand-in) — the demo page still works, just locally.
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      args:
+        - CRATE=ct-agent
+    command: ["ct-crew-bridge"]
+    environment:
+      - CREW_BRIDGE_LISTEN=0.0.0.0:8788
+      # Shared edge rendezvous/relay for every role dial.
+      - CREW_EDGE_BROKER=${CREW_EDGE_BROKER:?edge rendezvous host:port, e.g. edge:4433}
+      - CREW_EDGE_RELAY=${CREW_EDGE_RELAY:?edge relay host:port}
+      # Per-role channel-join identities (operator-supplied from central's provisioning; SECRET hex).
+      - CREW_PHYSICS_GRANT=${CREW_PHYSICS_GRANT:?source-2 (physics) channel grant hex}
+      - CREW_PHYSICS_HOLDER_KEY=${CREW_PHYSICS_HOLDER_KEY:?physics holder key hex}
+      - CREW_PHYSICS_NOISE_KEY=${CREW_PHYSICS_NOISE_KEY:?physics noise key hex}
+      - CREW_ART_GRANT=${CREW_ART_GRANT:?sink (art) channel grant hex}
+      - CREW_ART_HOLDER_KEY=${CREW_ART_HOLDER_KEY:?art holder key hex}
+      - CREW_ART_NOISE_KEY=${CREW_ART_NOISE_KEY:?art noise key hex}
+      - CREW_SAFETY_GRANT=${CREW_SAFETY_GRANT:?safety agent channel grant hex}
+      - CREW_SAFETY_HOLDER_KEY=${CREW_SAFETY_HOLDER_KEY:?safety holder key hex}
+      - CREW_SAFETY_NOISE_KEY=${CREW_SAFETY_NOISE_KEY:?safety noise key hex}
+      # One dial per role, each scoped to its own identity (see the note above re $$ expansion).
+      - "CREW_PHYSICS_CMD=env CT_CHANNEL_ROLE=initiate CT_CHANNEL_CALL_SERVICE=text_generation CT_CHANNEL_BROKER=$$CREW_EDGE_BROKER CT_CHANNEL_RELAY=$$CREW_EDGE_RELAY CT_CHANNEL_LISTEN=0.0.0.0:0 CT_CHANNEL_GRANT=$$CREW_PHYSICS_GRANT CT_CHANNEL_HOLDER_KEY=$$CREW_PHYSICS_HOLDER_KEY CT_CHANNEL_NOISE_KEY=$$CREW_PHYSICS_NOISE_KEY ct-agent channel"
+      - "CREW_ART_CMD=env CT_CHANNEL_ROLE=initiate CT_CHANNEL_CALL_SERVICE=text_generation CT_CHANNEL_BROKER=$$CREW_EDGE_BROKER CT_CHANNEL_RELAY=$$CREW_EDGE_RELAY CT_CHANNEL_LISTEN=0.0.0.0:0 CT_CHANNEL_GRANT=$$CREW_ART_GRANT CT_CHANNEL_HOLDER_KEY=$$CREW_ART_HOLDER_KEY CT_CHANNEL_NOISE_KEY=$$CREW_ART_NOISE_KEY ct-agent channel"
+      - "CREW_SAFETY_CMD=env CT_CHANNEL_ROLE=initiate CT_CHANNEL_CALL_SERVICE=safety_check CT_CHANNEL_BROKER=$$CREW_EDGE_BROKER CT_CHANNEL_RELAY=$$CREW_EDGE_RELAY CT_CHANNEL_LISTEN=0.0.0.0:0 CT_CHANNEL_GRANT=$$CREW_SAFETY_GRANT CT_CHANNEL_HOLDER_KEY=$$CREW_SAFETY_HOLDER_KEY CT_CHANNEL_NOISE_KEY=$$CREW_SAFETY_NOISE_KEY ct-agent channel"
+    expose:
+      - "8788"   # reached only by the origin's reverse_proxy on the compose network
+    depends_on:
+      - flappy-origin
+    restart: unless-stopped
+
 volumes:
   flappy_caddy_data:
   flappy_agent_state:

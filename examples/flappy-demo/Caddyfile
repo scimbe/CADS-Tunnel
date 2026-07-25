@@ -11,6 +11,10 @@
 }
 
 flappy-demo.bunsenbrenner.org {
+	# #173 distributed crew: the studio page POSTs its prompt here; the crew bridge runs the
+	# safety→physics→art crew over the tunnel and returns {safety, auction, config}. A more
+	# specific matcher than the file_server below, so Caddy routes it first.
+	reverse_proxy /crew/build flappy-crew-bridge:8788
 	root * /srv
 	file_server
 	encode gzip
