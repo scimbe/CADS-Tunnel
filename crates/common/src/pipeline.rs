@@ -125,7 +125,10 @@ impl PipelineSpec {
     /// #167 opt-in catalog — a generic empty-services offer never fills a role), and (c) it
     /// advertises at least the units the role needs. Among qualifying offers the winner is the
     /// one with the **lowest floor** (`min_price`, cheapest for the buyer), ties broken by holder
-    /// key for determinism.
+    /// key for determinism. A provider wins **at most one** role per convene (#172 cross-role
+    /// exclusivity), so N roles sharing a `ServiceType` require N *distinct* online providers —
+    /// otherwise the surplus roles error, preserving the "not enough online → error" guarantee even
+    /// when the closed `ServiceType` set is coarser than the roles.
     pub fn convene(
         &self,
         offers: &[CapacityOffer],
@@ -135,6 +138,13 @@ impl PipelineSpec {
             return Err(PipelineError::Empty);
         }
         let mut assignments = Vec::with_capacity(self.roles.len());
+        // Cross-role EXCLUSIVITY within one convene (#172): a single provider wins **at most one**
+        // role per convene, even if it qualifies for several. Without this, two roles sharing a
+        // (coarse, closed) `ServiceType` — e.g. flappy's `physics` + `art` both declare
+        // `TextGeneration` — could both be won by one cheapest offer, silently "filling" a role
+        // whose distinct provider is actually offline and breaking the "not enough online → error"
+        // guarantee. With it, N same-typed roles genuinely need N distinct online providers.
+        let mut assigned: Vec<[u8; 32]> = Vec::with_capacity(self.roles.len());
         for role in &self.roles {
             let winner = offers
                 .iter()
@@ -142,6 +152,7 @@ impl PipelineSpec {
                     o.is_valid(now)
                         && o.services.contains(&role.service)
                         && o.units_available >= role.units
+                        && !assigned.contains(&o.holder_pubkey)
                 })
                 .min_by(|a, b| {
                     a.min_price
@@ -149,12 +160,15 @@ impl PipelineSpec {
                         .then_with(|| a.holder_pubkey.cmp(&b.holder_pubkey))
                 });
             match winner {
-                Some(o) => assignments.push(RoleAssignment {
-                    service: role.service,
-                    provider: o.holder_pubkey,
-                    units: role.units,
-                    price: o.min_price,
-                }),
+                Some(o) => {
+                    assigned.push(o.holder_pubkey);
+                    assignments.push(RoleAssignment {
+                        service: role.service,
+                        provider: o.holder_pubkey,
+                        units: role.units,
+                        price: o.min_price,
+                    });
+                }
                 None => return Err(PipelineError::UnfilledRole { service: role.service }),
             }
         }
@@ -234,6 +248,27 @@ mod tests {
             spec.convene(&[expired, codegen], 100),
             Err(PipelineError::UnfilledRole { service: SafetyCheck }),
             "an expired offer doesn't fill the role"
+        );
+
+        // #172: two roles sharing one (coarse) ServiceType need TWO distinct online providers —
+        // a single offer cannot double-book both. flappy's physics + art both declare TextGeneration.
+        let spec_same = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() },
+                RequiredRole { service: TextGeneration, units: 1, tag: "art".into() },
+            ],
+        };
+        let s2 = offer(7, vec![TextGeneration], 20, 50, 1000);
+        let sk = offer(8, vec![TextGeneration], 20, 40, 1000);
+        let both = spec_same.convene(&[s2.clone(), sk], 100).expect("two distinct providers fill both roles");
+        assert_ne!(both[0].provider, both[1].provider, "each same-typed role gets a DISTINCT provider (no double-book)");
+        // Only ONE provider online → the second same-typed role is unfillable → error, not a silent
+        // double-book (the exact #172 reproduction).
+        assert_eq!(
+            spec_same.convene(&[s2], 100),
+            Err(PipelineError::UnfilledRole { service: TextGeneration }),
+            "#172: one offer cannot fill two same-typed roles — the second role errors"
         );
 
         // An empty spec convenes nothing.
