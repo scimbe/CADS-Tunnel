@@ -63,6 +63,10 @@ pub struct ArtFragment {
     /// pipe equivalent of `bird_emoji`. `None`/absent → classic colored-rectangle pipes.
     #[serde(default, rename = "pipeEmoji")]
     pub pipe_emoji: Option<String>,
+    /// #178: an optional animated background effect by name (`matrix-rain`, `snow`, `stars`).
+    /// `None`/absent or unknown → the static gradient sky.
+    #[serde(default, rename = "bgEffect")]
+    pub bg_effect: Option<String>,
 }
 
 /// The demo's game config — serialized with exactly the field names the studio's `CONFIG` /
@@ -88,6 +92,10 @@ pub struct CrewConfig {
     /// unchanged. `None` → classic colored-rectangle pipes.
     #[serde(default, rename = "pipeEmoji", skip_serializing_if = "Option::is_none")]
     pub pipe_emoji: Option<String>,
+    /// #178: optional animated background effect by name; a pure background layer (no gameplay
+    /// impact). Serialized only when present; unknown/`None` → the static gradient sky.
+    #[serde(default, rename = "bgEffect", skip_serializing_if = "Option::is_none")]
+    pub bg_effect: Option<String>,
 }
 
 impl CrewConfig {
@@ -105,6 +113,7 @@ impl CrewConfig {
             title: art.title.clone(),
             palette: art.palette.clone(),
             pipe_emoji: art.pipe_emoji.clone(),
+            bg_effect: art.bg_effect.clone(),
         }
     }
 
@@ -194,12 +203,12 @@ mod tests {
                 gravity: 2200, jump: 420, gap: 115, speed: 220,
                 theme: "night".into(), bird_color: "#00ff41".into(),
                 bird_emoji: "🕶️".into(), title: "Neo: Matrix Flap".into(),
-                palette: None, pipe_emoji: None,
+                palette: None, pipe_emoji: None, bg_effect: None,
             },
             "flapPower→jump, pipeGap→gap, pipeSpeed→speed; art carried verbatim (emoji intact)"
         );
-        // #176/#177 backward-compat: an art fragment with no palette / no pipeEmoji → None.
-        assert!(cfg.palette.is_none() && cfg.pipe_emoji.is_none());
+        // #176/#177/#178 backward-compat: absent palette / pipeEmoji / bgEffect → None.
+        assert!(cfg.palette.is_none() && cfg.pipe_emoji.is_none() && cfg.bg_effect.is_none());
 
         // The config serializes with the camelCase names the browser's applyLiveConfig reads.
         let cfg_json = serde_json::to_string(&cfg).unwrap();
@@ -216,6 +225,12 @@ mod tests {
         let cfg_pipe = CrewConfig::from_fragment_json(physics, art_pipe).expect("fragment with pipeEmoji parses");
         assert_eq!(cfg_pipe.pipe_emoji.as_deref(), Some("🌲"), "pipeEmoji carried through");
         assert!(serde_json::to_string(&cfg_pipe).unwrap().contains("\"pipeEmoji\":\"🌲\""), "pipeEmoji serializes camelCase");
+
+        // #178: a bgEffect carries through + serializes camelCase (a pure background layer).
+        let art_bg = r##"{"theme":"night","birdColor":"#00ff41","birdEmoji":"","title":"Matrix","bgEffect":"matrix-rain"}"##;
+        let cfg_bg = CrewConfig::from_fragment_json(physics, art_bg).expect("fragment with bgEffect parses");
+        assert_eq!(cfg_bg.bg_effect.as_deref(), Some("matrix-rain"), "bgEffect carried through");
+        assert!(serde_json::to_string(&cfg_bg).unwrap().contains("\"bgEffect\":\"matrix-rain\""), "bgEffect serializes camelCase");
 
         // #176: an art fragment WITH a custom palette carries it through to the config + wire (the
         // studio then applies the invented sky/pipe/ground colours directly, not one of 5 presets).

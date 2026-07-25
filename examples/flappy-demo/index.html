@@ -404,6 +404,45 @@ function runFlappy(canvas, CONFIG) {
     g.addColorStop(0, TH.skyTop); g.addColorStop(1, TH.skyBottom);
     ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
   }
+  // #178: optional ANIMATED background layer, drawn behind the game each frame. A pure visual layer —
+  // zero gameplay/collision impact. Kept cheap for mobile: bounded element counts + integer steps;
+  // rAF already pauses on tab-blur. Unknown / absent → static gradient sky only. Composes with the
+  // palette (glyphs/particles tinted TH.accent). Same if/else fallback shape as pipe()/drawBird().
+  const BG = String(C.bgEffect || "").toLowerCase();
+  const GLYPHS = "01<>[]{}$#*+=ﾊﾐﾋ";
+  let bgState = null;
+  if (BG === "matrix-rain") {
+    const cols = 16, colW = W / cols, y = [], sp = [];
+    for (let i = 0; i < cols; i++) { y[i] = Math.random() * H; sp[i] = 120 + Math.random() * 180; }
+    bgState = { cols, colW, y, sp };
+  } else if (BG === "snow" || BG === "stars") {
+    const n = BG === "stars" ? 42 : 64, x = [], y = [], sp = [], r = [];
+    for (let i = 0; i < n; i++) { x[i] = Math.random() * W; y[i] = Math.random() * H;
+      sp[i] = BG === "snow" ? 20 + Math.random() * 40 : 6 + Math.random() * 14;
+      r[i] = BG === "stars" ? (Math.random() < 0.5 ? 1 : 2) : 1 + Math.random() * 2; }
+    bgState = { n, x, y, sp, r };
+  }
+  function bgFx(dt) {
+    if (!bgState) return;
+    if (BG === "matrix-rain") {
+      ctx.font = bgState.colW + "px monospace"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+      for (let i = 0; i < bgState.cols; i++) {
+        bgState.y[i] += bgState.sp[i] * dt;
+        if (bgState.y[i] > H + bgState.colW) { bgState.y[i] = -bgState.colW; bgState.sp[i] = 120 + Math.random() * 180; }
+        const cx = i * bgState.colW + bgState.colW / 2;
+        const g = GLYPHS[(i * 7 + ((bgState.y[i] / bgState.colW) | 0)) % GLYPHS.length];
+        ctx.fillStyle = TH.accent; ctx.fillText(g, cx, bgState.y[i] - bgState.colW);   // trailing
+        ctx.fillStyle = "rgba(255,255,255,.55)"; ctx.fillText(g, cx, bgState.y[i]);     // bright head
+      }
+    } else {
+      for (let i = 0; i < bgState.n; i++) {
+        if (BG === "snow") { bgState.y[i] += bgState.sp[i] * dt; bgState.x[i] += Math.sin((bgState.y[i] + i) * 0.05) * 0.4;
+          if (bgState.y[i] > H) { bgState.y[i] = -2; bgState.x[i] = Math.random() * W; } ctx.fillStyle = "rgba(255,255,255,.85)"; }
+        else { bgState.x[i] -= bgState.sp[i] * dt; if (bgState.x[i] < 0) { bgState.x[i] = W; bgState.y[i] = Math.random() * H; } ctx.fillStyle = TH.accent; }
+        ctx.fillRect(bgState.x[i] | 0, bgState.y[i] | 0, bgState.r[i], bgState.r[i]);
+      }
+    }
+  }
   function pipe(p) {
     const botY = p.top + C.gap, botH = H - GROUND_H - botY;
     if (C.pipeEmoji) {
@@ -442,8 +481,8 @@ function runFlappy(canvas, CONFIG) {
     ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
     ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0,0,0,.45)"; ctx.strokeText(s, W / 2, y); ctx.fillText(s, W / 2, y);
   }
-  function draw() {
-    sky(); for (const p of pipes) pipe(p); ground(); drawBird();
+  function draw(dt) {
+    sky(); bgFx(dt || 0); for (const p of pipes) pipe(p); ground(); drawBird();
     text(String(score), 60, 40);
     if (state === "ready") { text(C.title || "Flappy", H * 0.3, 24, TH.accent);
       text("tap / space to start", H * 0.3 + 30, 14, "#fff"); }
@@ -456,7 +495,7 @@ function runFlappy(canvas, CONFIG) {
   }
   function loop(ts) {
     if (!t0) t0 = ts; let dt = (ts - t0) / 1000; t0 = ts; if (dt > 0.05) dt = 0.05;
-    step(dt); draw(); raf = requestAnimationFrame(loop);
+    step(dt); draw(dt); raf = requestAnimationFrame(loop);
   }
   function onInput(e) { e.preventDefault(); flap(); }
   canvas.addEventListener("mousedown", onInput);
@@ -494,6 +533,7 @@ const EMOJIS = ["●","🐤","🐥","🦜","🐦","🦆","🚀","🐟","🐝","�
 const $ = (id) => document.getElementById(id);
 let selEmoji = "";  // "" → classic circle bird (tint applies); set to an emoji to use that instead
 let pipeEmoji = "";  // #177: "" → classic colored-rectangle pipes; an emoji → tiled obstacle shape
+let bgEffect = "";   // #178: "" → static gradient sky; "matrix-rain"/"snow"/"stars" → animated layer
 let dispose = null;
 
 // ---- password gate (first layer) ----
@@ -557,6 +597,7 @@ function readConfig() {
     title: $("title").value.trim() || "Flappy Bird",
     emoji: selEmoji,
     pipeEmoji: pipeEmoji,
+    bgEffect: bgEffect,
     birdColor: $("birdColor").value,
     birdSize: 15,
     themeName: $("theme").value,
@@ -787,6 +828,7 @@ function applyLiveConfig(c) {
   if (c.birdColor) $("birdColor").value = c.birdColor;
   if (typeof c.birdEmoji === "string") setBirdEmoji(c.birdEmoji);
   if (typeof c.pipeEmoji === "string") pipeEmoji = c.pipeEmoji;  // #177: crew-chosen obstacle shape
+  if (typeof c.bgEffect === "string") bgEffect = c.bgEffect;     // #178: crew-chosen animated bg
   num("gravity", c.gravity); num("jump", c.jump); num("gap", c.gap); num("speed", c.speed);
   if (c.gravity != null || c.speed != null) $("preset").value = "custom";
   syncLabels();
@@ -889,7 +931,7 @@ const ENGINE_SRC = runFlappy.toString();  // reuse the exact preview engine
 function buildProductHtml(cfg) {
   const safeTitle = (cfg.title || "Flappy Bird").replace(/[<>&]/g, "");
   const config = {
-    title: cfg.title, emoji: cfg.emoji, pipeEmoji: cfg.pipeEmoji, birdColor: cfg.birdColor, birdSize: cfg.birdSize,
+    title: cfg.title, emoji: cfg.emoji, pipeEmoji: cfg.pipeEmoji, bgEffect: cfg.bgEffect, birdColor: cfg.birdColor, birdSize: cfg.birdSize,
     theme: cfg.theme, gravity: cfg.gravity, jump: cfg.jump, gap: cfg.gap, speed: cfg.speed,
   };
   return `<!doctype html>
