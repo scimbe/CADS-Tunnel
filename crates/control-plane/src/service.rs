@@ -27,7 +27,7 @@ use crate::storage::{
     AgentDirectoryEntry, AgentDirectoryError, BootstrapError, IssueBatchError, LedgerOpError,
     PaymentOpError, RedeemError, SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore,
     SqliteEnrollment,
-    SqliteLedger, SqliteNetworkStore, SqliteRegistry, SqliteTopologyStore,
+    SqliteLedger, SqliteNetworkStore, SqlitePipelineRegistry, SqliteRegistry, SqliteTopologyStore,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -959,6 +959,99 @@ async fn agent_search(
         .search(q.role.as_deref(), q.skill.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(entries))
+}
+
+/// State for the workflow-pipeline registry (#174 B): the store + the machine-writer admin token.
+#[derive(Clone)]
+struct PipelineRegistryState {
+    registry: Arc<SqlitePipelineRegistry>,
+    admin_token: Option<[u8; 32]>,
+}
+
+/// #174 B: the **workflow-pipeline registry** REST — where a designer publishes a `PipelineSpec`
+/// so scanning agents can discover workflows to join (the pipeline analogue of `/registry/agents`).
+///
+/// * `POST /registry/pipelines` `{owner?, spec}` — publish (upsert) a spec. **Machine-writer
+///   admin-token-gated** (same `CT_CP_EDGE_ADMIN_TOKEN` as `/registry/agents`, #161): a pipeline
+///   designer is an operator-class actor, not a human OIDC subject. Owner-scoped in the store —
+///   a `409` if the id is owned by someone else. `None` admin token → open (dev/back-compat).
+/// * `GET /registry/pipelines` — **public** list of `[{id, owner}]` (discovery).
+/// * `GET /registry/pipelines/:id` — **public** fetch of the full published `PipelineSpec`.
+pub fn pipeline_registry_router(
+    registry: Arc<SqlitePipelineRegistry>,
+    admin_token: Option<[u8; 32]>,
+) -> Router {
+    Router::new()
+        .route("/registry/pipelines", post(pipeline_publish).get(pipeline_list))
+        .route("/registry/pipelines/:id", get(pipeline_get))
+        .with_state(PipelineRegistryState { registry, admin_token })
+}
+
+fn default_pipeline_owner() -> String {
+    "operator".to_string()
+}
+
+#[derive(Deserialize)]
+struct PublishPipelineReq {
+    #[serde(default = "default_pipeline_owner")]
+    owner: String,
+    spec: ct_common::pipeline::PipelineSpec,
+}
+
+#[derive(Serialize)]
+struct PipelineListEntry {
+    id: String,
+    owner: String,
+}
+
+async fn pipeline_publish(
+    State(state): State<PipelineRegistryState>,
+    headers: HeaderMap,
+    Json(req): Json<PublishPipelineReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // #174 B / #161 SEC87b-auth: machine-writer gate — publishing a workflow spec is an
+    // operator-class write, gated by the shared admin token (not a human OIDC bearer).
+    if let Some(exp) = &state.admin_token {
+        let ok = headers
+            .get("x-ct-admin-token")
+            .and_then(|v| v.to_str().ok())
+            .and_then(hex_decode_32)
+            .map(|t| ct_token_eq(&t, exp))
+            .unwrap_or(false);
+        if !ok {
+            return Err((StatusCode::UNAUTHORIZED, "publishing a pipeline requires the admin token".to_string()));
+        }
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let published = state
+        .registry
+        .publish(&req.owner, &req.spec, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if published {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::CONFLICT, "a pipeline with this id is owned by another owner".to_string()))
+    }
+}
+
+async fn pipeline_list(
+    State(state): State<PipelineRegistryState>,
+) -> Result<Json<Vec<PipelineListEntry>>, (StatusCode, String)> {
+    let rows = state
+        .registry
+        .list()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(rows.into_iter().map(|(id, owner)| PipelineListEntry { id, owner }).collect()))
+}
+
+async fn pipeline_get(
+    State(state): State<PipelineRegistryState>,
+    Path(id): Path<String>,
+) -> Result<Json<ct_common::pipeline::PipelineSpec>, (StatusCode, String)> {
+    match state.registry.get(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))? {
+        Some(spec) => Ok(Json(spec)),
+        None => Err((StatusCode::NOT_FOUND, "no such pipeline".to_string())),
+    }
 }
 
 /// A random opaque id (16 bytes, hex) for a topology id / net_uuid.
@@ -2336,6 +2429,12 @@ pub fn persistent_control_plane_router(
         // self-enroll M2M and any peer searches — neither has a browser-interactive login path.
         .merge(agent_directory_router(
             Arc::new(SqliteAgentDirectory::open(db_path)?),
+            admin_token,
+        ))
+        // #174 B: the workflow-pipeline registry — POST publish (admin-gated) + public GET
+        // discovery, so a designer can publish a PipelineSpec agents scan to find workflows to join.
+        .merge(pipeline_registry_router(
+            Arc::new(SqlitePipelineRegistry::open(db_path)?),
             admin_token,
         ))
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
@@ -4083,6 +4182,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(injected.status(), StatusCode::BAD_REQUEST, "newline-injected facet token rejected");
+    }
+
+    #[tokio::test]
+    async fn pipeline_registry_rest_publishes_admin_gated_and_discovers_publicly() {
+        // #174 B (frozen): POST /registry/pipelines is machine-writer admin-gated (like #161's
+        // agent directory); GET list + GET :id are public discovery; unknown id → 404.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let admin = [0x6au8; 32];
+        let reg = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+        let app = pipeline_registry_router(reg, Some(admin));
+        let body = r#"{"owner":"alice","spec":{"id":"flappy","roles":[{"service":"TextGeneration","units":1,"tag":"physics"}]}}"#;
+        let publish = |tok: Option<String>| {
+            let mut req = Request::post("/registry/pipelines").header("content-type", "application/json");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        assert_eq!(publish(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no admin token → 401");
+        assert_eq!(
+            publish(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong admin token → 401"
+        );
+        assert_eq!(publish(Some(hex_encode(&admin))).await.unwrap().status(), StatusCode::OK, "admin token publishes");
+
+        // Public list shows the published id.
+        let list = app.clone().oneshot(Request::get("/registry/pipelines").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK, "list is public");
+        let lb = to_bytes(list.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&lb).contains("\"flappy\""), "the published pipeline is discoverable");
+
+        // Public fetch by id returns the full spec.
+        let get = app.clone().oneshot(Request::get("/registry/pipelines/flappy").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(get.status(), StatusCode::OK, "get is public");
+        let gb = to_bytes(get.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&gb).contains("\"physics\""), "the full spec is fetchable: {}", String::from_utf8_lossy(&gb));
+
+        // Unknown id → 404.
+        let miss = app.oneshot(Request::get("/registry/pipelines/nope").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(miss.status(), StatusCode::NOT_FOUND, "unknown pipeline → 404");
     }
 
     #[tokio::test]
