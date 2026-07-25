@@ -24,7 +24,6 @@ use serde_json::Value;
 /// Run one role command with `input` on stdin, returning trimmed stdout. Blocking (run via
 /// `spawn_blocking`); a non-zero exit or spawn failure is an `Err` (the caller fails closed).
 fn run_cmd(cmd: &str, input: &str) -> Result<String, String> {
-    use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("sh")
         .arg("-c")
@@ -34,12 +33,19 @@ fn run_cmd(cmd: &str, input: &str) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn role command failed: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("no stdin handle")?
-        .write_all(input.as_bytes())
-        .map_err(|e| format!("writing prompt to role command failed: {e}"))?;
+    // Write the prompt on its OWN thread so it proceeds concurrently with the wait/read below.
+    // Best-effort: a role command that exits before draining stdin (a fast reply, or a channel
+    // call that answers without reading all input) makes this write fail with a broken pipe —
+    // deliberately IGNORED, since the command's own exit status + stdout is the verdict, not
+    // whether every stdin byte landed. Writing before wait_with_output() (as the first cut did)
+    // races that early exit and 502s intermittently. Same fix already proven for
+    // run_service_handler_with_timeout in channel_run.rs.
+    let mut stdin = child.stdin.take().ok_or("no stdin handle")?;
+    let input_owned = input.to_string();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(input_owned.as_bytes());
+    });
     let out = child.wait_with_output().map_err(|e| format!("role command wait failed: {e}"))?;
     if !out.status.success() {
         return Err(format!("role command exited {:?}", out.status.code()));
