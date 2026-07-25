@@ -750,6 +750,16 @@ $("buildBtn").addEventListener("click", async () => {
   if (p.length < 3) { msg.className = "pmsg reject"; msg.textContent = "Say a bit more about the game you want."; return; }
   $("buildBtn").disabled = true;
   msg.className = "pmsg"; msg.textContent = "";
+  // IMMEDIATE feedback the instant the button is clicked: show the crew screen reaching over the
+  // tunnel BEFORE we contact the bridge. Without this the button just greyed and sat silently while
+  // `liveBuild` was in flight (a few seconds live, or a slow 502 when the bridge is down) — which
+  // reads as "nothing happens". runBuild() re-inits this same overlay when a build actually starts.
+  $("auctionFeed").innerHTML = "";
+  $("buildBar").style.width = "0%";
+  $("buildStep").textContent = "🛰 Reaching the agent crew over the tunnel…";
+  document.querySelectorAll(".crew .member").forEach((m) => m.classList.remove("active", "done"));
+  $("build").style.display = "flex";
+  const hideBuild = () => { $("build").style.display = "none"; };
   try {
     // 1) LIVE path — the real crew over the tunnel (#169/#171). The authoritative safety_check
     //    runs server-side; a rejection here is the live LLM guard, not the regex.
@@ -757,6 +767,7 @@ $("buildBtn").addEventListener("click", async () => {
     try { data = await liveBuild(p); } catch (e) { data = null; }
     if (data && (data.safety || data.config || data.auction)) {
       if (data.safety && data.safety.ok === false) {
+        hideBuild();
         msg.className = "pmsg reject";
         msg.textContent = "⛔ Rejected by the live safety agent — " + (data.safety.reason || "not a valid game request") + " Your current game is kept.";
         return;
@@ -771,9 +782,10 @@ $("buildBtn").addEventListener("click", async () => {
     // 2) FALLBACK — the crew bridge is unreachable; use the local stand-in (its own regex guard
     //    still applies, and #170's honest no-op for out-of-vocabulary prompts).
     const g = guardPrompt(p);
-    if (!g.ok) { msg.className = "pmsg reject"; msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept."; return; }
+    if (!g.ok) { hideBuild(); msg.className = "pmsg reject"; msg.textContent = "⛔ Rejected — " + g.reason + " Your current game is kept."; return; }
     const changes = interpretPrompt(p);
     if (changes.length === 0) {
+      hideBuild();
       msg.className = "pmsg reject";
       msg.textContent = "⚠ The live crew is unreachable and the offline stand-in only maps common game words " +
         "(bird, theme, colour, difficulty, speed) — it couldn't place that, so nothing changed. Try those, or retry when the crew is up.";
