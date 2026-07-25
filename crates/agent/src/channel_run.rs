@@ -1432,15 +1432,25 @@ where
         let reason = verdict.get("reason").and_then(|r| r.as_str()).unwrap_or("rejected by the safety agent");
         return Ok(ct_common::crew::CrewBuildResponse::rejected(reason.to_string()));
     }
-    // 2. physics + art fragments.
-    let (mut pr, mut pw) = tokio::io::split(physics_conn);
-    let physics_json = call_role_service(&mut pw, &mut pr, "text_generation", prompt)
-        .await
-        .map_err(|e| format!("physics role unreachable: {e}"))?;
-    let (mut ar, mut aw) = tokio::io::split(art_conn);
-    let art_json = call_role_service(&mut aw, &mut ar, "text_generation", prompt)
-        .await
-        .map_err(|e| format!("art role unreachable: {e}"))?;
+    // 2. physics + art fragments — run CONCURRENTLY. They are independent (each only depends on
+    //    safety_check having passed) and use separate channels, so their wall-clock is max(physics,
+    //    art), not the sum. Measured (#173): each role's real `claude -p` is ~14s and the tunnel
+    //    overhead is negligible, so sequential was safety+physics+art ≈ 40–55s; joining the two
+    //    independent roles cuts it to ≈ safety + max(physics, art) ≈ ~28s.
+    let physics = async {
+        let (mut pr, mut pw) = tokio::io::split(physics_conn);
+        call_role_service(&mut pw, &mut pr, "text_generation", prompt)
+            .await
+            .map_err(|e| format!("physics role unreachable: {e}"))
+    };
+    let art = async {
+        let (mut ar, mut aw) = tokio::io::split(art_conn);
+        call_role_service(&mut aw, &mut ar, "text_generation", prompt)
+            .await
+            .map_err(|e| format!("art role unreachable: {e}"))
+    };
+    let (physics_json, art_json) = tokio::join!(physics, art);
+    let (physics_json, art_json) = (physics_json?, art_json?);
     // 3. assemble the real config from the fragments (fail-closed on a malformed fragment).
     let cfg = ct_common::crew::CrewConfig::from_fragment_json(&physics_json, &art_json)
         .map_err(|e| format!("crew fragments malformed: {e}"))?;

@@ -721,7 +721,10 @@ fetch("crew.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null))
   .then((j) => { if (j && j.url) CREW_URL = j.url; }).catch(() => {});
 async function liveBuild(prompt) {
   const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), 25000);
+  // The real crew is 3 sequential-ish LLM calls: safety (~14s) + max(physics, art) (~14s, now run
+  // concurrently server-side, #173) ≈ ~28–30s. The abort must sit comfortably above that or a
+  // working live build gets cancelled and silently falls back to the offline stand-in.
+  const to = setTimeout(() => ctrl.abort(), 45000);
   try {
     const res = await fetch(CREW_URL, {
       method: "POST", headers: { "content-type": "application/json" },
