@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod a2a;
 pub mod channel;
 pub mod credential;
+pub mod crew;
 pub mod mcp;
 pub mod metrics;
 pub mod noise;
