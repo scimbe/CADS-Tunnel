@@ -1460,6 +1460,38 @@ fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStr
     session_side
 }
 
+/// Invoke the peer's `service/<slug>` tool with `input` over the channel's `local` duplex and return
+/// the **bare** service output (`result.output`) — reusing the tested [`call_role_service`]. Unlike
+/// [`call_local`]'s raw-method mode (which prints the whole JSON-RPC envelope for a caller-supplied
+/// method + static params), this is the crew-native contract: one `service/<slug>` call, plain
+/// output. Split out so it can be frozen-tested against an in-process serve peer.
+async fn run_service_call<S>(local: S, slug: &str, input: &str) -> std::io::Result<String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut recv, mut send) = tokio::io::split(local);
+    call_role_service(&mut send, &mut recv, slug, input).await
+}
+
+/// The initiator-side one-shot **service** call (#173 distributed crew topology): dial done by the
+/// channel session, this drives the local side — call the peer's `service/<slug>` with `input`, print
+/// the bare service output, then EOF the session so the process exits. This is exactly the
+/// stdin→stdout contract the crew bridge's `CREW_*_CMD` expects, so `CREW_PHYSICS_CMD="ct-agent
+/// channel"` (with `CT_CHANNEL_CALL_SERVICE=text_generation` + the source-2 channel-join env) dials
+/// source-2 over the real Agent-Fabric tunnel and yields its fragment JSON — no jq/wrapper needed.
+fn call_service_local(slug: String, input: String) -> tokio::io::DuplexStream {
+    let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        match run_service_call(serve_side, &slug, &input).await {
+            Ok(output) => println!("{output}"),
+            // Fail closed: no output on stdout → the crew bridge's run_cmd sees empty/!success and 502s.
+            Err(e) => eprintln!("ct-agent channel --call-service {slug}: {e}"),
+        }
+        // Dropping serve_side (moved into run_service_call) EOFs the session → the session ends.
+    });
+    session_side
+}
+
 /// Parse a `CT_AGENT_SERVICES` entry (the same slugs `ct_common::mcp`'s `service/<slug>` tool
 /// names use) into a [`ct_common::channel::ServiceType`]. Unknown entries are silently dropped by
 /// the caller's `filter_map` — a typo just means one fewer tool exposed, not a hard error, matching
@@ -1581,6 +1613,19 @@ fn run_service_handler(
 /// persistent MCP **service** (JSON-RPC `tools/list`/`tools/call` via the tool registry). Neither → the
 /// historical stdin/stdout pipe.
 fn channel_local() -> ChannelLocal {
+    // #173 distributed crew: one-shot `service/<slug>` client. Reads the prompt on stdin, calls the
+    // peer's service, prints the BARE output — the crew-bridge `CREW_*_CMD` contract. Checked before
+    // the raw CT_CHANNEL_CALL below because it's the service-specific (and jq-free) path.
+    if let Ok(slug) = std::env::var("CT_CHANNEL_CALL_SERVICE") {
+        let slug = slug.trim().to_string();
+        let mut input = String::new();
+        {
+            use std::io::Read;
+            let _ = std::io::stdin().read_to_string(&mut input);
+        }
+        eprintln!("ct-agent channel: --call-service {slug} (one service call over the channel, then exit)");
+        return ChannelLocal::Serve(call_service_local(slug, input.trim().to_string()));
+    }
     // #135 L2.3 client: one MCP request/response over the channel, then exit.
     if let Ok(method) = std::env::var("CT_CHANNEL_CALL") {
         let method = method.trim().to_string();
@@ -3201,6 +3246,36 @@ mod tests {
         assert!(
             call_role_service(&mut w2, &mut r2, "safety_check", "x").await.is_err(),
             "an unoffered service fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_call_service_mode_yields_bare_service_output() {
+        // #173 distributed (frozen): the initiator CT_CHANNEL_CALL_SERVICE mode's core — invoke the
+        // peer's service/<slug> and return the BARE output (result.output), NOT a JSON-RPC envelope
+        // (the crew bridge's CREW_*_CMD feeds this straight to ct_common::crew). Against an in-process
+        // serve peer. An unoffered service fails closed (→ the bridge 502s → browser local fallback).
+        use ct_common::channel::ServiceType;
+        let mut reg = ct_common::mcp::default_registry();
+        ct_common::mcp::register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_svc, input| {
+            Ok(format!("{{\"gravity\":2200,\"note\":\"{input}\"}}"))
+        });
+        let reg = std::sync::Arc::new(reg);
+        let peer = serve_local(move |req: Vec<u8>| {
+            let reg = reg.clone();
+            async move { reg.dispatch(&req) }
+        });
+        let out = run_service_call(peer, "text_generation", "hard matrix").await.unwrap();
+        assert_eq!(out, "{\"gravity\":2200,\"note\":\"hard matrix\"}", "bare service output, no JSON-RPC envelope");
+
+        let bare = std::sync::Arc::new(ct_common::mcp::default_registry());
+        let peer2 = serve_local(move |req: Vec<u8>| {
+            let bare = bare.clone();
+            async move { bare.dispatch(&req) }
+        });
+        assert!(
+            run_service_call(peer2, "safety_check", "x").await.is_err(),
+            "an unoffered service fails closed",
         );
     }
 
