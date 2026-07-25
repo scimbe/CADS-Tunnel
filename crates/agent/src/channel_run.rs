@@ -1363,6 +1363,37 @@ where
     ct_common::noise::read_frame(recv).await
 }
 
+/// Crew-bridge c2 atom (#171/#173): call a peer's `service/<slug>` tool over an already-established
+/// channel duplex and return the service's `output` string. Frames the fixed
+/// `service/<slug>({input}) -> {output}` shape (#149-A.1), reads the reply, and extracts
+/// `result.output`. **Fails closed:** a transport error, a JSON-RPC `error` (the service
+/// rejected/failed), or a reply missing `result.output` all return `Err` — never a bogus fragment.
+/// The crew bridge calls this once per role (safety_check, physics, art) over each dialed channel
+/// and feeds the returned JSON into [`ct_common::crew`].
+pub async fn call_role_service<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    slug: &str,
+    input: &str,
+) -> io::Result<String>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let params = serde_json::json!({ "name": format!("service/{slug}"), "arguments": { "input": input } });
+    let body = mcp_call_over(send, recv, "tools/call", params).await?;
+    let v: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if let Some(err) = v.get("error") {
+        return Err(io::Error::new(io::ErrorKind::Other, format!("service/{slug} returned an error: {err}")));
+    }
+    v.get("result")
+        .and_then(|r| r.get("output"))
+        .and_then(|o| o.as_str())
+        .map(String::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("service/{slug} reply missing result.output")))
+}
+
 fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStream {
     let (session_side, serve_side) = tokio::io::duplex(1 << 16);
     tokio::spawn(async move {
@@ -3084,6 +3115,40 @@ mod tests {
         // A non-zero exit surfaces as a tool error, not a panic or a silently-empty result.
         let err = run_service_handler("exit 7", TextGeneration, "x").unwrap_err();
         assert!(err.contains("exited"), "the exit status is reported: {err}");
+    }
+
+    #[tokio::test]
+    async fn call_role_service_calls_a_service_tool_over_a_duplex_and_fails_closed() {
+        // #171/#173 c2 atom (frozen): the crew bridge dials a role agent's channel and calls its
+        // service/<slug> tool, getting the fragment — exercised here against an IN-PROCESS serve
+        // peer (a local fake, exactly the parallel dev-testing #173 asks for). A missing service
+        // fails closed.
+        use ct_common::channel::ServiceType;
+        // A stub service that echoes a fragment-shaped output (stands in for a live LLM handler).
+        let mut reg = ct_common::mcp::default_registry();
+        ct_common::mcp::register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_svc, input| {
+            Ok(format!("{{\"echoed\":\"{input}\"}}"))
+        });
+        let reg = std::sync::Arc::new(reg);
+        let session = serve_local(move |req: Vec<u8>| {
+            let reg = reg.clone();
+            async move { reg.dispatch(&req) }
+        });
+        let (mut recv, mut send) = tokio::io::split(session);
+        let out = call_role_service(&mut send, &mut recv, "text_generation", "a matrix theme").await.unwrap();
+        assert_eq!(out, "{\"echoed\":\"a matrix theme\"}", "returns the service's output verbatim");
+
+        // Calling a service the peer does NOT offer → JSON-RPC error → Err (fail closed, no fragment).
+        let bare = std::sync::Arc::new(ct_common::mcp::default_registry());
+        let s2 = serve_local(move |req: Vec<u8>| {
+            let bare = bare.clone();
+            async move { bare.dispatch(&req) }
+        });
+        let (mut r2, mut w2) = tokio::io::split(s2);
+        assert!(
+            call_role_service(&mut w2, &mut r2, "safety_check", "x").await.is_err(),
+            "an unoffered service fails closed"
+        );
     }
 
     #[test]
