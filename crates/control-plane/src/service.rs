@@ -2235,7 +2235,10 @@ const LANDING_HTML: &str = r#"<!doctype html>
 </style></head><body>
 <div class="top">
  <h1>claude-tunnel — operator status</h1>
- <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
+ <div style="display:flex;gap:.6rem;flex-wrap:wrap">
+  <a class="btn" href="/llms.txt">&#129302; For AI agents &mdash; onboarding &rarr;</a>
+  <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
+ </div>
 </div>
 <div id="health" class="l">loading…</div>
 <div class="grid">
@@ -2261,13 +2264,26 @@ const LANDING_HTML: &str = r#"<!doctype html>
  refresh(); setInterval(refresh,5000);
 </script></body></html>"#;
 
-/// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`].
+/// The AI-agent onboarding doc (`docs/agent-onboarding.md`, #174), embedded so the control plane can
+/// serve it live at `/llms.txt` — the machine-readable entry point the operator status page links to
+/// so agents can discover how to register, join a pipeline, and publish one (the "linked,
+/// discoverable entry point" #174 asked for). Kept in sync at compile time via `include_str!`.
+const LLMS_TXT: &str = include_str!("../../../docs/agent-onboarding.md");
+
+/// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`]; `GET /llms.txt` serves the
+/// AI-agent onboarding doc (#174) as plain text so a CLI agent can `curl` it and a browser renders it.
 pub fn landing_router() -> Router {
-    Router::new().route("/", get(landing_handler))
+    Router::new()
+        .route("/", get(landing_handler))
+        .route("/llms.txt", get(llms_txt_handler))
 }
 
 async fn landing_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(LANDING_HTML)
+}
+
+async fn llms_txt_handler() -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], LLMS_TXT)
 }
 
 /// Build the CA-publish router (#11 C1): `GET /pki/ca` serves the edge CA root
@@ -4816,6 +4832,19 @@ mod tests {
         assert!(
             !html.contains("http://") && !html.contains("https://") && !html.contains("//cdn"),
             "no external assets (CSP-safe)"
+        );
+        // #174: the operator status page links AI agents to the onboarding entry point, and that
+        // entry point is served live at /llms.txt (the doc as plain text a CLI agent can curl).
+        assert!(html.contains(r#"href="/llms.txt""#), "links AI agents to the onboarding doc (#174)");
+        let app2 = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let ct2 = resp2.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        assert!(ct2.starts_with("text/plain"), "llms.txt is plain text, got {ct2}");
+        let doc = String::from_utf8_lossy(&to_bytes(resp2.into_body(), usize::MAX).await.unwrap()).to_string();
+        assert!(
+            doc.contains("AI-agent onboarding") && doc.contains("Register yourself as a discoverable agent"),
+            "/llms.txt serves the onboarding doc"
         );
     }
 
