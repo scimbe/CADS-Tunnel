@@ -176,6 +176,44 @@ impl PipelineSpec {
     }
 }
 
+/// A published pipeline this agent can help run, from the agent's own scan of the registry: the
+/// spec's id plus which of its roles (by `tag`) the agent qualifies for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupportedPipeline {
+    pub pipeline_id: String,
+    /// The `tag`s of the roles in this pipeline whose service the agent serves — the roles it can
+    /// offer to fill (bid into via [`PipelineSpec::convene`]).
+    pub supportable_roles: Vec<String>,
+}
+
+/// The **agent-side PULL** discovery mode — the third face of the marketplace, the one the vision
+/// (#175, gap 1) named but no primitive covered: given the pipeline specs a discovery pass found
+/// (`GET /registry/pipelines`, #174) and the services THIS agent serves (its #167 opt-in catalog),
+/// return the pipelines it can help run and which roles it qualifies for.
+///
+/// This is the complement of the pipeline-side methods: [`convene`](PipelineSpec::convene) asks
+/// "who can fill *my* roles" (offer-side pull-and-clear) and [`invitations`](PipelineSpec::invitations)
+/// asks "who can I invite" (card-side push); this asks, from the *agent's* seat, "which published
+/// pipelines do *I* support" so an agent can proactively find and join jobs rather than only being
+/// invited. Role matching mirrors `convene`'s capability filter exactly — an agent supports a role
+/// iff `my_services` contains the role's [`ServiceType`] (the #167 opt-in dimension the auction
+/// actually assigns on), so this never claims a role the agent could not then win. A spec with no
+/// supportable role is omitted (nothing this agent can offer it); the result preserves spec order.
+pub fn pipelines_supported_by_services(specs: &[PipelineSpec], my_services: &[ServiceType]) -> Vec<SupportedPipeline> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let supportable_roles: Vec<String> = spec
+                .roles
+                .iter()
+                .filter(|r| my_services.contains(&r.service))
+                .map(|r| r.tag.clone())
+                .collect();
+            (!supportable_roles.is_empty()).then(|| SupportedPipeline { pipeline_id: spec.id.clone(), supportable_roles })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +363,41 @@ mod tests {
             roles: vec![RequiredRole { service: SafetyCheck, units: 1, tag: "nobody-has-this".into() }],
         };
         assert!(spec2.invitations(&[card(5, vec!["physics"], vec![], 1000)], 100)[0].candidates.is_empty());
+    }
+
+    #[test]
+    fn agent_finds_published_pipelines_it_supports() {
+        // #175 gap 1 (frozen): the agent-side PULL — from the agent's OWN seat, scan the published
+        // specs and find which pipelines it can help run, matching its served services against each
+        // spec's roles (the complement of convene/invitations). Never claims a role it couldn't win.
+        let flappy = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() },
+                RequiredRole { service: TextGeneration, units: 1, tag: "art".into() },
+                RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into() },
+            ],
+        };
+        let audit = PipelineSpec {
+            id: "audit".into(),
+            roles: vec![RequiredRole { service: SecurityReview, units: 1, tag: "reviewer".into() }],
+        };
+
+        // A text-generation agent (source-2/sink) supports flappy's physics + art, but NOT its
+        // SafetyCheck role, and is not involved in the security-audit pipeline at all (omitted).
+        let text_agent = pipelines_supported_by_services(&[flappy.clone(), audit.clone()], &[TextGeneration]);
+        assert_eq!(text_agent.len(), 1, "the audit pipeline (no TextGeneration role) is omitted");
+        assert_eq!(text_agent[0].pipeline_id, "flappy");
+        assert_eq!(text_agent[0].supportable_roles, vec!["physics", "art"], "only the roles it can actually fill");
+
+        // A multi-service agent supports flappy's guard role AND the audit pipeline.
+        let multi = pipelines_supported_by_services(&[flappy.clone(), audit.clone()], &[SafetyCheck, SecurityReview]);
+        assert_eq!(multi.len(), 2, "both pipelines have a role this agent serves");
+        assert_eq!(multi[0].supportable_roles, vec!["guard"]);
+        assert_eq!(multi[1].pipeline_id, "audit");
+        assert_eq!(multi[1].supportable_roles, vec!["reviewer"]);
+
+        // An agent that serves nothing the marketplace needs finds no pipelines (never a false claim).
+        assert!(pipelines_supported_by_services(&[flappy, audit], &[CodeGeneration]).is_empty());
     }
 }
