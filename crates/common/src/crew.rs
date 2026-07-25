@@ -59,6 +59,10 @@ pub struct ArtFragment {
     /// #176: a full custom palette. `None`/absent → the studio uses the named `theme` preset.
     #[serde(default)]
     pub palette: Option<Palette>,
+    /// #177: an optional custom obstacle emoji tiled over the pipes (e.g. 🌲 forest, 🌵 desert), the
+    /// pipe equivalent of `bird_emoji`. `None`/absent → classic colored-rectangle pipes.
+    #[serde(default, rename = "pipeEmoji")]
+    pub pipe_emoji: Option<String>,
 }
 
 /// The demo's game config — serialized with exactly the field names the studio's `CONFIG` /
@@ -79,6 +83,11 @@ pub struct CrewConfig {
     /// consumers (and the named-theme path) are unaffected; the studio applies it directly when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub palette: Option<Palette>,
+    /// #177: optional obstacle emoji tiled over the pipes (the pipe equivalent of `bird_emoji`).
+    /// Serialized only when present; the studio tiles it purely visually, the collision box is
+    /// unchanged. `None` → classic colored-rectangle pipes.
+    #[serde(default, rename = "pipeEmoji", skip_serializing_if = "Option::is_none")]
+    pub pipe_emoji: Option<String>,
 }
 
 impl CrewConfig {
@@ -95,6 +104,7 @@ impl CrewConfig {
             bird_emoji: art.bird_emoji.clone(),
             title: art.title.clone(),
             palette: art.palette.clone(),
+            pipe_emoji: art.pipe_emoji.clone(),
         }
     }
 
@@ -184,12 +194,12 @@ mod tests {
                 gravity: 2200, jump: 420, gap: 115, speed: 220,
                 theme: "night".into(), bird_color: "#00ff41".into(),
                 bird_emoji: "🕶️".into(), title: "Neo: Matrix Flap".into(),
-                palette: None,
+                palette: None, pipe_emoji: None,
             },
             "flapPower→jump, pipeGap→gap, pipeSpeed→speed; art carried verbatim (emoji intact)"
         );
-        // #176 backward-compat: an art fragment with no palette → None.
-        assert!(cfg.palette.is_none());
+        // #176/#177 backward-compat: an art fragment with no palette / no pipeEmoji → None.
+        assert!(cfg.palette.is_none() && cfg.pipe_emoji.is_none());
 
         // The config serializes with the camelCase names the browser's applyLiveConfig reads.
         let cfg_json = serde_json::to_string(&cfg).unwrap();
@@ -198,6 +208,14 @@ mod tests {
         assert!(cfg_json.contains("\"jump\":420"), "jump (from flapPower)");
         assert!(!cfg_json.contains("flapPower"), "the handler's field name does not leak to the browser");
         assert!(!cfg_json.contains("palette"), "#176: no palette key serialized when the art agent didn't invent one");
+        assert!(!cfg_json.contains("pipeEmoji"), "#177: no pipeEmoji key serialized when absent");
+
+        // #177: an art fragment WITH a pipeEmoji carries it through + serializes camelCase (the studio
+        // tiles it over the pipes; the collision box is unchanged — a pure reskin).
+        let art_pipe = r##"{"theme":"day","birdColor":"#f7d51d","birdEmoji":"","title":"Forest","pipeEmoji":"🌲"}"##;
+        let cfg_pipe = CrewConfig::from_fragment_json(physics, art_pipe).expect("fragment with pipeEmoji parses");
+        assert_eq!(cfg_pipe.pipe_emoji.as_deref(), Some("🌲"), "pipeEmoji carried through");
+        assert!(serde_json::to_string(&cfg_pipe).unwrap().contains("\"pipeEmoji\":\"🌲\""), "pipeEmoji serializes camelCase");
 
         // #176: an art fragment WITH a custom palette carries it through to the config + wire (the
         // studio then applies the invented sky/pipe/ground colours directly, not one of 5 presets).

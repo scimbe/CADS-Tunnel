@@ -405,8 +405,18 @@ function runFlappy(canvas, CONFIG) {
     ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
   }
   function pipe(p) {
-    ctx.fillStyle = TH.pipe; ctx.strokeStyle = TH.pipeEdge; ctx.lineWidth = 2;
     const botY = p.top + C.gap, botH = H - GROUND_H - botY;
+    if (C.pipeEmoji) {
+      // #177: tile the obstacle emoji over the SAME two pipe boxes (top 0..p.top, bottom botY..).
+      // Purely visual — collide() still uses the rectangle hitbox, so difficulty is byte-identical
+      // to the colored-rectangle pipes (the exact if/else fallback shape drawBird() uses).
+      const S = PIPE_W, cx = p.x + PIPE_W / 2;
+      ctx.font = S + "px serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      for (let y = p.top - S / 2; y > -S; y -= S) ctx.fillText(C.pipeEmoji, cx, y);
+      for (let y = botY + S / 2; y < botY + botH + S; y += S) ctx.fillText(C.pipeEmoji, cx, y);
+      return;
+    }
+    ctx.fillStyle = TH.pipe; ctx.strokeStyle = TH.pipeEdge; ctx.lineWidth = 2;
     ctx.fillRect(p.x, 0, PIPE_W, p.top); ctx.strokeRect(p.x + 1, 0, PIPE_W - 2, p.top);
     ctx.fillRect(p.x - OVER, p.top - CAP_H, PIPE_W + OVER * 2, CAP_H);
     ctx.strokeRect(p.x - OVER + 1, p.top - CAP_H, PIPE_W + OVER * 2 - 2, CAP_H);
@@ -483,6 +493,7 @@ const EMOJIS = ["●","🐤","🐥","🦜","🐦","🦆","🚀","🐟","🐝","�
 
 const $ = (id) => document.getElementById(id);
 let selEmoji = "";  // "" → classic circle bird (tint applies); set to an emoji to use that instead
+let pipeEmoji = "";  // #177: "" → classic colored-rectangle pipes; an emoji → tiled obstacle shape
 let dispose = null;
 
 // ---- password gate (first layer) ----
@@ -545,6 +556,7 @@ function readConfig() {
   return {
     title: $("title").value.trim() || "Flappy Bird",
     emoji: selEmoji,
+    pipeEmoji: pipeEmoji,
     birdColor: $("birdColor").value,
     birdSize: 15,
     themeName: $("theme").value,
@@ -774,6 +786,7 @@ function applyLiveConfig(c) {
   }
   if (c.birdColor) $("birdColor").value = c.birdColor;
   if (typeof c.birdEmoji === "string") setBirdEmoji(c.birdEmoji);
+  if (typeof c.pipeEmoji === "string") pipeEmoji = c.pipeEmoji;  // #177: crew-chosen obstacle shape
   num("gravity", c.gravity); num("jump", c.jump); num("gap", c.gap); num("speed", c.speed);
   if (c.gravity != null || c.speed != null) $("preset").value = "custom";
   syncLabels();
@@ -876,7 +889,7 @@ const ENGINE_SRC = runFlappy.toString();  // reuse the exact preview engine
 function buildProductHtml(cfg) {
   const safeTitle = (cfg.title || "Flappy Bird").replace(/[<>&]/g, "");
   const config = {
-    title: cfg.title, emoji: cfg.emoji, birdColor: cfg.birdColor, birdSize: cfg.birdSize,
+    title: cfg.title, emoji: cfg.emoji, pipeEmoji: cfg.pipeEmoji, birdColor: cfg.birdColor, birdSize: cfg.birdSize,
     theme: cfg.theme, gravity: cfg.gravity, jump: cfg.jump, gap: cfg.gap, speed: cfg.speed,
   };
   return `<!doctype html>
