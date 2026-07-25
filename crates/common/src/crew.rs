@@ -28,7 +28,26 @@ pub struct PhysicsFragment {
     pub pipe_speed: u32,
 }
 
-/// The art agent's fragment — central's b1 art handler output shape.
+/// A fully custom colour palette the art agent can invent (#176) instead of only picking one of the
+/// demo's 5 named themes — the exact shape a studio `THEMES` entry has. Optional: when the art agent
+/// omits it, the coarse `theme` label still selects a preset. All fields are `#rrggbb`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Palette {
+    #[serde(rename = "skyTop")]
+    pub sky_top: String,
+    #[serde(rename = "skyBottom")]
+    pub sky_bottom: String,
+    pub pipe: String,
+    #[serde(rename = "pipeEdge")]
+    pub pipe_edge: String,
+    pub ground: String,
+    #[serde(rename = "groundEdge")]
+    pub ground_edge: String,
+    pub accent: String,
+}
+
+/// The art agent's fragment — central's b1 art handler output shape, plus an optional #176 custom
+/// `palette` so the LLM can invent a full sky/pipe/ground colour scheme, not just name one of five.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArtFragment {
     pub theme: String,
@@ -37,6 +56,9 @@ pub struct ArtFragment {
     #[serde(rename = "birdEmoji")]
     pub bird_emoji: String,
     pub title: String,
+    /// #176: a full custom palette. `None`/absent → the studio uses the named `theme` preset.
+    #[serde(default)]
+    pub palette: Option<Palette>,
 }
 
 /// The demo's game config — serialized with exactly the field names the studio's `CONFIG` /
@@ -53,6 +75,10 @@ pub struct CrewConfig {
     #[serde(rename = "birdEmoji")]
     pub bird_emoji: String,
     pub title: String,
+    /// #176: the art agent's optional full custom palette. Serialized only when present, so existing
+    /// consumers (and the named-theme path) are unaffected; the studio applies it directly when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette: Option<Palette>,
 }
 
 impl CrewConfig {
@@ -68,6 +94,7 @@ impl CrewConfig {
             bird_color: art.bird_color.clone(),
             bird_emoji: art.bird_emoji.clone(),
             title: art.title.clone(),
+            palette: art.palette.clone(),
         }
     }
 
@@ -157,9 +184,12 @@ mod tests {
                 gravity: 2200, jump: 420, gap: 115, speed: 220,
                 theme: "night".into(), bird_color: "#00ff41".into(),
                 bird_emoji: "🕶️".into(), title: "Neo: Matrix Flap".into(),
+                palette: None,
             },
             "flapPower→jump, pipeGap→gap, pipeSpeed→speed; art carried verbatim (emoji intact)"
         );
+        // #176 backward-compat: an art fragment with no palette → None.
+        assert!(cfg.palette.is_none());
 
         // The config serializes with the camelCase names the browser's applyLiveConfig reads.
         let cfg_json = serde_json::to_string(&cfg).unwrap();
@@ -167,6 +197,16 @@ mod tests {
         assert!(cfg_json.contains("\"birdEmoji\":\"🕶️\""), "birdEmoji camelCase + grapheme");
         assert!(cfg_json.contains("\"jump\":420"), "jump (from flapPower)");
         assert!(!cfg_json.contains("flapPower"), "the handler's field name does not leak to the browser");
+        assert!(!cfg_json.contains("palette"), "#176: no palette key serialized when the art agent didn't invent one");
+
+        // #176: an art fragment WITH a custom palette carries it through to the config + wire (the
+        // studio then applies the invented sky/pipe/ground colours directly, not one of 5 presets).
+        let art_pal = r##"{"theme":"night","birdColor":"#00ff41","birdEmoji":"","title":"Dusk","palette":{"skyTop":"#2a0f3a","skyBottom":"#7a3b1f","pipe":"#c85a2a","pipeEdge":"#8a3b18","ground":"#3a2a1a","groundEdge":"#241a10","accent":"#ffd18a"}}"##;
+        let cfg2 = CrewConfig::from_fragment_json(physics, art_pal).expect("fragment with palette parses");
+        let pal = cfg2.palette.as_ref().expect("custom palette carried through");
+        assert_eq!((pal.sky_top.as_str(), pal.pipe.as_str(), pal.accent.as_str()), ("#2a0f3a", "#c85a2a", "#ffd18a"));
+        let cfg2_json = serde_json::to_string(&cfg2).unwrap();
+        assert!(cfg2_json.contains("\"skyTop\":\"#2a0f3a\""), "palette serializes camelCase for the browser: {cfg2_json}");
 
         // built() carries safety.ok + auction + config.
         let auction = vec![RoleAuction {

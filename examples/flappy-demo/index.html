@@ -757,7 +757,21 @@ function applyLiveConfig(c) {
   if (!c) return;
   const num = (id, v) => { if (v != null && !Number.isNaN(+v)) $(id).value = v; };
   if (c.title) $("title").value = String(c.title).slice(0, 28);
-  if (c.theme && THEMES[c.theme]) $("theme").value = c.theme;
+  // #176: a full custom palette invented by the art agent overrides the 5 named presets. Accept it
+  // only if well-formed (all 7 #rrggbb fields) — register it as a "custom" theme, add + select the
+  // option — else fall back to the named theme. readConfig then feeds THEMES.custom to the engine and
+  // the downloaded product embeds it, so the invented sky/pipe/ground colours render everywhere.
+  const P = c.palette, hex = (v) => typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v);
+  const PK = ["skyTop", "skyBottom", "pipe", "pipeEdge", "ground", "groundEdge", "accent"];
+  if (P && PK.every((k) => hex(P[k]))) {
+    THEMES.custom = {}; PK.forEach((k) => { THEMES.custom[k] = P[k]; });
+    if (!$("theme").querySelector('option[value="custom"]')) {
+      const o = document.createElement("option"); o.value = "custom"; o.textContent = "Custom (from the crew)"; $("theme").appendChild(o);
+    }
+    $("theme").value = "custom";
+  } else if (c.theme && THEMES[c.theme]) {
+    $("theme").value = c.theme;
+  }
   if (c.birdColor) $("birdColor").value = c.birdColor;
   if (typeof c.birdEmoji === "string") setBirdEmoji(c.birdEmoji);
   num("gravity", c.gravity); num("jump", c.jump); num("gap", c.gap); num("speed", c.speed);

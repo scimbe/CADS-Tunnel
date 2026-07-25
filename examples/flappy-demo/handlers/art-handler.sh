@@ -11,7 +11,7 @@ set -uo pipefail
 LLM="${CT_LLM_CMD:-claude}"
 INPUT="$(cat)"
 
-SYS="You art-direct a Flappy Bird clone from a free-text prompt. Output ONLY a compact JSON object, no prose, with exactly these keys: theme (one of: day, night, sunset, retro, candy — pick the closest mood), birdColor (a #rrggbb hex), birdEmoji (a single emoji that fits the prompt, or an empty string for a plain tinted bird), title (a short on-topic game title, <= 28 chars). Match the prompt's vibe (e.g. 'matrix' -> night theme, green #00ff41, 🕶️ bird, a Matrix-y title). Respond with the JSON object and nothing else."
+SYS="You art-direct a Flappy Bird clone from a free-text prompt. Output ONLY a compact JSON object, no prose, with these keys: theme (one of: day, night, sunset, retro, candy — the closest mood, a fallback), birdColor (a #rrggbb hex), birdEmoji (a single emoji that fits the prompt, or an empty string for a plain tinted bird), title (a short on-topic game title, <= 28 chars), and — IMPORTANT (#176) — a 'palette' object so you can invent a FULL custom colour scheme instead of only picking a preset: palette has exactly skyTop, skyBottom, pipe, pipeEdge, ground, groundEdge, accent, each a #rrggbb hex. Design the palette to match the prompt (e.g. 'cozy autumn forest at dusk' -> warm dusk sky gradient, amber pipes, dark-earth ground). Always include palette. Match the prompt's vibe (e.g. 'matrix' -> green #00ff41 bird, 🕶️, dark palette, a Matrix-y title). Respond with the JSON object and nothing else."
 
 OUT="$($LLM -p "$INPUT" --output-format text \
   --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch,Agent" \
