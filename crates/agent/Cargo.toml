@@ -35,6 +35,12 @@ name = "natlab"
 path = "src/bin/natlab.rs"
 required-features = ["nat-lab"]
 
+# #171/#173 c3: the flappy-demo crew HTTP bridge (POST /crew/build → safety→physics→art crew,
+# assembled via ct_common::crew). Deployed beside the demo's Caddy origin; see examples/flappy-demo.
+[[bin]]
+name = "ct-crew-bridge"
+path = "src/bin/crew_bridge.rs"
+
 [dev-dependencies]
 # test-util enables `#[tokio::test(start_paused = true)]` for deterministic timeout tests (#126).
 tokio = { version = "1", features = ["test-util"] }
