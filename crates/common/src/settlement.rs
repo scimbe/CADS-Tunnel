@@ -16,6 +16,7 @@
 //! settlement account is its identity, and a transfer is authorized only by the holder's own signature.
 
 use crate::channel::UsageReceipt;
+use crate::preimage::Preimage;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -83,13 +84,13 @@ impl Transfer {
     /// Canonical fixed-wire preimage: `domain ‖ from ‖ to ‖ amount(LE) ‖ nonce(LE)`. All fields are
     /// fixed-size, so the encoding is injective without length prefixes.
     pub fn signing_bytes(from: &Account, to: &Account, amount: Amount, nonce: u64) -> Vec<u8> {
-        let mut m = Vec::with_capacity(TRANSFER_DOMAIN.len() + 32 + 32 + 8 + 8);
-        m.extend_from_slice(TRANSFER_DOMAIN);
-        m.extend_from_slice(from);
-        m.extend_from_slice(to);
-        m.extend_from_slice(&amount.to_le_bytes());
-        m.extend_from_slice(&nonce.to_le_bytes());
-        m
+        // #184: DOMAIN ‖ from ‖ to ‖ amount(LE) ‖ nonce(LE) — byte-identical to the prior hand-rolled form.
+        Preimage::new(TRANSFER_DOMAIN)
+            .fixed(from)
+            .fixed(to)
+            .u64(amount)
+            .u64(nonce)
+            .finish()
     }
 
     /// Construct + sign a transfer from the sender's `SigningKey` (derives `from` from the key, so a
@@ -428,15 +429,15 @@ impl Hold {
         nonce: u64,
         expires_at: u64,
     ) -> Vec<u8> {
-        let mut m = Vec::with_capacity(HOLD_DOMAIN.len() + 32 + 32 + 8 + 32 + 8 + 8);
-        m.extend_from_slice(HOLD_DOMAIN);
-        m.extend_from_slice(from);
-        m.extend_from_slice(to);
-        m.extend_from_slice(&amount.to_le_bytes());
-        m.extend_from_slice(match_ref);
-        m.extend_from_slice(&nonce.to_le_bytes());
-        m.extend_from_slice(&expires_at.to_le_bytes());
-        m
+        // #184: DOMAIN ‖ from ‖ to ‖ amount(LE) ‖ match_ref ‖ nonce(LE) ‖ expires_at(LE) — byte-identical.
+        Preimage::new(HOLD_DOMAIN)
+            .fixed(from)
+            .fixed(to)
+            .u64(amount)
+            .fixed(match_ref)
+            .u64(nonce)
+            .u64(expires_at)
+            .finish()
     }
 
     /// Construct + sign a hold from the consumer's `SigningKey` (derives `from` from the key, so a
@@ -730,12 +731,12 @@ impl Vote {
     /// Canonical fixed-wire preimage: `domain ‖ term(LE) ‖ candidate ‖ voter`. All fixed-size, so the
     /// encoding is injective without length prefixes.
     pub fn signing_bytes(term: u64, candidate: &Account, voter: &Account) -> Vec<u8> {
-        let mut m = Vec::with_capacity(VOTE_DOMAIN.len() + 8 + 32 + 32);
-        m.extend_from_slice(VOTE_DOMAIN);
-        m.extend_from_slice(&term.to_le_bytes());
-        m.extend_from_slice(candidate);
-        m.extend_from_slice(voter);
-        m
+        // #184: DOMAIN ‖ term(LE) ‖ candidate ‖ voter — byte-identical to the prior hand-rolled form.
+        Preimage::new(VOTE_DOMAIN)
+            .u64(term)
+            .fixed(candidate)
+            .fixed(voter)
+            .finish()
     }
 
     /// Construct + sign a vote from the voter's `SigningKey` (derives `voter` from the key, so a vote
@@ -824,12 +825,12 @@ impl LeaderAttestation {
     /// Canonical fixed-wire preimage: `domain ‖ term(LE) ‖ leader ‖ block_hash`. All fixed-size, so the
     /// encoding is injective without length prefixes.
     pub fn signing_bytes(term: u64, leader: &Account, block_hash: &[u8; 32]) -> Vec<u8> {
-        let mut m = Vec::with_capacity(LEADER_BLOCK_DOMAIN.len() + 8 + 32 + 32);
-        m.extend_from_slice(LEADER_BLOCK_DOMAIN);
-        m.extend_from_slice(&term.to_le_bytes());
-        m.extend_from_slice(leader);
-        m.extend_from_slice(block_hash);
-        m
+        // #184: DOMAIN ‖ term(LE) ‖ leader ‖ block_hash — byte-identical to the prior hand-rolled form.
+        Preimage::new(LEADER_BLOCK_DOMAIN)
+            .u64(term)
+            .fixed(leader)
+            .fixed(block_hash)
+            .finish()
     }
 
     /// Construct + sign an attestation from the leader's `SigningKey` (derives `leader` from the key,
@@ -934,6 +935,54 @@ impl SettlementOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signing_bytes_golden_vectors_are_byte_identical_after_the_preimage_refactor() {
+        // #184 (frozen): pin the EXACT preimage bytes for each fixed-field settlement primitive so the
+        // Preimage-builder refactor cannot drift a single byte — a drift would silently change every
+        // signature over that object type and break all verification. `expected` is the canonical
+        // `DOMAIN ‖ fields…` layout built by hand (identical to the prior hand-rolled encoders).
+        let a1: Account = [0x11; 32];
+        let a2: Account = [0x22; 32];
+        let mref = [0x33u8; 32];
+        let bhash = [0x44u8; 32];
+
+        // Transfer: DOMAIN ‖ from ‖ to ‖ amount(LE) ‖ nonce(LE)
+        let mut e = Vec::new();
+        e.extend_from_slice(TRANSFER_DOMAIN);
+        e.extend_from_slice(&a1);
+        e.extend_from_slice(&a2);
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(Transfer::signing_bytes(&a1, &a2, 7, 9), e, "Transfer preimage drifted");
+
+        // Hold: DOMAIN ‖ from ‖ to ‖ amount(LE) ‖ match_ref ‖ nonce(LE) ‖ expires_at(LE)
+        let mut e = Vec::new();
+        e.extend_from_slice(HOLD_DOMAIN);
+        e.extend_from_slice(&a1);
+        e.extend_from_slice(&a2);
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&mref);
+        e.extend_from_slice(&9u64.to_le_bytes());
+        e.extend_from_slice(&11u64.to_le_bytes());
+        assert_eq!(Hold::signing_bytes(&a1, &a2, 7, &mref, 9, 11), e, "Hold preimage drifted");
+
+        // Vote: DOMAIN ‖ term(LE) ‖ candidate ‖ voter
+        let mut e = Vec::new();
+        e.extend_from_slice(VOTE_DOMAIN);
+        e.extend_from_slice(&5u64.to_le_bytes());
+        e.extend_from_slice(&a1);
+        e.extend_from_slice(&a2);
+        assert_eq!(Vote::signing_bytes(5, &a1, &a2), e, "Vote preimage drifted");
+
+        // LeaderAttestation: DOMAIN ‖ term(LE) ‖ leader ‖ block_hash
+        let mut e = Vec::new();
+        e.extend_from_slice(LEADER_BLOCK_DOMAIN);
+        e.extend_from_slice(&5u64.to_le_bytes());
+        e.extend_from_slice(&a1);
+        e.extend_from_slice(&bhash);
+        assert_eq!(LeaderAttestation::signing_bytes(5, &a1, &bhash), e, "LeaderAttestation preimage drifted");
+    }
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])

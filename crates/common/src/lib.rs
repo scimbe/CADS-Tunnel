@@ -18,6 +18,7 @@ pub mod overlay;
 pub mod pipeline;
 pub mod policy;
 pub mod pow;
+pub mod preimage;
 pub mod ratelimit;
 pub mod replay;
 pub mod settlement;
