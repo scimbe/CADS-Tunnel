@@ -92,6 +92,44 @@ async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
         .map_err(|e| format!("role task join failed: {e}"))?
 }
 
+/// #207 Slice A — ordered-candidate failover. Try an ORDERED list of role commands, first success
+/// wins: candidate 0 is the primary (source-2's serve); on error (unreachable / non-zero / empty-#206
+/// / timeout — i.e. source-2 down) fall through to the next (sink's parallel standby serve). So the
+/// primary "always wins while it's up" and a standby "takes over when it can't connect", no reconfig.
+/// OPT-IN: a single-candidate list behaves exactly as before. Returns the last candidate's error if
+/// all fail. (Separate copy from the cookbook bridge — separate-bridge-per-pipeline, per the directive.)
+async fn run_with_fallbacks(candidates: &[String], input: String) -> Result<String, String> {
+    let mut last = Err("no role command configured".to_string());
+    for (i, cmd) in candidates.iter().enumerate() {
+        match run_cmd_async(cmd.clone(), input.clone()).await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                if candidates.len() > 1 {
+                    eprintln!(
+                        "ct-crew-bridge: role candidate {}/{} failed ({e}); trying next (#207)",
+                        i + 1,
+                        candidates.len()
+                    );
+                }
+                last = Err(e);
+            }
+        }
+    }
+    last
+}
+
+/// #207 Slice A — a role's ordered candidate list from env: primary `<primary_key>` + contiguous
+/// fallbacks `<primary_key>_2`, `_3`, … (stop at the first unset). No fallbacks ⇒ single candidate.
+fn role_candidates<F: Fn(&str) -> Option<String>>(env: &F, primary_key: &str, primary: String) -> Vec<String> {
+    let mut v = vec![primary];
+    let mut n = 2;
+    while let Some(c) = env(&format!("{primary_key}_{n}")) {
+        v.push(c);
+        n += 1;
+    }
+    v
+}
+
 /// The visible auction for the demo crew (the winners that produced each fragment). A real
 /// marketplace clear (`match_offer`/`convene`) would supply this; the demo shows its known crew.
 fn demo_auction() -> Vec<RoleAuction> {
@@ -121,7 +159,7 @@ async fn emit(tx: &Sender<String>, ev: Value) {
 ///   * `{"stage":"rejected", safety:{ok:false,reason}}` — the live safety guard refused,
 ///   * `{"stage":"error", message}` — an infrastructure failure (browser falls back to its stand-in).
 /// Intermediate events: `{"stage":"safety|physics|art","status":"start|ok|done"}`.
-async fn run_crew_streaming(prompt: String, safety_cmd: String, physics_cmd: String, art_cmd: String, tx: Sender<String>) {
+async fn run_crew_streaming(prompt: String, safety_cmd: String, physics_cmds: Vec<String>, art_cmd: String, tx: Sender<String>) {
     // 1. safety_check — authoritative live guard.
     emit(&tx, json!({"stage": "safety", "status": "start"})).await;
     let safety_out = match run_cmd_async(safety_cmd, prompt.clone()).await {
@@ -145,7 +183,9 @@ async fn run_crew_streaming(prompt: String, safety_cmd: String, physics_cmd: Str
     emit(&tx, json!({"stage": "art", "status": "start"})).await;
     let (tx_p, tx_a) = (tx.clone(), tx.clone());
     let physics = async {
-        let r = run_cmd_async(physics_cmd, prompt.clone()).await;
+        // #207 Slice A: dial physics (source-2) across its candidate list — primary first, standby
+        // on connect-failure. Single candidate ⇒ identical to before.
+        let r = run_with_fallbacks(&physics_cmds, prompt.clone()).await;
         if r.is_ok() {
             emit(&tx_p, json!({"stage": "physics", "status": "done"})).await;
         }
@@ -190,11 +230,14 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
         (Some(s), Some(p), Some(a)) => (s, p, a),
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, "crew role commands not configured").into_response(),
     };
+    // #207 Slice A: physics is source-2's role — the one that goes dark if source-2's box dies — so it
+    // gets an ordered candidate list (CREW_PHYSICS_CMD + optional _2/_3 standbys).
+    let physics_cmds = role_candidates(&env, "CREW_PHYSICS_CMD", physics);
     // Stream NDJSON progress events as the crew runs. run_crew_streaming pushes lines onto the
     // channel; the response body drains them. On any failure it emits a terminal {"stage":"error"}
     // and the browser falls back to its local stand-in — same fail-closed contract as before.
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
-    tokio::spawn(run_crew_streaming(prompt, safety, physics, art, tx));
+    tokio::spawn(run_crew_streaming(prompt, safety, physics_cmds, art, tx));
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
     Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -217,10 +260,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn run_with_fallbacks_tries_candidates_in_order_first_success_wins() {
+        // #207 Slice A (frozen): primary up ⇒ its output (standby not run); primary down ⇒ standby;
+        // all down ⇒ error; single candidate ⇒ unchanged.
+        assert_eq!(
+            run_with_fallbacks(&["printf primary".into(), "printf standby".into()], String::new()).await.unwrap(),
+            "primary"
+        );
+        assert_eq!(
+            run_with_fallbacks(&["false".into(), "printf standby".into()], String::new()).await.unwrap(),
+            "standby"
+        );
+        assert!(run_with_fallbacks(&["false".into(), "false".into()], String::new()).await.is_err());
+        assert_eq!(run_with_fallbacks(&["printf only".into()], String::new()).await.unwrap(), "only");
+    }
+
+    #[test]
+    fn role_candidates_reads_primary_plus_contiguous_fallbacks() {
+        // #207 Slice A (frozen): primary + contiguous _2/_3; gap stops enumeration; none ⇒ single.
+        let env = |k: &str| match k {
+            "R_2" => Some("cmd2".to_string()),
+            "R_3" => Some("cmd3".to_string()),
+            _ => None,
+        };
+        assert_eq!(role_candidates(&env, "R", "cmd1".to_string()), vec!["cmd1", "cmd2", "cmd3"]);
+        let gap = |k: &str| if k == "R_3" { Some("cmd3".to_string()) } else { None };
+        assert_eq!(role_candidates(&gap, "R", "cmd1".to_string()), vec!["cmd1"]);
+        assert_eq!(role_candidates(&(|_: &str| None), "R", "cmd1".to_string()), vec!["cmd1"]);
+    }
+
     /// Drive run_crew_streaming to completion and collect its NDJSON events as parsed JSON objects.
     async fn collect(prompt: &str, safety: String, physics: String, art: String) -> Vec<Value> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
-        let h = tokio::spawn(run_crew_streaming(prompt.to_string(), safety, physics, art, tx));
+        let h = tokio::spawn(run_crew_streaming(prompt.to_string(), safety, vec![physics], art, tx));
         let mut evs = Vec::new();
         while let Some(chunk) = rx.recv().await {
             for line in chunk.split('\n') {
