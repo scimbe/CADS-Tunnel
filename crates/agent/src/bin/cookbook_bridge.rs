@@ -93,6 +93,46 @@ async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
         .map_err(|e| format!("role task join failed: {e}"))?
 }
 
+/// #207 Slice A — ordered-candidate failover. Run a role against an ORDERED list of candidate
+/// commands, trying each until one succeeds. Candidate 0 is the primary (e.g. source-2's serve); if it
+/// errs — unreachable, non-zero exit, empty output (#206), or timeout — the next candidate (e.g.
+/// sink's parallel standby serve) is tried, and so on. First success wins, so the primary "always
+/// wins while it's up" and a standby "takes over when it can't connect", with no reconfig. OPT-IN: a
+/// role with a single candidate behaves exactly as before (this just wraps `run_cmd_async`). Returns
+/// the LAST candidate's error if every candidate fails.
+async fn run_with_fallbacks(candidates: &[String], input: String) -> Result<String, String> {
+    let mut last = Err("no role command configured".to_string());
+    for (i, cmd) in candidates.iter().enumerate() {
+        match run_cmd_async(cmd.clone(), input.clone()).await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                if candidates.len() > 1 {
+                    eprintln!(
+                        "ct-cookbook-bridge: role candidate {}/{} failed ({e}); trying next (#207)",
+                        i + 1,
+                        candidates.len()
+                    );
+                }
+                last = Err(e);
+            }
+        }
+    }
+    last
+}
+
+/// #207 Slice A — build a role's ordered candidate list from env: the primary `<primary_key>` plus any
+/// CONTIGUOUS fallbacks `<primary_key>_2`, `<primary_key>_3`, … (stopping at the first unset). With no
+/// fallbacks set this is a single-candidate list, i.e. unchanged behaviour.
+fn role_candidates<F: Fn(&str) -> Option<String>>(env: &F, primary_key: &str, primary: String) -> Vec<String> {
+    let mut v = vec![primary];
+    let mut n = 2;
+    while let Some(c) = env(&format!("{primary_key}_{n}")) {
+        v.push(c);
+        n += 1;
+    }
+    v
+}
+
 /// Emit one NDJSON progress event (a JSON object + `\n`) to the response stream.
 async fn emit(tx: &Sender<String>, ev: Value) {
     let _ = tx.send(ev.to_string() + "\n").await;
@@ -119,7 +159,7 @@ async fn run_cookbook_streaming(
     image: Option<String>,
     lang: String,
     safety_cmd: String,
-    structure_cmd: String,
+    structure_cmds: Vec<String>,
     presentation_cmd: String,
     review_cmd: String,
     tx: Sender<String>,
@@ -147,7 +187,10 @@ async fn run_cookbook_streaming(
     // back in it (a German prompt yields a German recipe). safety/review are language-agnostic
     // classifiers, so they don't need it.
     let structure_input = json!({"prompt": prompt, "image": image, "lang": lang}).to_string();
-    let structure_out = match run_cmd_async(structure_cmd, structure_input).await {
+    // #207 Slice A: dial the structure role (source-2) across its candidate list — primary first,
+    // then any configured standby — so source-2 wins while up and sink's standby takes over when it
+    // can't connect. Single candidate ⇒ identical to before.
+    let structure_out = match run_with_fallbacks(&structure_cmds, structure_input).await {
         Ok(o) => o,
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("structure role unreachable: {e}")})).await,
     };
@@ -222,10 +265,13 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
         (Some(s), Some(st), Some(p), Some(r)) => (s, st, p, r),
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, "cookbook role commands not configured").into_response(),
     };
+    // #207 Slice A: the structure role (source-2's) is the one that goes dark if source-2's box dies,
+    // so it gets an ordered candidate list (primary COOKBOOK_STRUCTURE_CMD + optional _2/_3 standbys).
+    let structure_cmds = role_candidates(&env, "COOKBOOK_STRUCTURE_CMD", structure);
     // Stream NDJSON progress events as the crew runs. run_cookbook_streaming pushes lines onto the
     // channel; on any failure it emits a terminal {"stage":"error"} and the browser falls back.
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
-    tokio::spawn(run_cookbook_streaming(prompt, image, lang, safety, structure, presentation, review, tx));
+    tokio::spawn(run_cookbook_streaming(prompt, image, lang, safety, structure_cmds, presentation, review, tx));
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
     Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -250,7 +296,7 @@ mod tests {
 
     async fn collect(prompt: &str, image: Option<String>, safety: String, structure: String, presentation: String, review: String) -> Vec<Value> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
-        let h = tokio::spawn(run_cookbook_streaming(prompt.to_string(), image, "en".to_string(), safety, structure, presentation, review, tx));
+        let h = tokio::spawn(run_cookbook_streaming(prompt.to_string(), image, "en".to_string(), safety, vec![structure], presentation, review, tx));
         let mut evs = Vec::new();
         while let Some(chunk) = rx.recv().await {
             for line in chunk.split('\n') {
@@ -273,6 +319,59 @@ mod tests {
         assert!(err.contains("timed out"), "reports a timeout: {err}");
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "returns promptly on timeout");
         assert_eq!(run_cmd_with_timeout("printf hi", "", std::time::Duration::from_secs(5)).unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn run_with_fallbacks_tries_candidates_in_order_first_success_wins() {
+        // #207 Slice A (frozen): the failover primitive. Primary up ⇒ its output, standby not run;
+        // primary down ⇒ standby's output; all down ⇒ error. `false` exits non-zero (a down
+        // provider); `printf X` is a live one.
+        // primary succeeds → standby never runs (its output must NOT appear).
+        let out = run_with_fallbacks(
+            &["printf primary".to_string(), "printf standby".to_string()],
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "primary", "primary wins while it's up");
+        // primary fails (exit 1) → standby takes over.
+        let out = run_with_fallbacks(
+            &["false".to_string(), "printf standby".to_string()],
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "standby", "standby takes over when the primary can't serve");
+        // every candidate fails → error (the last one's).
+        assert!(
+            run_with_fallbacks(&["false".to_string(), "false".to_string()], String::new())
+                .await
+                .is_err(),
+            "all-down ⇒ error"
+        );
+        // single candidate ⇒ unchanged behaviour.
+        assert_eq!(
+            run_with_fallbacks(&["printf only".to_string()], String::new()).await.unwrap(),
+            "only"
+        );
+    }
+
+    #[test]
+    fn role_candidates_reads_primary_plus_contiguous_fallbacks() {
+        // #207 Slice A (frozen): primary + contiguous _2/_3 fallbacks; stops at the first gap; no
+        // fallbacks ⇒ single-candidate list (unchanged behaviour).
+        let env = |k: &str| match k {
+            "R_2" => Some("cmd2".to_string()),
+            "R_3" => Some("cmd3".to_string()),
+            _ => None,
+        };
+        assert_eq!(role_candidates(&env, "R", "cmd1".to_string()), vec!["cmd1", "cmd2", "cmd3"]);
+        // a gap at _2 stops enumeration even if _3 is set.
+        let gap = |k: &str| if k == "R_3" { Some("cmd3".to_string()) } else { None };
+        assert_eq!(role_candidates(&gap, "R", "cmd1".to_string()), vec!["cmd1"]);
+        // no fallbacks ⇒ just the primary.
+        let none = |_: &str| None;
+        assert_eq!(role_candidates(&none, "R", "cmd1".to_string()), vec!["cmd1"]);
     }
 
     #[tokio::test]
