@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::noise::client_noise_exchange;
 use ct_common::noise::{client_handshake_for, frame, noise_pump, read_frame};
-use ct_common::pow::{build_request, Challenge};
+use ct_common::pow::{assemble_request, solve, Challenge};
 use ct_common::{Capability, RoutingToken};
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
@@ -20,6 +20,21 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Build a PoW-gated rendezvous request, offloading the CPU-bound solve to a blocking
+/// thread (#202). `pow::solve` is a tight brute-force loop whose cost grows ~2^difficulty;
+/// called inline it would occupy an async worker thread for the whole solve — on exactly
+/// the flood-gating path. `spawn_blocking` runs it on Tokio's blocking pool so the async
+/// runtime keeps servicing other tasks meanwhile, then we assemble the wire form via
+/// `pow::assemble_request` (the shared layout, no duplication). Used by every client
+/// rendezvous path in place of the sync `build_request`.
+pub(crate) async fn build_request_blocking(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
+    let challenge = challenge.clone();
+    let solution = tokio::task::spawn_blocking(move || solve(&challenge))
+        .await
+        .expect("pow solve task panicked");
+    assemble_request(solution, token)
 }
 
 /// Dial the Edge over QUIC, trusting `edge_cert`.
@@ -77,7 +92,7 @@ pub async fn client_tunnel(
         difficulty: chal[16],
     };
 
-    let req = build_request(&challenge, token); // solution(8) | token(32) = 40 bytes
+    let req = build_request_blocking(&challenge, token).await; // solution(8) | token(32) = 40 bytes
     send.write_all(&req).await?;
     send.write_all(input).await?;
     send.finish()?;
@@ -106,7 +121,7 @@ pub async fn client_tunnel_noise(
         nonce: chal[..16].try_into().unwrap(),
         difficulty: chal[16],
     };
-    let req = build_request(&challenge, token);
+    let req = build_request_blocking(&challenge, token).await;
     send.write_all(&req).await?;
 
     // The stream is now bridged to the Agent; run Noise over it.
@@ -195,7 +210,8 @@ where
         nonce: chal[..16].try_into().unwrap(),
         difficulty: chal[16],
     };
-    stream.write_all(&build_request(&challenge, token)).await?;
+    let req = build_request_blocking(&challenge, token).await;
+    stream.write_all(&req).await?;
 
     // Noise over the same stream (split into read/write halves).
     let (mut r, mut w) = split(stream);
@@ -299,7 +315,7 @@ where
             nonce: chal[..16].try_into().unwrap(),
             difficulty: chal[16],
         };
-        let req = build_request(&challenge, token);
+        let req = build_request_blocking(&challenge, token).await;
         send.write_all(&req).await?;
 
         // Noise_IK initiator handshake over the relayed stream.
@@ -383,7 +399,8 @@ pub async fn client_tunnel_udp(
         nonce: chal[..16].try_into().unwrap(),
         difficulty: chal[16],
     };
-    send.write_all(&build_request(&challenge, token)).await?;
+    let req = build_request_blocking(&challenge, token).await;
+    send.write_all(&req).await?;
 
     let mut hs = client_handshake_for(client_private, cap)?;
     let mut buf = vec![0u8; 65535];
@@ -580,6 +597,50 @@ mod tests {
     use ct_common::OriginIdentity;
     use ct_edge::transport::build_server_endpoint_with_cert;
     use std::time::Instant;
+
+    /// #202 (frozen): the CPU-bound PoW solve must NOT run inline on the async worker.
+    /// On a single-threaded (`current_thread`) runtime there is exactly ONE async worker;
+    /// an inline `solve` would monopolize it for the whole solve, so a concurrently-spawned
+    /// task could not run until the solve finished. `build_request_blocking` offloads the
+    /// solve to the blocking pool, so awaiting it yields the async worker and the concurrent
+    /// task makes progress WHILE the solve is in flight. The difficulty is chosen non-trivial
+    /// so the blocking solve is still running when we await (guaranteeing the yield hands the
+    /// worker to the ticker) yet stays fast (tens of ms). This test FAILS against an inline
+    /// `build_request` (the ticker never gets scheduled before the assert) and PASSES with the
+    /// offload — it pins the fix, not just the current behaviour.
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_request_blocking_offloads_the_solve_so_a_concurrent_task_progresses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let progressed = Arc::new(AtomicBool::new(false));
+        let p = progressed.clone();
+        // A concurrent async task that can only run if the single async worker is free.
+        let ticker = tokio::spawn(async move {
+            for _ in 0..10_000 {
+                p.store(true, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let token = RoutingToken([5u8; 32]);
+        let challenge = Challenge { nonce: [0x11; 16], difficulty: 20 };
+        let req = build_request_blocking(&challenge, &token).await;
+
+        assert_eq!(req.len(), 40, "solution(8) | token(32)");
+        let solution = u64::from_le_bytes(req[..8].try_into().unwrap());
+        assert!(
+            ct_common::pow::verify(&challenge, solution),
+            "the offloaded solve still produces a valid PoW solution"
+        );
+        assert_eq!(&req[8..], &token.0, "the token is appended after the solution");
+        assert!(
+            progressed.load(Ordering::SeqCst),
+            "a concurrent async task ran while the PoW solve was offloaded to the blocking pool \
+             (an inline solve would have starved the single async worker)"
+        );
+        ticker.abort();
+    }
 
     /// issue #2 regression: when the edge accepts the QUIC connection but never
     /// relays (no agent registered for the token), the tunnel op must return a

@@ -3,7 +3,8 @@
 //! The counterpart to the Edge's `resolve_rendezvous_gated`: read the Edge's
 //! challenge, solve the proof of work, present `solution | token`, and await OK.
 
-use ct_common::pow::{build_request, Challenge};
+use crate::transport::build_request_blocking;
+use ct_common::pow::Challenge;
 use ct_common::RoutingToken;
 use quinn::Connection;
 
@@ -19,7 +20,7 @@ pub async fn client_rendezvous(conn: &Connection, token: &RoutingToken) -> Resul
         nonce: chal[..16].try_into().unwrap(),
         difficulty: chal[16],
     };
-    let req = build_request(&challenge, token);
+    let req = build_request_blocking(&challenge, token).await;
     send.write_all(&req).await?;
     send.finish()?;
     let ack = recv.read_to_end(8).await?;

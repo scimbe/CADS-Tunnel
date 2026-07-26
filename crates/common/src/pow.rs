@@ -59,14 +59,24 @@ pub enum GateError {
     BadProofOfWork,
 }
 
-/// Build a PoW-gated rendezvous request for `token` by solving `challenge`.
-/// Wire form: `solution(8 LE) | token(32)`.
-pub fn build_request(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
-    let solution = solve(challenge);
+/// Assemble the PoW-gated rendezvous request wire form from an already-computed
+/// `solution` and `token`: `solution(8 LE) | token(32)` = 40 bytes. Split out from
+/// [`build_request`] so an async caller can offload the CPU-bound [`solve`] to a
+/// blocking thread (#202) and then assemble here — the single source of truth for the
+/// wire layout, so the sync and offloaded paths cannot drift.
+pub fn assemble_request(solution: u64, token: &RoutingToken) -> Vec<u8> {
     let mut req = Vec::with_capacity(40);
     req.extend_from_slice(&solution.to_le_bytes());
     req.extend_from_slice(&token.0);
     req
+}
+
+/// Build a PoW-gated rendezvous request for `token` by solving `challenge`.
+/// Wire form: `solution(8 LE) | token(32)`. Synchronous — CPU-bound; async callers on a
+/// Tokio runtime should offload the solve via `tokio::task::spawn_blocking` (#202) rather
+/// than calling this inline (see `ct_client`'s `build_request_blocking`).
+pub fn build_request(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
+    assemble_request(solve(challenge), token)
 }
 
 /// Verify a PoW-gated rendezvous request against `challenge` and extract the
