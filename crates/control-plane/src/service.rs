@@ -77,54 +77,53 @@ struct IssueResp {
     token: String,
 }
 
-/// #87 SEC87b-auth / #145: gate join-token issuance behind the configured admin token (constant-time
-/// compare). `Ok(())` when no token is configured (dev/back-compat) OR the correct `x-ct-admin-token`
-/// header is presented; `401` otherwise. Shared by single (`/enroll/issue`) and batch
-/// (`/enroll/issue-batch`) issuance so both enforce the exact same gate.
+/// #186: the ONE admin-token extract-and-compare. A presented `x-ct-admin-token` header hex-decodes
+/// to 32 bytes and constant-time-equals `expected`. EVERY admin gate — the axum layer
+/// ([`require_admin_token`]) and every inline guard ([`require_admin`]) — goes through this, so the
+/// control-plane's write-authorization check has exactly one implementation and cannot drift (a
+/// header rename, an added audit line, a per-IP limit lands in one place, not four). Constant-time via
+/// [`ct_token_eq`]; a missing/malformed/wrong header is `false`.
+fn admin_token_ok(headers: &HeaderMap, expected: &[u8; 32]) -> bool {
+    headers
+        .get("x-ct-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .and_then(hex_decode_32)
+        .map(|got| ct_token_eq(&got, expected))
+        .unwrap_or(false)
+}
+
+/// #186: the shared INLINE admin guard. `Ok(())` when no token is configured (dev/back-compat) OR the
+/// correct `x-ct-admin-token` is presented; `401` with the route-specific `msg` otherwise. The inline
+/// gates (`/enroll/issue*`, `/registry/agents`, `/registry/pipelines`) are thin wrappers over this so
+/// they share [`admin_token_ok`]'s single extract-and-compare.
+fn require_admin(
+    headers: &HeaderMap,
+    expected: &Option<[u8; 32]>,
+    msg: &'static str,
+) -> Result<(), (StatusCode, String)> {
+    match expected {
+        Some(exp) if !admin_token_ok(headers, exp) => Err((StatusCode::UNAUTHORIZED, msg.to_string())),
+        _ => Ok(()),
+    }
+}
+
+/// #87 SEC87b-auth / #145: gate join-token issuance behind the configured admin token. Shared by
+/// single (`/enroll/issue`) and batch (`/enroll/issue-batch`) issuance so both enforce the exact same
+/// gate. Thin wrapper over [`require_admin`] (#186).
 fn require_issue_admin(
     headers: &HeaderMap,
     expected: &Option<[u8; 32]>,
 ) -> Result<(), (StatusCode, String)> {
-    if let Some(exp) = expected {
-        let ok = headers
-            .get("x-ct-admin-token")
-            .and_then(|v| v.to_str().ok())
-            .and_then(hex_decode_32)
-            .map(|t| ct_token_eq(&t, exp))
-            .unwrap_or(false);
-        if !ok {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "join-token issuance requires the admin token".to_string(),
-            ));
-        }
-    }
-    Ok(())
+    require_admin(headers, expected, "join-token issuance requires the admin token")
 }
 
-/// #161/#87 SEC87b-auth: gate agent-directory self-registration (`POST /registry/agents`) behind
-/// the shared machine-writer admin token (constant-time compare). Same semantics as
-/// [`require_issue_admin`] — `Ok(())` when no token is configured (dev/back-compat) OR the correct
-/// `x-ct-admin-token` header is presented; `401` otherwise — with a route-specific message.
+/// #161/#87 SEC87b-auth: gate agent-directory self-registration (`POST /registry/agents`) behind the
+/// shared machine-writer admin token. Thin wrapper over [`require_admin`] (#186).
 fn require_agent_registry_admin(
     headers: &HeaderMap,
     expected: &Option<[u8; 32]>,
 ) -> Result<(), (StatusCode, String)> {
-    if let Some(exp) = expected {
-        let ok = headers
-            .get("x-ct-admin-token")
-            .and_then(|v| v.to_str().ok())
-            .and_then(hex_decode_32)
-            .map(|t| ct_token_eq(&t, exp))
-            .unwrap_or(false);
-        if !ok {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "agent-directory self-registration requires the admin token".to_string(),
-            ));
-        }
-    }
-    Ok(())
+    require_admin(headers, expected, "agent-directory self-registration requires the admin token")
 }
 
 async fn issue(
@@ -267,11 +266,7 @@ pub fn registry_router_sqlite_gated(store: Arc<SqliteRegistry>, admin_token: Opt
     let register = Router::new()
         .route("/registry/register", post(register_tunnel))
         .with_state(store);
-    let register = match admin_token {
-        Some(token) => register.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
-        None => register,
-    };
-    resolve.merge(register)
+    resolve.merge(admin_gated(register, admin_token))
 }
 
 /// Default TTL (seconds) for a minted bootstrap token (#90/#97 SEC90b-wire): short,
@@ -304,11 +299,7 @@ pub fn bootstrap_router(store: Arc<SqliteBootstrap>, admin_token: Option<[u8; 32
     let mint = Router::new()
         .route("/bootstrap/mint", post(bootstrap_mint))
         .with_state(BootstrapState { store });
-    let mint = match admin_token {
-        Some(token) => mint.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
-        None => mint,
-    };
-    redeem.merge(mint)
+    redeem.merge(admin_gated(mint, admin_token))
 }
 
 /// Seconds since the Unix epoch (wall clock), for the bootstrap-token TTL.
@@ -446,13 +437,7 @@ async fn require_admin_token(
     req: Request,
     next: Next,
 ) -> Response {
-    let ok = headers
-        .get("x-ct-admin-token")
-        .and_then(|v| v.to_str().ok())
-        .and_then(hex_decode_32)
-        .map(|got| ct_token_eq(&got, &state.token))
-        .unwrap_or(false);
-    if ok {
+    if admin_token_ok(&headers, &state.token) {
         next.run(req).await
     } else {
         (
@@ -460,6 +445,16 @@ async fn require_admin_token(
             "this control-plane write requires the admin token\n",
         )
             .into_response()
+    }
+}
+
+/// #186: apply the admin-token [`require_admin_token`] layer to `router` **iff** a token is configured
+/// — else leave it open (dev/back-compat). Collapses the `match admin_token { Some => .layer(..), None
+/// => r }` that was repeated at every gated writer router (registry, bootstrap-mint, billing writers).
+fn admin_gated(router: Router, admin_token: Option<[u8; 32]>) -> Router {
+    match admin_token {
+        Some(token) => router.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
+        None => router,
     }
 }
 
@@ -482,10 +477,7 @@ pub fn billing_writers_gated(store: Arc<SqliteLedger>, admin_token: Option<[u8; 
         .route("/payment/intent", post(create_payment_intent))
         .route("/billing/issue", post(buy_token))
         .with_state(store);
-    match admin_token {
-        Some(token) => writers.layer(from_fn_with_state(AdminGate { token }, require_admin_token)),
-        None => writers,
-    }
+    admin_gated(writers, admin_token)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1011,17 +1003,7 @@ async fn pipeline_publish(
 ) -> Result<StatusCode, (StatusCode, String)> {
     // #174 B / #161 SEC87b-auth: machine-writer gate — publishing a workflow spec is an
     // operator-class write, gated by the shared admin token (not a human OIDC bearer).
-    if let Some(exp) = &state.admin_token {
-        let ok = headers
-            .get("x-ct-admin-token")
-            .and_then(|v| v.to_str().ok())
-            .and_then(hex_decode_32)
-            .map(|t| ct_token_eq(&t, exp))
-            .unwrap_or(false);
-        if !ok {
-            return Err((StatusCode::UNAUTHORIZED, "publishing a pipeline requires the admin token".to_string()));
-        }
-    }
+    require_admin(&headers, &state.admin_token, "publishing a pipeline requires the admin token")?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let published = state
         .registry
@@ -2620,14 +2602,9 @@ async fn channel_authorize(
     headers: HeaderMap,
     Json(req): Json<AuthorizeReq>,
 ) -> Result<Json<AuthorizeResp>, StatusCode> {
-    // Verify the shared edge↔CP admin token (constant time) before any lookup.
-    let ok = headers
-        .get("x-ct-admin-token")
-        .and_then(|v| v.to_str().ok())
-        .and_then(hex_decode_32)
-        .map(|t| ct_token_eq(&t, &state.admin_token))
-        .unwrap_or(false);
-    if !ok {
+    // Verify the shared edge↔CP admin token (constant time) before any lookup — this route's token is
+    // mandatory (no dev-open path), so it calls the #186 core directly rather than the Option-aware guard.
+    if !admin_token_ok(&headers, &state.admin_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let channel = hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST)?;
@@ -2706,6 +2683,27 @@ fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
 mod tests {
     use super::*;
     use crate::client::ControlPlaneClient;
+
+    #[test]
+    fn admin_token_ok_is_the_one_extract_and_compare() {
+        // #186 (frozen): after unifying the five copies, the single admin-token core must still
+        // reject a missing / malformed / wrong header and accept only the exact hex of the expected
+        // 32 bytes. Every gate (the layer + all inline guards) now routes through this, so this test
+        // pins the shared behaviour that used to live in five places.
+        use axum::http::{HeaderMap, HeaderValue};
+        let expected = [0x11u8; 32];
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut h = HeaderMap::new();
+        assert!(!admin_token_ok(&h, &expected), "missing header → false");
+        h.insert("x-ct-admin-token", HeaderValue::from_static("not-hex"));
+        assert!(!admin_token_ok(&h, &expected), "malformed header → false");
+        let mut wrong = expected;
+        wrong[0] ^= 0xff;
+        h.insert("x-ct-admin-token", hex(&wrong).parse().unwrap());
+        assert!(!admin_token_ok(&h, &expected), "wrong token → false");
+        h.insert("x-ct-admin-token", hex(&expected).parse().unwrap());
+        assert!(admin_token_ok(&h, &expected), "correct token → true");
+    }
 
     #[tokio::test]
     async fn enroll_issue_requires_the_admin_token_when_configured() {
