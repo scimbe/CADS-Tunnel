@@ -1825,18 +1825,188 @@ pub async fn run_channel_join_command(cfg: ChannelJoinCliConfig) -> Result<(), B
         "ct-agent channel: plane-brokered {:?} (relay {}){}",
         cfg.role,
         cfg.relay_addr,
-        if serve_loop { " — persistent serve: re-admitting each peer (#179)" } else { "" }
+        if serve_loop { " — persistent serve: concurrent sessions (#200)" } else { "" }
     );
-    loop {
-        let result = run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
-        if !serve_loop {
-            return result;
+    if !serve_loop {
+        // One-shot roles (initiator / `--call` / a non-serve accept): exactly one session, unchanged.
+        return run_one_admission_session(&cfg, &request, &broker_ladder, &relay_ladder, &front_door_cert).await;
+    }
+    // #200: persistent serve is now CONCURRENT. The #179 loop admitted a peer, served it to
+    // completion, and only THEN re-admitted the next — so two users clicking Build within the same
+    // window collided: whoever wasn't currently being served got a fast "role unreachable" and fell
+    // back to the stand-in (central's 5-at-once test: 1 built, 4 unreachable, incl. central's own
+    // safety_check — the serve model, not a per-role bug). We now ADMIT sequentially (one parked
+    // accept at a time, so the edge pairer never has to hold two accepts for one channel) but SPAWN
+    // each paired session, looping straight back to admit the next peer. A bounded semaphore caps how
+    // many sessions run at once so a flood of Builds can't fork-bomb the host (each session may spawn
+    // a `claude -p`); at capacity the next peer simply waits at the broker.
+    //
+    // The direct listener is bound ONCE and shared across sessions (quinn `Endpoint` is a cheap
+    // clonable handle) — a per-session re-bind of the same advertised port would conflict. Over the
+    // plane the direct accept times out to the edge relay, so each session's relay leg is independent
+    // and fully concurrent; central must e2e the concurrent case (the regression bar: N concurrent
+    // builds all succeed, no `role unreachable` fallbacks, single-request builds unchanged).
+    let shared_listener: Option<Endpoint> = match cfg.role {
+        ChannelRole::Accept if !cfg.relay_only => Some(crate::transport::build_direct_listener_at(cfg.listen_addr)?.0),
+        _ => None,
+    };
+    let ctx = std::sync::Arc::new(ServeSessionCtx {
+        request: request.clone(),
+        holder: cfg.holder.clone(),
+        role: cfg.role,
+        own_noise_private: cfg.own_noise_private,
+        broker_addr: cfg.broker_addr,
+        relay_addr: cfg.relay_addr,
+        broker_ladder: broker_ladder.clone(),
+        relay_ladder: relay_ladder.clone(),
+        front_door_cert: front_door_cert.clone(),
+        listener: shared_listener,
+    });
+    let max = serve_concurrency_from_env(std::env::var("CT_CHANNEL_SERVE_CONCURRENCY").ok().as_deref());
+    eprintln!("ct-agent channel: persistent serve — up to {max} concurrent sessions (#200)");
+    let admit_ctx = ctx.clone();
+    serve_loop_concurrent(
+        max,
+        std::time::Duration::from_millis(200),
+        move || {
+            let c = admit_ctx.clone();
+            async move { admit_one_peer(&c).await }
+        },
+        move |admission| {
+            let c = ctx.clone();
+            async move { serve_admitted_session(c, admission).await }
+        },
+    )
+    .await
+}
+
+/// #200: the owned, `Send + Sync` context a persistent serve member needs to run each of its
+/// concurrent sessions independently of the parking loop. Built ONCE (cloning the config's
+/// request/holder/ladders + cert, and binding the shared direct listener) so each spawned session
+/// borrows only from an `Arc<ServeSessionCtx>` and never from the loop's stack.
+struct ServeSessionCtx {
+    request: ChannelJoinRequest,
+    holder: SigningKey,
+    role: ChannelRole,
+    own_noise_private: [u8; 32],
+    broker_addr: SocketAddr,
+    relay_addr: SocketAddr,
+    broker_ladder: Vec<ChannelDialRung>,
+    relay_ladder: Vec<ChannelDialRung>,
+    front_door_cert: Option<CertificateDer<'static>>,
+    /// Bound once (Accept + not relay-only) and cloned per session; `None` for relay-only members
+    /// (they can't be dialed directly) — those serve purely over the edge relay.
+    listener: Option<Endpoint>,
+}
+
+/// #200: present the grant to the broker and park until the edge pairs the NEXT peer, returning that
+/// peer's admission. This is the sequential part of the serve loop — only one admission is ever
+/// parked, so the pairer is never asked to hold two accepts for one channel. Mirrors the admission
+/// half of [`run_one_admission_session`], reading from the shared `Arc` instead of borrowed config.
+async fn admit_one_peer(ctx: &ServeSessionCtx) -> Result<ChannelJoinOutcome, BoxError> {
+    match &ctx.front_door_cert {
+        Some(edge_cert) => {
+            present_channel_join_via_ladder(&ctx.broker_ladder, &ctx.request, &ctx.holder, edge_cert.clone(), DIRECT_DIAL_TIMEOUT).await
         }
-        match result {
-            Ok(()) => eprintln!("ct-agent channel: peer session ended — re-admitting the next peer (#179)"),
+        None => {
+            let broker_conn = crate::transport::build_channel_dialer()?
+                .connect(ctx.broker_addr, "localhost")?
+                .await?;
+            present_channel_join(&broker_conn, &ctx.request, &ctx.holder).await
+        }
+    }
+}
+
+/// #200: run one already-admitted peer's session to completion — the SPAWNED part of the serve loop.
+/// Rebuilds the relay fallback + a fresh local app stream and clones the shared direct listener, then
+/// runs the session exactly as [`run_one_admission_session`] does. A fresh `channel_local()` per
+/// session matches the pre-existing per-session behaviour (the #179 loop rebuilt it each peer too).
+async fn serve_admitted_session(
+    ctx: std::sync::Arc<ServeSessionCtx>,
+    admission: ChannelJoinOutcome,
+) -> Result<(), BoxError> {
+    let relay = match &ctx.front_door_cert {
+        Some(edge_cert) => RelayFallback::Ladder {
+            rungs: &ctx.relay_ladder,
+            edge_cert: edge_cert.clone(),
+            direct_timeout: DIRECT_DIAL_TIMEOUT,
+        },
+        None => RelayFallback::QuicLazy(ctx.relay_addr),
+    };
+    let listener = ctx.listener.clone(); // cheap quinn handle; shared across concurrent sessions
+    let local = channel_local();
+    run_channel_join_with_admission(
+        admission,
+        relay,
+        &ctx.request,
+        &ctx.holder,
+        ctx.role,
+        &ctx.own_noise_private,
+        listener,
+        DIRECT_DIAL_TIMEOUT,
+        CHANNEL_ACCEPT_TIMEOUT,
+        local,
+    )
+    .await
+}
+
+/// #200: default number of concurrent serve sessions when `CT_CHANNEL_SERVE_CONCURRENCY` is unset —
+/// comfortably covers realistic demo concurrency (central's 5/10-at-once test) while bounding the
+/// fan-out of handler subprocesses (`claude -p`) a flood of Builds can trigger.
+const DEFAULT_SERVE_CONCURRENCY: usize = 8;
+
+/// Parse `CT_CHANNEL_SERVE_CONCURRENCY` into a concurrency cap: a positive integer overrides the
+/// default; anything absent/blank/zero/malformed falls back to [`DEFAULT_SERVE_CONCURRENCY`]. Pure.
+fn serve_concurrency_from_env(value: Option<&str>) -> usize {
+    value
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_SERVE_CONCURRENCY)
+}
+
+/// #200: drive a persistent serve member as CONCURRENT sessions. `admit` parks at the broker and
+/// returns the next paired peer's session work `W` (called sequentially — only one admission is ever
+/// in flight); `serve` runs a session to completion and is SPAWNED, so the loop returns to `admit`
+/// the next peer immediately instead of blocking on the whole session. `max` bounds in-flight
+/// sessions via a semaphore whose permit is taken BEFORE parking (backpressure: we never admit a peer
+/// we have no capacity to serve) and released when the session ends. A transient `admit` error is
+/// logged and retried after `retry_backoff`; a `serve` error is a single peer's problem, logged and
+/// dropped. Never returns under normal operation. Injectable so the concurrency contract is
+/// unit-testable without a real broker/relay.
+async fn serve_loop_concurrent<A, Fa, S, Fs, W>(
+    max: usize,
+    retry_backoff: std::time::Duration,
+    mut admit: A,
+    serve: S,
+) -> Result<(), BoxError>
+where
+    A: FnMut() -> Fa,
+    Fa: std::future::Future<Output = Result<W, BoxError>>,
+    S: Fn(W) -> Fs,
+    Fs: std::future::Future<Output = Result<(), BoxError>> + Send + 'static,
+    W: Send + 'static,
+{
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max.max(1)));
+    loop {
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("serve concurrency semaphore is never closed");
+        match admit().await {
+            Ok(work) => {
+                let fut = serve(work);
+                tokio::spawn(async move {
+                    let _permit = permit; // held for the whole session; frees a slot on drop
+                    if let Err(e) = fut.await {
+                        eprintln!("ct-agent channel: serve session ended with error (#200): {e}");
+                    }
+                });
+            }
             Err(e) => {
-                eprintln!("ct-agent channel: serve session error, re-admitting (#179): {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                drop(permit);
+                eprintln!("ct-agent channel: admission error, re-admitting (#200): {e}");
+                tokio::time::sleep(retry_backoff).await;
             }
         }
     }
@@ -3346,6 +3516,107 @@ mod tests {
         assert!(!should_serve_loop(ChannelRole::Accept, None));
         assert!(!should_serve_loop(ChannelRole::Accept, Some("0")));
         assert!(!should_serve_loop(ChannelRole::Accept, Some("false")));
+    }
+
+    #[test]
+    fn serve_concurrency_parses_the_cap_or_falls_back() {
+        // #200 (frozen): a positive integer overrides; absent/blank/zero/garbage → the default.
+        assert_eq!(serve_concurrency_from_env(Some("4")), 4);
+        assert_eq!(serve_concurrency_from_env(Some(" 16 ")), 16);
+        assert_eq!(serve_concurrency_from_env(None), DEFAULT_SERVE_CONCURRENCY);
+        assert_eq!(serve_concurrency_from_env(Some("")), DEFAULT_SERVE_CONCURRENCY);
+        assert_eq!(serve_concurrency_from_env(Some("0")), DEFAULT_SERVE_CONCURRENCY);
+        assert_eq!(serve_concurrency_from_env(Some("lots")), DEFAULT_SERVE_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn serve_loop_admits_the_next_peer_while_a_slow_session_is_still_running() {
+        // #200 (frozen) — THE regression this fixes. The old serve loop served a peer to
+        // completion before re-admitting, so a slow handler starved every concurrent Build. Here
+        // `serve` never finishes within the window; we assert the loop still admitted and STARTED
+        // all five peers concurrently (proving admission no longer waits on the prior session).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let admits = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        let a = admits.clone();
+        let admit = move || {
+            let a = a.clone();
+            async move {
+                let n = a.fetch_add(1, Ordering::SeqCst);
+                if n < 5 {
+                    Ok::<usize, BoxError>(n)
+                } else {
+                    // no more peers — park forever so the loop stops admitting
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        };
+        let st = started.clone();
+        let fi = finished.clone();
+        let serve = move |_w: usize| {
+            let st = st.clone();
+            let fi = fi.clone();
+            async move {
+                st.fetch_add(1, Ordering::SeqCst);
+                // a session that outlives the observation window (aborted at test end)
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                fi.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), BoxError>(())
+            }
+        };
+
+        // cap high so concurrency (not the cap) is what we're testing.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            serve_loop_concurrent(100, std::time::Duration::from_millis(10), admit, serve),
+        )
+        .await;
+
+        assert!(admits.load(Ordering::SeqCst) >= 5, "admitted every peer without waiting for prior sessions");
+        assert_eq!(started.load(Ordering::SeqCst), 5, "all five sessions ran concurrently");
+        assert_eq!(finished.load(Ordering::SeqCst), 0, "sessions still running — admission did not block on serve");
+    }
+
+    #[tokio::test]
+    async fn serve_loop_caps_concurrency_so_a_flood_cannot_fork_bomb() {
+        // #200 (frozen): the bounded-concurrency guard the issue asks for. With cap=2 and sessions
+        // that never finish, only two may start; the permit is taken BEFORE parking, so the loop
+        // stops admitting a third peer it has no capacity to serve (backpressure, not a dropped call).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let admits = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let a = admits.clone();
+        let admit = move || {
+            let a = a.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), BoxError>(())
+            }
+        };
+        let st = started.clone();
+        let serve = move |_w: ()| {
+            let st = st.clone();
+            async move {
+                st.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await; // never frees its permit
+                Ok::<(), BoxError>(())
+            }
+        };
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            serve_loop_concurrent(2, std::time::Duration::from_millis(10), admit, serve),
+        )
+        .await;
+
+        assert_eq!(started.load(Ordering::SeqCst), 2, "never exceeded the concurrency cap");
+        assert_eq!(admits.load(Ordering::SeqCst), 2, "backpressure stopped admitting a peer we couldn't serve");
     }
 
     #[tokio::test]
