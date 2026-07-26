@@ -1,0 +1,4 @@
+{
+  "_comment": "#201: optional override for the cookbook crew-bridge endpoint the page POSTs {prompt,image?} to. Copy to crew.json (gitignored) only if the bridge is NOT at the default same-origin /cookbook/build. The bridge streams NDJSON per-stage events (safety/structure/presentation/review) then a terminal built/rejected/error.",
+  "url": "/cookbook/build"
+}
