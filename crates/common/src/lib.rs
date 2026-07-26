@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod a2a;
 pub mod channel;
+pub mod cookbook;
 pub mod credential;
 pub mod crew;
 pub mod mcp;
