@@ -944,7 +944,7 @@ canvas{image-rendering:pixelated;max-width:100vw;max-height:100vh;box-shadow:0 0
 <canvas id="c" width="288" height="512"></canvas>
 <script>
 "use strict";
-const CONFIG = ${JSON.stringify(config)};
+const CONFIG = ${JSON.stringify(config).replace(/</g, "\\u003c")};
 const runFlappy = ${ENGINE_SRC};
 function fit(){const c=document.getElementById("c");const s=Math.min(innerWidth/288,innerHeight/512);
 c.style.width=(288*s)+"px";c.style.height=(512*s)+"px";}
