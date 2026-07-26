@@ -117,6 +117,7 @@ fn demo_auction() -> Vec<RoleAuction> {
 async fn run_cookbook_streaming(
     prompt: String,
     image: Option<String>,
+    lang: String,
     safety_cmd: String,
     structure_cmd: String,
     presentation_cmd: String,
@@ -142,7 +143,10 @@ async fn run_cookbook_streaming(
     // 2. structure (source-2) — the photo bytes travel over the channel here, as base64 in the JSON
     //    the role receives; source-2's handler decodes it to a local temp file for its own claude -p.
     emit(&tx, json!({"stage": "structure", "status": "start"})).await;
-    let structure_input = json!({"prompt": prompt, "image": image}).to_string();
+    // #201 i18n: the desired output language rides to the generating roles so the recipe text comes
+    // back in it (a German prompt yields a German recipe). safety/review are language-agnostic
+    // classifiers, so they don't need it.
+    let structure_input = json!({"prompt": prompt, "image": image, "lang": lang}).to_string();
     let structure_out = match run_cmd_async(structure_cmd, structure_input).await {
         Ok(o) => o,
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("structure role unreachable: {e}")})).await,
@@ -153,7 +157,7 @@ async fn run_cookbook_streaming(
     //    output as context. Sequential (not parallel) because of this dependency.
     emit(&tx, json!({"stage": "presentation", "status": "start"})).await;
     let structure_val: Value = serde_json::from_str(&structure_out).unwrap_or(Value::Null);
-    let presentation_input = json!({"prompt": prompt, "structure": structure_val}).to_string();
+    let presentation_input = json!({"prompt": prompt, "structure": structure_val, "lang": lang}).to_string();
     let presentation_out = match run_cmd_async(presentation_cmd, presentation_input).await {
         Ok(o) => o,
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("presentation role unreachable: {e}")})).await,
@@ -206,6 +210,8 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     }
     // Optional photo of the ingredients, base64 in the JSON payload (#201 image transport).
     let image = body.get("image").and_then(Value::as_str).map(str::to_string);
+    // #201 i18n: desired recipe language (BCP-47-ish, e.g. "en"/"de"); default English.
+    let lang = body.get("lang").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("en").to_string();
     let env = |k: &str| std::env::var(k).ok();
     let (safety, structure, presentation, review) = match (
         env("COOKBOOK_SAFETY_CMD"),
@@ -219,7 +225,7 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     // Stream NDJSON progress events as the crew runs. run_cookbook_streaming pushes lines onto the
     // channel; on any failure it emits a terminal {"stage":"error"} and the browser falls back.
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
-    tokio::spawn(run_cookbook_streaming(prompt, image, safety, structure, presentation, review, tx));
+    tokio::spawn(run_cookbook_streaming(prompt, image, lang, safety, structure, presentation, review, tx));
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
     Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -244,7 +250,7 @@ mod tests {
 
     async fn collect(prompt: &str, image: Option<String>, safety: String, structure: String, presentation: String, review: String) -> Vec<Value> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
-        let h = tokio::spawn(run_cookbook_streaming(prompt.to_string(), image, safety, structure, presentation, review, tx));
+        let h = tokio::spawn(run_cookbook_streaming(prompt.to_string(), image, "en".to_string(), safety, structure, presentation, review, tx));
         let mut evs = Vec::new();
         while let Some(chunk) = rx.recv().await {
             for line in chunk.split('\n') {

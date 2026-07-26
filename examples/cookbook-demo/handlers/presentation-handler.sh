@@ -13,13 +13,14 @@ LLM="${CT_LLM_CMD:-claude}"
 IN="$(cat)"
 PROMPT="$(printf '%s' "$IN" | jq -r '.prompt // ""' 2>/dev/null)"
 STRUCTURE="$(printf '%s' "$IN" | jq -c '.structure // {}' 2>/dev/null)"
+RLANG="$(printf '%s' "$IN" | jq -r '.lang // "en"' 2>/dev/null)"   # #201 i18n: output language
 
 SYS="You are the recipe-presentation agent. Given the user's request and the structured recipe (ingredients + steps) as JSON context, output ONLY a compact JSON object, no prose, with EXACTLY: dishName (a short, appetising on-topic name, <= 40 chars), theme (one word mood, e.g. rustic/fresh/cozy/elegant), garnish (a short finishing touch), moodDescription (one short sentence about the vibe). Match the actual recipe. Respond with the JSON object and nothing else."
 
 OUT="$($LLM -p "Request: ${PROMPT}
 Recipe (JSON): ${STRUCTURE}" --output-format text \
   --disallowedTools "Edit,Write,Bash,Read,WebFetch,WebSearch,Agent" \
-  --append-system-prompt "$SYS" 2>/dev/null)" || OUT=""
+  --append-system-prompt "$SYS Write the dishName, garnish and moodDescription in this language: $RLANG (theme stays a single English mood word). Only values are translated, not the JSON keys." 2>/dev/null)" || OUT=""
 
 JSON="$(printf '%s' "$OUT" | grep -o '{.*}' | head -1)"
 if printf '%s' "$JSON" | grep -q '"dishName"'; then

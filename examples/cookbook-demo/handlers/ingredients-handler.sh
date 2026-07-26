@@ -15,6 +15,7 @@ LLM="${CT_LLM_CMD:-claude}"
 IN="$(cat)"
 PROMPT="$(printf '%s' "$IN" | jq -r '.prompt // ""' 2>/dev/null)"
 IMG_B64="$(printf '%s' "$IN" | jq -r '.image // empty' 2>/dev/null)"
+RLANG="$(printf '%s' "$IN" | jq -r '.lang // "en"' 2>/dev/null)"   # #201 i18n: output language
 
 IMG_NOTE=""
 IMG_FILE=""
@@ -32,7 +33,7 @@ SYS="You are the recipe-structure agent. From the user's text and (if given) the
 # Read is allowed here (the image); write/exec/network tools are not.
 OUT="$($LLM -p "${IMG_NOTE}${PROMPT}" --output-format text \
   --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch,Agent" \
-  --append-system-prompt "$SYS" 2>/dev/null)" || OUT=""
+  --append-system-prompt "$SYS Write ALL output text (ingredient names, steps, etc.) in this language: $RLANG. The JSON keys stay in English; only the values are translated." 2>/dev/null)" || OUT=""
 [ -n "$IMG_FILE" ] && rm -f "$IMG_FILE"
 
 JSON="$(printf '%s' "$OUT" | grep -o '{.*}' | head -1)"

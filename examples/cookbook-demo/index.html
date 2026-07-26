@@ -45,39 +45,42 @@
 
 <!-- ===== password gate ===== -->
 <div id="gate" class="wrap">
-  <h1>🍳 Cookbook</h1>
-  <p class="sub">A recipe generator built live by a crew of cooperating AI agents over the tunnel.</p>
+  <h1 data-i18n="brand">🍳 Cookbook</h1>
+  <p class="sub" data-i18n="gatesub">A recipe generator built live by a crew of cooperating AI agents over the tunnel.</p>
   <form id="gateForm" class="panel" style="max-width:320px;margin:16px auto">
-    <input type="password" id="pw" placeholder="access password" autocomplete="off">
+    <input type="password" id="pw" placeholder="access password" data-i18n-ph="pw_ph" autocomplete="off">
     <div id="gateMsg" class="pmsg"></div>
-    <button class="btn accent" type="submit" style="margin-top:10px">Unlock</button>
+    <button class="btn accent" type="submit" style="margin-top:10px" data-i18n="unlock">Unlock</button>
   </form>
 </div>
 
 <!-- ===== studio ===== -->
 <div id="studio" class="wrap" style="display:none">
   <header style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap">
-    <div><h1>🍳 Cookbook</h1><div class="sub">Describe what's in your fridge — the crew designs a recipe.</div></div>
-    <button class="btn" id="infoBtn" title="How this works">ⓘ Info</button>
+    <div><h1 data-i18n="brand">🍳 Cookbook</h1><div class="sub" data-i18n="sub">Describe what's in your fridge — the crew designs a recipe.</div></div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="btn lang" id="langEn">EN</button><button class="btn lang" id="langDe">DE</button>
+      <button class="btn" id="infoBtn" title="How this works" data-i18n="info">ⓘ Info</button>
+    </div>
   </header>
 
   <div class="panel">
     <h2>🤖 Prompt the recipe crew</h2>
-    <textarea id="prompt" rows="3" maxlength="600" placeholder="e.g. I have eggs, spinach and feta — something quick and vegetarian"></textarea>
+    <textarea id="prompt" rows="3" maxlength="600" data-i18n-ph="prompt_ph" placeholder="e.g. I have eggs, spinach and feta — something quick and vegetarian"></textarea>
     <div class="imgrow">
-      <label class="file">📷 Add a photo of your ingredients
+      <label class="file"><span data-i18n="addphoto">📷 Add a photo of your ingredients</span>
         <input type="file" id="photo" accept="image/*" capture="environment" style="display:none">
       </label>
       <img id="thumb" alt="ingredient photo">
       <button class="btn" id="clearPhoto" style="display:none">✕ remove</button>
     </div>
-    <button class="btn accent" id="buildBtn" style="margin-top:12px">🍳 Cook up a recipe</button>
+    <button class="btn accent" id="buildBtn" style="margin-top:12px" data-i18n="cook">🍳 Cook up a recipe</button>
     <div id="promptMsg" class="pmsg"></div>
   </div>
 
   <!-- live crew screen -->
   <div class="panel" id="build">
-    <h2>The crew is cooking…</h2>
+    <h2 data-i18n="cooking">The crew is cooking…</h2>
     <div class="crew">
       <div class="member" data-role="safety"><span class="tick"></span> 🛡️ safety</div>
       <div class="member" data-role="structure"><span class="tick"></span> 🥕 source-2 · ingredients</div>
@@ -93,8 +96,8 @@
     <div class="dish" id="dishName"></div>
     <div class="mood" id="mood"></div>
     <div class="badges" id="badges"></div>
-    <h2>Ingredients</h2><ul class="ings" id="ings"></ul>
-    <h2>Steps</h2><ol class="steps" id="steps"></ol>
+    <h2 data-i18n="ingredients">Ingredients</h2><ul class="ings" id="ings"></ul>
+    <h2 data-i18n="steps">Steps</h2><ol class="steps" id="steps"></ol>
     <div class="sub" id="garnish"></div>
   </div>
 </div>
@@ -102,7 +105,7 @@
 <!-- ===== info modal ===== -->
 <div id="info" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);align-items:center;justify-content:center;padding:16px">
   <div class="panel" style="max-width:520px;max-height:80vh;overflow:auto">
-    <h2>How this recipe is built</h2>
+    <h2 data-i18n="howbuilt">How this recipe is built</h2>
     <p class="sub">You give a text prompt and (optionally) a photo of your ingredients. A crew of independent AI agents, connected over the claude-tunnel Agent-Fabric, cooperate to build the recipe:</p>
     <ul class="sub">
       <li><b>🛡️ safety</b> checks your prompt is a real cooking request.</li>
@@ -111,13 +114,61 @@
       <li><b>🧪 review</b> checks the finished recipe is safe and consistent — nothing inedible, no contradiction with your dietary constraints — before you see it.</li>
     </ul>
     <p class="sub">Each step is shown live as it happens. The operator never sees your photo or recipe — only that a channel exists between two keys.</p>
-    <button class="btn accent" id="infoClose">Got it</button>
+    <button class="btn accent" id="infoClose" data-i18n="gotit">Got it</button>
   </div>
 </div>
 
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+
+// ---- i18n (#201): EN + DE. Text nodes carry data-i18n / placeholders carry data-i18n-ph;
+// the recipe LANGUAGE also travels to the crew as `lang` so the LLM writes in the chosen tongue. ----
+const STRINGS = {
+  en: {
+    brand: "🍳 Cookbook",
+    sub: "Describe what's in your fridge — the crew designs a recipe.",
+    gatesub: "A recipe generator built live by a crew of cooperating AI agents over the tunnel.",
+    pw_ph: "access password",
+    unlock: "Unlock",
+    info: "ⓘ Info",
+    prompt_ph: "e.g. I have eggs, spinach and feta — something quick and vegetarian",
+    addphoto: "📷 Add a photo of your ingredients",
+    cook: "🍳 Cook up a recipe",
+    cooking: "The crew is cooking…",
+    ingredients: "Ingredients",
+    steps: "Steps",
+    howbuilt: "How this recipe is built",
+    gotit: "Got it",
+  },
+  de: {
+    brand: "🍳 Kochbuch",
+    sub: "Beschreibe, was in deinem Kühlschrank ist — die Crew entwirft ein Rezept.",
+    gatesub: "Ein Rezeptgenerator, live gebaut von einer Crew kooperierender KI-Agenten über den Tunnel.",
+    pw_ph: "Zugangspasswort",
+    unlock: "Entsperren",
+    info: "ⓘ Info",
+    prompt_ph: "z. B. Ich habe Eier, Spinat und Feta — etwas Schnelles, Vegetarisches",
+    addphoto: "📷 Foto der Zutaten hinzufügen",
+    cook: "🍳 Rezept kochen",
+    cooking: "Die Crew kocht…",
+    ingredients: "Zutaten",
+    steps: "Schritte",
+    howbuilt: "Wie dieses Rezept entsteht",
+    gotit: "Verstanden",
+  },
+};
+let curLang = (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
+function applyLang(lang) {
+  curLang = STRINGS[lang] ? lang : "en";
+  const t = STRINGS[curLang];
+  document.querySelectorAll("[data-i18n]").forEach((el) => { const k = el.getAttribute("data-i18n"); if (t[k] != null) el.textContent = t[k]; });
+  document.querySelectorAll("[data-i18n-ph]").forEach((el) => { const k = el.getAttribute("data-i18n-ph"); if (t[k] != null) el.setAttribute("placeholder", t[k]); });
+  document.documentElement.lang = curLang;
+  const en = $("langEn"), de = $("langDe");
+  if (en && de) { en.classList.toggle("accent", curLang === "en"); de.classList.toggle("accent", curLang === "de"); }
+  try { localStorage.setItem("cb-lang", curLang); } catch (e) {}
+}
 
 // ---- password gate (#168 pattern): only the SHA-256 of the password is served, never plaintext ----
 let GATE_HASH = null;
@@ -168,7 +219,7 @@ async function liveBuildStream(prompt, image, onEvent) {
   // well above ~55s.
   const to = setTimeout(() => ctrl.abort(), 75000);
   try {
-    const res = await fetch(CREW_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt, image }), signal: ctrl.signal });
+    const res = await fetch(CREW_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt, image, lang: curLang }), signal: ctrl.signal });
     if (!res.ok || !res.body) throw new Error("cookbook bridge " + res.status);
     const reader = res.body.getReader(); const dec = new TextDecoder();
     let buf = "", terminal = null;
@@ -254,6 +305,12 @@ $("buildBtn").addEventListener("click", async () => {
 $("infoBtn").addEventListener("click", () => $("info").style.display = "flex");
 $("infoClose").addEventListener("click", () => $("info").style.display = "none");
 $("info").addEventListener("click", (e) => { if (e.target === $("info")) $("info").style.display = "none"; });
+
+// ---- language toggle (#201): restore a saved choice, else navigator.language default ----
+try { const saved = localStorage.getItem("cb-lang"); if (saved) curLang = saved; } catch (e) {}
+$("langEn").addEventListener("click", () => applyLang("en"));
+$("langDe").addEventListener("click", () => applyLang("de"));
+applyLang(curLang);
 </script>
 </body>
 </html>
