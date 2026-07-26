@@ -68,8 +68,12 @@
     <h2>🤖 Prompt the recipe crew</h2>
     <textarea id="prompt" rows="3" maxlength="600" data-i18n-ph="prompt_ph" placeholder="e.g. I have eggs, spinach and feta — something quick and vegetarian"></textarea>
     <div class="imgrow">
-      <label class="file"><span data-i18n="addphoto">📷 Add a photo of your ingredients</span>
-        <input type="file" id="photo" accept="image/*" capture="environment" style="display:none">
+      <label class="file"><span data-i18n="addphoto">📷 Add a photo — camera or gallery</span>
+        <!-- #201: NO `capture` attribute — with capture="environment" mobile browsers force the rear
+             camera and hide the file picker. Plain accept="image/*" shows the OS chooser (Take Photo /
+             Photo Library / Browse), so the ingredients photo can come from the CAMERA or the
+             GALLERY / filesystem. -->
+        <input type="file" id="photo" accept="image/*" style="display:none">
       </label>
       <img id="thumb" alt="ingredient photo">
       <button class="btn" id="clearPhoto" style="display:none">✕ remove</button>
@@ -133,7 +137,7 @@ const STRINGS = {
     unlock: "Unlock",
     info: "ⓘ Info",
     prompt_ph: "e.g. I have eggs, spinach and feta — something quick and vegetarian",
-    addphoto: "📷 Add a photo of your ingredients",
+    addphoto: "📷 Add a photo — camera or gallery",
     cook: "🍳 Cook up a recipe",
     cooking: "The crew is cooking…",
     ingredients: "Ingredients",
@@ -149,7 +153,7 @@ const STRINGS = {
     unlock: "Entsperren",
     info: "ⓘ Info",
     prompt_ph: "z. B. Ich habe Eier, Spinat und Feta — etwas Schnelles, Vegetarisches",
-    addphoto: "📷 Foto der Zutaten hinzufügen",
+    addphoto: "📷 Foto hinzufügen — Kamera oder Galerie",
     cook: "🍳 Rezept kochen",
     cooking: "Die Crew kocht…",
     ingredients: "Zutaten",
