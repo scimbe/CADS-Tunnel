@@ -1598,7 +1598,20 @@ fn run_service_handler_with_timeout(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        // #206: every shipped handler script unconditionally prints either its real result or a
+        // fallback on every code path — an exit-0-with-empty-stdout result is never a legitimate
+        // success, only a process torn down externally (e.g. OOM) between spawn and its final print,
+        // after this function's own timeout-kill path (which returns Err before reaching here). Left
+        // untreated, the empty string flows on as a "successful" fragment and produces a cryptic
+        // downstream `serde_json` "EOF while parsing a value" instead of an honest, attributable error.
+        return Err(format!(
+            "service handler exited {} but produced no output (killed mid-run?)",
+            output.status
+        ));
+    }
+    Ok(stdout)
 }
 
 /// [`run_service_handler_with_timeout`] bound to the real [`SERVICE_HANDLER_TIMEOUT`] — the seam
@@ -3721,6 +3734,24 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "the call returns promptly after the timeout, not after the child's own 30s sleep: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_service_handler_errors_instead_of_silently_succeeding_on_empty_stdout() {
+        // #206 (frozen): every shipped handler script (ingredients/presentation/art/physics) prints
+        // either its real result or a hardcoded fallback on EVERY code path, under `set -uo pipefail`
+        // (no `-e`) specifically so an internal failure still reaches one of those prints. So exit-0
+        // with empty stdout is never a legitimate handler result — only a process torn down externally
+        // between spawn and its final print (this function's own timeout path already returns Err
+        // before ever reaching here, so it can't be the source). Before this fix, `Ok("")` flowed on as
+        // a "successful" fragment and blew up downstream as a cryptic `serde_json` "EOF while parsing a
+        // value" instead of an honest, attributable error at the source.
+        use ct_common::channel::ServiceType::CodeGeneration;
+        let err = run_service_handler("true", CodeGeneration, "x").unwrap_err();
+        assert!(
+            err.contains("no output"),
+            "empty-but-successful stdout must be reported as an error, got: {err}"
         );
     }
 
