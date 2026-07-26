@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
           target/release/ct-control-plane target/release/cp_selftest \
           target/release/metrics_probe target/release/udp_echo \
           target/release/quic_echo target/release/direct_bench \
-          target/release/ct-crew-bridge /build/bin/
+          target/release/ct-crew-bridge target/release/ct-cookbook-bridge /build/bin/
 
 FROM debian:bookworm-slim AS runtime
 # iproute2 for tc/netem inside the node containers; ca-certificates is harmless.
@@ -54,6 +54,8 @@ COPY --from=builder /build/bin/quic_echo /usr/local/bin/quic_echo
 COPY --from=builder /build/bin/direct_bench /usr/local/bin/direct_bench
 # #173 flappy-demo crew: the HTTP bridge the demo's Caddy origin reverse-proxies /crew/build to.
 COPY --from=builder /build/bin/ct-crew-bridge /usr/local/bin/ct-crew-bridge
+# #201 cookbook-demo crew: the HTTP bridge for /cookbook/build.
+COPY --from=builder /build/bin/ct-cookbook-bridge /usr/local/bin/ct-cookbook-bridge
 COPY docker/netem-entrypoint.sh /usr/local/bin/netem-entrypoint.sh
 RUN chmod +x /usr/local/bin/netem-entrypoint.sh
 CMD ["ct-edge"]

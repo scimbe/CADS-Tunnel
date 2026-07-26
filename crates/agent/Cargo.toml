@@ -42,6 +42,12 @@ required-features = ["nat-lab"]
 name = "ct-crew-bridge"
 path = "src/bin/crew_bridge.rs"
 
+# #201: the cookbook-demo crew HTTP bridge (POST /cookbook/build → safety→structure→presentation,
+# assembled via ct_common::cookbook). Shares run_cmd/streaming with ct-crew-bridge via ct_agent::bridge.
+[[bin]]
+name = "ct-cookbook-bridge"
+path = "src/bin/cookbook_bridge.rs"
+
 [dev-dependencies]
 # test-util enables `#[tokio::test(start_paused = true)]` for deterministic timeout tests (#126).
 tokio = { version = "1", features = ["test-util"] }
