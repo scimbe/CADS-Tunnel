@@ -3495,7 +3495,14 @@ mod tests {
     const TEST_WEBHOOK_SECRET: &[u8] = b"whsec_unified_test";
 
     async fn spawn_unified(db_path: &str) -> String {
-        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, None).unwrap();
+        // #194: the production router fail-closes the client-supplied-account billing writers
+        // (/accounts/open, /payment/intent, /billing/issue) when no admin token is configured. This
+        // E2E restart test legitimately drives them (open_account / buy_token) to prove billing
+        // persists across a restart, so mount the OPEN (ungated) writers here against the SAME db —
+        // test-only, and no route conflict since the production router mounts none without a token.
+        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, None)
+            .unwrap()
+            .merge(billing_writers_gated(std::sync::Arc::new(SqliteLedger::open(db_path).unwrap()), None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
