@@ -1556,6 +1556,7 @@ fn run_service_handler_with_timeout(
     input: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let slug = match service {
         ct_common::channel::ServiceType::CodeGeneration => "code_generation",
@@ -1570,6 +1571,11 @@ fn run_service_handler_with_timeout(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // #183: put the child in its OWN process group (pgid == its pid) so the timeout kill below can
+        // signal the WHOLE subtree, not just the immediate `sh -c`. The handler scripts shell out to a
+        // real LLM CLI as a GRANDCHILD; killing only the `sh` pid leaves an orphaned (costed, running)
+        // LLM subprocess whenever the script pipes/backgrounds, defeating SERVICE_HANDLER_TIMEOUT.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("service handler spawn failed: {e}"))?;
     let pid = child.id();
@@ -1598,7 +1604,13 @@ fn run_service_handler_with_timeout(
     let output = match rx.recv_timeout(timeout) {
         Ok(result) => result.map_err(|e| format!("service handler wait failed: {e}"))?,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            // #183: kill the whole process GROUP so a grandchild (the LLM CLI) can't survive the
+            // timeout as an orphan. `process_group(0)` above made pgid == pid, and a NEGATIVE pid to
+            // kill(2) signals every process in that group. Done via libc, not `Command::new("kill")`:
+            // minimal images ship no `kill` binary, so the old spawn silently no-op'd there.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
             return Err(format!(
                 "service handler timed out after {}s (pid {pid} killed)",
                 timeout.as_secs()
@@ -3700,6 +3712,43 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "the call returns promptly after the timeout, not after the child's own 30s sleep: {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group_not_just_the_immediate_child() {
+        // #183 Finding 1 (frozen): the handler scripts shell out to a real LLM CLI as a GRANDCHILD of
+        // the `sh -c`. Killing only the `sh` pid on timeout leaves a backgrounded grandchild running
+        // (costed, unbounded) as an orphan. This handler BACKGROUNDS a grandchild that would create a
+        // marker file AFTER a sleep, while the foreground `sh` sleeps so the call times out. With a
+        // process-GROUP kill the grandchild dies too and the marker never appears; the pre-fix
+        // single-pid kill would let it survive and touch the marker. Distinguishes the fix, not just
+        // the current behaviour.
+        use ct_common::channel::ServiceType::TextGeneration;
+        let marker = std::env::temp_dir().join(format!(
+            "ct-183-pgkill-{}-{:?}.marker",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let m = marker.to_string_lossy().replace('\'', "");
+        // background grandchild: after 4s, touch the marker; foreground sleeps so the call times out.
+        let cmd = format!("(sleep 4; : > '{m}') & sleep 4");
+        let err = run_service_handler_with_timeout(
+            &cmd,
+            TextGeneration,
+            "",
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "expected a timeout error, got: {err}");
+        // Wait past the grandchild's own 4s sleep; if the group kill worked, the marker never appears.
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(
+            !survived,
+            "a backgrounded grandchild survived the timeout kill — the process group was not killed (#183)"
         );
     }
 

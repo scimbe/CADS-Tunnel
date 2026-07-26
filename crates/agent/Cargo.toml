@@ -23,6 +23,10 @@ base64 = "0.22"
 libp2p = { workspace = true }
 libp2p-stream = { workspace = true }
 tokio-util = { workspace = true }
+# #183: process-group kill on service-handler timeout — a negative pid to kill(2) signals the whole
+# group, so a grandchild LLM CLI can't survive as an orphan. Done via libc (there is no dependable
+# `kill` binary in minimal images; the old `Command::new("kill")` silently no-op'd there).
+libc = "0.2"
 
 [features]
 # #136 N-rig-2b: build the TEST-ONLY natlab harness binary (the Docker 2-NAT DCUtR punch

@@ -488,6 +488,7 @@ dependencies = [
  "ct-edge",
  "ed25519-dalek",
  "http-body-util",
+ "libc",
  "libp2p",
  "libp2p-stream",
  "quinn",

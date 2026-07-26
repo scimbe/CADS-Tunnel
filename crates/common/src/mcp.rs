@@ -369,6 +369,15 @@ fn service_slug(service: crate::channel::ServiceType) -> &'static str {
 /// priority slot), which is what makes a schema-typed task far harder to jailbreak than an open chat
 /// endpoint, and a service the offer doesn't declare is simply never exposed. `handler(service, input)`
 /// runs the typed task (the agent's actual LLM call); its `Err` becomes a JSON-RPC tool error.
+/// #183: the largest `input` a single `service/<slug>` call may carry. A legitimate-but-abusive
+/// channel member (already past the crypto/membership gate) could otherwise send an arbitrarily large
+/// `input`, growing memory server-side (the JSON-RPC request, the `String` copy, and the handler's own
+/// `"$(cat)"` buffer are all unbounded) and — for an LLM-backed handler — driving an arbitrarily large,
+/// costed prompt. Capping at the dispatch boundary rejects it with a clean JSON-RPC error before any
+/// subprocess is spawned. 4 MiB comfortably fits a resized cookbook ingredient photo (the client caps
+/// it at 1024px JPEG → a few hundred KB of base64) while bounding abuse.
+pub const MAX_SERVICE_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
 pub fn register_service_tools(
     reg: &mut ToolRegistry,
     services: &[crate::channel::ServiceType],
@@ -386,6 +395,14 @@ pub fn register_service_tools(
                     .get("input")
                     .and_then(Value::as_str)
                     .ok_or("this service requires a string `input` (fixed schema — no free-form slot)")?;
+                // #183: bound the input BEFORE it reaches the handler subprocess.
+                if input.len() > MAX_SERVICE_INPUT_BYTES {
+                    return Err(format!(
+                        "service `input` too large: {} bytes exceeds the {}-byte cap (#183)",
+                        input.len(),
+                        MAX_SERVICE_INPUT_BYTES
+                    ));
+                }
                 let output = h(service, input)?;
                 Ok(json!({ "output": output }))
             },
@@ -713,6 +730,36 @@ mod tests {
         let none = call(&reg, json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": { "name": "service/safety_check", "arguments": { "input": "x" } } }));
         assert!(none.error.is_some(), "an undeclared service is not exposed");
+    }
+
+    #[test]
+    fn service_tool_rejects_oversized_input() {
+        // #183 Finding 2 (frozen): a legitimate-but-abusive member could send an arbitrarily large
+        // `input`; it is capped at the dispatch boundary with a clean JSON-RPC error BEFORE it ever
+        // reaches the handler subprocess. Just-under passes, just-over is refused.
+        use crate::channel::ServiceType;
+        let mut reg = default_registry();
+        register_service_tools(&mut reg, &[ServiceType::TextGeneration], |_s, input| {
+            Ok(format!("len={}", input.len()))
+        });
+
+        // At the cap → allowed (the handler runs).
+        let at = "x".repeat(MAX_SERVICE_INPUT_BYTES);
+        let ok = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "service/text_generation", "arguments": { "input": at } } }));
+        assert!(ok.error.is_none(), "input exactly at the cap is accepted");
+        assert_eq!(ok.result.unwrap()["output"], json!(format!("len={}", MAX_SERVICE_INPUT_BYTES)));
+
+        // One byte over the cap → refused, and the handler never runs.
+        let over = "x".repeat(MAX_SERVICE_INPUT_BYTES + 1);
+        let bad = call(&reg, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "service/text_generation", "arguments": { "input": over } } }));
+        let err = bad.error.expect("oversized input is refused");
+        assert!(
+            err.message.contains("too large"),
+            "the refusal names the size cap (#183): {}",
+            err.message
+        );
     }
 
     #[test]
