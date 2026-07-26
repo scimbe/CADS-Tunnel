@@ -16,6 +16,13 @@ set -eu
 #     and fine-grained PATs (github_pat_ + long) — this repo's primary credential
 #     (.mcp.json injects ${GITHUB_PERSONAL_ACCESS_TOKEN}; every gh call uses it).
 pattern='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[oprsu]_[0-9A-Za-z]{36}|github_pat_[0-9A-Za-z_]{30,}'
+# #198: this project's OWN primary credential shape — a raw 64-hex (32-byte) ed25519/X25519 private
+# scalar assigned to a SECRET channel key env var (CT_CHANNEL_HOLDER/NOISE/OPERATOR_KEY, from
+# `ct-agent channel init`). Anchored to the var name (with `=`/`:`, optional quotes) so it catches a
+# real committed key assignment WITHOUT false-positiving on the codebase's many bare 64-hex values —
+# SHA-256 hashes, test vectors (which are separate `hk = "…"` variables, not `VAR=<hex>` literals),
+# commit refs. Verified 0 matches across the current tree.
+pattern="$pattern|CT_CHANNEL_(HOLDER|NOISE|OPERATOR)_KEY[\"']?[[:space:]]*[=:][[:space:]]*[\"']?[0-9a-fA-F]{64}"
 
 # Self-test (#79 regression guard): prove the pattern catches each credential shape
 # and does not false-positive on benign text. Synthetic placeholders only — this
@@ -29,13 +36,19 @@ if [ "${1:-}" = "--selftest" ]; then
     'github_pat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
     'AKIAAAAAAAAAAAAAAAAA' \
     'AIzaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
-    '-----BEGIN RSA PRIVATE KEY-----'
+    '-----BEGIN RSA PRIVATE KEY-----' \
+    'CT_CHANNEL_HOLDER_KEY=9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0' \
+    'export CT_CHANNEL_NOISE_KEY="9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0"'
   do
     printf '%s\n' "$s" | grep -Eq -e "$pattern" || { echo "SELFTEST FAIL: pattern missed a credential shape: $s"; rc=1; }
   done
   printf 'a benign line that mentions a secret token value in prose\n' | grep -Eq -e "$pattern" \
     && { echo "SELFTEST FAIL: false positive on benign text"; rc=1; }
-  [ "$rc" -eq 0 ] && echo "SELFTEST OK: PEM/AWS/Google/GitHub-token shapes all detected, no false positive"
+  # #198: a BARE 64-hex value not anchored to a secret key var (a SHA-256 hash, a test vector) must
+  # NOT trip — else every push would false-positive on the codebase's many hashes/test keys.
+  printf 'gate.json sha256 = a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n' \
+    | grep -Eq -e "$pattern" && { echo "SELFTEST FAIL: false positive on a bare 64-hex hash (#198)"; rc=1; }
+  [ "$rc" -eq 0 ] && echo "SELFTEST OK: PEM/AWS/Google/GitHub + raw channel-key shapes detected, no false positive"
   exit "$rc"
 fi
 
