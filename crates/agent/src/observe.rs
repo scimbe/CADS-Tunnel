@@ -37,6 +37,16 @@ async fn render(State(metrics): State<Arc<TunnelMetrics>>) -> impl IntoResponse 
 /// Bind `listen` and serve the metrics endpoint until the process exits.
 pub async fn serve_metrics(listen: SocketAddr, metrics: Arc<TunnelMetrics>) -> Result<(), BoxError> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    serve_metrics_on(listener, metrics).await
+}
+
+/// Serve the metrics scrape on an ALREADY-bound listener. Lets a caller (e.g. a test) bind the port
+/// itself and keep the binding, avoiding the bind-`:0` → drop → re-bind TOCTOU race that made the
+/// scrape test flaky under parallel load.
+pub async fn serve_metrics_on(
+    listener: tokio::net::TcpListener,
+    metrics: Arc<TunnelMetrics>,
+) -> Result<(), BoxError> {
     axum::serve(listener, metrics_router(metrics)).await?;
     Ok(())
 }
@@ -112,12 +122,13 @@ mod tests {
 
         let metrics = Arc::new(TunnelMetrics::new());
         metrics.tunnels_opened.add(5);
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe); // free the port for serve_metrics to bind
+        // Bind the listener ONCE and hand it to serve_metrics_on — no drop-then-rebind, so there's no
+        // TOCTOU window for another process to grab the port (the source of this test's flakiness).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let m = Arc::clone(&metrics);
-        let server = tokio::spawn(async move { serve_metrics(addr, m).await });
+        let server = tokio::spawn(async move { serve_metrics_on(listener, m).await });
 
         // serve_metrics binds asynchronously; retry briefly until it answers.
         let mut resp = String::new();

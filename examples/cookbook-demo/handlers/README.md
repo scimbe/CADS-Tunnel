@@ -32,11 +32,16 @@ The bridge runs them **sequentially**: `safety → structure → presentation �
 Same recipe as the flappy handlers, with the cookbook service env:
 
 ```bash
-CT_AGENT_OFFER_SERVICES=text_generation \
 CT_AGENT_SERVICE_HANDLER_CMD="$PWD/ingredients-handler.sh" \
+CT_AGENT_SERVICES=text_generation \
 CT_CHANNEL_SERVE=1 \
   ct-agent channel <join args…>          # source-2 = ingredients; sink = presentation
 ```
 
 Point `CT_LLM_CMD` at your non-interactive LLM CLI (default `claude`). The safety + review agents
 serve `safety_check`; structure + presentation serve `text_generation`.
+
+> **Use `CT_AGENT_SERVICES` — NOT `CT_AGENT_OFFER_SERVICES`.** The latter only feeds the #147
+> marketplace *offer* catalog; alone it registers **zero** `service/<slug>` tools, so every call
+> fails `unknown tool 'service/<slug>'` (the #203 trap). `CT_AGENT_SERVICES` is what registers the
+> served tools; see the flappy handlers README for the full offer-vs-serve note.

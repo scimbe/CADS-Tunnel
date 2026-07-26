@@ -13,21 +13,27 @@ bridge parses (`ct_common::crew` + `crew_build_over`).
 
 ## How an agent serves its role
 
-On the agent host, run a channel-serving process that offers the service and points the handler at
-these scripts (the `#173` sink/source-2 lane):
+On the agent host, run a channel-serving process that points the handler at these scripts (the
+`#173` sink/source-2 lane):
 
 ```bash
 CT_CHANNEL_HOLDER_KEY=<agent holder key hex> \
-CT_AGENT_OFFER_SERVICES=text_generation \
-CT_AGENT_OFFER_KIND=cloud CT_AGENT_OFFER_MODELS=<model> \
-CT_AGENT_OFFER_UNITS=100 CT_AGENT_OFFER_MIN_PRICE=1 CT_AGENT_OFFER_CURRENCY=ct-llm-token-chain \
 CT_AGENT_SERVICE_HANDLER_CMD="$PWD/physics-handler.sh" \
+CT_AGENT_SERVICES=text_generation \
 CT_CHANNEL_SERVE=1 \
   ct-agent channel <join args…>          # source-2: physics-handler.sh; sink: art-handler.sh
 ```
 
-The safety agent serves `safety_check` the same way (`CT_AGENT_OFFER_SERVICES` including
-`safety_check`, `CT_AGENT_SERVICE_HANDLER_CMD=$PWD/safety-check-handler.sh`).
+The safety agent serves `safety_check` the same way (`CT_AGENT_SERVICES=safety_check`,
+`CT_AGENT_SERVICE_HANDLER_CMD=$PWD/safety-check-handler.sh`).
+
+> **Use `CT_AGENT_SERVICES` — NOT `CT_AGENT_OFFER_SERVICES` — to register the served
+> `service/<slug>` tools.** `CT_AGENT_OFFER_SERVICES` only feeds the #147 marketplace *offer*
+> catalog; setting it **alone** (without a full `CT_AGENT_OFFER_KIND/MODELS/UNITS/MIN_PRICE/CURRENCY`
+> offer) registers **zero** tools, so every call fails `unknown tool 'service/<slug>'` — the exact
+> trap behind #203. To *also* advertise capacity in the marketplace, add the full `CT_AGENT_OFFER_*`
+> block; then `CT_AGENT_SERVICES` (when set) is filtered to the offer's declared catalog (#167), and
+> if `CT_AGENT_SERVICES` is unset the offer's catalog is used. `CT_AGENT_SERVICES` alone always works.
 
 ## The LLM call
 
