@@ -4,8 +4,12 @@ target/
 .claude/
 .claude-flow/
 .swarm/
-docs/
+docs/**
 ruvector.db
 agentdb.rvf
 agentdb.rvf.lock
 *.md
+# #174 fix: the control plane embeds this one doc via include_str! (served at /llms.txt), so it MUST
+# be in the build context. `docs/**` (not `docs/`) keeps the dir traversable so this re-include works
+# even though the rest of docs/ (and all *.md) stays excluded; placed LAST so it overrides both.
+!docs/agent-onboarding.md
