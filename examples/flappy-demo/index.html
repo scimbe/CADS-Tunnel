@@ -500,7 +500,15 @@ function runFlappy(canvas, CONFIG) {
   function onInput(e) { e.preventDefault(); flap(); }
   canvas.addEventListener("mousedown", onInput);
   canvas.addEventListener("touchstart", onInput, { passive: false });
-  const keyh = (e) => { if (e.code === "Space" || e.key === " ") { e.preventDefault(); flap(); } };
+  const keyh = (e) => {
+    // #185: don't hijack Space (flap) while the user is typing in a text field — the studio's prompt
+    // box is a textarea, and eating its spaces turned "a hard night" into "ahardnight". Only flap
+    // when focus isn't in an input/textarea/contenteditable (the standalone game has none, so this
+    // is a harmless no-op there).
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    if (e.code === "Space" || e.key === " ") { e.preventDefault(); flap(); }
+  };
   window.addEventListener("keydown", keyh);
   reset(); raf = requestAnimationFrame(loop);
   // return a disposer so the studio can restart cleanly with new params
