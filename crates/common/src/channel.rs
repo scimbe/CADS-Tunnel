@@ -1288,37 +1288,34 @@ impl AgentCard {
         issued_at: UnixSeconds,
         expires_at: UnixSeconds,
     ) -> Vec<u8> {
-        fn put_str(m: &mut Vec<u8>, s: &str) {
-            m.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            m.extend_from_slice(s.as_bytes());
-        }
-        let mut m = Vec::new();
-        m.extend_from_slice(AGENT_CARD_DOMAIN);
-        m.extend_from_slice(holder_pubkey);
-        m.extend_from_slice(&(role_tags.len() as u32).to_le_bytes());
+        // #184: DOMAIN ‖ holder ‖ ⟨role_tags⟩ ‖ ⟨skills⟩ ‖ ⟨cells⟩ ‖ ⟨channels⟩ ‖ issued_at ‖ expires_at,
+        // each sequence a u32-LE count then its elements, each string u32-LE-length-prefixed
+        // (var_bytes) — byte-identical to the prior put_str form.
+        let mut p = Preimage::new(AGENT_CARD_DOMAIN)
+            .fixed(holder_pubkey)
+            .u32(role_tags.len() as u32);
         for t in role_tags {
-            put_str(&mut m, t);
+            p = p.var_bytes(t.as_bytes());
         }
-        m.extend_from_slice(&(skills.len() as u32).to_le_bytes());
+        p = p.u32(skills.len() as u32);
         for s in skills {
-            put_str(&mut m, &s.id);
-            put_str(&mut m, &s.description);
-            m.extend_from_slice(&(s.examples.len() as u32).to_le_bytes());
+            p = p
+                .var_bytes(s.id.as_bytes())
+                .var_bytes(s.description.as_bytes())
+                .u32(s.examples.len() as u32);
             for e in &s.examples {
-                put_str(&mut m, e);
+                p = p.var_bytes(e.as_bytes());
             }
         }
-        m.extend_from_slice(&(cells.len() as u32).to_le_bytes());
+        p = p.u32(cells.len() as u32);
         for c in cells {
-            m.extend_from_slice(&c.0);
+            p = p.fixed(&c.0);
         }
-        m.extend_from_slice(&(channels.len() as u32).to_le_bytes());
+        p = p.u32(channels.len() as u32);
         for ch in channels {
-            m.extend_from_slice(&ch.0);
+            p = p.fixed(&ch.0);
         }
-        m.extend_from_slice(&issued_at.to_le_bytes());
-        m.extend_from_slice(&expires_at.to_le_bytes());
-        m
+        p.u64(issued_at).u64(expires_at).finish()
     }
 
     /// Whether this card is authentic AND still current at `now`: the holder signature verifies for
@@ -1517,28 +1514,26 @@ impl CapacityOffer {
         expires_at: UnixSeconds,
         services: &[ServiceType],
     ) -> Vec<u8> {
-        fn put_str(m: &mut Vec<u8>, s: &str) {
-            m.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            m.extend_from_slice(s.as_bytes());
-        }
-        let mut m = Vec::new();
-        m.extend_from_slice(CAPACITY_OFFER_DOMAIN);
-        m.extend_from_slice(holder_pubkey);
-        m.push(kind.tag());
-        m.extend_from_slice(&(models.len() as u32).to_le_bytes());
+        // #184: DOMAIN ‖ holder ‖ kind.tag ‖ ⟨models⟩ ‖ units ‖ min_price ‖ currency ‖ issued ‖ expires
+        // ‖ ⟨service tags⟩ — byte-identical to the prior put_str form (u32-LE counts, var_bytes strings).
+        let mut p = Preimage::new(CAPACITY_OFFER_DOMAIN)
+            .fixed(holder_pubkey)
+            .tag(kind.tag())
+            .u32(models.len() as u32);
         for model in models {
-            put_str(&mut m, model);
+            p = p.var_bytes(model.as_bytes());
         }
-        m.extend_from_slice(&units_available.to_le_bytes());
-        m.extend_from_slice(&min_price.to_le_bytes());
-        put_str(&mut m, currency_id);
-        m.extend_from_slice(&issued_at.to_le_bytes());
-        m.extend_from_slice(&expires_at.to_le_bytes());
-        m.extend_from_slice(&(services.len() as u32).to_le_bytes());
+        p = p
+            .u64(units_available)
+            .u64(min_price)
+            .var_bytes(currency_id.as_bytes())
+            .u64(issued_at)
+            .u64(expires_at)
+            .u32(services.len() as u32);
         for service in services {
-            m.push(service.tag());
+            p = p.tag(service.tag());
         }
-        m
+        p.finish()
     }
 
     /// Whether this offer is authentic AND still current at `now`: the holder signature verifies for its
@@ -1715,19 +1710,19 @@ impl UsageReceipt {
         request_hash: &[u8; 32],
         response_hash: &[u8; 32],
     ) -> Vec<u8> {
-        let mut m = Vec::new();
-        m.extend_from_slice(USAGE_RECEIPT_DOMAIN);
-        m.extend_from_slice(provider);
-        m.extend_from_slice(consumer);
-        m.push(kind.tag());
-        m.extend_from_slice(&(model.len() as u32).to_le_bytes());
-        m.extend_from_slice(model.as_bytes());
-        m.extend_from_slice(&units_consumed.to_le_bytes());
-        m.extend_from_slice(match_ref);
-        m.extend_from_slice(&issued_at.to_le_bytes());
-        m.extend_from_slice(request_hash);
-        m.extend_from_slice(response_hash);
-        m
+        // #184: DOMAIN ‖ provider ‖ consumer ‖ kind.tag ‖ model ‖ units ‖ match_ref ‖ issued ‖
+        // request_hash ‖ response_hash — byte-identical (model is u32-LE-length-prefixed via var_bytes).
+        Preimage::new(USAGE_RECEIPT_DOMAIN)
+            .fixed(provider)
+            .fixed(consumer)
+            .tag(kind.tag())
+            .var_bytes(model.as_bytes())
+            .u64(units_consumed)
+            .fixed(match_ref)
+            .u64(issued_at)
+            .fixed(request_hash)
+            .fixed(response_hash)
+            .finish()
     }
 
     /// Whether this is an authentic co-signed proof: **both** the provider signature (against
@@ -1955,25 +1950,21 @@ impl CapacityBid {
         terms_ack: &[u8; 32],
         service: Option<ServiceType>,
     ) -> Vec<u8> {
-        let mut m = Vec::new();
-        m.extend_from_slice(CAPACITY_BID_DOMAIN);
-        m.extend_from_slice(bidder);
-        m.push(kind.tag());
-        m.extend_from_slice(&(model.len() as u32).to_le_bytes());
-        m.extend_from_slice(model.as_bytes());
-        m.extend_from_slice(&units.to_le_bytes());
-        m.extend_from_slice(&total_price.to_le_bytes());
-        m.extend_from_slice(&issued_at.to_le_bytes());
-        m.extend_from_slice(&expires_at.to_le_bytes());
-        m.extend_from_slice(terms_ack);
+        // #184: DOMAIN ‖ bidder ‖ kind.tag ‖ model ‖ units ‖ total_price ‖ issued ‖ expires ‖ terms_ack
+        // ‖ optional service (present: 0x01 ‖ tag ; absent: 0x00) — byte-identical to the prior form.
+        let p = Preimage::new(CAPACITY_BID_DOMAIN)
+            .fixed(bidder)
+            .tag(kind.tag())
+            .var_bytes(model.as_bytes())
+            .u64(units)
+            .u64(total_price)
+            .u64(issued_at)
+            .u64(expires_at)
+            .fixed(terms_ack);
         match service {
-            Some(s) => {
-                m.push(1);
-                m.push(s.tag());
-            }
-            None => m.push(0),
+            Some(s) => p.tag(1).tag(s.tag()).finish(),
+            None => p.tag(0).finish(),
         }
-        m
     }
 
     /// Whether the bid is authentic and still current at `now` (signature verifies, `now < expires_at`).
@@ -2551,6 +2542,116 @@ mod tests {
         e.extend_from_slice(topo.as_bytes());
         e.extend_from_slice(&a);
         assert_eq!(topology_operator_binding_bytes(topo, &a), e, "topology_operator_binding preimage drifted");
+    }
+
+    #[test]
+    fn signing_bytes_golden_vectors_variable_length_are_byte_identical_184_slice3() {
+        // #184 slice 3 (frozen): the VARIABLE-length preimages — where the length-prefix variants
+        // lived — pinned byte-for-byte, with MULTIBYTE strings + multi-element sequences so the u32
+        // length prefixes are exercised as BYTE lengths, not char counts. A drift here silently breaks
+        // every card/offer/bid/receipt signature.
+        fn put_str(m: &mut Vec<u8>, s: &str) {
+            m.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            m.extend_from_slice(s.as_bytes());
+        }
+        let h = [0x11u8; 32];
+
+        // AgentCard: DOMAIN ‖ holder ‖ ⟨role_tags⟩ ‖ ⟨skills⟩ ‖ ⟨cells⟩ ‖ ⟨channels⟩ ‖ issued ‖ expires
+        let roles = vec!["α".to_string(), "b".to_string()]; // α = 2 UTF-8 bytes
+        let skills = vec![Skill {
+            id: "s1".to_string(),
+            description: "δ".to_string(),
+            examples: vec!["e1".to_string(), "é".to_string()],
+        }];
+        let cells = vec![CellId([0x22; 32])];
+        let chans = vec![ChannelId([0x33; 32])];
+        let mut e = Vec::new();
+        e.extend_from_slice(AGENT_CARD_DOMAIN);
+        e.extend_from_slice(&h);
+        e.extend_from_slice(&2u32.to_le_bytes());
+        put_str(&mut e, "α");
+        put_str(&mut e, "b");
+        e.extend_from_slice(&1u32.to_le_bytes());
+        put_str(&mut e, "s1");
+        put_str(&mut e, "δ");
+        e.extend_from_slice(&2u32.to_le_bytes());
+        put_str(&mut e, "e1");
+        put_str(&mut e, "é");
+        e.extend_from_slice(&1u32.to_le_bytes());
+        e.extend_from_slice(&cells[0].0);
+        e.extend_from_slice(&1u32.to_le_bytes());
+        e.extend_from_slice(&chans[0].0);
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(AgentCard::signing_bytes(&h, &roles, &skills, &cells, &chans, 7, 9), e, "AgentCard preimage drifted");
+
+        // CapacityOffer: DOMAIN ‖ holder ‖ kind.tag ‖ ⟨models⟩ ‖ units ‖ min ‖ currency ‖ issued ‖ expires ‖ ⟨svc tags⟩
+        let models = vec!["m1".to_string(), "µ".to_string()];
+        let svcs = vec![ServiceType::CodeGeneration, ServiceType::SafetyCheck];
+        let mut e = Vec::new();
+        e.extend_from_slice(CAPACITY_OFFER_DOMAIN);
+        e.extend_from_slice(&h);
+        e.push(CapacityKind::CloudApiQuota.tag());
+        e.extend_from_slice(&2u32.to_le_bytes());
+        put_str(&mut e, "m1");
+        put_str(&mut e, "µ");
+        e.extend_from_slice(&100u64.to_le_bytes());
+        e.extend_from_slice(&50u64.to_le_bytes());
+        put_str(&mut e, "€");
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&9u64.to_le_bytes());
+        e.extend_from_slice(&2u32.to_le_bytes());
+        e.push(ServiceType::CodeGeneration.tag());
+        e.push(ServiceType::SafetyCheck.tag());
+        assert_eq!(
+            CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &models, 100, 50, "€", 7, 9, &svcs),
+            e, "CapacityOffer preimage drifted"
+        );
+
+        // UsageReceipt: DOMAIN ‖ provider ‖ consumer ‖ kind.tag ‖ model ‖ units ‖ match_ref ‖ issued ‖ req ‖ resp
+        let (p, c, mref, rq, rs) = ([0x22u8; 32], [0x33u8; 32], [0x44u8; 32], [0x55u8; 32], [0x66u8; 32]);
+        let mut e = Vec::new();
+        e.extend_from_slice(USAGE_RECEIPT_DOMAIN);
+        e.extend_from_slice(&p);
+        e.extend_from_slice(&c);
+        e.push(CapacityKind::LocalHardware.tag());
+        put_str(&mut e, "m");
+        e.extend_from_slice(&10u64.to_le_bytes());
+        e.extend_from_slice(&mref);
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&rq);
+        e.extend_from_slice(&rs);
+        assert_eq!(
+            UsageReceipt::signing_bytes(&p, &c, CapacityKind::LocalHardware, "m", 10, &mref, 7, &rq, &rs),
+            e, "UsageReceipt preimage drifted"
+        );
+
+        // CapacityBid: DOMAIN ‖ bidder ‖ kind.tag ‖ model ‖ units ‖ total ‖ issued ‖ expires ‖ terms_ack ‖ optional service
+        let ta = [0x77u8; 32];
+        // Some(service) → 0x01 ‖ tag
+        let mut e = Vec::new();
+        e.extend_from_slice(CAPACITY_BID_DOMAIN);
+        e.extend_from_slice(&h);
+        e.push(CapacityKind::CloudApiQuota.tag());
+        put_str(&mut e, "m");
+        e.extend_from_slice(&5u64.to_le_bytes());
+        e.extend_from_slice(&500u64.to_le_bytes());
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&9u64.to_le_bytes());
+        e.extend_from_slice(&ta);
+        e.push(1);
+        e.push(ServiceType::TextGeneration.tag());
+        assert_eq!(
+            CapacityBid::signing_bytes(&h, CapacityKind::CloudApiQuota, "m", 5, 500, 7, 9, &ta, Some(ServiceType::TextGeneration)),
+            e, "CapacityBid (Some service) preimage drifted"
+        );
+        // None → 0x00 (truncate the last two bytes, append 0)
+        let mut e_none = e[..e.len() - 2].to_vec();
+        e_none.push(0);
+        assert_eq!(
+            CapacityBid::signing_bytes(&h, CapacityKind::CloudApiQuota, "m", 5, 500, 7, 9, &ta, None),
+            e_none, "CapacityBid (None service) preimage drifted"
+        );
     }
 
     #[test]
