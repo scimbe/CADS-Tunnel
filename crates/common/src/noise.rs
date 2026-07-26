@@ -154,6 +154,23 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Vec<u8
 /// short-held mutex — the send and receive nonces are independent, so
 /// serialising only the (synchronous, fast) crypto step is correct and never
 /// blocks on I/O.
+/// #189: the ONE encrypt-and-frame primitive shared by every pump. Encrypt `plaintext` with `ts` and
+/// frame it IN PLACE into `ct` as `2-byte BE len ‖ ciphertext`: `ct` must reserve 2 bytes at the front
+/// (`write_message` encrypts into `ct[2..]`), and the returned total (`2 + ciphertext_len`) is the
+/// slice the caller writes (`&ct[..total]`). The base pump frames the app bytes directly; the
+/// multiplexed pump frames `[tag] ‖ app bytes` — the framing is identical, only the plaintext differs
+/// (which is why the base wire carries no tag and the multiplexed wire's tag lives INSIDE the
+/// ciphertext). Byte-identical to the inline/closure code it replaces (`noise.rs` golden-vector pinned).
+fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8]) -> io::Result<usize> {
+    let len = ts
+        .lock()
+        .unwrap()
+        .write_message(plaintext, &mut ct[2..])
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+    Ok(2 + len)
+}
+
 pub async fn noise_pump<C, P>(
     transport: snow::TransportState,
     cipher: C,
@@ -184,13 +201,9 @@ where
                 let _ = c_write.shutdown().await;
                 return Ok::<(), io::Error>(());
             }
-            let len = ts
-                .lock()
-                .unwrap()
-                .write_message(&buf[..n], &mut ct[2..])
-                .map_err(noise_err)?;
-            ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
-            c_write.write_all(&ct[..2 + len]).await?;
+            // #189: encrypt+frame the app bytes via the shared primitive (no tag on the base wire).
+            let total = seal_frame(&ts, &buf[..n], &mut ct)?;
+            c_write.write_all(&ct[..total]).await?;
             c_write.flush().await?;
         }
     };
@@ -314,12 +327,12 @@ where
     // Encrypt `[tag ‖ payload]` with `ts` and frame it into `ct` (2-byte len prefix reserved at
     // the front, as `noise_pump`); returns the total framed length.
     let seal = |ts: &Mutex<snow::TransportState>, tag: u8, payload: &[u8], ct: &mut [u8]| -> io::Result<usize> {
+        // #189: multiplexed frames `[tag] ‖ payload`; the encrypt+frame is the shared seal_frame, so the
+        // wire framing is provably identical to the base pump (only this leading tag byte differs).
         let mut msg = Vec::with_capacity(1 + payload.len());
         msg.push(tag);
         msg.extend_from_slice(payload);
-        let len = ts.lock().unwrap().write_message(&msg, &mut ct[2..]).map_err(noise_err)?;
-        ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
-        Ok(2 + len)
+        seal_frame(ts, &msg, ct)
     };
 
     // app bytes + in-band control -> tagged frames, over relay until cutover, then over direct.
@@ -517,6 +530,39 @@ mod tests {
         let m = resp.write_message(&[], &mut b2).unwrap();
         ini.read_message(&b2[..m], &mut t).unwrap();
         (ini.into_transport_mode().unwrap(), resp.into_transport_mode().unwrap())
+    }
+
+    #[test]
+    fn seal_frame_emits_a_2byte_len_frame_that_round_trips_byte_exact() {
+        // #189 (frozen): the shared seal_frame primitive emits exactly `2-byte BE len ‖ ciphertext`
+        // and the peer decrypts it back to the EXACT plaintext — proven for BOTH caller shapes: the
+        // base pump's untagged app bytes, and the multiplexed pump's `[tag] ‖ payload`. A drift in the
+        // extraction (wrong prefix, wrong slice) would corrupt every frame on the live wire.
+        let (a, mut b) = transport_pair();
+        let ats = Mutex::new(a);
+        // multi-KiB, non-trivial payload (exercises a real frame, not a toy).
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+
+        // base shape: seal_frame(app_bytes)
+        let mut ct = vec![0u8; 2 + payload.len() + 256];
+        let total = seal_frame(&ats, &payload, &mut ct).unwrap();
+        let len = u16::from_be_bytes([ct[0], ct[1]]) as usize;
+        assert_eq!(total, 2 + len, "total is 2-byte prefix + ciphertext");
+        let mut pt = vec![0u8; payload.len() + 256];
+        let dl = b.read_message(&ct[2..total], &mut pt).unwrap();
+        assert_eq!(&pt[..dl], &payload[..], "base (untagged) frame round-trips byte-exact");
+
+        // multiplexed shape: seal_frame([tag] ‖ payload) → peer recovers the tag + payload intact.
+        let tag = 2u8;
+        let mut tagged = Vec::with_capacity(1 + payload.len());
+        tagged.push(tag);
+        tagged.extend_from_slice(&payload);
+        let mut ct2 = vec![0u8; 2 + tagged.len() + 256];
+        let total2 = seal_frame(&ats, &tagged, &mut ct2).unwrap();
+        let mut pt2 = vec![0u8; tagged.len() + 256];
+        let dl2 = b.read_message(&ct2[2..total2], &mut pt2).unwrap();
+        assert_eq!(pt2[0], tag, "multiplexed frame preserves the leading tag byte");
+        assert_eq!(&pt2[1..dl2], &payload[..], "multiplexed frame round-trips the payload byte-exact");
     }
 
     #[tokio::test]
