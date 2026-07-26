@@ -79,21 +79,32 @@ services:
       # tunnel (source <-> sink, #98/#99/#103).
       CT_EDGE_CP_URL: "http://control-plane:8090"
       CT_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:-}"
-      CT_EDGE_CHANNEL_LISTEN: "0.0.0.0:4435"
+      # The rendezvous/relay bind ports were previously hardcoded here while the port
+      # PUBLISH mapping below already read EDGE_CHANNEL_PORT/EDGE_CHANNEL_RELAY_PORT from
+      # .env — i.e. only the published (host-side) port was ever actually configurable,
+      # the container's own listen address wasn't, so the two could silently drift.
+      # Reusing the SAME .env vars for both sides makes this a genuine single parameter:
+      # an operator whose network/DDoS-protection blocks the default UDP ports (observed
+      # on host-unlimited.de's Voxility protection, #141) can move both rendezvous + relay
+      # to any confirmed-open port pair via .env alone, no compose/code edit needed.
+      CT_EDGE_CHANNEL_LISTEN: "0.0.0.0:${EDGE_CHANNEL_PORT:-4435}"
+      CT_EDGE_CHANNEL_RELAY_LISTEN: "0.0.0.0:${EDGE_CHANNEL_RELAY_PORT:-4436}"
     volumes:
       - shared:/shared
     ports:
       - "${EDGE_PORT:-4433}:4433/udp"
       - "${EDGE_PORT:-4433}:4433/tcp"
       # Agent-Fabric channel RENDEZVOUS (#100/#103) — pairs two members for a direct dial.
-      - "${EDGE_CHANNEL_PORT:-4435}:4435/udp"
-      - "${EDGE_CHANNEL_PORT:-4435}:4435/tcp"
+      - "${EDGE_CHANNEL_PORT:-4435}:${EDGE_CHANNEL_PORT:-4435}/udp"
+      - "${EDGE_CHANNEL_PORT:-4435}:${EDGE_CHANNEL_PORT:-4435}/tcp"
       # Agent-Fabric channel RELAY (#105): the fallback both NAT'd members tunnel through
-      # (rendezvous alone can't pair peers that can't reach each other directly). run_edge
-      # binds it at the rendezvous port + 1 by default. Restrictive client networks that
-      # block these ports fall back to the :443 front door (#106, ALPN=ct-edge-channel).
-      - "${EDGE_CHANNEL_RELAY_PORT:-4436}:4436/udp"
-      - "${EDGE_CHANNEL_RELAY_PORT:-4436}:4436/tcp"
+      # (rendezvous alone can't pair peers that can't reach each other directly). Defaults
+      # to rendezvous port + 1; set EDGE_CHANNEL_RELAY_PORT explicitly in .env to pick an
+      # independently-confirmed-open port instead of relying on an untested "+1" neighbor.
+      # Restrictive client networks that block these ports fall back to the :443 front
+      # door (#106, ALPN=ct-edge-channel).
+      - "${EDGE_CHANNEL_RELAY_PORT:-4436}:${EDGE_CHANNEL_RELAY_PORT:-4436}/udp"
+      - "${EDGE_CHANNEL_RELAY_PORT:-4436}:${EDGE_CHANNEL_RELAY_PORT:-4436}/tcp"
       # Operator-facing metrics scrape endpoint (#19), bound to LOOPBACK (#85) — it's
       # unauthenticated, so it must not be published on a public interface; scrape it
       # from 127.0.0.1 (or internally via the docker network at edge:9600). Override
