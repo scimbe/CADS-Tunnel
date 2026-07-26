@@ -878,16 +878,8 @@ impl ChannelJoinCliConfig {
             .ok_or("CT_CHANNEL_GRANT required (hex signed grant)")?;
         let grant = ct_common::channel::SignedChannelGrant::decode(&grant_bytes)
             .map_err(|e| format!("CT_CHANNEL_GRANT malformed: {e}"))?;
-        let holder = SigningKey::from_bytes(
-            &f("CT_CHANNEL_HOLDER_KEY")
-                .as_deref()
-                .and_then(hex32)
-                .ok_or("CT_CHANNEL_HOLDER_KEY required (64 hex)")?,
-        );
-        let own_noise_private = f("CT_CHANNEL_NOISE_KEY")
-            .as_deref()
-            .and_then(hex32)
-            .ok_or("CT_CHANNEL_NOISE_KEY required (64 hex)")?;
+        let holder = req_key(&f, "CT_CHANNEL_HOLDER_KEY", "64 hex")?;
+        let own_noise_private = req_hex32(&f, "CT_CHANNEL_NOISE_KEY", "64 hex")?;
         // #106: optional :443 front-door fallback. Absent -> direct-only ladder; a set but
         // malformed value is an error (a typo shouldn't silently drop the fallback).
         let front_door = match f("CT_CHANNEL_FRONT_DOOR") {
@@ -1188,29 +1180,15 @@ impl OperatorGrantRequest {
     }
 
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let operator = SigningKey::from_bytes(
-            &f("CT_CHANNEL_OPERATOR_KEY")
-                .as_deref()
-                .and_then(hex32)
-                .ok_or("CT_CHANNEL_OPERATOR_KEY required (64 hex; from `channel operator-init`)")?,
-        );
-        let channel = ct_common::channel::ChannelId(
-            f("CT_GRANT_CHANNEL")
-                .as_deref()
-                .and_then(hex32)
-                .ok_or("CT_GRANT_CHANNEL required (64 hex channel id)")?,
-        );
-        let member_holder = f("CT_GRANT_MEMBER_HOLDER")
-            .as_deref()
-            .and_then(hex32)
-            .ok_or("CT_GRANT_MEMBER_HOLDER required (64 hex member holder pubkey)")?;
+        let operator = req_key(&f, "CT_CHANNEL_OPERATOR_KEY", "64 hex; from `channel operator-init`")?;
+        let channel = ct_common::channel::ChannelId(req_hex32(&f, "CT_GRANT_CHANNEL", "64 hex channel id")?);
+        let member_holder = req_hex32(&f, "CT_GRANT_MEMBER_HOLDER", "64 hex member holder pubkey")?;
         let direction = match f("CT_GRANT_DIRECTION").as_deref().map(|s| s.trim().to_ascii_lowercase()) {
             Some(ref d) if d == "initiate" || d == "initiator" => ct_common::channel::Direction::Initiate,
             Some(ref d) if d == "accept" || d == "responder" => ct_common::channel::Direction::Accept,
             other => return Err(format!("CT_GRANT_DIRECTION must be initiate|accept, got {other:?}")),
         };
-        let expires_at = f("CT_GRANT_EXPIRES")
-            .ok_or("CT_GRANT_EXPIRES required (unix seconds)")?
+        let expires_at = req_str(&f, "CT_GRANT_EXPIRES", "unix seconds")?
             .trim()
             .parse()
             .map_err(|e| format!("CT_GRANT_EXPIRES invalid: {e}"))?;
@@ -1257,20 +1235,13 @@ impl ChannelRegisterRequest {
         let cp_url = f("CT_AGENT_CP_URL")
             .filter(|s| !s.trim().is_empty())
             .ok_or("CT_AGENT_CP_URL required (control-plane base URL)")?;
-        let channel_hex = hex_encode(
-            &f("CT_GRANT_CHANNEL")
-                .as_deref()
-                .and_then(hex32)
-                .ok_or("CT_GRANT_CHANNEL required (64 hex channel id)")?,
-        );
+        let channel_hex = hex_encode(&req_hex32(&f, "CT_GRANT_CHANNEL", "64 hex channel id")?);
         // The channel authority: derive from the operator's own private key
         // (CT_CHANNEL_OPERATOR_KEY, from `channel operator-init`), or take the public key
         // directly (CT_CHANNEL_OPERATOR_PUBKEY) when only the pubkey is at hand.
-        let operator_pubkey_hex = if let Some(pk) =
-            f("CT_CHANNEL_OPERATOR_PUBKEY").as_deref().and_then(hex32)
-        {
+        let operator_pubkey_hex = if let Some(pk) = opt_hex32(&f, "CT_CHANNEL_OPERATOR_PUBKEY") {
             hex_encode(&pk)
-        } else if let Some(sk) = f("CT_CHANNEL_OPERATOR_KEY").as_deref().and_then(hex32) {
+        } else if let Some(sk) = opt_hex32(&f, "CT_CHANNEL_OPERATOR_KEY") {
             OperatorIdentity { key: SigningKey::from_bytes(&sk) }.pubkey_hex()
         } else {
             return Err(
@@ -2233,6 +2204,28 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     <[u8; 32]>::try_from(v.as_slice()).ok()
 }
 
+/// #190: the shared "required env field" parses the CliConfig `from_lookup` parsers repeat. Each was
+/// hand-rolling `f(K).and_then(hex32).ok_or("K required (…)")` per field (~a dozen times across the
+/// channel-session, grant, register, agent-card and offer parsers), duplicating both the boilerplate
+/// and the `X required (…)` message format. These centralise it. `f` is the same env lookup every
+/// parser already takes; `what` is the parenthetical hint. Behaviour is byte-identical to the inlined
+/// forms (same message text), so a missing var still fails loudly at startup with the exact same error.
+fn req_str<F: Fn(&str) -> Option<String>>(f: &F, key: &str, what: &str) -> Result<String, String> {
+    f(key).ok_or_else(|| format!("{key} required ({what})"))
+}
+/// Required 32-byte hex env field: present, valid 64-hex → `[u8;32]`; else the `X required (…)` error.
+fn req_hex32<F: Fn(&str) -> Option<String>>(f: &F, key: &str, what: &str) -> Result<[u8; 32], String> {
+    f(key).as_deref().and_then(hex32).ok_or_else(|| format!("{key} required ({what})"))
+}
+/// Required ed25519 key env field: [`req_hex32`] + `SigningKey::from_bytes` (the seed is validated 32 bytes).
+fn req_key<F: Fn(&str) -> Option<String>>(f: &F, key: &str, what: &str) -> Result<SigningKey, String> {
+    Ok(SigningKey::from_bytes(&req_hex32(f, key, what)?))
+}
+/// Optional 32-byte hex env field: absent or malformed → `None` (the caller decides what that means).
+fn opt_hex32<F: Fn(&str) -> Option<String>>(f: &F, key: &str) -> Option<[u8; 32]> {
+    f(key).as_deref().and_then(hex32)
+}
+
 /// Split a comma-separated env value into trimmed, non-empty tokens (empty input → no tokens).
 fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
@@ -2273,12 +2266,7 @@ impl AgentCardCliConfig {
 
     /// Parse from a variable lookup (the `from_env` seam — testable without touching the real env).
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let holder = SigningKey::from_bytes(
-            &f("CT_CHANNEL_HOLDER_KEY")
-                .as_deref()
-                .and_then(hex32)
-                .ok_or("CT_CHANNEL_HOLDER_KEY required (64 hex)")?,
-        );
+        let holder = req_key(&f, "CT_CHANNEL_HOLDER_KEY", "64 hex")?;
         let role_tags = split_csv(f("CT_AGENT_CARD_ROLES").as_deref().unwrap_or_default());
         if role_tags.is_empty() {
             return Err("CT_AGENT_CARD_ROLES required (comma-separated role tags)".to_string());
@@ -2368,12 +2356,7 @@ impl AgentOfferCliConfig {
     /// absent required var is an `Err`, which the caller treats as "no offer configured" (auction tools
     /// stay off), exactly like the card path.
     pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let signing_key = SigningKey::from_bytes(
-            &f("CT_CHANNEL_HOLDER_KEY")
-                .as_deref()
-                .and_then(hex32)
-                .ok_or("CT_CHANNEL_HOLDER_KEY required (64 hex)")?,
-        );
+        let signing_key = req_key(&f, "CT_CHANNEL_HOLDER_KEY", "64 hex")?;
         let kind = match f("CT_AGENT_OFFER_KIND").as_deref().map(str::trim) {
             Some("cloud") | Some("cloud-api") | Some("CloudApiQuota") => {
                 ct_common::channel::CapacityKind::CloudApiQuota
@@ -3528,6 +3511,32 @@ mod tests {
         assert!(!should_serve_loop(ChannelRole::Accept, None));
         assert!(!should_serve_loop(ChannelRole::Accept, Some("0")));
         assert!(!should_serve_loop(ChannelRole::Accept, Some("false")));
+    }
+
+    #[test]
+    fn required_env_helpers_keep_the_exact_message_format() {
+        // #190 (frozen): the shared req_*/opt_hex32 helpers must produce the SAME "KEY required (what)"
+        // text the inlined parses used, so consolidating ~a dozen sites changed no error string and no
+        // required-vs-optional semantics. A missing var still fails loudly at startup, identically.
+        let empty = |_: &str| None::<String>;
+        assert_eq!(req_str(&empty, "CT_X", "hint").unwrap_err(), "CT_X required (hint)");
+        assert_eq!(req_hex32(&empty, "CT_K", "64 hex").unwrap_err(), "CT_K required (64 hex)");
+        assert_eq!(req_key(&empty, "CT_HOLDER", "64 hex").unwrap_err(), "CT_HOLDER required (64 hex)");
+        assert_eq!(opt_hex32(&empty, "CT_O"), None);
+        // present + valid → the parsed value (req_key accepts any 32-byte seed).
+        let full = |k: &str| match k {
+            "CT_S" => Some("value".to_string()),
+            "CT_H" => Some("11".repeat(32)), // 64 hex chars → [0x11; 32]
+            _ => None,
+        };
+        assert_eq!(req_str(&full, "CT_S", "x").unwrap(), "value");
+        assert_eq!(req_hex32(&full, "CT_H", "x").unwrap(), [0x11u8; 32]);
+        assert_eq!(opt_hex32(&full, "CT_H"), Some([0x11u8; 32]));
+        assert!(req_key(&full, "CT_H", "x").is_ok());
+        // a malformed hex value is treated as absent (opt) / a required error (req) — unchanged.
+        let bad = |_: &str| Some("nothex".to_string());
+        assert_eq!(opt_hex32(&bad, "CT_H"), None);
+        assert!(req_hex32(&bad, "CT_H", "64 hex").is_err());
     }
 
     #[test]
