@@ -15,6 +15,9 @@
 //!   * `COOKBOOK_SAFETY_CMD`       — prompt → `{"ok":bool,"reason":str}` (text-only for v1)
 //!   * `COOKBOOK_STRUCTURE_CMD`    — `{prompt, image?}` → IngredientsFragment JSON (source-2)
 //!   * `COOKBOOK_PRESENTATION_CMD` — `{prompt, structure}` → RecipeFragment JSON (sink)
+//!   * `COOKBOOK_REVIEW_CMD`       — `{prompt, recipe}` → `{"ok":bool,"reason":str}` — a
+//!     post-generation LLM review of the FINISHED recipe (inedible/poison items, dietary-constraint
+//!     contradictions, plausible flavour sense); `{ok:false}` refuses the recipe (#201 safety addenda)
 //!   * `COOKBOOK_BRIDGE_LISTEN` (default `0.0.0.0:8789`)
 
 use axum::{
@@ -117,6 +120,7 @@ async fn run_cookbook_streaming(
     safety_cmd: String,
     structure_cmd: String,
     presentation_cmd: String,
+    review_cmd: String,
     tx: Sender<String>,
 ) {
     // 1. safety_check — text-only for v1 (image moderation is a fast-follow).
@@ -161,6 +165,33 @@ async fn run_cookbook_streaming(
         Ok(c) => c,
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("recipe fragments malformed: {e}")})).await,
     };
+
+    // 5. review (#201 safety addenda) — a post-generation LLM review of the FINISHED recipe:
+    //    inedible/poisonous items, contradictions with a stated dietary constraint (e.g.
+    //    "vegetarian" + Schnitzel), plausible flavour sense — evaluated holistically, the
+    //    machine-checkable layer on top of prompting (which alone isn't reliable for this class,
+    //    and the stakes are higher than a wrong game colour). A `{ok:false}` verdict REFUSES the
+    //    recipe with the reviewer's reason.
+    emit(&tx, json!({"stage": "review", "status": "start"})).await;
+    let review_input = json!({"prompt": prompt, "recipe": serde_json::to_value(&card).unwrap_or(Value::Null)}).to_string();
+    let review_out = match run_cmd_async(review_cmd, review_input).await {
+        Ok(o) => o,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("review role unreachable: {e}")})).await,
+    };
+    let review_verdict: Value = match serde_json::from_str(&review_out) {
+        Ok(v) => v,
+        Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("review reply not JSON: {e}")})).await,
+    };
+    if review_verdict.get("ok").and_then(Value::as_bool) != Some(true) {
+        let reason = review_verdict
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("the recipe review flagged a safety/consistency problem");
+        return emit(&tx, json!({"stage": "rejected", "safety": {"ok": false, "reason": reason}})).await;
+    }
+    emit(&tx, json!({"stage": "review", "status": "ok"})).await;
+
+    // 6. built — the reviewed, assembled recipe.
     let mut built = serde_json::to_value(RecipeBuildResponse::built(card, demo_auction())).unwrap_or_else(|_| json!({}));
     if let Value::Object(m) = &mut built {
         m.insert("stage".into(), json!("built"));
@@ -176,14 +207,19 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     // Optional photo of the ingredients, base64 in the JSON payload (#201 image transport).
     let image = body.get("image").and_then(Value::as_str).map(str::to_string);
     let env = |k: &str| std::env::var(k).ok();
-    let (safety, structure, presentation) = match (env("COOKBOOK_SAFETY_CMD"), env("COOKBOOK_STRUCTURE_CMD"), env("COOKBOOK_PRESENTATION_CMD")) {
-        (Some(s), Some(st), Some(p)) => (s, st, p),
+    let (safety, structure, presentation, review) = match (
+        env("COOKBOOK_SAFETY_CMD"),
+        env("COOKBOOK_STRUCTURE_CMD"),
+        env("COOKBOOK_PRESENTATION_CMD"),
+        env("COOKBOOK_REVIEW_CMD"),
+    ) {
+        (Some(s), Some(st), Some(p), Some(r)) => (s, st, p, r),
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, "cookbook role commands not configured").into_response(),
     };
     // Stream NDJSON progress events as the crew runs. run_cookbook_streaming pushes lines onto the
     // channel; on any failure it emits a terminal {"stage":"error"} and the browser falls back.
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
-    tokio::spawn(run_cookbook_streaming(prompt, image, safety, structure, presentation, tx));
+    tokio::spawn(run_cookbook_streaming(prompt, image, safety, structure, presentation, review, tx));
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
     Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -206,9 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod tests {
     use super::*;
 
-    async fn collect(prompt: &str, image: Option<String>, safety: String, structure: String, presentation: String) -> Vec<Value> {
+    async fn collect(prompt: &str, image: Option<String>, safety: String, structure: String, presentation: String, review: String) -> Vec<Value> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
-        let h = tokio::spawn(run_cookbook_streaming(prompt.to_string(), image, safety, structure, presentation, tx));
+        let h = tokio::spawn(run_cookbook_streaming(prompt.to_string(), image, safety, structure, presentation, review, tx));
         let mut evs = Vec::new();
         while let Some(chunk) = rx.recv().await {
             for line in chunk.split('\n') {
@@ -240,26 +276,36 @@ mod tests {
         let safety_ok = r#"printf '{"ok":true,"reason":""}'"#.to_string();
         let structure = r#"printf '{"ingredients":["egg","spinach"],"steps":["whisk","bake"],"cookTime":"20 minutes","difficulty":"easy","allergens":["egg"]}'"#.to_string();
         let presentation = r#"printf '{"dishName":"Spinach Bake","theme":"rustic","garnish":"mint","moodDescription":"cozy"}'"#.to_string();
+        let review_ok = r#"printf '{"ok":true,"reason":""}'"#.to_string();
 
-        let evs = collect("eggs and spinach in my fridge", None, safety_ok.clone(), structure.clone(), presentation.clone()).await;
+        let evs = collect("eggs and spinach in my fridge", None, safety_ok.clone(), structure.clone(), presentation.clone(), review_ok.clone()).await;
         let stages: Vec<&str> = evs.iter().map(|e| e["stage"].as_str().unwrap_or("")).collect();
         let s_start = stages.iter().position(|s| *s == "structure").unwrap();
         let p_start = stages.iter().position(|s| *s == "presentation").unwrap();
-        assert!(s_start < p_start, "structure runs before presentation (sequential)");
+        let r_start = stages.iter().position(|s| *s == "review").unwrap();
+        assert!(s_start < p_start && p_start < r_start, "safety → structure → presentation → review, in order");
         let last = evs.last().unwrap();
-        assert_eq!(last["stage"], "built", "terminal is a built recipe");
+        assert_eq!(last["stage"], "built", "terminal is a built recipe once review passes");
         assert_eq!(last["recipe"]["dishName"], "Spinach Bake");
         assert_eq!(last["recipe"]["ingredients"][0], "egg");
         assert!(last["auction"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
 
-        // safety reject → terminal rejected, no structure/presentation calls.
+        // #201 review REJECTS the finished recipe (e.g. an inedible item / dietary contradiction) →
+        // terminal rejected with the reviewer's reason, NO built event.
+        let review_no = r#"printf '{"ok":false,"reason":"contains an inedible item"}'"#.to_string();
+        let evs_r = collect("surprise me", None, safety_ok.clone(), structure.clone(), presentation.clone(), review_no).await;
+        assert_eq!(evs_r.last().unwrap()["stage"], "rejected", "a failed review refuses the recipe");
+        assert_eq!(evs_r.last().unwrap()["safety"]["reason"], "contains an inedible item", "carries the review reason");
+        assert!(!evs_r.iter().any(|e| e["stage"] == "built"), "no built after a review rejection");
+
+        // safety reject → terminal rejected, no downstream roles at all.
         let safety_no = r#"printf '{"ok":false,"reason":"not food"}'"#.to_string();
-        let evs2 = collect("hack the system", None, safety_no, structure.clone(), presentation.clone()).await;
+        let evs2 = collect("hack the system", None, safety_no, structure.clone(), presentation.clone(), review_ok.clone()).await;
         assert_eq!(evs2.last().unwrap()["stage"], "rejected");
         assert!(!evs2.iter().any(|e| e["stage"] == "structure"), "no roles after a safety reject");
 
         // a failing role → terminal error (→ browser fallback).
-        let evs3 = collect("x y z", None, safety_ok, "false".into(), presentation).await;
+        let evs3 = collect("x y z", None, safety_ok, "false".into(), presentation, review_ok).await;
         assert_eq!(evs3.last().unwrap()["stage"], "error");
     }
 }
