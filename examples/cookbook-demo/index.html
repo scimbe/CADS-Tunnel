@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cookbook — recipe from your fridge</title>
+<style>
+  :root { --bg:#12100e; --panel:#1c1815; --edge:#3a322b; --ink:#f4ede2; --muted:#b3a596; --accent:#e8842b; --ok:#5cbf6a; --bad:#e2603b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,-apple-system,sans-serif; line-height:1.4; }
+  .wrap { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.4rem; margin:.2rem 0; } h2 { font-size:1.05rem; margin:.2rem 0 .6rem; }
+  .sub { color:var(--muted); font-size:.9rem; }
+  .panel { background:var(--panel); border:1px solid var(--edge); border-radius:14px; padding:14px; margin:12px 0; }
+  textarea, input[type=text], input[type=password] { width:100%; background:#0e0c0a; color:var(--ink); border:1px solid var(--edge); border-radius:10px; padding:10px; font:inherit; }
+  .btn { display:inline-block; border:0; border-radius:10px; padding:12px 16px; font-weight:700; font:inherit; cursor:pointer; background:#2a2521; color:var(--ink); }
+  .btn.accent { background:var(--accent); color:#241200; width:100%; font-size:1.05rem; }
+  .btn:disabled { opacity:.5; }
+  .imgrow { display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  label.file { display:inline-block; background:#2a2521; border:1px solid var(--edge); border-radius:10px; padding:10px 14px; cursor:pointer; }
+  #thumb { width:64px; height:64px; object-fit:cover; border-radius:10px; border:1px solid var(--edge); display:none; }
+  .pmsg { margin-top:10px; font-size:.92rem; min-height:1.2em; }
+  .pmsg.ok { color:var(--ok); } .pmsg.reject { color:var(--bad); }
+  /* crew waiting screen */
+  #build { display:none; }
+  .crew { display:flex; gap:8px; flex-wrap:wrap; }
+  .member { flex:1 1 46%; background:#0e0c0a; border:1px solid var(--edge); border-radius:10px; padding:8px 10px; font-size:.9rem; opacity:.5; transition:opacity .2s; }
+  .member.active { opacity:1; border-color:var(--accent); }
+  .member.done { opacity:1; border-color:var(--ok); }
+  .member .tick::after { content:"•"; color:var(--muted); }
+  .member.done .tick::after { content:"✓"; color:var(--ok); }
+  .bar { height:6px; background:#0e0c0a; border-radius:6px; overflow:hidden; margin:10px 0; }
+  .barfill { height:100%; width:0; background:var(--accent); transition:width .3s; }
+  .bstep { color:var(--muted); font-size:.9rem; min-height:1.2em; }
+  /* recipe card */
+  #card { display:none; }
+  .dish { font-size:1.5rem; font-weight:800; }
+  .badges { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+  .badge { background:#0e0c0a; border:1px solid var(--edge); border-radius:20px; padding:3px 10px; font-size:.82rem; color:var(--muted); }
+  .badge.allergen { border-color:var(--bad); color:var(--bad); }
+  ul.ings { columns:2; padding-left:18px; } ul.ings li { margin:2px 0; }
+  ol.steps { padding-left:20px; } ol.steps li { margin:6px 0; }
+  .mood { color:var(--muted); font-style:italic; margin:6px 0; }
+  #gate { text-align:center; padding-top:12vh; }
+</style></head>
+<body>
+
+<!-- ===== password gate ===== -->
+<div id="gate" class="wrap">
+  <h1>🍳 Cookbook</h1>
+  <p class="sub">A recipe generator built live by a crew of cooperating AI agents over the tunnel.</p>
+  <form id="gateForm" class="panel" style="max-width:320px;margin:16px auto">
+    <input type="password" id="pw" placeholder="access password" autocomplete="off">
+    <div id="gateMsg" class="pmsg"></div>
+    <button class="btn accent" type="submit" style="margin-top:10px">Unlock</button>
+  </form>
+</div>
+
+<!-- ===== studio ===== -->
+<div id="studio" class="wrap" style="display:none">
+  <header style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap">
+    <div><h1>🍳 Cookbook</h1><div class="sub">Describe what's in your fridge — the crew designs a recipe.</div></div>
+    <button class="btn" id="infoBtn" title="How this works">ⓘ Info</button>
+  </header>
+
+  <div class="panel">
+    <h2>🤖 Prompt the recipe crew</h2>
+    <textarea id="prompt" rows="3" maxlength="600" placeholder="e.g. I have eggs, spinach and feta — something quick and vegetarian"></textarea>
+    <div class="imgrow">
+      <label class="file">📷 Add a photo of your ingredients
+        <input type="file" id="photo" accept="image/*" capture="environment" style="display:none">
+      </label>
+      <img id="thumb" alt="ingredient photo">
+      <button class="btn" id="clearPhoto" style="display:none">✕ remove</button>
+    </div>
+    <button class="btn accent" id="buildBtn" style="margin-top:12px">🍳 Cook up a recipe</button>
+    <div id="promptMsg" class="pmsg"></div>
+  </div>
+
+  <!-- live crew screen -->
+  <div class="panel" id="build">
+    <h2>The crew is cooking…</h2>
+    <div class="crew">
+      <div class="member" data-role="safety"><span class="tick"></span> 🛡️ safety</div>
+      <div class="member" data-role="structure"><span class="tick"></span> 🥕 source-2 · ingredients</div>
+      <div class="member" data-role="presentation"><span class="tick"></span> 🍽️ sink · plating</div>
+      <div class="member" data-role="review"><span class="tick"></span> 🧪 review</div>
+    </div>
+    <div class="bar"><div id="buildBar" class="barfill"></div></div>
+    <div id="buildStep" class="bstep">…</div>
+  </div>
+
+  <!-- recipe card output -->
+  <div class="panel" id="card">
+    <div class="dish" id="dishName"></div>
+    <div class="mood" id="mood"></div>
+    <div class="badges" id="badges"></div>
+    <h2>Ingredients</h2><ul class="ings" id="ings"></ul>
+    <h2>Steps</h2><ol class="steps" id="steps"></ol>
+    <div class="sub" id="garnish"></div>
+  </div>
+</div>
+
+<!-- ===== info modal ===== -->
+<div id="info" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);align-items:center;justify-content:center;padding:16px">
+  <div class="panel" style="max-width:520px;max-height:80vh;overflow:auto">
+    <h2>How this recipe is built</h2>
+    <p class="sub">You give a text prompt and (optionally) a photo of your ingredients. A crew of independent AI agents, connected over the claude-tunnel Agent-Fabric, cooperate to build the recipe:</p>
+    <ul class="sub">
+      <li><b>🛡️ safety</b> checks your prompt is a real cooking request.</li>
+      <li><b>🥕 source-2</b> reads your photo (its bytes travel over the encrypted channel to source-2's own machine) + text and works out the ingredients, steps, timing and allergens.</li>
+      <li><b>🍽️ sink</b> names and themes the dish.</li>
+      <li><b>🧪 review</b> checks the finished recipe is safe and consistent — nothing inedible, no contradiction with your dietary constraints — before you see it.</li>
+    </ul>
+    <p class="sub">Each step is shown live as it happens. The operator never sees your photo or recipe — only that a channel exists between two keys.</p>
+    <button class="btn accent" id="infoClose">Got it</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+// ---- password gate (#168 pattern): only the SHA-256 of the password is served, never plaintext ----
+let GATE_HASH = null;
+fetch("gate.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((j) => { GATE_HASH = j && j.sha256; }).catch(() => {});
+async function sha256hex(s) {
+  const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+function unlock() { $("gate").style.display = "none"; $("studio").style.display = "block"; }
+if (sessionStorage.getItem("cb-unlocked") === "1") unlock();
+$("gateForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!GATE_HASH) { $("gateMsg").textContent = "Access config (gate.json) not loaded — see the demo README."; return; }
+  if ((await sha256hex($("pw").value)) === GATE_HASH) { sessionStorage.setItem("cb-unlocked", "1"); unlock(); }
+  else { $("gateMsg").textContent = "Wrong password — try again."; $("pw").value = ""; }
+});
+
+// ---- image: load, RESIZE client-side (cap the channel payload), keep base64 ----
+let imageB64 = null;   // base64 (no data: prefix) of a downscaled JPEG, or null
+$("photo").addEventListener("change", (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = () => {
+    const MAX = 1024;
+    let { width: w, height: h } = img;
+    if (w > MAX || h > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w * s); h = Math.round(h * s); }
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    c.getContext("2d").drawImage(img, 0, 0, w, h);
+    const url = c.toDataURL("image/jpeg", 0.8);
+    imageB64 = url.split(",")[1] || null;
+    $("thumb").src = url; $("thumb").style.display = "inline-block"; $("clearPhoto").style.display = "inline-block";
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(file);
+});
+$("clearPhoto").addEventListener("click", () => {
+  imageB64 = null; $("photo").value = ""; $("thumb").style.display = "none"; $("clearPhoto").style.display = "none";
+});
+
+// ---- live crew bridge (#201): the browser POSTs {prompt, image?} and reads a stream of NDJSON
+// per-stage events, so the crew screen updates live. Configurable via an untracked crew.json.
+let CREW_URL = "cookbook/build";
+fetch("crew.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((j) => { if (j && j.url) CREW_URL = j.url; }).catch(() => {});
+async function liveBuildStream(prompt, image, onEvent) {
+  const ctrl = new AbortController();
+  // 4 sequential LLM calls (safety + structure + presentation + review ≈ 4×~14s), so the abort sits
+  // well above ~55s.
+  const to = setTimeout(() => ctrl.abort(), 75000);
+  try {
+    const res = await fetch(CREW_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt, image }), signal: ctrl.signal });
+    if (!res.ok || !res.body) throw new Error("cookbook bridge " + res.status);
+    const reader = res.body.getReader(); const dec = new TextDecoder();
+    let buf = "", terminal = null;
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        onEvent(ev);
+        if (ev.stage === "built" || ev.stage === "rejected" || ev.stage === "error") terminal = ev;
+      }
+    }
+    return terminal;
+  } finally { clearTimeout(to); }
+}
+
+function member(role) { return document.querySelector('.crew .member[data-role="' + role + '"]'); }
+function renderCard(recipe) {
+  $("dishName").textContent = recipe.dishName || "Your recipe";
+  $("mood").textContent = recipe.moodDescription || "";
+  const badges = [];
+  if (recipe.cookTime) badges.push('<span class="badge">⏱ ' + esc(recipe.cookTime) + "</span>");
+  if (recipe.difficulty) badges.push('<span class="badge">📊 ' + esc(recipe.difficulty) + "</span>");
+  if (recipe.theme) badges.push('<span class="badge">🎨 ' + esc(recipe.theme) + "</span>");
+  (recipe.allergens || []).forEach((a) => badges.push('<span class="badge allergen">⚠ ' + esc(a) + "</span>"));
+  $("badges").innerHTML = badges.join("");
+  $("ings").innerHTML = (recipe.ingredients || []).map((i) => "<li>" + esc(i) + "</li>").join("");
+  $("steps").innerHTML = (recipe.steps || []).map((s) => "<li>" + esc(s) + "</li>").join("");
+  $("garnish").textContent = recipe.garnish ? "Finish with: " + recipe.garnish : "";
+  $("card").style.display = "block";
+}
+function esc(s) { return String(s).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c])); }
+
+$("buildBtn").addEventListener("click", async () => {
+  const p = $("prompt").value.trim();
+  const msg = $("promptMsg");
+  if (p.length < 3) { msg.className = "pmsg reject"; msg.textContent = "Tell me a bit more about what you'd like to cook."; return; }
+  $("buildBtn").disabled = true; msg.className = "pmsg"; msg.textContent = "";
+  $("card").style.display = "none";
+  // immediate feedback: show the crew screen the instant the button is clicked.
+  document.querySelectorAll(".crew .member").forEach((m) => m.classList.remove("active", "done"));
+  $("buildBar").style.width = "0%"; $("buildStep").textContent = "🛰 Reaching the recipe crew over the tunnel…";
+  $("build").style.display = "block";
+  const hide = () => { $("build").style.display = "none"; };
+  const bar = { safety: 20, structure: 55, presentation: 80, review: 95 };
+  const onEvent = (ev) => {
+    const m = member(ev.stage);
+    if (ev.status === "start") {
+      if (m) m.classList.add("active");
+      const label = { safety: "🛡️ safety agent reviewing your request…", structure: "🥕 source-2 is reading the ingredients…", presentation: "🍽️ sink is plating the dish…", review: "🧪 reviewing the finished recipe…" }[ev.stage];
+      if (label) $("buildStep").textContent = label;
+    } else if (ev.status === "ok" || ev.status === "done") {
+      if (m) { m.classList.remove("active"); m.classList.add("done"); }
+      if (bar[ev.stage]) $("buildBar").style.width = bar[ev.stage] + "%";
+    }
+  };
+  try {
+    let term = null;
+    try { term = await liveBuildStream(p, imageB64, onEvent); } catch (e) { term = null; }
+    if (term && term.stage === "built" && term.recipe) {
+      $("buildBar").style.width = "100%"; await new Promise((r) => setTimeout(r, 350)); hide();
+      renderCard(term.recipe);
+      msg.className = "pmsg ok"; msg.textContent = "✓ Cooked up live by the crew over the tunnel.";
+      if ($("card").scrollIntoView) $("card").scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    hide();
+    if (term && term.stage === "rejected") {
+      msg.className = "pmsg reject";
+      msg.textContent = "⛔ " + ((term.safety && term.safety.reason) || "the crew declined this request") + ".";
+      return;
+    }
+    // error / unreachable — no offline stand-in for the cookbook; ask to retry.
+    msg.className = "pmsg reject";
+    msg.textContent = "⚠ The recipe crew is unreachable right now" + (term && term.message ? " (" + esc(term.message) + ")" : "") + ". Please try again in a moment.";
+  } finally { $("buildBtn").disabled = false; }
+});
+
+// keep Space usable while typing (#185 lesson) — no global key handler here, but guard for parity.
+$("infoBtn").addEventListener("click", () => $("info").style.display = "flex");
+$("infoClose").addEventListener("click", () => $("info").style.display = "none");
+$("info").addEventListener("click", (e) => { if (e.target === $("info")) $("info").style.display = "none"; });
+</script>
+</body>
+</html>
