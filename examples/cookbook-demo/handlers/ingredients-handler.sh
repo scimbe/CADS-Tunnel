@@ -29,7 +29,16 @@ if [ "${1:-}" = "--selftest" ]; then
   [ -n "$got" ] || { echo "SELFTEST FAIL (#204): multi-line/fenced JSON yielded an EMPTY match" >&2; exit 1; }
   printf '%s' "$got" | python3 -c 'import sys,json; json.loads(sys.stdin.read())' 2>/dev/null \
     || { echo "SELFTEST FAIL (#204): extracted text is not valid JSON" >&2; exit 1; }
-  echo "SELFTEST OK (#204): multi-line/fenced JSON extraction recovers a valid object"
+  # #205 (frozen): a text-only DISH request (no photo) must infer its ingredients from the dish name,
+  # not take the pantry fallback. The live behaviour is model-dependent (the extraction selftest can't
+  # exercise it), so pin the fix textually: the system prompt MUST carry the infer-from-named-dish
+  # directive + the narrowed "only fall back when the text is empty AND no photo" condition, so neither
+  # can be silently removed in a future edit.
+  grep -q "A photo is NOT required to recognize a named dish" "$0" \
+    || { echo "SELFTEST FAIL (#205): the infer-from-named-dish directive is missing from the system prompt" >&2; exit 1; }
+  grep -q "genuinely empty or unusable AND no photo was given" "$0" \
+    || { echo "SELFTEST FAIL (#205): the narrowed fallback condition is missing from the system prompt" >&2; exit 1; }
+  echo "SELFTEST OK (#204 extraction + #205 infer-from-dish directive present)"
   exit 0
 fi
 LLM="${CT_LLM_CMD:-claude}"
@@ -49,7 +58,7 @@ if [ -n "$IMG_B64" ]; then
   fi
 fi
 
-SYS="You are the recipe-structure agent. From the user's text and (if given) the ingredient photo, output ONLY a compact JSON object, no prose, with EXACTLY these keys: ingredients (array of strings), steps (array of strings, in order), cookTime (a string like '30 minutes'), difficulty (one of: easy, medium, hard), allergens (array of strings; [] if none). Base it on the ingredients you can actually see/read. If you genuinely cannot identify any ingredients at all, DO NOT fail — return a simple, safe fallback dish built from common pantry staples and say so in the first step. Never include inedible or unsafe items. Respond with the JSON object and nothing else."
+SYS="You are the recipe-structure agent. From the user's text and (if given) the ingredient photo, output ONLY a compact JSON object, no prose, with EXACTLY these keys: ingredients (array of strings), steps (array of strings, in order), cookTime (a string like '30 minutes'), difficulty (one of: easy, medium, hard), allergens (array of strings; [] if none). Derive the ingredients from BOTH the photo (if given) and the text. IMPORTANT (#205): if the text names a DISH or any ingredients — even with NO photo (e.g. 'Eier mit Senfsoße'/'eggs in mustard sauce', 'spaghetti carbonara', 'a quick omelette') — INFER the ingredients that dish needs and build the recipe from those. A photo is NOT required to recognize a named dish or ingredients; treat the dish name itself as the ingredient source. ONLY return the safe pantry fallback dish (and say so in the first step) if the text is genuinely empty or unusable AND no photo was given — NEVER fall back merely because no photo was attached, or because the text names a dish rather than listing raw ingredients. Never include inedible or unsafe items. Respond with the JSON object and nothing else."
 
 # Read is allowed here (the image); write/exec/network tools are not.
 OUT="$($LLM -p "${IMG_NOTE}${PROMPT}" --output-format text \
