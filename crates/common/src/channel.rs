@@ -14,6 +14,7 @@
 //! transport, the control-plane channel/invitation registry, and connect-time
 //! enforcement of the `holder` binding come in later sub-packets (AF2b/AF3/AF4).
 
+use crate::preimage::Preimage;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 /// Unix timestamp in whole seconds, supplied by the caller.
@@ -586,12 +587,15 @@ pub fn verify_holder_possession(holder: &[u8; 32], challenge: &[u8], signature: 
 /// [`verify_topology_operator_binding`] before storing the binding. The length-prefixed
 /// `topology_id` keeps the preimage injective (no id/key boundary ambiguity).
 pub fn topology_operator_binding_bytes(topology_id: &str, operator_pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(23 + 8 + topology_id.len() + 32);
-    m.extend_from_slice(b"ct-topology-operator-v1");
-    m.extend_from_slice(&(topology_id.len() as u64).to_le_bytes());
-    m.extend_from_slice(topology_id.as_bytes());
-    m.extend_from_slice(operator_pubkey);
-    m
+    // #184: DOMAIN ‖ topology_id.len()(u64 LE) ‖ topology_id ‖ operator_pubkey — byte-identical.
+    // NOTE: this field is length-prefixed with a u64 (not Preimage::var_bytes's u32), so it is written
+    // as an explicit `.u64(len).fixed(bytes)` to preserve the exact wire bytes — changing the prefix
+    // width would break every existing topology-operator binding signature.
+    Preimage::new(b"ct-topology-operator-v1")
+        .u64(topology_id.len() as u64)
+        .fixed(topology_id.as_bytes())
+        .fixed(operator_pubkey)
+        .finish()
 }
 
 /// Verify an operator's **proof of possession** for binding `operator_pubkey` to `topology_id`
@@ -626,12 +630,12 @@ pub fn member_noise_attest_bytes(
     holder: &[u8; 32],
     noise_pubkey: &[u8; 32],
 ) -> Vec<u8> {
-    let mut m = Vec::with_capacity(22 + 32 + 32 + 32);
-    m.extend_from_slice(b"ct-a2a-noise-attest-v1");
-    m.extend_from_slice(&channel.0);
-    m.extend_from_slice(holder);
-    m.extend_from_slice(noise_pubkey);
-    m
+    // #184: DOMAIN ‖ channel ‖ holder ‖ noise_pubkey — byte-identical (literal domain kept verbatim).
+    Preimage::new(b"ct-a2a-noise-attest-v1")
+        .fixed(&channel.0)
+        .fixed(holder)
+        .fixed(noise_pubkey)
+        .finish()
 }
 
 /// Verify a member Noise-key attestation (#101): `signature` must be `holder`'s
@@ -691,13 +695,13 @@ impl MembershipStaple {
         stapled_at: UnixSeconds,
         expires_at: UnixSeconds,
     ) -> Vec<u8> {
-        let mut m = Vec::with_capacity(MEMBERSHIP_STAPLE_DOMAIN.len() + 32 + 32 + 8 + 8);
-        m.extend_from_slice(MEMBERSHIP_STAPLE_DOMAIN);
-        m.extend_from_slice(&channel.0);
-        m.extend_from_slice(holder);
-        m.extend_from_slice(&stapled_at.to_le_bytes());
-        m.extend_from_slice(&expires_at.to_le_bytes());
-        m
+        // #184: DOMAIN ‖ channel ‖ holder ‖ stapled_at(LE) ‖ expires_at(LE) — byte-identical.
+        Preimage::new(MEMBERSHIP_STAPLE_DOMAIN)
+            .fixed(&channel.0)
+            .fixed(holder)
+            .u64(stapled_at)
+            .u64(expires_at)
+            .finish()
     }
 
     /// Whether this staple is authentic **and** still fresh at `now`: the operator
@@ -931,15 +935,15 @@ impl BillingCommitment {
         max_amount: u64,
         expires_at: UnixSeconds,
     ) -> Vec<u8> {
-        let mut m = Vec::with_capacity(BILLING_COMMITMENT_DOMAIN.len() + 32 * 4 + 8 + 8);
-        m.extend_from_slice(BILLING_COMMITMENT_DOMAIN);
-        m.extend_from_slice(&channel.0);
-        m.extend_from_slice(holder);
-        m.extend_from_slice(payee);
-        m.extend_from_slice(terms_hash);
-        m.extend_from_slice(&max_amount.to_le_bytes());
-        m.extend_from_slice(&expires_at.to_le_bytes());
-        m
+        // #184: DOMAIN ‖ channel ‖ holder ‖ payee ‖ terms_hash ‖ max_amount(LE) ‖ expires_at(LE) — byte-identical.
+        Preimage::new(BILLING_COMMITMENT_DOMAIN)
+            .fixed(&channel.0)
+            .fixed(holder)
+            .fixed(payee)
+            .fixed(terms_hash)
+            .u64(max_amount)
+            .u64(expires_at)
+            .finish()
     }
 
     /// Whether this commitment is authentic AND still current at `now`: the holder signature
@@ -1105,15 +1109,15 @@ impl SettleReceipt {
         bytes_delivered: u64,
         transfer_digest: &[u8; 32],
     ) -> Vec<u8> {
-        let mut m = Vec::with_capacity(SETTLE_RECEIPT_DOMAIN.len() + 32 * 4 + 8);
-        m.extend_from_slice(SETTLE_RECEIPT_DOMAIN);
-        m.extend_from_slice(&channel.0);
-        m.extend_from_slice(receiver);
-        m.extend_from_slice(terms_hash);
-        m.extend_from_slice(session_nonce);
-        m.extend_from_slice(&bytes_delivered.to_le_bytes());
-        m.extend_from_slice(transfer_digest);
-        m
+        // #184: DOMAIN ‖ channel ‖ receiver ‖ terms_hash ‖ session_nonce ‖ bytes_delivered(LE) ‖ transfer_digest — byte-identical.
+        Preimage::new(SETTLE_RECEIPT_DOMAIN)
+            .fixed(&channel.0)
+            .fixed(receiver)
+            .fixed(terms_hash)
+            .fixed(session_nonce)
+            .u64(bytes_delivered)
+            .fixed(transfer_digest)
+            .finish()
     }
 
     /// Whether the receipt is authentic: the receiver signature verifies for its exact binding. A
@@ -2486,6 +2490,68 @@ fn hex32(b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn signing_bytes_golden_vectors_are_byte_identical_after_the_preimage_refactor_184() {
+        // #184 slice 2 (frozen): pin the EXACT preimage bytes for each channel primitive migrated to
+        // the Preimage builder, so the refactor cannot drift a single byte (a drift silently breaks
+        // every signature over that object type — staples → admission, commitments/receipts →
+        // settlement, noise-attest → direct-path key pinning, topology-binding → overlay admission).
+        // `expected` is the canonical layout built by hand, identical to the prior hand-rolled encoders.
+        let ch = ChannelId([0x11; 32]);
+        let a = [0x22u8; 32];
+        let b = [0x33u8; 32];
+        let c = [0x44u8; 32];
+        let d = [0x55u8; 32];
+
+        // MembershipStaple: DOMAIN ‖ channel ‖ holder ‖ stapled_at(LE) ‖ expires_at(LE)
+        let mut e = Vec::new();
+        e.extend_from_slice(MEMBERSHIP_STAPLE_DOMAIN);
+        e.extend_from_slice(&ch.0);
+        e.extend_from_slice(&a);
+        e.extend_from_slice(&7u64.to_le_bytes());
+        e.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(MembershipStaple::signing_bytes(&ch, &a, 7, 9), e, "MembershipStaple preimage drifted");
+
+        // BillingCommitment: DOMAIN ‖ channel ‖ holder ‖ payee ‖ terms_hash ‖ max_amount(LE) ‖ expires_at(LE)
+        let mut e = Vec::new();
+        e.extend_from_slice(BILLING_COMMITMENT_DOMAIN);
+        e.extend_from_slice(&ch.0);
+        e.extend_from_slice(&a);
+        e.extend_from_slice(&b);
+        e.extend_from_slice(&c);
+        e.extend_from_slice(&100u64.to_le_bytes());
+        e.extend_from_slice(&200u64.to_le_bytes());
+        assert_eq!(BillingCommitment::signing_bytes(&ch, &a, &b, &c, 100, 200), e, "BillingCommitment preimage drifted");
+
+        // SettleReceipt: DOMAIN ‖ channel ‖ receiver ‖ terms_hash ‖ session_nonce ‖ bytes_delivered(LE) ‖ transfer_digest
+        let mut e = Vec::new();
+        e.extend_from_slice(SETTLE_RECEIPT_DOMAIN);
+        e.extend_from_slice(&ch.0);
+        e.extend_from_slice(&a);
+        e.extend_from_slice(&b);
+        e.extend_from_slice(&c);
+        e.extend_from_slice(&4096u64.to_le_bytes());
+        e.extend_from_slice(&d);
+        assert_eq!(SettleReceipt::signing_bytes(&ch, &a, &b, &c, 4096, &d), e, "SettleReceipt preimage drifted");
+
+        // member_noise_attest_bytes: DOMAIN ‖ channel ‖ holder ‖ noise_pubkey
+        let mut e = Vec::new();
+        e.extend_from_slice(b"ct-a2a-noise-attest-v1");
+        e.extend_from_slice(&ch.0);
+        e.extend_from_slice(&a);
+        e.extend_from_slice(&b);
+        assert_eq!(member_noise_attest_bytes(&ch, &a, &b), e, "member_noise_attest preimage drifted");
+
+        // topology_operator_binding_bytes: DOMAIN ‖ len(u64 LE) ‖ topology_id ‖ operator_pubkey
+        let topo = "my-topology-α"; // multibyte: len is BYTE length, not char count
+        let mut e = Vec::new();
+        e.extend_from_slice(b"ct-topology-operator-v1");
+        e.extend_from_slice(&(topo.len() as u64).to_le_bytes());
+        e.extend_from_slice(topo.as_bytes());
+        e.extend_from_slice(&a);
+        assert_eq!(topology_operator_binding_bytes(topo, &a), e, "topology_operator_binding preimage drifted");
+    }
 
     #[test]
     fn hex32_is_byte_identical_to_the_format_loop() {
