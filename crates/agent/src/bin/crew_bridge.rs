@@ -29,9 +29,18 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::Sender;
 use tokio_stream::StreamExt;
 
+/// Hard cap on a single role command (#188). A role is a `ct-agent channel … --call` doing a ~14s
+/// `claude -p`; generous so a legitimately slow crew isn't cut, but bounded so a *wedged* handler /
+/// stalled channel call can't leak a zombie subprocess and hang `/crew/build` forever.
+const ROLE_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Run one role command with `input` on stdin, returning trimmed stdout. Blocking (run via
 /// `spawn_blocking`); a non-zero exit or spawn failure is an `Err` (the caller fails closed).
 fn run_cmd(cmd: &str, input: &str) -> Result<String, String> {
+    run_cmd_with_timeout(cmd, input, ROLE_CMD_TIMEOUT)
+}
+
+fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let mut child = Command::new("sh")
         .arg("-c")
@@ -41,20 +50,36 @@ fn run_cmd(cmd: &str, input: &str) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn role command failed: {e}"))?;
+    let pid = child.id();
     // Write the prompt on its OWN thread so it proceeds concurrently with the wait/read below.
     // Best-effort: a role command that exits before draining stdin (a fast reply, or a channel
     // call that answers without reading all input) makes this write fail with a broken pipe —
     // deliberately IGNORED, since the command's own exit status + stdout is the verdict, not
-    // whether every stdin byte landed. Writing before wait_with_output() (as the first cut did)
-    // races that early exit and 502s intermittently. Same fix already proven for
-    // run_service_handler_with_timeout in channel_run.rs.
+    // whether every stdin byte landed. Writing before wait (as the first cut did) races that early
+    // exit and 502s intermittently. Same fix as run_service_handler_with_timeout in channel_run.rs.
     let mut stdin = child.stdin.take().ok_or("no stdin handle")?;
     let input_owned = input.to_string();
     std::thread::spawn(move || {
         use std::io::Write;
         let _ = stdin.write_all(input_owned.as_bytes());
     });
-    let out = child.wait_with_output().map_err(|e| format!("role command wait failed: {e}"))?;
+    // #188: bound wait_with_output (which itself reads stdout on its own thread) so a hung command
+    // can't wait forever — run it on a background thread and, on timeout, KILL the child by the pid
+    // captured above so it can't linger as a zombie. Same shape as channel_run.rs's timed handler.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(|e| format!("role command wait failed: {e}"))?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            return Err(format!("role command timed out after {}s (pid {pid} killed)", timeout.as_secs()));
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err("role command wait thread disconnected".to_string());
+        }
+    };
     if !out.status.success() {
         return Err(format!("role command exited {:?}", out.status.code()));
     }
@@ -236,6 +261,19 @@ mod tests {
         // a failing role command → terminal 'error' (→ browser falls back to its stand-in).
         let evs3 = collect("x", safety_ok, "false".into(), art).await;
         assert_eq!(evs3.last().unwrap()["stage"], "error");
+    }
+
+    #[test]
+    fn run_cmd_kills_and_errors_a_role_that_exceeds_its_timeout() {
+        // #188 (frozen): a hung role command is killed and reported as a timeout, not left to hang
+        // /crew/build forever (the unbounded-subprocess bug reintroduced from channel_run.rs).
+        let start = std::time::Instant::now();
+        let err = run_cmd_with_timeout("sleep 5", "", std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("timed out"), "reports a timeout: {err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "returns promptly on timeout, doesn't wait out the sleep");
+        // A prompt command well within the bound still returns its output.
+        let ok = run_cmd_with_timeout("printf hi", "", std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(ok, "hi");
     }
 
     #[tokio::test]
