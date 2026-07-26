@@ -67,6 +67,27 @@ fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// #192: the identical `open` / `open_in_memory` constructor pair that every `Sqlite*` store below
+/// repeated verbatim (only each store's own `from_connection` schema differs). `open` uses the tuned
+/// WAL connection ([`open_tuned`]); `open_in_memory` a `:memory:` one; both delegate to the store's
+/// inherent `from_connection`. Invoked once per store (`sqlite_store_ctors!(SqliteX);`), collapsing 10
+/// copy-pasted ctor pairs to one declaration each. `from_connection` (schema + any `ensure_column`
+/// migrations) stays hand-written per store — that is the only part that legitimately differs.
+macro_rules! sqlite_store_ctors {
+    ($name:ident) => {
+        impl $name {
+            /// Open (creating if needed) a durable store at `path` on a tuned WAL connection.
+            pub fn open(path: &str) -> rusqlite::Result<Self> {
+                Self::from_connection(open_tuned(path)?)
+            }
+            /// Open an ephemeral in-memory store (for tests / stateless runs).
+            pub fn open_in_memory() -> rusqlite::Result<Self> {
+                Self::from_connection(Connection::open_in_memory()?)
+            }
+        }
+    };
+}
+
 /// Why a persisted redemption failed: an enrollment rule or the database.
 #[derive(Debug)]
 pub enum RedeemError {
@@ -131,17 +152,9 @@ pub struct SqliteEnrollment {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteEnrollment);
+
 impl SqliteEnrollment {
-    /// Open (creating if needed) a durable store at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory store (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS join_tokens (
@@ -380,17 +393,9 @@ pub struct SqliteBootstrap {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteBootstrap);
+
 impl SqliteBootstrap {
-    /// Open (creating if needed) a durable store at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory store (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bootstrap_tokens (
@@ -518,17 +523,9 @@ pub struct SqliteAgentDirectory {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteAgentDirectory);
+
 impl SqliteAgentDirectory {
-    /// Open (creating if needed) a durable directory at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory directory (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agent_cards (
@@ -625,17 +622,9 @@ pub struct SqlitePipelineRegistry {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqlitePipelineRegistry);
+
 impl SqlitePipelineRegistry {
-    /// Open (creating if needed) a durable pipeline registry at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory pipeline registry (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pipelines (
@@ -706,17 +695,9 @@ pub struct SqliteRegistry {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteRegistry);
+
 impl SqliteRegistry {
-    /// Open (creating if needed) a durable registry at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory registry (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tunnels (
@@ -828,17 +809,9 @@ pub struct SqliteLedger {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteLedger);
+
 impl SqliteLedger {
-    /// Open (creating if needed) a durable ledger at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory ledger (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS accounts (
@@ -1116,17 +1089,9 @@ pub struct SqliteTunnelStore {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteTunnelStore);
+
 impl SqliteTunnelStore {
-    /// Open (creating if needed) a durable tunnel store at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory store (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS subject_tunnels (
@@ -1428,17 +1393,9 @@ pub struct SqliteChannelStore {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteChannelStore);
+
 impl SqliteChannelStore {
-    /// Open (creating if needed) a durable channel store at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory channel store (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channels (
@@ -1739,17 +1696,9 @@ pub struct SqliteNetworkStore {
     conn: Mutex<Connection>,
 }
 
+sqlite_store_ctors!(SqliteNetworkStore);
+
 impl SqliteNetworkStore {
-    /// Open (creating if needed) a durable store at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory store (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS networks (
@@ -1878,17 +1827,9 @@ fn topo_node_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+sqlite_store_ctors!(SqliteTopologyStore);
+
 impl SqliteTopologyStore {
-    /// Open (creating if needed) a durable store at `path`.
-    pub fn open(path: &str) -> rusqlite::Result<Self> {
-        Self::from_connection(open_tuned(path)?)
-    }
-
-    /// Open an ephemeral in-memory store (for tests / stateless runs).
-    pub fn open_in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
-    }
-
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS topology_agents (
@@ -2285,6 +2226,24 @@ impl SqliteTopologyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_sqlite_store_constructs_via_the_shared_ctor_macro() {
+        // #192 (frozen): sqlite_store_ctors! generates open/open_in_memory for all 10 stores, each
+        // delegating to its own from_connection. The regression the macro could introduce is "a store
+        // no longer opens / its schema isn't applied", so construct every one — a failure here (a
+        // store dropped from the macro, a broken from_connection) fails loudly, not silently at boot.
+        SqliteEnrollment::open_in_memory().unwrap();
+        SqliteBootstrap::open_in_memory().unwrap();
+        SqliteAgentDirectory::open_in_memory().unwrap();
+        SqlitePipelineRegistry::open_in_memory().unwrap();
+        SqliteRegistry::open_in_memory().unwrap();
+        SqliteLedger::open_in_memory().unwrap();
+        SqliteTunnelStore::open_in_memory().unwrap();
+        SqliteChannelStore::open_in_memory().unwrap();
+        SqliteNetworkStore::open_in_memory().unwrap();
+        SqliteTopologyStore::open_in_memory().unwrap();
+    }
 
     #[test]
     fn pipeline_registry_publishes_and_discovers_specs_owner_scoped() {
