@@ -2433,9 +2433,22 @@ pub fn persistent_control_plane_router(
         .ok()
         .filter(|s| !s.is_empty())
         .and_then(|s| hex_decode_32(&s));
+    // #194: the client-supplied-account billing WRITERS (/accounts/open, /payment/intent,
+    // /billing/issue) debit/grow the ledger by an account named in the request body, with no
+    // possession proof. Gated by the admin token when set — but mounting them OPEN when it's unset
+    // means a deploy that forgot CT_CP_EDGE_ADMIN_TOKEN silently exposes an UNAUTHENTICATED
+    // account-debit endpoint (anyone can drain any account's credits). Fail closed in production:
+    // only mount them when the admin token is configured; without it they're simply absent (404).
+    // The real customer/agent paths (session-authed portal /portal/account/credits, OIDC /me/issue,
+    // the signature-verified /payment/webhook) don't use these routes, so this is transparent.
+    let billing_writers = if admin_token.is_some() {
+        billing_writers_gated(ledger.clone(), admin_token)
+    } else {
+        Router::new()
+    };
     let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), admin_token)
         .merge(registry_router_sqlite_gated(registry, admin_token))
-        .merge(billing_writers_gated(ledger.clone(), admin_token))
+        .merge(billing_writers)
         // #90/#97 SEC90b-wire: bootstrap-token exchange — /bootstrap/mint (admin-gated)
         // + /bootstrap/redeem (public, single-use short-TTL token handed off over TLS).
         .merge(bootstrap_router(bootstrap.clone(), admin_token))
@@ -4833,6 +4846,20 @@ mod tests {
             !html.contains("http://") && !html.contains("https://") && !html.contains("//cdn"),
             "no external assets (CSP-safe)"
         );
+        // #194: fail closed — with no CT_CP_EDGE_ADMIN_TOKEN set (unset in the test env → admin_token
+        // = None), the unauthenticated client-supplied-account billing writer must NOT be served;
+        // /billing/issue is absent (404), not an open account-debit endpoint.
+        let app_b = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp_b = app_b
+            .oneshot(
+                Request::post("/billing/issue")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"account":"0000000000000000000000000000000000000000000000000000000000000000","price":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_b.status(), StatusCode::NOT_FOUND, "billing writers absent without the admin token (#194)");
         // #174: the operator status page links AI agents to the onboarding entry point, and that
         // entry point is served live at /llms.txt (the doc as plain text a CLI agent can curl).
         assert!(html.contains(r#"href="/llms.txt""#), "links AI agents to the onboarding doc (#174)");
