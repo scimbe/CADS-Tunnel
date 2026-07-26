@@ -28,8 +28,31 @@ if [ "${1:-}" = "--selftest" ]; then
   check agent     '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}' 2
   check agent     '{"tool_name":"Bash","tool_input":{"command":"ls -la && grep x f"}}' 0
   check agent     '{"tool_name":"Read","tool_input":{}}'                        0
+  # #196: interpreter one-liners / download-to-file / patch|rsync|wget are blocked for field roles.
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"python3 -c \"open('\''crates/x.rs'\'','\''w'\'').write(p)\""}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"perl -e '\''open(F,\">f\");print F $x'\''"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"node -e \"require('\''fs'\'').writeFileSync('\''f'\'',x)\""}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"ruby -e \"File.write('\''f'\'',x)\""}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"php -r \"file_put_contents('\''f'\'',$x);\""}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"curl -o crates/x.rs http://h/x"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"curl --output f http://h/x"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"wget http://h/x"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"patch -p1 < d.patch"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"ls; rsync a b"}}'  2
+  # #196 false-positive guards: reads that merely mention or run these tools must stay ALLOWED.
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"python3 scripts/analyze.py"}}' 0
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"node --version"}}' 0
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"curl -sSL http://h/x"}}' 0
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"grep -r \"patch\" ."}}' 0
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"ls node_modules && sed -e s/a/b/ f"}}' 0
+  # #196: the `rm` COMMAND stays blocked, but the `--rm` flag (docker/podman) must NOT trip it.
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"rm crates/x.rs"}}'  2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"ls; rm f"}}'        2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"docker run --rm rust:1-slim bash -c cargo"}}' 0
+  check agent     '{"tool_name":"Read","tool_input":{}}'                        0
   check developer '{"tool_name":"Edit","tool_input":{}}'                        0
   check developer '{"tool_name":"Bash","tool_input":{"command":"echo x > f"}}'  0
+  check developer '{"tool_name":"Bash","tool_input":{"command":"python3 -c \"open('\''f'\'','\''w'\'')\""}}' 0
   echo "SELFTEST OK: field-role writes blocked; developer + read-only allowed"
   exit 0
 fi
@@ -60,7 +83,24 @@ if tool in {"Edit", "Write", "MultiEdit", "NotebookEdit"}:
 if tool == "Bash":
     cmd = ti.get("command", "") or ""
     # Reject shell that writes files or mutates git — the ways Bash bypasses the Edit/Write deny.
-    if re.search(r">>?(?![>&])|\btee\b|\bsed\b[^|]*-i|\bdd\b|\btruncate\b|\bcp\b|\bmv\b|\brm\b|git\s+(add|commit|apply|checkout|restore|reset|push|rm|mv)", cmd):
+    # A text denylist can only block what it names, so beyond shell redirection / tee / sed -i / the
+    # named file + git commands we also block the general *interpreter one-liner* route (#196):
+    #   - python/perl/ruby/node/php with an eval flag (-c/-e/-E/-r/--eval) run ARBITRARY code, so they
+    #     can write any file with no shell `>` — the most concerning bypass (general-purpose). Gated on
+    #     the eval flag so `python3 script.py`, `node --version`, etc. stay allowed.
+    #   - curl writing to a file (-o/-O/--output/--remote-name); plain curl-to-stdout stays allowed.
+    #   - wget / patch / rsync in COMMAND position (start, or after ; & | ( ) — so `grep "patch" f`
+    #     and other read commands that merely mention the word are not falsely blocked.
+    # This is defence-in-depth, not airtight (an adversary with shell metaprogramming can always find
+    # another route — the trust boundary is ultimately social); it closes the easy/accidental holes.
+    if re.search(
+        r">>?(?![>&])|\btee\b|\bsed\b[^|]*-i|\bdd\b|\btruncate\b|\bcp\b|\bmv\b|(?<!-)\brm\b"
+        r"|git\s+(add|commit|apply|checkout|restore|reset|push|rm|mv)"
+        r"|\b(python3?|perl|ruby|node|nodejs|php)\b[^|]*\s-{1,2}(c|e|E|r|eval)\b"
+        r"|\bcurl\b[^|]*\s-{1,2}(o|O|output|remote-name)\b"
+        r"|(^|[;&|(]\s*)(wget|patch|rsync)\b",
+        cmd,
+    ):
         block("Bash command writes files or mutates git")
 sys.exit(0)
 '
