@@ -535,6 +535,37 @@ where
     }
 }
 
+/// The post-accept admission of ONE already-accepted incoming connection: finish the QUIC handshake,
+/// read + authorize the channel-join, and return the [`AdmittedMember`]. Split out from
+/// [`accept_and_read_join`] so [`run_channel_broker_loop`] can `spawn` it per connection — the slow
+/// part (grant verification + possession-proof challenge-response) then runs OFF the accept loop, so
+/// one in-flight admission can't serialize every other channel's admission on this edge (#203).
+async fn admit_incoming_member<F, Fut>(
+    incoming: quinn::Incoming,
+    now: UnixSeconds,
+    authorize: &F,
+) -> Result<AdmittedMember, BoxError>
+where
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    let conn = incoming.await.map_err(|e| format!("[quic-handshake] {e}"))?;
+    match read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await {
+        Ok((send, req, operator, noise, attest, observed)) => {
+            Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed })
+        }
+        Err(e) => {
+            // #129-follow: keep the connection alive briefly so the peer reads the `NO` refusal
+            // before teardown (same as accept_and_read_join). Detached + bounded.
+            let held = conn.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), held.closed()).await;
+            });
+            Err(e)
+        }
+    }
+}
+
 /// Accept one channel-join over QUIC (AF2d-transport-a): read the presented
 /// [`ChannelJoinRequest`], authorize the holder + verify its grant (via `authorize`,
 /// wired to the control-plane channel registry — see [`accept_and_read_join`]),
@@ -1052,70 +1083,86 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     park_ttl: UnixSeconds,
     complete: C,
 ) where
-    N: Fn() -> UnixSeconds,
-    F: Fn(ChannelId, [u8; 32]) -> Fut,
-    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
-    C: Fn(AdmittedMember, AdmittedMember, UnixSeconds) -> CFut,
+    N: Fn() -> UnixSeconds + Send + Sync + 'static,
+    F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send,
+    C: Fn(AdmittedMember, AdmittedMember, UnixSeconds) -> CFut + Send + Sync + 'static,
     CFut: std::future::Future<Output = Result<ChannelPairing, BoxError>> + Send + 'static,
 {
-    let pairer: std::sync::Mutex<ChannelPairer<AdmittedMember>> =
-        std::sync::Mutex::new(ChannelPairer::new());
+    // #203: the pairer + closures are shared into each per-connection admission task, so admission
+    // (the slow grant-verify + possession-proof handshake) runs concurrently across channels instead
+    // of serialized in the accept loop — the admission analog of #120/#1's already-spawned pair
+    // COMPLETION. Arc so each spawned task can hold them.
+    let pairer = std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::<AdmittedMember>::new()));
+    let now_fn = std::sync::Arc::new(now_fn);
+    let authorize = std::sync::Arc::new(authorize);
+    let complete = std::sync::Arc::new(complete);
     loop {
         let now = now_fn();
 
-        // Sweep lone waiters past their park deadline (#3) before admitting the next member,
-        // so a first-comer with no partner is bounded instead of wedging the endpoint. The
-        // guard is dropped before the following `.await`.
+        // Sweep lone waiters past their park deadline (#3) before accepting the next connection,
+        // so a first-comer with no partner is bounded instead of wedging the endpoint.
         let expired = pairer.lock().unwrap().drain_expired(now);
         for m in expired {
             m.payload.conn.close(0u32.into(), b"channel park timeout");
         }
 
-        // Admit ONE member (its join read is bounded by #105); on error, log and keep
-        // serving — a single bad connection must not tear down the endpoint loop.
-        let member = match accept_member(endpoint, now, &authorize).await {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("ct-edge: channel admit failed: {e}");
-                continue;
+        // Accept the next incoming CONNECTION only — fast (the QUIC accept, not the handshake). The
+        // slow admission (handshake + join read + grant verify + possession-proof) then runs on a
+        // SPAWNED task, so ONE in-flight admission can't serialize every other channel's admission on
+        // this edge (#203: the loop awaited accept_member — the whole handshake — inline; `structure`
+        // / `review`, dialed last in a multi-stage pipeline, lost most to that contention).
+        let incoming = match endpoint.accept().await {
+            Some(i) => i,
+            None => {
+                eprintln!("ct-edge: channel broker endpoint closed with no incoming");
+                return;
             }
         };
-        // #103 FIX (root cause): re-sample `now` at ADMISSION time for the parked member's
-        // deadline. The `now` above is sampled at the TOP of the iteration, BEFORE the possibly
-        // long-idle `accept_member().await`; reusing that stale value for the `deadline` made a
-        // member that arrived after an idle period already past-due, so the very next iteration's
-        // `drain_expired` evicted it before its partner could pair. The deadline must be TTL from
-        // the member's ACTUAL admission time, not from before the accept wait.
-        let now = now_fn();
-        let channel = member.req.grant.grant.channel;
-        let holder = member.req.grant.grant.holder;
+        let pairer = pairer.clone();
+        let now_fn = now_fn.clone();
+        let authorize = authorize.clone();
+        let complete = complete.clone();
+        tokio::spawn(async move {
+            let now = now_fn();
+            // Admit this one member (its join read is bounded by #105); on error, log and drop it —
+            // a single bad connection must not affect any other channel.
+            let member = match admit_incoming_member(incoming, now, &*authorize).await {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("ct-edge: channel admit failed: {e}");
+                    return;
+                }
+            };
+            // #103: sample `now` at ADMISSION time for the parked member's deadline (the deadline is
+            // TTL from the member's ACTUAL admission time, not from before the handshake wait).
+            let now = now_fn();
+            let channel = member.req.grant.grant.channel;
+            let holder = member.req.grant.grant.holder;
 
-        // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
-        let outcome = pairer.lock().unwrap().offer(WaitingMember {
-            channel,
-            holder,
-            deadline: now.saturating_add(park_ttl),
-            payload: member,
-        });
-        match outcome {
-            // First holder of this channel — parked, waiting for its partner.
-            PairOutcome::Parked => {}
-            // Its partner met it: complete the pair on its OWN task so the accept loop stays
-            // free to admit the next member. This is the fix for the single-slot wedge (#1).
-            PairOutcome::Paired(a, b) => {
-                let fut = complete(a.payload, b.payload, now);
-                tokio::spawn(async move {
-                    if let Err(e) = fut.await {
+            // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
+            let outcome = pairer.lock().unwrap().offer(WaitingMember {
+                channel,
+                holder,
+                deadline: now.saturating_add(park_ttl),
+                payload: member,
+            });
+            match outcome {
+                // First holder of this channel — parked, waiting for its partner.
+                PairOutcome::Parked => {}
+                // Its partner met it: complete the pair (this task is already off the accept loop).
+                PairOutcome::Paired(a, b) => {
+                    if let Err(e) = complete(a.payload, b.payload, now).await {
                         eprintln!("ct-edge: channel pair ended: {e}");
                     }
-                });
+                }
+                // Same holder re-presented before its partner arrived: the fresh offer stays parked;
+                // close the stale connection (pairing a holder with itself is refused).
+                PairOutcome::Superseded(stale) => {
+                    stale.payload.conn.close(0u32.into(), b"superseded by newer join");
+                }
             }
-            // Same holder re-presented before its partner arrived: the fresh offer stays
-            // parked; close the stale connection (pairing a holder with itself is refused).
-            PairOutcome::Superseded(stale) => {
-                stale.payload.conn.close(0u32.into(), b"superseded by newer join");
-            }
-        }
+        });
     }
 }
 
@@ -2462,6 +2509,58 @@ mod tests {
         let ack_x_acc = x_acc.await.expect("x acc task");
         assert!(ack_x_init.contains("203.0.113.2:7002"), "X initiator learns X acceptor's endpoint, got {ack_x_init:?}");
         assert!(ack_x_acc.contains("203.0.113.1:7001"), "X acceptor learns X initiator's endpoint, got {ack_x_acc:?}");
+
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_is_concurrent_a_stalled_join_does_not_block_other_channels() {
+        // #203 (frozen): ADMISSION must be spawned, not awaited inline. A member that connects but
+        // never sends its join stalls its admission (read_join blocks up to JOIN_READ_TIMEOUT = 15s).
+        // Under the OLD serial loop that stalled admission wedged the single accept slot, so ANOTHER
+        // channel could not be admitted until the staller timed out ~15s later (exactly why
+        // `structure`/`review`, dialed last, lost to contention behind an in-flight admission). Here
+        // channel Y admits + pairs PROMPTLY (well under 15s) despite the staller.
+        let pk = operator_pubkey();
+        let chan_y = [0x22u8; 32];
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let driver = tokio::spawn(async move {
+            run_channel_broker_loop(
+                &server,
+                || 500u64,
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan_y).then_some((pk, None, None)) },
+                10_000,
+                |a, b, now| finish_rendezvous_pair(a, b, now),
+            )
+            .await;
+        });
+
+        // A staller: connect over QUIC and hold it open, NEVER sending a join → its admission blocks
+        // in read_join for the full JOIN_READ_TIMEOUT. Held in scope so it stays connected + stalling.
+        let staller_client = build_client_endpoint(cert.clone()).expect("staller client");
+        let _staller = staller_client.connect(addr, "localhost").expect("cfg").await.expect("staller conn");
+        // Let the staller be an accepted, in-flight admission before channel Y arrives.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Channel Y's two members must admit + pair PROMPTLY (< the 15s stall) — the proof that
+        // admission is concurrent. Under the old serial loop these would not resolve until ~15s.
+        let y_init = tokio::spawn(run_rendezvous_member(
+            cert.clone(), addr, chan_y, holder_sk(0xc3), Direction::Initiate, "203.0.113.3:7003", None, None,
+        ));
+        let y_acc = tokio::spawn(run_rendezvous_member(
+            cert.clone(), addr, chan_y, holder_sk(0xd4), Direction::Accept, "203.0.113.4:7004", None, None,
+        ));
+        let ack_i = tokio::time::timeout(std::time::Duration::from_secs(8), y_init)
+            .await
+            .expect("Y initiator must pair promptly despite the stalled admission (#203 admission concurrency)")
+            .expect("y init task");
+        let ack_a = tokio::time::timeout(std::time::Duration::from_secs(8), y_acc)
+            .await
+            .expect("Y acceptor must pair promptly (#203)")
+            .expect("y acc task");
+        assert!(ack_i.starts_with("OK ") && ack_i.contains("203.0.113.4:7004"), "Y initiator admitted+paired: {ack_i:?}");
+        assert!(ack_a.starts_with("OK ") && ack_a.contains("203.0.113.3:7003"), "Y acceptor admitted+paired: {ack_a:?}");
 
         driver.abort();
     }
