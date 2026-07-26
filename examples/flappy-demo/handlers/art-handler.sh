@@ -8,6 +8,27 @@
 # (the studio's bird accepts arbitrary emoji since #169) or "" for the classic tinted bird.
 # Isolated, NO tool access — pure generation. Point CT_LLM_CMD at your LLM CLI (default: `claude`).
 set -uo pipefail
+
+# #204: extract the JSON object from the LLM output, FLATTENING newlines first (`tr -d '\n'`) so the
+# match spans a pretty-printed / ```json-fenced multi-line response. `grep` is line-oriented, so
+# without the flatten a multi-line object (the LLM emits one ~1 in 3 calls) matched NOTHING on every
+# line and the handler silently fell through to its fallback — the "ask for eggs, get plain pasta" bug.
+extract_json_object() { tr -d '\n' | grep -o '{.*}' | head -1; }
+
+if [ "${1:-}" = "--selftest" ]; then
+  sample='```json
+{
+  "k": ["eggs", "spinach"],
+  "n": 2
+}
+```'
+  got="$(printf '%s' "$sample" | extract_json_object)"
+  [ -n "$got" ] || { echo "SELFTEST FAIL (#204): multi-line/fenced JSON yielded an EMPTY match" >&2; exit 1; }
+  printf '%s' "$got" | python3 -c 'import sys,json; json.loads(sys.stdin.read())' 2>/dev/null \
+    || { echo "SELFTEST FAIL (#204): extracted text is not valid JSON" >&2; exit 1; }
+  echo "SELFTEST OK (#204): multi-line/fenced JSON extraction recovers a valid object"
+  exit 0
+fi
 LLM="${CT_LLM_CMD:-claude}"
 INPUT="$(cat)"
 
@@ -17,7 +38,7 @@ OUT="$($LLM -p "$INPUT" --output-format text \
   --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch,Agent" \
   --append-system-prompt "$SYS" 2>/dev/null)" || OUT=""
 
-JSON="$(printf '%s' "$OUT" | grep -o '{.*}' | head -1)"
+JSON="$(printf '%s' "$OUT" | extract_json_object)"
 if printf '%s' "$JSON" | grep -q '"theme"'; then
   printf '%s\n' "$JSON"
 else
