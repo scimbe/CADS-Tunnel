@@ -1,4 +1,0 @@
-{
-  "_comment": "#171: optional override for the live crew-bridge endpoint the demo POSTs prompts to. Copy to crew.json (gitignored) only if the bridge is NOT at the default same-origin /crew/build. The bridge runs safety_check + the per-role matches + handlers and returns {safety:{ok,reason}, auction:[{role,bids:[{who,model,units,price,win}]}], config:{gravity,jump,gap,speed,theme,birdColor,birdEmoji,title}}. If unset/unreachable the demo falls back to the local stand-in.",
-  "url": "/crew/build"
-}

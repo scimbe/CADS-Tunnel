@@ -1,4 +1,0 @@
-{
-  "_comment": "#168: the demo's first-layer gate config. Copy to gate.json (gitignored) and set 'sha256' to the SHA-256 hash of your demo password. The PLAINTEXT never goes here or in git. run-demo.sh generates gate.json for you from FLAPPY_DEMO_PASSWORD in docker/deploy/.env. To make one by hand:  printf %s 'your-password' | sha256sum",
-  "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
-}
