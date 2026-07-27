@@ -25,11 +25,19 @@ Recipe to review (JSON): ${RECIPE}" --output-format text \
   --append-system-prompt "$SYS" 2>/dev/null)" || VERDICT=""
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\r' '  '; }
-if printf '%s' "$VERDICT" | grep -qi '^[[:space:]]*ACCEPT:'; then
-  REASON="$(printf '%s' "$VERDICT" | sed -E 's/^[[:space:]]*ACCEPT:[[:space:]]*//I')"
+
+# The model is told to answer in exactly one line, but sometimes reasons out loud and
+# self-corrects mid-response (e.g. "REJECT: ... but wait, that's fine. Let me correct: ACCEPT:
+# ..."). Checking only whether the response STARTS with ACCEPT/REJECT locks in the model's first
+# instinct and silently discards its own correction — a real false-negative/positive, not just
+# noise. Take the LAST ACCEPT:/REJECT: occurring anywhere in the response instead, since a
+# self-correction is by construction the model's final, considered verdict.
+LAST_VERDICT="$(printf '%s' "$VERDICT" | grep -oiE '(ACCEPT|REJECT):' | tail -1 | tr '[:upper:]' '[:lower:]')"
+if [ "$LAST_VERDICT" = "accept:" ]; then
+  REASON="$(printf '%s' "$VERDICT" | sed -E 's/^.*[Aa][Cc][Cc][Ee][Pp][Tt]:[[:space:]]*//')"
   printf '{"ok":true,"reason":"%s"}\n' "$(json_escape "$REASON")"
 else
-  REASON="$(printf '%s' "$VERDICT" | sed -E 's/^[[:space:]]*REJECT:[[:space:]]*//I')"
+  REASON="$(printf '%s' "$VERDICT" | sed -E 's/^.*[Rr][Ee][Jj][Ee][Cc][Tt]:[[:space:]]*//')"
   [ -n "$REASON" ] || REASON="the recipe could not be safety-reviewed"
   printf '{"ok":false,"reason":"%s"}\n' "$(json_escape "$REASON")"
 fi
