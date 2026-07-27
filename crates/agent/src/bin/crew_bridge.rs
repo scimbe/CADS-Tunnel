@@ -96,23 +96,17 @@ fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) ->
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Up to 2 retries (3 total attempts) on failure. Root-caused live (2026-07-27): the edge's own
+/// Up to `max_attempts` tries on failure. Root-caused live (2026-07-27): the edge's own
 /// `RelayHandoffError` (`crates/edge/src/channel_broker.rs`, #148) explicitly documents that a
 /// mid-handoff ack-write failure against ONE side of a relay pair is a "transient handoff race,
 /// not an admission refusal" and that "a bare retry by the survivor should re-pair" — but nothing
 /// on the client side ever actually retried, so every role dial that raced this (observed hitting
 /// art/presentation under back-to-back load, surfacing as "edge broker refused the channel join")
 /// or the related #140 "admission exchange stalled" condition surfaced as a hard, permanent-
-/// looking failure even though a later attempt routinely succeeds. A single retry measurably
-/// helped but wasn't enough under sustained concurrent load (live-observed: the same request can
-/// race TWO consecutive attempts under heavy load, not just one) — 3 total attempts directly
-/// implements the edge's own stated remedy with enough margin to actually clear it in practice,
-/// without needing to parse `ct-agent`'s stderr text to distinguish this race from a genuine
-/// refusal (which fails identically on every retry, at the cost of at most 2 extra attempts).
-async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
-    const MAX_ATTEMPTS: u32 = 3;
+/// looking failure even though a later attempt routinely succeeds.
+async fn run_cmd_async_with_retries(cmd: String, input: String, max_attempts: u32) -> Result<String, String> {
     let mut last = Err("no attempts made".to_string());
-    for _ in 0..MAX_ATTEMPTS {
+    for _ in 0..max_attempts.max(1) {
         let (cmd, input) = (cmd.clone(), input.clone());
         last = tokio::task::spawn_blocking(move || run_cmd(&cmd, &input))
             .await
@@ -122,6 +116,12 @@ async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
         }
     }
     last
+}
+
+/// 3 total attempts — the default for a role with no configured standby (nowhere else to fall
+/// through to, so it's worth paying the retry cost in full to recover a transient race).
+async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
+    run_cmd_async_with_retries(cmd, input, 3).await
 }
 
 /// #207 Slice A — ordered-candidate failover. Try an ORDERED list of role commands, first success
@@ -134,9 +134,17 @@ async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
 /// served the request (the previous version discarded this, so the demo's "auction" display always
 /// claimed the primary won even when a standby served — misleading exactly when failover matters).
 async fn run_with_fallbacks(candidates: &[String], input: String) -> Result<(String, usize), String> {
+    // Live-observed (2026-07-27, real browser test): giving EVERY candidate the full 3-attempt
+    // retry meant a persistently-down primary (source-2, mid-outage — not just racing a transient
+    // #148 blip) wasted up to 3x its own timeout before ever reaching a working standby, pushing a
+    // real build past 120s on one role alone. A candidate with somewhere else to fall through to
+    // should fail fast; only the LAST candidate (nowhere further to go) is worth paying the full
+    // retry cost for, since that's exactly the #148/#140 transient-race case retries fix.
+    let last_index = candidates.len().saturating_sub(1);
     let mut last = Err("no role command configured".to_string());
     for (i, cmd) in candidates.iter().enumerate() {
-        match run_cmd_async(cmd.clone(), input.clone()).await {
+        let attempts = if i == last_index { 3 } else { 1 };
+        match run_cmd_async_with_retries(cmd.clone(), input.clone(), attempts).await {
             Ok(out) => return Ok((out, i)),
             Err(e) => {
                 if candidates.len() > 1 {
@@ -450,6 +458,40 @@ mod tests {
         // Frozen: a command that ALWAYS fails must still fail after exhausting all 3 attempts —
         // the retry is bounded, not an infinite loop that would hang a real outage forever.
         assert!(run_cmd_async("false".to_string(), String::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_with_fallbacks_gives_a_non_last_candidate_only_1_attempt_but_the_last_candidate_3() {
+        // Frozen (root-caused live 2026-07-27, real browser test): giving EVERY candidate the full
+        // 3-attempt retry meant a persistently-down primary wasted up to 3x its own timeout before
+        // ever reaching a working standby — a real build took 120s+ on one role alone. A counter
+        // file proves candidate 0 is tried exactly ONCE (not retried) before falling through, while
+        // the LAST candidate still gets its full 3 attempts to recover a genuine transient race.
+        let marker = std::env::temp_dir().join(format!(
+            "ct-fastfail-test-{}-{:?}.count",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let m = marker.to_string_lossy().replace('\'', "");
+        let primary = format!("n=$(cat '{m}' 2>/dev/null || echo 0); echo $((n+1)) > '{m}'; exit 1");
+        let standby_marker = std::env::temp_dir().join(format!(
+            "ct-fastfail-test-standby-{}-{:?}.count",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&standby_marker);
+        let sm = standby_marker.to_string_lossy().replace('\'', "");
+        let standby = format!(
+            "n=$(cat '{sm}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{sm}'; \
+             if [ \"$n\" -ge 3 ]; then printf ok; else exit 1; fi"
+        );
+        let (out, idx) = run_with_fallbacks(&[primary, standby], String::new()).await.unwrap();
+        let primary_calls: u32 = std::fs::read_to_string(&marker).unwrap_or_default().trim().parse().unwrap_or(0);
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&standby_marker);
+        assert_eq!(primary_calls, 1, "the non-last candidate must be tried exactly once, not retried");
+        assert_eq!((out, idx), ("ok".to_string(), 1), "the last candidate still gets its full retries");
     }
 
     #[tokio::test]
