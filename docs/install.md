@@ -29,21 +29,38 @@ parse the manifest. Then `rustup update stable && cargo build --workspace`.
 
 ### Self-host (Docker Compose) — one file, durable state
 
-**Scripted (recommended)** — `scripts/deploy-selfhost.sh` installs Docker if
-needed, generates `docker/deploy/.env` (incl. a random `CT_EDGE_ADMIN_TOKEN`),
-optionally obtains a real Let's Encrypt cert for the `:443` front door via
-deSEC DNS-01, brings the stack up, and waits for `/readyz`:
+**Scripted (recommended)** — `scripts/deploy-selfhost.sh` is the single,
+idempotent entry point for the whole core system: the base stack, the `:443`
+front door, Keycloak SSO, and the `help.<zone>` demo. It installs Docker if
+needed, generates `docker/deploy/.env` (random `CT_EDGE_ADMIN_TOKEN`, and
+`KC_ADMIN_PASSWORD`/`KC_PORTAL_CLIENT_SECRET` when `--sso` is used), obtains
+real Let's Encrypt certs for each public hostname via deSEC DNS-01, brings the
+stack up, and waits for `/readyz`:
 
 ```bash
-./scripts/deploy-selfhost.sh                                    # base stack only (:4433)
-DESEC_TOKEN=<token> ./scripts/deploy-selfhost.sh --frontdoor     # + public :443 with a real cert
-./scripts/deploy-selfhost.sh --fresh --frontdoor                 # tear down + redeploy clean
+./scripts/deploy-selfhost.sh                                       # base stack only (:4433)
+DESEC_TOKEN=<token> ./scripts/deploy-selfhost.sh --frontdoor        # + public :443 with a real cert
+./scripts/deploy-selfhost.sh --frontdoor --sso                     # + Keycloak SSO login on the portal
+./scripts/deploy-selfhost.sh --frontdoor --help-site                # + the help.<zone> demo
+./scripts/deploy-selfhost.sh --frontdoor --sso --help-site --fresh  # the whole core system, clean
 ```
 
-Idempotent and re-runnable — after a failed run, re-run it (optionally with
-`--fresh`) rather than patching by hand. `--staging` uses the Let's Encrypt
-staging CA to validate the flow without risking the production rate limit.
-`./scripts/deploy-selfhost.sh --help` for all flags/env vars.
+`--sso` and `--help-site` both require `--frontdoor` (Keycloak and the demo are
+both served through it) and are independent — pick any combination. Idempotent
+and re-runnable — after a failed run, re-run it (optionally with `--fresh`)
+rather than patching by hand. `--staging` uses the Let's Encrypt staging CA to
+validate the flow without risking the production rate limit; `--skip-cert`
+reuses certs already on disk. `./scripts/deploy-selfhost.sh --help` for every
+flag/env var (including `AUTH_PUBLIC_HOST`, `AUTH_CERT_DIR`, `KC_ADMIN_USER`).
+
+Deep-dive references for what each piece does under the hood: the front door
+and its `.env` keys are in the [runbook](ops/runbook.md#deploy); SSO's realm/
+client setup is in [keycloak-sso.md](deploy/keycloak-sso.md); the DNS-01
+mechanism (and the `acme.sh` `DEDYN_TOKEN` naming gotcha) is in
+[dns01-desec.md](dns01-desec.md); the help demo's own design is in
+[examples/help-site/README.md](../examples/help-site/README.md). The script
+supersedes running each of those manual procedures by hand — read them for
+the *why*, run the script for the *how*.
 
 **Manual** — the same stack, one step at a time:
 

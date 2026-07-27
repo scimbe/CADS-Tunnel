@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
-# CADS-Tunnel — scripted self-host bring-up (Docker Compose + optional :443 front
-# door with a real Let's Encrypt cert via deSEC DNS-01).
+# CADS-Tunnel — scripted self-host bring-up: the base Docker Compose stack plus
+# every optional overlay this operator runs as part of "the core system" —
+# the :443 front door (real Let's Encrypt cert via deSEC DNS-01), Keycloak SSO,
+# and the help.<zone> Browser-Plane demo.
 #
 # Idempotent and re-runnable: safe to run again after a failure. `--fresh` tears
 # the compose stack down (incl. volumes) first for a clean slate instead of
 # patching a half-up deployment.
 #
-#   ./scripts/deploy-selfhost.sh                  # base stack only (:4433, loopback :8090)
-#   ./scripts/deploy-selfhost.sh --frontdoor       # + :443/:80 front door with a real cert
-#   ./scripts/deploy-selfhost.sh --frontdoor --staging   # LE staging cert (no rate-limit risk)
-#   ./scripts/deploy-selfhost.sh --fresh --frontdoor     # tear down + fresh bring-up
-#   ./scripts/deploy-selfhost.sh --frontdoor --skip-cert # reuse an existing cert in PORTAL_CERT_DIR
+#   ./scripts/deploy-selfhost.sh                          # base stack only (:4433, loopback :8090)
+#   ./scripts/deploy-selfhost.sh --frontdoor               # + :443/:80 front door with a real cert
+#   ./scripts/deploy-selfhost.sh --frontdoor --sso         # + Keycloak SSO login on the portal
+#   ./scripts/deploy-selfhost.sh --frontdoor --help-site   # + the help.<zone> demo
+#   ./scripts/deploy-selfhost.sh --frontdoor --sso --help-site --fresh  # the whole core system, clean
+#   ./scripts/deploy-selfhost.sh --frontdoor --staging     # LE staging certs (no rate-limit risk)
+#   ./scripts/deploy-selfhost.sh --frontdoor --skip-cert   # reuse existing certs, don't re-issue
 #
-# Required env for --frontdoor (first run only — persisted into docker/deploy/.env
-# after that): DESEC_TOKEN=<deSEC API token scoped to the zone>
+# --sso and --help-site both imply/require --frontdoor (Keycloak and the demo
+# are both served through it). Each optional piece issues its own Let's
+# Encrypt cert (front door: PORTAL_PUBLIC_HOST; SSO: AUTH_PUBLIC_HOST) via the
+# SAME acme.sh + deSEC DNS-01 mechanism — see docs/dns01-desec.md.
+#
+# Required env for --frontdoor/--sso/--help-site (first run only — persisted
+# into docker/deploy/.env after that): DESEC_TOKEN=<deSEC API token scoped to
+# the zone>
 # Optional env: PORTAL_PUBLIC_HOST (default bunsenbrenner.org), DESEC_DOMAIN
 # (defaults to PORTAL_PUBLIC_HOST), PORTAL_CERT_DIR (default ~/ct-certs/portal),
-# ACME_EMAIL (default scimbe@gmail.com), NO_COLOR.
+# AUTH_PUBLIC_HOST (default auth.<PORTAL_PUBLIC_HOST>), AUTH_CERT_DIR (default
+# ~/ct-certs/auth), KC_ADMIN_USER (default admin), ACME_EMAIL (default
+# scimbe@gmail.com), NO_COLOR.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,13 +38,19 @@ ENV_EXAMPLE="$DEPLOY_DIR/.env.example"
 DESEC_EXAMPLE="$ROOT/config/desec.env.example"
 COMPOSE_BASE="$DEPLOY_DIR/compose.selfhost.yml"
 COMPOSE_FRONTDOOR="$DEPLOY_DIR/compose.frontdoor.yml"
+COMPOSE_SSO="$DEPLOY_DIR/compose.sso.yml"
 
 FRESH=0
 FRONTDOOR=0
+SSO=0
+HELP_SITE=0
 STAGING=0
 SKIP_CERT=0
 PORTAL_PUBLIC_HOST="${PORTAL_PUBLIC_HOST:-bunsenbrenner.org}"
 PORTAL_CERT_DIR="${PORTAL_CERT_DIR:-$HOME/ct-certs/portal}"
+AUTH_PUBLIC_HOST="${AUTH_PUBLIC_HOST:-auth.$PORTAL_PUBLIC_HOST}"
+AUTH_CERT_DIR="${AUTH_CERT_DIR:-$HOME/ct-certs/auth}"
+KC_ADMIN_USER="${KC_ADMIN_USER:-admin}"
 DESEC_DOMAIN="${DESEC_DOMAIN:-$PORTAL_PUBLIC_HOST}"
 ACME_EMAIL="${ACME_EMAIL:-scimbe@gmail.com}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
@@ -47,12 +65,14 @@ ok()   { printf "${C_G}  ✓${C_0} %s\n" "$*"; }
 warn() { printf "${C_Y}  !${C_0} %s\n" "$*" >&2; }
 die()  { printf "${C_R}error:${C_0} %s\n" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh)       FRESH=1 ;;
     --frontdoor)   FRONTDOOR=1 ;;
+    --sso)         SSO=1 ;;
+    --help-site)   HELP_SITE=1 ;;
     --staging)     STAGING=1 ;;
     --skip-cert)   SKIP_CERT=1 ;;
     -h|--help)     usage 0 ;;
@@ -78,6 +98,7 @@ docker_() {
 compose_() {
   local files=(-f "$COMPOSE_BASE")
   [ "$FRONTDOOR" = "1" ] && files+=(-f "$COMPOSE_FRONTDOOR")
+  [ "$SSO" = "1" ] && files+=(-f "$COMPOSE_SSO")
   docker_ compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
 
@@ -153,27 +174,36 @@ ensure_env() {
       die "DESEC_TOKEN not set — export DESEC_TOKEN=<deSEC API token> and re-run (needed for the ACME DNS-01 cert; see $DESEC_EXAMPLE)"
     fi
   fi
+
+  if [ "$SSO" = "1" ]; then
+    [ "$FRONTDOOR" = "1" ] || die "--sso requires --frontdoor (Keycloak is served through the front door)"
+    env_set AUTH_PUBLIC_HOST "$AUTH_PUBLIC_HOST"
+    env_set KEYCLOAK_PUBLIC_URL "https://$AUTH_PUBLIC_HOST"
+    env_set AUTH_CERT_DIR "$AUTH_CERT_DIR"
+    env_set PORTAL_PUBLIC_URL "https://$PORTAL_PUBLIC_HOST"
+    env_set KC_ADMIN_USER "$KC_ADMIN_USER"
+    local kc_pw; kc_pw="$(env_get KC_ADMIN_PASSWORD)"
+    if [ -z "$kc_pw" ] || [ "$kc_pw" = "change-me" ]; then
+      kc_pw="$(openssl rand -hex 20)"
+      env_set KC_ADMIN_PASSWORD "$kc_pw"
+      ok "generated KC_ADMIN_PASSWORD"
+    fi
+    local kc_secret; kc_secret="$(env_get KC_PORTAL_CLIENT_SECRET)"
+    if [ -z "$kc_secret" ]; then
+      kc_secret="$(openssl rand -hex 32)"
+      env_set KC_PORTAL_CLIENT_SECRET "$kc_secret"
+      ok "generated KC_PORTAL_CLIENT_SECRET"
+    fi
+  fi
+
+  if [ "$HELP_SITE" = "1" ]; then
+    [ "$FRONTDOOR" = "1" ] || die "--help-site requires --frontdoor (it's a Browser-Plane hostname demo)"
+  fi
   ok "$ENV_FILE ready"
 }
 
-# --- 3. Portal TLS cert via acme.sh + deSEC DNS-01 ---------------------------
-ensure_portal_cert() {
-  [ "$FRONTDOOR" = "1" ] || return 0
-  local full="$PORTAL_CERT_DIR/fullchain.pem" key="$PORTAL_CERT_DIR/privkey.pem"
-  mkdir -p "$PORTAL_CERT_DIR"
-
-  if [ "$SKIP_CERT" = "1" ]; then
-    [ -f "$full" ] && [ -f "$key" ] || die "--skip-cert given but $full / $key missing"
-    ok "using existing cert in $PORTAL_CERT_DIR (--skip-cert)"
-    return 0
-  fi
-
-  if [ -f "$full" ] && [ -f "$key" ] && openssl x509 -in "$full" -checkend 604800 -noout >/dev/null 2>&1; then
-    ok "existing cert in $PORTAL_CERT_DIR is valid for >7 days — skipping issuance"
-    return 0
-  fi
-
-  log "obtaining a Let's Encrypt cert for $PORTAL_PUBLIC_HOST via deSEC DNS-01 (acme.sh)"
+# --- 3. TLS certs via acme.sh + deSEC DNS-01 (portal + auth) -----------------
+ensure_acme_sh() {
   if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
     curl -fsS https://get.acme.sh | sh -s email="$ACME_EMAIL" >/dev/null
   fi
@@ -181,24 +211,58 @@ ensure_portal_cert() {
   [ -n "$DESEC_TOKEN" ] || die "DESEC_TOKEN unavailable for acme.sh (check $ENV_FILE)"
   # acme.sh's dns_desec hook uses the legacy dedyn.io variable name, not DESEC_TOKEN.
   export DEDYN_TOKEN="$DESEC_TOKEN"
+}
+
+# Issue (or reuse) a Let's Encrypt cert for $host into $dir/{fullchain,privkey}.pem,
+# used by both the portal (front door) and auth (Keycloak) hostnames.
+issue_cert() {
+  local host="$1" dir="$2" reload_cmd="$3"
+  local full="$dir/fullchain.pem" key="$dir/privkey.pem"
+  mkdir -p "$dir"
+
+  if [ "$SKIP_CERT" = "1" ]; then
+    [ -f "$full" ] && [ -f "$key" ] || die "--skip-cert given but $full / $key missing"
+    ok "using existing cert in $dir (--skip-cert)"
+    return 0
+  fi
+
+  if [ -f "$full" ] && [ -f "$key" ] && openssl x509 -in "$full" -checkend 604800 -noout >/dev/null 2>&1; then
+    ok "existing cert in $dir is valid for >7 days — skipping issuance"
+    return 0
+  fi
+
+  log "obtaining a Let's Encrypt cert for $host via deSEC DNS-01 (acme.sh)"
+  ensure_acme_sh
 
   local server_flag=(--server letsencrypt)
   [ "$STAGING" = "1" ] && server_flag=(--server letsencrypt_test)
 
-  "$HOME/.acme.sh/acme.sh" --issue --dns dns_desec -d "$PORTAL_PUBLIC_HOST" "${server_flag[@]}" \
-    || die "acme.sh issuance failed for $PORTAL_PUBLIC_HOST"
-  # The reloadcmd only matters on RENEWAL (restart the already-running edge so it
-  # picks up the new cert); on first issuance there's nothing running yet to
+  "$HOME/.acme.sh/acme.sh" --issue --dns dns_desec -d "$host" "${server_flag[@]}" \
+    || die "acme.sh issuance failed for $host"
+  # The reloadcmd only matters on RENEWAL (restart the already-running service so
+  # it picks up the new cert); on first issuance there's nothing running yet to
   # restart, and the reload also needs real docker-group access (not the `sg
   # docker` workaround this shell may be using) — so a reload failure here is not
   # fatal as long as the cert files themselves landed.
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "$PORTAL_PUBLIC_HOST" \
+  "$HOME/.acme.sh/acme.sh" --install-cert -d "$host" \
     --fullchain-file "$full" --key-file "$key" \
-    --reloadcmd "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' --env-file '$ENV_FILE' restart edge" \
+    --reloadcmd "$reload_cmd" \
     || warn "acme.sh install-cert reload step failed (fine on first issuance — verifying cert files below)"
   [ -f "$full" ] && [ -f "$key" ] || die "cert files missing after acme.sh install-cert"
   chmod 600 "$key"
-  ok "cert installed at $PORTAL_CERT_DIR ($([ "$STAGING" = "1" ] && echo staging || echo production))"
+  ok "cert installed at $dir ($([ "$STAGING" = "1" ] && echo staging || echo production))"
+}
+
+ensure_portal_cert() {
+  [ "$FRONTDOOR" = "1" ] || return 0
+  issue_cert "$PORTAL_PUBLIC_HOST" "$PORTAL_CERT_DIR" \
+    "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' --env-file '$ENV_FILE' restart edge"
+}
+
+ensure_auth_cert() {
+  [ "$SSO" = "1" ] || return 0
+  issue_cert "$AUTH_PUBLIC_HOST" "$AUTH_CERT_DIR" \
+    "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' -f '$COMPOSE_SSO' --env-file '$ENV_FILE' restart edge"
 }
 
 # --- 4. bring the stack up ----------------------------------------------------
@@ -207,7 +271,7 @@ compose_up() {
     log "tearing down any existing stack (--fresh)"
     compose_ down -v --remove-orphans || true
   fi
-  log "docker compose up --build -d ($([ "$FRONTDOOR" = "1" ] && echo "base+frontdoor" || echo "base only"))"
+  log "docker compose up --build -d (base$([ "$FRONTDOOR" = "1" ] && echo "+frontdoor")$([ "$SSO" = "1" ] && echo "+sso"))"
   compose_ up --build -d
 }
 
@@ -226,35 +290,71 @@ wait_healthy() {
   ok "control plane /readyz is 200"
 }
 
+# Keycloak's own healthcheck only proves ITS http server answers — the
+# control-plane may have raced it at boot and failed its one-shot JWKS fetch
+# (logged as "no usable RS256 key — /me/* disabled", docs/deploy/keycloak-sso.md).
+# One `restart` (compose subcommand, not `docker restart`, which reuses stale
+# baked-in env) makes it re-fetch; harmless no-op if OIDC was already fine.
+restart_control_plane_for_jwks() {
+  [ "$SSO" = "1" ] || return 0
+  log "restarting control-plane once to (re)fetch the Keycloak JWKS"
+  compose_ restart control-plane
+  wait_healthy
+}
+
+ensure_help_site() {
+  [ "$HELP_SITE" = "1" ] || return 0
+  log "bringing up the help.$PORTAL_PUBLIC_HOST demo (examples/help-site)"
+  "$ROOT/examples/help-site/run-demo.sh" \
+    || warn "help-site demo did not come up cleanly — check its container logs (docker compose -f docker/deploy/compose.selfhost.yml -f examples/help-site/compose.help-site.yml logs)"
+}
+
 verify() {
   curl -fsS -m 5 http://127.0.0.1:8090/healthz >/dev/null || die "healthz check failed"
   ok "healthz OK"
+  local insecure_flag=()
+  [ "$STAGING" = "1" ] && insecure_flag=(-k)   # staging certs aren't in the trust store
   if [ "$FRONTDOOR" = "1" ]; then
-    local code insecure_flag=()
-    [ "$STAGING" = "1" ] && insecure_flag=(-k)   # staging cert isn't in the trust store
-    code="$(curl -sS -m 10 "${insecure_flag[@]}" -o /dev/null -w '%{http_code}' "https://$PORTAL_PUBLIC_HOST/" 2>/dev/null)"
-    code="${code:-000}"
-    if [ "$code" = "200" ]; then
-      ok "https://$PORTAL_PUBLIC_HOST/ -> 200"
-    else
-      warn "https://$PORTAL_PUBLIC_HOST/ -> $code (DNS propagation or firewall — check manually)"
-    fi
+    verify_url "https://$PORTAL_PUBLIC_HOST/" "${insecure_flag[@]}"
+  fi
+  if [ "$SSO" = "1" ]; then
+    verify_url "https://$AUTH_PUBLIC_HOST/realms/ct-demo" "${insecure_flag[@]}"
+  fi
+  if [ "$HELP_SITE" = "1" ]; then
+    verify_url "https://help.$PORTAL_PUBLIC_HOST/" "${insecure_flag[@]}"
+  fi
+}
+
+verify_url() {
+  local url="$1"; shift
+  local code
+  code="$(curl -sS -m 10 "$@" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"
+  code="${code:-000}"
+  if [ "$code" = "200" ]; then
+    ok "$url -> 200"
+  else
+    warn "$url -> $code (DNS propagation, cert issuance still in progress, or firewall — check manually)"
   fi
 }
 
 main() {
-  log "CADS-Tunnel self-host deploy — frontdoor=${FRONTDOOR} staging=${STAGING} fresh=${FRESH}"
+  log "CADS-Tunnel self-host deploy — frontdoor=${FRONTDOOR} sso=${SSO} help_site=${HELP_SITE} staging=${STAGING} fresh=${FRESH}"
   [ -f "$ROOT/Cargo.toml" ] || die "run from the CADS-Tunnel checkout"
   ensure_docker
   ensure_env
   ensure_portal_cert
+  ensure_auth_cert
   compose_up
   wait_healthy
+  restart_control_plane_for_jwks
+  ensure_help_site
   verify
   echo
   ok "self-host stack is up"
   echo "  Dashboard:      http://127.0.0.1:8090/  (loopback)"
   [ "$FRONTDOOR" = "1" ] && echo "  Public portal:  https://$PORTAL_PUBLIC_HOST/"
-  echo "  Logs:           docker compose -f $COMPOSE_BASE $([ "$FRONTDOOR" = "1" ] && echo "-f $COMPOSE_FRONTDOOR") --env-file $ENV_FILE logs -f"
+  [ "$SSO" = "1" ] && echo "  SSO login:      https://$AUTH_PUBLIC_HOST/ (realm ct-demo)"
+  [ "$HELP_SITE" = "1" ] && echo "  Help demo:      https://help.$PORTAL_PUBLIC_HOST/"
+  echo "  Logs:           docker compose -f $COMPOSE_BASE $([ "$FRONTDOOR" = "1" ] && echo "-f $COMPOSE_FRONTDOOR") $([ "$SSO" = "1" ] && echo "-f $COMPOSE_SSO") --env-file $ENV_FILE logs -f"
 }
 main
