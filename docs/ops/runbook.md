@@ -156,6 +156,67 @@ sustained `429`s on `/me/issue` (a client hitting the rate limit), and webhook
 
 ## Routine procedures
 
+### Authorize a new pipeline hostname (headless agents, #214)
+
+**When you need this**: a remote pipeline maintainer's agent (flappy-demo,
+cookbook-demo, or any future headless pipeline with no portal/Keycloak account)
+tries to bind a hostname and the agent log shows:
+
+```
+ct-agent: hostname binding for '<host>' failed (edge rejected hostname binding)
+```
+
+This is expected, not a bug — it's caused by `CT_EDGE_REQUIRE_HOST_AUTH=1`
+(set by `compose.frontdoor.yml`, on for this deployment), which requires every
+hostname bind to be explicitly authorized by an operator (#23 BP4b) before the
+edge will route it. It's the price of the front door being public: without
+this gate, anyone could claim any hostname. Two ways an agent gets past it:
+
+- **It has a portal/Keycloak account** → uses the self-serve `POST
+  /portal/tunnels` flow, which authorizes automatically. Nothing for the
+  operator to do.
+- **It doesn't** (a headless pipeline agent, e.g. flappy-demo/cookbook-demo)
+  → needs the steps below, **once per hostname**.
+
+**One-time setup, not per pipeline**: give the pipeline maintainer the shared
+`CT_CP_EDGE_ADMIN_TOKEN` (find it in `docker/deploy/.env` as
+`CT_EDGE_ADMIN_TOKEN` — same value) **directly, out of band** (chat, not a
+GitHub issue/comment — this repo is public). With that one token they can call
+`POST /enroll/issue` themselves over the public HTTPS API to mint their own
+join tokens for any future pipeline — no further relay needed for that half.
+
+**Per-hostname** (the part a remote agent still can't self-serve — the edge's
+own admin API is loopback-only on the operator's host): run, from an operator
+checkout with `docker/deploy/.env` present:
+
+```bash
+./scripts/authorize-pipeline.sh <hostname> [tenant]
+# e.g.:
+./scripts/authorize-pipeline.sh cookbook.bunsenbrenner.org cookbook-demo
+```
+
+It authorizes `<hostname>` at the edge (via the public, admin-gated `POST
+/registry/authorize-host/:token/:host`, #214 — no loopback access needed) and,
+if `[tenant]` is given, mints a single-use join token too. It prints a
+`CT_AGENT_TOKEN` (the routing token) and, if minted, the join token response —
+**relay both to the pipeline maintainer out of band**, never to GitHub. They
+onboard with:
+
+```bash
+CT_AGENT_HOSTNAME=<hostname> CT_AGENT_TOKEN=<routing token> \
+CT_AGENT_JOIN_TOKEN=<join token> CT_AGENT_CP_URL=https://<zone> \
+CT_AGENT_EDGE=<zone>:4433 CT_AGENT_EDGE_CERT_URL=https://<zone> \
+  ct-agent onboard
+```
+
+(`CT_AGENT_EDGE_CERT_URL` is the bare control-plane base URL — `ct-agent`
+appends `/pki/ca` itself; a stray extra `/pki/ca` 404s, see `examples/help-site/run-demo.sh`'s history.)
+
+Confirm it worked from anywhere: `curl -I https://<hostname>/` should return
+`200` with a real (non-staging) Let's Encrypt cert — `openssl s_client -connect
+<hostname>:443 -servername <hostname> </dev/null 2>/dev/null | openssl x509
+-noout -issuer` should **not** say `STAGING`.
+
 ### Rotate the edge certificate
 Restart the edge. It mints a fresh CA leaf under its internal CA on startup;
 clients trust the CA root, so no client change is needed.
