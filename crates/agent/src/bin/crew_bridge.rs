@@ -96,30 +96,32 @@ fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) ->
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// One immediate retry on failure. Root-caused live (2026-07-27): the edge's own
+/// Up to 2 retries (3 total attempts) on failure. Root-caused live (2026-07-27): the edge's own
 /// `RelayHandoffError` (`crates/edge/src/channel_broker.rs`, #148) explicitly documents that a
 /// mid-handoff ack-write failure against ONE side of a relay pair is a "transient handoff race,
 /// not an admission refusal" and that "a bare retry by the survivor should re-pair" — but nothing
 /// on the client side ever actually retried, so every role dial that raced this (observed hitting
-/// art/presentation under back-to-back load) surfaced as a hard, permanent-looking failure
-/// ("role command exited Some(1): ... edge broker refused the channel join") even though the very
-/// next attempt routinely succeeds. A single fast retry directly implements the edge's own stated
-/// fix without needing to parse `ct-agent`'s stderr text to distinguish this race from a genuine
-/// refusal (which would still fail identically on retry, at the cost of one extra attempt).
+/// art/presentation under back-to-back load, surfacing as "edge broker refused the channel join")
+/// or the related #140 "admission exchange stalled" condition surfaced as a hard, permanent-
+/// looking failure even though a later attempt routinely succeeds. A single retry measurably
+/// helped but wasn't enough under sustained concurrent load (live-observed: the same request can
+/// race TWO consecutive attempts under heavy load, not just one) — 3 total attempts directly
+/// implements the edge's own stated remedy with enough margin to actually clear it in practice,
+/// without needing to parse `ct-agent`'s stderr text to distinguish this race from a genuine
+/// refusal (which fails identically on every retry, at the cost of at most 2 extra attempts).
 async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
-    let cmd2 = cmd.clone();
-    let input2 = input.clone();
-    match tokio::task::spawn_blocking(move || run_cmd(&cmd, &input))
-        .await
-        .map_err(|e| format!("role task join failed: {e}"))?
-    {
-        Ok(out) => Ok(out),
-        Err(_first_err) => {
-            tokio::task::spawn_blocking(move || run_cmd(&cmd2, &input2))
-                .await
-                .map_err(|e| format!("role task join failed: {e}"))?
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last = Err("no attempts made".to_string());
+    for _ in 0..MAX_ATTEMPTS {
+        let (cmd, input) = (cmd.clone(), input.clone());
+        last = tokio::task::spawn_blocking(move || run_cmd(&cmd, &input))
+            .await
+            .map_err(|e| format!("role task join failed: {e}"))?;
+        if last.is_ok() {
+            return last;
         }
     }
+    last
 }
 
 /// #207 Slice A — ordered-candidate failover. Try an ORDERED list of role commands, first success
@@ -404,14 +406,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_cmd_async_retries_once_recovering_from_a_transient_first_failure() {
+    async fn run_cmd_async_retries_up_to_3_attempts_recovering_from_transient_failures() {
         // Frozen (root-caused live 2026-07-27, see the doc comment on run_cmd_async): a role dial
-        // that fails once (the edge's own documented "transient handoff race") must succeed anyway
-        // if the immediate retry would have worked — a marker file makes the command fail exactly
-        // once, then succeed on every subsequent invocation, proving the retry (not just luck) is
-        // what recovers it.
+        // that fails on its first attempt (the edge's own documented "transient handoff race") must
+        // succeed anyway if a retry would have worked. A counter file makes the command fail exactly
+        // once, then succeed — proving the retry (not just luck) recovers it.
         let marker = std::env::temp_dir().join(format!(
-            "ct-retry-test-{}-{:?}.marker",
+            "ct-retry-test-1fail-{}-{:?}.marker",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -420,7 +421,35 @@ mod tests {
         let cmd = format!("if [ -f '{m}' ]; then printf ok; else : > '{m}'; exit 1; fi");
         let out = run_cmd_async(cmd, String::new()).await;
         let _ = std::fs::remove_file(&marker);
-        assert_eq!(out.unwrap(), "ok", "the retry recovers a command that only fails on its first try");
+        assert_eq!(out.unwrap(), "ok", "recovers a command that only fails on its first try");
+    }
+
+    #[tokio::test]
+    async fn run_cmd_async_recovers_from_two_consecutive_transient_failures() {
+        // Frozen: live testing found a SINGLE retry insufficient under sustained concurrent load —
+        // the same request raced two consecutive attempts, not just one. A counter file makes the
+        // command fail exactly twice, then succeed on the 3rd (final) attempt.
+        let marker = std::env::temp_dir().join(format!(
+            "ct-retry-test-2fail-{}-{:?}.count",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let m = marker.to_string_lossy().replace('\'', "");
+        let cmd = format!(
+            "n=$(cat '{m}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{m}'; \
+             if [ \"$n\" -ge 3 ]; then printf ok; else exit 1; fi"
+        );
+        let out = run_cmd_async(cmd, String::new()).await;
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(out.unwrap(), "ok", "3 total attempts recovers a command that fails its first 2 tries");
+    }
+
+    #[tokio::test]
+    async fn run_cmd_async_gives_up_after_3_attempts_on_a_genuine_failure() {
+        // Frozen: a command that ALWAYS fails must still fail after exhausting all 3 attempts —
+        // the retry is bounded, not an infinite loop that would hang a real outage forever.
+        assert!(run_cmd_async("false".to_string(), String::new()).await.is_err());
     }
 
     #[tokio::test]
