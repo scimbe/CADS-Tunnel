@@ -1502,7 +1502,15 @@ fn call_local(method: String, params: serde_json::Value) -> tokio::io::DuplexStr
         let (mut recv, mut send) = tokio::io::split(serve_side);
         match mcp_call_over(&mut send, &mut recv, &method, params).await {
             Ok(response) => println!("{}", String::from_utf8_lossy(&response)),
-            Err(e) => eprintln!("ct-agent channel --call: no response ({e})"),
+            // #211: a failed one-shot call (e.g. `write_message` rejecting an oversized request past
+            // MAX_MESSAGE_BYTES) must exit NON-ZERO, not exit-0-with-empty-stdout — otherwise the
+            // caller can't tell "the call failed" from "the call produced nothing", and a size
+            // rejection surfaces downstream as a cryptic empty-output/JSON-parse failure. stderr is
+            // unbuffered, so the message is out before we exit.
+            Err(e) => {
+                eprintln!("ct-agent channel --call: no response ({e})");
+                std::process::exit(1);
+            }
         }
         // Dropping serve_side EOFs the session side → the channel session ends → the process exits.
     });
@@ -1533,8 +1541,16 @@ fn call_service_local(slug: String, input: String) -> tokio::io::DuplexStream {
     tokio::spawn(async move {
         match run_service_call(serve_side, &slug, &input).await {
             Ok(output) => println!("{output}"),
-            // Fail closed: no output on stdout → the crew bridge's run_cmd sees empty/!success and 502s.
-            Err(e) => eprintln!("ct-agent channel --call-service {slug}: {e}"),
+            // #211: fail closed AND exit NON-ZERO. Previously this only `eprintln!`'d and let the
+            // process exit 0 with empty stdout — indistinguishable from "the role produced no output"
+            // (the empty-stdout bugs #206/a3412fc). An oversized `input` is correctly rejected by
+            // `write_message` (MAX_MESSAGE_BYTES, u16 wire ceiling) as an `Err` that propagates up
+            // here; turning it into a non-zero exit lets the bridge surface the clear "message too
+            // large" stderr instead of a cryptic downstream JSON-parse failure. stderr is unbuffered.
+            Err(e) => {
+                eprintln!("ct-agent channel --call-service {slug}: {e}");
+                std::process::exit(1);
+            }
         }
         // Dropping serve_side (moved into run_service_call) EOFs the session → the session ends.
     });
@@ -3570,6 +3586,28 @@ mod tests {
         assert!(
             call_role_service(&mut w2, &mut r2, "safety_check", "x").await.is_err(),
             "an unoffered service fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_role_service_propagates_an_oversized_request_as_an_error_211() {
+        // #211 (frozen): a service call whose framed request exceeds the u16 wire ceiling
+        // (MAX_MESSAGE_BYTES) is rejected by `write_message` BEFORE anything is sent, and that error
+        // PROPAGATES up through `call_role_service` as an `Err` (kind InvalidInput) — it is not
+        // swallowed. This is exactly the error the one-shot `--call-service`/`--call` wrappers now turn
+        // into a NON-ZERO process exit instead of exit-0-with-empty-stdout, so an oversized `input`
+        // surfaces as a clear "message too large" rather than a cryptic downstream empty-output failure.
+        let (client, _server) = tokio::io::duplex(1 << 16);
+        let (mut recv, mut send) = tokio::io::split(client);
+        // An `input` past the ceiling → the JSON request is even larger → write_message rejects it.
+        let oversized = "x".repeat(ct_common::a2a::MAX_MESSAGE_BYTES + 1);
+        let err = call_role_service(&mut send, &mut recv, "text_generation", &oversized)
+            .await
+            .expect_err("an oversized request must surface as an Err, not be dropped");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "the transport size rejection kind is preserved");
+        assert!(
+            err.to_string().contains("MAX_MESSAGE_BYTES"),
+            "the error names the wire ceiling so the failure is attributable: {err}"
         );
     }
 
