@@ -94,7 +94,19 @@ fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) ->
             if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if stdout.is_empty() {
+        // Same principle as #206's server-side fix (channel_run.rs's run_service_handler): a
+        // successful exit with genuinely empty stdout is never a legitimate role response — it
+        // silently produced the cryptic "recipe fragments malformed: EOF while parsing a value"
+        // instead of an honest, attributable error. #206 covers the case where the SERVER's own
+        // handler process gets killed mid-run; this closes the equivalent gap on the CLIENT side
+        // (the bridge's own `ct-agent channel --call-service` dial exiting 0 with nothing printed —
+        // e.g. a response-read race, not necessarily #206's exact mechanism) so an empty result is
+        // ALWAYS treated as an error regardless of which side or layer produced it.
+        return Err(format!("role command exited {:?} but produced no output", out.status.code()));
+    }
+    Ok(stdout)
 }
 
 /// Up to `max_attempts` tries on failure. Root-caused live (2026-07-27): the edge's own
@@ -372,6 +384,16 @@ mod tests {
         assert!(err.contains("timed out"), "reports a timeout: {err}");
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "returns promptly on timeout");
         assert_eq!(run_cmd_with_timeout("printf hi", "", std::time::Duration::from_secs(5)).unwrap(), "hi");
+    }
+
+    #[test]
+    fn run_cmd_errors_instead_of_silently_succeeding_on_empty_stdout() {
+        // Frozen: closes the client-side equivalent of #206 — a command that exits 0 with
+        // genuinely empty stdout ("true") must be reported as an error, not silently accepted as
+        // Ok(""), which previously flowed on to produce the cryptic "recipe fragments malformed:
+        // EOF while parsing a value" instead of an honest, attributable error.
+        let err = run_cmd("true", "").unwrap_err();
+        assert!(err.contains("no output"), "empty-but-successful stdout must error, got: {err}");
     }
 
     #[tokio::test]
