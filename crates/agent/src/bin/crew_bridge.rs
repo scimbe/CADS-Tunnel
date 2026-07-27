@@ -47,7 +47,7 @@ fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) ->
         .arg(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn role command failed: {e}"))?;
     let pid = child.id();
@@ -81,7 +81,17 @@ fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) ->
         }
     };
     if !out.status.success() {
-        return Err(format!("role command exited {:?}", out.status.code()));
+        // Was silently `Stdio::null()`'d before — the underlying `ct-agent channel --call-service`
+        // process's OWN diagnostic (admission timeout, connection refused, channel-join stalled,
+        // etc.) was thrown away, leaving only a useless bare exit code ("role command exited
+        // Some(1)") with no way to tell a real outage from a transient admission race. Capture and
+        // surface it now, same as run_service_handler_with_timeout in channel_run.rs already does.
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!(
+            "role command exited {:?}{}",
+            out.status.code(),
+            if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
