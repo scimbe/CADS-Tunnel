@@ -100,11 +100,14 @@ async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
 /// wins while it's up" and a standby "takes over when it can't connect", with no reconfig. OPT-IN: a
 /// role with a single candidate behaves exactly as before (this just wraps `run_cmd_async`). Returns
 /// the LAST candidate's error if every candidate fails.
-async fn run_with_fallbacks(candidates: &[String], input: String) -> Result<String, String> {
+/// Returns `(output, winning_candidate_index)` — the index lets the caller report WHO actually
+/// served the request (the previous version discarded this, so the demo's "auction" display always
+/// claimed the primary won even when a standby served — misleading exactly when failover matters).
+async fn run_with_fallbacks(candidates: &[String], input: String) -> Result<(String, usize), String> {
     let mut last = Err("no role command configured".to_string());
     for (i, cmd) in candidates.iter().enumerate() {
         match run_cmd_async(cmd.clone(), input.clone()).await {
-            Ok(out) => return Ok(out),
+            Ok(out) => return Ok((out, i)),
             Err(e) => {
                 if candidates.len() > 1 {
                     eprintln!(
@@ -118,6 +121,13 @@ async fn run_with_fallbacks(candidates: &[String], input: String) -> Result<Stri
         }
     }
     last
+}
+
+/// The label to show for a failover role's winning candidate. Index 0 is always the documented
+/// primary; any later index is a standby. Not fully general (a 3rd+ candidate would also show
+/// "standby"), but accurate for the current at-most-one-standby-per-role deployments.
+fn candidate_label(primary: &str, standby: &str, winning_index: usize) -> String {
+    if winning_index == 0 { primary.to_string() } else { standby.to_string() }
 }
 
 /// #207 Slice A — build a role's ordered candidate list from env: the primary `<primary_key>` plus any
@@ -139,11 +149,13 @@ async fn emit(tx: &Sender<String>, ev: Value) {
 }
 
 /// The visible auction for the demo recipe crew (the winners that produced each fragment).
-fn demo_auction() -> Vec<RoleAuction> {
+/// `structure_who` reflects which candidate ACTUALLY served (source-2 vs a standby), not a
+/// hardcoded guess, so the display stays honest under #207's failover.
+fn demo_auction(structure_who: &str) -> Vec<RoleAuction> {
     vec![
         RoleAuction {
             role: "structure".into(),
-            bids: vec![RoleBid { who: "source-2".into(), model: "claude".into(), units: 20, price: 50, win: true }],
+            bids: vec![RoleBid { who: structure_who.into(), model: "claude".into(), units: 20, price: 50, win: true }],
         },
         RoleAuction {
             role: "presentation".into(),
@@ -190,8 +202,8 @@ async fn run_cookbook_streaming(
     // #207 Slice A: dial the structure role (source-2) across its candidate list — primary first,
     // then any configured standby — so source-2 wins while up and sink's standby takes over when it
     // can't connect. Single candidate ⇒ identical to before.
-    let structure_out = match run_with_fallbacks(&structure_cmds, structure_input).await {
-        Ok(o) => o,
+    let (structure_out, structure_winner) = match run_with_fallbacks(&structure_cmds, structure_input).await {
+        Ok((o, i)) => (o, i),
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("structure role unreachable: {e}")})).await,
     };
     emit(&tx, json!({"stage": "structure", "status": "done"})).await;
@@ -239,7 +251,8 @@ async fn run_cookbook_streaming(
     emit(&tx, json!({"stage": "review", "status": "ok"})).await;
 
     // 6. built — the reviewed, assembled recipe.
-    let mut built = serde_json::to_value(RecipeBuildResponse::built(card, demo_auction())).unwrap_or_else(|_| json!({}));
+    let structure_who = candidate_label("source-2", "central (standby)", structure_winner);
+    let mut built = serde_json::to_value(RecipeBuildResponse::built(card, demo_auction(&structure_who))).unwrap_or_else(|_| json!({}));
     if let Value::Object(m) = &mut built {
         m.insert("stage".into(), json!("built"));
     }
@@ -323,25 +336,26 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_fallbacks_tries_candidates_in_order_first_success_wins() {
-        // #207 Slice A (frozen): the failover primitive. Primary up ⇒ its output, standby not run;
-        // primary down ⇒ standby's output; all down ⇒ error. `false` exits non-zero (a down
-        // provider); `printf X` is a live one.
+        // #207 Slice A (frozen): the failover primitive. Primary up ⇒ its output + index 0, standby
+        // not run; primary down ⇒ standby's output + index 1; all down ⇒ error. `false` exits
+        // non-zero (a down provider); `printf X` is a live one. The index is what candidate_label()
+        // uses to report WHO actually served, not a guess.
         // primary succeeds → standby never runs (its output must NOT appear).
-        let out = run_with_fallbacks(
+        let (out, idx) = run_with_fallbacks(
             &["printf primary".to_string(), "printf standby".to_string()],
             String::new(),
         )
         .await
         .unwrap();
-        assert_eq!(out, "primary", "primary wins while it's up");
+        assert_eq!((out, idx), ("primary".to_string(), 0), "primary wins while it's up");
         // primary fails (exit 1) → standby takes over.
-        let out = run_with_fallbacks(
+        let (out, idx) = run_with_fallbacks(
             &["false".to_string(), "printf standby".to_string()],
             String::new(),
         )
         .await
         .unwrap();
-        assert_eq!(out, "standby", "standby takes over when the primary can't serve");
+        assert_eq!((out, idx), ("standby".to_string(), 1), "standby takes over when the primary can't serve");
         // every candidate fails → error (the last one's).
         assert!(
             run_with_fallbacks(&["false".to_string(), "false".to_string()], String::new())
@@ -352,8 +366,15 @@ mod tests {
         // single candidate ⇒ unchanged behaviour.
         assert_eq!(
             run_with_fallbacks(&["printf only".to_string()], String::new()).await.unwrap(),
-            "only"
+            ("only".to_string(), 0)
         );
+    }
+
+    #[test]
+    fn candidate_label_reports_primary_at_index_0_and_standby_otherwise() {
+        assert_eq!(candidate_label("source-2", "central (standby)", 0), "source-2");
+        assert_eq!(candidate_label("source-2", "central (standby)", 1), "central (standby)");
+        assert_eq!(candidate_label("source-2", "central (standby)", 2), "central (standby)");
     }
 
     #[test]
