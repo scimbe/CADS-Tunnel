@@ -1,7 +1,7 @@
 # Demo: `https://help.bunsenbrenner.org` through the Browser Plane
 
 A single-page overview of the project that links to the (LLM-generated) BA thesis,
-served **through a claude-tunnel demo tunnel** with a **publicly-trusted HTTPS
+served **through a CADS-Tunnel demo tunnel** with a **publicly-trusted HTTPS
 certificate** — an end-to-end demo of the Browser Plane (#23) + deSEC DNS-01 (#31).
 
 ## How it works (payload-blind, cert at the origin)

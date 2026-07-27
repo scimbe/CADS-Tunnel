@@ -1,4 +1,4 @@
-//! Claude Tunnel Edge daemon (M5.4c).
+//! CADS Tunnel Edge daemon (M5.4c).
 //!
 //! Reads [`EdgeConfig`] from the environment, writes its certificate to a shared
 //! path (so Agents/Clients can trust it), and runs the serve loop.

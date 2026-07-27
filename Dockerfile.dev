@@ -1,4 +1,4 @@
-# Hermetic dev/CI image for Claude Tunnel (ADR-0007; DEVELOPMENT-PROCESS D3/D7).
+# Hermetic dev/CI image for CADS Tunnel (ADR-0007; DEVELOPMENT-PROCESS D3/D7).
 # The same image builds, tests, and (later) produces release artifacts, so local
 # and CI runs are byte-for-byte reproducible.
 FROM rust:1-slim

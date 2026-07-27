@@ -610,7 +610,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-tunnel — {title}</title>
+<title>CADS-Tunnel — {title}</title>
 <style>
  body{{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
       display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:3rem 1rem}}

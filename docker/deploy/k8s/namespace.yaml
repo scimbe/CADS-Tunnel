@@ -5,4 +5,4 @@ kind: Namespace
 metadata:
   name: ct-system
   labels:
-    app.kubernetes.io/part-of: claude-tunnel
+    app.kubernetes.io/part-of: CADS-Tunnel

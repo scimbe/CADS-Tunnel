@@ -11,7 +11,7 @@
   "clients": [
     {
       "clientId": "ct-portal",
-      "name": "claude-tunnel customer portal",
+      "name": "CADS-Tunnel customer portal",
       "secret": "${KC_PORTAL_CLIENT_SECRET}",
       "protocol": "openid-connect",
       "enabled": true,

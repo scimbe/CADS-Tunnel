@@ -1,9 +1,9 @@
 ---
 name: coordinated-development-loop
-description: The three-role (developer/agent/central) coordinated development loop for claude-tunnel — the per-cycle control loop, the report + verify contracts, and the delegated-agent contract. Synthesized from retrospective #115 round 1. Start this to reorganize the process at a better level; each role then aligns its own SKILL.md to its section here.
+description: The three-role (developer/agent/central) coordinated development loop for CADS-Tunnel — the per-cycle control loop, the report + verify contracts, and the delegated-agent contract. Synthesized from retrospective #115 round 1. Start this to reorganize the process at a better level; each role then aligns its own SKILL.md to its section here.
 ---
 
-# Coordinated development loop (claude-tunnel)
+# Coordinated development loop (CADS-Tunnel)
 
 Three roles coordinate **only through GitHub issues**; **only `developer` changes code**.
 This skill is the shared process, distilled from retrospective #115 (round 1). Each role

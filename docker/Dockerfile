@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Claude Tunnel testbed image (M5.4).
+# CADS Tunnel testbed image (M5.4).
 #
 # Multi-stage: build all node binaries in release, then ship them in a slim
 # runtime. docker compose runs this one image with per-node commands

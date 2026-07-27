@@ -1,6 +1,6 @@
-# Claude Tunnel
+# CADS Tunnel
 
-Claude Tunnel is a zero-knowledge, censorship-resistant network-tunnel SaaS: it exposes services running behind NAT or firewalls **without the operator ever being able to read the tunneled traffic**, and it resists discretionary takedown. The primary (v1) access model is a client-software **Mesh Plane** that also hides routing metadata; anonymous-browser exposure is a later plane.
+CADS Tunnel is a zero-knowledge, censorship-resistant network-tunnel SaaS: it exposes services running behind NAT or firewalls **without the operator ever being able to read the tunneled traffic**, and it resists discretionary takedown. The primary (v1) access model is a client-software **Mesh Plane** that also hides routing metadata; anonymous-browser exposure is a later plane.
 
 ## Language
 

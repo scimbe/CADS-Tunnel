@@ -1,4 +1,4 @@
-//! Claude Tunnel Client tool (M6.1c).
+//! CADS Tunnel Client tool (M6.1c).
 //!
 //! Waits for the Edge cert and the Agent's Capability, then either tunnels a
 //! single payload (verifying the round-trip) or, when `CT_CLIENT_ITERATIONS>1`,

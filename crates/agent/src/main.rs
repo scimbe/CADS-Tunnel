@@ -1,4 +1,4 @@
-//! Claude Tunnel Agent daemon (M5.4c).
+//! CADS Tunnel Agent daemon (M5.4c).
 //!
 //! Waits for the Edge cert on a shared path, mints a Capability (written to the
 //! shared volume for the Client), registers its tunnel, and serves the Origin.

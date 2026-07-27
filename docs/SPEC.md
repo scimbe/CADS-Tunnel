@@ -1,10 +1,10 @@
-# Claude Tunnel — v1 Product & Architecture Spec
+# CADS Tunnel — v1 Product & Architecture Spec
 
 > Status: draft for review. Derived from the grilling session captured in `CONTEXT.md` (glossary) and `docs/adr/0001–0018`. Each decision links to its ADR; rationale lives there and is not repeated here.
 
 ## 1. What it is
 
-Claude Tunnel is a **zero-knowledge, censorship-resistant network-tunnel SaaS**. It exposes a service running behind NAT or a firewall to remote clients **without the operator ever being able to read the traffic**, and it is designed to keep working under discretionary takedown pressure.
+CADS Tunnel is a **zero-knowledge, censorship-resistant network-tunnel SaaS**. It exposes a service running behind NAT or a firewall to remote clients **without the operator ever being able to read the traffic**, and it is designed to keep working under discretionary takedown pressure.
 
 The operator is deliberately kept out of three things:
 

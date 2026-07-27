@@ -1,6 +1,6 @@
-# Claude Tunnel — security whitepaper
+# CADS Tunnel — security whitepaper
 
-A concise, customer-facing account of how Claude Tunnel protects your traffic and
+A concise, customer-facing account of how CADS Tunnel protects your traffic and
 your account. Every mechanism named here is implemented and tested; deeper detail
 lives in the linked documents.
 

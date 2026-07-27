@@ -1,4 +1,4 @@
-# Claude Tunnel testbed topology (M5.5).
+# CADS Tunnel testbed topology (M5.5).
 #
 # edge + agent(+origin) + client on a static-IP network, coordinating via a
 # shared volume. tc netem link impairment is configurable per node via env

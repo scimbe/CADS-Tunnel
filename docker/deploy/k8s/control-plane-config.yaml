@@ -9,10 +9,10 @@ metadata:
   namespace: ct-system
   labels:
     app.kubernetes.io/name: ct-control-plane
-    app.kubernetes.io/part-of: claude-tunnel
+    app.kubernetes.io/part-of: CADS-Tunnel
 data:
   CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
   # Durable SQLite lives on the PVC mounted at /data.
   CT_CONTROL_PLANE_DB: "/data/control-plane.db"
   # Replace with the real Keycloak realm issuer before deploying.
-  CT_OIDC_ISSUER: "https://keycloak.example/realms/claude-tunnel"
+  CT_OIDC_ISSUER: "https://keycloak.example/realms/CADS-Tunnel"

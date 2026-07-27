@@ -46,7 +46,7 @@ command -v openssl >/dev/null || fail "openssl is required"
 command -v curl >/dev/null || fail "curl is required"
 command -v jq >/dev/null || fail "jq is required (apt-get install jq)"
 
-bold "=== claude-tunnel HTTPS demo: a real HTTPS website through the tunnel ==="
+bold "=== CADS-Tunnel HTTPS demo: a real HTTPS website through the tunnel ==="
 
 # 1. A private HTTPS origin on loopback with its OWN self-signed cert (SAN
 #    127.0.0.1). TLS terminates HERE — the tunnel never sees the plaintext.

@@ -192,7 +192,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const SECRET: &[u8] = b"test-realm-secret";
-    const ISSUER: &str = "https://keycloak.example/realms/claude-tunnel";
+    const ISSUER: &str = "https://keycloak.example/realms/CADS-Tunnel";
 
     fn now() -> u64 {
         SystemTime::now()

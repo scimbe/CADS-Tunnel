@@ -1,4 +1,4 @@
-//! Claude Tunnel Control Plane — thin, self-hostable-ready coordination:
+//! CADS Tunnel Control Plane — thin, self-hostable-ready coordination:
 //! enrollment, Tunnel Registry, Rendezvous, billing. Holds no trust material or
 //! payload. See ADR-0005 (enrollment/identity), ADR-0017 (thin control plane).
 

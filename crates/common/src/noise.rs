@@ -9,7 +9,7 @@ use std::io;
 use std::sync::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// The Noise parameter set for Claude Tunnel's mesh handshake (ADR-0013).
+/// The Noise parameter set for CADS Tunnel's mesh handshake (ADR-0013).
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// A Noise static keypair (X25519). The public half is the Origin Identity;

@@ -10,7 +10,7 @@ metadata:
   namespace: ct-system
   labels:
     app.kubernetes.io/name: ct-control-plane
-    app.kubernetes.io/part-of: claude-tunnel
+    app.kubernetes.io/part-of: CADS-Tunnel
 spec:
   accessModes:
     - ReadWriteOnce

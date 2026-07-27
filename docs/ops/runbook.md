@@ -1,6 +1,6 @@
 # Operations runbook
 
-How to deploy, operate, and respond to incidents for a Claude Tunnel deployment.
+How to deploy, operate, and respond to incidents for a CADS Tunnel deployment.
 Commands assume the repo root.
 
 ## Deploy
@@ -221,7 +221,7 @@ CT_CLIENT_ITERATIONS=50 BIN=./target/debug CENTRAL=<central-host> EDGE_CERT=/pat
 Example output:
 
 ```text
-=== claude-tunnel demo: reaching a PRIVATE origin through the tunnel ===
+=== CADS-Tunnel demo: reaching a PRIVATE origin through the tunnel ===
 ▶ Starting a PRIVATE origin on 127.0.0.1:8080 (echo; logs each request)
 ✓ Origin is up on 127.0.0.1:8080 — bound to loopback, so it is NOT reachable from another host.
 ▶ Contrast — is the origin reachable directly from outside loopback?

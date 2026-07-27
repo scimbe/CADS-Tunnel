@@ -427,7 +427,7 @@ fn sso_unconfigured() -> Response {
 const ACCESS_DENIED_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-tunnel — access not permitted</title>
+<title>CADS-Tunnel — access not permitted</title>
 <style>
  body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
       display:flex;min-height:100vh;align-items:center;justify-content:center}
@@ -557,7 +557,7 @@ fn home_html(subject: &str) -> String {
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-tunnel — your account</title>
+<title>CADS-Tunnel — your account</title>
 <style>
  body{{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
       display:flex;min-height:100vh;align-items:center;justify-content:center}}
@@ -635,7 +635,7 @@ fn urlencode(s: &str) -> String {
 const PORTAL_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-tunnel — customer portal</title>
+<title>CADS-Tunnel — customer portal</title>
 <style>
  body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
       display:flex;min-height:100vh;align-items:center;justify-content:center}
@@ -646,7 +646,7 @@ const PORTAL_HTML: &str = r#"<!doctype html>
  .foot{color:#8b949e;font-size:.8rem;margin-top:1.6rem}
 </style></head><body>
 <div class="card">
- <h1>claude-tunnel</h1>
+ <h1>CADS-Tunnel</h1>
  <div class="sub">Sign in to manage your account and tunnels.</div>
  <a class="btn" href="/portal/login">Sign in with SSO</a>
  <div class="foot">Provider-blind tunnels — the operator never sees your payload.</div>

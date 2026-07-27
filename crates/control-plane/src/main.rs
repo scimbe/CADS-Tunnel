@@ -1,4 +1,4 @@
-//! Claude Tunnel Control-Plane service (M13.3, durable since M18.4d).
+//! CADS Tunnel Control-Plane service (M13.3, durable since M18.4d).
 //!
 //! Serves the enrollment + registry/rendezvous + billing HTTP API over TCP,
 //! backed by a durable SQLite database so state survives a restart. Thin and

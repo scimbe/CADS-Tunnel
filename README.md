@@ -1,4 +1,4 @@
-# Claude Tunnel
+# CADS Tunnel
 
 A tunnel that exposes a local service (any TCP/UDP) to clients through a thin
 hosted control plane, with the payload **end-to-end encrypted** so the operator

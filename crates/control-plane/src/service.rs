@@ -2204,7 +2204,7 @@ fn parse_metric(body: &str, name: &str) -> Option<i64> {
 const LANDING_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-tunnel — operator status</title>
+<title>CADS-Tunnel — operator status</title>
 <style>
  body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6edf3}
  h1{font-size:1.3rem} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:1rem}
@@ -2216,7 +2216,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
  a.btn:hover{background:#2ea043}
 </style></head><body>
 <div class="top">
- <h1>claude-tunnel — operator status</h1>
+ <h1>CADS-Tunnel — operator status</h1>
  <div style="display:flex;gap:.6rem;flex-wrap:wrap">
   <a class="btn" href="/llms.txt">&#129302; For AI agents &mdash; onboarding &rarr;</a>
   <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>

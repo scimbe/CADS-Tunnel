@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-`claude-tunnel` is a **zero-knowledge tunnel**, implemented as a Rust workspace — crates `ct-common`, `ct-edge`, `ct-agent`, `ct-client`, `ct-control-plane`, `ct-dns` (an end-to-end-encrypted data path with a thin, provider-blind control plane). Application code lives under `crates/`; build and test with Cargo (the hermetic Docker gate is the canonical check — see `scripts/`). The `main` branch has a full commit history.
+`CADS-Tunnel` is a **zero-knowledge tunnel**, implemented as a Rust workspace — crates `ct-common`, `ct-edge`, `ct-agent`, `ct-client`, `ct-control-plane`, `ct-dns` (an end-to-end-encrypted data path with a thin, provider-blind control plane). Application code lives under `crates/`; build and test with Cargo (the hermetic Docker gate is the canonical check — see `scripts/`). The `main` branch has a full commit history.
 
 The repo **also** carries a developer-workflow layer for driving Claude Code against it: the role skills under `.claude/skills/`, `scripts/claude-resume.sh`, and `.mcp.json`. Note what is actually tracked here: only `.claude/skills/{agent,central,developer}/SKILL.md` and `.mcp.json` (which declares a single MCP server, `github`). The ruflo/claude-flow **3-layer memory system, `.claude/settings.json` hooks, and `.claude/helpers/*` described below are local, untracked developer tooling** — conveniences on the developer's machine, **not controls enforced by this repository** (the skills' guardrails are therefore prompt-level, not hook-enforced; cf. issue #77).
 

@@ -9,7 +9,7 @@ is ever wanted, `#144`'s `AgentCard` is the primitive to reuse, not a new format
 ## Role
 
 Runs and field-tests the central point (control plane `:8090` + edge `:4433`) of the
-claude-tunnel self-host stack. Cannot modify the codebase directly — influence on the
+CADS-Tunnel self-host stack. Cannot modify the codebase directly — influence on the
 codebase is entirely through GitHub issues (verify, reproduce, report; the developer role
 fixes). See `.claude/skills/central/SKILL.md` for the full operating contract.
 

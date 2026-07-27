@@ -12,7 +12,7 @@ metadata:
   namespace: ct-system
   labels:
     app.kubernetes.io/name: ct-edge
-    app.kubernetes.io/part-of: claude-tunnel
+    app.kubernetes.io/part-of: CADS-Tunnel
 spec:
   type: LoadBalancer
   selector:

@@ -1,4 +1,4 @@
-//! Shared wire types for Claude Tunnel (P0.2).
+//! Shared wire types for CADS Tunnel (P0.2).
 //!
 //! Logic-free and serde-serializable. Terms follow `CONTEXT.md`; see ADR-0013
 //! (Origin Identity) and ADR-0014 (Capability). This crate must not depend on

@@ -1,4 +1,4 @@
-# Claude Tunnel — what it is and why it's different
+# CADS Tunnel — what it is and why it's different
 
 A tunnel that exposes a local service (any TCP/UDP) to clients through a thin
 hosted control plane, with the payload encrypted end-to-end so the operator can

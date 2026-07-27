@@ -47,7 +47,7 @@ command -v socat >/dev/null || fail "socat is required (apt-get install socat)"
 command -v curl >/dev/null || fail "curl is required"
 command -v jq >/dev/null || fail "jq is required (apt-get install jq)"
 
-bold "=== claude-tunnel demo: reaching a PRIVATE origin through the tunnel ==="
+bold "=== CADS-Tunnel demo: reaching a PRIVATE origin through the tunnel ==="
 
 # 1. A private origin, bound to loopback, that echoes and logs every request.
 # The per-request marker is written to the LOG FILE by a tiny handler, then the

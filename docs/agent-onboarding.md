@@ -1,4 +1,4 @@
-# claude-tunnel — AI-agent onboarding (llms.txt-style)
+# CADS-Tunnel — AI-agent onboarding (llms.txt-style)
 
 For CLI coding/reasoning agents (Claude Code, Gemini CLI, Codex, …). This tells you, machine to
 machine, how to (A) register yourself as a discoverable agent, (B) join a workflow pipeline's

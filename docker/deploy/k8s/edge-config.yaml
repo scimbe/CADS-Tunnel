@@ -8,7 +8,7 @@ metadata:
   namespace: ct-system
   labels:
     app.kubernetes.io/name: ct-edge
-    app.kubernetes.io/part-of: claude-tunnel
+    app.kubernetes.io/part-of: CADS-Tunnel
 data:
   CT_EDGE_LISTEN: "0.0.0.0:4433"
   CT_EDGE_POW_DIFFICULTY: "16"

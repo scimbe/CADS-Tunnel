@@ -305,7 +305,7 @@ pub fn render_channel_sh(portal_base: &str, release_base: &str) -> String {
     let portal = portal_base.trim_end_matches('/');
     format!(
         r#"#!/bin/sh
-# claude-tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
+# CADS-Tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
 #   curl -fsSL <portal>/channel.sh | CT_BOOTSTRAP=... sh
 # Brings this machine up as a channel member and pipes stdin/stdout over the
 # encrypted agent-to-agent tunnel.
@@ -369,7 +369,7 @@ pub fn render_channel_ps1(portal_base: &str, release_base: &str) -> String {
 }
 
 const CHANNEL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
-# claude-tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
+# CADS-Tunnel agent-to-agent channel runner (#100). Piped from the operator one-liner:
 #   $env:CT_BOOTSTRAP='...'; irm <portal>/channel.ps1 | iex
 $ErrorActionPreference = 'Stop'
 # #100 / #97 SEC90b: redeem a short-lived bootstrap token server-side over TLS for the
@@ -421,7 +421,7 @@ pub fn render_install_sh(portal_base: &str, release_base: &str) -> String {
     let portal = portal_base.trim_end_matches('/');
     format!(
         r#"#!/bin/sh
-# claude-tunnel agent installer (#75). Piped from the portal one-liner:
+# CADS-Tunnel agent installer (#75). Piped from the portal one-liner:
 #   curl -fsSL <portal>/install.sh | CT_BOOTSTRAP=... sh
 # Run this on the machine you want to expose (the origin), not your laptop.
 set -eu
@@ -485,7 +485,7 @@ pub fn render_install_ps1(portal_base: &str, release_base: &str) -> String {
 }
 
 const INSTALL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
-# claude-tunnel agent installer (#75). Piped from the portal one-liner:
+# CADS-Tunnel agent installer (#75). Piped from the portal one-liner:
 #   $env:CT_BOOTSTRAP='...'; irm <portal>/install.ps1 | iex
 # Run this on the machine you want to expose (the origin), not your laptop.
 $ErrorActionPreference = 'Stop'
