@@ -20,6 +20,12 @@ rendezvous/relay on `:4435`/`:4436`** (all udp+tcp), plus metrics on `:9600` —
 once `CT_EDGE_ADMIN_TOKEN` is set (#100/#105), so they sit idle until then. Add the
 overlays below for the public-facing planes.
 
+**Scripted end-to-end** (recommended): `./scripts/deploy-selfhost.sh --frontdoor`
+handles Docker install, `.env` generation, the Let's Encrypt cert (via
+`acme.sh` + deSEC DNS-01, see [dns01-desec.md](../dns01-desec.md)), and the
+`compose up` below in one idempotent, re-runnable command — `--help` for flags.
+The manual steps it automates:
+
 **Optional `:443` front door** (`compose.frontdoor.yml`, #60) — publishes one
 `:443` that serves the **Portal landing page**, **Browser-Plane subdomains**
 (`help.<zone>`), the tunnel data-plane relay, and the **Agent-Fabric channel
@@ -198,8 +204,20 @@ CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der CT_CLIENT_FORCE_TCP=1 ./
 ```
 
 Requires the built binaries (`docker run --rm -v "$PWD":/work -w /work rust:1-slim
-cargo build --workspace`), plus `socat` and `curl`. `EDGE_CERT` is the edge CA
+cargo build --workspace`), plus `socat`, `curl`, and `jq`. `EDGE_CERT` is the edge CA
 root (public trust material) copied from the central host.
+
+If the control plane has `CT_EDGE_ADMIN_TOKEN`/`CT_CP_EDGE_ADMIN_TOKEN` set (the
+front-door overlay requires it, see above), `POST /enroll/issue` is admin-gated
+and the script's own token-minting call gets `401`. Mint one yourself with the
+admin header and pass it in:
+
+```bash
+TOKEN=$(curl -sS -X POST http://127.0.0.1:8090/enroll/issue \
+  -H 'content-type: application/json' -H "x-ct-admin-token: $CT_EDGE_ADMIN_TOKEN" \
+  -d '{"tenant":"t1"}' | jq -r .token)
+CENTRAL=<central-host> EDGE_CERT=/path/to/edge-cert.der CT_JOIN_TOKEN="$TOKEN" ./scripts/e2e-smoke.sh
+```
 
 ### Demo in 2 minutes (show a human the tunnel works)
 Where the smoke above prints a machine verdict for operators, `./scripts/demo.sh`

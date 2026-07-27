@@ -29,6 +29,24 @@ parse the manifest. Then `rustup update stable && cargo build --workspace`.
 
 ### Self-host (Docker Compose) — one file, durable state
 
+**Scripted (recommended)** — `scripts/deploy-selfhost.sh` installs Docker if
+needed, generates `docker/deploy/.env` (incl. a random `CT_EDGE_ADMIN_TOKEN`),
+optionally obtains a real Let's Encrypt cert for the `:443` front door via
+deSEC DNS-01, brings the stack up, and waits for `/readyz`:
+
+```bash
+./scripts/deploy-selfhost.sh                                    # base stack only (:4433)
+DESEC_TOKEN=<token> ./scripts/deploy-selfhost.sh --frontdoor     # + public :443 with a real cert
+./scripts/deploy-selfhost.sh --fresh --frontdoor                 # tear down + redeploy clean
+```
+
+Idempotent and re-runnable — after a failed run, re-run it (optionally with
+`--fresh`) rather than patching by hand. `--staging` uses the Let's Encrypt
+staging CA to validate the flow without risking the production rate limit.
+`./scripts/deploy-selfhost.sh --help` for all flags/env vars.
+
+**Manual** — the same stack, one step at a time:
+
 ```bash
 cp docker/deploy/.env.example docker/deploy/.env   # edit ports / OIDC issuer / webhook secret
 docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.env up --build -d
