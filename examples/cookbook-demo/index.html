@@ -191,18 +191,39 @@ $("gateForm").addEventListener("submit", async (e) => {
 });
 
 // ---- image: load, RESIZE client-side (cap the channel payload), keep base64 ----
+// The Agent-Fabric channel's message framing uses a u16 length prefix (crates/common/src/a2a.rs
+// MAX_MESSAGE_BYTES = 65535 bytes total) — a hard wire-format ceiling, not a soft target. A real
+// phone photo, even downscaled to 1024px at quality 0.8, routinely produced a base64 payload of
+// several hundred KB — several times over the limit — which the transport correctly rejected, but
+// that rejection wasn't surfacing as a clear error (a separate bug), just a cryptic parse failure.
+// Budget the image well under the ceiling: ~40KB of base64 leaves generous headroom (~25KB) for the
+// prompt text, the lang field, and JSON-in-JSON escaping/structure overhead in the same message.
+const IMAGE_B64_BUDGET = 40 * 1024;
+function canvasToJpeg(canvas, quality) { return canvas.toDataURL("image/jpeg", quality); }
 let imageB64 = null;   // base64 (no data: prefix) of a downscaled JPEG, or null
 $("photo").addEventListener("change", (e) => {
   const file = e.target.files && e.target.files[0];
   if (!file) return;
   const img = new Image();
   img.onload = () => {
-    const MAX = 1024;
     let { width: w, height: h } = img;
-    if (w > MAX || h > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w * s); h = Math.round(h * s); }
-    const c = document.createElement("canvas"); c.width = w; c.height = h;
-    c.getContext("2d").drawImage(img, 0, 0, w, h);
-    const url = c.toDataURL("image/jpeg", 0.8);
+    const c = document.createElement("canvas");
+    let url, dim = 1024, quality = 0.8;
+    // Iteratively shrink (dimension first, then quality) until the encoded payload actually fits
+    // the transport's hard ceiling — a fixed dimension/quality pair can't guarantee that across
+    // wildly different source photos (a detailed, high-contrast fridge photo encodes far larger
+    // than a plain one at the same pixel size).
+    for (let attempt = 0; attempt < 8; attempt++) {
+      let cw = w, ch = h;
+      if (cw > dim || ch > dim) { const s = dim / Math.max(cw, ch); cw = Math.round(cw * s); ch = Math.round(ch * s); }
+      c.width = cw; c.height = ch;
+      c.getContext("2d").drawImage(img, 0, 0, cw, ch);
+      url = canvasToJpeg(c, quality);
+      if ((url.length * 3 / 4) <= IMAGE_B64_BUDGET) break;
+      // Alternate: cut quality first (cheap, preserves framing), then fall back to shrinking
+      // dimensions once quality is already low, so a big/detailed photo still converges.
+      if (quality > 0.35) quality -= 0.15; else dim = Math.round(dim * 0.75);
+    }
     imageB64 = url.split(",")[1] || null;
     $("thumb").src = url; $("thumb").style.display = "inline-block"; $("clearPhoto").style.display = "inline-block";
     URL.revokeObjectURL(img.src);
