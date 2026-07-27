@@ -203,66 +203,26 @@ ensure_env() {
 }
 
 # --- 3. TLS certs via acme.sh + deSEC DNS-01 (portal + auth) -----------------
-ensure_acme_sh() {
-  if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
-    curl -fsS https://get.acme.sh | sh -s email="$ACME_EMAIL" >/dev/null
-  fi
-  export DESEC_TOKEN="${DESEC_TOKEN:-$(env_get DESEC_TOKEN)}"
-  [ -n "$DESEC_TOKEN" ] || die "DESEC_TOKEN unavailable for acme.sh (check $ENV_FILE)"
-  # acme.sh's dns_desec hook uses the legacy dedyn.io variable name, not DESEC_TOKEN.
-  export DEDYN_TOKEN="$DESEC_TOKEN"
-}
-
-# Issue (or reuse) a Let's Encrypt cert for $host into $dir/{fullchain,privkey}.pem,
-# used by both the portal (front door) and auth (Keycloak) hostnames.
-issue_cert() {
-  local host="$1" dir="$2" reload_cmd="$3"
-  local full="$dir/fullchain.pem" key="$dir/privkey.pem"
-  mkdir -p "$dir"
-
-  if [ "$SKIP_CERT" = "1" ]; then
-    [ -f "$full" ] && [ -f "$key" ] || die "--skip-cert given but $full / $key missing"
-    ok "using existing cert in $dir (--skip-cert)"
-    return 0
-  fi
-
-  if [ -f "$full" ] && [ -f "$key" ] && openssl x509 -in "$full" -checkend 604800 -noout >/dev/null 2>&1; then
-    ok "existing cert in $dir is valid for >7 days — skipping issuance"
-    return 0
-  fi
-
-  log "obtaining a Let's Encrypt cert for $host via deSEC DNS-01 (acme.sh)"
-  ensure_acme_sh
-
-  local server_flag=(--server letsencrypt)
-  [ "$STAGING" = "1" ] && server_flag=(--server letsencrypt_test)
-
-  "$HOME/.acme.sh/acme.sh" --issue --dns dns_desec -d "$host" "${server_flag[@]}" \
-    || die "acme.sh issuance failed for $host"
-  # The reloadcmd only matters on RENEWAL (restart the already-running service so
-  # it picks up the new cert); on first issuance there's nothing running yet to
-  # restart, and the reload also needs real docker-group access (not the `sg
-  # docker` workaround this shell may be using) — so a reload failure here is not
-  # fatal as long as the cert files themselves landed.
-  "$HOME/.acme.sh/acme.sh" --install-cert -d "$host" \
-    --fullchain-file "$full" --key-file "$key" \
-    --reloadcmd "$reload_cmd" \
-    || warn "acme.sh install-cert reload step failed (fine on first issuance — verifying cert files below)"
-  [ -f "$full" ] && [ -f "$key" ] || die "cert files missing after acme.sh install-cert"
-  chmod 600 "$key"
-  ok "cert installed at $dir ($([ "$STAGING" = "1" ] && echo staging || echo production))"
-}
+# shared with scripts/authorize-pipeline.sh — see scripts/lib-acme.sh.
+# shellcheck source=lib-acme.sh
+. "$ROOT/scripts/lib-acme.sh"
 
 ensure_portal_cert() {
   [ "$FRONTDOOR" = "1" ] || return 0
+  export DESEC_TOKEN="${DESEC_TOKEN:-$(env_get DESEC_TOKEN)}"
+  [ -n "$DESEC_TOKEN" ] || die "DESEC_TOKEN unavailable for acme.sh (check $ENV_FILE)"
   issue_cert "$PORTAL_PUBLIC_HOST" "$PORTAL_CERT_DIR" \
-    "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' --env-file '$ENV_FILE' restart edge"
+    "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' --env-file '$ENV_FILE' restart edge" \
+    "$ACME_EMAIL"
 }
 
 ensure_auth_cert() {
   [ "$SSO" = "1" ] || return 0
+  export DESEC_TOKEN="${DESEC_TOKEN:-$(env_get DESEC_TOKEN)}"
+  [ -n "$DESEC_TOKEN" ] || die "DESEC_TOKEN unavailable for acme.sh (check $ENV_FILE)"
   issue_cert "$AUTH_PUBLIC_HOST" "$AUTH_CERT_DIR" \
-    "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' -f '$COMPOSE_SSO' --env-file '$ENV_FILE' restart edge"
+    "docker compose -f '$COMPOSE_BASE' -f '$COMPOSE_FRONTDOOR' -f '$COMPOSE_SSO' --env-file '$ENV_FILE' restart edge" \
+    "$ACME_EMAIL"
 }
 
 # --- 4. bring the stack up ----------------------------------------------------
