@@ -135,13 +135,16 @@ CT_CLIENT_EDGE_CERT=edge-cert.der ct-client
 
 - **Dashboard**: `GET /` on the control plane — a self-contained operator
   landing page showing health plus live counts (tunnels, agents, accounts,
-  confirmed payments, uptime), auto-refreshing. `:8090` is loopback-bound (#85), so
-  open it locally at `http://localhost:8090/`, or publicly via the `:443` front door
-  at `https://<zone>/`. It shows metadata and health only; the payload is
-  end-to-end encrypted and never visible here.
+  published pipelines, discoverable agents, uptime), plus the actual lists of
+  published workflow pipelines and directory agents (each linking to its full
+  spec / agent card) and buttons to the raw `/registry/pipelines` and
+  `/registry/agents` endpoints — auto-refreshing. `:8090` is loopback-bound
+  (#85), so open it locally at `http://localhost:8090/`, or publicly via the
+  `:443` front door at `https://<zone>/`. It shows metadata and health only;
+  the payload is end-to-end encrypted and never visible here.
 - **Status (JSON)**: `GET /status` — the machine-readable data behind the
-  dashboard: `{ready, tunnels, agents, accounts, payments_confirmed, uptime_seconds}`.
-  Scrape or alert on it.
+  dashboard: `{ready, tunnels, agents, accounts, payments_confirmed,
+  pipelines_published, agents_directory, uptime_seconds}`. Scrape or alert on it.
 - **Liveness**: `GET /healthz` on the control plane (always 200 while up).
 - **Readiness**: `GET /readyz` (200 only when the database is reachable; 503
   otherwise — orchestrators route around it).

@@ -2100,6 +2100,12 @@ pub struct StatusState {
     enrollment: Arc<SqliteEnrollment>,
     registry: Arc<SqliteRegistry>,
     ledger: Arc<SqliteLedger>,
+    /// The public agent directory (#144 ②) and workflow-pipeline registry (#174 B) —
+    /// shared with `agent_directory_router`/`pipeline_registry_router` (same Arc,
+    /// same underlying tables) so the landing page's counts and the actual
+    /// discovery endpoints can never drift apart.
+    agent_directory: Arc<SqliteAgentDirectory>,
+    pipeline_registry: Arc<SqlitePipelineRegistry>,
     started: std::time::Instant,
     /// When set, `/status.tunnels` reports the edge's live registration count
     /// scraped from this URL (the edge's `/metrics` `ct_edge_active_tunnels`
@@ -2124,6 +2130,12 @@ pub struct StatusResp {
     pub accounts: i64,
     /// Confirmed payments.
     pub payments_confirmed: i64,
+    /// Published workflow pipelines (#174 B `GET /registry/pipelines`).
+    pub pipelines_published: i64,
+    /// Publicly discoverable agents (#144 ② `GET /registry/agents`) — distinct
+    /// from `agents` above, which counts raw enrollment (join-token redemptions),
+    /// not agents that opted into the searchable directory.
+    pub agents_directory: i64,
     /// Seconds since the control plane started.
     pub uptime_seconds: u64,
 }
@@ -2134,12 +2146,16 @@ pub fn status_router(
     enrollment: Arc<SqliteEnrollment>,
     registry: Arc<SqliteRegistry>,
     ledger: Arc<SqliteLedger>,
+    agent_directory: Arc<SqliteAgentDirectory>,
+    pipeline_registry: Arc<SqlitePipelineRegistry>,
     edge_metrics_url: Option<String>,
 ) -> Router {
     Router::new().route("/status", get(status_handler)).with_state(StatusState {
         enrollment,
         registry,
         ledger,
+        agent_directory,
+        pipeline_registry,
         started: std::time::Instant::now(),
         edge_metrics_url,
         http: reqwest::Client::new(),
@@ -2151,6 +2167,8 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
         ready: s.ledger.ping().is_ok(),
         tunnels: live_tunnel_count(&s).await,
         agents: s.enrollment.agent_count().unwrap_or(0),
+        pipelines_published: s.pipeline_registry.list().map(|v| v.len() as i64).unwrap_or(0),
+        agents_directory: s.agent_directory.search(None, None).map(|v| v.len() as i64).unwrap_or(0),
         accounts: s.ledger.account_count().unwrap_or(0),
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
         uptime_seconds: s.started.elapsed().as_secs(),
@@ -2207,13 +2225,21 @@ const LANDING_HTML: &str = r#"<!doctype html>
 <title>CADS-Tunnel — operator status</title>
 <style>
  body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6edf3}
- h1{font-size:1.3rem} .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:1rem}
+ h1{font-size:1.3rem} h2{font-size:1rem;color:#c9d1d9;margin:2rem 0 .5rem}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:1rem}
  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem}
  .n{font-size:2rem;font-weight:700} .l{color:#8b949e;font-size:.85rem}
  .ok{color:#3fb950} .bad{color:#f85149} .foot{color:#8b949e;font-size:.8rem;margin-top:1.5rem}
  .top{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:.75rem}
  a.btn{display:inline-block;background:#238636;color:#fff;padding:.55rem 1.1rem;border-radius:8px;font-weight:600;text-decoration:none}
  a.btn:hover{background:#2ea043}
+ a.btn.secondary{background:#21262d;border:1px solid #30363d}
+ a.btn.secondary:hover{background:#30363d}
+ ul.list{list-style:none;margin:.5rem 0 0;padding:0;display:flex;flex-direction:column;gap:.5rem}
+ ul.list li{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:.75rem 1rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}
+ ul.list .id{font-weight:600} ul.list .meta{color:#8b949e;font-size:.85rem}
+ ul.list a{color:#58a6ff;text-decoration:none} ul.list a:hover{text-decoration:underline}
+ .empty{color:#8b949e;font-size:.85rem;padding:.5rem 0}
 </style></head><body>
 <div class="top">
  <h1>CADS-Tunnel — operator status</h1>
@@ -2227,9 +2253,23 @@ const LANDING_HTML: &str = r#"<!doctype html>
  <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
  <div class="card"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
  <div class="card"><div class="n" id="accounts">–</div><div class="l">accounts</div></div>
- <div class="card"><div class="n" id="payments">–</div><div class="l">confirmed payments</div></div>
+ <div class="card"><div class="n" id="pipelines">–</div><div class="l">published pipelines</div></div>
+ <div class="card"><div class="n" id="directory">–</div><div class="l">discoverable agents</div></div>
  <div class="card"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
 </div>
+
+<h2>Workflow pipelines</h2>
+<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
+ <a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a>
+</div>
+<ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
+
+<h2>AI agents</h2>
+<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
+ <a class="btn secondary" href="/registry/agents">Agent registry (raw) &rarr;</a>
+</div>
+<ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
+
 <div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
 <script>
  async function refresh(){
@@ -2239,11 +2279,37 @@ const LANDING_HTML: &str = r#"<!doctype html>
    document.getElementById('tunnels').textContent=s.tunnels;
    document.getElementById('agents').textContent=s.agents;
    document.getElementById('accounts').textContent=s.accounts;
-   document.getElementById('payments').textContent=s.payments_confirmed;
+   document.getElementById('pipelines').textContent=s.pipelines_published;
+   document.getElementById('directory').textContent=s.agents_directory;
    document.getElementById('uptime').textContent=s.uptime_seconds;
   }catch(e){ document.getElementById('health').innerHTML='<span class="bad">● unreachable</span>'; }
  }
- refresh(); setInterval(refresh,5000);
+ function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+ async function refreshPipelines(){
+  const el = document.getElementById('pipeline-list');
+  try{
+   const r = await fetch('/registry/pipelines'); const rows = await r.json();
+   if(!rows.length){ el.innerHTML = '<li class="empty">No pipelines published yet.</li>'; return; }
+   el.innerHTML = rows.map(p =>
+     '<li><span class="id">'+esc(p.id)+'</span><span class="meta">owner: '+esc(p.owner)+'</span>'+
+     '<a href="/registry/pipelines/'+encodeURIComponent(p.id)+'">spec &rarr;</a></li>'
+   ).join('');
+  }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
+ }
+ async function refreshAgents(){
+  const el = document.getElementById('agent-list');
+  try{
+   const r = await fetch('/registry/agents'); const rows = await r.json();
+   if(!rows.length){ el.innerHTML = '<li class="empty">No agents in the directory yet.</li>'; return; }
+   el.innerHTML = rows.map(a =>
+     '<li><span class="id">'+esc(a.holder_pubkey.slice(0,16))+'…</span>'+
+     '<span class="meta">'+esc((a.role_tags||[]).join(', ')||'no roles advertised')+'</span>'+
+     '<a href="'+esc(a.card_url)+'">card &rarr;</a></li>'
+   ).join('');
+  }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
+ }
+ refresh(); refreshPipelines(); refreshAgents();
+ setInterval(refresh,5000); setInterval(refreshPipelines,15000); setInterval(refreshAgents,15000);
 </script></body></html>"#;
 
 /// The AI-agent onboarding doc (`docs/agent-onboarding.md`, #174), embedded so the control plane can
@@ -2386,12 +2452,20 @@ pub fn persistent_control_plane_router(
     // these three client-supplied-account writers are gated behind the shared admin
     // token when the CP has one configured (the customer path is the session-authed
     // portal, not these HTTP routes); wired just below with `issue_admin_token`.
+    // Opened here (rather than inline at their .merge() call sites below) so the
+    // SAME Arcs back both the actual registry endpoints and the landing page's
+    // counts — they can never read a different table than what /registry/agents
+    // and /registry/pipelines actually serve.
+    let agent_directory = Arc::new(SqliteAgentDirectory::open(db_path)?);
+    let pipeline_registry = Arc::new(SqlitePipelineRegistry::open(db_path)?);
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
-    // the three stores, plus a self-contained HTML dashboard at `/`.
+    // the stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(
         enrollment.clone(),
         registry.clone(),
         ledger.clone(),
+        agent_directory.clone(),
+        pipeline_registry.clone(),
         std::env::var("CT_CP_EDGE_METRICS_URL")
             .ok()
             .filter(|u| !u.is_empty()),
@@ -2438,16 +2512,10 @@ pub fn persistent_control_plane_router(
         // machine-writer-gated `POST` self-register (same `CT_CP_EDGE_ADMIN_TOKEN` as the other
         // agent-facing writers). Mounted unconditionally (no OIDC dependency): autonomous agents
         // self-enroll M2M and any peer searches — neither has a browser-interactive login path.
-        .merge(agent_directory_router(
-            Arc::new(SqliteAgentDirectory::open(db_path)?),
-            admin_token,
-        ))
+        .merge(agent_directory_router(agent_directory, admin_token))
         // #174 B: the workflow-pipeline registry — POST publish (admin-gated) + public GET
         // discovery, so a designer can publish a PipelineSpec agents scan to find workflows to join.
-        .merge(pipeline_registry_router(
-            Arc::new(SqlitePipelineRegistry::open(db_path)?),
-            admin_token,
-        ))
+        .merge(pipeline_registry_router(pipeline_registry, admin_token))
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
         // proof-gated (operator-signed invitation + invitee redemption + Noise attest).
         .merge(channel_invite_router(channels.clone()))
@@ -4944,8 +5012,16 @@ mod tests {
         let acct = ledger.open_account().unwrap();
         let pid = ledger.create_intent(&acct, 5).unwrap();
         ledger.confirm_payment(&pid).unwrap();
+        let agent_directory = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        agent_directory
+            .register("holder1", "https://example.test/card.json", &["physics".into()], &[], 1)
+            .unwrap();
+        let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+        pipeline_registry
+            .publish("owner1", &ct_common::pipeline::PipelineSpec { id: "flappy".into(), roles: vec![] }, 1)
+            .unwrap();
 
-        let app = status_router(enrollment, registry, ledger, None);
+        let app = status_router(enrollment, registry, ledger, agent_directory, pipeline_registry, None);
         let resp = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
             .await
@@ -4958,6 +5034,8 @@ mod tests {
         assert_eq!(s.agents, 1);
         assert_eq!(s.accounts, 1);
         assert_eq!(s.payments_confirmed, 1);
+        assert_eq!(s.pipelines_published, 1);
+        assert_eq!(s.agents_directory, 1);
     }
 
     #[test]
@@ -5001,6 +5079,8 @@ mod tests {
             enrollment,
             registry,
             ledger,
+            Arc::new(SqliteAgentDirectory::open_in_memory().unwrap()),
+            Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap()),
             Some(format!("http://{addr}/metrics")),
         );
         let resp = app
