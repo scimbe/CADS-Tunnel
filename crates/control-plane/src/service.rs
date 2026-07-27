@@ -1036,6 +1036,75 @@ async fn pipeline_get(
     }
 }
 
+/// State for the public edge host-authorization proxy (below).
+#[derive(Clone)]
+struct EdgeAuthorizeState {
+    edge_admin_url: Arc<str>,
+    edge_admin_token: Arc<str>,
+    admin_token: Option<[u8; 32]>,
+    http: reqwest::Client,
+}
+
+/// `POST /registry/authorize-host/:token/:host` — a public, admin-token-gated proxy
+/// to the edge's own `/admin/authorize-host/:token/:host` (#23 BP4b).
+///
+/// Host authorization was previously reachable only two ways: the session-authed
+/// portal's automatic call in `create_tunnel` (human browser login required), or
+/// the edge's admin API directly — which is loopback-only on the operator's host,
+/// unreachable by a remote pipeline maintainer's own agent process. That forced
+/// every hostname bind through the operator relaying tokens by hand (the flow
+/// `help.<zone>` and `flappy-demo.<zone>` both needed, out of band, per-hostname).
+///
+/// This closes that gap: a remote pipeline maintainer holding just the shared
+/// `CT_CP_EDGE_ADMIN_TOKEN` (the same one `/enroll/issue`/`/registry/agents`/
+/// `/registry/pipelines` already require) can now self-serve host authorization
+/// over the public HTTPS control-plane, with no further per-deployment relay
+/// through the operator or a GitHub issue. Mounted only when the edge admin
+/// URL+token are configured (nothing to proxy to otherwise) — same fail-closed
+/// posture as every other admin-gated writer here.
+fn edge_authorize_host_router(
+    edge_admin_url: String,
+    edge_admin_token: String,
+    admin_token: Option<[u8; 32]>,
+) -> Router {
+    Router::new()
+        .route("/registry/authorize-host/:token/:host", post(authorize_host_proxy))
+        .with_state(EdgeAuthorizeState {
+            edge_admin_url: Arc::from(edge_admin_url),
+            edge_admin_token: Arc::from(edge_admin_token),
+            admin_token,
+            http: reqwest::Client::new(),
+        })
+}
+
+async fn authorize_host_proxy(
+    State(state): State<EdgeAuthorizeState>,
+    headers: HeaderMap,
+    Path((token, host)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_admin(&headers, &state.admin_token, "authorizing a hostname requires the admin token")?;
+    let host = ct_common::normalize_hostname(&host)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid hostname".to_string()))?;
+    let endpoint = format!(
+        "{}/admin/authorize-host/{}/{}",
+        state.edge_admin_url.trim_end_matches('/'),
+        token,
+        host
+    );
+    let resp = state
+        .http
+        .post(&endpoint)
+        .header("x-ct-admin-token", state.edge_admin_token.as_ref())
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("edge unreachable: {e}")))?;
+    if resp.status().is_success() {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::BAD_GATEWAY, format!("edge returned {}", resp.status())))
+    }
+}
+
 /// A random opaque id (16 bytes, hex) for a topology id / net_uuid.
 fn gen_hex_id() -> String {
     let mut b = [0u8; 16];
@@ -2458,6 +2527,17 @@ pub fn persistent_control_plane_router(
     // and /registry/pipelines actually serve.
     let agent_directory = Arc::new(SqliteAgentDirectory::open(db_path)?);
     let pipeline_registry = Arc::new(SqlitePipelineRegistry::open(db_path)?);
+    // Where to reach the edge's admin API (host-authorize/revoke, #23 BP4b / #27
+    // RB4b) — hoisted here (rather than inline at each of its two call sites
+    // below) so both the portal's automatic authorize-on-create-tunnel AND the
+    // new public authorize-host proxy (#214) read the exact same config.
+    let edge_admin_config = match (
+        std::env::var("CT_CP_EDGE_ADMIN_URL").ok().filter(|s| !s.is_empty()),
+        std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()),
+    ) {
+        (Some(url), Some(token)) => Some((url, token)),
+        _ => None,
+    };
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
     // the stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(
@@ -2516,6 +2596,15 @@ pub fn persistent_control_plane_router(
         // #174 B: the workflow-pipeline registry — POST publish (admin-gated) + public GET
         // discovery, so a designer can publish a PipelineSpec agents scan to find workflows to join.
         .merge(pipeline_registry_router(pipeline_registry, admin_token))
+        // #214: public, admin-token-gated host-authorization proxy to the edge — lets a
+        // remote pipeline maintainer holding just the admin token self-serve hostname
+        // binds (the same shared secret /enroll/issue already requires), no operator
+        // relay or GitHub coordination needed per deployment. Absent when the edge
+        // admin URL/token aren't configured (nothing to proxy to).
+        .merge(match edge_admin_config.clone() {
+            Some((url, token)) => edge_authorize_host_router(url, token, admin_token),
+            None => Router::new(),
+        })
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
         // proof-gated (operator-signed invitation + invitee redemption + Noise attest).
         .merge(channel_invite_router(channels.clone()))
@@ -2537,13 +2626,7 @@ pub fn persistent_control_plane_router(
             &std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
             // #27 RB4b: propagate tunnel revokes to the edge when both the admin
             // URL and shared secret are configured.
-            match (
-                std::env::var("CT_CP_EDGE_ADMIN_URL").ok().filter(|s| !s.is_empty()),
-                std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()),
-            ) {
-                (Some(url), Some(token)) => Some((url, token)),
-                _ => None,
-            },
+            edge_admin_config.clone(),
             // #38 DL2: automatic tunnel-hostname DNS via deSEC, pointing A records
             // at the edge's public IP. Enabled when the deSEC config + edge IP are set.
             match (
@@ -4327,6 +4410,60 @@ mod tests {
         // Unknown id → 404.
         let miss = app.oneshot(Request::get("/registry/pipelines/nope").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(miss.status(), StatusCode::NOT_FOUND, "unknown pipeline → 404");
+    }
+
+    #[tokio::test]
+    async fn authorize_host_proxy_is_admin_gated_and_forwards_to_the_edge() {
+        // #214: a remote pipeline maintainer holding just the admin token can self-serve
+        // host authorization over the public control plane, without operator/GitHub relay.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let edge_admin_token = "edge-secret";
+
+        // Mock edge admin API: records the exact path it was hit on.
+        let hit = Arc::new(std::sync::Mutex::new(None::<String>));
+        let hit2 = hit.clone();
+        let mock_edge = Router::new().route(
+            "/admin/authorize-host/:token/:host",
+            post(move |axum::extract::Path((token, host)): axum::extract::Path<(String, String)>, headers: HeaderMap| {
+                let hit = hit2.clone();
+                async move {
+                    if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(edge_admin_token) {
+                        return StatusCode::UNAUTHORIZED;
+                    }
+                    *hit.lock().unwrap() = Some(format!("{token}/{host}"));
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock_edge).await.unwrap() });
+
+        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin));
+        let call = |tok: Option<String>| {
+            let mut req = Request::post("/registry/authorize-host/deadbeef/flappy-demo.bunsenbrenner.org");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        assert_eq!(call(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no admin token → 401");
+        assert_eq!(
+            call(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong admin token → 401"
+        );
+        assert_eq!(call(Some(hex_encode(&admin))).await.unwrap().status(), StatusCode::OK, "admin token authorizes");
+        assert_eq!(
+            hit.lock().unwrap().as_deref(),
+            Some("deadbeef/flappy-demo.bunsenbrenner.org"),
+            "forwarded to the edge with the exact token/host and its admin header"
+        );
     }
 
     #[tokio::test]
