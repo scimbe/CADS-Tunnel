@@ -10,6 +10,18 @@
 
 use ct_common::channel::ChannelId;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+/// Hard bound on a single edge→CP authorize round-trip. Without it, `reqwest::Client::new()` has NO
+/// request timeout, so a CP that accepts the TCP connection but never responds hangs `authorize().await`
+/// **indefinitely** — and because authorize sits inline in the broker's admission gate
+/// (`read_channel_join_on_stream`), every channel's admission then parks with no reply. From the
+/// acceptor that surfaces as "admission exchange stalled (#140)" (a hang), NOT "refused" (a clean `NO`),
+/// and post-#203 each new connection spawns another admit task that hangs the same way. This bound turns
+/// an unresponsive CP into a fast, fail-closed refusal (the `send()` errors → `None` → `NO`) instead of
+/// an unbounded stall — surfaced live on #207. 10s is generous for a same-cluster internal call while
+/// still bounding the hang.
+const DEFAULT_AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -76,10 +88,22 @@ pub struct ChannelAuthorizer {
 
 impl ChannelAuthorizer {
     /// `cp_base` is the control-plane base URL (e.g. `http://control-plane:8090`);
-    /// `admin_token` is the shared edge↔CP admin secret the CP verifies.
+    /// `admin_token` is the shared edge↔CP admin secret the CP verifies. The authorize round-trip is
+    /// bounded by [`DEFAULT_AUTHORIZE_TIMEOUT`] so an unresponsive CP fails closed fast instead of
+    /// hanging the admission gate (#207).
     pub fn new(cp_base: &str, admin_token: &[u8; 32]) -> Self {
+        Self::with_timeout(cp_base, admin_token, DEFAULT_AUTHORIZE_TIMEOUT)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit per-request `timeout` on the authorize round-trip.
+    /// A CP that never responds makes `send()` error at `timeout`, which resolves fail-closed to `None`
+    /// (a refusal) — never an unbounded hang.
+    pub fn with_timeout(cp_base: &str, admin_token: &[u8; 32], timeout: Duration) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             url: format!(
                 "{}/internal/channel/authorize",
                 cp_base.trim_end_matches('/')
@@ -198,5 +222,42 @@ mod tests {
         assert_eq!(m.noise_attestation, Some([0x66u8; 64]), "the holder attestation is delivered too (#101)");
         // A non-member still resolves to None (fail-closed).
         assert!(good.resolve(&channel, &[0x44u8; 32]).await.is_none(), "non-member denied");
+    }
+
+    // A CP that accepts the connection but NEVER responds — the live #207 failure mode (unresponsive,
+    // not rejecting): the request hangs until the client's own timeout fires.
+    async fn hang_forever(_headers: axum::http::HeaderMap, Json(_body): Json<Value>) -> Json<Value> {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Json(serde_json::json!({}))
+    }
+
+    async fn spawn_hanging_cp() -> String {
+        let app = Router::new().route("/internal/channel/authorize", post(hang_forever));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn an_unresponsive_cp_fails_closed_within_the_timeout_not_hangs() {
+        // #207 (frozen): a CP that accepts the TCP connection but never replies must resolve to `None`
+        // (a fail-closed refusal) bounded by the authorize timeout — NOT hang the admission gate
+        // indefinitely (which surfaced as the plane-wide "admission exchange stalled (#140)" flood).
+        let base = spawn_hanging_cp().await;
+        let channel = ChannelId([0xC5u8; 32]);
+        let auth = ChannelAuthorizer::with_timeout(&base, &[0x7au8; 32], Duration::from_millis(200));
+
+        // The whole call must complete well under the mock's 3600s sleep — a generous 5s test bound
+        // proves it's the client timeout ending it, not a hang. Result is None (fail-closed).
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            auth.authorize(&channel, &[0x33u8; 32]),
+        )
+        .await
+        .expect("authorize must return within the bound, not hang on an unresponsive CP");
+        assert_eq!(result, None, "an unresponsive CP fails closed to a refusal, not a hang");
     }
 }
