@@ -1,0 +1,109 @@
+{
+  "timestamp": "2026-07-07T02:58:26.100Z",
+  "mode": "headless",
+  "workerType": "audit",
+  "model": "haiku",
+  "durationMs": 107650,
+  "executionId": "audit_1783392998450_55o03f",
+  "success": true,
+  "findings": {
+    "vulnerabilities": [
+      {
+        "severity": "high",
+        "file": ".claude/helpers/memory.js",
+        "line": 24,
+        "category": "insecure-file-permissions",
+        "description": "Memory files stored in .claude-flow/data/ are created with world-readable permissions (rw-rw-r--). Any local user can read session context, exposing sensitive data, API keys, or authentication tokens.",
+        "cwe": "CWE-276: Incorrect Default File Permissions",
+        "impact": "Confidentiality breach - local users can access session secrets"
+      },
+      {
+        "severity": "high",
+        "file": ".claude/helpers/session.js",
+        "line": 25,
+        "category": "insecure-file-permissions",
+        "description": "Session files in .claude-flow/sessions/ created with rw-rw-r-- permissions. Group/world readable access to session context, metrics, and workflow information.",
+        "cwe": "CWE-276: Incorrect Default File Permissions",
+        "impact": "Confidentiality breach - local privilege escalation or information disclosure"
+      },
+      {
+        "severity": "medium",
+        "file": ".claude/helpers/memory.js",
+        "line": 37,
+        "category": "unrestricted-data-storage",
+        "description": "No input validation on set() function. Arbitrary key-value pairs without sanitization. Attacker could corrupt JSON or exhaust disk space.",
+        "cwe": "CWE-434: Unrestricted Upload of File with Dangerous Type",
+        "impact": "Denial of service or JSON parsing errors"
+      },
+      {
+        "severity": "medium",
+        "file": ".claude/helpers/memory.js",
+        "line": 16,
+        "category": "insecure-error-handling",
+        "description": "Silent error handling - catch block ignores all errors without logging. Corrupted/truncated JSON returns empty object without alerting user.",
+        "cwe": "CWE-391: Unchecked Error Condition",
+        "impact": "Silent data loss or inconsistent state"
+      },
+      {
+        "severity": "medium",
+        "file": ".claude/helpers/session.js",
+        "line": 8,
+        "category": "race-condition",
+        "description": "Race window between temp file write and rename in atomicWrite(). Process crash could leave orphaned temp files. Concurrent writers could collide.",
+        "cwe": "CWE-362: Concurrent Execution using Shared Resource",
+        "impact": "Temporary file accumulation and potential session corruption"
+      },
+      {
+        "severity": "medium",
+        "file": ".claude/helpers/github-safe.js",
+        "line": 78,
+        "category": "temporary-file-cleanup",
+        "description": "Temp files cleaned up in finally block. SIGTERM/SIGKILL before cleanup leaves files in /tmp/. No automatic stale file cleanup.",
+        "cwe": "CWE-459: Incomplete Cleanup",
+        "impact": "Disk space accumulation in /tmp/, exposure of body content"
+      },
+      {
+        "severity": "medium",
+        "file": ".claude/settings.json",
+        "line": 9,
+        "category": "insecure-hook-execution",
+        "description": "Hook commands use `sh -c` with unquoted variable interpolation. If CLAUDE_PROJECT_DIR or HOME contain special characters, command injection possible.",
+        "cwe": "CWE-78: Improper Neutralization of Special Elements",
+        "impact": "Command injection in hook handlers"
+      },
+      {
+        "severity": "low",
+        "file": ".claude/helpers/router.js",
+        "line": 35,
+        "category": "regex-denial-of-service",
+        "description": "buildPattern() constructs alternation regex without size limits. Malicious task description with many regex chars could cause ReDoS.",
+        "cwe": "CWE-1333: Inefficient Regular Expression Complexity",
+        "impact": "Denial of service - CPU spike during task routing"
+      },
+      {
+        "severity": "low",
+        "file": ".claude-flow/data/ (all JSON files)",
+        "line": 0,
+        "category": "plaintext-sensitive-data",
+        "description": "Memory, session, and intelligence data stored in plaintext JSON with group-readable permissions in multiuser environments.",
+        "cwe": "CWE-312: Cleartext Storage of Sensitive Information",
+        "impact": "Confidentiality breach if memory contains API keys or tokens"
+      }
+    ],
+    "riskScore": 68,
+    "recommendations": [
+      "CRITICAL: Fix file permissions - use fs.writeFileSync(file, data, {mode: 0o600}) for memory/session files",
+      "CRITICAL: Implement atomic writes in memory.js (copy pattern from session.js with temp file + rename)",
+      "HIGH: Add input validation to memory.set() - validate key names, value size limits, JSON schema",
+      "HIGH: Quote environment variables in settings.json hook commands to prevent injection: sh -c 'D=\"${CLAUDE_PROJECT_DIR:-.}\"; ... exec node \"$D/...\"'",
+      "HIGH: Encrypt memory and session files at rest using TweetNaCl.js or similar",
+      "MEDIUM: Replace silent catch blocks with proper error logging to stderr",
+      "MEDIUM: Add /tmp cleanup routine for stale gh-body-*.tmp files older than 1 hour",
+      "MEDIUM: Add ReDoS protection to router.js - timeout on regex or limit task description to 10KB",
+      "LOW: Add JSON schema validation when loading memory/session files",
+      "LOW: Document security assumptions (single-user or trusted-user environment)"
+    ]
+  },
+  "rawOutputPreview": "I've completed a comprehensive security analysis of your codebase. Here's the detailed vulnerability report:\n\n```json\n{\n  \"vulnerabilities\": [\n    {\n      \"severity\": \"high\",\n      \"file\": \".claude/helpers/memory.js\",\n      \"line\": 24,\n      \"category\": \"insecure-file-permissions\",\n      \"description\": \"Memory files stored in .claude-flow/data/ are created with world-readable permissions (rw-rw-r--). Any local user can read session context, exposing sensitive data, API keys, or authentication tokens.\",\n      \"cwe\": \"CWE-276: Incorrect Default File Permissions\",\n      \"impact\": \"Confidentiality breach - local users can access session secrets\"\n    },\n    {\n      \"severity\": \"high\",\n      \"file\": \".claude/helpers/session.js\",\n      \"line\": 25,\n      \"category\": \"insecure-file-permissions\",\n      \"description\": \"Session files in .claude-flow/sessions/ created with rw-rw-r-- permissions. Group/world readable access to session context, metrics, and workflow information.\",\n      \"cwe\": \"CWE-276: Incorrect Default File Permissions\",\n      \"impact\": \"Confidentiality breach - local privilege escalation or information disclosure\"\n    },\n    {\n      \"severity\": \"medium\",\n      \"file\": \".claude/helpers/memory.js\",\n      \"line\": 37,\n      \"category\": \"unrestricted-data-storage\",\n      \"description\": \"No input validation on set() function. Arbitrary key-value pairs without sanitization. Attacker could corrupt JSON or exhaust disk space.\",\n      \"cwe\": \"CWE-434: Unrestricted Upload of File with Dangerous Type\",\n      \"impact\": \"Denial of service or JSON parsing errors\"\n    },\n    {\n      \"severity\": \"medium\",\n      \"file\": \".claude/helpers/memory.js\",\n      \"line\": 16,\n      \"category\": \"insecure-error-handling\",\n      \"description\": \"Silent error handling - catch block ignores all errors without logging. Corrupted/truncated JSON returns empty object without alerting user.\",\n      \"cwe\": \"CWE-391: Unchecked Error Condition\",\n      \"impact\": \"Silent data loss or inconsistent state\"\n",
+  "rawOutputLength": 6276
+}

@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-07-07T03:06:19.798Z",
+  "projectRoot": "/home/becke/git/claude-tunnel",
+  "structure": {
+    "hasPackageJson": false,
+    "hasTsConfig": false,
+    "hasClaudeConfig": true,
+    "hasClaudeFlow": true
+  },
+  "scannedAt": 1783393579798
+}

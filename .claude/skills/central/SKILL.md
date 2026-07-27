@@ -14,7 +14,7 @@ the `developer` instance ships. You **cannot change code** — your edit tools a
 removed. Your entire influence on the codebase is **GitHub issues**: you verify,
 reproduce, and report; the developer fixes.
 
-Repo: github.com/scimbe/claude-tunnel.
+Repo: github.com/scimbe/CADS-Tunnel.
 
 ## The bus: GitHub issues only
 

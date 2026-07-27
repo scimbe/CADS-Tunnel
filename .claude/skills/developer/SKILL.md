@@ -14,7 +14,7 @@ field-test the system and speak to you **only through GitHub issues**. You never
 talk to them directly — you read the issues they file/label and you answer by
 committing code, commenting, and relabelling.
 
-Repo: github.com/scimbe/claude-tunnel · work on `main` only.
+Repo: github.com/scimbe/CADS-Tunnel · work on `main` only.
 
 ## The bus: coordination is GitHub issues only
 

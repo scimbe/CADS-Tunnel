@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-07-07T03:05:44.697Z",
+  "mode": "headless",
+  "workerType": "optimize",
+  "model": "sonnet",
+  "durationMs": 34200,
+  "executionId": "optimize_1783393510497_ogs538",
+  "success": true,
+  "findings": {
+    "sections": [],
+    "codeBlocks": []
+  },
+  "rawOutputPreview": "This confirms it: `claude-tunnel` has no application code to analyze. Per this repo's own `CLAUDE.md`, it's explicitly \"a Claude Code + ruflo orchestration workspace, not an application\" — there's no `src/`, no `package.json`, no database layer, and no React (or any UI framework). The only non-tooling content is:\n\n- `docs/adr/` — 14 architecture decision records for what appears to be a *planned* system (a QUIC-based, provider-blind tunnel/mesh network with zero-knowledge routing)\n- `scripts/claude-resume.sh` — a bash session-management script\n- `.claude/helpers/*.{js,mjs,cjs}` — Claude Code hook handlers (memory sync, routing, statusline) for the tooling itself, not product code\n\nNone of these contain database queries, React components, or a request-handling stack, so there's nothing here to check for N+1 queries, unnecessary re-renders, cacheable calls, memory leaks, or redundant computation — those categories don't apply to a bash script or hook scaffolding.\n\nTwo ways to make this useful:\n1. If the ADRs describe a system whose implementation lives in a **different repo**, point me at it and I'll run this analysis there.\n2. If you want, I can review `scripts/claude-resume.sh` and the `.claude/helpers/*.js` files for their own (non-web) inefficiencies — e.g., repeated subprocess spawns, redundant file reads/JSON parses in the hook handlers — which is a real but different question than the one asked.\n\nLet me know which you'd like, or share the actual application repo.\n",
+  "rawOutputLength": 1493
+}

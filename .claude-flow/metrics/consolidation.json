@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-07-07T02:42:20.593Z",
+  "distillationEnabled": true,
+  "patternsConsolidated": 17,
+  "memoryCleaned": 33,
+  "duplicatesRemoved": 16,
+  "episodes": 17,
+  "patternEmbeddings": 17,
+  "causalEdges": 15,
+  "promoted": 0,
+  "byProvenance": {
+    "proxy:structural": 17
+  },
+  "namespaces": [
+    "commands",
+    "session",
+    "feedback"
+  ],
+  "dryRun": false,
+  "corrupt": false
+}

@@ -6,8 +6,8 @@ Easy-going setup. Everything runs in containers, so the only hard requirement is
 ## 1. Get the code
 
 ```bash
-git clone https://github.com/scimbe/claude-tunnel.git
-cd claude-tunnel
+git clone https://github.com/scimbe/CADS-Tunnel.git
+cd CADS-Tunnel
 ```
 
 ## 2. Build & test (hermetic — no host toolchain)

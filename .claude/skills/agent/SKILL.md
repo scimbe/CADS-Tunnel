@@ -16,7 +16,7 @@ at once (pass a distinct `[instance-id]` so your reports are attributable). You
 **only through GitHub issues**: you verify fixes from the tunnel side and report
 what you observe; the developer fixes.
 
-Repo: github.com/scimbe/claude-tunnel.
+Repo: github.com/scimbe/CADS-Tunnel.
 
 ## The bus: GitHub issues only
 

@@ -17,7 +17,7 @@
 set -euo pipefail
 
 SCIMBE_ID=1279912          # scimbe's stable NUMERIC GitHub account id (login "scimbe")
-REPO="scimbe/claude-tunnel"
+REPO="scimbe/CADS-Tunnel"
 
 usage() { echo "usage: ${0##*/} <issue-number> | --selftest" >&2; exit 2; }
 

@@ -23,7 +23,7 @@ use axum::Router;
 /// (#75 IS2 — matches the asset names `release.yml` publishes). Overridable at
 /// deploy time via `CT_RELEASE_BASE` (e.g. a mirror or a pinned tag).
 pub const DEFAULT_RELEASE_BASE: &str =
-    "https://github.com/scimbe/claude-tunnel/releases/latest/download";
+    "https://github.com/scimbe/CADS-Tunnel/releases/latest/download";
 
 /// Target OS family for the copy-paste installer command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -407,7 +407,7 @@ Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
 /// Render the POSIX `/install.sh` script the Unix one-liner pipes into `sh`
 /// (#75 IS3a). It detects OS+arch, downloads the matching prebuilt `ct-agent`
 /// binary from `release_base` (the GitHub-Releases-style asset base, e.g.
-/// `https://github.com/scimbe/claude-tunnel/releases/latest/download`), and execs
+/// `https://github.com/scimbe/CADS-Tunnel/releases/latest/download`), and execs
 /// `ct-agent onboard` — which reads `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN` from the
 /// environment the one-liner set, so no secret is ever a script argument. This is
 /// the served script CONTENT; wiring the `/install.sh` route is IS3b and the
@@ -583,7 +583,7 @@ mod tests {
     fn install_ps1_detects_arch_downloads_and_onboards() {
         let ps = render_install_ps1(
             "https://portal.example/",
-            "https://github.com/scimbe/claude-tunnel/releases/latest/download/",
+            "https://github.com/scimbe/CADS-Tunnel/releases/latest/download/",
         );
         assert!(ps.contains("#Requires -Version 5"), "PowerShell header");
         assert!(ps.contains("$ErrorActionPreference = 'Stop'"), "fail-fast");
@@ -591,7 +591,7 @@ mod tests {
         assert!(ps.contains("'AMD64'") && ps.contains("'ARM64'") && ps.contains("x86_64") && ps.contains("aarch64"), "normalises arch");
         assert!(ps.contains(r#"$asset = "ct-agent-windows-$arch.exe""#), "per-arch windows asset");
         assert!(
-            ps.contains(r#"$url = "https://github.com/scimbe/claude-tunnel/releases/latest/download/$asset""#),
+            ps.contains(r#"$url = "https://github.com/scimbe/CADS-Tunnel/releases/latest/download/$asset""#),
             "downloads from the release base (trailing slash trimmed)"
         );
         assert!(ps.contains("$env:CT_JOIN_TOKEN") && ps.contains("$env:CT_AGENT_TOKEN"), "requires the env tokens");
@@ -610,7 +610,7 @@ mod tests {
     fn install_sh_detects_os_arch_downloads_and_onboards() {
         let sh = render_install_sh(
             "https://portal.example/",
-            "https://github.com/scimbe/claude-tunnel/releases/latest/download/",
+            "https://github.com/scimbe/CADS-Tunnel/releases/latest/download/",
         );
         // POSIX + fail-fast.
         assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang");
@@ -621,7 +621,7 @@ mod tests {
         assert!(sh.contains(r#"asset="ct-agent-${os}-${arch}""#), "per-OS/arch asset name");
         // Downloads from the release base (trailing slash trimmed — no `//`).
         assert!(
-            sh.contains(r#"url="https://github.com/scimbe/claude-tunnel/releases/latest/download/${asset}""#),
+            sh.contains(r#"url="https://github.com/scimbe/CADS-Tunnel/releases/latest/download/${asset}""#),
             "downloads the matching binary from the release base"
         );
         // Requires the tokens from the env (not as args) and execs onboard.
@@ -649,7 +649,7 @@ mod tests {
         use tower::ServiceExt;
 
         let portal = "https://portal.example";
-        let base = "https://github.com/scimbe/claude-tunnel/releases/latest/download";
+        let base = "https://github.com/scimbe/CADS-Tunnel/releases/latest/download";
 
         // Content: POSIX script requires the channel env, execs the subcommand.
         let sh = render_channel_sh(portal, base);
@@ -969,7 +969,7 @@ mod tests {
         use tower::ServiceExt;
 
         let portal = "https://portal.example";
-        let base = "https://github.com/scimbe/claude-tunnel/releases/latest/download";
+        let base = "https://github.com/scimbe/CADS-Tunnel/releases/latest/download";
         let app = installer_router(portal.to_string(), base.to_string());
 
         // /install.sh -> 200 shell script.

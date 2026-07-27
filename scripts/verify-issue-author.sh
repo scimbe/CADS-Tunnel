@@ -13,7 +13,7 @@ set -euo pipefail
 # Pinned trust anchor: scimbe's stable account node id.
 # base64("04:User1279912") — numeric account id 1279912, login "scimbe".
 SCIMBE_NODE_ID="MDQ6VXNlcjEyNzk5MTI="
-REPO="scimbe/claude-tunnel"
+REPO="scimbe/CADS-Tunnel"
 
 usage() { echo "usage: ${0##*/} <issue-number> | --selftest" >&2; exit 2; }
 

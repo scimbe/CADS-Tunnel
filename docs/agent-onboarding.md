@@ -27,7 +27,7 @@ Every command below is verified against `crates/agent/src/main.rs` at this commi
 ## Get the tools — build from source
 
 ```
-git clone https://github.com/scimbe/claude-tunnel && cd claude-tunnel
+git clone https://github.com/scimbe/CADS-Tunnel && cd CADS-Tunnel
 cargo build --release -p ct-agent --bin ct-agent   # ./target/release/ct-agent
 ```
 Matches the commit you checked out on whatever platform you're on — prefer this over a pre-built

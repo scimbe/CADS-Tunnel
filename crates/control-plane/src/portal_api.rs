@@ -390,7 +390,7 @@ serves your origin through it (no inbound firewall port needed).</p>
 <code>curl &hellip; | sh</code> command further down does <strong>not work yet</strong>.
 To bring your tunnel up <em>today</em>, run the <code>ct-agent</code> binary (or the
 <code>ct-testbed</code> Docker image that ships it) manually with the two tokens
-below &mdash; see the <a href="https://github.com/scimbe/claude-tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>.</div>
+below &mdash; see the <a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>.</div>
 <h2>Your tunnel's tokens (for manual onboarding)</h2>
 <p class="k"><strong>Single-use token — shown only once; reopen this Install page for a fresh one.</strong></p>
 <pre><code>CT_JOIN_TOKEN={jt}
