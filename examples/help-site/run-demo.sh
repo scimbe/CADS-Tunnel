@@ -25,6 +25,19 @@ HOSTNAME_FQDN="${HOSTNAME_FQDN:-help.bunsenbrenner.org}"
 CP_URL="${CP_URL:-${HELP_AGENT_CP_URL:-http://127.0.0.1:8090}}"
 EDGE="${EDGE:-${HELP_AGENT_EDGE:-127.0.0.1:4433}}"
 TENANT="${TENANT:-help-demo}"
+# help-agent joins the plane's ct-selfhost_default network (see the networks:
+# block in compose.help-site.yml), so its OWN CT_AGENT_CP_URL/CT_AGENT_EDGE must
+# use the internal service names (control-plane:8090, edge:4433) — NOT the
+# host-loopback CP_URL/EDGE above, which only this script (running on the host)
+# can reach. Reusing those for the container was the bug: 127.0.0.1 inside the
+# container means the container itself, so the agent could never reach the
+# plane and crash-looped on /enroll/redeem.
+AGENT_CP_URL="${AGENT_CP_URL:-http://control-plane:8090}"
+AGENT_EDGE="${AGENT_EDGE:-edge:4433}"
+# CT_AGENT_EDGE_CERT_URL (below, at the compose invocation) must be this bare
+# control-plane base URL, not .../pki/ca — ct-agent's ControlPlaneClient::
+# fetch_edge_cert() (crates/control-plane/src/client.rs) appends /pki/ca itself,
+# so appending it here too produced a double .../pki/ca/pki/ca path (404 loop).
 COMPOSE="docker compose -f compose.help-site.yml"
 # Edge admin endpoint for hostname-ownership authorization (#23 BP4b). Reuses the
 # same URL+secret the control plane uses for the revoke/authorize push. When set,
@@ -86,9 +99,9 @@ fi
 say "Starting the Caddy origin + Browser-Plane agent"
 HELP_JOIN_TOKEN="$TOKEN" \
 HELP_AGENT_TOKEN="$HELP_AGENT_TOKEN" \
-HELP_AGENT_EDGE="$EDGE" \
-HELP_AGENT_CP_URL="$CP_URL" \
-HELP_AGENT_EDGE_CERT_URL="${HELP_AGENT_EDGE_CERT_URL:-$CP_URL/pki/ca}" \
+HELP_AGENT_EDGE="$AGENT_EDGE" \
+HELP_AGENT_CP_URL="$AGENT_CP_URL" \
+HELP_AGENT_EDGE_CERT_URL="${HELP_AGENT_EDGE_CERT_URL:-$AGENT_CP_URL}" \
   $COMPOSE up --build -d
 
 # --- Wait for it to serve over HTTPS -------------------------------------------
