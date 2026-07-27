@@ -1206,6 +1206,64 @@ impl OperatorGrantRequest {
     }
 }
 
+/// #207 Slice A onboarding helper — compute the material a channel MEMBER hands its operator/central
+/// so the operator can mint its grant and admit it to a link channel (e.g. sink's standby joining a
+/// bridge role for failover). A member otherwise has to hand-roll `channel_id_for_link` +
+/// `member_noise_attest_bytes` + an ed25519 signature; this does it in one local command. Reads the
+/// operator + bridge-holder PUBLIC keys the operator supplies, the member's own holder PRIVATE key
+/// (to derive its holder pubkey and sign the attestation), and the member's noise PUBLIC key. Pure
+/// local compute — nothing is minted, nothing leaves the box.
+pub struct MemberMaterialRequest {
+    operator_pubkey: [u8; 32],
+    bridge_holder: [u8; 32],
+    holder: SigningKey,
+    noise_pubkey: [u8; 32],
+}
+
+impl MemberMaterialRequest {
+    /// Read from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (the `from_env` seam — testable without touching the real env).
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        Ok(Self {
+            operator_pubkey: req_hex32(&f, "CT_CHANNEL_OPERATOR_PUBKEY", "64 hex operator pubkey (from central)")?,
+            bridge_holder: req_hex32(&f, "CT_CHANNEL_BRIDGE_HOLDER", "64 hex bridge holder pubkey (from central)")?,
+            holder: req_key(&f, "CT_CHANNEL_HOLDER_KEY", "64 hex; your member holder PRIVATE key")?,
+            noise_pubkey: req_hex32(&f, "CT_CHANNEL_NOISE_PUBKEY", "64 hex; your member noise PUBLIC key")?,
+        })
+    }
+
+    /// `(channel_id, holder_pubkey, noise_attestation)` — the derived material. The channel id is the
+    /// operator-scoped link between the bridge holder and this member (order-independent); the
+    /// attestation is this member's holder-signed binding of its noise key (#101), which the operator
+    /// relays so the peer can pin the key safely.
+    fn compute(&self) -> (ct_common::channel::ChannelId, [u8; 32], [u8; 64]) {
+        use ct_common::channel::{channel_id_for_link, member_noise_attest_bytes};
+        let holder_pubkey = self.holder.verifying_key().to_bytes();
+        let channel = channel_id_for_link(&self.operator_pubkey, &self.bridge_holder, &holder_pubkey);
+        let attestation = self
+            .holder
+            .sign(&member_noise_attest_bytes(&channel, &holder_pubkey, &self.noise_pubkey))
+            .to_bytes();
+        (channel, holder_pubkey, attestation)
+    }
+
+    /// The paste-able block the member posts back to the operator/central.
+    pub fn render(&self) -> String {
+        let (channel, holder_pubkey, attestation) = self.compute();
+        format!(
+            "holder_pubkey     = {}\nnoise_pubkey      = {}\nchannel_id        = {}\nnoise_attestation = {}\n",
+            hex_encode(&holder_pubkey),
+            hex_encode(&self.noise_pubkey),
+            hex_encode(&channel.0),
+            hex_encode(&attestation),
+        )
+    }
+}
+
 /// Inputs for `ct-agent channel register` (#117-operator-register): register the
 /// operator's channel authority with the control plane (`POST /me/channels`) so the edge
 /// accepts the member grants the operator signs — the last CP round-trip for an
@@ -2985,6 +3043,40 @@ mod tests {
             Err("z".to_string()),
             "an unmapped node id fails the compile with that id"
         );
+    }
+
+    #[test]
+    fn member_material_computes_verifiable_channel_id_and_attestation() {
+        // #207 Slice A (frozen): the member-material helper derives the member's channel_id + a
+        // holder-signed noise attestation that VERIFY against the canonical primitives — so the block
+        // a member posts is exactly what the operator/edge will accept.
+        use ct_common::channel::{channel_id_for_link, verify_member_noise_attestation};
+        let operator = [0x1eu8; 32];
+        let bridge = [0xe1u8; 32];
+        let holder_seed = [0x55u8; 32];
+        let holder = SigningKey::from_bytes(&holder_seed);
+        let noise_pub = [0x77u8; 32];
+        let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let env = move |k: &str| match k {
+            "CT_CHANNEL_OPERATOR_PUBKEY" => Some(hx(&operator)),
+            "CT_CHANNEL_BRIDGE_HOLDER" => Some(hx(&bridge)),
+            "CT_CHANNEL_HOLDER_KEY" => Some(hx(&holder_seed)),
+            "CT_CHANNEL_NOISE_PUBKEY" => Some(hx(&noise_pub)),
+            _ => None,
+        };
+        let req = MemberMaterialRequest::from_lookup(&env).unwrap();
+        let (channel, holder_pub, attestation) = req.compute();
+        assert_eq!(holder_pub, holder.verifying_key().to_bytes(), "holder pubkey derived from the private key");
+        assert_eq!(channel, channel_id_for_link(&operator, &bridge, &holder_pub), "canonical operator-scoped link id");
+        assert!(
+            verify_member_noise_attestation(&channel, &holder_pub, &noise_pub, &attestation),
+            "the emitted attestation verifies against the canonical verifier"
+        );
+        // the rendered block carries all four values.
+        let block = req.render();
+        assert!(block.contains(&hx(&channel.0)) && block.contains(&hx(&attestation)) && block.contains(&hx(&noise_pub)));
+        // a missing required input errors clearly.
+        assert!(MemberMaterialRequest::from_lookup(|_| None).is_err());
     }
 
     #[test]

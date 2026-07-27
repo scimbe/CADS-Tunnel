@@ -56,6 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             print!("{}", ct_agent::channel_run::OperatorIdentity::generate().operator_env_block());
             return Ok(());
         }
+        // #207 `ct-agent channel member-material`: compute the (holder_pubkey, noise_pubkey,
+        // channel_id, noise_attestation) a MEMBER hands its operator/central to be admitted to a link
+        // channel — so a member never hand-rolls channel_id_for_link / member_noise_attest_bytes.
+        // Reads CT_CHANNEL_OPERATOR_PUBKEY + CT_CHANNEL_BRIDGE_HOLDER (from central) + the member's
+        // CT_CHANNEL_HOLDER_KEY (private) + CT_CHANNEL_NOISE_PUBKEY. Pure local compute.
+        if std::env::args().nth(2).as_deref() == Some("member-material") {
+            let req = ct_agent::channel_run::MemberMaterialRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            print!("{}", req.render());
+            return Ok(());
+        }
         // #117 `ct-agent channel grant`: as the operator, sign a member's grant (from
         // CT_CHANNEL_OPERATOR_KEY + CT_GRANT_*) and print the CT_CHANNEL_GRANT hex the
         // member uses — self-service admission, no central provisioning.
