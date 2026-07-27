@@ -91,6 +91,17 @@ dig +short TXT _acme-challenge.bunsenbrenner.org @1.1.1.1
 It should return the current challenge value. Once resolution works, Let's Encrypt
 DNS-01 validates and the certificate issues/renews automatically.
 
+## Using `acme.sh` for the front-door Portal cert (BYO)
+
+The `:443` front door's Portal cert (`PORTAL_CERT_DIR`, see the
+[runbook](ops/runbook.md)) is BYO — obtained with an external ACME client, not
+by the tunnel's own services. `scripts/deploy-selfhost.sh --frontdoor` automates
+this with [`acme.sh`](https://github.com/acmesh-official/acme.sh)'s `dns_desec`
+hook. **Gotcha**: that hook reads `DEDYN_TOKEN`, not `DESEC_TOKEN` — a holdover
+from deSEC's `dedyn.io` dynamic-DNS naming. The deploy script sets both (it
+exports `DEDYN_TOKEN` from `DESEC_TOKEN` before calling `acme.sh`); doing this
+by hand instead, remember to `export DEDYN_TOKEN=<your deSEC token>`.
+
 ## Which to choose
 - **deSEC**: least operational effort, robust (deSEC runs anycast NS), no `:53` to
   expose — at the cost of a third party hosting your zone (still zero-knowledge for
