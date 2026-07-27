@@ -1891,6 +1891,136 @@ impl UsageReceipt {
     }
 }
 
+const PROPOSAL_ACCEPTANCE_DOMAIN: &[u8] = b"ct-proposal-acceptance-v1";
+
+/// An accepter's decision on a `propose` (#163): the narrow design/coordination verbs sink scoped —
+/// accept, reject, or counter. Kept a small closed set (not free text) so the decision is one byte in
+/// the co-signed preimage; the co-signed record shape is signature-ready to grow into a governance
+/// primitive later (a richer decision set) without a wire-format rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProposalDecision {
+    Accept,
+    Reject,
+    Counter,
+}
+
+impl ProposalDecision {
+    /// The one byte that represents this decision in the signing preimage (stable across serde renames).
+    fn tag(self) -> u8 {
+        match self {
+            ProposalDecision::Accept => 0,
+            ProposalDecision::Reject => 1,
+            ProposalDecision::Counter => 2,
+        }
+    }
+}
+
+/// A **non-repudiable, attributable record of an accepter's decision on a proposal** (#163 `propose`).
+///
+/// The collaboration analog of [`UsageReceipt`]: where a bare `{accepted: bool}` is an unattributable
+/// claim (nobody could later prove *who* accepted *what*), this is the accepter's holder signature over
+/// a domain-separated preimage that binds all four facts of the decision — the accepter, the authenticated
+/// proposer, the exact proposal (by SHA-256), and the deadline it was decided under. Only the accepter
+/// signs (it is the accepter's decision that must be provable); the proposer receives it live over the
+/// already-authenticated channel, and the proposer's identity is *inside* the co-signed preimage so the
+/// record can't be replayed as if a different agent had proposed.
+///
+/// `proposal_hash` is `SHA-256(proposal)` — the hash, never the text, rides the record, so the decision
+/// is bound to the exact proposal without the record having to carry (or re-transmit) its full content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SignedAcceptance {
+    /// The accepter (the deciding agent)'s ed25519 holder public key — `accepter_sig` is checked against this.
+    #[serde(with = "card_hex::b32")]
+    pub accepter: [u8; 32],
+    /// The proposer's channel-authenticated holder public key, bound into the signature so the decision
+    /// is attributable to a specific proposer (not replayable against another).
+    #[serde(with = "card_hex::b32")]
+    pub proposer: [u8; 32],
+    /// The decision the accepter reached.
+    pub decision: ProposalDecision,
+    /// SHA-256 of the proposal text this decision is about — binds the record to the exact proposal.
+    #[serde(with = "card_hex::b32")]
+    pub proposal_hash: [u8; 32],
+    /// The deadline (unix seconds) the proposal asked to be decided by, co-signed so it can't be altered.
+    pub requires_response_by: UnixSeconds,
+    /// The accepter's ed25519 signature over [`signing_bytes`](Self::signing_bytes).
+    #[serde(with = "card_hex::b64")]
+    pub accepter_sig: [u8; 64],
+}
+
+impl SignedAcceptance {
+    /// Domain-separated, canonical injective preimage the accepter signs: `domain ‖ accepter ‖ proposer ‖
+    /// decision(u8) ‖ proposal_hash ‖ requires_response_by(LE)`. All fields fixed-size, so no length
+    /// prefixing is needed for injectivity.
+    pub fn signing_bytes(
+        accepter: &[u8; 32],
+        proposer: &[u8; 32],
+        decision: ProposalDecision,
+        proposal_hash: &[u8; 32],
+        requires_response_by: UnixSeconds,
+    ) -> Vec<u8> {
+        Preimage::new(PROPOSAL_ACCEPTANCE_DOMAIN)
+            .fixed(accepter)
+            .fixed(proposer)
+            .tag(decision.tag())
+            .fixed(proposal_hash)
+            .u64(requires_response_by)
+            .finish()
+    }
+
+    /// SHA-256 of a proposal's text — what [`proposal_hash`](Self::proposal_hash) records.
+    pub fn hash_proposal(proposal: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(proposal.as_bytes());
+        h.finalize().into()
+    }
+
+    /// The accepter signs its decision on `proposal` from `proposer`, producing the attributable record.
+    pub fn sign_new(
+        accepter_key: &ed25519_dalek::SigningKey,
+        proposer: [u8; 32],
+        decision: ProposalDecision,
+        proposal: &str,
+        requires_response_by: UnixSeconds,
+    ) -> SignedAcceptance {
+        use ed25519_dalek::Signer;
+        let accepter = accepter_key.verifying_key().to_bytes();
+        let proposal_hash = Self::hash_proposal(proposal);
+        let bytes =
+            Self::signing_bytes(&accepter, &proposer, decision, &proposal_hash, requires_response_by);
+        let accepter_sig = accepter_key.sign(&bytes).to_bytes();
+        SignedAcceptance { accepter, proposer, decision, proposal_hash, requires_response_by, accepter_sig }
+    }
+
+    /// Whether the accepter's signature authentically covers this record's exact contents. A record with
+    /// a forged signature, or one the named accepter never signed, returns `false`.
+    pub fn is_valid(&self) -> bool {
+        let bytes = Self::signing_bytes(
+            &self.accepter,
+            &self.proposer,
+            self.decision,
+            &self.proposal_hash,
+            self.requires_response_by,
+        );
+        match VerifyingKey::from_bytes(&self.accepter) {
+            Ok(vk) => vk.verify(&bytes, &Signature::from_bytes(&self.accepter_sig)).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Verify this record is an authentic decision **by `accepter`** on **exactly `proposal`** from
+    /// **`proposer`**: the signature verifies *and* the record's bound identities and proposal hash match
+    /// the ones the caller expects. This is what a verifier (or an audit) checks — a valid signature over
+    /// a *different* proposal or a swapped proposer is rejected.
+    pub fn verify_for(&self, proposer: &[u8; 32], proposal: &str) -> bool {
+        self.is_valid()
+            && &self.proposer == proposer
+            && self.proposal_hash == Self::hash_proposal(proposal)
+    }
+}
+
 const CAPACITY_BID_DOMAIN: &[u8] = b"ct-capacity-bid-v1";
 const CAPACITY_MATCH_DOMAIN: &[u8] = b"ct-capacity-match-v1";
 
@@ -2651,6 +2781,48 @@ mod tests {
         assert_eq!(
             CapacityBid::signing_bytes(&h, CapacityKind::CloudApiQuota, "m", 5, 500, 7, 9, &ta, None),
             e_none, "CapacityBid (None service) preimage drifted"
+        );
+    }
+
+    #[test]
+    fn signed_acceptance_preimage_is_frozen_and_binds_proposal_and_proposer_163() {
+        // #163 (frozen): pin the EXACT SignedAcceptance preimage — DOMAIN ‖ accepter ‖ proposer ‖
+        // decision(u8) ‖ proposal_hash(32) ‖ requires_response_by(LE) — so the co-signed collaboration
+        // record can't drift a byte (a drift would silently break every acceptance signature). All
+        // fields are fixed-size; the proposal is bound by its SHA-256, so the record binds the exact
+        // proposal without carrying its text.
+        use sha2::{Digest, Sha256};
+        let accepter = [0x11u8; 32];
+        let proposer = [0x22u8; 32];
+        let proposal = "let's use topology X";
+        let mut hh = Sha256::new();
+        hh.update(proposal.as_bytes());
+        let proposal_hash: [u8; 32] = hh.finalize().into();
+        assert_eq!(SignedAcceptance::hash_proposal(proposal), proposal_hash, "hash_proposal = SHA-256(text)");
+
+        let mut e = Vec::new();
+        e.extend_from_slice(PROPOSAL_ACCEPTANCE_DOMAIN);
+        e.extend_from_slice(&accepter);
+        e.extend_from_slice(&proposer);
+        e.push(ProposalDecision::Counter.tag()); // 2
+        e.extend_from_slice(&proposal_hash);
+        e.extend_from_slice(&5_000u64.to_le_bytes());
+        assert_eq!(
+            SignedAcceptance::signing_bytes(&accepter, &proposer, ProposalDecision::Counter, &proposal_hash, 5_000),
+            e, "SignedAcceptance preimage drifted"
+        );
+
+        // End-to-end: a signed record verifies only for the exact (proposer, proposal) pair.
+        let key = SigningKey::from_bytes(&[0x11u8; 32]);
+        let rec = SignedAcceptance::sign_new(&key, proposer, ProposalDecision::Accept, proposal, 5_000);
+        assert!(rec.is_valid(), "the accepter signature verifies");
+        assert!(rec.verify_for(&proposer, proposal), "verifies for the bound proposer + exact proposal");
+        assert!(!rec.verify_for(&proposer, "tampered proposal"), "a different proposal is rejected");
+        assert!(!rec.verify_for(&[0x99u8; 32], proposal), "a swapped proposer is rejected");
+        // The three decision tags are distinct + stable.
+        assert_eq!(
+            (ProposalDecision::Accept.tag(), ProposalDecision::Reject.tag(), ProposalDecision::Counter.tag()),
+            (0, 1, 2), "decision tags are stable"
         );
     }
 

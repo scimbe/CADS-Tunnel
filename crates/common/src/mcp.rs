@@ -82,10 +82,28 @@ impl JsonRpcResponse {
     }
 }
 
-/// A tool the agent advertises + can be asked to run. `handler` maps the call's `arguments` object to a
-/// result value (or an error message → a JSON-RPC tool error). Handlers are `Send + Sync` so the
-/// registry can live behind an `Arc` in the persistent serve loop.
-type ToolHandler = Box<dyn Fn(&Value) -> Result<Value, String> + Send + Sync>;
+/// The identity of the channel-authenticated peer making a call — its Noise/holder public key — or
+/// `None` for an anonymous/self call (the plain [`ToolRegistry::dispatch`] path). Threaded to
+/// identity-aware tools (#163 `chat`/`propose`) so they can key on the **unspoofable** authenticated
+/// identity, never a payload field a caller controls. Most tools ignore it; the ones that need it take
+/// the [`register_ctx`](ToolRegistry::register_ctx) handler shape.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallContext {
+    /// The authenticated peer's 32-byte public key, or `None` when the caller is anonymous.
+    pub peer: Option<[u8; 32]>,
+}
+
+impl CallContext {
+    /// A call from an authenticated peer with the given public key.
+    pub fn authenticated(peer: [u8; 32]) -> Self {
+        Self { peer: Some(peer) }
+    }
+}
+
+/// A tool the agent advertises + can be asked to run. `handler` maps the call's [`CallContext`] +
+/// `arguments` object to a result value (or an error message → a JSON-RPC tool error). Handlers are
+/// `Send + Sync` so the registry can live behind an `Arc` in the persistent serve loop.
+type ToolHandler = Box<dyn Fn(&CallContext, &Value) -> Result<Value, String> + Send + Sync>;
 
 struct Tool {
     description: String,
@@ -105,12 +123,27 @@ impl ToolRegistry {
         Self { tools: BTreeMap::new() }
     }
 
-    /// Register a tool by `name`, with a human `description` and a `handler(arguments) -> result`.
+    /// Register a tool by `name`, with a human `description` and a `handler(arguments) -> result`. The
+    /// handler ignores the caller's identity — the shape every existing tool uses. Identity-aware tools
+    /// (#163) use [`register_ctx`](Self::register_ctx) instead.
     pub fn register(
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
         handler: impl Fn(&Value) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.register_ctx(name, description, move |_ctx, args| handler(args))
+    }
+
+    /// Register an **identity-aware** tool whose handler also receives the [`CallContext`] — the
+    /// channel-authenticated peer making the call (#163). Used by tools that must key on the
+    /// unspoofable authenticated identity (rate-limiting `chat`, binding a `propose` decision to its
+    /// proposer) rather than a caller-supplied field.
+    pub fn register_ctx(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        handler: impl Fn(&CallContext, &Value) -> Result<Value, String> + Send + Sync + 'static,
     ) -> &mut Self {
         self.tools.insert(
             name.into(),
@@ -129,8 +162,8 @@ impl ToolRegistry {
         json!({ "tools": tools })
     }
 
-    /// Route one already-parsed request to a response.
-    fn route(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+    /// Route one already-parsed request to a response, in the given caller [`CallContext`].
+    fn route(&self, ctx: &CallContext, req: JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id;
         match req.method.as_str() {
             // Minimal MCP handshake — advertise the protocol version + that we serve tools.
@@ -152,7 +185,7 @@ impl ToolRegistry {
                 };
                 let arguments = req.params.get("arguments").cloned().unwrap_or(Value::Null);
                 match self.tools.get(name) {
-                    Some(tool) => match (tool.handler)(&arguments) {
+                    Some(tool) => match (tool.handler)(ctx, &arguments) {
                         Ok(result) => JsonRpcResponse::ok(id, result),
                         Err(msg) => JsonRpcResponse::err(id, TOOL_ERROR, msg),
                     },
@@ -163,10 +196,20 @@ impl ToolRegistry {
         }
     }
 
-    /// Dispatch one JSON-RPC request **body** to its response body (#135 L2.3). Malformed JSON yields a
-    /// JSON-RPC parse-error response (id `null`) rather than an error — so `serve_request_loop` keeps
-    /// serving. This is the `handle` a channel-`--serve` session runs.
+    /// Dispatch one JSON-RPC request **body** to its response body (#135 L2.3), as an **anonymous**
+    /// caller (no authenticated peer identity). Malformed JSON yields a JSON-RPC parse-error response
+    /// (id `null`) rather than an error — so `serve_request_loop` keeps serving. This is the `handle` a
+    /// channel-`--serve` session runs when it does not thread peer identity; identity-aware tools (#163)
+    /// see `CallContext::peer == None` and refuse.
     pub fn dispatch(&self, request: &[u8]) -> Vec<u8> {
+        self.dispatch_ctx(&CallContext::default(), request)
+    }
+
+    /// Dispatch one JSON-RPC request **body** on behalf of the given authenticated caller
+    /// [`CallContext`] (#163). Identical to [`dispatch`](Self::dispatch) except identity-aware tools
+    /// receive the channel-authenticated peer key. The serve loop calls this with the peer's Noise
+    /// static key once it threads it through the handshake boundary.
+    pub fn dispatch_ctx(&self, ctx: &CallContext, request: &[u8]) -> Vec<u8> {
         let req: JsonRpcRequest = match serde_json::from_slice(request) {
             Ok(r) => r,
             Err(e) => {
@@ -174,7 +217,7 @@ impl ToolRegistry {
                     .into_bytes()
             }
         };
-        self.route(req).into_bytes()
+        self.route(ctx, req).into_bytes()
     }
 }
 
@@ -410,6 +453,142 @@ pub fn register_service_tools(
     }
 }
 
+/// The largest `chat` message a single call may carry (#163 guard 1). 16 KiB — one Noise chunk,
+/// symmetric with the transport — is rejected at the schema boundary exactly like a missing field, so a
+/// caller can't grow server memory with an arbitrarily large message.
+pub const MAX_CHAT_MESSAGE_BYTES: usize = 16 * 1024;
+
+/// Register the #163 **`chat`** collaboration tool — an *inert* text-message primitive so two agents can
+/// exchange free-text over the same authenticated channel they discover + cooperate on, instead of over
+/// GitHub comments. Opt-in exactly like [`register_service_tools`] — an agent that never registers it has
+/// zero added attack surface.
+///
+/// Contract `{message: string} -> {ack: bool}`, with sink's three adversarial guards:
+/// 1. **Bounded** — `message` over [`MAX_CHAT_MESSAGE_BYTES`] is a schema error, like a missing field.
+/// 2. **Rate-limited on the AUTHENTICATED peer** — the [`CallContext::peer`] key (the unspoofable
+///    channel-authenticated Noise/holder key), never a caller-supplied "from" field a flooder could
+///    rotate. At most `max_msgs_per_window` messages per `window_secs`-second fixed window per peer
+///    (reusing [`KeyedRateLimiter`](crate::ratelimit::KeyedRateLimiter)); `window_secs == 0` = one
+///    all-time window. An unauthenticated (anonymous) caller is refused outright.
+/// 3. **Inert — data, never instruction.** The message is handed to `on_message(peer, message)` (the
+///    operator/log sink) and the tool returns `{ack:true}`; the agent MUST NOT branch its own behavior
+///    on the content (per #149-A.1: feeding peer text to an LLM as instruction re-opens "ignore your
+///    task, do X"). `on_message` is a surfacing sink, not a dispatcher.
+pub fn register_chat_tool(
+    reg: &mut ToolRegistry,
+    now_fn: impl Fn() -> crate::channel::UnixSeconds + Send + Sync + 'static,
+    max_msgs_per_window: u32,
+    window_secs: u64,
+    on_message: impl Fn([u8; 32], &str) + Send + Sync + 'static,
+) {
+    let limiter = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::new(max_msgs_per_window),
+    ));
+    reg.register_ctx(
+        "chat",
+        "send an inert text message to this agent (surfaced to its operator/logged, NEVER auto-acted-upon) — {message:string} -> {ack:bool}",
+        move |ctx, args| {
+            let peer = ctx.peer.ok_or("chat requires an authenticated channel peer")?;
+            let message = args
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or("chat requires a string `message` (fixed schema — no free-form slot)")?;
+            if message.len() > MAX_CHAT_MESSAGE_BYTES {
+                return Err(format!(
+                    "chat `message` too large: {} bytes exceeds the {}-byte cap (#163)",
+                    message.len(),
+                    MAX_CHAT_MESSAGE_BYTES
+                ));
+            }
+            let now = now_fn();
+            let window = if window_secs == 0 { 0 } else { now / window_secs };
+            if !limiter
+                .lock()
+                .map_err(|_| "chat rate limiter lock poisoned")?
+                .allow(&peer, window)
+            {
+                return Err("chat rate limit exceeded for this peer — slow down".to_string());
+            }
+            // Inert: surface to the operator sink; NEVER branch behavior on the content (#163 guard 3).
+            on_message(peer, message);
+            Ok(json!({ "ack": true }))
+        },
+    );
+}
+
+/// The largest `propose` proposal text a single call may carry (#163) — bounded like `chat`.
+pub const MAX_PROPOSAL_BYTES: usize = 16 * 1024;
+
+/// The furthest into the future a `propose` deadline may be (#163 guard 1): a `requires_response_by`
+/// beyond `now + MAX_PROPOSAL_HORIZON_SECS` is rejected, so it can't be used to manipulate time-based
+/// logic keyed on it (same discipline as RelayChallenger TTLs / escrow expiry). 30 days.
+pub const MAX_PROPOSAL_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Register the #163 **`propose`** collaboration tool — a narrow design/coordination decision primitive
+/// (accept / reject / counter) whose response is a **co-signed, non-repudiable record**, not a bare
+/// bool. Opt-in like [`register_chat_tool`].
+///
+/// Contract `{proposal: string, requires_response_by: u64} -> `[`SignedAcceptance`](crate::channel::SignedAcceptance),
+/// with sink's two adversarial fixes:
+/// 1. **Bounded deadline** — `requires_response_by` must be strictly in the future and no further than
+///    [`MAX_PROPOSAL_HORIZON_SECS`] ahead (`now` is the SERVING agent's via `now_fn`, never the caller's);
+///    `proposal` over [`MAX_PROPOSAL_BYTES`] is a schema error.
+/// 2. **Attributable record** — the response is the accepter's holder signature over
+///    `hash(proposal ‖ decision ‖ requires_response_by ‖ proposer)`, so anyone can later prove *who*
+///    decided *what* on *which* proposal (the collaboration analog of `UsageReceipt`). The proposer is
+///    the [`CallContext::peer`] (authenticated), not a caller-supplied field; an anonymous caller is
+///    refused. `decide(proposer, proposal, requires_response_by)` is the agent's own policy hook.
+pub fn register_propose_tool(
+    reg: &mut ToolRegistry,
+    accepter_key: ed25519_dalek::SigningKey,
+    now_fn: impl Fn() -> crate::channel::UnixSeconds + Send + Sync + 'static,
+    decide: impl Fn([u8; 32], &str, crate::channel::UnixSeconds) -> crate::channel::ProposalDecision
+        + Send
+        + Sync
+        + 'static,
+) {
+    reg.register_ctx(
+        "propose",
+        "make a design/coordination proposal; returns the agent's holder-signed SignedAcceptance (accept/reject/counter) — {proposal:string, requires_response_by:u64} -> SignedAcceptance",
+        move |ctx, args| {
+            let proposer = ctx.peer.ok_or("propose requires an authenticated channel peer")?;
+            let proposal = args
+                .get("proposal")
+                .and_then(Value::as_str)
+                .ok_or("propose requires a string `proposal` (fixed schema — no free-form slot)")?;
+            if proposal.len() > MAX_PROPOSAL_BYTES {
+                return Err(format!(
+                    "`proposal` too large: {} bytes exceeds the {}-byte cap (#163)",
+                    proposal.len(),
+                    MAX_PROPOSAL_BYTES
+                ));
+            }
+            let requires_response_by = args
+                .get("requires_response_by")
+                .and_then(Value::as_u64)
+                .ok_or("propose requires an integer `requires_response_by` (unix seconds)")?;
+            let now = now_fn();
+            if requires_response_by <= now {
+                return Err("`requires_response_by` must be strictly in the future".to_string());
+            }
+            if requires_response_by > now.saturating_add(MAX_PROPOSAL_HORIZON_SECS) {
+                return Err(format!(
+                    "`requires_response_by` is unreasonably far in the future (> {MAX_PROPOSAL_HORIZON_SECS}s horizon)"
+                ));
+            }
+            let decision = decide(proposer, proposal, requires_response_by);
+            let record = crate::channel::SignedAcceptance::sign_new(
+                &accepter_key,
+                proposer,
+                decision,
+                proposal,
+                requires_response_by,
+            );
+            serde_json::to_value(record).map_err(|e| e.to_string())
+        },
+    );
+}
+
 /// The [`default_registry`] plus an **`agent/card`** tool returning `card_json` (#144 × #135): a peer
 /// that has connected over the authenticated channel can fetch the agent's holder-signed `AgentCard`
 /// directly, bound to the live session — the channel is authenticated by the same holder key, so the
@@ -441,6 +620,12 @@ mod tests {
 
     fn call(reg: &ToolRegistry, body: Value) -> JsonRpcResponse {
         let bytes = reg.dispatch(&serde_json::to_vec(&body).unwrap());
+        serde_json::from_slice(&bytes).expect("response is valid JSON-RPC")
+    }
+
+    /// Dispatch as a specific (or anonymous) authenticated peer — for the #163 identity-aware tools.
+    fn call_as(reg: &ToolRegistry, peer: Option<[u8; 32]>, body: Value) -> JsonRpcResponse {
+        let bytes = reg.dispatch_ctx(&CallContext { peer }, &serde_json::to_vec(&body).unwrap());
         serde_json::from_slice(&bytes).expect("response is valid JSON-RPC")
     }
 
@@ -817,5 +1002,145 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], json!(MCP_PROTOCOL_VERSION));
         assert!(result["capabilities"].get("tools").is_some(), "advertises the tools capability");
+    }
+
+    #[test]
+    fn collab_tools_are_opt_in_not_present_by_default() {
+        // #163 (frozen): an agent that never registers the collaboration tools exposes neither — zero
+        // added attack surface, exactly like the #149-A.1 service catalog.
+        let names: Vec<String> = default_registry()
+            .list()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "chat" || n == "propose"), "collab tools are opt-in, got {names:?}");
+    }
+
+    #[test]
+    fn chat_is_fixed_shape_bounded_and_inert() {
+        // #163 (frozen): chat is {message:string}->{ack:bool}; it surfaces the message to the operator
+        // sink (never acting on it) and bounds size at the schema boundary.
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<([u8; 32], String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut reg = default_registry();
+        register_chat_tool(&mut reg, || 1_000, 100, 0, move |peer, msg| {
+            sink.lock().unwrap().push((peer, msg.to_string()));
+        });
+        let peer = [0xAB; 32];
+
+        // A well-formed message from an authenticated peer → ack, and it reached the operator sink verbatim.
+        let ok = call_as(&reg, Some(peer), json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "chat", "arguments": { "message": "hi from the peer" } } }));
+        assert_eq!(ok.result.unwrap(), json!({ "ack": true }), "chat acks");
+        assert_eq!(*seen.lock().unwrap(), vec![(peer, "hi from the peer".to_string())], "surfaced inert to the sink");
+
+        // Missing `message` → schema error (no free-form slot).
+        let miss = call_as(&reg, Some(peer), json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "chat", "arguments": { "text": "wrong field" } } }));
+        assert!(miss.error.is_some(), "a call without the fixed `message` field is refused");
+
+        // Oversized message → refused at the boundary, naming the cap; the sink never sees it.
+        let big = "x".repeat(MAX_CHAT_MESSAGE_BYTES + 1);
+        let over = call_as(&reg, Some(peer), json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "chat", "arguments": { "message": big } } }));
+        assert!(over.error.unwrap().message.contains("too large"), "oversized message is a schema error");
+        assert_eq!(seen.lock().unwrap().len(), 1, "the oversized message never reached the sink");
+    }
+
+    #[test]
+    fn chat_rate_limit_fires_on_the_authenticated_peer_not_a_payload_field() {
+        // #163 guard 2 (frozen): the bucket is keyed by the AUTHENTICATED peer (CallContext), so a
+        // flooder can't dodge it by varying the message; a distinct peer has its own budget; and an
+        // anonymous caller is refused outright.
+        let mut reg = default_registry();
+        register_chat_tool(&mut reg, || 1_000, 2, 100, |_p, _m| {}); // 2 msgs / window
+        let a = [0x0A; 32];
+        let b = [0x0B; 32];
+        let send = |reg: &ToolRegistry, peer: Option<[u8; 32]>, id: i64, msg: &str| {
+            call_as(reg, peer, json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "chat", "arguments": { "message": msg } } }))
+        };
+
+        // Peer A: two go through even with DIFFERENT message content, the third in the window is limited.
+        assert!(send(&reg, Some(a), 1, "one").result.is_some(), "1st within limit");
+        assert!(send(&reg, Some(a), 2, "two — different content").result.is_some(), "2nd within limit");
+        let third = send(&reg, Some(a), 3, "three");
+        assert!(third.error.unwrap().message.contains("rate limit"), "3rd in the window is rate-limited by peer, not content");
+
+        // A different authenticated peer has its own independent budget.
+        assert!(send(&reg, Some(b), 4, "hello").result.is_some(), "a distinct peer isn't limited by A's usage");
+
+        // An anonymous (unauthenticated) caller is refused — there is no spoofable identity to key on.
+        let anon = send(&reg, None, 5, "no identity");
+        assert!(anon.error.unwrap().message.contains("authenticated"), "an anonymous chat is refused");
+    }
+
+    #[test]
+    fn propose_returns_a_signature_bound_to_the_exact_proposal_and_proposer() {
+        // #163 (frozen): propose returns a SignedAcceptance — the accepter's holder signature bound to
+        // the exact proposal AND the authenticated proposer. It verifies for that pair, and NOT for a
+        // swapped proposal or proposer; the decision is the agent's own policy output.
+        use crate::channel::{ProposalDecision, SignedAcceptance};
+        use ed25519_dalek::SigningKey;
+        let accepter_key = SigningKey::from_bytes(&[0x11; 32]);
+        let accepter_pub = accepter_key.verifying_key().to_bytes();
+        let mut reg = default_registry();
+        register_propose_tool(&mut reg, accepter_key, || 1_000, |_proposer, _proposal, _deadline| {
+            ProposalDecision::Accept
+        });
+        let proposer = [0x22; 32];
+
+        let resp = call_as(&reg, Some(proposer), json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "propose", "arguments": { "proposal": "let's use topology X", "requires_response_by": 5_000 } } }));
+        let record: SignedAcceptance = serde_json::from_value(resp.result.expect("propose returns a record")).unwrap();
+
+        assert_eq!(record.decision, ProposalDecision::Accept, "the policy's decision is recorded");
+        assert_eq!(record.accepter, accepter_pub, "signed by the serving agent's holder key");
+        assert_eq!(record.proposer, proposer, "bound to the AUTHENTICATED proposer, not a payload field");
+        assert!(record.is_valid(), "the accepter signature verifies");
+        assert!(record.verify_for(&proposer, "let's use topology X"), "verifies for the exact proposal + proposer");
+        assert!(!record.verify_for(&proposer, "a DIFFERENT proposal"), "a different proposal doesn't verify");
+        assert!(!record.verify_for(&[0x99; 32], "let's use topology X"), "a swapped proposer doesn't verify");
+    }
+
+    #[test]
+    fn propose_rejects_past_absurd_deadline_oversized_and_anonymous() {
+        // #163 guard 1 (frozen): requires_response_by must be strictly future and within the horizon;
+        // an oversized proposal is a schema error; an anonymous caller is refused. `now` is the seller's.
+        use crate::channel::ProposalDecision;
+        use ed25519_dalek::SigningKey;
+        let mut reg = default_registry();
+        register_propose_tool(&mut reg, SigningKey::from_bytes(&[0x11; 32]), || 1_000, |_p, _pr, _d| {
+            ProposalDecision::Accept
+        });
+        let proposer = [0x22; 32];
+        let go = |reg: &ToolRegistry, peer: Option<[u8; 32]>, args: Value| {
+            call_as(reg, peer, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "propose", "arguments": args } }))
+        };
+
+        // Deadline in the past (<= now=1000) → refused.
+        let past = go(&reg, Some(proposer), json!({ "proposal": "p", "requires_response_by": 1_000 }));
+        assert!(past.error.unwrap().message.contains("future"), "a past/now deadline is refused");
+
+        // Deadline absurdly far in the future (> now + horizon) → refused.
+        let far = go(&reg, Some(proposer), json!({ "proposal": "p", "requires_response_by": 1_000 + MAX_PROPOSAL_HORIZON_SECS + 1 }));
+        assert!(far.error.unwrap().message.contains("far in the future"), "an absurd-horizon deadline is refused");
+
+        // Just within the horizon → accepted.
+        let ok = go(&reg, Some(proposer), json!({ "proposal": "p", "requires_response_by": 1_000 + MAX_PROPOSAL_HORIZON_SECS }));
+        assert!(ok.result.is_some(), "a deadline exactly at the horizon is accepted");
+
+        // Oversized proposal → schema error.
+        let big = "x".repeat(MAX_PROPOSAL_BYTES + 1);
+        let over = go(&reg, Some(proposer), json!({ "proposal": big, "requires_response_by": 5_000 }));
+        assert!(over.error.unwrap().message.contains("too large"), "an oversized proposal is refused");
+
+        // Anonymous caller → refused (no authenticated proposer to bind).
+        let anon = go(&reg, None, json!({ "proposal": "p", "requires_response_by": 5_000 }));
+        assert!(anon.error.unwrap().message.contains("authenticated"), "an anonymous propose is refused");
     }
 }
