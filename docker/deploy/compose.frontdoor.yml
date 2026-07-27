@@ -54,6 +54,13 @@ services:
     ports:
       - "443:443"
       - "80:80"
+      # Edge admin API (host-ownership authorize/revoke, #23 BP4b) — unauthenticated
+      # by network but token-gated (x-ct-admin-token); loopback-only like the
+      # metrics port above, so an operator script on this host (e.g.
+      # examples/help-site/run-demo.sh's CT_CP_EDGE_ADMIN_URL) can reach it without
+      # publishing it publicly. The control plane itself reaches it internally via
+      # http://edge:9601, unaffected by this host-side publish.
+      - "127.0.0.1:${EDGE_ADMIN_PORT:-9601}:9601"
 
   control-plane:
     # Let the control plane authorize hostnames + push revocations to the edge's
