@@ -784,10 +784,12 @@ fetch("crew.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null))
 // start/ok → physics/art start → physics/art done → a terminal built|rejected|error — so the browser
 // shows the real role-chain live instead of one opaque ~28s wait. `onEvent` is called per event;
 // the resolved value is the terminal event (or null if the stream died before one). The real crew is
-// safety (~14s) + max(physics, art) (~14s concurrent) ≈ ~28–30s, so the abort sits well above at 45s.
+// safety (~14s) + max(physics, art) (~14s concurrent) ≈ ~28–30s happy path, but each role now
+// retries up to 3 total attempts on a transient dial race (#148/#140), so the abort is sized with
+// real margin above the worst case (one role needing full retries), not just the happy path.
 async function liveBuildStream(prompt, onEvent) {
   const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), 45000);
+  const to = setTimeout(() => ctrl.abort(), 100000);
   try {
     const res = await fetch(CREW_URL, {
       method: "POST", headers: { "content-type": "application/json" },

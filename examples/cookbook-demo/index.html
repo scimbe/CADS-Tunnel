@@ -219,9 +219,11 @@ let CREW_URL = "cookbook/build";
 fetch("crew.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((j) => { if (j && j.url) CREW_URL = j.url; }).catch(() => {});
 async function liveBuildStream(prompt, image, onEvent) {
   const ctrl = new AbortController();
-  // 4 sequential LLM calls (safety + structure + presentation + review ≈ 4×~14s), so the abort sits
-  // well above ~55s.
-  const to = setTimeout(() => ctrl.abort(), 75000);
+  // 4 sequential LLM calls (safety + structure + presentation + review ≈ 4×~14s ≈ 55s), PLUS each
+  // role now retries up to 3 total attempts on a transient dial race (#148/#140 — a live-observed
+  // worst case took 83s under load with one role needing full retries). Sized with real margin
+  // above that, not just the happy-path ~55s.
+  const to = setTimeout(() => ctrl.abort(), 150000);
   try {
     const res = await fetch(CREW_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt, image, lang: curLang }), signal: ctrl.signal });
     if (!res.ok || !res.body) throw new Error("cookbook bridge " + res.status);
