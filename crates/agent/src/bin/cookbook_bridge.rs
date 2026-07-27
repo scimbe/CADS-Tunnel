@@ -97,10 +97,30 @@ fn run_cmd_with_timeout(cmd: &str, input: &str, timeout: std::time::Duration) ->
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// One immediate retry on failure. Root-caused live (2026-07-27): the edge's own
+/// `RelayHandoffError` (`crates/edge/src/channel_broker.rs`, #148) explicitly documents that a
+/// mid-handoff ack-write failure against ONE side of a relay pair is a "transient handoff race,
+/// not an admission refusal" and that "a bare retry by the survivor should re-pair" — but nothing
+/// on the client side ever actually retried, so every role dial that raced this (observed hitting
+/// art/presentation under back-to-back load) surfaced as a hard, permanent-looking failure
+/// ("role command exited Some(1): ... edge broker refused the channel join") even though the very
+/// next attempt routinely succeeds. A single fast retry directly implements the edge's own stated
+/// fix without needing to parse `ct-agent`'s stderr text to distinguish this race from a genuine
+/// refusal (which would still fail identically on retry, at the cost of one extra attempt).
 async fn run_cmd_async(cmd: String, input: String) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || run_cmd(&cmd, &input))
+    let cmd2 = cmd.clone();
+    let input2 = input.clone();
+    match tokio::task::spawn_blocking(move || run_cmd(&cmd, &input))
         .await
         .map_err(|e| format!("role task join failed: {e}"))?
+    {
+        Ok(out) => Ok(out),
+        Err(_first_err) => {
+            tokio::task::spawn_blocking(move || run_cmd(&cmd2, &input2))
+                .await
+                .map_err(|e| format!("role task join failed: {e}"))?
+        }
+    }
 }
 
 /// #207 Slice A — ordered-candidate failover. Run a role against an ORDERED list of candidate
@@ -342,6 +362,26 @@ mod tests {
         assert!(err.contains("timed out"), "reports a timeout: {err}");
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "returns promptly on timeout");
         assert_eq!(run_cmd_with_timeout("printf hi", "", std::time::Duration::from_secs(5)).unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn run_cmd_async_retries_once_recovering_from_a_transient_first_failure() {
+        // Frozen (root-caused live 2026-07-27, see the doc comment on run_cmd_async): a role dial
+        // that fails once (the edge's own documented "transient handoff race") must succeed anyway
+        // if the immediate retry would have worked — a marker file makes the command fail exactly
+        // once, then succeed on every subsequent invocation, proving the retry (not just luck) is
+        // what recovers it.
+        let marker = std::env::temp_dir().join(format!(
+            "ct-retry-test-{}-{:?}.marker",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let m = marker.to_string_lossy().replace('\'', "");
+        let cmd = format!("if [ -f '{m}' ]; then printf ok; else : > '{m}'; exit 1; fi");
+        let out = run_cmd_async(cmd, String::new()).await;
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(out.unwrap(), "ok", "the retry recovers a command that only fails on its first try");
     }
 
     #[tokio::test]
