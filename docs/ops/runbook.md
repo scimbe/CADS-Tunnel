@@ -20,11 +20,14 @@ rendezvous/relay on `:4435`/`:4436`** (all udp+tcp), plus metrics on `:9600` —
 once `CT_EDGE_ADMIN_TOKEN` is set (#100/#105), so they sit idle until then. Add the
 overlays below for the public-facing planes.
 
-**Scripted end-to-end** (recommended): `./scripts/deploy-selfhost.sh --frontdoor`
-handles Docker install, `.env` generation, the Let's Encrypt cert (via
-`acme.sh` + deSEC DNS-01, see [dns01-desec.md](../dns01-desec.md)), and the
-`compose up` below in one idempotent, re-runnable command — `--help` for flags.
-The manual steps it automates:
+**Scripted end-to-end** (recommended): `./scripts/deploy-selfhost.sh --frontdoor
+[--sso] [--help-site]` handles Docker install, `.env` generation, a Let's
+Encrypt cert per public hostname (via `acme.sh` + deSEC DNS-01, see
+[dns01-desec.md](../dns01-desec.md)), the `compose up` below, and — with
+`--sso`/`--help-site` — the SSO and help-demo overlays further down this
+section too, all in one idempotent, re-runnable command. `--help` for every
+flag. The manual steps below are what it automates; read them for the *why*,
+run the script for the *how*.
 
 **Optional `:443` front door** (`compose.frontdoor.yml`, #60) — publishes one
 `:443` that serves the **Portal landing page**, **Browser-Plane subdomains**

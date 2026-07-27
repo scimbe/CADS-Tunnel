@@ -76,15 +76,16 @@ feature, stabilized in 1.85): `rustup update stable && cargo build --workspace`.
 ## Deploy
 
 ```bash
-# Self-host (Docker Compose)
-cp docker/deploy/.env.example docker/deploy/.env   # then edit secrets
-docker compose -f docker/deploy/compose.selfhost.yml --env-file docker/deploy/.env up --build -d
+# Self-host (Docker Compose) — scripted, idempotent, the whole core system:
+./scripts/deploy-selfhost.sh --frontdoor --sso --help-site
 
 # Hosted (Kubernetes)
 kubectl apply -k docker/deploy/k8s
 ```
 
-See the [runbook](docs/ops/runbook.md) for configuration and operations.
+See [docs/install.md](docs/install.md) for the script's flags and the manual
+step-by-step, and the [runbook](docs/ops/runbook.md) for configuration and
+operations.
 
 ## Status
 
