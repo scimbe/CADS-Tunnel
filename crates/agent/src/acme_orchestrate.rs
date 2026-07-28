@@ -21,6 +21,7 @@ use ct_dns::provider::{Dns01Provider, RemoteAgentDns01Client};
 
 use crate::acme_client::AcmeClient;
 use crate::acme_jws::AccountKey;
+use crate::dns01_authoritative::AuthoritativeChecker;
 use crate::dns01_propagation::{self, PropagationWaiter};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -68,6 +69,12 @@ pub struct AcmeCertConfig {
     /// outlives the whole timeout (the #229 root cause); too high only costs
     /// issuance time. `None` uses the measured-safe default.
     pub dns01_initial_delay: Option<Duration>,
+    /// Verify the challenge record against the zone's own authoritative
+    /// nameservers (what Let's Encrypt actually queries, #229) rather than
+    /// only public resolvers. Default `true`; set `false` only where direct
+    /// DNS to those servers is impossible, or in hermetic tests whose mock
+    /// hostname has no real zone.
+    pub dns01_use_authoritative: bool,
 }
 
 pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -125,6 +132,9 @@ impl AcmeCertConfig {
             dns01_resolver_urls,
             dns01_propagation_timeout,
             dns01_initial_delay,
+            dns01_use_authoritative: get("CT_ACME_DNS01_AUTHORITATIVE")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
         })
     }
 
@@ -182,7 +192,24 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     if let Some(delay) = config.dns01_initial_delay {
         propagation = propagation.with_initial_delay(delay);
     }
-    let issued = client.issue_certificate(&config.hostname, &publish, Some(&propagation)).await?;
+    // The authoritative check is the one that matches how Let's Encrypt
+    // actually validates (#229). If this host genuinely cannot query the
+    // authoritative servers (outbound 53 blocked), fall back to the weaker
+    // public-resolver check rather than refusing to issue at all.
+    let authoritative = if config.dns01_use_authoritative {
+        match AuthoritativeChecker::from_system() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("ct-agent: authoritative DNS check unavailable ({e}); falling back to public resolvers");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let issued = client
+        .issue_certificate(&config.hostname, &publish, Some(&propagation), authoritative.as_ref())
+        .await?;
 
     // Write key before cert (an origin polling for the cert file should never
     // see a cert with no matching key on disk yet).
@@ -481,6 +508,7 @@ mod tests {
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(5),
             dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -521,6 +549,7 @@ mod tests {
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(5),
             dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("publishing"), "{err}");
@@ -550,6 +579,7 @@ mod tests {
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(10),
             dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -581,6 +611,7 @@ mod tests {
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_millis(200),
             dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
         };
 
         let err = obtain_or_renew(&config).await.unwrap_err();

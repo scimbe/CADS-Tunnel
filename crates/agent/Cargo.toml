@@ -31,6 +31,13 @@ ring = "0.17"
 # ACME (ADR-0003): the network driver's HTTP client — rustls-tls to match the rest of
 # the workspace's zero-OpenSSL policy (control-plane/edge/dns already do this).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# ACME (ADR-0003, #229): query the zone's AUTHORITATIVE nameservers directly when
+# confirming a DNS-01 record has propagated. Public resolvers are the wrong thing to
+# ask -- Let's Encrypt validates against the authoritative servers themselves from
+# several perspectives, and this zone's two authoritative servers were measured
+# drifting ~60s apart, which no resolver-side check can see. Already in the lock file
+# transitively (via libp2p); this makes it a direct, intentional dependency.
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
 libp2p = { workspace = true }
 libp2p-stream = { workspace = true }
 tokio-util = { workspace = true }

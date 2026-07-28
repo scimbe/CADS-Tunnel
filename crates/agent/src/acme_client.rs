@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::acme::{self, AcmeDirectory, CsrBundle};
 use crate::acme_jws::AccountKey;
+use crate::dns01_authoritative::AuthoritativeChecker;
 use crate::dns01_propagation::PropagationWaiter;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -141,6 +142,7 @@ impl AcmeClient {
         hostname: &str,
         publish: &Dns01Provider,
         propagation: Option<&PropagationWaiter>,
+        authoritative: Option<&AuthoritativeChecker>,
     ) -> Result<IssuedCert, BoxError> {
         if self.account_url.is_none() {
             self.register_account().await?;
@@ -150,7 +152,7 @@ impl AcmeClient {
         let (order_url, mut order) = order_url_and_body;
 
         for authz_url in order.authorizations.clone() {
-            self.validate_authorization(&authz_url, hostname, publish, propagation).await?;
+            self.validate_authorization(&authz_url, hostname, publish, propagation, authoritative).await?;
         }
 
         order = self.poll_order(&order_url, |o| o.status != "pending" && o.status != "processing").await?;
@@ -188,6 +190,7 @@ impl AcmeClient {
         hostname: &str,
         publish: &Dns01Provider,
         propagation: Option<&PropagationWaiter>,
+        authoritative: Option<&AuthoritativeChecker>,
     ) -> Result<(), BoxError> {
         let authz = self.post_as_get(authz_url).await?;
         let challenge =
@@ -198,19 +201,52 @@ impl AcmeClient {
 
         let publish_result = publish.set_txt(&record_name, &txt_value).await;
         let outcome = match publish_result {
-            Ok(()) => match propagation {
-                Some(waiter) => match waiter.wait_for(&record_name, &txt_value).await {
-                    Ok(()) => self.complete_challenge(&challenge.url, authz_url).await,
-                    Err(e) => Err(format!("DNS-01 propagation check failed: {e}").into()),
-                },
-                None => self.complete_challenge(&challenge.url, authz_url).await,
-            },
+            Ok(()) => self.confirm_then_complete(&record_name, &txt_value, &challenge.url, authz_url, propagation, authoritative).await,
             Err(e) => Err(format!("publishing the DNS-01 challenge record failed: {e}").into()),
         };
         // Always attempt cleanup, whether validation succeeded or not -- a
         // stale challenge TXT record must not linger either way.
         let _ = publish.clear_txt(&record_name).await;
         outcome
+    }
+
+    /// Gate the "tell the CA to validate now" step on the record actually
+    /// being live where the CA will look.
+    ///
+    /// `authoritative` is the signal that matters (#229): Let's Encrypt
+    /// queries the zone's own authoritative nameservers, from several
+    /// perspectives, and this zone's two authoritative servers were measured
+    /// drifting ~60s apart while reporting an identical SOA serial. A public
+    /// resolver can (and did) report "visible" off the fast one while the slow
+    /// one still answered NXDOMAIN, which is precisely how a run passed our
+    /// own check and then failed the CA's secondary validation.
+    ///
+    /// `propagation` (public DoH resolvers) is kept as a secondary, best-effort
+    /// signal for deployments where the authoritative servers can't be reached
+    /// directly at all -- e.g. a host with outbound 53 blocked. It is strictly
+    /// weaker, so it is only consulted when the authoritative check is absent.
+    async fn confirm_then_complete(
+        &mut self,
+        record_name: &str,
+        txt_value: &str,
+        challenge_url: &str,
+        authz_url: &str,
+        propagation: Option<&PropagationWaiter>,
+        authoritative: Option<&AuthoritativeChecker>,
+    ) -> Result<(), BoxError> {
+        if let Some(checker) = authoritative {
+            match checker.wait_for_all(record_name, txt_value).await {
+                Ok(()) => return self.complete_challenge(challenge_url, authz_url).await,
+                Err(e) => return Err(format!("DNS-01 authoritative check failed: {e}").into()),
+            }
+        }
+        if let Some(waiter) = propagation {
+            match waiter.wait_for(record_name, txt_value).await {
+                Ok(()) => return self.complete_challenge(challenge_url, authz_url).await,
+                Err(e) => return Err(format!("DNS-01 propagation check failed: {e}").into()),
+            }
+        }
+        self.complete_challenge(challenge_url, authz_url).await
     }
 
     async fn complete_challenge(&mut self, challenge_url: &str, authz_url: &str) -> Result<(), BoxError> {
@@ -470,7 +506,7 @@ mod tests {
 
         let account = AccountKey::generate().unwrap();
         let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
-        let issued = client.issue_certificate("shop.example.test", &publish, None).await.unwrap();
+        let issued = client.issue_certificate("shop.example.test", &publish, None, None).await.unwrap();
 
         assert!(issued.cert_chain_pem.contains("BEGIN CERTIFICATE"));
         assert!(issued.key_pem.contains("PRIVATE KEY"), "the CSR's own key is returned for persistence");
