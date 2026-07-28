@@ -134,6 +134,30 @@ pub struct RoleAssignment {
     pub price: u64,
 }
 
+/// One bid in a role's [`auction_view`](PipelineSpec::auction_view): a qualifying offer as the UI
+/// shows it. Generic (no pipeline-specific fields) so it belongs in core — unlike the demo-shaped
+/// `ct_common::crew` types it is meant to replace (#180/#219). `Serialize` only: it is an output view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoleBidView {
+    /// The provider's display identity (resolved by the caller's `label`), not the raw pubkey.
+    pub who: String,
+    /// The units the offer advertises (`units_available`) — the quantity this bid can serve.
+    pub units: u64,
+    /// The offer's floor (`min_price`) — the price this bid clears at if it wins.
+    pub price: u64,
+    /// Whether this bid won the role under the active [`SelectionPolicy`].
+    pub win: bool,
+}
+
+/// The full auction for one role: every qualifying bid, winner flagged — the honest counterpart to a
+/// hardcoded fixture. Produced by [`PipelineSpec::auction_view`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoleAuctionView {
+    /// The role's `tag` (e.g. `"physics"`).
+    pub role: String,
+    pub bids: Vec<RoleBidView>,
+}
+
 /// The rule [`convene_with_policy`](PipelineSpec::convene_with_policy) uses to pick the winner **among the offers
 /// that already qualify** for a role (all equally valid/eligible — this only decides *which*
 /// qualifying offer wins, never whether a role is fillable). A workflow-pipeline owner selects the
@@ -364,6 +388,57 @@ impl PipelineSpec {
             });
         }
         Ok(assignments)
+    }
+
+    /// The **browser-facing auction view** of a real clear (#180): run
+    /// [`convene_with_policy`](Self::convene_with_policy), then for every role list *each* qualifying
+    /// offer as a bid (`who` = `label(provider)`, `units`/`price` straight off the signed offer) with
+    /// the policy's winner flagged `win: true`. This is the honest replacement for a hardcoded
+    /// `demo_auction()` fixture: the numbers are the agents' own signed offer terms, and adding a
+    /// second offer for a role turns the single-bidder display into a genuine contest with no code
+    /// change. Errors with the same [`PipelineError::UnfilledRole`] as `convene` if any role has no
+    /// online offer — no market is shown for a pipeline that cannot actually run.
+    ///
+    /// `label` resolves a provider's holder pubkey to the human `who` string the UI shows (e.g. a
+    /// registry/[`AgentCard`] name, or hex as a fallback) — the display identity core doesn't carry
+    /// on the economic [`CapacityOffer`]. Bids are returned winner-first, then cheapest, then by
+    /// `who`, for a stable display order. `state` threads the stateful policies exactly as in
+    /// `convene_with_policy` (the winner shown is the one that would be dialed).
+    pub fn auction_view(
+        &self,
+        offers: &[CapacityOffer],
+        now: UnixSeconds,
+        policy: SelectionPolicy,
+        state: &mut SelectionState,
+        label: impl Fn(&[u8; 32]) -> String,
+    ) -> Result<Vec<RoleAuctionView>, PipelineError> {
+        // Clear for real first: winners honor policy + #172 cross-role exclusivity + state.
+        let assignments = self.convene_with_policy(offers, now, policy, state)?;
+        let views = self
+            .roles
+            .iter()
+            .zip(&assignments)
+            .map(|(role, assignment)| {
+                let mut bids: Vec<RoleBidView> = offers
+                    .iter()
+                    .filter(|o| {
+                        o.is_valid(now) && o.services.contains(&role.service) && o.units_available >= role.units
+                    })
+                    .map(|o| RoleBidView {
+                        who: label(&o.holder_pubkey),
+                        units: o.units_available,
+                        price: o.min_price,
+                        win: o.holder_pubkey == assignment.provider,
+                    })
+                    .collect();
+                // Winner first, then cheapest floor, then `who` — deterministic display order.
+                bids.sort_by(|a, b| {
+                    b.win.cmp(&a.win).then(a.price.cmp(&b.price)).then_with(|| a.who.cmp(&b.who))
+                });
+                RoleAuctionView { role: role.tag.clone(), bids }
+            })
+            .collect();
+        Ok(views)
     }
 }
 
@@ -917,5 +992,67 @@ mod tests {
         let r1 = spec.convene_with_policy(&offers, 100, spec.selection_policy, &mut state).unwrap();
         assert_ne!(r0[0].provider, r1[0].provider, "physics role rotates under its RoundRobin override");
         assert_ne!(r0[1].provider, r1[1].provider, "guard role balances under the inherited LeastCalls default");
+    }
+
+    /// Resolve the two reference providers to their demo names, anything else to a short hex tag.
+    fn who_label(pk: &[u8; 32]) -> String {
+        if *pk == holder(1) {
+            "source-2".into()
+        } else if *pk == holder(2) {
+            "sink".into()
+        } else {
+            format!("agent-{:02x}", pk[0])
+        }
+    }
+
+    #[test]
+    fn auction_view_shows_real_signed_bids_with_the_winner_flagged() {
+        // #180: the auction view is a real clear, not a fixture — every qualifying offer is a bid
+        // with the agent's own signed price/units, and the policy winner is flagged. Two bidders at
+        // different floors → lowest-floor wins, both are shown.
+        let spec = physics_spec();
+        let source2 = offer(1, vec![TextGeneration], 20, 50, 1000);
+        let sink = offer(2, vec![TextGeneration], 30, 40, 1000); // cheaper floor, more units
+        let view = spec
+            .auction_view(&[source2, sink], 100, SelectionPolicy::LowestFloor, &mut SelectionState::default(), who_label)
+            .unwrap();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].role, "physics");
+        assert_eq!(view[0].bids.len(), 2, "both agents' offers are shown as bids");
+        // Winner first: sink (floor 40) beats source-2 (floor 50); numbers are the offers', not a fixture.
+        assert_eq!(view[0].bids[0], RoleBidView { who: "sink".into(), units: 30, price: 40, win: true });
+        assert_eq!(view[0].bids[1], RoleBidView { who: "source-2".into(), units: 20, price: 50, win: false });
+    }
+
+    #[test]
+    fn auction_view_tracks_the_policy_winner_but_always_shows_every_bid() {
+        // Under a load-balancing policy the *winner* alternates, but the auction always shows the
+        // full field of bidders (one flagged win) — the display stays honest as load shifts.
+        let spec = physics_spec();
+        let offers = [
+            offer(1, vec![TextGeneration], 20, 50, 1000),
+            offer(2, vec![TextGeneration], 20, 50, 1000),
+        ];
+        let mut state = SelectionState::default();
+        let mut winners = vec![];
+        for _ in 0..2 {
+            let v = spec
+                .auction_view(&offers, 100, SelectionPolicy::RoundRobin, &mut state, who_label)
+                .unwrap();
+            assert_eq!(v[0].bids.len(), 2, "both bidders always shown");
+            assert_eq!(v[0].bids.iter().filter(|b| b.win).count(), 1, "exactly one winner per clear");
+            winners.push(v[0].bids.iter().find(|b| b.win).unwrap().who.clone());
+        }
+        assert_ne!(winners[0], winners[1], "round-robin moves the winner between the shown bids");
+    }
+
+    #[test]
+    fn auction_view_errors_when_a_role_has_no_bidder() {
+        // No market is shown for a pipeline that cannot convene — same guarantee as `convene`.
+        let spec = physics_spec();
+        assert_eq!(
+            spec.auction_view(&[], 100, SelectionPolicy::LowestFloor, &mut SelectionState::default(), who_label),
+            Err(PipelineError::UnfilledRole { service: TextGeneration }),
+        );
     }
 }
