@@ -1,14 +1,22 @@
 # DNS-01 via deSEC (alternative to the self-hosted `ct-dns`)
 
-For automatic Let's Encrypt certificates (the `:443` front-door cert #31 FD4, the
-wildcard `*.<zone>`, and customer origin certs #23 BP4c) the ACME client needs to
-publish `_acme-challenge` **TXT** records. Two interchangeable backends exist and
-both stay supported — pick one with `CT_ACME_DNS_PROVIDER`:
+For automatic Let's Encrypt certificates, the operator's control plane needs to
+publish `_acme-challenge` **TXT** records on an agent's behalf (ADR-0003: the
+agent's private key never leaves the agent — the operator only ever assists with
+the DNS-01 challenge, via `POST /agent/dns01-challenge`, gated by the tunnel's own
+routing token). Two interchangeable backends exist —
+[`ct_dns::provider::Dns01Provider`](../crates/dns/src/provider.rs)'s `SelfHosted`
+and `Desec` variants:
 
-- `self-hosted` — run our own authoritative DNS (`ct-dns`, see ADR-0019). Fully
+- **self-hosted** — run our own authoritative DNS (`ct-dns`, see ADR-0019). Fully
   self-contained, no third party; you run public `:53`.
-- `desec` — **deSEC** (<https://desec.io>), a free, EU-based, privacy-friendly
-  managed DNS with a clean REST API. No `:53` to run; a third party hosts the zone.
+- **deSEC** (<https://desec.io>) — a free, EU-based, privacy-friendly managed DNS
+  with a clean REST API. No `:53` to run; a third party hosts the zone. **This is
+  the backend actually wired into the control plane's `/agent/dns01-challenge`
+  today** (`persistent_control_plane_router` constructs `Dns01Provider::Desec`
+  straight from `DesecClient::from_env()` — there's no separate provider-selector
+  env var; self-hosted `ct-dns` is a real, tested backend but isn't wired to that
+  endpoint yet).
 
 This document sets up the **deSEC** option.
 
@@ -68,20 +76,42 @@ differs by deployment mode, so put them in the right place:
 
 Required keys (**never commit the real token**):
 ```dotenv
-CT_ACME_DNS_PROVIDER=desec
 DESEC_TOKEN=<your deSEC API token>
 DESEC_DOMAIN=bunsenbrenner.org
 # DESEC_API_BASE=https://desec.io/api/v1   # default; only override for testing
 ```
 
-The token is read at startup and never logged. The service that **consumes**
-`DESEC_TOKEN` (the ACME client) lands with **#31 FD4**; the authoritative location
-above is stable, so you can set the token now. What the client does under the
-hood (for reference): a bulk **`PATCH https://desec.io/api/v1/domains/<zone>/rrsets/`**
+The token is read at startup and never logged, and stays on the operator's
+control plane only — an agent obtaining a certificate never sees it (see
+"Self-service agent certificates" below). What the client does under the hood
+(for reference): a bulk **`PATCH https://desec.io/api/v1/domains/<zone>/rrsets/`**
 with `Authorization: Token <token>` and a body like
 `[{"subname":"_acme-challenge","type":"TXT","ttl":3600,"records":["\"<value>\""]}]`
 to publish, and the same with `"records":[]` to clean up. (This is exactly what
 `ct_dns::provider::DesecClient` sends; verified in its tests against a mock.)
+
+## Self-service agent certificates (ADR-0003, implemented)
+
+An agent doesn't need any of the above — it never touches `DESEC_TOKEN`. Run:
+```bash
+CT_AGENT_CP_URL=https://bunsenbrenner.org \
+CT_AGENT_TOKEN=<this tunnel's own routing token> \
+CT_AGENT_HOSTNAME=you.bunsenbrenner.org \
+CT_ACME_CERT_OUT_DIR=/path/your-origin-webserver-reads-from \
+  ct-agent certificate
+```
+This generates a private key locally (never transmitted), drives the full ACME
+order against Let's Encrypt, proves hostname ownership to the control plane's
+`POST /agent/dns01-challenge` with the tunnel's own routing token (the control
+plane is the only thing that ever touches the real DNS zone), and writes
+`fullchain.pem`/`privkey.pem` to `CT_ACME_CERT_OUT_DIR` — the same static-file
+pair your origin's webserver (Caddy, etc.) already knows how to load. It
+re-checks every few hours and only actually contacts Let's Encrypt once the
+existing cert is old enough to renew (`crates/agent/src/acme_orchestrate.rs`).
+
+Set `CT_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory`
+to test against Let's Encrypt's staging environment first — production has real
+per-hostname rate limits.
 
 ## 5. Verify
 After a cert run publishes a challenge, from anywhere:

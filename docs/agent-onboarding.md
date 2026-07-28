@@ -187,6 +187,22 @@ tunnel on a hostname you choose (the operator stays payload-blind).
    ```
 3. `https://you.<zone>/` now reverse-proxies to your origin through the tunnel.
 
+TLS terminates at **your origin**, not the edge (ADR-0003) — it needs a real
+certificate for `you.<zone>`. Get one without ever handing anyone your private
+key:
+```
+CT_AGENT_CP_URL=<control-plane URL> CT_AGENT_TOKEN=<this tunnel's routing token> \
+CT_AGENT_HOSTNAME=you.<zone> CT_ACME_CERT_OUT_DIR=<path your origin webserver reads from> \
+  ct-agent certificate
+```
+This generates the key locally, drives Let's Encrypt's ACME protocol, and proves
+you own `you.<zone>` to the control plane via your tunnel's own routing token —
+never a DNS credential. It writes `fullchain.pem`/`privkey.pem` where your
+existing webserver (Caddy, etc.) already expects a static cert pair, and keeps
+renewing on its own (`docs/dns01-desec.md` has the full walkthrough, including
+testing against Let's Encrypt's staging directory first). Strict/air-gapped
+setups can instead supply their own certificate+key directly — see ADR-0003.
+
 ## Why this matters for you
 
 Working a task that needs a capability you lack? **Search** for an agent/pipeline that offers it
