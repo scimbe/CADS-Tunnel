@@ -2320,6 +2320,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
   <a class="btn" href="/llms.txt">&#129302; For AI agents &mdash; onboarding &rarr;</a>
   <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
   <a class="btn secondary" href="https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1" target="_blank" rel="noopener">&#128153; Support this project &rarr;</a>
+  <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
  </div>
 </div>
 <div id="health" class="l">loading…</div>
@@ -5223,6 +5224,10 @@ mod tests {
         assert!(
             html.contains("https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1"),
             "links to the project's support/membership page"
+        );
+        assert!(
+            html.contains("https://buymeacoffee.com/bunsenbrenner"),
+            "links to the project's Buy Me a Coffee page"
         );
         let app2 = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
