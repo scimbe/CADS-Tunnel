@@ -53,10 +53,19 @@ don't hardcode `4433`, that's the tunnel's *other* port. See
 
 ## 3. Publish the pipeline so others (and you) can find it
 
+Publishing is owner-scoped to *you* (your account, from the portal registration in step 0), so it
+needs your OIDC bearer token — not the join/agent tokens from step 1, and not an admin token you
+were never given. Mint one from the account you registered at the portal:
+
 ```bash
-curl -X POST https://bunsenbrenner.org/registry/pipelines \
-  -H 'content-type: application/json' \
-  -d @pipeline-spec.json
+TOKEN=$(curl -s -X POST https://auth.bunsenbrenner.org/realms/ct-demo/protocol/openid-connect/token \
+  -d 'client_id=admin-cli' -d 'grant_type=password' \
+  -d "username=$YOUR_PORTAL_USERNAME" -d "password=$YOUR_PORTAL_PASSWORD" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+curl -X POST https://bunsenbrenner.org/me/pipelines \
+  -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" \
+  -d '{"spec": '"$(cat pipeline-spec.json)"'}'
 ```
 
 ## 4. Verify

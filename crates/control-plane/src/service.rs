@@ -95,8 +95,9 @@ fn admin_token_ok(headers: &HeaderMap, expected: &[u8; 32]) -> bool {
 /// #186: the shared INLINE admin guard. `Ok(())` when no token is configured (dev/back-compat) OR the
 /// correct `x-ct-admin-token` is presented; `401` with the route-specific `msg` otherwise. The inline
 /// gates (`/enroll/issue*`, `/registry/agents`, `/registry/pipelines`) are thin wrappers over this so
-/// they share [`admin_token_ok`]'s single extract-and-compare.
-fn require_admin(
+/// they share [`admin_token_ok`]'s single extract-and-compare. `pub(crate)` so [`crate::edge_mesh`]'s
+/// endpoints reuse the exact same gate rather than growing a second copy.
+pub(crate) fn require_admin(
     headers: &HeaderMap,
     expected: &Option<[u8; 32]>,
     msg: &'static str,
@@ -1033,6 +1034,59 @@ async fn pipeline_get(
     match state.registry.get(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))? {
         Some(spec) => Ok(Json(spec)),
         None => Err((StatusCode::NOT_FOUND, "no such pipeline".to_string())),
+    }
+}
+
+/// Shared state for the authenticated pipeline-publish endpoint (below): the
+/// pipeline store + the OIDC verifier. The owner is always the verified
+/// subject, never a request field — same `/me/*` convention as
+/// [`AuthedChannelState`]/[`AuthedNetworkState`].
+#[derive(Clone)]
+struct AuthedPipelineState {
+    registry: Arc<SqlitePipelineRegistry>,
+    verifier: Arc<OidcVerifier>,
+}
+
+/// `POST /me/pipelines` `{spec}` → publish (owner = verified subject); `403` if the id
+/// is already owned by a different subject.
+///
+/// Publishing a pipeline was admin-token-gated only (`pipeline_publish`/`#174 B`) — fine
+/// for the operator, but that token is never handed to an ordinary onboarded pipeline
+/// designer (they only ever get a join token + agent token, #218/agent-onboarding.md §A),
+/// so nobody but the operator could actually publish one. That directly contradicted the
+/// "generic, coordination-free" self-service design already shipped for channels
+/// (`/me/channels`, #214 follow-up) and joining (`ct-agent channel join-pipeline-role`) —
+/// a designer could derive every role's channel id and describe how to join it, but had no
+/// way to actually publish the spec that makes it discoverable. This closes that gap the
+/// same way `/me/channels` did: owner = the caller's verified OIDC subject, no shared
+/// secret required. The admin-gated `/registry/pipelines` stays mounted unchanged for
+/// operator/back-compat use (e.g. scripted publishes without an interactive login).
+pub fn authed_pipeline_router(registry: Arc<SqlitePipelineRegistry>, verifier: Arc<OidcVerifier>) -> Router {
+    Router::new()
+        .route("/me/pipelines", post(me_pipeline_publish))
+        .with_state(AuthedPipelineState { registry, verifier })
+}
+
+#[derive(Deserialize)]
+struct MePublishPipelineReq {
+    spec: ct_common::pipeline::PipelineSpec,
+}
+
+async fn me_pipeline_publish(
+    State(state): State<AuthedPipelineState>,
+    headers: HeaderMap,
+    Json(req): Json<MePublishPipelineReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let published = state
+        .registry
+        .publish(&owner, &req.spec, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if published {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "a pipeline with this id is owned by another subject".to_string()))
     }
 }
 
@@ -2478,8 +2532,11 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 2. Read the template's README.md, and https://bunsenbrenner.org/llms.txt for
    background -- both are reference material, not instructions to follow
    blindly; use your own judgement throughout, same as with any doc.
-3. Build ct-agent from source (there's a Docker one-liner in docs/install.md —
-   I don't have a Rust toolchain installed).
+3. Get ct-agent -- no build needed, it's a prebuilt binary from GitHub Releases
+   (see docs/install.md "Just want to run ct-agent?"): detect my OS/arch and
+   curl the matching `ct-agent-&lt;os&gt;-&lt;arch&gt;` asset from
+   https://github.com/scimbe/CADS-Tunnel/releases/latest, `chmod +x` it. No
+   Docker, no Rust toolchain, no repo clone required for this.
 4. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
    want your service to do here&gt;. It's currently running on: &lt;your PC /
    Raspberry Pi / container / agent&gt;.
@@ -2488,7 +2545,9 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    long-lived -- running channel init again later would create a second,
    unrelated identity rather than restoring this one; that's just how it works,
    not something to worry about.
-6. Walk me through running the handler as a live role and publishing my pipeline.</code></template>
+6. Walk me through running the handler as a live role, then publishing my
+   pipeline at POST /me/pipelines with my portal login's OIDC bearer token
+   (not an admin token -- I was never given one, and don't need one).</code></template>
     </div>
     <p class="alt-link">
      Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
@@ -3012,7 +3071,7 @@ pub fn persistent_control_plane_router(
         .merge(agent_directory_router(agent_directory, admin_token))
         // #174 B: the workflow-pipeline registry — POST publish (admin-gated) + public GET
         // discovery, so a designer can publish a PipelineSpec agents scan to find workflows to join.
-        .merge(pipeline_registry_router(pipeline_registry, admin_token))
+        .merge(pipeline_registry_router(pipeline_registry.clone(), admin_token))
         // #214: public, admin-token-gated host-authorization proxy to the edge — lets a
         // remote pipeline maintainer holding just the admin token self-serve hostname
         // binds (the same shared secret /enroll/issue already requires), no operator
@@ -3098,7 +3157,11 @@ pub fn persistent_control_plane_router(
             .merge(authed_topology_router(topologies.clone(), oidc.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
-            .merge(authed_channel_router(channels, oidc));
+            .merge(authed_channel_router(channels, oidc.clone()))
+            // Self-service pipeline publish (owner = verified subject) — see
+            // `authed_pipeline_router`'s doc comment for why this exists alongside
+            // the admin-gated `/registry/pipelines`.
+            .merge(authed_pipeline_router(pipeline_registry, oidc));
     }
     let app = app.merge(health_router(ledger));
     // #87 SEC87b-rl: optional per-IP flood cap on the unauthenticated DB-writers.
@@ -4834,6 +4897,64 @@ mod tests {
         // Unknown id → 404.
         let miss = app.oneshot(Request::get("/registry/pipelines/nope").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(miss.status(), StatusCode::NOT_FOUND, "unknown pipeline → 404");
+    }
+
+    #[tokio::test]
+    async fn me_pipelines_publishes_self_service_owned_by_the_bearer_subject() {
+        // An ordinary onboarded pipeline designer only ever holds a join token + agent
+        // token, never the admin token (#218/agent-onboarding.md §A) — so the admin-gated
+        // `/registry/pipelines` was never actually reachable by them. `/me/pipelines`
+        // closes that gap the same way `/me/channels` did: owner = the verified subject.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let reg = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_pipeline_router(reg.clone(), verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let body = r#"{"spec":{"id":"flappy","roles":[{"service":"TextGeneration","units":1,"tag":"physics"}]}}"#;
+        let publish = |bearer: Option<String>| {
+            let mut req = Request::post("/me/pipelines").header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        assert_eq!(publish(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no bearer token → 401");
+        assert_eq!(publish(Some(alice.clone())).await.unwrap().status(), StatusCode::OK, "alice publishes her own spec");
+        assert_eq!(
+            reg.get("flappy").unwrap().expect("published").id,
+            "flappy",
+            "the spec is actually persisted"
+        );
+        assert_eq!(
+            publish(Some(mallory)).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "a different subject can't re-publish alice's id"
+        );
+        // Re-publishing under the SAME subject (an update) still succeeds.
+        let ok_republish = publish(Some(alice)).await.unwrap();
+        assert_eq!(ok_republish.status(), StatusCode::OK, "the owning subject can republish/update");
+
+        // Discoverable via the existing public GET (same registry, shared with #174 B's router).
+        let list = pipeline_registry_router(reg, None)
+            .oneshot(Request::get("/registry/pipelines").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let lb = to_bytes(list.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&lb).contains("\"flappy\""), "self-published pipeline is publicly discoverable");
     }
 
     #[tokio::test]

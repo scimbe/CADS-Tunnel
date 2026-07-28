@@ -57,7 +57,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ru
 /// run alongside a single writer, and `busy_timeout` makes a contending writer
 /// wait-and-retry (up to 5s) rather than failing outright. The `open_in_memory`
 /// variants skip this — WAL and file locking are moot for a `:memory:` database.
-fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
+pub(crate) fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     // `PRAGMA journal_mode` returns the resulting mode as a row, so it must be
     // set via `query_row` — `execute`/`pragma_update` reject row-returning
@@ -87,6 +87,7 @@ macro_rules! sqlite_store_ctors {
         }
     };
 }
+pub(crate) use sqlite_store_ctors;
 
 /// Why a persisted redemption failed: an enrollment rule or the database.
 #[derive(Debug)]

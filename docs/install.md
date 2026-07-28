@@ -1,7 +1,29 @@
 # Install & use
 
-Easy-going setup. Everything runs in containers, so the only hard requirement is
-**Docker** (plus `git`). No Rust toolchain needs to be installed on the host.
+## Just want to run `ct-agent`? Skip the repo entirely.
+
+If you're exposing a tunnel, serving a pipeline role, or publishing a pipeline — not
+running the core system (control-plane + edge) yourself — you don't need to clone or
+build anything. A prebuilt `ct-agent` binary ships with every release:
+
+```bash
+curl -fsSL https://bunsenbrenner.org/install.sh | CT_JOIN_TOKEN=<yours> CT_AGENT_TOKEN=<yours> sh
+```
+
+That downloads the right `ct-agent` for your OS/arch from
+[GitHub Releases](https://github.com/scimbe/CADS-Tunnel/releases/latest) and runs
+`ct-agent onboard`. If you only need the binary itself (e.g. for `ct-agent channel …` —
+publishing/joining a workflow pipeline, no tunnel involved), grab it directly and skip
+`onboard`:
+
+```bash
+curl -fsSL https://github.com/scimbe/CADS-Tunnel/releases/latest/download/ct-agent-linux-x86_64 \
+  -o ct-agent && chmod +x ct-agent   # macOS: ct-agent-darwin-<x86_64|aarch64>; Windows: see install.ps1
+```
+
+No Docker, no Rust toolchain, no repo checkout, on any of these paths. The rest of this
+page is for the **operator** side — building/running the control plane + edge
+themselves (self-hosting, or contributing to core development).
 
 ## 1. Get the code
 

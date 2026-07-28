@@ -34,6 +34,36 @@ jobs:
       - name: Committed-secret guard
         run: bash scripts/check-no-secrets.sh
 
+      - name: hello-world-pipeline.zip matches its source files
+        # The zip is include_bytes!'d into the served /downloads/hello-world-pipeline.zip
+        # (crates/control-plane/src/service.rs) but built by hand from README.md/
+        # hello-handler.sh/pipeline-spec.json — nothing regenerated it automatically, so it
+        # silently went stale (a README fix landed without the zip ever being rebuilt).
+        # Rebuild it deterministically here and fail if the committed one differs, so a
+        # PR that edits any source file without regenerating the zip is caught in CI
+        # instead of shipping a stale download.
+        run: |
+          cd examples/hello-world-pipeline
+          python3 -c "
+          import zipfile
+          with zipfile.ZipFile('rebuilt.zip', 'w', zipfile.ZIP_DEFLATED) as z:
+              for f in ['README.md', 'hello-handler.sh', 'pipeline-spec.json']:
+                  z.write(f, f)
+          "
+          python3 -c "
+          import zipfile, sys
+          def names(p):
+              with zipfile.ZipFile(p) as z:
+                  return {n: z.read(n) for n in z.namelist()}
+          a, b = names('hello-world-pipeline.zip'), names('rebuilt.zip')
+          if a != b:
+              print('hello-world-pipeline.zip is stale relative to its source files.')
+              print('Rebuild it (see examples/hello-world-pipeline, or the same 3-line')
+              print('zipfile.ZipFile(...) snippet this check uses) and commit the result.')
+              sys.exit(1)
+          "
+          rm -f rebuilt.zip
+
       - name: Dependency audit
         run: |
           cargo install cargo-audit --locked || true

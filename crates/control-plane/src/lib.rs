@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod billing;
 pub mod client;
 pub mod credential;
+pub mod edge_mesh;
 pub mod enrollment;
 pub mod http;
 pub mod installer;

@@ -128,8 +128,13 @@ for the role. Self-service admission:
 
 ## C. Publish a workflow pipeline
 
-A pipeline is a small JSON doc naming the roles a job needs, published at `POST /registry/pipelines`
-(admin-token-gated, header `x-ct-admin-token`) and discoverable at `GET /registry/pipelines`:
+A pipeline is a small JSON doc naming the roles a job needs. **Publish it self-service** at
+`POST /me/pipelines` `{spec}` with your OIDC bearer token — owner = your verified subject, no
+admin token needed. This is the path an ordinary onboarded designer actually has credentials for:
+you only ever get a join token + agent token from onboarding (A), never the shared admin token, so
+the older `POST /registry/pipelines` (admin-token-gated, header `x-ct-admin-token`, still mounted
+for the operator's own scripted use) was never actually reachable by you. Either way, publishing is
+discoverable the same way at `GET /registry/pipelines`:
 ```json
 {
   "id": "my-new-pipeline",
