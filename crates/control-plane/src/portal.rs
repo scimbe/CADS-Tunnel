@@ -126,14 +126,22 @@ impl PortalOidc {
         crate::oidc::jwks_uri_for(self.issuer())
     }
 
-    /// Build the Authorization Code redirect URL, carrying a CSRF `state`.
-    fn authorize_redirect(&self, state: &str) -> String {
+    /// Build the Authorization Code redirect URL, carrying a CSRF `state`. `idp_hint`
+    /// (Keycloak's `kc_idp_hint`) sends the browser straight to a specific brokered
+    /// identity provider (e.g. `google`, `github`) instead of Keycloak's own
+    /// provider-chooser screen -- the "Continue with Google/GitHub" buttons on the
+    /// portal shell use this so picking a provider is a single click, not two.
+    fn authorize_redirect(&self, state: &str, idp_hint: Option<&str>) -> String {
+        let hint_param = idp_hint
+            .map(|h| format!("&kc_idp_hint={}", urlencode(h)))
+            .unwrap_or_default();
         format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}{}",
             self.authorize_url,
             urlencode(&self.client_id),
             urlencode(&self.redirect_uri),
             urlencode(state),
+            hint_param,
         )
     }
 }
@@ -311,14 +319,28 @@ async fn portal_home() -> Html<&'static str> {
     Html(PORTAL_HTML)
 }
 
-async fn portal_login(State(st): State<PortalState>) -> Response {
+/// `kc_idp_hint` from the portal shell's "Continue with Google/GitHub" buttons.
+/// Allowlisted against the identity providers actually declared in the `ct-demo`
+/// realm (`keycloak/ct-demo-realm.json`) -- anything else is dropped rather than
+/// passed through, since this value is embedded verbatim into a redirect URL.
+#[derive(Deserialize)]
+struct LoginQuery {
+    kc_idp_hint: Option<String>,
+}
+
+fn known_idp_hint(hint: Option<&str>) -> Option<&str> {
+    hint.filter(|h| matches!(*h, "google" | "github" | "gitlab"))
+}
+
+async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>) -> Response {
     match st.oidc {
         Some(cfg) => {
             // Mint the CSRF `state`, carry it BOTH in the authorize redirect and
             // in a single-use HttpOnly cookie so the callback can prove the
             // response came back to the same browser we sent out.
             let state = random_state();
-            let mut resp = Redirect::to(&cfg.authorize_redirect(&state)).into_response();
+            let hint = known_idp_hint(q.kc_idp_hint.as_deref());
+            let mut resp = Redirect::to(&cfg.authorize_redirect(&state, hint)).into_response();
             set_cookie(&mut resp, &state_cookie(&state));
             resp
         }
@@ -631,24 +653,57 @@ fn urlencode(s: &str) -> String {
 }
 
 /// The customer portal shell (logged-out state): a self-contained, CSP-safe HTML
-/// page with a "Sign in with SSO" call to action. Themed like the operator page.
+/// page offering real "Continue with Google/GitHub" buttons (via Keycloak's
+/// `kc_idp_hint`, #portal-idp-hint) plus a direct email/password path -- one
+/// click straight into the right flow instead of a single generic "Sign in with
+/// SSO" button that just forwarded to another chooser screen.
 const PORTAL_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CADS-Tunnel — customer portal</title>
+<title>Bunsenbrenner.org — sign in or create an account</title>
 <style>
- body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
-      display:flex;min-height:100vh;align-items:center;justify-content:center}
- .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;max-width:420px;text-align:center}
- h1{font-size:1.4rem;margin:.2rem 0 .4rem} .sub{color:#8b949e;font-size:.95rem;margin-bottom:1.6rem}
- a.btn{display:inline-block;background:#238636;color:#fff;text-decoration:none;padding:.7rem 1.4rem;
-       border-radius:8px;font-weight:600} a.btn:hover{background:#2ea043}
- .foot{color:#8b949e;font-size:.8rem;margin-top:1.6rem}
+ :root{--bg:#0b0e13;--panel:#161b22;--border:#30363d;--border2:#3d4551;--text:#e6edf3;--muted:#8b949e}
+ *{box-sizing:border-box}
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);
+      color:var(--text);display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}
+ .card{background:linear-gradient(180deg,#1c2128,var(--panel));border:1px solid var(--border);border-radius:14px;
+       padding:2.3rem 2.1rem;max-width:400px;width:100%}
+ .back{display:inline-block;margin-bottom:1.2rem;color:var(--muted);font-size:.85rem;text-decoration:none}
+ .back:hover{color:#c9d1d9}
+ h1{font-size:1.35rem;margin:.2rem 0 .35rem} .sub{color:#8b949e;font-size:.9rem;margin-bottom:1.6rem}
+ .providers{display:flex;flex-direction:column;gap:.65rem;margin-bottom:1.2rem}
+ a.provider{display:flex;align-items:center;gap:.7rem;background:#0d1117;border:1px solid var(--border);
+   border-radius:9px;padding:.7rem 1rem;color:var(--text);text-decoration:none;font-weight:600;font-size:.92rem;
+   transition:border-color .15s ease,background .15s ease}
+ a.provider:hover{border-color:var(--border2);background:#1c2128}
+ a.provider svg{width:1.1rem;height:1.1rem;flex-shrink:0}
+ .divider{display:flex;align-items:center;gap:.7rem;color:var(--muted);font-size:.74rem;text-transform:uppercase;
+   letter-spacing:.05em;margin:.9rem 0}
+ .divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--border)}
+ a.btn-email{display:block;text-align:center;background:#238636;color:#fff;text-decoration:none;padding:.7rem 1.4rem;
+       border-radius:9px;font-weight:600} a.btn-email:hover{background:#2ea043}
+ .foot{color:var(--muted);font-size:.8rem;margin-top:1.6rem;text-align:center}
 </style></head><body>
 <div class="card">
- <h1>CADS-Tunnel</h1>
- <div class="sub">Sign in to manage your account and tunnels.</div>
- <a class="btn" href="/portal/login">Sign in with SSO</a>
+ <a class="back" href="/">&larr; bunsenbrenner.org</a>
+ <h1>&#128293; Sign in or create an account</h1>
+ <div class="sub">One account for your tunnels, pipelines, and agents.</div>
+
+ <div class="providers">
+  <a class="provider" href="/portal/login?kc_idp_hint=google">
+   <svg viewBox="0 0 18 18"><path fill='#4285F4' d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84c-.21 1.13-.84 2.09-1.8 2.73v2.27h2.92c1.7-1.57 2.68-3.87 2.68-6.64z"/><path fill='#34A853' d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.27c-.81.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33C2.44 15.98 5.48 18 9 18z"/><path fill='#FBBC05' d="M3.97 10.7c-.18-.54-.28-1.11-.28-1.7s.1-1.16.28-1.7V4.97H.96A8.99 8.99 0 0 0 0 9c0 1.45.35 2.83.96 4.03l3.01-2.33z"/><path fill='#EA4335' d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.59-2.59C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.97l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>
+   Continue with Google
+  </a>
+  <a class="provider" href="/portal/login?kc_idp_hint=github">
+   <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+   Continue with GitHub
+  </a>
+ </div>
+
+ <div class="divider">or</div>
+
+ <a class="btn-email" href="/portal/login">Continue with email</a>
+
  <div class="foot">Provider-blind tunnels — the operator never sees your payload.</div>
 </div>
 </body></html>"#;
@@ -1024,8 +1079,16 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("Sign in with SSO"), "login CTA present");
-        assert!(html.contains("href=\"/portal/login\""), "links to the login route");
+        assert!(html.contains("Continue with email"), "direct email/password login CTA present");
+        assert!(html.contains(r#"href="/portal/login""#), "the email path links to the plain login route");
+        assert!(
+            html.contains(r#"href="/portal/login?kc_idp_hint=google""#),
+            "the Google button hints Keycloak straight to that provider"
+        );
+        assert!(
+            html.contains(r#"href="/portal/login?kc_idp_hint=github""#),
+            "the GitHub button hints Keycloak straight to that provider"
+        );
         assert!(!html.contains("http://") && !html.contains("https://cdn"), "self-contained, no external assets");
     }
 
@@ -1050,6 +1113,46 @@ mod tests {
         assert!(loc.contains("redirect_uri=https%3A%2F%2Fportal.example%2Fportal%2Fcallback"));
         assert!(loc.contains("scope=openid"));
         assert!(loc.contains("state="), "carries a CSRF state");
+    }
+
+    #[tokio::test]
+    async fn login_passes_a_known_idp_hint_but_drops_an_unknown_one() {
+        // The portal shell's "Continue with Google/GitHub" buttons send
+        // ?kc_idp_hint=<provider> so Keycloak skips straight to that broker
+        // instead of showing its own chooser. Only providers actually declared
+        // in the ct-demo realm are allowlisted -- anything else is dropped
+        // rather than reflected verbatim into the redirect URL.
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg.clone()), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login?kc_idp_hint=google")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(loc.contains("kc_idp_hint=google"), "known hint is passed through, got {loc}");
+
+        let app2 = portal_router(Some(cfg), TEST_KEY);
+        let resp2 = app2
+            .oneshot(
+                Request::get("/portal/login?kc_idp_hint=evil.com%2Fx")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::SEE_OTHER);
+        let loc2 = resp2.headers().get("location").unwrap().to_str().unwrap();
+        assert!(!loc2.contains("kc_idp_hint"), "an unrecognized hint is dropped, not reflected, got {loc2}");
     }
 
     fn cfg() -> PortalOidc {

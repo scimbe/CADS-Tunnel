@@ -2334,15 +2334,10 @@ const LANDING_HTML: &str = r#"<!doctype html>
  a.btn.big{padding:.85rem 1.7rem;font-size:1.05rem}
 
  .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1.2rem;margin:0 0 2.2rem;
-  align-items:start;text-align:left}
- .option{margin:0 0 1.1rem}
- .option:last-child{margin-bottom:0}
- .option h4{margin:0 0 .35rem;font-size:.95rem;color:var(--text)}
- .option-link{display:inline-block;margin-top:.6rem;font-size:.85rem;text-decoration:none}
- .option-link:hover{text-decoration:underline}
- .option-divider{display:flex;align-items:center;gap:.7rem;color:var(--muted);font-size:.76rem;
-  text-transform:uppercase;letter-spacing:.05em;margin:1rem 0}
- .option-divider::before,.option-divider::after{content:"";flex:1;height:1px;background:var(--border)}
+  text-align:left}
+ .alt-link{margin:.7rem 0 0;font-size:.82rem;color:var(--muted)}
+ .alt-link a{text-decoration:none}
+ .alt-link a:hover{text-decoration:underline}
  .step{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:14px;
   padding:1.5rem 1.4rem 1.4rem;position:relative;transition:border-color .15s ease,transform .15s ease,box-shadow .15s ease}
  .step:hover{border-color:var(--border2);transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.35)}
@@ -2427,7 +2422,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
   </div>
 
   <div class="hero-content">
-   <h1>Create at home.<br>Publish world wide.</h1>
+   <h1>Better homemade ideas,<br>published worldwide.</h1>
    <p class="lede">
     Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
     own AI agent — and make it reachable at a real, encrypted HTTPS address. No open ports. No public IP.
@@ -2453,27 +2448,13 @@ const LANDING_HTML: &str = r#"<!doctype html>
     <div class="step-n">2</div>
     <h3>Get your template</h3>
     <p>A minimal, working "hello world" workflow pipeline — one role, one handler script that echoes
-    your input back. Proves the whole loop before you swap in your own idea. Pick whichever path fits
-    how you work:</p>
-
-    <div class="option">
-     <h4>Download it and build it your way</h4>
-     <p>One click, no git needed. Read through the code yourself and wire it up at your own pace.</p>
-     <a class="btn" href="/downloads/hello-world-pipeline.zip" download>&#11015; hello-world-pipeline.zip</a>
-     <a class="option-link" href="/template-guide">See how it's structured &amp; how to adapt it &rarr;</a>
-    </div>
-
-    <div class="option-divider">or</div>
-
-    <div class="option">
-     <h4>Hand it to your LLM</h4>
-     <p>Paste this into
-     <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any
-     coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
-     itself. Nothing to unzip by hand.</p>
-     <div class="code-block">
-      <div class="code-block-head"><span>prompt.txt</span><button class="copy-btn" onclick="copyCode(this)" type="button">&#128203; Copy</button></div>
-      <pre><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+    your input back. Proves the whole loop before you swap in your own idea. Paste this into
+    <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any
+    coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
+    itself. Nothing to unzip by hand.</p>
+    <div class="code-block">
+     <div class="code-block-head"><span>prompt.txt</span><button class="copy-btn" onclick="copyCode(this)" type="button">&#128203; Copy</button></div>
+     <pre><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
 
 1. Download and unpack the starter template:
    curl -LO https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
@@ -2491,8 +2472,11 @@ const LANDING_HTML: &str = r#"<!doctype html>
 6. Walk me through running the handler as a live role and publishing my pipeline.
 
 I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></pre>
-     </div>
     </div>
+    <p class="alt-link">
+     Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
+     &middot; <a href="/template-guide">see how it's structured &rarr;</a>
+    </p>
    </div>
 
    <div class="step">
@@ -5484,7 +5468,7 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         // Self-contained (no external asset URLs) and renders the status figures.
         assert!(html.contains("Bunsenbrenner"), "has the Bunsenbrenner branding");
-        assert!(html.contains("Create at home"), "has the onboarding tagline");
+        assert!(html.contains("published worldwide"), "has the onboarding tagline");
         assert!(html.contains("operator status"), "has the live-status section");
         assert!(html.contains("fetch('/status')"), "fetches the status endpoint");
         assert!(
