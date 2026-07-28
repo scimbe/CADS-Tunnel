@@ -37,6 +37,22 @@ pub const DEFAULT_RESOLVER_URLS: &[&str] = &["https://cloudflare-dns.com/dns-que
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Wait this long after publishing before the *first* lookup.
+///
+/// This is not politeness -- it is the difference between working and not.
+/// Querying a name before it has propagated makes the resolver cache the
+/// resulting NXDOMAIN for the zone's SOA `minimum` (3600s on deSEC, which
+/// enforces a 3600 floor -- a `ttl: 60` PATCH is rejected outright with
+/// "Ensure this value is greater than or equal to 3600"). So an eager first
+/// poll *causes* the very stale-negative-cache failure the rest of this
+/// module then spends its whole timeout budget fighting: every subsequent
+/// poll for the next hour sees our own poisoned entry, not reality.
+///
+/// `acme.sh` -- the manual path that has always worked here -- does exactly
+/// this and for exactly this reason ("Let's check each DNS record now.
+/// Sleeping for 20 seconds first." before `_check_dns_entries`). Matching it.
+const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(20);
+
 /// Cloudflare's own DoH endpoint, and the public (unauthenticated) 1.1.1.1
 /// resolver cache-purge endpoint the same one `acme.sh`'s `dns_desec`/
 /// `_ns_purge_cf` uses -- verified directly (not from a docs page; no public
@@ -63,6 +79,7 @@ pub struct PropagationWaiter {
     // without ever calling the live purge API from a test.
     cloudflare_doh_url: String,
     cloudflare_purge_url: String,
+    initial_delay: Duration,
 }
 
 impl PropagationWaiter {
@@ -78,7 +95,16 @@ impl PropagationWaiter {
             interval,
             cloudflare_doh_url: CLOUDFLARE_DOH.to_string(),
             cloudflare_purge_url: CLOUDFLARE_PURGE_URL.to_string(),
+            initial_delay: DEFAULT_INITIAL_DELAY,
         }
+    }
+
+    /// Tests only: skip the pre-check delay (its whole point is real-world
+    /// resolver-cache behavior, which a mock server does not have).
+    #[cfg(test)]
+    fn without_initial_delay(mut self) -> Self {
+        self.initial_delay = Duration::ZERO;
+        self
     }
 
     #[cfg(test)]
@@ -89,7 +115,15 @@ impl PropagationWaiter {
         cloudflare_doh_url: String,
         cloudflare_purge_url: String,
     ) -> Self {
-        Self { http: reqwest::Client::new(), resolver_urls, timeout, interval, cloudflare_doh_url, cloudflare_purge_url }
+        Self {
+            http: reqwest::Client::new(),
+            resolver_urls,
+            timeout,
+            interval,
+            cloudflare_doh_url,
+            cloudflare_purge_url,
+            initial_delay: Duration::ZERO,
+        }
     }
 
     /// Poll every configured resolver for `record_name`'s TXT value each
@@ -102,6 +136,11 @@ impl PropagationWaiter {
     /// cache before the next round, rather than only hoping either real
     /// propagation or the cached TTL wins the race first.
     pub async fn wait_for(&self, record_name: &str, expected_value: &str) -> Result<(), String> {
+        // Deliberately BEFORE the deadline is taken: this delay buys propagation
+        // headroom, it must not eat the polling budget (see DEFAULT_INITIAL_DELAY
+        // -- an early first lookup poisons the resolver cache with an NXDOMAIN
+        // that then outlives the entire timeout).
+        tokio::time::sleep(self.initial_delay).await;
         let deadline = Instant::now() + self.timeout;
         let mut last_seen: Vec<String> = Vec::new();
         loop {
@@ -210,7 +249,7 @@ mod tests {
     async fn succeeds_immediately_when_the_record_is_already_visible() {
         let calls = Arc::new(AtomicU32::new(0));
         let url = spawn_mock(MockResolver { calls: calls.clone(), answers_after: 0, value: "abc123".into() }).await;
-        let waiter = PropagationWaiter::with_interval(vec![url], Duration::from_secs(5), Duration::from_millis(10));
+        let waiter = PropagationWaiter::with_interval(vec![url], Duration::from_secs(5), Duration::from_millis(10)).without_initial_delay();
         waiter.wait_for("_acme-challenge.example.test", "abc123").await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -219,7 +258,7 @@ mod tests {
     async fn retries_until_the_record_appears() {
         let calls = Arc::new(AtomicU32::new(0));
         let url = spawn_mock(MockResolver { calls: calls.clone(), answers_after: 3, value: "xyz789".into() }).await;
-        let waiter = PropagationWaiter::with_interval(vec![url], Duration::from_secs(5), Duration::from_millis(10));
+        let waiter = PropagationWaiter::with_interval(vec![url], Duration::from_secs(5), Duration::from_millis(10)).without_initial_delay();
         waiter.wait_for("_acme-challenge.example.test", "xyz789").await.unwrap();
         assert!(calls.load(Ordering::SeqCst) >= 4);
     }
@@ -229,7 +268,7 @@ mod tests {
         let calls = Arc::new(AtomicU32::new(0));
         let url = spawn_mock(MockResolver { calls, answers_after: 0, value: "wrong-value".into() }).await;
         let waiter =
-            PropagationWaiter::with_interval(vec![url], Duration::from_millis(50), Duration::from_millis(10));
+            PropagationWaiter::with_interval(vec![url], Duration::from_millis(50), Duration::from_millis(10)).without_initial_delay();
         let err = waiter.wait_for("_acme-challenge.example.test", "expected-value").await.unwrap_err();
         assert!(err.contains("did not become publicly resolvable"), "{err}");
         assert!(err.contains("wrong-value"), "{err}");
@@ -244,7 +283,7 @@ mod tests {
             vec!["http://127.0.0.1:1".to_string()],
             Duration::from_millis(50),
             Duration::from_millis(10),
-        );
+        ).without_initial_delay();
         let err = waiter.wait_for("_acme-challenge.example.test", "whatever").await.unwrap_err();
         assert!(err.contains("did not become publicly resolvable"), "{err}");
     }
@@ -266,9 +305,22 @@ mod tests {
             vec![stale, fresh],
             Duration::from_secs(5),
             Duration::from_millis(10),
-        );
+        ).without_initial_delay();
         waiter.wait_for("_acme-challenge.example.test", "v1").await.unwrap();
         assert_eq!(stale_calls.load(Ordering::SeqCst), 1, "queried the stale resolver too, just didn't wait on it");
+    }
+
+    #[test]
+    fn the_default_waiter_delays_before_its_first_lookup() {
+        // Regression guard for the actual #229 root cause: an eager first
+        // lookup caches an NXDOMAIN for the zone's SOA minimum (3600s on
+        // deSEC, which rejects any lower TTL), which then outlives the whole
+        // timeout budget. The delay must be non-zero on the real constructor,
+        // and must not be silently folded into the polling deadline.
+        let waiter = PropagationWaiter::new(vec!["https://example.test/dns-query".into()], DEFAULT_TIMEOUT);
+        assert_eq!(waiter.initial_delay, DEFAULT_INITIAL_DELAY);
+        assert!(!waiter.initial_delay.is_zero(), "a zero pre-check delay reintroduces the self-poisoning bug");
+        assert_eq!(waiter.timeout, DEFAULT_TIMEOUT, "the delay is extra headroom, not taken out of the poll budget");
     }
 
     #[derive(Clone, Default)]
