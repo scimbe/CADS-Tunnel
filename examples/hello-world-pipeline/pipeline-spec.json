@@ -1,0 +1,6 @@
+{
+  "id": "hello-world",
+  "roles": [
+    { "service": "TextGeneration", "units": 1, "tag": "hello" }
+  ]
+}

@@ -2316,8 +2316,10 @@ const LANDING_HTML: &str = r#"<!doctype html>
 <div class="top">
  <h1>CADS-Tunnel — operator status</h1>
  <div style="display:flex;gap:.6rem;flex-wrap:wrap">
+  <a class="btn" href="/publish">&#128293; Publish your service &rarr;</a>
   <a class="btn" href="/llms.txt">&#129302; For AI agents &mdash; onboarding &rarr;</a>
   <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
+  <a class="btn secondary" href="https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1" target="_blank" rel="noopener">&#128153; Support this project &rarr;</a>
  </div>
 </div>
 <div id="health" class="l">loading…</div>
@@ -2406,14 +2408,22 @@ const DATENSCHUTZ_HTML: &str = include_str!("../../../docs/legal/datenschutz.htm
 /// the operator against third-party claims arising from) their own service run through the platform.
 const NUTZUNGSBEDINGUNGEN_HTML: &str = include_str!("../../../docs/legal/nutzungsbedingungen.html");
 
+/// The human "publish your service" onboarding page: register → download the hello-world starter
+/// template → an example Claude Code prompt to adapt it → the subdomain-assignment policy — plus the
+/// closing "what is Bunsenbrenner" explanation. Distinct from `/llms.txt` (the AI-agent-facing,
+/// machine-readable onboarding doc) — this is the human-facing entry point linked from the landing
+/// page, for a customer bringing their own hardware/idea rather than an autonomous agent reading docs.
+const PUBLISH_HTML: &str = include_str!("../../../docs/landing/publish.html");
+
 /// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`]; `GET /llms.txt` serves the
 /// AI-agent onboarding doc (#174) as plain text so a CLI agent can `curl` it and a browser renders it.
-/// `/impressum`, `/datenschutz`, `/nutzungsbedingungen` serve the legal pages linked from the
-/// landing page's footer.
+/// `/publish` is the human-facing "get started" onboarding page. `/impressum`, `/datenschutz`,
+/// `/nutzungsbedingungen` serve the legal pages linked from the landing page's footer.
 pub fn landing_router() -> Router {
     Router::new()
         .route("/", get(landing_handler))
         .route("/llms.txt", get(llms_txt_handler))
+        .route("/publish", get(|| async { axum::response::Html(PUBLISH_HTML) }))
         .route("/impressum", get(|| async { axum::response::Html(IMPRESSUM_HTML) }))
         .route("/datenschutz", get(|| async { axum::response::Html(DATENSCHUTZ_HTML) }))
         .route(
@@ -5186,9 +5196,11 @@ mod tests {
             html.contains(r#"href="/portal""#),
             "links to the customer portal (#64)"
         );
+        // CSP-safe means no external *asset* (script/style/image) sources -- an outbound <a href>
+        // link (e.g. the support/membership page below) is plain navigation, not a CSP concern.
         assert!(
-            !html.contains("http://") && !html.contains("https://") && !html.contains("//cdn"),
-            "no external assets (CSP-safe)"
+            !html.contains("src=\"http") && !html.contains("<link") && !html.contains("//cdn"),
+            "no externally-sourced scripts/styles/images (CSP-safe)"
         );
         // #194: fail closed — with no CT_CP_EDGE_ADMIN_TOKEN set (unset in the test env → admin_token
         // = None), the unauthenticated client-supplied-account billing writer must NOT be served;
@@ -5207,6 +5219,11 @@ mod tests {
         // #174: the operator status page links AI agents to the onboarding entry point, and that
         // entry point is served live at /llms.txt (the doc as plain text a CLI agent can curl).
         assert!(html.contains(r#"href="/llms.txt""#), "links AI agents to the onboarding doc (#174)");
+        assert!(html.contains(r#"href="/publish""#), "links human makers to the publish onboarding page");
+        assert!(
+            html.contains("https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1"),
+            "links to the project's support/membership page"
+        );
         let app2 = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
@@ -5240,6 +5257,18 @@ mod tests {
             ("/impressum", vec!["Martin Becke", "Mettinger", "Neuenkirchen", "§ 19 UStG"]),
             ("/datenschutz", vec!["DSGVO", "TTDSG", "Cookies"]),
             ("/nutzungsbedingungen", vec!["Freistellung", "Nutzerdienst", "§§ 7", "TMG"]),
+            (
+                "/publish",
+                vec![
+                    "Register",
+                    "hello-world-pipeline",
+                    "Claude Code",
+                    "Standard",
+                    "subdomain",
+                    "Bunsenbrenner",
+                    "not protection",
+                ],
+            ),
         ] {
             let app = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
             let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
