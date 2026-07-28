@@ -193,14 +193,21 @@ checkout with `docker/deploy/.env` present:
 ./scripts/authorize-pipeline.sh <hostname> [tenant]
 # e.g.:
 ./scripts/authorize-pipeline.sh cookbook.bunsenbrenner.org cookbook-demo
+./scripts/authorize-pipeline.sh <hostname> [tenant] --staging     # LE staging cert, testing only
+./scripts/authorize-pipeline.sh <hostname> [tenant] --skip-cert   # host-auth + token only, no cert
 ```
 
 It authorizes `<hostname>` at the edge (via the public, admin-gated `POST
-/registry/authorize-host/:token/:host`, #214 — no loopback access needed) and,
-if `[tenant]` is given, mints a single-use join token too. It prints a
-`CT_AGENT_TOKEN` (the routing token) and, if minted, the join token response —
-**relay both to the pipeline maintainer out of band**, never to GitHub. They
-onboard with:
+/registry/authorize-host/:token/:host`, #214 — no loopback access needed),
+**issues a real Let's Encrypt cert for that single hostname** (DNS-01 via the
+operator's own `DESEC_TOKEN`, run HERE — the pipeline never sees or holds it,
+#219/#221) into `CERT_DIR` (default `~/ct-pipeline-certs/<hostname>/`), and, if
+`[tenant]` is given, mints a single-use join token too. It prints the
+`CT_AGENT_TOKEN` (routing token), the cert file paths, and, if minted, the join
+token response — **relay all of it to the pipeline maintainer out of band**,
+never to GitHub. They point their origin's Caddyfile at the delivered
+`fullchain.pem`/`privkey.pem` as static files (no ACME client, no DNS plugin,
+no `DESEC_TOKEN` in their repo, ever), then onboard with:
 
 ```bash
 CT_AGENT_HOSTNAME=<hostname> CT_AGENT_TOKEN=<routing token> \
@@ -216,6 +223,13 @@ Confirm it worked from anywhere: `curl -I https://<hostname>/` should return
 `200` with a real (non-staging) Let's Encrypt cert — `openssl s_client -connect
 <hostname>:443 -servername <hostname> </dev/null 2>/dev/null | openssl x509
 -noout -issuer` should **not** say `STAGING`.
+
+Before telling the pipeline maintainer their compose file is ready, run
+`./scripts/verify-tunnel-only.sh <their-compose-file>` against it — it exits
+non-zero and lists every offending line if their origin/bridge publishes a
+host port instead of using `expose:` (#219), the same invariant the cert
+hand-off above depends on (the browser must reach the origin only through the
+tunnel, never directly).
 
 ### Rotate the edge certificate
 Restart the edge. It mints a fresh CA leaf under its internal CA on startup;

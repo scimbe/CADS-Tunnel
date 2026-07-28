@@ -35,7 +35,7 @@ A Rust Cargo workspace of six crates. Five form the tunnel and depend only on
 
 ## Documentation
 
-Four entry points, depending on what you need:
+Five entry points, depending on what you need:
 
 **1. The source base** — how the code is organized
 [**→ Codebase overview**](docs/architecture.md): the six crates, the data path,
@@ -43,11 +43,19 @@ the control path, and where each piece lives.
 
 **2. Using it** — easy install notes and scripts
 [**→ Install & use**](docs/install.md): clone, hermetic build/test, self-host or
-Kubernetes deploy, one-command agent onboarding, and the helper scripts. Plus the
+Kubernetes deploy, one-command agent onboarding, headless-pipeline
+authorization, and the helper scripts. Plus the
 [onboarding quickstart](docs/onboarding/quickstart.md) and the
 [operations runbook](docs/ops/runbook.md).
 
-**3. Deep detail** — the reasoning and specification
+**3. For AI agents** — bring yourself up, no human required beyond one OIDC step
+[**→ Agent onboarding**](docs/agent-onboarding.md): register as a discoverable
+agent, join a workflow pipeline's channels and serve a role, publish your own
+pipeline, and publish a browser-reachable site — every step a shell command or
+plain HTTP call. See also
+[self-service channel provisioning](docs/ops/self-service-channel-provisioning.md).
+
+**4. Deep detail** — the reasoning and specification
 The 20 [Architecture Decision Records](docs/adr/), the [specification](docs/SPEC.md),
 and the security set: [whitepaper](docs/security/whitepaper.md) ·
 [threat model](docs/security/threat-model.md) ·
@@ -56,7 +64,7 @@ and the security set: [whitepaper](docs/security/whitepaper.md) ·
 [payment integration](docs/payment/integration.md) ·
 [product positioning](docs/product/positioning.md).
 
-**4. The bachelor thesis (draft)** — the academic write-up
+**5. The bachelor thesis (draft)** — the academic write-up
 [**→ thesis PDF**](docs/thesis/thesis.pdf) (German, HAW template); LaTeX sources
 under [`docs/thesis/`](docs/thesis/).
 

@@ -102,10 +102,30 @@ CT_AGENT_ORIGIN="127.0.0.1:8080" \
 
 Full walkthrough: [onboarding quickstart](onboarding/quickstart.md).
 
+## 5. Onboard a headless workflow pipeline
+
+A pipeline agent with no portal/Keycloak account (e.g. a demo maintainer's own
+host) can't self-serve host authorization — `scripts/authorize-pipeline.sh
+<hostname> [tenant]` does it from the operator side: authorizes the hostname at
+the edge, issues it a real Let's Encrypt cert (the pipeline never holds
+`DESEC_TOKEN` — that stays on the operator's host, #219/#221), and optionally
+mints a join token. Full walkthrough, including the self-service Agent-Fabric
+**channel** provisioning an agent needs to join a pipeline's roles (no
+per-pipeline core changes required, #214): [runbook §Authorize a new pipeline
+hostname](ops/runbook.md#authorize-a-new-pipeline-hostname-headless-agents-214)
+and [docs/ops/self-service-channel-provisioning.md](ops/self-service-channel-provisioning.md).
+For an AI agent bringing itself up end-to-end (register, join a pipeline,
+publish its own pipeline, serve a browser-reachable site), see
+[docs/agent-onboarding.md](agent-onboarding.md) — every command there is a
+plain shell command or HTTP call, no human required beyond the one OIDC-account
+step.
+
 ## Helper scripts
 
 | Script | What it does |
 |--------|--------------|
+| `scripts/verify-tunnel-only.sh` | guard that a pipeline's compose file never publishes a host port that bypasses the tunnel (#219) |
+| `scripts/authorize-pipeline.sh` | authorize a headless pipeline's hostname + issue its cert (see §5 above) |
 | `scripts/security-audit.sh` | `cargo audit` against the pinned `Cargo.lock` in a container |
 | `scripts/check-no-secrets.sh` | guard that no credential material is committed |
 | `scripts/sweep.sh` | run the latency benchmark matrix (edge netem × modes) |
