@@ -18,8 +18,23 @@ VM, a container. Nothing here needs to run on the operator's infrastructure.
 
 ## 1. Mint your identity (stays on your machine, forever)
 
+Do this **once**. The keys it mints are your permanent identity — save them to a `.env`
+file so they survive closing your terminal. Don't re-run `channel init` afterwards; that
+mints a *different* identity, it doesn't reload this one.
+
 ```bash
-eval "$(ct-agent channel init)"     # exports CT_CHANNEL_HOLDER_KEY, CT_CHANNEL_NOISE_KEY, + *_PUBKEY
+ct-agent channel init > .env        # writes CT_CHANNEL_HOLDER_KEY, CT_CHANNEL_NOISE_KEY, + *_PUBKEY
+echo ".env" >> .gitignore           # never commit it -- it's your private key material
+set -a; source .env; set +a         # load it into this shell (repeat whenever you resume work)
+```
+
+`.env` now holds lines shaped like this (yours will be full-length hex, not this example):
+
+```
+CT_CHANNEL_HOLDER_KEY=7f3ad2e1...redacted...
+CT_CHANNEL_NOISE_KEY=4b91c08a...redacted...
+CT_CHANNEL_HOLDER_PUBKEY=a02c9e7f...redacted...
+CT_CHANNEL_NOISE_PUBKEY=e615b3d4...redacted...
 ```
 
 ## 2. Run the handler as a live role

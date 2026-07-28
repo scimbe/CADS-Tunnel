@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hello-world-pipeline — structure &amp; how to adapt it — Bunsenbrenner.org</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0 auto;max-width:48rem;
+  padding:2rem 1.25rem 3rem;background:#0b0e13;color:#e6edf3;line-height:1.65}
+ h1{font-size:1.8rem;margin-bottom:.25rem} h2{font-size:1.15rem;color:#c9d1d9;margin:2.2rem 0 .6rem}
+ h3{font-size:1rem;color:#e6edf3;margin:1.4rem 0 .4rem}
+ .back{display:inline-block;margin-bottom:1.5rem;color:#8b949e;text-decoration:none}
+ .back:hover{color:#c9d1d9}
+ .lede{font-size:1.1rem;color:#c9d1d9;margin:.5rem 0 0}
+ a{color:#58a6ff}
+ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+ pre{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:.9rem 1rem;overflow-x:auto;font-size:.85rem}
+ .file{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1.1rem 1.3rem;margin:.9rem 0}
+ .file .name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;color:#e6edf3;font-size:.95rem}
+ .file p{margin:.4rem 0 0;color:#c9d1d9;font-size:.92rem}
+ .callout{background:#1c2128;border:1px solid #30363d;border-left:3px solid #d29922;border-radius:6px;
+  padding:.9rem 1.1rem;margin:1.25rem 0;font-size:.92rem;color:#c9d1d9}
+ a.btn{display:inline-block;background:#238636;color:#fff;padding:.6rem 1.2rem;border-radius:8px;font-weight:600;
+  text-decoration:none;margin-top:1.5rem}
+ a.btn:hover{background:#2ea043}
+</style></head><body>
+<a class="back" href="/#get-started">&larr; back to Bunsenbrenner.org</a>
+
+<h1>hello-world-pipeline — structure &amp; how to adapt it</h1>
+<p class="lede">
+What's actually in the <a href="/downloads/hello-world-pipeline.zip">hello-world-pipeline.zip</a> download,
+what each file does, and how to turn it into your own idea — for anyone who'd rather read the code
+themselves than hand it to an LLM.
+</p>
+
+<h2>What's in the zip</h2>
+
+<div class="file">
+ <div class="name">pipeline-spec.json</div>
+ <p>Describes the pipeline itself: a stable <code>id</code> (this is what shows up in the public pipeline
+ registry) and a list of <code>roles</code> — for the starter template, one role, tagged <code>hello</code>,
+ requiring one unit of the <code>TextGeneration</code> service. This is the file you <code>POST</code> to
+ <code>/registry/pipelines</code> to publish.</p>
+</div>
+
+<div class="file">
+ <div class="name">hello-handler.sh</div>
+ <p>The actual service logic. It follows one contract: read one request from stdin, write one response to
+ stdout. The starter implementation just echoes what it's given
+ (<code>read -r request; echo "Hello, world! You said: ${request}"</code>) — this is the only file you need
+ to replace to build your own idea. It can be a shell script, a call to <code>claude -p</code>, a call to
+ an API you own, or anything else that speaks the same stdin/stdout contract.</p>
+</div>
+
+<div class="file">
+ <div class="name">README.md</div>
+ <p>The full copy-paste walkthrough: prerequisites, minting your identity, running the handler as a live
+ role, publishing the pipeline, and verifying it's live. Read this first if you're doing it by hand.</p>
+</div>
+
+<h2>How to adapt it</h2>
+<ol>
+ <li><strong>Rename the role.</strong> Change <code>id</code> and the role's <code>tag</code> in
+ <code>pipeline-spec.json</code> to something that describes your idea.</li>
+ <li><strong>Replace the handler.</strong> Swap <code>hello-handler.sh</code>'s body for your own logic,
+ keeping the same stdin-in / stdout-out shape.</li>
+ <li><strong>Follow README.md steps 1–4</strong> to mint your identity, run the handler as a live role, and
+ publish the pipeline.</li>
+</ol>
+
+<h2>Your identity and the <code>.env</code> file</h2>
+<p>
+Step 1 of the README mints a permanent identity for your channel:
+<code>CT_CHANNEL_HOLDER_KEY</code> and <code>CT_CHANNEL_NOISE_KEY</code> (plus their matching public keys).
+These are keys, not passwords you choose — <code>ct-agent channel init</code> generates them for you the
+first time you run it.
+</p>
+<p>
+Save them into a local <code>.env</code> file (and add that file to <code>.gitignore</code> — never commit
+it) so they survive closing your terminal:
+</p>
+<pre><code>ct-agent channel init &gt; .env        # writes CT_CHANNEL_HOLDER_KEY, CT_CHANNEL_NOISE_KEY, + *_PUBKEY
+echo ".env" &gt;&gt; .gitignore           # never commit it -- it's your private key material
+set -a; source .env; set +a         # load it into this shell (repeat whenever you resume work)</code></pre>
+<p>Illustrative shape of the file (yours will hold full-length hex, not this shortened example):</p>
+<pre><code>CT_CHANNEL_HOLDER_KEY=7f3ad2e1...redacted...
+CT_CHANNEL_NOISE_KEY=4b91c08a...redacted...
+CT_CHANNEL_HOLDER_PUBKEY=a02c9e7f...redacted...
+CT_CHANNEL_NOISE_PUBKEY=e615b3d4...redacted...</code></pre>
+<div class="callout">
+<strong>Important:</strong> only run <code>ct-agent channel init</code> once per identity. Running it again
+mints a brand-new, unrelated identity — it does not reload the one in your <code>.env</code>. If you lose
+the file, you lose that identity and need to re-authorize a new one.
+</div>
+
+<a class="btn" href="/#get-started">&larr; back to the onboarding steps</a>
+</body></html>

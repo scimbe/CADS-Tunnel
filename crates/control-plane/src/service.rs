@@ -2302,8 +2302,8 @@ const LANDING_HTML: &str = r#"<!doctype html>
 
  .hero{position:relative;overflow:hidden;padding:2.2rem 1.5rem 3.5rem;
   background:
-   radial-gradient(ellipse 70% 55% at 15% -15%, rgba(88,166,255,.16), transparent 60%),
-   radial-gradient(ellipse 55% 45% at 95% -10%, rgba(63,185,80,.14), transparent 60%),
+   radial-gradient(ellipse 70% 55% at 15% -15%, rgba(255,166,87,.16), transparent 60%),
+   radial-gradient(ellipse 55% 45% at 95% -10%, rgba(248,81,73,.14), transparent 60%),
    var(--bg);
   border-bottom:1px solid var(--border)}
  .hero-inner{max-width:66rem;margin:0 auto}
@@ -2312,12 +2312,13 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .brand .tld{color:var(--muted);font-weight:600}
  .hero-nav{display:flex;gap:.6rem;flex-wrap:wrap}
 
- h1{font-size:clamp(2.1rem,5.5vw,3.4rem);line-height:1.08;letter-spacing:-.02em;margin:0 0 1rem;font-weight:800;
-  background:linear-gradient(100deg,#f0f6fc 10%,#79c0ff 55%,#56d364 100%);
+ .hero-content{max-width:46rem;margin:0 auto;text-align:center;display:flex;flex-direction:column;align-items:center}
+ h1{font-size:clamp(2.1rem,5.5vw,3.4rem);line-height:1.15;letter-spacing:-.02em;margin:0 0 1.1rem;font-weight:800;
+  background:linear-gradient(100deg,#fff4e6 5%,#ffa657 50%,#f85149 100%);
   -webkit-background-clip:text;background-clip:text;color:transparent}
- .lede{font-size:1.2rem;color:var(--muted2);max-width:42rem;margin:0 0 1.4rem}
+ .lede{font-size:1.2rem;color:var(--muted2);max-width:38rem;margin:0 0 1.4rem}
 
- .badges{display:flex;gap:.6rem;flex-wrap:wrap;margin:0 0 2.6rem}
+ .badges{display:flex;gap:.6rem;flex-wrap:wrap;justify-content:center;margin:0 0 2.6rem}
  .badge{display:inline-flex;align-items:center;gap:.45rem;background:rgba(22,27,34,.7);border:1px solid var(--border);
   border-radius:999px;padding:.4rem 1rem;font-size:.82rem;color:var(--muted2);backdrop-filter:blur(6px)}
 
@@ -2332,7 +2333,16 @@ const LANDING_HTML: &str = r#"<!doctype html>
  a.btn.support:hover{box-shadow:0 4px 18px rgba(137,87,229,.4)}
  a.btn.big{padding:.85rem 1.7rem;font-size:1.05rem}
 
- .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1.2rem;margin:0 0 2.2rem}
+ .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1.2rem;margin:0 0 2.2rem;
+  align-items:start;text-align:left}
+ .option{margin:0 0 1.1rem}
+ .option:last-child{margin-bottom:0}
+ .option h4{margin:0 0 .35rem;font-size:.95rem;color:var(--text)}
+ .option-link{display:inline-block;margin-top:.6rem;font-size:.85rem;text-decoration:none}
+ .option-link:hover{text-decoration:underline}
+ .option-divider{display:flex;align-items:center;gap:.7rem;color:var(--muted);font-size:.76rem;
+  text-transform:uppercase;letter-spacing:.05em;margin:1rem 0}
+ .option-divider::before,.option-divider::after{content:"";flex:1;height:1px;background:var(--border)}
  .step{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:14px;
   padding:1.5rem 1.4rem 1.4rem;position:relative;transition:border-color .15s ease,transform .15s ease,box-shadow .15s ease}
  .step:hover{border-color:var(--border2);transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.35)}
@@ -2342,15 +2352,18 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .step h3{margin:.7rem 0 .5rem;font-size:1.08rem;letter-spacing:-.01em}
  .step p{color:var(--muted2);font-size:.92rem;margin:0 0 .9rem}
 
- .code-block{position:relative;margin-top:.5rem}
- pre{background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:1rem 1.1rem;overflow-x:auto;
+ .code-block{margin-top:.7rem;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#0d1117}
+ .code-block-head{display:flex;justify-content:space-between;align-items:center;background:#161b22;
+  padding:.5rem .5rem .5rem .9rem;border-bottom:1px solid var(--border)}
+ .code-block-head span{font-size:.76rem;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+ pre{background:transparent;border:none;border-radius:0;padding:1rem 1.1rem;overflow-x:auto;
   font-size:.8rem;margin:0;max-height:16rem}
- .copy-btn{position:absolute;top:.55rem;right:.55rem;background:#21262d;border:1px solid var(--border);color:var(--text);
+ .copy-btn{background:#21262d;border:1px solid var(--border);color:var(--text);flex-shrink:0;
   border-radius:7px;padding:.35rem .7rem;font-size:.78rem;font-weight:600;cursor:pointer;transition:background .15s ease}
  .copy-btn:hover{background:#30363d}
 
  .callout{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--link);border-radius:10px;
-  padding:1.1rem 1.3rem;font-size:.92rem;color:var(--muted2);max-width:58rem}
+  padding:1.1rem 1.3rem;font-size:.92rem;color:var(--muted2)}
  .callout a{color:var(--link)}
 
  main{max-width:66rem;margin:0 auto;padding:3rem 1.5rem 2rem}
@@ -2413,16 +2426,18 @@ const LANDING_HTML: &str = r#"<!doctype html>
    </div>
   </div>
 
-  <h1>Create at home.<br>Publish world wide.</h1>
-  <p class="lede">
-   Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
-   own AI agent — and make it reachable at a real, encrypted HTTPS address. No open ports. No public IP.
-   Nobody, including us, sees the payload.
-  </p>
-  <div class="badges">
-   <span class="badge">&#128274; Zero-knowledge transport</span>
-   <span class="badge">&#127760; No public IP needed</span>
-   <span class="badge">&#9889; First success in minutes</span>
+  <div class="hero-content">
+   <h1>Create at home.<br>Publish world wide.</h1>
+   <p class="lede">
+    Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
+    own AI agent — and make it reachable at a real, encrypted HTTPS address. No open ports. No public IP.
+    Nobody, including us, sees the payload.
+   </p>
+   <div class="badges">
+    <span class="badge">&#128274; Zero-knowledge transport</span>
+    <span class="badge">&#127760; No public IP needed</span>
+    <span class="badge">&#9889; First success in minutes</span>
+   </div>
   </div>
 
   <div class="steps" id="get-started">
@@ -2436,41 +2451,52 @@ const LANDING_HTML: &str = r#"<!doctype html>
 
    <div class="step">
     <div class="step-n">2</div>
-    <h3>Download the starter template</h3>
+    <h3>Get your template</h3>
     <p>A minimal, working "hello world" workflow pipeline — one role, one handler script that echoes
-    your input back. Proves the whole loop before you swap in your own idea. One click, no git needed.</p>
-    <a class="btn" href="/downloads/hello-world-pipeline.zip" download>&#11015; hello-world-pipeline.zip</a>
-   </div>
+    your input back. Proves the whole loop before you swap in your own idea. Pick whichever path fits
+    how you work:</p>
 
-   <div class="step">
-    <div class="step-n">3</div>
-    <h3>Let Claude Code build it with you</h3>
-    <p>Unzip the template, then paste this into
-    <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any coding
-    agent) — it reads the docs, wires up your identity, and adapts the template to your idea:</p>
-    <div class="code-block">
-     <button class="copy-btn" onclick="copyCode(this)" type="button">&#128203; Copy</button>
-     <pre><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+    <div class="option">
+     <h4>Download it and build it your way</h4>
+     <p>One click, no git needed. Read through the code yourself and wire it up at your own pace.</p>
+     <a class="btn" href="/downloads/hello-world-pipeline.zip" download>&#11015; hello-world-pipeline.zip</a>
+     <a class="option-link" href="/template-guide">See how it's structured &amp; how to adapt it &rarr;</a>
+    </div>
 
-I downloaded and unzipped the starter template from
-https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
+    <div class="option-divider">or</div>
 
-1. Read the template's README.md (and https://bunsenbrenner.org/llms.txt for the
+    <div class="option">
+     <h4>Hand it to your LLM</h4>
+     <p>Paste this into
+     <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any
+     coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
+     itself. Nothing to unzip by hand.</p>
+     <div class="code-block">
+      <div class="code-block-head"><span>prompt.txt</span><button class="copy-btn" onclick="copyCode(this)" type="button">&#128203; Copy</button></div>
+      <pre><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+
+1. Download and unpack the starter template:
+   curl -LO https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
+   unzip hello-world-pipeline.zip && cd hello-world-pipeline
+2. Read the template's README.md (and https://bunsenbrenner.org/llms.txt for the
    full AI-agent onboarding doc).
-2. Build ct-agent (there's a Docker one-liner in docs/install.md — I don't have a
+3. Build ct-agent (there's a Docker one-liner in docs/install.md — I don't have a
    Rust toolchain installed).
-3. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
+4. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
    want your service to do here&gt;. It's currently running on: &lt;your PC /
    Raspberry Pi / container / agent&gt;.
-4. Walk me through minting my channel identity, running the handler as a live
-   role, and publishing my pipeline.
+5. Mint my channel identity with `ct-agent channel init` and save it into a local
+   .env file so it survives a restart -- never re-run channel init afterwards,
+   that mints a different identity instead of reusing this one.
+6. Walk me through running the handler as a live role and publishing my pipeline.
 
 I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></pre>
+     </div>
     </div>
    </div>
 
    <div class="step">
-    <div class="step-n">4</div>
+    <div class="step-n">3</div>
     <h3>Your subdomain</h3>
     <p>In the <strong>Standard</strong> tier you don't pick your own subdomain — it's assigned
     automatically from your project id and your account's unique user id (e.g.
@@ -2485,12 +2511,23 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
    runs on it. We provide secure (end-to-end encrypted) transport <em>to</em> your exposed service —
    not protection <em>of</em> the device it runs on. Keeping your own machine and code secure —
    including not introducing exploitable weaknesses through how you implement it — is your responsibility; see
-   <a href="/nutzungsbedingungen">Nutzungsbedingungen</a> §3–§5.
+   <a href="/nutzungsbedingungen">Nutzungsbedingungen</a> §3–§5. We recommend running your service in an
+   isolated, containerized environment (Docker, a VM, or a Kubernetes pod) rather than directly on your
+   host — that way a bug in your own code can't reach past the sandbox onto the rest of your machine.
   </div>
  </div>
 </header>
 
 <main>
+
+ <div class="section support">
+  <p><strong>Keep the lab running.</strong> Bunsenbrenner is free to use and runs on donated time and
+  server costs. If it helped you get something live, a small contribution keeps it going.</p>
+  <div class="actions">
+   <a class="btn support" href="https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413" target="_blank" rel="noopener">&#128153; Support as a member &rarr;</a>
+   <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
+  </div>
+ </div>
 
  <div class="features">
   <div class="feature"><div class="icon">&#128274;</div><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
@@ -2598,7 +2635,7 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
   }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
  }
  function copyCode(btn){
-  const block = btn.parentElement.querySelector('code');
+  const block = btn.closest('.code-block').querySelector('code');
   const text = block ? block.textContent : '';
   const done = () => { const orig = btn.innerHTML; btn.innerHTML = '&#9989; Copied'; setTimeout(()=>{ btn.innerHTML = orig; }, 1600); };
   if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done).catch(()=>{}); }
@@ -2646,13 +2683,19 @@ const NUTZUNGSBEDINGUNGEN_HTML: &str = include_str!("../../../docs/legal/nutzung
 const HELLO_WORLD_ZIP: &[u8] =
     include_bytes!("../../../examples/hello-world-pipeline/hello-world-pipeline.zip");
 
+/// A read-it-yourself guide to the hello-world-pipeline template: what each of the three files in the
+/// zip does, how to adapt it into your own idea, and how to persist the identity `ct-agent channel
+/// init` mints (the `.env` file, why it must never be re-minted) -- for the "download and build it
+/// your way" path on the landing page, as opposed to the "hand it to your LLM" path.
+const TEMPLATE_GUIDE_HTML: &str = include_str!("../../../docs/landing/template-guide.html");
+
 /// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`], which now also carries the
-/// full human "get started" onboarding (register → download → Claude Code prompt → subdomain policy)
-/// inline rather than on a separate `/publish` subpage. `/publish` redirects to `/#get-started` for
-/// anyone with an old link. `GET /llms.txt` serves the AI-agent onboarding doc (#174) as plain text so
-/// a CLI agent can `curl` it. `/downloads/hello-world-pipeline.zip` serves the starter template as a
-/// real download (no `git clone` required). `/impressum`, `/datenschutz`, `/nutzungsbedingungen` serve
-/// the legal pages linked from the footer.
+/// full human "get started" onboarding (register → get the template → subdomain policy) inline rather
+/// than on a separate `/publish` subpage. `/publish` redirects to `/#get-started` for anyone with an
+/// old link. `GET /llms.txt` serves the AI-agent onboarding doc (#174) as plain text so a CLI agent can
+/// `curl` it. `/downloads/hello-world-pipeline.zip` serves the starter template as a real download (no
+/// `git clone` required); `/template-guide` explains its structure for the "build it yourself" path.
+/// `/impressum`, `/datenschutz`, `/nutzungsbedingungen` serve the legal pages linked from the footer.
 pub fn landing_router() -> Router {
     Router::new()
         .route("/", get(landing_handler))
@@ -2675,6 +2718,10 @@ pub fn landing_router() -> Router {
                     HELLO_WORLD_ZIP,
                 )
             }),
+        )
+        .route(
+            "/template-guide",
+            get(|| async { axum::response::Html(TEMPLATE_GUIDE_HTML) }),
         )
         .route("/impressum", get(|| async { axum::response::Html(IMPRESSUM_HTML) }))
         .route("/datenschutz", get(|| async { axum::response::Html(DATENSCHUTZ_HTML) }))
@@ -5487,6 +5534,15 @@ mod tests {
             "offers a one-click template download (no git required)"
         );
         assert!(html.contains("copyCode"), "the Claude Code prompt has a copy-to-clipboard button");
+        // The "get your template" step offers both a self-serve download+guide path and a
+        // self-fetching LLM-prompt path, and the prompt tells the LLM to persist the minted
+        // identity into a .env file rather than just holding it in the current shell.
+        assert!(html.contains(r#"href="/template-guide""#), "links to the read-it-yourself template guide");
+        assert!(html.contains(".env"), "the LLM prompt is told to persist the identity into a .env file");
+        assert!(
+            html.contains("containerized") || html.contains("Kubernetes pod"),
+            "the security callout recommends running the user's service in an isolated sandbox"
+        );
         assert!(
             html.contains("https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413"),
             "links to the project's support/membership page"
@@ -5526,6 +5582,19 @@ mod tests {
         );
         let zip_bytes = to_bytes(resp_zip.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&zip_bytes[..2], b"PK", "serves a real zip archive (PK magic bytes)");
+        // The read-it-yourself template guide actually serves (not a dead link).
+        let app_guide = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp_guide = app_guide
+            .oneshot(Request::get("/template-guide").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp_guide.status(), StatusCode::OK);
+        let guide_html =
+            String::from_utf8_lossy(&to_bytes(resp_guide.into_body(), usize::MAX).await.unwrap()).to_string();
+        assert!(
+            guide_html.contains("pipeline-spec.json") && guide_html.contains(".env"),
+            "the template guide explains the file structure and the .env identity file"
+        );
         let app2 = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
