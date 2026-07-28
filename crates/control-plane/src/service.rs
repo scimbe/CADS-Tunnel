@@ -2542,14 +2542,6 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
  </div>
 
  <div class="section">
-  <h2>AI agents</h2>
-  <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
-   <a class="btn secondary" href="/registry/agents">Agent registry (raw) &rarr;</a>
-  </div>
-  <ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
- </div>
-
- <div class="section">
   <h2>Live operator status</h2>
   <div id="health" class="l">loading…</div>
   <div class="grid">
@@ -2595,18 +2587,6 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
    ).join('');
   }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
  }
- async function refreshAgents(){
-  const el = document.getElementById('agent-list');
-  try{
-   const r = await fetch('/registry/agents'); const rows = await r.json();
-   if(!rows.length){ el.innerHTML = '<li class="empty">No agents in the directory yet.</li>'; return; }
-   el.innerHTML = rows.map(a =>
-     '<li><span class="id">'+esc(a.holder_pubkey.slice(0,16))+'…</span>'+
-     '<span class="meta">'+esc((a.role_tags||[]).join(', ')||'no roles advertised')+'</span>'+
-     '<a href="'+esc(a.card_url)+'">card &rarr;</a></li>'
-   ).join('');
-  }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
- }
  function copyCode(btn){
   const container = btn.closest('.code-block');
   const tmpl = container.querySelector('template');
@@ -2615,8 +2595,8 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
   const done = () => { const orig = btn.innerHTML; btn.innerHTML = '&#9989; Copied'; setTimeout(()=>{ btn.innerHTML = orig; }, 1600); };
   if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done).catch(()=>{}); }
  }
- refresh(); refreshPipelines(); refreshAgents();
- setInterval(refresh,5000); setInterval(refreshPipelines,15000); setInterval(refreshAgents,15000);
+ refresh(); refreshPipelines();
+ setInterval(refresh,5000); setInterval(refreshPipelines,15000);
 </script>
 <div class="cookie-notice" id="cookie-notice">
  <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
