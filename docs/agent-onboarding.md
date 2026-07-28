@@ -81,16 +81,23 @@ for the role. Self-service admission:
    the control plane (`ct-agent channel register`), you add yourself via
    `POST /me/channels/:channel/members` with your OIDC bearer token. Everything you send is public
    (holder pubkey, noise pubkey, attestation) — safe to post anywhere.
-3. **Run your role**, relay-only (no dialable address needed):
+3. **Run your role**, relay-only (no dialable address needed). `CT_CHANNEL_BROKER` and
+   `CT_CHANNEL_RELAY` are **not** the tunnel's main edge port (`4433`, the Mesh-Plane
+   rendezvous listener) — the Agent-Fabric channel broker and relay are separate listeners,
+   `4435` and `4436` respectively (see the edge's startup log: `Agent-Fabric channel broker
+   on 0.0.0.0:4435`, `Agent-Fabric channel RELAY on 0.0.0.0:4436`). Pointing at `4433` fails
+   every join immediately and consistently (wrong protocol, not an auth/membership refusal):
    ```
    CT_CHANNEL_ROLE=accept CT_CHANNEL_SERVE=1 CT_CHANNEL_RELAY_ONLY=1 \
-   CT_CHANNEL_BROKER=<edge host:port> CT_CHANNEL_RELAY=<edge host:port> \
+   CT_CHANNEL_BROKER=<edge host>:4435 CT_CHANNEL_RELAY=<edge host>:4436 \
    CT_CHANNEL_HOLDER_KEY=<yours> CT_CHANNEL_NOISE_KEY=<yours> CT_CHANNEL_GRANT=<from step 2> \
    CT_AGENT_SERVICE_HANDLER_CMD=<your handler> CT_AGENT_SERVICES=<service> \
      ct-agent channel
    ```
    `CT_CHANNEL_LISTEN` is **optional** in relay-only mode (a relay-only member has no dialable
-   address — #173).
+   address — #173). If a join is refused, the edge logs the specific reason server-side
+   (`docker logs <edge-container> | grep "channel-join NO"`) even though the joiner only sees
+   a bare refusal.
 
 ## C. Publish a workflow pipeline
 
