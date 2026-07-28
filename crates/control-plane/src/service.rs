@@ -2309,6 +2309,9 @@ const LANDING_HTML: &str = r#"<!doctype html>
  ul.list .id{font-weight:600} ul.list .meta{color:#8b949e;font-size:.85rem}
  ul.list a{color:#58a6ff;text-decoration:none} ul.list a:hover{text-decoration:underline}
  .empty{color:#8b949e;font-size:.85rem;padding:.5rem 0}
+ .legal-foot{color:#8b949e;font-size:.8rem;margin-top:.5rem}
+ .legal-foot a{color:#8b949e;text-decoration:underline}
+ .legal-foot a:hover{color:#c9d1d9}
 </style></head><body>
 <div class="top">
  <h1>CADS-Tunnel — operator status</h1>
@@ -2321,7 +2324,6 @@ const LANDING_HTML: &str = r#"<!doctype html>
 <div class="grid">
  <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
  <div class="card"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
- <div class="card"><div class="n" id="accounts">–</div><div class="l">accounts</div></div>
  <div class="card"><div class="n" id="pipelines">–</div><div class="l">published pipelines</div></div>
  <div class="card"><div class="n" id="directory">–</div><div class="l">discoverable agents</div></div>
  <div class="card"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
@@ -2340,6 +2342,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
 <ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
 
 <div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
+<div class="legal-foot"><a href="/impressum">Impressum</a> · <a href="/datenschutz">Datenschutzerklärung</a> · <a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
 <script>
  async function refresh(){
   try{
@@ -2347,7 +2350,6 @@ const LANDING_HTML: &str = r#"<!doctype html>
    document.getElementById('health').innerHTML = s.ready ? '<span class="ok">● ready</span>' : '<span class="bad">● not ready</span>';
    document.getElementById('tunnels').textContent=s.tunnels;
    document.getElementById('agents').textContent=s.agents;
-   document.getElementById('accounts').textContent=s.accounts;
    document.getElementById('pipelines').textContent=s.pipelines_published;
    document.getElementById('directory').textContent=s.agents_directory;
    document.getElementById('uptime').textContent=s.uptime_seconds;
@@ -2387,12 +2389,37 @@ const LANDING_HTML: &str = r#"<!doctype html>
 /// discoverable entry point" #174 asked for). Kept in sync at compile time via `include_str!`.
 const LLMS_TXT: &str = include_str!("../../../docs/agent-onboarding.md");
 
+/// Legal notice (Impressum, §5 TMG/DDG) — real, verified operator facts (name, address, contact,
+/// Kleinunternehmer/§19 UStG status), not placeholder text. A fabricated Impressum is itself a legal
+/// defect (worse than none), so this is only ever edited with real, current facts.
+const IMPRESSUM_HTML: &str = include_str!("../../../docs/legal/impressum.html");
+
+/// Privacy notice (Datenschutzerklärung, Art. 13 DSGVO). Documents what this deployment ACTUALLY
+/// processes (checked against the code, not assumed): only two cookies (OIDC CSRF-state + session,
+/// both strictly necessary, no consent required under §25 TTDSG), no analytics/tracking, and the
+/// zero-knowledge-payload architecture (the operator cannot see tunneled content).
+const DATENSCHUTZ_HTML: &str = include_str!("../../../docs/legal/datenschutz.html");
+
+/// Terms of use (Nutzungsbedingungen). §4/§5 establish the platform-liability boundary: the operator
+/// provides infrastructure only (§§7-10 TMG/DDG host-provider privilege) and does not adopt users'
+/// own workflow-pipelines/services as its own; each user is solely responsible for (and indemnifies
+/// the operator against third-party claims arising from) their own service run through the platform.
+const NUTZUNGSBEDINGUNGEN_HTML: &str = include_str!("../../../docs/legal/nutzungsbedingungen.html");
+
 /// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`]; `GET /llms.txt` serves the
 /// AI-agent onboarding doc (#174) as plain text so a CLI agent can `curl` it and a browser renders it.
+/// `/impressum`, `/datenschutz`, `/nutzungsbedingungen` serve the legal pages linked from the
+/// landing page's footer.
 pub fn landing_router() -> Router {
     Router::new()
         .route("/", get(landing_handler))
         .route("/llms.txt", get(llms_txt_handler))
+        .route("/impressum", get(|| async { axum::response::Html(IMPRESSUM_HTML) }))
+        .route("/datenschutz", get(|| async { axum::response::Html(DATENSCHUTZ_HTML) }))
+        .route(
+            "/nutzungsbedingungen",
+            get(|| async { axum::response::Html(NUTZUNGSBEDINGUNGEN_HTML) }),
+        )
 }
 
 /// This deployment's actual mesh/channel-broker/channel-relay ports (#214 follow-up: generic
@@ -5190,6 +5217,40 @@ mod tests {
             doc.contains("AI-agent onboarding") && doc.contains("Register yourself as a discoverable agent"),
             "/llms.txt serves the onboarding doc"
         );
+        // The footer links to the three legal pages, and each actually serves (not a dead link).
+        assert!(
+            html.contains(r#"href="/impressum""#)
+                && html.contains(r#"href="/datenschutz""#)
+                && html.contains(r#"href="/nutzungsbedingungen""#),
+            "footer links to the legal pages"
+        );
+        // The accounts stat is no longer shown on the landing page (operator request).
+        assert!(!html.contains(r#"id="accounts""#), "accounts counter removed from the landing page");
+    }
+
+    #[tokio::test]
+    async fn legal_pages_serve_real_operator_facts_not_placeholders() {
+        // A fabricated/placeholder Impressum is itself a legal defect (worse than none) -- this
+        // pins that the served page carries real, specific operator facts, not a TODO/placeholder.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        for (path, must_contain) in [
+            ("/impressum", vec!["Martin Becke", "Mettinger", "Neuenkirchen", "§ 19 UStG"]),
+            ("/datenschutz", vec!["DSGVO", "TTDSG", "Cookies"]),
+            ("/nutzungsbedingungen", vec!["Freistellung", "Nutzerdienst", "§§ 7", "TMG"]),
+        ] {
+            let app = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+            let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path} should serve");
+            let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            assert!(ct.starts_with("text/html"), "{path} serves HTML, got {ct}");
+            let body = String::from_utf8_lossy(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).to_string();
+            for needle in must_contain {
+                assert!(body.contains(needle), "{path} should mention {needle:?}");
+            }
+        }
     }
 
     #[tokio::test]
