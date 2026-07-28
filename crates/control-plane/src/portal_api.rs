@@ -461,7 +461,7 @@ async fn delete_tunnel(
 /// Plane both serve) plus this deployment's real mesh edge port (`/network-info`,
 /// [`crate::service::NetworkInfoResp`]), so the Install page never hardcodes or
 /// guesses a port that could drift from the actual deployment.
-fn edge_host_port(portal_base: &str) -> String {
+pub(crate) fn edge_host_port(portal_base: &str) -> String {
     let host = portal_base
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -488,7 +488,7 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     let edge_host = edge_host_port(&st.portal_base);
     let build_cmd = "git clone https://github.com/scimbe/CADS-Tunnel.git && cd CADS-Tunnel\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine";
     let env_block = format!(
-        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
+        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_EDGE_CERT_URL={cp}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
         jt = token,
         rt = routing_token,
         id = id,
@@ -1487,6 +1487,17 @@ mod tests {
         assert!(
             html.contains("CT_AGENT_EDGE=portal.example:4433"),
             "carries the real edge host:mesh-port, not a placeholder"
+        );
+        // A real onboarding attempt hung forever waiting for /shared/edge-cert.der:
+        // without CT_AGENT_EDGE_CERT_URL, ct-agent's cert fetch falls back to
+        // polling a shared-docker-volume path that doesn't exist for an external
+        // (non-docker-compose) agent, and waits indefinitely by design (main.rs) --
+        // the fix is this page must always set it, not a behavior change to the
+        // fallback itself (other deployments rely on that indefinite wait).
+        assert!(
+            html.contains("CT_AGENT_EDGE_CERT_URL=https://portal.example"),
+            "sets the cert URL so an external agent self-fetches the CA root instead of \
+             hanging forever waiting for the shared-volume path"
         );
         assert!(
             html.contains(".env"),

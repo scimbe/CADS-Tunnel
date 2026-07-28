@@ -3184,13 +3184,23 @@ pub fn persistent_control_plane_router(
         // that were 404ing). CT_PORTAL_BASE_URL is the origin the served scripts POST
         // /bootstrap/redeem to (#90/#97 SEC90b); CT_RELEASE_BASE overrides the
         // GitHub-Releases asset base the scripts download the prebuilt ct-agent from.
-        .merge(crate::installer::installer_router(
-            std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
-            std::env::var("CT_RELEASE_BASE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| crate::installer::DEFAULT_RELEASE_BASE.to_string()),
-        ));
+        .merge({
+            let portal_base =
+                std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string());
+            // The served install scripts need this deployment's real mesh-plane
+            // host:port (CT_AGENT_EDGE) baked in too -- without it, onboard()
+            // either errors immediately or (missing CT_AGENT_EDGE_CERT_URL, set
+            // alongside it) hangs forever; see render_install_sh's doc comment.
+            let edge_addr = crate::portal_api::edge_host_port(&portal_base);
+            crate::installer::installer_router(
+                portal_base,
+                std::env::var("CT_RELEASE_BASE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| crate::installer::DEFAULT_RELEASE_BASE.to_string()),
+                edge_addr,
+            )
+        });
     // #81 SEC81c-c (c-i): the live edge queries this to authorize channel-joins (the
     // broker's `authorize` closure). Gated by the shared edge↔CP admin token; mounted
     // only when CT_CP_EDGE_ADMIN_TOKEN is a valid 64-hex value.
