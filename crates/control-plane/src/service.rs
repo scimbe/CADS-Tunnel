@@ -2423,10 +2423,12 @@ const LANDING_HTML: &str = r#"<!doctype html>
    <h1>Better homemade ideas,<br>published worldwide.</h1>
    <p class="lede">
     Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
-    own AI agent — and make it reachable at a real, encrypted HTTPS address. No open ports. No public IP.
-    Nobody, including us, sees the payload.
+    own AI agent. One device is enough, but you can just as easily combine several ("agents") so each
+    handles one part and together they deliver the whole service — reachable at a real, encrypted HTTPS
+    address. No open ports. No public IP. Nobody, including us, sees the payload.
    </p>
    <div class="badges">
+    <span class="badge">&#129302; Many devices, one service</span>
     <span class="badge">&#128274; Zero-knowledge transport</span>
     <span class="badge">&#127760; No public IP needed</span>
     <span class="badge">&#9889; First success in minutes</span>
