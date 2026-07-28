@@ -17,6 +17,10 @@ services:
       dockerfile: Caddy.Dockerfile
     volumes:
       - ./index.html:/srv/index.html:ro
+      # #226: this agent's own signed AgentCard, so it can be a real (not fabricated)
+      # entry in /registry/agents — proof the auto-discoverability path works end to
+      # end, using core's own infrastructure/keys, not anyone else's.
+      - ./.well-known:/srv/.well-known:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       # #219: fullchain.pem + privkey.pem, issued CORE-side (see
       # docs/dns01-desec.md) — never a DESEC_TOKEN, never an ACME client here.
