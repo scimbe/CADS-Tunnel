@@ -146,14 +146,26 @@ impl PropagationWaiter {
     }
 
     /// Poll every configured resolver for `record_name`'s TXT value each
-    /// round, succeeding as soon as *any one* of them shows `expected_value`
-    /// -- until `timeout` elapses. A resolver-side hiccup (network error,
-    /// non-2xx) is treated as "not yet visible from that resolver" and
-    /// retried rather than failing immediately; only running out of time
-    /// with no resolver agreeing is a hard error. A miss on Cloudflare
-    /// specifically also actively purges that query from Cloudflare's own
-    /// cache before the next round, rather than only hoping either real
-    /// propagation or the cached TTL wins the race first.
+    /// round, succeeding only once **all** of them agree on `expected_value`
+    /// in the *same* round -- until `timeout` elapses. This is deliberately
+    /// stronger than "any one resolver": Let's Encrypt's own validation does
+    /// a primary check plus multi-perspective secondary validation from
+    /// several geographically distributed vantage points (CA/Browser Forum
+    /// SC067), and requires them to agree. A single resolver we happen to
+    /// query from this one network location is a weak proxy for that -- we
+    /// saw exactly this gap directly: our own (single-resolver-satisfied)
+    /// check passed, then Let's Encrypt's own secondary validation still
+    /// failed, because the record genuinely wasn't visible everywhere yet.
+    /// Requiring every configured resolver to agree is a stronger, closer
+    /// (if still imperfect) proxy for that global visibility.
+    ///
+    /// A resolver-side hiccup (network error, non-2xx) is treated as "not
+    /// yet visible from that resolver" and retried rather than failing
+    /// immediately; only running out of time without full agreement is a
+    /// hard error. A miss on Cloudflare specifically also actively purges
+    /// that query from Cloudflare's own cache before the next round, rather
+    /// than only hoping either real propagation or the cached TTL wins the
+    /// race first.
     pub async fn wait_for(&self, record_name: &str, expected_value: &str) -> Result<(), String> {
         // Deliberately BEFORE the deadline is taken: this delay buys propagation
         // headroom, it must not eat the polling budget (see DEFAULT_INITIAL_DELAY
@@ -164,20 +176,31 @@ impl PropagationWaiter {
         let mut last_seen: Vec<String> = Vec::new();
         loop {
             let mut cloudflare_missed = false;
+            let mut all_agree = true;
             for resolver_url in &self.resolver_urls {
-                if let Ok(values) = self.lookup(resolver_url, record_name).await {
-                    if values.iter().any(|v| v == expected_value) {
-                        return Ok(());
+                let matched = match self.lookup(resolver_url, record_name).await {
+                    Ok(values) => {
+                        let matched = values.iter().any(|v| v == expected_value);
+                        if !matched {
+                            last_seen = values;
+                        }
+                        matched
                     }
-                    last_seen = values;
+                    Err(_) => false,
+                };
+                if !matched {
+                    all_agree = false;
+                    if *resolver_url == self.cloudflare_doh_url {
+                        cloudflare_missed = true;
+                    }
                 }
-                if *resolver_url == self.cloudflare_doh_url {
-                    cloudflare_missed = true;
-                }
+            }
+            if all_agree {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "TXT record for {record_name} did not become publicly resolvable within {:?} across {} resolver(s) (last seen: {last_seen:?})",
+                    "TXT record for {record_name} did not become publicly resolvable everywhere within {:?} across {} resolver(s) (last seen: {last_seen:?})",
                     self.timeout,
                     self.resolver_urls.len()
                 ));
@@ -308,12 +331,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_resolver_still_confirms_when_the_first_has_a_stale_negative_cache() {
-        // Reproduces #229's actual failure shape: one resolver has already
-        // cached NXDOMAIN for this exact query (e.g. from an earlier failed
-        // attempt at the same hostname) and never sees the record no matter
-        // how long we wait; a second, independent resolver has not, and
-        // shows it immediately -- succeeding overall.
+    async fn succeeds_once_a_transiently_lagging_resolver_catches_up_too() {
+        // One resolver is briefly behind (still propagating), the other is
+        // already there -- success requires BOTH to agree, so this must wait
+        // for the lagging one rather than declaring victory on the first hit.
+        let lagging_calls = Arc::new(AtomicU32::new(0));
+        let lagging =
+            spawn_mock(MockResolver { calls: lagging_calls.clone(), answers_after: 3, value: "v1".into() }).await;
+        let fast = spawn_mock(MockResolver { calls: Arc::new(AtomicU32::new(0)), answers_after: 0, value: "v1".into() }).await;
+
+        let waiter = PropagationWaiter::with_interval(
+            vec![lagging, fast],
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        ).without_initial_delay();
+        waiter.wait_for("_acme-challenge.example.test", "v1").await.unwrap();
+        assert!(lagging_calls.load(Ordering::SeqCst) >= 4, "kept polling the lagging resolver until it agreed too");
+    }
+
+    #[tokio::test]
+    async fn does_not_falsely_succeed_when_only_one_of_two_resolvers_ever_agrees() {
+        // Reproduces the actual #229 failure this design change fixes: our
+        // own check was satisfied by a single resolver while Let's Encrypt's
+        // own multi-perspective secondary validation still failed, because
+        // one resolver agreeing is a weak proxy for genuinely global
+        // visibility. A resolver permanently stuck on a stale/wrong value
+        // must NOT be outvoted by the other one appearing to work --
+        // requiring unanimous agreement should time out here, not succeed.
         let stale_calls = Arc::new(AtomicU32::new(0));
         let stale =
             spawn_mock(MockResolver { calls: stale_calls.clone(), answers_after: u32::MAX, value: "v1".into() })
@@ -322,11 +366,12 @@ mod tests {
 
         let waiter = PropagationWaiter::with_interval(
             vec![stale, fresh],
-            Duration::from_secs(5),
+            Duration::from_millis(100),
             Duration::from_millis(10),
         ).without_initial_delay();
-        waiter.wait_for("_acme-challenge.example.test", "v1").await.unwrap();
-        assert_eq!(stale_calls.load(Ordering::SeqCst), 1, "queried the stale resolver too, just didn't wait on it");
+        let err = waiter.wait_for("_acme-challenge.example.test", "v1").await.unwrap_err();
+        assert!(err.contains("did not become publicly resolvable everywhere"), "{err}");
+        assert!(stale_calls.load(Ordering::SeqCst) >= 1, "did poll the lagging resolver, just didn't accept an outvote");
     }
 
     #[test]
