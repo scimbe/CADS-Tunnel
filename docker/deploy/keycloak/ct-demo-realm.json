@@ -42,7 +42,7 @@
       "attributes": {
         "access.token.signed.response.alg": "RS256",
         "id.token.signed.response.alg": "RS256",
-        "post.logout.redirect.uris": "https://bunsenbrenner.org/portal+http://localhost:8090/portal"
+        "post.logout.redirect.uris": "https://bunsenbrenner.org/portal##http://localhost:8090/portal"
       },
       "protocolMappers": [
         {
