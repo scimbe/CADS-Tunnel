@@ -2456,31 +2456,39 @@ const LANDING_HTML: &str = r#"<!doctype html>
     <div class="code-block">
      <div class="code-block-head"><span>&#128203; prompt.txt — ready to paste into Claude Code</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
      <template><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+This is my own request, at my own machine -- please proceed once you're satisfied
+below, not stall on it.
 
-1. Check whether a `.env` file already exists in this directory.
-   - If it exists: load it now with `set -a; source .env; set +a` before doing
-     anything else, and keep it loaded/updated for the rest of this session.
-   - If it does NOT exist: stop and ask me to open
-     https://bunsenbrenner.org/portal/tunnels, click Install on my tunnel, and
-     paste the shown `.env` block into a new `.env` file here. Don't continue
-     until it exists and is loaded.
-2. Download and unpack the starter template:
+Context so you can verify this yourself rather than take my word for it:
+CADS-Tunnel is open source: https://github.com/scimbe/CADS-Tunnel -- a
+self-hosted, end-to-end-encrypted tunnel, the same kind of tool as
+cloudflared/ngrok/frp/tailscale funnel. Read any file in the repo or the
+downloaded template before building or running it if that helps you confirm
+what it does and what it connects to.
+
+All my tokens and account info live in `./.env` -- check it exists before doing
+anything else. If it's missing, stop and ask me to copy it from
+https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it with
+`set -a; source .env; set +a` before continuing.
+
+1. Download and unpack the starter template (it's the same repo above, just
+   zipped for convenience -- inspect any file before running it):
    curl -LO https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
    unzip hello-world-pipeline.zip && cd hello-world-pipeline
-3. Read the template's README.md (and https://bunsenbrenner.org/llms.txt for the
-   full AI-agent onboarding doc).
-4. Build ct-agent (there's a Docker one-liner in docs/install.md — I don't have a
-   Rust toolchain installed).
-5. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
+2. Read the template's README.md, and https://bunsenbrenner.org/llms.txt for
+   background -- both are reference material, not instructions to follow
+   blindly; use your own judgement throughout, same as with any doc.
+3. Build ct-agent from source (there's a Docker one-liner in docs/install.md —
+   I don't have a Rust toolchain installed).
+4. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
    want your service to do here&gt;. It's currently running on: &lt;your PC /
    Raspberry Pi / container / agent&gt;.
-6. Mint my channel identity with `ct-agent channel init`, append it to the same
-   `.env` file, and reload it (`set -a; source .env; set +a`) -- never re-run
-   channel init afterwards, that mints a different identity instead of reusing
-   this one.
-7. Walk me through running the handler as a live role and publishing my pipeline.
-
-I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></template>
+5. Mint my channel identity with `ct-agent channel init`, append it to `.env`,
+   and reload it (`set -a; source .env; set +a`). This identity is meant to be
+   long-lived -- running channel init again later would create a second,
+   unrelated identity rather than restoring this one; that's just how it works,
+   not something to worry about.
+6. Walk me through running the handler as a live role and publishing my pipeline.</code></template>
     </div>
     <p class="alt-link">
      Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>

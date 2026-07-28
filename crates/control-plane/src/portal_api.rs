@@ -7,17 +7,15 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Form, Path, Query, State};
+use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::accounts::AccountId;
-use crate::installer::{install_bundle_secret, install_one_liner_bootstrap, InstallOs};
 use crate::portal::{escape, session_subject_for};
 use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
@@ -63,8 +61,13 @@ struct ApiState {
     ledger: Arc<SqliteLedger>,
     tunnels: Arc<SqliteTunnelStore>,
     enrollment: Arc<SqliteEnrollment>,
-    /// Bootstrap-token store (#90/#97 SEC90b): the install page mints a short-lived
-    /// token over the `{join, routing}` bundle so the shown one-liner carries no secret.
+    /// Bootstrap-token store (#90/#97 SEC90b): the install page's one-liner used
+    /// this to mint a short-lived token over the `{join, routing}` bundle so the
+    /// shown one-liner carried no secret. Temporarily unused -- the one-liner
+    /// itself is hidden until `/install.sh`/`/install.ps1` actually ship (#75) --
+    /// kept (not removed) so re-enabling it doesn't need to re-thread this field
+    /// through `portal_api_router`'s signature and every test call site again.
+    #[allow(dead_code)]
     bootstrap: Arc<SqliteBootstrap>,
     /// Public portal origin (e.g. `https://portal.example`) baked into installers.
     portal_base: Arc<str>,
@@ -403,19 +406,11 @@ async fn delete_tunnel(
     Redirect::to("/portal/tunnels").into_response()
 }
 
-/// Which OS installer to show; absent = show all.
-#[derive(Deserialize)]
-struct InstallQuery {
-    os: Option<String>,
-}
-
-/// TTL (seconds) for the bootstrap token minted for an install one-liner (#90/#97
-/// SEC90b): short — it exists only to be redeemed once, promptly, by the installer.
-const INSTALL_BOOTSTRAP_TTL_SECS: u64 = 600;
-
-/// `GET /portal/tunnels/:id/install` (#28): render the copy-paste one-liner(s)
-/// that install + onboard an agent for one of the caller's own tunnels. A fresh,
+/// `GET /portal/tunnels/:id/install` (#28): render the tokens (and how to use
+/// them) to bring an agent up for one of the caller's own tunnels. A fresh,
 /// single-use join token is minted per request and embedded via an env var.
+/// The one-line installer (`/install.sh`/`/install.ps1`, #75) isn't live yet,
+/// so its copy-paste blocks are deliberately not shown here for now.
 ///
 /// The token is a secret: it is shown once to the authenticated owner and never
 /// logged, cached or persisted anywhere in cleartext.
@@ -433,12 +428,7 @@ fn edge_host_port(portal_base: &str) -> String {
     format!("{host}:{}", crate::service::NetworkInfoResp::from_env().mesh_edge_port)
 }
 
-async fn install_page(
-    State(st): State<ApiState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Query(q): Query<InstallQuery>,
-) -> Response {
+async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
@@ -454,38 +444,6 @@ async fn install_page(
         Ok(t) => hex(&t.0),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // #90/#97 SEC90b: mint a short-lived, single-use bootstrap token over the
-    // {join, routing} bundle and carry only *that* in the copy-paste one-liner, so
-    // no real secret lands in shell history / `ps`. The install script redeems it
-    // server-side (`POST /bootstrap/redeem`). The raw tokens are still shown once,
-    // separately, for the manual onboarding path below.
-    let bundle = install_bundle_secret(&token, &routing_token);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let boot = match st.bootstrap.mint(&bundle, INSTALL_BOOTSTRAP_TTL_SECS, now) {
-        Ok(b) => hex(&b),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-    let oses = match q.os.as_deref().and_then(InstallOs::parse) {
-        Some(os) => vec![os],
-        None => vec![InstallOs::Unix, InstallOs::Windows],
-    };
-    let blocks = oses
-        .iter()
-        .map(|os| {
-            let label = match os {
-                InstallOs::Unix => "Linux / macOS",
-                InstallOs::Windows => "Windows (PowerShell)",
-            };
-            let cmd = install_one_liner_bootstrap(&st.portal_base, &boot, *os);
-            format!(
-                r#"<h2>{label}</h2><div class="code-block">
- <div class="code-block-head"><span>one-liner</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
- <pre><code>{}</code></pre>
-</div>"#,
-                escape(&cmd)
-            )
-        })
-        .collect::<String>();
     let edge_host = edge_host_port(&st.portal_base);
     let build_cmd = "git clone https://github.com/scimbe/CADS-Tunnel.git && cd CADS-Tunnel\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine";
     let env_block = format!(
@@ -503,16 +461,8 @@ async fn install_page(
 the <em>origin</em>: the server or device running the service you are tunnelling,
 not the device you are reading this on. The agent connects out to the relay and
 serves your origin through it (no inbound firewall port needed).</p>
-<div class="warn"><strong>&#9888; The one-line installer isn't live yet (#75).</strong> Use the
-three steps below instead &mdash; they work today, no prebuilt binaries required.</div>
 
-<h2>1. Build <code>ct-agent</code> (Docker, no Rust toolchain needed)</h2>
-<div class="code-block">
- <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
- <pre><code>{build_cmd}</code></pre>
-</div>
-
-<h2>2. Save your tunnel's tokens into a <code>.env</code> file</h2>
+<h2>Save your tunnel's tokens into a <code>.env</code> file</h2>
 <p class="k"><strong>Single-use join token — shown only once; reopen this Install page for a fresh one.</strong></p>
 <p class="help">Minted ready to use &mdash; accepted immediately, no separate approval step. Save this
 as <code>.env</code> <strong>next to the binary, on the machine you want to expose</strong>.</p>
@@ -521,18 +471,25 @@ as <code>.env</code> <strong>next to the binary, on the machine you want to expo
  <pre><code>{env_block}</code></pre>
 </div>
 
-<h2>3. Bring the tunnel up</h2>
-<div class="code-block">
- <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
- <pre><code>{run_cmd}</code></pre>
-</div>
-<p class="help">That's it &mdash; <code>ct-agent</code> redeems the join token, binds your tunnel's
-routing token, and starts serving your origin through the relay end-to-end encrypted. See the
-<a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>
-for troubleshooting.</p>
+<details>
+ <summary>How to bring your tunnel up with these tokens</summary>
+ <h3>1. Build <code>ct-agent</code> (Docker, no Rust toolchain needed)</h3>
+ <div class="code-block">
+  <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{build_cmd}</code></pre>
+ </div>
+ <h3>2. Run it</h3>
+ <div class="code-block">
+  <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{run_cmd}</code></pre>
+ </div>
+ <p class="help">That's it &mdash; <code>ct-agent</code> redeems the join token, binds your tunnel's
+ routing token, and starts serving your origin through the relay end-to-end encrypted. A one-line
+ installer is planned but not ready yet (#75). See the
+ <a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>
+ for troubleshooting.</p>
+</details>
 
-<h2 class="muted">One-line installer &mdash; coming soon (not functional yet)</h2>
-{blocks}
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
     );
     Html(page("install", &body)).into_response()
@@ -768,6 +725,11 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  .copy-btn{{background:#21262d;border:1px solid #30363d;color:#e6edf3;flex-shrink:0;border-radius:6px;
   padding:.3rem .65rem;font-size:.76rem;font-weight:600;cursor:pointer}}
  .copy-btn:hover{{background:#30363d}}
+ details{{margin:1.1rem 0;border:1px solid #30363d;border-radius:8px;padding:.7rem .9rem}}
+ summary{{cursor:pointer;color:#58a6ff;font-weight:600}}
+ summary:hover{{color:#79c0ff}}
+ details h3{{font-size:.95rem;color:#e6edf3;margin:1rem 0 .4rem}}
+ details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
 <nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/logout">Sign out</a></nav>
@@ -872,57 +834,6 @@ mod tests {
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
         portal_api_router(KEY, ledger, tunnels, enrollment, bootstrap, "https://portal.example", None, None)
-    }
-
-    #[tokio::test]
-    async fn install_page_shows_a_bootstrap_one_liner_carrying_no_real_token() {
-        // #90/#97 SEC90b: the copy-paste one-liner must carry only CT_BOOTSTRAP, never
-        // the raw join/routing tokens (those appear only in the separate manual block).
-        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
-        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
-        let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
-        // Own a tunnel so the install page authorizes and has a routing token.
-        let tunnel = tunnels.create("kc-user-1", "t", None).unwrap();
-        let routing = tunnel.routing_token.clone();
-        let app = portal_api_router(
-            KEY,
-            ledger,
-            tunnels,
-            enrollment,
-            bootstrap,
-            "https://portal.example",
-            None,
-            None,
-        );
-        let resp = app
-            .oneshot(
-                Request::get(format!("/portal/tunnels/{}/install?os=linux", tunnel.id))
-                    .header("cookie", session_header("kc-user-1"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let html = String::from_utf8(body.to_vec()).unwrap();
-
-        // The one-liner carries CT_BOOTSTRAP and pipes to the installer.
-        assert!(html.contains("CT_BOOTSTRAP="), "one-liner carries the bootstrap token");
-        assert!(html.contains("/install.sh"), "pipes the installer script");
-        // The routing token must NOT appear inside a shown `curl … | … sh` command.
-        for line in html.lines().filter(|l| l.contains("CT_BOOTSTRAP=")) {
-            assert!(
-                !line.contains(&routing),
-                "the routing token must not be embedded in the one-liner command"
-            );
-        }
-        // The working-today manual path still exists (raw tokens shown once, separately).
-        assert!(
-            html.contains("CT_AGENT_JOIN_TOKEN=") && html.contains("ct-agent onboard"),
-            "manual path retained"
-        );
     }
 
     #[tokio::test]
@@ -1351,7 +1262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_page_is_owner_only_and_renders_per_os_one_liners() {
+    async fn install_page_is_owner_only_and_surfaces_a_genuinely_working_path() {
         let app = test_app();
         post_form(&app, "/portal/tunnels", "alice", "name=web").await;
         let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
@@ -1366,13 +1277,11 @@ mod tests {
             StatusCode::SEE_OTHER
         );
 
-        // Owner sees both one-liners with the portal base and env-carried token.
+        // Owner sees the env-carried tokens.
         let (status, html) = get(&app, &format!("/portal/tunnels/{id}/install"), Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("curl -fsSL https://portal.example/install.sh"));
         assert!(html.contains("CT_AGENT_JOIN_TOKEN="), "join token carried via env");
         assert!(html.contains("CT_AGENT_TOKEN="), "tunnel routing token carried via env (#27 RB2)");
-        assert!(html.contains("irm https://portal.example/install.ps1 | iex"));
         assert!(html.contains("single-use") || html.contains("Single-use"), "warns token is single-use");
         // #69 T69.3: the page must frame WHERE to run the command (on the origin,
         // not the browsing device) and signpost recovery for a lost single-use
@@ -1385,13 +1294,15 @@ mod tests {
             html.contains("reopen this Install page"),
             "signposts lost-token recovery (a fresh token per visit)"
         );
-        // #75: the /install.sh + /install.ps1 endpoints don't exist yet, so the page
-        // must NOT present the one-liner as a working command — it must carry an
-        // honest "isn't live yet" notice and surface the working manual path
-        // (the tokens for `ct-agent onboard`), not a broken copy-paste.
+        // #75: /install.sh + /install.ps1 don't exist yet, so their one-liners must
+        // NOT be shown as if they worked -- the page surfaces only the genuinely
+        // working manual path, tucked behind a <details> disclosure, not the tokens
+        // themselves (those stay visible up front).
+        assert!(!html.contains("curl -fsSL"), "no non-functional one-liner shown");
+        assert!(!html.contains("irm "), "no non-functional PowerShell one-liner shown");
         assert!(
-            html.contains("isn't live yet (#75)"),
-            "honestly flags the one-liner as non-functional until #75 ships"
+            html.contains("<details>") && html.contains("<summary>"),
+            "the how-to-run steps are collapsible, not dumped inline"
         );
         assert!(
             html.contains("Build") && html.contains("ct-agent onboard"),
@@ -1419,12 +1330,13 @@ mod tests {
         );
         assert!(
             html.contains("copyCode(this)") && html.matches("copy-btn").count() >= 3,
-            "every code block (tokens + both one-liners) has a copy button"
+            "every code block (tokens + build + run) has a copy button"
         );
-
-        // os filter renders just one block.
-        let (_s, only_win) = get(&app, &format!("/portal/tunnels/{id}/install?os=windows"), Some("alice")).await;
-        assert!(only_win.contains("irm ") && !only_win.contains("curl -fsSL"));
+        // The tokens section reads before the (collapsible) how-to-run steps.
+        assert!(
+            html.find("Save your tunnel's tokens").unwrap() < html.find("<details>").unwrap(),
+            "the tokens are the first thing shown, ahead of the collapsible how-to"
+        );
     }
 
     #[tokio::test]
