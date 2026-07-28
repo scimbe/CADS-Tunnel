@@ -2440,7 +2440,9 @@ const LANDING_HTML: &str = r#"<!doctype html>
     <div class="step-n">1</div>
     <h3>Register</h3>
     <p>One-time, human step: create an account. This is the identity your subdomain and your published
-    pipelines/agents will be tied to.</p>
+    pipelines/agents will be tied to. Your first tunnel is created automatically as soon as you sign in
+    — click <strong>Install</strong> on it, copy the <code>.env</code> block shown there, and save it in
+    the directory where that tunnel will run.</p>
     <a class="btn" href="/portal">Zum Kundenportal — Registrieren &rarr;</a>
    </div>
 
