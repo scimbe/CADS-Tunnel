@@ -37,11 +37,18 @@ pub const DEFAULT_RESOLVER_URLS: &[&str] = &["https://cloudflare-dns.com/dns-que
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Cloudflare's own DoH endpoint, and its documented public cache-purge API
-/// (<https://developers.cloudflare.com/1.1.1.1/infrastructure/#purge-cache>)
-/// -- the same one `acme.sh`'s `dns_desec`/`_ns_purge_cf` uses, which is why
-/// its manual runs don't get stuck behind exactly the stale-cache case a
-/// second resolver alone only works around rather than actually clearing.
+/// Cloudflare's own DoH endpoint, and the public (unauthenticated) 1.1.1.1
+/// resolver cache-purge endpoint the same one `acme.sh`'s `dns_desec`/
+/// `_ns_purge_cf` uses -- verified directly (not from a docs page; no public
+/// Cloudflare docs page actually covers this specific endpoint):
+/// `curl -sL -X POST 'https://cloudflare-dns.com/api/v1/purge?domain=example.com&type=A'`
+/// returns a genuine `200` with
+/// `{"msg":"purge request queued. Please wait a few seconds and verify the
+/// request was successful"}`, distinct from Cloudflare's real error page for
+/// an actually-nonexistent path on the same host. Purges the **public 1.1.1.1
+/// resolver's cached answer** for a query name -- unrelated to, and much
+/// narrower than, Cloudflare's authenticated zone-level CDN cache-purge API
+/// (`api.cloudflare.com`), which only affects zones you own.
 const CLOUDFLARE_DOH: &str = "https://cloudflare-dns.com/dns-query";
 const CLOUDFLARE_PURGE_URL: &str = "https://cloudflare-dns.com/api/v1/purge";
 
