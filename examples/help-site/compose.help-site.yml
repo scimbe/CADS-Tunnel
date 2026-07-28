@@ -9,16 +9,18 @@
 #     --env-file docker/deploy/.env up --build -d
 services:
   help-origin:
-    # Caddy + deSEC plugin: terminates TLS with the LE cert for the hostname.
+    # Plain Caddy: terminates TLS with a cert issued CORE-side (#219,
+    # scripts/lib-acme.sh) and mounted read-only below — no ACME client or
+    # deSEC token in this container at all.
     build:
       context: .
       dockerfile: Caddy.Dockerfile
-    environment:
-      # deSEC token for DNS-01 (never committed; from docker/deploy/.env).
-      - DESEC_TOKEN=${DESEC_TOKEN:?set DESEC_TOKEN in docker/deploy/.env}
     volumes:
       - ./index.html:/srv/index.html:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # #219: fullchain.pem + privkey.pem, issued CORE-side (see
+      # docs/dns01-desec.md) — never a DESEC_TOKEN, never an ACME client here.
+      - ${HELP_CERT_DIR:?set HELP_CERT_DIR=<dir with fullchain.pem+privkey.pem>}:/certs:ro
       - help_caddy_data:/data
     expose:
       - "443"   # reachable only via the tunnel/agent, not published to the host

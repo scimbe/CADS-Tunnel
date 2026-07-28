@@ -47,11 +47,13 @@ EDGE_ADMIN_URL="${CT_CP_EDGE_ADMIN_URL:-}"
 EDGE_ADMIN_TOKEN="${CT_CP_EDGE_ADMIN_TOKEN:-}"
 
 say() { printf '\033[36m▶ %s\033[0m\n' "$*"; }
+ok()  { printf '\033[32m  ✓\033[0m %s\n' "$*"; }
+warn(){ printf '\033[33m  !\033[0m %s\n' "$*" >&2; }
+log() { say "$@"; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- Prereq checks (fail early, actionable) ------------------------------------
 say "Checking prerequisites"
-[ -n "${DESEC_TOKEN:-}" ] || die "DESEC_TOKEN is not set (Caddy needs it for the cert). See docs/dns01-desec.md; put it in $ENV_FILE."
 command -v docker >/dev/null || die "docker not found."
 curl -fsS "$CP_URL/healthz" >/dev/null 2>&1 || curl -fsS "$CP_URL/status" >/dev/null 2>&1 \
   || die "control-plane not reachable at $CP_URL (is the plane running?). Set CP_URL."
@@ -94,6 +96,18 @@ if [ -n "$EDGE_ADMIN_URL" ] && [ -n "$EDGE_ADMIN_TOKEN" ]; then
 else
   echo "   ! edge host-auth not configured (CT_CP_EDGE_ADMIN_URL/TOKEN) — relying on BP4a (fine for one hostname)."
 fi
+
+# --- Cert (#219): issued HERE via the shared lib, using the operator's own
+# DESEC_TOKEN — Caddy itself never sees the zone-wide token, only the resulting
+# single-hostname fullchain.pem/privkey.pem it mounts read-only.
+say "Obtaining the origin's TLS cert (core-side deSEC DNS-01)"
+export HELP_CERT_DIR="${HELP_CERT_DIR:-$HOME/ct-certs/help}"
+[ -n "${DESEC_TOKEN:-}" ] || die "DESEC_TOKEN is not set (needed to issue the cert; see docs/dns01-desec.md; put it in $ENV_FILE)."
+export DESEC_TOKEN
+ACME_EMAIL="${ACME_EMAIL:-scimbe@gmail.com}"
+# shellcheck source=../../scripts/lib-acme.sh
+. "../../scripts/lib-acme.sh"
+issue_cert "$HOSTNAME_FQDN" "$HELP_CERT_DIR" true "$ACME_EMAIL"
 
 # --- Bring up origin + browser agent -------------------------------------------
 say "Starting the Caddy origin + Browser-Plane agent"

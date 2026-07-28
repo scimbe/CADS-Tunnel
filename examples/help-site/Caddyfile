@@ -1,36 +1,18 @@
-# Origin for the help.bunsenbrenner.org demo. Caddy terminates TLS with a real
-# Let's Encrypt certificate obtained via DNS-01 against deSEC — so it needs NO
-# inbound :80/:443 of its own (the origin is only reachable through the tunnel).
-# The agent (Browser Plane) forwards the raw TLS to this Caddy; TLS terminates
-# here, at the origin, keeping the edge/plane payload-blind.
+# Origin for the help.bunsenbrenner.org demo. Caddy terminates TLS, so it
+# needs NO inbound :80/:443 of its own (the origin is only reachable through
+# the tunnel). The agent (Browser Plane) forwards the raw TLS to this Caddy;
+# TLS terminates here, at the origin, keeping the edge/plane payload-blind.
 #
-# While testing, uncomment the staging CA to avoid Let's Encrypt rate limits.
-{
-	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
-	email admin@bunsenbrenner.org
-}
+# #219: the cert is issued CORE-side (scripts/lib-acme.sh, deSEC DNS-01 with
+# the operator's zone-wide token) and mounted in as static files — this
+# Caddyfile only ever reads fullchain.pem/privkey.pem, never holds a DNS
+# credential of its own.
 
 help.bunsenbrenner.org {
 	root * /srv
 	file_server
 	encode gzip
-	tls {
-		# DNS-01 via deSEC (token from the environment; see docs/dns01-desec.md).
-		# Block form with {$DESEC_TOKEN}: the Caddyfile adapter substitutes the env
-		# var at adapt time (guaranteed), rather than relying on the desec module to
-		# run a runtime replacer on an inline {env.X} placeholder.
-		dns desec {
-			token {$DESEC_TOKEN}
-		}
-		resolvers ns1.desec.io ns2.desec.org
-		# deSEC enforces a zone minimum_ttl of 3600s and rejects the plugin's default
-		# TTL 0 outright (HTTP 400), so the challenge TXT is never created. Pin it.
-		dns_ttl 3600s
-		# Give LE's multi-vantage-point validation time to read the TXT before Caddy's
-		# own propagation check passes and deletes it (else LE hits NXDOMAIN).
-		propagation_delay 30s
-		propagation_timeout 2m
-	}
+	tls /certs/fullchain.pem /certs/privkey.pem
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
