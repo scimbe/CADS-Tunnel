@@ -80,6 +80,12 @@ impl DesecClient {
         })
     }
 
+    /// The zone this client manages (`DESEC_DOMAIN`) — e.g. so a caller can build
+    /// a fully-qualified hostname under it without re-reading the environment.
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
     /// Upsert the TXT record via a bulk PATCH (leaves other records untouched);
     /// deSEC requires TXT values wrapped in double quotes.
     pub async fn set_txt(&self, name: &str, value: &str) -> Result<(), String> {

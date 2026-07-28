@@ -177,25 +177,148 @@ provider's signed webhook confirms the payment.</p>
     Html(page("buy credits", &body)).into_response()
 }
 
-/// A new tunnel from the create form.
+/// A new tunnel from the (defense-in-depth; not linked from the UI in the
+/// Standard tier — see [`tunnels_page`]) create form.
 #[derive(Deserialize)]
 struct CreateTunnelForm {
     name: String,
-    hostname: Option<String>,
 }
 
-/// `GET /portal/tunnels` (#27): list the caller's own tunnels + a create form.
+/// Derive a DNS-safe label from a free-form name: lowercase, alphanumeric and
+/// hyphens only, collapsed/trimmed, falling back to `"tunnel"` if empty.
+fn dns_label_from(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    let trimmed = if trimmed.is_empty() { "tunnel" } else { trimmed };
+    trimmed.chars().take(40).collect()
+}
+
+/// A short, stable, non-choosable per-account suffix (4 hex chars of
+/// SHA-256(subject)) — the "unique user id" half of the Standard tier's
+/// auto-assigned hostname `<name>-<user-id>.<zone>` (see the landing page's
+/// subdomain-policy step and the /publish onboarding).
+fn account_suffix(subject: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(subject.as_bytes());
+    hex(&digest[..2])
+}
+
+/// Standard tier: the public hostname is always auto-assigned from the tunnel
+/// name + the caller's account suffix — never user-chosen. Custom/vanity
+/// hostnames are a planned paid tier.
+fn auto_hostname(zone: &str, name: &str, subject: &str) -> String {
+    format!("{}-{}.{}", dns_label_from(name), account_suffix(subject), zone)
+}
+
+/// `GET /portal/tunnels` (#27): the caller's tunnel(s). Standard tier: exactly
+/// one tunnel per account, auto-provisioned right here on first view (with an
+/// auto-assigned hostname when DNS is configured) — there is no manual create
+/// step to onboard with; see the tunnel's Install link for its tokens.
+/// Additional tunnels and custom hostnames are a planned paid tier (shown,
+/// disabled, in [`tunnels_html`]).
 async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
+    let owns_one = match st.tunnels.list_authorized_for_subject(&subject) {
+        Ok(rows) => rows.iter().any(|(_, owned)| *owned),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if !owns_one {
+        provision_tunnel(&st, &subject, "site").await;
+    }
     match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(tunnels) => Html(tunnels_html(&tunnels)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-/// `POST /portal/tunnels` (#27): create a tunnel owned by the caller.
+/// Create `name`'s tunnel for `subject` (auto-assigning its hostname when DNS
+/// is configured) and run the same edge-authorize + DNS-A-record side effects
+/// [`create_tunnel`] does — shared so the Standard tier's auto-provisioned
+/// tunnel ([`tunnels_page`]) and a direct `POST /portal/tunnels` behave
+/// identically. Errors are logged, not surfaced — a failed auto-provision
+/// just leaves the tunnel list empty and the next page view retries it.
+async fn provision_tunnel(st: &ApiState, subject: &str, name: &str) {
+    let hostname = st
+        .dns
+        .as_ref()
+        .map(|d| auto_hostname(d.client.domain(), name, subject))
+        .as_deref()
+        .and_then(ct_common::normalize_hostname);
+    let tunnel = match st.tunnels.create(subject, name, hostname.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("ct-cp: auto-provisioning a tunnel for {subject} failed: {e}");
+            return;
+        }
+    };
+    authorize_hostname(st, &tunnel).await;
+}
+
+/// The edge-authorize + DNS-A-record side effects of giving a tunnel a public
+/// hostname (#23 BP4b-c, #38 DL2) — best-effort, logged, never fails the
+/// caller's request (the tunnel row already exists either way).
+async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunnel) {
+    let Some(host) = tunnel.hostname.as_deref() else {
+        return;
+    };
+    // #23 BP4b-c: authorize the hostname at the edge (host -> routing token)
+    // so the agent's 'H' bind is accepted under CT_EDGE_REQUIRE_HOST_AUTH.
+    if let Some(edge) = &st.edge_admin {
+        let endpoint = format!(
+            "{}/admin/authorize-host/{}/{}",
+            edge.url.trim_end_matches('/'),
+            tunnel.routing_token,
+            host
+        );
+        match edge_admin_http_client()
+            .post(&endpoint)
+            .header("x-ct-admin-token", edge.token.as_ref())
+            .send()
+            .await
+        {
+            // #71: log success too (not just failures), so tunnel creation's
+            // auto-authorize is diagnosable from control-plane logs alone —
+            // previously a success was silent and indistinguishable from the
+            // edge_admin=None skip below.
+            Ok(r) if r.status().is_success() => {
+                eprintln!("ct-cp: edge authorize-host for {host} succeeded")
+            }
+            Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
+            Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
+        }
+    } else {
+        // #71: the most likely silent cause — the edge admin API isn't wired, so
+        // the hostname is never authorized and the agent's bind is rejected under
+        // CT_EDGE_REQUIRE_HOST_AUTH. Say so loudly instead of doing nothing.
+        eprintln!(
+            "ct-cp: edge authorize-host SKIPPED for {host} — edge admin API not configured \
+             (set CT_CP_EDGE_ADMIN_URL + CT_CP_EDGE_ADMIN_TOKEN); the agent's hostname bind \
+             will be rejected while CT_EDGE_REQUIRE_HOST_AUTH is on"
+        );
+    }
+    // #38 DL2: auto-create the A record (host -> edge IP) so the hostname is
+    // publicly resolvable without a manual DNS step. Both best-effort; logged.
+    if let Some(dns) = &st.dns {
+        if let Err(e) = dns.client.set_a(host, &dns.edge_ip).await {
+            eprintln!("ct-cp: DNS A-record create for {host} failed: {e}");
+        }
+    }
+}
+
+/// `POST /portal/tunnels`: kept as a server-side-enforced safety net, not
+/// linked from the Standard-tier UI (which auto-provisions the one included
+/// tunnel — see [`tunnels_page`]). Rejects a second tunnel even if posted
+/// directly: "not enabled in the free tier" is enforced here, not just by
+/// hiding the form.
 async fn create_tunnel(
     State(st): State<ApiState>,
     headers: HeaderMap,
@@ -208,63 +331,28 @@ async fn create_tunnel(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
     }
-    // #23 BP4b-d: validate + normalize the hostname (reject non-DNS junk /
-    // trailing-dot ambiguity) so it matches what the edge binds and authorizes.
-    let hostname = match form.hostname.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(h) => match ct_common::normalize_hostname(h) {
-            Some(n) => Some(n),
-            None => return (StatusCode::BAD_REQUEST, "invalid hostname").into_response(),
-        },
-        None => None,
-    };
+    match st.tunnels.list_authorized_for_subject(&subject) {
+        Ok(rows) if rows.iter().any(|(_, owned)| *owned) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "the Standard tier includes one tunnel per account; additional tunnels are a planned paid-tier feature",
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+    let hostname = st
+        .dns
+        .as_ref()
+        .map(|d| auto_hostname(d.client.domain(), name, &subject))
+        .as_deref()
+        .and_then(ct_common::normalize_hostname);
     let tunnel = match st.tunnels.create(&subject, name, hostname.as_deref()) {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    if let Some(host) = tunnel.hostname.as_deref() {
-        // #23 BP4b-c: authorize the hostname at the edge (host -> routing token)
-        // so the agent's 'H' bind is accepted under CT_EDGE_REQUIRE_HOST_AUTH.
-        if let Some(edge) = &st.edge_admin {
-            let endpoint = format!(
-                "{}/admin/authorize-host/{}/{}",
-                edge.url.trim_end_matches('/'),
-                tunnel.routing_token,
-                host
-            );
-            match edge_admin_http_client()
-                .post(&endpoint)
-                .header("x-ct-admin-token", edge.token.as_ref())
-                .send()
-                .await
-            {
-                // #71: log success too (not just failures), so tunnel creation's
-                // auto-authorize is diagnosable from control-plane logs alone —
-                // previously a success was silent and indistinguishable from the
-                // edge_admin=None skip below.
-                Ok(r) if r.status().is_success() => {
-                    eprintln!("ct-cp: edge authorize-host for {host} succeeded")
-                }
-                Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
-                Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
-            }
-        } else {
-            // #71: the most likely silent cause — the edge admin API isn't wired, so
-            // the hostname is never authorized and the agent's bind is rejected under
-            // CT_EDGE_REQUIRE_HOST_AUTH. Say so loudly instead of doing nothing.
-            eprintln!(
-                "ct-cp: edge authorize-host SKIPPED for {host} — edge admin API not configured \
-                 (set CT_CP_EDGE_ADMIN_URL + CT_CP_EDGE_ADMIN_TOKEN); the agent's hostname bind \
-                 will be rejected while CT_EDGE_REQUIRE_HOST_AUTH is on"
-            );
-        }
-        // #38 DL2: auto-create the A record (host -> edge IP) so the hostname is
-        // publicly resolvable without a manual DNS step. Both best-effort; logged.
-        if let Some(dns) = &st.dns {
-            if let Err(e) = dns.client.set_a(host, &dns.edge_ip).await {
-                eprintln!("ct-cp: DNS A-record create for {host} failed: {e}");
-            }
-        }
-    }
+    authorize_hostname(&st, &tunnel).await;
     Redirect::to("/portal/tunnels").into_response()
 }
 
@@ -375,7 +463,13 @@ async fn install_page(
                 InstallOs::Windows => "Windows (PowerShell)",
             };
             let cmd = install_one_liner_bootstrap(&st.portal_base, &boot, *os);
-            format!("<h2>{label}</h2><pre><code>{}</code></pre>", escape(&cmd))
+            format!(
+                r#"<h2>{label}</h2><div class="code-block">
+ <div class="code-block-head"><span>one-liner</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <pre><code>{}</code></pre>
+</div>"#,
+                escape(&cmd)
+            )
         })
         .collect::<String>();
     let body = format!(
@@ -384,18 +478,22 @@ async fn install_page(
 the <em>origin</em>: the server or device running the service you are tunnelling,
 not the device you are reading this on. The agent connects out to the relay and
 serves your origin through it (no inbound firewall port needed).</p>
-<div class="warn"><strong>&#9888; The one-line installer is not available yet (#75).</strong>
-<code>/install.sh</code> and <code>/install.ps1</code> return 404 until the prebuilt
-<code>ct-agent</code> binaries and the installer endpoint ship, so the
-<code>curl &hellip; | sh</code> command further down does <strong>not work yet</strong>.
-To bring your tunnel up <em>today</em>, run the <code>ct-agent</code> binary (or the
-<code>ct-testbed</code> Docker image that ships it) manually with the two tokens
-below &mdash; see the <a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>.</div>
+<div class="warn"><strong>&#9888; The one-line installer isn't live yet (#75).</strong> It will
+work once <code>ct-agent</code> prebuilt binaries ship. For now, use the tokens below with
+<code>ct-agent onboard</code> directly &mdash; see the
+<a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>.</div>
 <h2>Your tunnel's tokens (for manual onboarding)</h2>
 <p class="k"><strong>Single-use token — shown only once; reopen this Install page for a fresh one.</strong></p>
-<pre><code>CT_JOIN_TOKEN={jt}
+<p class="help">Minted ready to use &mdash; accepted immediately, no separate approval step. Copy
+this into a <code>.env</code> file <strong>on the machine you want to expose</strong> (the
+<em>origin</em>), then <code>set -a; source .env; set +a</code> before running
+<code>ct-agent onboard</code>, rather than leaving it in your shell history.</p>
+<div class="code-block">
+ <div class="code-block-head"><span>.env</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <pre><code>CT_JOIN_TOKEN={jt}
 CT_AGENT_TOKEN={rt}
 # also set CT_AGENT_CP_URL, CT_AGENT_EDGE, CT_AGENT_ORIGIN (see the onboarding guide), then run: ct-agent onboard</code></pre>
+</div>
 <h2 class="muted">One-line installer &mdash; coming soon (not functional yet)</h2>
 {blocks}
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
@@ -501,66 +599,58 @@ fn grants_html(id: &str, grantees: &[String]) -> String {
 }
 
 fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
-    let rows = if tunnels.is_empty() {
-        "<p class=\"k\">No tunnels yet. Create one below.</p>".to_string()
-    } else {
-        tunnels
-            .iter()
-            .map(|(t, owned)| {
-                let host = t
-                    .hostname
-                    .as_deref()
-                    .map(|h| format!(" · <code>{}</code>", escape(h)))
-                    .unwrap_or_default();
-                let id = escape(&t.id);
-                // Owner-only actions (share/revoke) are hidden on shared tunnels;
-                // an authorized grantee can still install an agent for it.
-                let owner_actions = if *owned {
-                    format!(
-                        r#" <a class="btn sec" href="/portal/tunnels/{id}/grants">Share</a>
+    let rows = tunnels
+        .iter()
+        .map(|(t, owned)| {
+            let host = t
+                .hostname
+                .as_deref()
+                .map(|h| format!(" · <code>{}</code>", escape(h)))
+                .unwrap_or_default();
+            let id = escape(&t.id);
+            // Owner-only actions are hidden on shared tunnels; an authorized
+            // grantee can still install an agent for it. Sharing itself is a
+            // planned paid-tier feature — shown so owners know it exists, but
+            // disabled (Standard tier ships one tunnel, not shared access).
+            let owner_actions = if *owned {
+                format!(
+                    r#" <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <span class="btn sec disabled" title="Sharing tunnels is a planned paid-tier feature">Share</span>
  <form class="inline" method="post" action="/portal/tunnels/{id}/delete">
   <button class="sec" type="submit">Revoke</button></form>"#
-                    )
-                } else {
-                    " <span class=\"k\">(shared with you)</span>".to_string()
-                };
-                format!(
-                    r#"<div class="row"><span class="v">{name}{host}</span><span>
- <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>{owner_actions}
-</span></div>"#,
-                    name = escape(&t.name),
-                    host = host,
                 )
-            })
-            .collect::<String>()
-    };
+            } else {
+                format!(
+                    r#" <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <span class="k">(shared with you)</span>"#
+                )
+            };
+            format!(
+                r#"<div class="row"><span class="v">{name}{host}</span><span>{owner_actions}
+</span></div>"#,
+                name = escape(&t.name),
+            )
+        })
+        .collect::<String>();
     let body = format!(
         r#"<h1>Your tunnels</h1>
 {rows}
-<h2>Create a tunnel</h2>
-<p class="help">A tunnel exposes a service running on your own machine (the
-<em>origin</em>) through the relay &mdash; no inbound firewall port to open.</p>
-<form method="post" action="/portal/tunnels">
+<p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
+assigned hostname (e.g. <code>site-a3f9.bunsenbrenner.org</code>) &mdash; already set up for
+you above, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
+<h2>Create another tunnel</h2>
+<p class="help">Additional tunnels and custom/vanity hostnames are a planned paid tier, coming
+later.</p>
+<form aria-disabled="true">
  <label>Name
-  <input type="text" name="name" placeholder="e.g. my-api" required>
-  <span class="help">A label to recognise this tunnel. Any short name.</span>
+  <input type="text" placeholder="e.g. my-api" disabled>
  </label>
- <label>Public hostname <span class="opt">&mdash; optional (Browser Plane)</span>
-  <input type="text" name="hostname" placeholder="e.g. app.example.com">
-  <span class="help">Leave empty for a standard end-to-end tunnel (reached by your
-  own client with a routing token). Set a hostname to serve the origin as a normal
-  HTTPS website a browser can open directly &mdash; this is the <em>Browser Plane</em>.
-  When the operator has DNS configured, the hostname's DNS record is pointed at the
-  edge automatically; otherwise point it there yourself.</span>
- </label>
- <button type="submit">Create</button>
+ <button type="submit" disabled>Create</button>
 </form>
 <h2>Next steps</h2>
 <ol class="steps">
- <li>Create a tunnel above &mdash; name it, and add a hostname if you want a public
- HTTPS site.</li>
- <li>Click <strong>Install</strong> on its row to get a one-line install command.</li>
- <li>Run that command <strong>on the machine you want to expose</strong> (the
+ <li>Click <strong>Install</strong> on your tunnel above to get its tokens.</li>
+ <li>Run the shown command <strong>on the machine you want to expose</strong> (the
  <em>origin</em> &mdash; e.g. your server or laptop running the service), not on
  the device you are browsing from.</li>
  <li>Done &mdash; requests reach your origin through the relay, end-to-end
@@ -631,13 +721,31 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  p.help{{margin:.2rem 0 1rem}} .opt{{color:#8b949e;font-weight:400}}
  ol.steps{{color:#8b949e;font-size:.86rem;margin:.2rem 0;padding-left:1.2rem}}
  ol.steps li{{margin:.35rem 0}} ol.steps strong{{color:#e6edf3}}
- .warn{{background:#3d1e00;border:1px solid #7d4e00;color:#f0c674;border-radius:8px;padding:.7rem .9rem;margin:1rem 0;font-size:.88rem}}
+ .warn{{background:#3d1e00;border:1px solid #7d4e00;color:#f0c674;border-radius:8px;padding:.7rem .9rem;margin:1rem 0;font-size:.88rem;line-height:1.6}}
  .warn code{{background:#2a1500;border-color:#7d4e00}} h2.muted{{color:#6e7681}}
+ .btn.disabled,button:disabled,input:disabled{{opacity:.45;cursor:not-allowed;pointer-events:none}}
+ .code-block{{margin:.6rem 0 1rem;border:1px solid #30363d;border-radius:8px;overflow:hidden;background:#0d1117}}
+ .code-block-head{{display:flex;justify-content:space-between;align-items:center;gap:.8rem;background:#161b22;
+  padding:.45rem .5rem .45rem .8rem;border-bottom:1px solid #30363d}}
+ .code-block-head span{{font-size:.78rem;color:#8b949e}}
+ .code-block pre{{margin:0;padding:.8rem .9rem;overflow-x:auto}}
+ .code-block code{{background:none;border:none;padding:0}}
+ .copy-btn{{background:#21262d;border:1px solid #30363d;color:#e6edf3;flex-shrink:0;border-radius:6px;
+  padding:.3rem .65rem;font-size:.76rem;font-weight:600;cursor:pointer}}
+ .copy-btn:hover{{background:#30363d}}
 </style></head><body>
 <div class="card">
 <nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/logout">Sign out</a></nav>
 {body}
 </div>
+<script>
+ function copyCode(btn){{
+  const code = btn.closest('.code-block').querySelector('code');
+  const text = code ? code.textContent : '';
+  const done = () => {{ const orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(()=>{{ btn.textContent = orig; }}, 1600); }};
+  if(navigator.clipboard && navigator.clipboard.writeText){{ navigator.clipboard.writeText(text).then(done).catch(()=>{{}}); }}
+ }}
+</script>
 </body></html>"#
     )
 }
@@ -880,36 +988,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnels_are_created_listed_and_revoked_self_scoped() {
+    async fn tunnels_are_auto_provisioned_one_per_account_and_revoke_is_self_scoped() {
         let app = test_app();
         let count = |h: &str| h.matches("/delete").count();
 
         // Unauthenticated -> bounced.
         assert_eq!(get(&app, "/portal/tunnels", None).await.0, StatusCode::SEE_OTHER);
 
-        // alice creates two tunnels (one with a browser-plane hostname); bob one.
+        // First view auto-provisions exactly one tunnel each — no create step.
+        let (_s, alice_html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(count(&alice_html), 1, "alice's one Standard-tier tunnel was auto-provisioned");
         assert_eq!(
-            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=app.example").await,
+            count(&get(&app, "/portal/tunnels", Some("bob")).await.1),
+            1,
+            "bob gets his own, separate auto-provisioned tunnel"
+        );
+        // Revisiting doesn't provision a second one.
+        assert_eq!(count(&get(&app, "/portal/tunnels", Some("alice")).await.1), 1, "still just one on a re-view");
+
+        // A direct POST for a second tunnel is rejected server-side (not just hidden in the UI).
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=second").await,
+            StatusCode::FORBIDDEN,
+            "additional tunnels are rejected even via a direct POST"
+        );
+
+        // alice revokes her tunnel -> none remain immediately...
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/delete", first_id(&alice_html)), "alice", "").await,
             StatusCode::SEE_OTHER
         );
-        assert_eq!(post_form(&app, "/portal/tunnels", "alice", "name=ssh").await, StatusCode::SEE_OTHER);
-        assert_eq!(post_form(&app, "/portal/tunnels", "bob", "name=db").await, StatusCode::SEE_OTHER);
-
-        // alice sees exactly her two; bob sees exactly his one.
-        let (_s, html) = get(&app, "/portal/tunnels", Some("alice")).await;
-        assert_eq!(count(&html), 2, "alice sees her two tunnels");
-        assert!(html.contains("web") && html.contains("app.example") && html.contains("ssh"));
-        assert_eq!(count(&get(&app, "/portal/tunnels", Some("bob")).await.1), 1, "bob sees only his own");
-
-        // alice revokes one of her tunnels -> one remains.
-        assert_eq!(
-            post_form(&app, &format!("/portal/tunnels/{}/delete", first_id(&html)), "alice", "").await,
-            StatusCode::SEE_OTHER
-        );
+        // ...but the next view auto-provisions a fresh one again.
         let (_s, after) = get(&app, "/portal/tunnels", Some("alice")).await;
-        assert_eq!(count(&after), 1, "one tunnel removed");
+        assert_eq!(count(&after), 1, "revoking and revisiting re-provisions a tunnel");
 
-        // bob cannot revoke alice's remaining tunnel (self-scoped) — it survives.
+        // bob cannot revoke alice's tunnel (self-scoped) — it survives.
         post_form(&app, &format!("/portal/tunnels/{}/delete", first_id(&after)), "bob", "").await;
         assert_eq!(
             count(&get(&app, "/portal/tunnels", Some("alice")).await.1),
@@ -919,25 +1032,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunnels_create_form_carries_inline_help() {
-        // #69 T69.1: a first-time customer must be able to understand the create
-        // form without reading the architecture docs — the two fields get real
-        // labels + help text, and the hostname field explains the Browser-Plane
-        // choice and the automatic-DNS behaviour. Frozen so the form can't regress
-        // back to two bare unlabelled inputs.
+    async fn tunnels_page_explains_the_standard_tier_and_shows_share_disabled() {
+        // #69 T69.1 (updated for the Standard-tier auto-provision policy): a
+        // first-time customer must understand, without reading the architecture
+        // docs, that their one tunnel is already set up, that Sharing exists but
+        // is a paid-tier feature, and that "Create another" is visible-but-disabled
+        // rather than silently missing.
         let app = test_app();
         let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("<label>Name"), "the name field is labelled");
-        assert!(html.contains("Public hostname"), "the hostname field is labelled");
-        assert!(html.contains("Browser Plane"), "explains the Browser-Plane choice");
+        assert!(html.contains("automatically\nassigned hostname") || html.contains("automatically assigned hostname"),
+            "explains the auto-assigned hostname");
+        assert!(html.contains("disabled") && html.contains(">Share<"), "Share is shown but disabled");
+        assert!(html.contains("paid tier") || html.contains("paid-tier"), "names the paid-tier gate");
         assert!(
-            html.contains("standard end-to-end tunnel"),
-            "explains the empty-hostname (standard tunnel) case"
+            html.contains("disabled") && html.contains("Create another tunnel"),
+            "the second-tunnel form is visible but disabled, not hidden"
         );
         assert!(
-            html.to_lowercase().contains("dns"),
-            "gives DNS guidance for a hostname tunnel"
+            html.to_lowercase().contains("hostname"),
+            "gives hostname guidance"
         );
         // Still self-contained / CSP-safe: no external asset URLs.
         assert!(
@@ -1021,9 +1135,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_tunnel_with_a_hostname_authorizes_it_at_the_edge() {
-        // #23 BP4b-c: a tunnel that declares a hostname authorizes (host -> token)
-        // at the edge so the agent's 'H' bind is accepted under required auth.
+    async fn auto_provisioned_tunnel_with_a_hostname_authorizes_it_at_the_edge() {
+        // #23 BP4b-c (updated for the Standard-tier auto-provision policy, #226):
+        // the tunnel's auto-assigned (not user-chosen) hostname still authorizes
+        // (host -> token) at the edge so the agent's 'H' bind is accepted under
+        // required auth.
         use axum::extract::{Path as AxPath, State as AxState};
         use axum::http::HeaderMap as AxHeaderMap;
         use std::sync::Mutex;
@@ -1054,6 +1170,12 @@ mod tests {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let desec = ct_dns::provider::DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            _ => None,
+        })
+        .unwrap();
         let app = portal_api_router(
             KEY,
             ledger,
@@ -1062,19 +1184,23 @@ mod tests {
             Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
-            None,
+            Some((desec, "1.2.3.4".to_string())),
         );
 
-        assert_eq!(
-            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=help.example").await,
-            StatusCode::SEE_OTHER
+        // Viewing the tunnels page auto-provisions the one Standard-tier tunnel.
+        assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK);
+
+        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
+        let expected_host = tunnel.hostname.clone().expect("auto-assigned a hostname");
+        assert!(
+            expected_host.starts_with("site-") && expected_host.ends_with(".bunsenbrenner.org"),
+            "auto-assigned from the tunnel name + account suffix, not user-chosen: {expected_host}"
         );
 
         // The edge received authorize-host with this tunnel's routing token + auth.
-        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
         let (token, host, auth) = received.lock().unwrap().clone().expect("edge authorize called");
         assert_eq!(token, tunnel.routing_token, "authorizes the tunnel's routing token");
-        assert_eq!(host, "help.example");
+        assert_eq!(host, expected_host);
         assert_eq!(auth, "edge-secret");
     }
 
@@ -1122,14 +1248,21 @@ mod tests {
             Some((desec, "45.133.9.145".to_string())),
         );
 
-        // Create with a hostname -> A record for "help" pointing at the edge IP.
-        assert_eq!(
-            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=help.bunsenbrenner.org").await,
-            StatusCode::SEE_OTHER
-        );
-        let id = tunnels.list_for_subject("alice").unwrap()[0].id.clone();
+        // Viewing the tunnels page auto-provisions the tunnel with its auto-assigned
+        // hostname -> an A record for that hostname's label, pointing at the edge IP.
+        assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK);
+        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
+        let id = tunnel.id.clone();
+        let subname = tunnel
+            .hostname
+            .as_deref()
+            .expect("auto-assigned a hostname")
+            .split('.')
+            .next()
+            .unwrap()
+            .to_string();
         assert!(
-            bodies.lock().unwrap().iter().any(|x| x.contains("\"subname\":\"help\"")
+            bodies.lock().unwrap().iter().any(|x| x.contains(&format!("\"subname\":\"{subname}\""))
                 && x.contains("\"type\":\"A\"")
                 && x.contains("45.133.9.145")),
             "A record created on hostname-set"
@@ -1138,7 +1271,7 @@ mod tests {
         // Revoke -> A record cleared (empty records list).
         post_form(&app, &format!("/portal/tunnels/{id}/delete"), "alice", "").await;
         assert!(
-            bodies.lock().unwrap().iter().any(|x| x.contains("\"subname\":\"help\"")
+            bodies.lock().unwrap().iter().any(|x| x.contains(&format!("\"subname\":\"{subname}\""))
                 && x.contains("\"records\":[]")),
             "A record cleared on revoke"
         );
@@ -1153,14 +1286,30 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn create_tunnel_rejects_an_invalid_hostname() {
-        // #23 BP4b-d: a malformed hostname (empty label) is refused.
-        let app = test_app();
-        assert_eq!(
-            post_form(&app, "/portal/tunnels", "alice", "name=web&hostname=bad..host").await,
-            StatusCode::BAD_REQUEST
+    #[test]
+    fn dns_label_from_sanitizes_arbitrary_names_into_valid_labels() {
+        // #226-tiers: the hostname is now auto-assigned from the tunnel name, not
+        // typed by the user, so it must always sanitize into something DNS-valid
+        // rather than rejecting a "bad" name outright (there's no form to reject on).
+        assert_eq!(dns_label_from("My Cool App!!"), "my-cool-app");
+        assert_eq!(dns_label_from("...."), "tunnel", "an all-invalid name falls back, never empty");
+        assert_eq!(dns_label_from(""), "tunnel");
+        assert_eq!(dns_label_from("a..b"), "a-b", "collapses runs of separators, no empty labels");
+    }
+
+    #[test]
+    fn auto_hostname_is_deterministic_and_account_scoped() {
+        // Idempotent: revoking and re-viewing (tunnels_page) must land the same
+        // account back on the same hostname, not a fresh random one each time.
+        let h1 = auto_hostname("bunsenbrenner.org", "site", "alice");
+        assert_eq!(h1, auto_hostname("bunsenbrenner.org", "site", "alice"), "deterministic per (name, subject)");
+        assert_ne!(
+            h1,
+            auto_hostname("bunsenbrenner.org", "site", "bob"),
+            "different accounts never collide on the same default name"
         );
+        assert!(h1.ends_with(".bunsenbrenner.org"));
+        assert!(h1.starts_with("site-"));
     }
 
     #[tokio::test]
@@ -1200,15 +1349,23 @@ mod tests {
         );
         // #75: the /install.sh + /install.ps1 endpoints don't exist yet, so the page
         // must NOT present the one-liner as a working command — it must carry an
-        // honest "not available yet" notice and surface the working manual path
+        // honest "isn't live yet" notice and surface the working manual path
         // (the tokens for `ct-agent onboard`), not a broken copy-paste.
         assert!(
-            html.contains("not available yet (#75)"),
+            html.contains("isn't live yet (#75)"),
             "honestly flags the one-liner as non-functional until #75 ships"
         );
         assert!(
             html.contains("manual onboarding") && html.contains("ct-agent onboard"),
             "surfaces the working manual onboarding path with the tokens"
+        );
+        assert!(
+            html.contains(".env"),
+            "advises copying the tokens into a .env file on the exposing machine"
+        );
+        assert!(
+            html.contains("copyCode(this)") && html.matches("copy-btn").count() >= 3,
+            "every code block (tokens + both one-liners) has a copy button"
         );
 
         // os filter renders just one block.
