@@ -2445,8 +2445,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
    <div class="step">
     <div class="step-n">2</div>
     <h3>Get your template</h3>
-    <p>A minimal, working "hello world" workflow pipeline — one role, one handler script that echoes
-    your input back. Proves the whole loop before you swap in your own idea. Paste this into
+    <p>The easiest way: paste this into
     <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any
     coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
     itself. Nothing to unzip by hand.</p>
