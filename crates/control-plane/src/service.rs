@@ -2348,11 +2348,9 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .step p{color:var(--muted2);font-size:.92rem;margin:0 0 .9rem}
 
  .code-block{margin-top:.7rem;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#0d1117}
- .code-block-head{display:flex;justify-content:space-between;align-items:center;background:#161b22;
-  padding:.5rem .5rem .5rem .9rem;border-bottom:1px solid var(--border)}
- .code-block-head span{font-size:.76rem;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
- pre{background:transparent;border:none;border-radius:0;padding:1rem 1.1rem;overflow-x:auto;
-  font-size:.8rem;margin:0;max-height:16rem}
+ .code-block-head{display:flex;justify-content:space-between;align-items:center;gap:.8rem;background:#161b22;
+  padding:.6rem .6rem .6rem .9rem}
+ .code-block-head span{font-size:.8rem;color:var(--muted2)}
  .copy-btn{background:#21262d;border:1px solid var(--border);color:var(--text);flex-shrink:0;
   border-radius:7px;padding:.35rem .7rem;font-size:.78rem;font-weight:600;cursor:pointer;transition:background .15s ease}
  .copy-btn:hover{background:#30363d}
@@ -2453,8 +2451,8 @@ const LANDING_HTML: &str = r#"<!doctype html>
     coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
     itself. Nothing to unzip by hand.</p>
     <div class="code-block">
-     <div class="code-block-head"><span>prompt.txt</span><button class="copy-btn" onclick="copyCode(this)" type="button">&#128203; Copy</button></div>
-     <pre><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+     <div class="code-block-head"><span>&#128203; prompt.txt — ready to paste into Claude Code</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+     <template><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
 
 1. Download and unpack the starter template:
    curl -LO https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
@@ -2471,7 +2469,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
    that mints a different identity instead of reusing this one.
 6. Walk me through running the handler as a live role and publishing my pipeline.
 
-I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></pre>
+I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></template>
     </div>
     <p class="alt-link">
      Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
@@ -2619,8 +2617,10 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
   }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
  }
  function copyCode(btn){
-  const block = btn.closest('.code-block').querySelector('code');
-  const text = block ? block.textContent : '';
+  const container = btn.closest('.code-block');
+  const tmpl = container.querySelector('template');
+  const code = tmpl ? tmpl.content.querySelector('code') : container.querySelector('code');
+  const text = code ? code.textContent : '';
   const done = () => { const orig = btn.innerHTML; btn.innerHTML = '&#9989; Copied'; setTimeout(()=>{ btn.innerHTML = orig; }, 1600); };
   if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done).catch(()=>{}); }
  }
