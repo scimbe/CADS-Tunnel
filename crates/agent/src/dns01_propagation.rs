@@ -37,11 +37,25 @@ pub const DEFAULT_RESOLVER_URLS: &[&str] = &["https://cloudflare-dns.com/dns-que
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Cloudflare's own DoH endpoint, and its documented public cache-purge API
+/// (<https://developers.cloudflare.com/1.1.1.1/infrastructure/#purge-cache>)
+/// -- the same one `acme.sh`'s `dns_desec`/`_ns_purge_cf` uses, which is why
+/// its manual runs don't get stuck behind exactly the stale-cache case a
+/// second resolver alone only works around rather than actually clearing.
+const CLOUDFLARE_DOH: &str = "https://cloudflare-dns.com/dns-query";
+const CLOUDFLARE_PURGE_URL: &str = "https://cloudflare-dns.com/api/v1/purge";
+
 pub struct PropagationWaiter {
     http: reqwest::Client,
     resolver_urls: Vec<String>,
     timeout: Duration,
     interval: Duration,
+    // Which configured resolver_url gets the active cache-purge treatment on
+    // a miss, and where its purge endpoint lives -- real Cloudflare in
+    // production; a mock server in tests, so this is hermetically testable
+    // without ever calling the live purge API from a test.
+    cloudflare_doh_url: String,
+    cloudflare_purge_url: String,
 }
 
 impl PropagationWaiter {
@@ -50,7 +64,25 @@ impl PropagationWaiter {
     }
 
     pub(crate) fn with_interval(resolver_urls: Vec<String>, timeout: Duration, interval: Duration) -> Self {
-        Self { http: reqwest::Client::new(), resolver_urls, timeout, interval }
+        Self {
+            http: reqwest::Client::new(),
+            resolver_urls,
+            timeout,
+            interval,
+            cloudflare_doh_url: CLOUDFLARE_DOH.to_string(),
+            cloudflare_purge_url: CLOUDFLARE_PURGE_URL.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cloudflare_urls(
+        resolver_urls: Vec<String>,
+        timeout: Duration,
+        interval: Duration,
+        cloudflare_doh_url: String,
+        cloudflare_purge_url: String,
+    ) -> Self {
+        Self { http: reqwest::Client::new(), resolver_urls, timeout, interval, cloudflare_doh_url, cloudflare_purge_url }
     }
 
     /// Poll every configured resolver for `record_name`'s TXT value each
@@ -58,17 +90,24 @@ impl PropagationWaiter {
     /// -- until `timeout` elapses. A resolver-side hiccup (network error,
     /// non-2xx) is treated as "not yet visible from that resolver" and
     /// retried rather than failing immediately; only running out of time
-    /// with no resolver agreeing is a hard error.
+    /// with no resolver agreeing is a hard error. A miss on Cloudflare
+    /// specifically also actively purges that query from Cloudflare's own
+    /// cache before the next round, rather than only hoping either real
+    /// propagation or the cached TTL wins the race first.
     pub async fn wait_for(&self, record_name: &str, expected_value: &str) -> Result<(), String> {
         let deadline = Instant::now() + self.timeout;
         let mut last_seen: Vec<String> = Vec::new();
         loop {
+            let mut cloudflare_missed = false;
             for resolver_url in &self.resolver_urls {
                 if let Ok(values) = self.lookup(resolver_url, record_name).await {
                     if values.iter().any(|v| v == expected_value) {
                         return Ok(());
                     }
                     last_seen = values;
+                }
+                if *resolver_url == self.cloudflare_doh_url {
+                    cloudflare_missed = true;
                 }
             }
             if Instant::now() >= deadline {
@@ -78,8 +117,26 @@ impl PropagationWaiter {
                     self.resolver_urls.len()
                 ));
             }
+            if cloudflare_missed {
+                self.purge_cloudflare(record_name).await;
+            }
             tokio::time::sleep(self.interval).await;
         }
+    }
+
+    /// Best-effort: ask Cloudflare to drop its own cached answer for this
+    /// exact query so the *next* poll has a real chance of seeing a fresh
+    /// answer instead of a stale one served for the rest of its TTL.
+    /// Failure is not fatal -- the retry loop still works without it, just
+    /// slower (limited to whatever the multi-resolver fallback already
+    /// covers).
+    async fn purge_cloudflare(&self, record_name: &str) {
+        let _ = self
+            .http
+            .post(&self.cloudflare_purge_url)
+            .query(&[("domain", record_name), ("type", "TXT")])
+            .send()
+            .await;
     }
 
     async fn lookup(&self, resolver_url: &str, name: &str) -> Result<Vec<String>, String> {
@@ -107,7 +164,7 @@ impl PropagationWaiter {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use axum::extract::{Query, State};
     use axum::routing::get;
@@ -205,5 +262,70 @@ mod tests {
         );
         waiter.wait_for("_acme-challenge.example.test", "v1").await.unwrap();
         assert_eq!(stale_calls.load(Ordering::SeqCst), 1, "queried the stale resolver too, just didn't wait on it");
+    }
+
+    #[derive(Clone, Default)]
+    struct PurgeableCloudflareMock {
+        lookups: Arc<AtomicU32>,
+        purge_calls: Arc<Mutex<Vec<(String, String)>>>,
+        purged: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn cf_doh_handler(
+        State(state): State<PurgeableCloudflareMock>,
+        Query(_params): Query<std::collections::HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        state.lookups.fetch_add(1, Ordering::SeqCst);
+        if state.purged.load(Ordering::SeqCst) {
+            Json(serde_json::json!({"Status": 0, "Answer": [{"data": "\"fresh-value\""}]}))
+        } else {
+            // Stale cached hit -- keeps answering this, no matter how many
+            // times it's asked, exactly like a resolver serving a cached
+            // record for the rest of its TTL, until purged.
+            Json(serde_json::json!({"Status": 0, "Answer": [{"data": "\"stale-cached-value\""}]}))
+        }
+    }
+
+    async fn cf_purge_handler(
+        State(state): State<PurgeableCloudflareMock>,
+        Query(params): Query<std::collections::HashMap<String, String>>,
+    ) -> axum::http::StatusCode {
+        let domain = params.get("domain").cloned().unwrap_or_default();
+        let rtype = params.get("type").cloned().unwrap_or_default();
+        state.purge_calls.lock().unwrap().push((domain, rtype));
+        state.purged.store(true, Ordering::SeqCst);
+        axum::http::StatusCode::OK
+    }
+
+    #[tokio::test]
+    async fn a_miss_on_the_cloudflare_resolver_actively_purges_its_cache_instead_of_only_waiting() {
+        // Mirrors acme.sh's own dns_desec/_ns_purge_cf behavior: don't just
+        // wait out a stale Cloudflare cache entry (or lean entirely on a
+        // second resolver) -- actively tell Cloudflare to drop it, so the
+        // very next poll has a real chance at a fresh answer.
+        let state = PurgeableCloudflareMock::default();
+        let app = Router::new()
+            .route("/dns-query", get(cf_doh_handler))
+            .route("/api/v1/purge", axum::routing::post(cf_purge_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cf_doh_url = format!("http://{addr}/dns-query");
+        let cf_purge_url = format!("http://{addr}/api/v1/purge");
+
+        let waiter = PropagationWaiter::with_cloudflare_urls(
+            vec![cf_doh_url.clone()],
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            cf_doh_url,
+            cf_purge_url,
+        );
+        waiter.wait_for("_acme-challenge.example.test", "fresh-value").await.unwrap();
+
+        let purges = state.purge_calls.lock().unwrap().clone();
+        assert!(!purges.is_empty(), "purged at least once after a stale-cache miss");
+        assert_eq!(purges[0], ("_acme-challenge.example.test".to_string(), "TXT".to_string()));
+        assert!(state.lookups.load(Ordering::SeqCst) >= 2, "looked up again after purging, not just once");
     }
 }
