@@ -21,6 +21,7 @@ use ct_dns::provider::{Dns01Provider, RemoteAgentDns01Client};
 
 use crate::acme_client::AcmeClient;
 use crate::acme_jws::AccountKey;
+use crate::dns01_propagation::{self, PropagationWaiter};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -51,6 +52,15 @@ pub struct AcmeCertConfig {
     /// Where to persist the ACME account key (PKCS#8 DER) so renewals reuse
     /// the same account instead of registering a new one every run.
     pub account_key_path: PathBuf,
+    /// DNS-over-HTTPS resolver used to confirm the `_acme-challenge` TXT
+    /// record is publicly visible before validation is triggered (see
+    /// `crate::dns01_propagation`). Defaults to a public resolver reachable
+    /// over 443 even when outbound UDP/53 is blocked.
+    pub dns01_resolver_url: String,
+    /// How long to wait for that TXT record to become publicly resolvable
+    /// before giving up (deSEC and similar managed DNS backends replicate to
+    /// public nameservers with a short but nonzero delay).
+    pub dns01_propagation_timeout: Duration,
 }
 
 pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -60,7 +70,9 @@ impl AcmeCertConfig {
     /// `CT_AGENT_HOSTNAME` (all required), `CT_ACME_DIRECTORY_URL` (defaults
     /// to Let's Encrypt production), `CT_ACME_CERT_OUT_DIR` (default
     /// `/shared/acme-cert`), `CT_ACME_ACCOUNT_KEY_PATH` (default
-    /// `<cert_out_dir>/acme-account-key.der`).
+    /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URL`
+    /// (default a public DoH resolver), `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS`
+    /// (default 90).
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -80,7 +92,24 @@ impl AcmeCertConfig {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| cert_out_dir.join("acme-account-key.der"));
-        Ok(Self { cp_url, routing_token, hostname, directory_url, cert_out_dir, account_key_path })
+        let dns01_resolver_url = get("CT_ACME_DNS01_RESOLVER_URL")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| dns01_propagation::DEFAULT_RESOLVER_URL.to_string());
+        let dns01_propagation_timeout = get("CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS")
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(dns01_propagation::DEFAULT_TIMEOUT);
+        Ok(Self {
+            cp_url,
+            routing_token,
+            hostname,
+            directory_url,
+            cert_out_dir,
+            account_key_path,
+            dns01_resolver_url,
+            dns01_propagation_timeout,
+        })
     }
 
     fn cert_path(&self) -> PathBuf {
@@ -132,7 +161,9 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
         config.cp_url.clone(),
         config.routing_token.clone(),
     ));
-    let issued = client.issue_certificate(&config.hostname, &publish).await?;
+    let propagation =
+        PropagationWaiter::new(config.dns01_resolver_url.clone(), config.dns01_propagation_timeout);
+    let issued = client.issue_certificate(&config.hostname, &publish, Some(&propagation)).await?;
 
     // Write key before cert (an origin polling for the cert file should never
     // see a cert with no matching key on disk yet).
@@ -211,6 +242,8 @@ mod tests {
         assert_eq!(cfg.directory_url, DEFAULT_ACME_DIRECTORY, "defaults to Let's Encrypt production");
         assert_eq!(cfg.cert_out_dir, PathBuf::from("/shared/acme-cert"));
         assert_eq!(cfg.account_key_path, PathBuf::from("/shared/acme-cert/acme-account-key.der"));
+        assert_eq!(cfg.dns01_resolver_url, dns01_propagation::DEFAULT_RESOLVER_URL);
+        assert_eq!(cfg.dns01_propagation_timeout, dns01_propagation::DEFAULT_TIMEOUT);
     }
 
     #[test]
@@ -222,12 +255,16 @@ mod tests {
             "CT_ACME_DIRECTORY_URL" => Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_string()),
             "CT_ACME_CERT_OUT_DIR" => Some("/tmp/my-certs".to_string()),
             "CT_ACME_ACCOUNT_KEY_PATH" => Some("/tmp/my-account.der".to_string()),
+            "CT_ACME_DNS01_RESOLVER_URL" => Some("https://dns.google/resolve".to_string()),
+            "CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS" => Some("30".to_string()),
             _ => None,
         };
         let cfg = AcmeCertConfig::from_env_with(env).unwrap();
         assert!(cfg.directory_url.contains("staging"));
         assert_eq!(cfg.cert_out_dir, PathBuf::from("/tmp/my-certs"));
         assert_eq!(cfg.account_key_path, PathBuf::from("/tmp/my-account.der"));
+        assert_eq!(cfg.dns01_resolver_url, "https://dns.google/resolve");
+        assert_eq!(cfg.dns01_propagation_timeout, Duration::from_secs(30));
     }
 
     #[test]
@@ -258,9 +295,15 @@ mod tests {
         order_status: Mutex<&'static str>,
         dns01_hits: Mutex<Vec<Value>>,
         cp_publish_ok: bool,
+        doh_hits: Mutex<u32>,
+        doh_answers_after: u32,
     }
 
     async fn spawn_mock(cp_publish_ok: bool) -> (String, Arc<MockAll>) {
+        spawn_mock_with_doh_delay(cp_publish_ok, 0).await
+    }
+
+    async fn spawn_mock_with_doh_delay(cp_publish_ok: bool, doh_answers_after: u32) -> (String, Arc<MockAll>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -269,6 +312,8 @@ mod tests {
             order_status: Mutex::new("pending"),
             dns01_hits: Mutex::new(Vec::new()),
             cp_publish_ok,
+            doh_hits: Mutex::new(0),
+            doh_answers_after,
         });
 
         fn nonce() -> HeaderMap {
@@ -354,6 +399,26 @@ mod tests {
         async fn dns01_clear() -> StatusCode {
             StatusCode::OK
         }
+        // Stands in for a public DoH resolver: immediately echoes back whatever
+        // value the last dns01_publish call recorded, so the propagation check
+        // in obtain_or_renew sees the record as already visible -- no real
+        // network, no arbitrary sleep needed to keep this test fast.
+        async fn doh(AxState(s): AxState<Arc<MockAll>>) -> AxJson<Value> {
+            let n = {
+                let mut hits = s.doh_hits.lock().unwrap();
+                let seen = *hits;
+                *hits += 1;
+                seen
+            };
+            if n < s.doh_answers_after {
+                return AxJson(serde_json::json!({"Status": 0, "Answer": []}));
+            }
+            let value = s.dns01_hits.lock().unwrap().last().and_then(|h| h["value"].as_str().map(str::to_string));
+            match value {
+                Some(v) => AxJson(serde_json::json!({"Status": 0, "Answer": [{"data": format!("\"{v}\"")}]})),
+                None => AxJson(serde_json::json!({"Status": 0, "Answer": []})),
+            }
+        }
 
         let app = Router::new()
             .route("/directory", get(directory))
@@ -367,6 +432,7 @@ mod tests {
             .route("/cert/1", post(get_cert))
             .route("/agent/dns01-challenge", post(dns01_publish))
             .route("/agent/dns01-challenge/clear", post(dns01_clear))
+            .route("/doh", get(doh))
             .with_state(state.clone());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -387,6 +453,8 @@ mod tests {
             directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
+            dns01_resolver_url: format!("{base}/doh"),
+            dns01_propagation_timeout: Duration::from_secs(5),
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -424,10 +492,71 @@ mod tests {
             directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
+            dns01_resolver_url: format!("{base}/doh"),
+            dns01_propagation_timeout: Duration::from_secs(5),
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("publishing"), "{err}");
         assert!(!config.cert_path().exists(), "no cert file written on a failed issuance");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Reproduces #229: publish succeeding must not be treated as "the CA
+    // can already see it" -- these two pin down the actual reported failure
+    // shape (NXDOMAIN at validation time despite a successful publish call).
+
+    #[tokio::test]
+    async fn obtain_or_renew_waits_out_a_delayed_dns01_propagation_then_succeeds() {
+        // The mock's own DoH-lookalike withholds the TXT answer for the first
+        // lookup, simulating deSEC not having replicated the record to public
+        // nameservers yet -- issuance must still complete once it appears.
+        let (base, mock) = spawn_mock_with_doh_delay(true, 1).await;
+        let dir = std::env::temp_dir().join(format!("ct-acme-e2e-delayed-doh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = AcmeCertConfig {
+            cp_url: base.clone(),
+            routing_token: "deadbeef".to_string(),
+            hostname: "app.example.com".to_string(),
+            directory_url: format!("{base}/directory"),
+            cert_out_dir: dir.clone(),
+            account_key_path: dir.join("account.der"),
+            dns01_resolver_url: format!("{base}/doh"),
+            dns01_propagation_timeout: Duration::from_secs(10),
+        };
+
+        let did_issue = obtain_or_renew(&config).await.unwrap();
+        assert!(did_issue);
+        assert!(std::fs::read_to_string(config.cert_path()).unwrap().contains("BEGIN CERTIFICATE"));
+        assert!(*mock.doh_hits.lock().unwrap() >= 2, "retried the DoH lookup at least once before succeeding");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn obtain_or_renew_fails_clearly_instead_of_racing_the_ca_when_dns01_never_becomes_visible() {
+        // The publish call to the control plane succeeds (unlike the
+        // already-covered forbidden-token case above), but the record never
+        // becomes publicly visible -- must fail with a clear propagation
+        // error and never reach/trigger the ACME server's own validation,
+        // not the confusing "authorization became invalid: NXDOMAIN" shape
+        // an agent would otherwise see straight from Let's Encrypt.
+        let (base, _mock) = spawn_mock_with_doh_delay(true, u32::MAX).await;
+        let dir = std::env::temp_dir().join(format!("ct-acme-e2e-stuck-doh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = AcmeCertConfig {
+            cp_url: base.clone(),
+            routing_token: "deadbeef".to_string(),
+            hostname: "app.example.com".to_string(),
+            directory_url: format!("{base}/directory"),
+            cert_out_dir: dir.clone(),
+            account_key_path: dir.join("account.der"),
+            dns01_resolver_url: format!("{base}/doh"),
+            dns01_propagation_timeout: Duration::from_millis(200),
+        };
+
+        let err = obtain_or_renew(&config).await.unwrap_err();
+        assert!(err.to_string().contains("DNS-01 propagation check failed"), "{err}");
+        assert!(!config.cert_path().exists(), "no cert file written when propagation never confirms");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

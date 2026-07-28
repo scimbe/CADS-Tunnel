@@ -9,6 +9,7 @@ pub mod capability;
 pub mod channel;
 pub mod channel_run;
 pub mod config;
+pub mod dns01_propagation;
 pub mod ladder;
 pub mod identity;
 pub mod observe;
