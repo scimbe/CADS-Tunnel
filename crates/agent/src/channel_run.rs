@@ -815,6 +815,23 @@ fn upgrade_safe_endpoint(ep: &str) -> Option<SocketAddr> {
         .filter(|addr| ct_common::channel::is_global_unicast(*addr))
 }
 
+/// Resolve an edge endpoint (`CT_CHANNEL_BROKER` / `CT_CHANNEL_RELAY`) that may be given as either a
+/// literal `IP:port` **or** a `host:port` hostname (#214: the plane's rendezvous/relay is often handed
+/// out as e.g. `bunsenbrenner.org:4433`). A literal address is taken as-is (no name lookup, so the
+/// common case and the tests stay resolver-free); otherwise it is resolved via DNS and the first
+/// address is used. A string with no port, or a name that resolves to nothing, is a clear error rather
+/// than the previous opaque "invalid socket address syntax".
+fn resolve_socket_addr(raw: &str) -> Result<SocketAddr, String> {
+    if let Ok(sa) = raw.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    use std::net::ToSocketAddrs;
+    raw.to_socket_addrs()
+        .map_err(|e| format!("{raw:?} is not an IP:port and did not resolve as host:port: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{raw:?} resolved to no addresses"))
+}
+
 impl ChannelJoinCliConfig {
     pub fn from_env() -> Result<Self, String> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -847,10 +864,8 @@ impl ChannelJoinCliConfig {
             other => return Err(format!("CT_CHANNEL_ROLE must be initiate|accept, got {other:?}")),
         };
         let addr = |k: &str, what: &str| -> Result<SocketAddr, String> {
-            f(k).ok_or_else(|| format!("{k} required ({what})"))?
-                .trim()
-                .parse()
-                .map_err(|e| format!("{k} invalid: {e}"))
+            let raw = f(k).ok_or_else(|| format!("{k} required ({what})"))?;
+            resolve_socket_addr(raw.trim()).map_err(|e| format!("{k} invalid ({what}): {e}"))
         };
         let broker_addr = addr("CT_CHANNEL_BROKER", "edge rendezvous host:port")?;
         let relay_addr = addr("CT_CHANNEL_RELAY", "edge relay host:port")?;
@@ -3920,6 +3935,27 @@ mod tests {
             !survived,
             "a backgrounded grandchild survived the timeout kill — the process group was not killed (#183)"
         );
+    }
+
+    #[test]
+    fn resolve_socket_addr_takes_ip_literals_and_resolves_hostnames_214() {
+        use std::net::SocketAddr;
+        // #214: a literal IP:port is taken as-is (no resolver), so the common case + tests are
+        // resolver-free and deterministic.
+        assert_eq!(
+            resolve_socket_addr("57.131.133.91:4433").unwrap(),
+            "57.131.133.91:4433".parse::<SocketAddr>().unwrap(),
+            "an IP:port literal parses unchanged"
+        );
+        // A host:port hostname resolves via DNS. `localhost` always resolves to a loopback address
+        // without any network (hermetic), so this exercises the resolution path deterministically —
+        // this is exactly what previously failed with "invalid socket address syntax".
+        let resolved = resolve_socket_addr("localhost:4433").expect("localhost:port resolves");
+        assert!(resolved.ip().is_loopback(), "localhost resolves to loopback, got {resolved}");
+        assert_eq!(resolved.port(), 4433, "the port is preserved through resolution");
+        // A bare host with NO port is a clear error (fast, no slow DNS), not an opaque parse failure.
+        let err = resolve_socket_addr("bunsenbrenner.org").expect_err("a host with no port is rejected");
+        assert!(err.contains("no IP:port") || err.contains("host:port"), "the error is descriptive: {err}");
     }
 
     #[test]
