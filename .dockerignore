@@ -17,6 +17,3 @@ agentdb.rvf.lock
 # include_str! and served live -- must be in the build context too.
 !docs/legal/
 !docs/legal/*.html
-# Same reason: the human "publish your service" onboarding page (served at /publish).
-!docs/landing/
-!docs/landing/*.html

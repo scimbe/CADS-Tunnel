@@ -62,4 +62,4 @@ it (§D).
 Got your first pipeline running? This project (and the free hosting behind
 `bunsenbrenner.org`) runs on donated time and a bit of coffee — if it helped you,
 consider supporting it: [Buy me a coffee](https://buymeacoffee.com/bunsenbrenner) ·
-[Support as a member on Steady](https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1).
+[Support as a member on Steady](https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413).

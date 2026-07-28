@@ -2291,79 +2291,276 @@ fn parse_metric(body: &str, name: &str) -> Option<i64> {
 const LANDING_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CADS-Tunnel — operator status</title>
+<title>Bunsenbrenner.org — create at home, publish world wide</title>
 <style>
- body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6edf3}
- h1{font-size:1.3rem} h2{font-size:1rem;color:#c9d1d9;margin:2rem 0 .5rem}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-top:1rem}
- .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem}
- .n{font-size:2rem;font-weight:700} .l{color:#8b949e;font-size:.85rem}
- .ok{color:#3fb950} .bad{color:#f85149} .foot{color:#8b949e;font-size:.8rem;margin-top:1.5rem}
- .top{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:.75rem}
- a.btn{display:inline-block;background:#238636;color:#fff;padding:.55rem 1.1rem;border-radius:8px;font-weight:600;text-decoration:none}
- a.btn:hover{background:#2ea043}
- a.btn.secondary{background:#21262d;border:1px solid #30363d}
- a.btn.secondary:hover{background:#30363d}
+ :root{--bg:#0b0e13;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--border2:#3d4551;--text:#e6edf3;--muted:#8b949e;--muted2:#c9d1d9;--accent:#238636;--accent2:#2ea043;--link:#58a6ff}
+ *{box-sizing:border-box}
+ html{scroll-behavior:smooth}
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+ a{color:var(--link)}
+ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+ .hero{position:relative;overflow:hidden;padding:2.2rem 1.5rem 3.5rem;
+  background:
+   radial-gradient(ellipse 70% 55% at 15% -15%, rgba(88,166,255,.16), transparent 60%),
+   radial-gradient(ellipse 55% 45% at 95% -10%, rgba(63,185,80,.14), transparent 60%),
+   var(--bg);
+  border-bottom:1px solid var(--border)}
+ .hero-inner{max-width:66rem;margin:0 auto}
+ .hero-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.75rem;margin-bottom:2.4rem}
+ .brand{font-size:1.35rem;font-weight:800;letter-spacing:-.02em;display:flex;align-items:center;gap:.4rem}
+ .brand .tld{color:var(--muted);font-weight:600}
+ .hero-nav{display:flex;gap:.6rem;flex-wrap:wrap}
+
+ h1{font-size:clamp(2.1rem,5.5vw,3.4rem);line-height:1.08;letter-spacing:-.02em;margin:0 0 1rem;font-weight:800;
+  background:linear-gradient(100deg,#f0f6fc 10%,#79c0ff 55%,#56d364 100%);
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+ .lede{font-size:1.2rem;color:var(--muted2);max-width:42rem;margin:0 0 1.4rem}
+
+ .badges{display:flex;gap:.6rem;flex-wrap:wrap;margin:0 0 2.6rem}
+ .badge{display:inline-flex;align-items:center;gap:.45rem;background:rgba(22,27,34,.7);border:1px solid var(--border);
+  border-radius:999px;padding:.4rem 1rem;font-size:.82rem;color:var(--muted2);backdrop-filter:blur(6px)}
+
+ a.btn{display:inline-flex;align-items:center;gap:.4rem;background:linear-gradient(135deg,var(--accent2),var(--accent));
+  color:#fff;padding:.65rem 1.3rem;border-radius:9px;font-weight:600;text-decoration:none;border:1px solid transparent;
+  box-shadow:0 2px 12px rgba(35,134,54,.35);transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}
+ a.btn:hover{transform:translateY(-1px);box-shadow:0 4px 18px rgba(35,134,54,.45);filter:brightness(1.05)}
+ a.btn:active{transform:translateY(0)}
+ a.btn.secondary{background:rgba(33,38,45,.7);border:1px solid var(--border);box-shadow:none}
+ a.btn.secondary:hover{background:#262c34;border-color:var(--border2);box-shadow:0 4px 14px rgba(0,0,0,.25)}
+ a.btn.support{background:linear-gradient(135deg,#a371f7,#8957e5);box-shadow:0 2px 12px rgba(137,87,229,.3)}
+ a.btn.support:hover{box-shadow:0 4px 18px rgba(137,87,229,.4)}
+ a.btn.big{padding:.85rem 1.7rem;font-size:1.05rem}
+
+ .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1.2rem;margin:0 0 2.2rem}
+ .step{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:14px;
+  padding:1.5rem 1.4rem 1.4rem;position:relative;transition:border-color .15s ease,transform .15s ease,box-shadow .15s ease}
+ .step:hover{border-color:var(--border2);transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.35)}
+ .step-n{position:absolute;top:-1rem;left:1.3rem;width:2.1rem;height:2.1rem;border-radius:50%;
+  background:linear-gradient(135deg,#3fb950,#238636);color:#fff;display:flex;align-items:center;justify-content:center;
+  font-weight:700;font-size:.95rem;box-shadow:0 3px 10px rgba(35,134,54,.45);border:2px solid var(--bg)}
+ .step h3{margin:.7rem 0 .5rem;font-size:1.08rem;letter-spacing:-.01em}
+ .step p{color:var(--muted2);font-size:.92rem;margin:0 0 .9rem}
+
+ .code-block{position:relative;margin-top:.5rem}
+ pre{background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:1rem 1.1rem;overflow-x:auto;
+  font-size:.8rem;margin:0;max-height:16rem}
+ .copy-btn{position:absolute;top:.55rem;right:.55rem;background:#21262d;border:1px solid var(--border);color:var(--text);
+  border-radius:7px;padding:.35rem .7rem;font-size:.78rem;font-weight:600;cursor:pointer;transition:background .15s ease}
+ .copy-btn:hover{background:#30363d}
+
+ .callout{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--link);border-radius:10px;
+  padding:1.1rem 1.3rem;font-size:.92rem;color:var(--muted2);max-width:58rem}
+ .callout a{color:var(--link)}
+
+ main{max-width:66rem;margin:0 auto;padding:3rem 1.5rem 2rem}
+ .features{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin:0 0 3rem}
+ .feature{padding:1.2rem 1.3rem;border:1px solid var(--border);border-radius:12px;background:var(--panel)}
+ .feature .icon{font-size:1.4rem;margin-bottom:.5rem}
+ .feature h3{margin:0 0 .3rem;font-size:1rem} .feature p{margin:0;color:var(--muted);font-size:.87rem}
+
+ .lab{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:14px;
+  padding:1.7rem 1.9rem;margin-bottom:3rem}
+ .lab h2{margin-top:0}
+
+ h2{font-size:1.2rem;color:var(--muted2);margin:0 0 .8rem;font-weight:700;letter-spacing:-.01em}
+ .section{margin-bottom:3rem}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-top:1rem}
+ .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:1.1rem;transition:border-color .15s ease}
+ .card:hover{border-color:var(--border2)}
+ .n{font-size:2rem;font-weight:700} .l{color:var(--muted);font-size:.85rem}
+ .ok{color:#3fb950} .bad{color:#f85149}
  ul.list{list-style:none;margin:.5rem 0 0;padding:0;display:flex;flex-direction:column;gap:.5rem}
- ul.list li{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:.75rem 1rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}
- ul.list .id{font-weight:600} ul.list .meta{color:#8b949e;font-size:.85rem}
- ul.list a{color:#58a6ff;text-decoration:none} ul.list a:hover{text-decoration:underline}
- .empty{color:#8b949e;font-size:.85rem;padding:.5rem 0}
- .legal-foot{color:#8b949e;font-size:.8rem;margin-top:.5rem}
- .legal-foot a{color:#8b949e;text-decoration:underline}
- .legal-foot a:hover{color:#c9d1d9}
- .cta-box{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1.3rem 1.5rem;margin:2rem 0}
- .cookie-notice{position:fixed;left:1rem;right:1rem;bottom:1rem;max-width:40rem;margin:0 auto;background:#161b22;
-  border:1px solid #30363d;border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:#c9d1d9;
+ ul.list li{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:.8rem 1.05rem;
+  display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;transition:border-color .15s ease}
+ ul.list li:hover{border-color:var(--border2)}
+ ul.list .id{font-weight:600} ul.list .meta{color:var(--muted);font-size:.85rem}
+ ul.list a{text-decoration:none} ul.list a:hover{text-decoration:underline}
+ .empty{color:var(--muted);font-size:.85rem;padding:.5rem 0}
+
+ .support{background:linear-gradient(135deg,rgba(163,113,247,.1),rgba(88,166,255,.08));border:1px solid var(--border);
+  border-radius:14px;padding:1.6rem 1.8rem;display:flex;justify-content:space-between;align-items:center;gap:1.5rem;flex-wrap:wrap}
+ .support p{margin:0;color:var(--muted2);max-width:32rem;font-size:.95rem}
+ .support .actions{display:flex;gap:.7rem;flex-wrap:wrap}
+
+ footer.site-footer{border-top:1px solid var(--border);background:var(--panel);padding:2rem 1.5rem}
+ footer.site-footer .footer-inner{max-width:66rem;margin:0 auto;display:flex;justify-content:space-between;
+  align-items:center;flex-wrap:wrap;gap:1rem}
+ footer.site-footer .foot{color:var(--muted);font-size:.82rem;max-width:34rem}
+ footer.site-footer .legal-links{display:flex;gap:.4rem;flex-wrap:wrap;font-size:.85rem;color:var(--muted)}
+ footer.site-footer .legal-links a{color:var(--muted);text-decoration:underline}
+ footer.site-footer .legal-links a:hover{color:var(--muted2)}
+ footer.site-footer .copyright{color:var(--muted);font-size:.8rem;width:100%;margin-top:1.2rem;padding-top:1.2rem;
+  border-top:1px solid var(--border)}
+
+ .cookie-notice{position:fixed;left:1rem;right:1rem;bottom:1rem;max-width:40rem;margin:0 auto;background:var(--panel);
+  border:1px solid var(--border);border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:var(--muted2);
   box-shadow:0 4px 20px rgba(0,0,0,.4);z-index:100;display:none}
  .cookie-notice.show{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;justify-content:space-between}
- .cookie-notice a{color:#58a6ff}
- .cookie-notice button{background:#238636;color:#fff;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
- .cookie-notice button:hover{background:#2ea043}
+ .cookie-notice button{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
+ .cookie-notice button:hover{background:var(--accent2)}
+
+ @media (max-width:640px){ .support{flex-direction:column;align-items:flex-start} }
 </style></head><body>
-<div class="top">
- <h1>CADS-Tunnel — operator status</h1>
- <div style="display:flex;gap:.6rem;flex-wrap:wrap">
-  <a class="btn" href="/publish">&#128293; Publish your service &rarr;</a>
-  <a class="btn" href="/llms.txt">&#129302; For AI agents &mdash; onboarding &rarr;</a>
-  <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
-  <a class="btn secondary" href="https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1" target="_blank" rel="noopener">&#128153; Support this project &rarr;</a>
-  <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
+
+<header class="hero">
+ <div class="hero-inner">
+  <div class="hero-top">
+   <div class="brand">&#128293; Bunsenbrenner<span class="tld">.org</span></div>
+   <div class="hero-nav">
+    <a class="btn secondary" href="/llms.txt">&#129302; For AI agents &rarr;</a>
+    <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
+   </div>
+  </div>
+
+  <h1>Create at home.<br>Publish world wide.</h1>
+  <p class="lede">
+   Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
+   own AI agent — and make it reachable at a real, encrypted HTTPS address. No open ports. No public IP.
+   Nobody, including us, sees the payload.
+  </p>
+  <div class="badges">
+   <span class="badge">&#128274; Zero-knowledge transport</span>
+   <span class="badge">&#127760; No public IP needed</span>
+   <span class="badge">&#9889; First success in minutes</span>
+  </div>
+
+  <div class="steps" id="get-started">
+   <div class="step">
+    <div class="step-n">1</div>
+    <h3>Register</h3>
+    <p>One-time, human step: create an account. This is the identity your subdomain and your published
+    pipelines/agents will be tied to.</p>
+    <a class="btn" href="/portal">Zum Kundenportal — Registrieren &rarr;</a>
+   </div>
+
+   <div class="step">
+    <div class="step-n">2</div>
+    <h3>Download the starter template</h3>
+    <p>A minimal, working "hello world" workflow pipeline — one role, one handler script that echoes
+    your input back. Proves the whole loop before you swap in your own idea. One click, no git needed.</p>
+    <a class="btn" href="/downloads/hello-world-pipeline.zip" download>&#11015; hello-world-pipeline.zip</a>
+   </div>
+
+   <div class="step">
+    <div class="step-n">3</div>
+    <h3>Let Claude Code build it with you</h3>
+    <p>Unzip the template, then paste this into
+    <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any coding
+    agent) — it reads the docs, wires up your identity, and adapts the template to your idea:</p>
+    <div class="code-block">
+     <button class="copy-btn" onclick="copyCode(this)" type="button">&#128203; Copy</button>
+     <pre><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+
+I downloaded and unzipped the starter template from
+https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
+
+1. Read the template's README.md (and https://bunsenbrenner.org/llms.txt for the
+   full AI-agent onboarding doc).
+2. Build ct-agent (there's a Docker one-liner in docs/install.md — I don't have a
+   Rust toolchain installed).
+3. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
+   want your service to do here&gt;. It's currently running on: &lt;your PC /
+   Raspberry Pi / container / agent&gt;.
+4. Walk me through minting my channel identity, running the handler as a live
+   role, and publishing my pipeline.
+
+I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></pre>
+    </div>
+   </div>
+
+   <div class="step">
+    <div class="step-n">4</div>
+    <h3>Your subdomain</h3>
+    <p>In the <strong>Standard</strong> tier you don't pick your own subdomain — it's assigned
+    automatically from your project id and your account's unique user id (e.g.
+    <code>hello-world-a3f9.bunsenbrenner.org</code>), so names never collide and every subdomain traces
+    back to an account. A future tier may offer custom/vanity subdomains.</p>
+   </div>
+  </div>
+
+  <div class="callout">
+   <strong>Security model, plainly stated:</strong> the tunnel exposes exactly one thing — the service
+   you point it at. It does not expose, scan, or secure the rest of your machine, and we cannot see what
+   runs on it. We provide secure (end-to-end encrypted) transport <em>to</em> your exposed service —
+   not protection <em>of</em> the device it runs on. Keeping your own machine and code secure —
+   including not introducing exploitable weaknesses through how you implement it — is your responsibility; see
+   <a href="/nutzungsbedingungen">Nutzungsbedingungen</a> §3–§5.
+  </div>
  </div>
-</div>
-<div id="health" class="l">loading…</div>
-<div class="grid">
- <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
- <div class="card"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
- <div class="card"><div class="n" id="pipelines">–</div><div class="l">published pipelines</div></div>
- <div class="card"><div class="n" id="directory">–</div><div class="l">discoverable agents</div></div>
- <div class="card"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
-</div>
+</header>
 
-<h2>Workflow pipelines</h2>
-<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
- <a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a>
-</div>
-<ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
+<main>
 
-<h2>AI agents</h2>
-<div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
- <a class="btn secondary" href="/registry/agents">Agent registry (raw) &rarr;</a>
-</div>
-<ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
+ <div class="features">
+  <div class="feature"><div class="icon">&#128274;</div><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
+  <div class="feature"><div class="icon">&#128421;</div><h3>Any hardware</h3><p>Laptop, Raspberry Pi, spare VM, container, or your own AI agent — nothing runs on our infrastructure.</p></div>
+  <div class="feature"><div class="icon">&#129302;</div><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
+ </div>
 
-<div class="cta-box">
- <h2 style="margin-top:0">&#128293; Have your own idea? Publish it — with Claude Code doing the wiring</h2>
- <p style="color:#c9d1d9;margin:.4rem 0 .8rem">
-  Register, download the hello-world starter, then hand Claude Code (or any coding agent) one prompt —
-  it reads the docs, mints your identity, and turns the template into your service. Runs on whatever
-  you already have: a laptop, a Raspberry Pi, a container, your own agent.
- </p>
- <a class="btn" href="/publish">Get your first success in 4 steps &rarr;</a>
-</div>
+ <div class="lab">
+  <h2 style="margin-top:0">What is "Bunsenbrenner"?</h2>
+  <p>
+   Picture a lab bench. A Bunsen burner isn't the experiment — it's the reliable, unglamorous heat
+   source every experiment on that bench depends on, so you can focus on the idea instead of
+   re-inventing how to make fire.
+  </p>
+  <p style="margin-bottom:0">
+   <strong>bunsenbrenner.org is that bench.</strong> A shared lab where you can test an idea, run it on
+   whatever hardware you already have, and hand the result to other people — over a real, encrypted,
+   publicly reachable address — without having to build or trust a whole platform first. Some ideas here
+   started as a weekend demo and are now real, working pipelines with their own community of
+   contributors. That's the point: a straight line from "it works on my machine" to "here, try it."
+  </p>
+ </div>
 
-<div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
-<div class="legal-foot"><a href="/impressum">Impressum</a> · <a href="/datenschutz">Datenschutzerklärung</a> · <a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
+ <div class="section">
+  <h2>Workflow pipelines</h2>
+  <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
+   <a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a>
+  </div>
+  <ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
+ </div>
+
+ <div class="section">
+  <h2>AI agents</h2>
+  <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
+   <a class="btn secondary" href="/registry/agents">Agent registry (raw) &rarr;</a>
+  </div>
+  <ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
+ </div>
+
+ <div class="section support">
+  <p><strong>Keep the lab running.</strong> Bunsenbrenner is free to use and runs on donated time and
+  server costs. If it helped you get something live, a small contribution keeps it going.</p>
+  <div class="actions">
+   <a class="btn support" href="https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413" target="_blank" rel="noopener">&#128153; Support as a member &rarr;</a>
+   <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
+  </div>
+ </div>
+
+ <div class="section">
+  <h2>Live operator status</h2>
+  <div id="health" class="l">loading…</div>
+  <div class="grid">
+   <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
+   <div class="card"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
+   <div class="card"><div class="n" id="pipelines">–</div><div class="l">published pipelines</div></div>
+   <div class="card"><div class="n" id="directory">–</div><div class="l">discoverable agents</div></div>
+   <div class="card"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
+  </div>
+ </div>
+
+</main>
+
+<footer class="site-footer">
+ <div class="footer-inner">
+  <div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
+  <div class="legal-links"><a href="/impressum">Impressum</a> · <a href="/datenschutz">Datenschutzerklärung</a> · <a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
+  <div class="copyright">&copy; Bunsenbrenner.org — Martin Becke</div>
+ </div>
+</footer>
+
 <script>
  async function refresh(){
   try{
@@ -2399,6 +2596,12 @@ const LANDING_HTML: &str = r#"<!doctype html>
      '<a href="'+esc(a.card_url)+'">card &rarr;</a></li>'
    ).join('');
   }catch(e){ el.innerHTML = '<li class="empty">unreachable</li>'; }
+ }
+ function copyCode(btn){
+  const block = btn.parentElement.querySelector('code');
+  const text = block ? block.textContent : '';
+  const done = () => { const orig = btn.innerHTML; btn.innerHTML = '&#9989; Copied'; setTimeout(()=>{ btn.innerHTML = orig; }, 1600); };
+  if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done).catch(()=>{}); }
  }
  refresh(); refreshPipelines(); refreshAgents();
  setInterval(refresh,5000); setInterval(refreshPipelines,15000); setInterval(refreshAgents,15000);
@@ -2436,22 +2639,43 @@ const DATENSCHUTZ_HTML: &str = include_str!("../../../docs/legal/datenschutz.htm
 /// the operator against third-party claims arising from) their own service run through the platform.
 const NUTZUNGSBEDINGUNGEN_HTML: &str = include_str!("../../../docs/legal/nutzungsbedingungen.html");
 
-/// The human "publish your service" onboarding page: register → download the hello-world starter
-/// template → an example Claude Code prompt to adapt it → the subdomain-assignment policy — plus the
-/// closing "what is Bunsenbrenner" explanation. Distinct from `/llms.txt` (the AI-agent-facing,
-/// machine-readable onboarding doc) — this is the human-facing entry point linked from the landing
-/// page, for a customer bringing their own hardware/idea rather than an autonomous agent reading docs.
-const PUBLISH_HTML: &str = include_str!("../../../docs/landing/publish.html");
+/// The downloadable "hello world" starter template (register → download → adapt with Claude Code →
+/// publish), zipped so a human onboarding on the landing page gets it with one click instead of
+/// needing `git`. Rebuild via the same `python3 -m zipfile` invocation whenever
+/// `examples/hello-world-pipeline/{pipeline-spec.json,hello-handler.sh,README.md}` change.
+const HELLO_WORLD_ZIP: &[u8] =
+    include_bytes!("../../../examples/hello-world-pipeline/hello-world-pipeline.zip");
 
-/// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`]; `GET /llms.txt` serves the
-/// AI-agent onboarding doc (#174) as plain text so a CLI agent can `curl` it and a browser renders it.
-/// `/publish` is the human-facing "get started" onboarding page. `/impressum`, `/datenschutz`,
-/// `/nutzungsbedingungen` serve the legal pages linked from the landing page's footer.
+/// Build the landing-page router (F4.2): `GET /` serves [`LANDING_HTML`], which now also carries the
+/// full human "get started" onboarding (register → download → Claude Code prompt → subdomain policy)
+/// inline rather than on a separate `/publish` subpage. `/publish` redirects to `/#get-started` for
+/// anyone with an old link. `GET /llms.txt` serves the AI-agent onboarding doc (#174) as plain text so
+/// a CLI agent can `curl` it. `/downloads/hello-world-pipeline.zip` serves the starter template as a
+/// real download (no `git clone` required). `/impressum`, `/datenschutz`, `/nutzungsbedingungen` serve
+/// the legal pages linked from the footer.
 pub fn landing_router() -> Router {
     Router::new()
         .route("/", get(landing_handler))
         .route("/llms.txt", get(llms_txt_handler))
-        .route("/publish", get(|| async { axum::response::Html(PUBLISH_HTML) }))
+        .route(
+            "/publish",
+            get(|| async { axum::response::Redirect::temporary("/#get-started") }),
+        )
+        .route(
+            "/downloads/hello-world-pipeline.zip",
+            get(|| async {
+                (
+                    [
+                        ("content-type", "application/zip"),
+                        (
+                            "content-disposition",
+                            "attachment; filename=\"hello-world-pipeline.zip\"",
+                        ),
+                    ],
+                    HELLO_WORLD_ZIP,
+                )
+            }),
+        )
         .route("/impressum", get(|| async { axum::response::Html(IMPRESSUM_HTML) }))
         .route("/datenschutz", get(|| async { axum::response::Html(DATENSCHUTZ_HTML) }))
         .route(
@@ -5212,7 +5436,9 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8_lossy(&body);
         // Self-contained (no external asset URLs) and renders the status figures.
-        assert!(html.contains("operator status"), "has a title");
+        assert!(html.contains("Bunsenbrenner"), "has the Bunsenbrenner branding");
+        assert!(html.contains("Create at home"), "has the onboarding tagline");
+        assert!(html.contains("operator status"), "has the live-status section");
         assert!(html.contains("fetch('/status')"), "fetches the status endpoint");
         assert!(
             html.contains("registered tunnels") && html.contains("uptime"),
@@ -5253,15 +5479,53 @@ mod tests {
         // #174: the operator status page links AI agents to the onboarding entry point, and that
         // entry point is served live at /llms.txt (the doc as plain text a CLI agent can curl).
         assert!(html.contains(r#"href="/llms.txt""#), "links AI agents to the onboarding doc (#174)");
-        assert!(html.contains(r#"href="/publish""#), "links human makers to the publish onboarding page");
+        // The human "get started" onboarding (register/download/prompt/subdomain) now lives inline
+        // on the landing page itself, not a separate /publish subpage.
+        assert!(html.contains(r#"id="get-started""#), "the onboarding steps are anchored for deep-linking");
         assert!(
-            html.contains("https://steady.page/plans/6038c56b-6f15-4d68-a5c2-74573d7dd9c1"),
+            html.contains("/downloads/hello-world-pipeline.zip"),
+            "offers a one-click template download (no git required)"
+        );
+        assert!(html.contains("copyCode"), "the Claude Code prompt has a copy-to-clipboard button");
+        assert!(
+            html.contains("https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413"),
             "links to the project's support/membership page"
         );
         assert!(
             html.contains("https://buymeacoffee.com/bunsenbrenner"),
             "links to the project's Buy Me a Coffee page"
         );
+        // /publish still redirects (old links / bookmarks keep working) to the merged section.
+        let app_pub = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp_pub = app_pub.oneshot(Request::get("/publish").body(Body::empty()).unwrap()).await.unwrap();
+        assert!(resp_pub.status().is_redirection(), "/publish redirects, got {}", resp_pub.status());
+        assert_eq!(
+            resp_pub.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/#get-started"),
+            "/publish redirects into the merged landing-page section"
+        );
+        // The starter template is a real, downloadable zip (not a 404, not HTML).
+        let app_zip = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
+        let resp_zip = app_zip
+            .oneshot(Request::get("/downloads/hello-world-pipeline.zip").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp_zip.status(), StatusCode::OK);
+        assert_eq!(
+            resp_zip.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/zip")
+        );
+        assert!(
+            resp_zip
+                .headers()
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("hello-world-pipeline.zip"),
+            "downloads with a real filename, not just an octet stream"
+        );
+        let zip_bytes = to_bytes(resp_zip.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&zip_bytes[..2], b"PK", "serves a real zip archive (PK magic bytes)");
         let app2 = persistent_control_plane_router(":memory:", b"whsec", None).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
@@ -5296,7 +5560,8 @@ mod tests {
             ("/datenschutz", vec!["DSGVO", "TTDSG", "Cookies"]),
             ("/nutzungsbedingungen", vec!["Freistellung", "Nutzerdienst", "§§ 7", "TMG"]),
             (
-                "/publish",
+                // The human "get started" onboarding now lives inline on the landing page itself.
+                "/",
                 vec![
                     "Register",
                     "hello-world-pipeline",
