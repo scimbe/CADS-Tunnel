@@ -74,7 +74,7 @@ impl AcmeCertConfig {
     /// `/shared/acme-cert`), `CT_ACME_ACCOUNT_KEY_PATH` (default
     /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URLS`
     /// (comma-separated, defaults to two independent public DoH resolvers),
-    /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 90).
+    /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 180).
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }

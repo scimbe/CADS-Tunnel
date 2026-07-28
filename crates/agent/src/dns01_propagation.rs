@@ -20,11 +20,21 @@
 //! plausibly have already been queried against the default resolver by an
 //! earlier attempt; a second, independent resolver operator is unlikely to
 //! share that exact cache poisoning.
+//!
+//! [`DEFAULT_TIMEOUT`] has real margin built in on purpose: measured deSEC
+//! propagation to a public resolver has ranged from ~10s up to just over 90s
+//! across repeated live tests against the same zone -- a short timeout here
+//! doesn't just risk a slower issuance, it risks the record briefly
+//! *becoming* valid just after giving up, only for the caller's own
+//! post-attempt cleanup (always run, success or failure -- see
+//! `crate::acme_client::AcmeClient::validate_authorization`) to delete it
+//! moments later, which from the outside looks indistinguishable from
+//! "never published at all."
 
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_RESOLVER_URLS: &[&str] = &["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"];
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 
 pub struct PropagationWaiter {

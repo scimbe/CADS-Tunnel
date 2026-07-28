@@ -480,6 +480,11 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
         Ok(None) => return (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    // Best-effort: a Mesh-Plane-only tunnel (no DNS configured) has no
+    // hostname, and this must never fail the page over that -- only the
+    // env block's CT_AGENT_HOSTNAME line is affected, not the tunnel's
+    // actual tokens above.
+    let hostname = st.tunnels.hostname_if_authorized(&subject, &id).ok().flatten();
     // Mint a fresh single-use join token bound to the customer (subject as tenant).
     let token = match st.enrollment.issue_join_token(&TenantId(subject.clone())) {
         Ok(t) => hex(&t.0),
@@ -487,8 +492,17 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     };
     let edge_host = edge_host_port(&st.portal_base);
     let build_cmd = "git clone https://github.com/scimbe/CADS-Tunnel.git && cd CADS-Tunnel\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine";
+    // Only this tunnel's own already-assigned hostname -- never a value the
+    // caller supplies -- so the agent never has to copy it by hand from the
+    // tunnels list, and can never accidentally (or otherwise) end up with a
+    // hostname it doesn't actually own in its own .env. Omitted entirely for
+    // a Mesh-Plane-only tunnel (no DNS configured, so no hostname exists).
+    let hostname_line = hostname
+        .as_deref()
+        .map(|h| format!("\nCT_AGENT_HOSTNAME={h}   # this tunnel's own assigned hostname -- for CT_AGENT_MODE=browser and `ct-agent certificate`"))
+        .unwrap_or_default();
     let env_block = format!(
-        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_EDGE_CERT_URL={cp}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
+        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_EDGE_CERT_URL={cp}{hostname_line}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
         jt = token,
         rt = routing_token,
         id = id,
@@ -1313,6 +1327,69 @@ mod tests {
             Some("primary".to_string()),
             "resolvable by hostname too"
         );
+    }
+
+    #[tokio::test]
+    async fn install_page_carries_the_tunnels_own_assigned_hostname_not_a_bare_mesh_tunnel() {
+        // The agent should never have to copy its own already-assigned hostname
+        // by hand from the tunnels list -- the install page's .env carries it
+        // directly, for CT_AGENT_MODE=browser and `ct-agent certificate`.
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let desec = ct_dns::provider::DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            _ => None,
+        })
+        .unwrap();
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            Some((desec, "1.2.3.4".to_string())),
+            None,
+            EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
+        );
+
+        assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK);
+        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
+        let expected_host = tunnel.hostname.clone().expect("DNS configured -- auto-assigned a hostname");
+
+        let (status, html) = get(&app, &format!("/portal/tunnels/{}/install", tunnel.id), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(&format!("CT_AGENT_HOSTNAME={expected_host}")),
+            "carries this tunnel's own hostname, not left for the agent to copy by hand: {html}"
+        );
+
+        // A tunnel with no hostname (no DNS configured at all) must not show a
+        // bogus/empty CT_AGENT_HOSTNAME line -- omitted entirely, not blank.
+        let no_dns_tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let no_dns_mesh = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let no_dns_app = portal_api_router(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            no_dns_tunnels.clone(),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            EdgeMeshHandle::new(no_dns_mesh, Arc::from("primary")),
+        );
+        assert_eq!(get(&no_dns_app, "/portal/tunnels", Some("bob")).await.0, StatusCode::OK);
+        let bare_tunnel = &no_dns_tunnels.list_for_subject("bob").unwrap()[0];
+        assert!(bare_tunnel.hostname.is_none(), "no DNS configured -- no hostname assigned");
+        let (_, bare_html) =
+            get(&no_dns_app, &format!("/portal/tunnels/{}/install", bare_tunnel.id), Some("bob")).await;
+        assert!(!bare_html.contains("CT_AGENT_HOSTNAME"), "omitted, not blank, when there's no hostname to carry");
     }
 
     #[tokio::test]

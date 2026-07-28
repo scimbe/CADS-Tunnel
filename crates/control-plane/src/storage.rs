@@ -1292,6 +1292,41 @@ impl SqliteTunnelStore {
         Ok(granted.map(|_| token))
     }
 
+    /// The public hostname of a tunnel `subject` is **authorized** to use — same
+    /// owner-or-grantee rule as [`Self::routing_token_if_authorized`] — or `None`
+    /// if unauthorized, unknown, or the tunnel simply has no hostname assigned
+    /// (a Mesh-Plane-only tunnel). Lets the install page hand the agent its own
+    /// already-assigned hostname instead of the agent copying it by hand from
+    /// the tunnels list.
+    pub fn hostname_if_authorized(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock_safe();
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT subject, hostname FROM subject_tunnels WHERE id = ?1",
+                params![tunnel_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((owner, hostname)) = row else {
+            return Ok(None);
+        };
+        if owner == subject {
+            return Ok(hostname);
+        }
+        let granted: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(granted.and(hostname))
+    }
+
     /// List every tunnel `subject` is authorized to use — the ones they own plus
     /// the ones shared with them (#29) — each flagged with whether they own it
     /// (owned tunnels get the management actions; shared ones are read-only).
