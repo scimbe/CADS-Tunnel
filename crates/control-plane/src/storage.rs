@@ -2250,15 +2250,15 @@ mod tests {
         // #174 B (frozen): a designer publishes a workflow PipelineSpec so agents can discover it —
         // owner-scoped (a stranger can't overwrite), round-trips through JSON, unknown id → None.
         use ct_common::channel::ServiceType;
-        use ct_common::pipeline::{PipelineSpec, RequiredRole};
+        use ct_common::pipeline::{PipelineSpec, RequiredRole, SelectionPolicy};
         let reg = SqlitePipelineRegistry::open_in_memory().unwrap();
         let spec = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "physics".into() },
-                RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "art".into() },
+                RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "art".into(), selection_policy: None },
             ],
-            operator_pubkey_hex: None,
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         assert!(reg.publish("alice", &spec, 100).unwrap(), "owner publishes");
         assert_eq!(reg.get("flappy").unwrap(), Some(spec.clone()), "published spec round-trips");
@@ -2266,15 +2266,15 @@ mod tests {
         assert_eq!(reg.list().unwrap(), vec![("flappy".to_string(), "alice".to_string())], "discoverable in the list");
 
         // Owner-scoped: a different owner cannot overwrite the published spec.
-        let hijack = PipelineSpec { id: "flappy".into(), roles: vec![], operator_pubkey_hex: None };
+        let hijack = PipelineSpec { id: "flappy".into(), roles: vec![], operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor };
         assert!(!reg.publish("mallory", &hijack, 200).unwrap(), "non-owner cannot overwrite");
         assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 2, "spec unchanged after hijack attempt");
 
         // The owner re-publishing updates it.
         let updated = PipelineSpec {
             id: "flappy".into(),
-            roles: vec![RequiredRole { service: ServiceType::SafetyCheck, units: 1, tag: "guard".into() }],
-            operator_pubkey_hex: None,
+            roles: vec![RequiredRole { service: ServiceType::SafetyCheck, units: 1, tag: "guard".into(), selection_policy: None }],
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         assert!(reg.publish("alice", &updated, 300).unwrap(), "owner re-publish");
         assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 1, "owner re-publish updates the spec");
