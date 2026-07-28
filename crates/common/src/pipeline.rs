@@ -23,6 +23,7 @@ use crate::channel::{AgentCard, CapacityOffer, ChannelId, ServiceType, UnixSecon
 use crate::settlement::Hold;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// One role a pipeline requires. The `service` is the [`ServiceType`] the role's capacity
 /// [`CapacityOffer`] must declare (the auction/offer dimension); the `tag` is the human role name
@@ -115,6 +116,105 @@ pub struct RoleAssignment {
     pub price: u64,
 }
 
+/// The rule [`convene_with`](PipelineSpec::convene_with) uses to pick the winner **among the offers
+/// that already qualify** for a role (all equally valid/eligible — this only decides *which*
+/// qualifying offer wins, never whether a role is fillable). A workflow-pipeline owner selects the
+/// policy in their bridge config, so cheapest-price clearing can be traded for fair load
+/// distribution across N interchangeable providers **without any core change** (#207/#208 asked for
+/// "fallback / load-balancing, controlled by the auction"; #207 only ever designed the failover
+/// half — the priority-tiered-floor case below — and named load-balancing as an undelivered bonus).
+///
+/// Every policy ranks *only the currently-valid* offers (a role's stale/expired offers are already
+/// filtered out before it runs), so **failover is preserved under all three**: when the current
+/// winner's offer goes stale (its short-TTL heartbeat stops, #207), the next convene simply re-picks
+/// over whoever is still live. `LowestFloor` + tiered floors = priority failover; `RoundRobin` /
+/// `LeastCalls` over equal-floor live offers = load-balancing. Same offer pool, swappable rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SelectionPolicy {
+    /// Cheapest offer wins (lowest `min_price`), ties broken by holder key for determinism. The
+    /// original — and **default** — behavior: convening with this over a fresh
+    /// [`SelectionState`] is byte-identical to the pre-policy `convene`. Gives priority-failover
+    /// when a preferred provider publishes a *lower* floor than its standby (source-2 primary vs
+    /// sink standby, #207/#208). Stateless.
+    #[default]
+    LowestFloor,
+    /// Rotate across the qualifying providers: each convene picks the next provider (deterministic
+    /// order by holder key, wrap-around) after the one that last won this role. Over N stable live
+    /// providers this cycles 1→2→…→N→1, spreading load evenly. Stateful — see [`SelectionState`].
+    RoundRobin,
+    /// Route to the qualifying provider that has served the fewest jobs so far (ties broken by
+    /// floor, then holder key). Self-balancing: a freshly added *copy* provider starts at zero and
+    /// is preferred until it catches up, so adding a clone drains the backlog off the busy ones
+    /// with no reconfig. Stateful — see [`SelectionState`].
+    LeastCalls,
+}
+
+/// The cross-convene state the stateful [`SelectionPolicy`] variants carry between calls. The
+/// auction engine stays pure — the **caller** (a pipeline's bridge) owns this value and threads the
+/// same instance through successive convenes, so a policy change or a core restart can never corrupt
+/// engine internals. [`SelectionPolicy::LowestFloor`] reads and writes none of it, so a default
+/// (empty) state convenes identically to the old stateless `convene` — the reason back-compat holds.
+///
+/// Persistence, if any, is the caller's choice (in-memory is enough for load-balancing while the
+/// bridge runs); core deliberately does not pin a wire format for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionState {
+    /// Per role `tag` → the holder key that last won it, so `RoundRobin` can advance to the next.
+    pub round_robin_cursor: BTreeMap<String, [u8; 32]>,
+    /// Per provider holder key → jobs it has been assigned, so `LeastCalls` can prefer the laggard.
+    pub served_counts: BTreeMap<[u8; 32], u64>,
+}
+
+impl SelectionPolicy {
+    /// Pick the winner among `qualifying` (already filtered to the valid, eligible, not-yet-assigned
+    /// offers for one role — the caller guarantees it is **non-empty**) and update `state` so the
+    /// next convene of this role sees the effect. `role_tag` scopes the `RoundRobin` cursor.
+    fn pick<'o>(
+        self,
+        role_tag: &str,
+        qualifying: &[&'o CapacityOffer],
+        state: &mut SelectionState,
+    ) -> &'o CapacityOffer {
+        match self {
+            SelectionPolicy::LowestFloor => qualifying
+                .iter()
+                .copied()
+                .min_by(|a, b| a.min_price.cmp(&b.min_price).then_with(|| a.holder_pubkey.cmp(&b.holder_pubkey)))
+                .expect("caller guarantees qualifying is non-empty"),
+            SelectionPolicy::RoundRobin => {
+                // Deterministic ring so rotation is stable regardless of offer arrival order.
+                let mut ring: Vec<&CapacityOffer> = qualifying.to_vec();
+                ring.sort_by(|a, b| a.holder_pubkey.cmp(&b.holder_pubkey));
+                // Next provider strictly after the last winner. If the last winner is gone
+                // (offline) this lands on the next-higher key; if it was the highest (or unset),
+                // wrap to the ring start. Either way we advance over the *live* set → failover.
+                let start = match state.round_robin_cursor.get(role_tag) {
+                    Some(last) => ring.iter().position(|o| o.holder_pubkey > *last).unwrap_or(0),
+                    None => 0,
+                };
+                let chosen = ring[start];
+                state.round_robin_cursor.insert(role_tag.to_string(), chosen.holder_pubkey);
+                chosen
+            }
+            SelectionPolicy::LeastCalls => {
+                let chosen = qualifying
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| {
+                        let ca = state.served_counts.get(&a.holder_pubkey).copied().unwrap_or(0);
+                        let cb = state.served_counts.get(&b.holder_pubkey).copied().unwrap_or(0);
+                        ca.cmp(&cb)
+                            .then_with(|| a.min_price.cmp(&b.min_price))
+                            .then_with(|| a.holder_pubkey.cmp(&b.holder_pubkey))
+                    })
+                    .expect("caller guarantees qualifying is non-empty");
+                *state.served_counts.entry(chosen.holder_pubkey).or_insert(0) += 1;
+                chosen
+            }
+        }
+    }
+}
+
 /// An agent the pipeline can invite for a role (the PUSH path), with the channels its card
 /// advertises it is reachable via.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,23 +254,42 @@ impl PipelineSpec {
             .collect()
     }
 
-    /// Convene the pipeline against the currently-online `offers`. Runs a per-role auction and
-    /// returns the winning [`RoleAssignment`] for **every** role, or the first
-    /// [`PipelineError::UnfilledRole`] if any role has no matchable offer online.
-    ///
-    /// An offer fills a role iff it (a) [`is_valid`](CapacityOffer::is_valid) at `now`
-    /// (signature + not expired), (b) its declared `services` contains the role's service (the
-    /// #167 opt-in catalog — a generic empty-services offer never fills a role), and (c) it
-    /// advertises at least the units the role needs. Among qualifying offers the winner is the
-    /// one with the **lowest floor** (`min_price`, cheapest for the buyer), ties broken by holder
-    /// key for determinism. A provider wins **at most one** role per convene (#172 cross-role
-    /// exclusivity), so N roles sharing a `ServiceType` require N *distinct* online providers —
-    /// otherwise the surplus roles error, preserving the "not enough online → error" guarantee even
-    /// when the closed `ServiceType` set is coarser than the roles.
+    /// Convene the pipeline against the currently-online `offers` with the default
+    /// [`SelectionPolicy::LowestFloor`] auction (cheapest floor wins) — the original signature and
+    /// behavior, preserved unchanged for every existing caller. Equivalent to
+    /// [`convene_with`](Self::convene_with) with `LowestFloor` and a fresh [`SelectionState`].
     pub fn convene(
         &self,
         offers: &[CapacityOffer],
         now: UnixSeconds,
+    ) -> Result<Vec<RoleAssignment>, PipelineError> {
+        self.convene_with(offers, now, SelectionPolicy::LowestFloor, &mut SelectionState::default())
+    }
+
+    /// Convene the pipeline against the currently-online `offers`, clearing each role's auction with
+    /// the given [`SelectionPolicy`]. Runs a per-role auction and returns the winning
+    /// [`RoleAssignment`] for **every** role, or the first [`PipelineError::UnfilledRole`] if any
+    /// role has no matchable offer online.
+    ///
+    /// An offer fills a role iff it (a) [`is_valid`](CapacityOffer::is_valid) at `now`
+    /// (signature + not expired), (b) its declared `services` contains the role's service (the
+    /// #167 opt-in catalog — a generic empty-services offer never fills a role), and (c) it
+    /// advertises at least the units the role needs. **Which** qualifying offer wins is decided by
+    /// `policy` (see [`SelectionPolicy`]); `LowestFloor` is the cheapest-floor auction `convene`
+    /// has always run. A provider wins **at most one** role per convene (#172 cross-role
+    /// exclusivity), so N roles sharing a `ServiceType` require N *distinct* online providers —
+    /// otherwise the surplus roles error, preserving the "not enough online → error" guarantee even
+    /// when the closed `ServiceType` set is coarser than the roles.
+    ///
+    /// `state` carries the cross-convene bookkeeping the stateful policies need; pass the *same*
+    /// instance across successive convenes (the caller owns it). `LowestFloor` ignores it, so a
+    /// fresh `SelectionState::default()` is fine there.
+    pub fn convene_with(
+        &self,
+        offers: &[CapacityOffer],
+        now: UnixSeconds,
+        policy: SelectionPolicy,
+        state: &mut SelectionState,
     ) -> Result<Vec<RoleAssignment>, PipelineError> {
         if self.roles.is_empty() {
             return Err(PipelineError::Empty);
@@ -184,7 +303,9 @@ impl PipelineSpec {
         // guarantee. With it, N same-typed roles genuinely need N distinct online providers.
         let mut assigned: Vec<[u8; 32]> = Vec::with_capacity(self.roles.len());
         for role in &self.roles {
-            let winner = offers
+            // Eligibility is policy-independent: valid + declares the service + enough units + not
+            // already assigned this convene. The policy only ranks whoever survives this filter.
+            let qualifying: Vec<&CapacityOffer> = offers
                 .iter()
                 .filter(|o| {
                     o.is_valid(now)
@@ -192,23 +313,18 @@ impl PipelineSpec {
                         && o.units_available >= role.units
                         && !assigned.contains(&o.holder_pubkey)
                 })
-                .min_by(|a, b| {
-                    a.min_price
-                        .cmp(&b.min_price)
-                        .then_with(|| a.holder_pubkey.cmp(&b.holder_pubkey))
-                });
-            match winner {
-                Some(o) => {
-                    assigned.push(o.holder_pubkey);
-                    assignments.push(RoleAssignment {
-                        service: role.service,
-                        provider: o.holder_pubkey,
-                        units: role.units,
-                        price: o.min_price,
-                    });
-                }
-                None => return Err(PipelineError::UnfilledRole { service: role.service }),
+                .collect();
+            if qualifying.is_empty() {
+                return Err(PipelineError::UnfilledRole { service: role.service });
             }
+            let o = policy.pick(&role.tag, &qualifying, state);
+            assigned.push(o.holder_pubkey);
+            assignments.push(RoleAssignment {
+                service: role.service,
+                provider: o.holder_pubkey,
+                units: role.units,
+                price: o.min_price,
+            });
         }
         Ok(assignments)
     }
@@ -592,5 +708,107 @@ mod tests {
         );
         escrow.refund(&holds[1].match_ref, 500).expect("refund after expiry");
         assert_eq!(escrow.balance(&buyer), 910 + 40, "unspent role refunded to the buyer");
+    }
+
+    /// A single-role flappy-style `physics` spec — the reference role of #207/#208.
+    fn physics_spec() -> PipelineSpec {
+        PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() }],
+            operator_pubkey_hex: None,
+        }
+    }
+
+    #[test]
+    fn lowest_floor_is_the_default_and_convene_matches_convene_with() {
+        // Back-compat contract: the default policy is LowestFloor, and the old `convene` is exactly
+        // `convene_with(LowestFloor, fresh state)` — cheapest floor still wins, nothing regresses.
+        assert_eq!(SelectionPolicy::default(), SelectionPolicy::LowestFloor);
+        let spec = physics_spec();
+        let dear = offer(1, vec![TextGeneration], 20, 50, 1000);
+        let cheap = offer(2, vec![TextGeneration], 20, 30, 1000);
+        let offers = [dear, cheap];
+        let via_default = spec.convene(&offers, 100).unwrap();
+        let via_policy = spec
+            .convene_with(&offers, 100, SelectionPolicy::LowestFloor, &mut SelectionState::default())
+            .unwrap();
+        assert_eq!(via_default, via_policy, "convene() == convene_with(LowestFloor, fresh)");
+        assert_eq!(via_default[0].provider, holder(2), "cheapest floor wins by default");
+        assert_eq!(via_default[0].price, 30);
+    }
+
+    #[test]
+    fn round_robin_spreads_load_across_equal_floor_providers() {
+        // Two interchangeable providers with an identical floor: LowestFloor would pin every job to
+        // the same one; RoundRobin alternates so each serves exactly half — the load-balancing #207
+        // named but never implemented.
+        let spec = physics_spec();
+        let offers = [
+            offer(1, vec![TextGeneration], 20, 50, 1000),
+            offer(2, vec![TextGeneration], 20, 50, 1000),
+        ];
+        let mut state = SelectionState::default();
+        let winners: Vec<[u8; 32]> = (0..4)
+            .map(|_| spec.convene_with(&offers, 100, SelectionPolicy::RoundRobin, &mut state).unwrap()[0].provider)
+            .collect();
+        assert_ne!(winners[0], winners[1], "never the same provider twice in a row");
+        assert_eq!(winners[0], winners[2], "cycles back after all providers had a turn");
+        assert_eq!(winners[1], winners[3]);
+        assert_eq!(winners.iter().filter(|w| **w == holder(1)).count(), 2, "half the jobs each");
+        assert_eq!(winners.iter().filter(|w| **w == holder(2)).count(), 2);
+    }
+
+    #[test]
+    fn least_calls_routes_to_the_laggard_and_absorbs_a_fresh_copy() {
+        let spec = physics_spec();
+        let p1 = offer(1, vec![TextGeneration], 20, 50, 1000);
+        let p2 = offer(2, vec![TextGeneration], 20, 50, 1000);
+        let mut state = SelectionState::default();
+
+        // Two equal providers → least-calls balances 1:1 over an even number of jobs.
+        let two = [p1.clone(), p2.clone()];
+        for _ in 0..4 {
+            spec.convene_with(&two, 100, SelectionPolicy::LeastCalls, &mut state).unwrap();
+        }
+        assert_eq!(state.served_counts.get(&holder(1)).copied().unwrap_or(0), 2);
+        assert_eq!(state.served_counts.get(&holder(2)).copied().unwrap_or(0), 2);
+
+        // A brand-new *copy* joins at zero served → it is preferred until it catches up, draining
+        // the backlog off the busy providers with no reconfig ("provide agents as a copy the auction
+        // can take as an alternative").
+        let three = [p1, p2, offer(3, vec![TextGeneration], 20, 50, 1000)];
+        let next: Vec<[u8; 32]> = (0..2)
+            .map(|_| spec.convene_with(&three, 100, SelectionPolicy::LeastCalls, &mut state).unwrap()[0].provider)
+            .collect();
+        assert!(next.iter().all(|w| *w == holder(3)), "the fresh copy drains the backlog first");
+        assert_eq!(state.served_counts.get(&holder(3)).copied().unwrap_or(0), 2, "copy caught up");
+    }
+
+    #[test]
+    fn stateful_policy_still_fails_over_to_whoever_is_live() {
+        // The #207 failover guarantee must survive a load-balancing policy: when the current winner
+        // goes offline, the next convene re-clears over the live set with no reconfig — and an
+        // all-offline role still errors (a policy never invents a provider).
+        let spec = physics_spec();
+        let p1 = offer(1, vec![TextGeneration], 20, 50, 1000);
+        let p2 = offer(2, vec![TextGeneration], 20, 50, 1000);
+        let mut state = SelectionState::default();
+
+        let first = spec
+            .convene_with(&[p1.clone(), p2.clone()], 100, SelectionPolicy::RoundRobin, &mut state)
+            .unwrap()[0]
+            .provider;
+        let (survivor_offer, survivor) =
+            if first == holder(1) { (p2, holder(2)) } else { (p1, holder(1)) };
+        let a = spec
+            .convene_with(&[survivor_offer], 100, SelectionPolicy::RoundRobin, &mut state)
+            .unwrap();
+        assert_eq!(a[0].provider, survivor, "re-clears over the live set → automatic failover");
+
+        assert_eq!(
+            spec.convene_with(&[], 100, SelectionPolicy::RoundRobin, &mut state),
+            Err(PipelineError::UnfilledRole { service: TextGeneration }),
+            "all offline → unfilled, exactly as before",
+        );
     }
 }
