@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 
 use crate::accounts::AccountId;
+use crate::edge_mesh::EdgeMeshHandle;
 use crate::portal::{escape, session_subject_for};
 use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
@@ -79,6 +80,11 @@ struct ApiState {
     /// account deletion) — `None` when OIDC isn't configured, in which case the
     /// account page simply omits the link rather than pointing at nothing.
     account_console_url: Option<Arc<str>>,
+    /// Records which edge owns a tunnel's (token, hostname) once it's authorized —
+    /// the multi-edge ownership registry's first hook point (edge_mesh Phase 0).
+    /// Always present (no config gate): purely additive bookkeeping alongside the
+    /// edge-authorize call, never blocking tunnel creation on its own.
+    edge_mesh: EdgeMeshHandle,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -93,6 +99,7 @@ pub fn portal_api_router(
     edge_admin: Option<(String, String)>,
     dns: Option<(DesecClient, String)>,
     account_console_url: Option<String>,
+    edge_mesh: EdgeMeshHandle,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -110,6 +117,7 @@ pub fn portal_api_router(
             edge_ip: Arc::from(edge_ip),
         }),
         account_console_url: account_console_url.map(Arc::from),
+        edge_mesh,
     };
     Router::new()
         .route("/portal/account", get(account_page))
@@ -317,7 +325,10 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
             // previously a success was silent and indistinguishable from the
             // edge_admin=None skip below.
             Ok(r) if r.status().is_success() => {
-                eprintln!("ct-cp: edge authorize-host for {host} succeeded")
+                eprintln!("ct-cp: edge authorize-host for {host} succeeded");
+                // edge_mesh Phase 0: record that this deployment's local edge now owns
+                // this (token, hostname) pair -- best-effort, never blocks the caller.
+                st.edge_mesh.record(&tunnel.routing_token, Some(host));
             }
             Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
             Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
@@ -403,6 +414,9 @@ async fn delete_tunnel(
     let hostname = st.tunnels.tunnel_hostname(&subject, &id).ok().flatten();
     // `revoke` returns the removed tunnel's routing token (owner-scoped).
     if let Ok(Some(routing_token)) = st.tunnels.revoke(&subject, &id) {
+        // edge_mesh Phase 0: the tunnel row is gone either way, so its ownership
+        // record must not keep claiming an edge still holds this token.
+        st.edge_mesh.forget(&routing_token);
         // Auto-delete the A record so a revoked tunnel leaves no orphaned DNS.
         if let (Some(dns), Some(host)) = (&st.dns, hostname.as_deref()) {
             if let Err(e) = dns.client.clear_a(host).await {
@@ -873,6 +887,13 @@ mod tests {
         format!("ct_portal_session={}", sign_session_for_test(KEY, subject))
     }
 
+    fn test_edge_mesh() -> EdgeMeshHandle {
+        EdgeMeshHandle::new(
+            Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()),
+            Arc::from("test-edge"),
+        )
+    }
+
     fn test_app() -> Router {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
@@ -888,6 +909,7 @@ mod tests {
             None,
             None,
             None,
+            test_edge_mesh(),
         )
     }
 
@@ -946,6 +968,7 @@ mod tests {
             None,
             None,
             Some("https://auth.example/realms/ct-demo/account".to_string()),
+            test_edge_mesh(),
         );
         let resp = app
             .oneshot(
@@ -1161,6 +1184,13 @@ mod tests {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let created = tunnels.create("alice", "web", None).unwrap();
+        // Pre-seed an edge_mesh ownership record, as authorize_hostname would have
+        // written when the tunnel was created -- revoke must clean it up too.
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        mesh_store
+            .record_ownership(&created.routing_token, None, "test-edge", 0)
+            .unwrap();
+        let edge_mesh = EdgeMeshHandle::new(mesh_store.clone(), Arc::from("test-edge"));
         let app = portal_api_router(
             KEY,
             ledger,
@@ -1171,6 +1201,7 @@ mod tests {
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
             None,
+            edge_mesh,
         );
 
         let status = post_form(&app, &format!("/portal/tunnels/{}/delete", created.id), "alice", "").await;
@@ -1180,6 +1211,10 @@ mod tests {
         assert_eq!(got.0, created.routing_token, "revoked the tunnel's routing token");
         assert_eq!(got.1, "edge-secret", "carried the admin auth header");
         assert!(tunnels.list_for_subject("alice").unwrap().is_empty(), "tunnel removed");
+        assert!(
+            mesh_store.lookup_by_token(&created.routing_token).unwrap().is_none(),
+            "edge_mesh ownership record forgotten on revoke"
+        );
     }
 
     #[tokio::test]
@@ -1224,6 +1259,11 @@ mod tests {
             _ => None,
         })
         .unwrap();
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        // lookup_by_token/lookup_by_host join against mesh_edges, so the owning edge must
+        // have heartbeated at least once to be resolvable (mirrors persistent_control_plane_router's
+        // boot-time self-heartbeat for the real deployment).
+        mesh_store.heartbeat("primary", "test", 0).unwrap();
         let app = portal_api_router(
             KEY,
             ledger,
@@ -1234,6 +1274,7 @@ mod tests {
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             Some((desec, "1.2.3.4".to_string())),
             None,
+            EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary")),
         );
 
         // Viewing the tunnels page auto-provisions the one Standard-tier tunnel.
@@ -1259,6 +1300,19 @@ mod tests {
         assert_eq!(token, tunnel.routing_token, "authorizes the tunnel's routing token");
         assert_eq!(host, expected_host);
         assert_eq!(auth, "edge-secret");
+
+        // edge_mesh Phase 0: a successful edge-authorize records this deployment's
+        // local edge as the owner of the tunnel's (token, hostname) pair.
+        let (owner_id, _) = mesh_store
+            .lookup_by_token(&tunnel.routing_token)
+            .unwrap()
+            .expect("ownership recorded after a successful edge authorize");
+        assert_eq!(owner_id, "primary");
+        assert_eq!(
+            mesh_store.lookup_by_host(&expected_host).unwrap().map(|(id, _)| id),
+            Some("primary".to_string()),
+            "resolvable by hostname too"
+        );
     }
 
     #[tokio::test]
@@ -1304,6 +1358,7 @@ mod tests {
             None,
             Some((desec, "45.133.9.145".to_string())),
             None,
+            test_edge_mesh(),
         );
 
         // Viewing the tunnels page auto-provisions the tunnel with its auto-assigned

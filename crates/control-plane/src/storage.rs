@@ -1179,6 +1179,25 @@ impl SqliteTunnelStore {
         rows.collect()
     }
 
+    /// Every tunnel across every subject — the edge_mesh backfill's source of truth for
+    /// portal-created tunnels (an admin/migration read, not subject-scoped like the rest
+    /// of this store's API; deliberately doesn't leak into any customer-facing route).
+    pub fn all(&self) -> rusqlite::Result<Vec<SubjectTunnel>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT id, name, hostname, created_at, routing_token FROM subject_tunnels ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SubjectTunnel {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                hostname: r.get(2)?,
+                created_at: r.get(3)?,
+                routing_token: r.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Revoke a tunnel by id, but only if it belongs to `subject`. Returns the
     /// removed tunnel's **routing token** (so the caller can invalidate its edge
     /// registration — #27 RB3/RB4), or `None` when the id is unknown or owned by

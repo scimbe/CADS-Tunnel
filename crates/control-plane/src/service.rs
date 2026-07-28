@@ -1097,6 +1097,7 @@ struct EdgeAuthorizeState {
     edge_admin_token: Arc<str>,
     admin_token: Option<[u8; 32]>,
     http: reqwest::Client,
+    edge_mesh: crate::edge_mesh::EdgeMeshHandle,
 }
 
 /// `POST /registry/authorize-host/:token/:host` — a public, admin-token-gated proxy
@@ -1120,6 +1121,7 @@ fn edge_authorize_host_router(
     edge_admin_url: String,
     edge_admin_token: String,
     admin_token: Option<[u8; 32]>,
+    edge_mesh: crate::edge_mesh::EdgeMeshHandle,
 ) -> Router {
     Router::new()
         .route("/registry/authorize-host/:token/:host", post(authorize_host_proxy))
@@ -1128,6 +1130,7 @@ fn edge_authorize_host_router(
             edge_admin_token: Arc::from(edge_admin_token),
             admin_token,
             http: reqwest::Client::new(),
+            edge_mesh,
         })
 }
 
@@ -1153,6 +1156,9 @@ async fn authorize_host_proxy(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("edge unreachable: {e}")))?;
     if resp.status().is_success() {
+        // edge_mesh Phase 0: record that this deployment's local edge now owns
+        // this (token, hostname) pair -- best-effort, never blocks the caller.
+        state.edge_mesh.record(&token, Some(&host));
         Ok(StatusCode::OK)
     } else {
         Err((StatusCode::BAD_GATEWAY, format!("edge returned {}", resp.status())))
@@ -3003,6 +3009,55 @@ pub fn persistent_control_plane_router(
     // and /registry/pipelines actually serve.
     let agent_directory = Arc::new(SqliteAgentDirectory::open(db_path)?);
     let pipeline_registry = Arc::new(SqlitePipelineRegistry::open(db_path)?);
+    // edge_mesh Phase 0 (multi-edge ownership registry): which edge owns which
+    // routing token/hostname, keyed by a stable per-deployment identifier. Defaults
+    // to "primary" so an unconfigured deployment still gets a consistent id rather
+    // than an empty string; only matters once a second real edge reports in.
+    let edge_mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open(db_path)?);
+    let local_edge_id: Arc<str> = Arc::from(
+        std::env::var("CT_EDGE_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "primary".to_string()),
+    );
+    {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        // Self-heartbeat the local edge at boot: `lookup_by_token`/`lookup_by_host` join
+        // against `mesh_edges`, so an ownership record is only resolvable once its owning
+        // edge has heartbeated at least once. This deployment's own edge is live by
+        // definition (the CP just proxies authorize calls to it) well before any real
+        // edge-side heartbeat loop exists (that's a later increment) -- without this, every
+        // record_ownership written below/at the two hook points would be silently
+        // unresolvable via lookup. "local" is a placeholder peer_addr; a real edge-side
+        // heartbeat will overwrite it with its actual reachable address once that lands.
+        if let Err(e) = edge_mesh_store.heartbeat(&local_edge_id, "local", now) {
+            eprintln!("ct-cp: edge_mesh self-heartbeat failed: {e}");
+        }
+    }
+    // One-time-per-boot, idempotent backfill: portal-created tunnels that predate
+    // edge_mesh (or were created before this deploy) get an ownership record under
+    // this deployment's local edge, skipping any token already recorded (never
+    // overwrites a token that's since been assigned elsewhere). Safe to run every
+    // boot -- it's a no-op once every tunnel has a record.
+    {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        match tunnels.all() {
+            Ok(existing) => {
+                for t in existing {
+                    if edge_mesh_store.lookup_by_token(&t.routing_token).ok().flatten().is_some() {
+                        continue;
+                    }
+                    if let Err(e) =
+                        edge_mesh_store.record_ownership(&t.routing_token, t.hostname.as_deref(), &local_edge_id, now)
+                    {
+                        eprintln!("ct-cp: edge_mesh backfill failed for tunnel {}: {e}", t.id);
+                    }
+                }
+            }
+            Err(e) => eprintln!("ct-cp: edge_mesh backfill: could not list existing tunnels: {e}"),
+        }
+    }
+    let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(edge_mesh_store.clone(), local_edge_id);
     // Where to reach the edge's admin API (host-authorize/revoke, #23 BP4b / #27
     // RB4b) — hoisted here (rather than inline at each of its two call sites
     // below) so both the portal's automatic authorize-on-create-tunnel AND the
@@ -3072,13 +3127,16 @@ pub fn persistent_control_plane_router(
         // #174 B: the workflow-pipeline registry — POST publish (admin-gated) + public GET
         // discovery, so a designer can publish a PipelineSpec agents scan to find workflows to join.
         .merge(pipeline_registry_router(pipeline_registry.clone(), admin_token))
+        // edge_mesh Phase 0: heartbeat/lookup/rehydrate — admin-token-gated the same as
+        // every other internal machine-writer surface here.
+        .merge(crate::edge_mesh::edge_mesh_router(edge_mesh_store.clone(), admin_token))
         // #214: public, admin-token-gated host-authorization proxy to the edge — lets a
         // remote pipeline maintainer holding just the admin token self-serve hostname
         // binds (the same shared secret /enroll/issue already requires), no operator
         // relay or GitHub coordination needed per deployment. Absent when the edge
         // admin URL/token aren't configured (nothing to proxy to).
         .merge(match edge_admin_config.clone() {
-            Some((url, token)) => edge_authorize_host_router(url, token, admin_token),
+            Some((url, token)) => edge_authorize_host_router(url, token, admin_token, edge_mesh.clone()),
             None => Router::new(),
         })
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
@@ -3117,6 +3175,7 @@ pub fn persistent_control_plane_router(
                     // self-service account deletion) -- linked from /portal/account
                     // instead of CADS-Tunnel reimplementing any of it.
                     account_console_url,
+                    edge_mesh.clone(),
                 ),
             )
         })
@@ -4988,7 +5047,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, mock_edge).await.unwrap() });
 
-        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin));
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        // lookup_by_token joins against mesh_edges, so "primary" must have heartbeated at
+        // least once to be resolvable (mirrors the real deployment's boot-time self-heartbeat).
+        mesh_store.heartbeat("primary", "test", 0).unwrap();
+        let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary"));
+        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
         let call = |tok: Option<String>| {
             let mut req = Request::post("/registry/authorize-host/deadbeef/flappy-demo.bunsenbrenner.org");
             if let Some(t) = tok {
@@ -5008,6 +5072,12 @@ mod tests {
             hit.lock().unwrap().as_deref(),
             Some("deadbeef/flappy-demo.bunsenbrenner.org"),
             "forwarded to the edge with the exact token/host and its admin header"
+        );
+        // edge_mesh Phase 0: a successful proxy call records the local edge's ownership.
+        assert_eq!(
+            mesh_store.lookup_by_token("deadbeef").unwrap().map(|(id, _)| id),
+            Some("primary".to_string()),
+            "ownership recorded after a successful authorize-host proxy call"
         );
     }
 

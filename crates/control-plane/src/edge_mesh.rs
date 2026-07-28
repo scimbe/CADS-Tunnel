@@ -176,6 +176,46 @@ impl SqliteEdgeMesh {
             .collect();
         rows
     }
+
+    /// Forget `token`'s ownership record — a tunnel revoke/delete, so a stale row
+    /// doesn't keep claiming an edge still owns a token nobody authorized anymore.
+    pub fn remove_ownership(&self, token: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock_safe()
+            .execute("DELETE FROM mesh_ownership WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+}
+
+/// Shared handle the two ownership-recording hook points use (portal_api.rs's tunnel
+/// creation flow, service.rs's `/registry/authorize-host` proxy) to record which edge
+/// now owns a freshly-authorized (token, hostname) pair. Best-effort: a registry write
+/// failure is logged, never surfaces to the caller — the tunnel/authorization itself
+/// already succeeded and must not fail because of this bookkeeping.
+#[derive(Clone)]
+pub struct EdgeMeshHandle {
+    store: Arc<SqliteEdgeMesh>,
+    local_edge_id: Arc<str>,
+}
+
+impl EdgeMeshHandle {
+    pub fn new(store: Arc<SqliteEdgeMesh>, local_edge_id: Arc<str>) -> Self {
+        Self { store, local_edge_id }
+    }
+
+    /// Record that this deployment's local edge now owns `token` (and `host`, if any).
+    pub fn record(&self, token: &str, host: Option<&str>) {
+        if let Err(e) = self.store.record_ownership(token, host, &self.local_edge_id, now_secs()) {
+            eprintln!("ct-cp: edge_mesh record_ownership failed: {e}");
+        }
+    }
+
+    /// Forget `token`'s ownership record (a tunnel revoke/delete).
+    pub fn forget(&self, token: &str) {
+        if let Err(e) = self.store.remove_ownership(token) {
+            eprintln!("ct-cp: edge_mesh remove_ownership failed: {e}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -364,6 +404,42 @@ mod tests {
         );
         assert_eq!(s.owned_by("edge-2").unwrap(), vec![("tok-c".to_string(), Some("c.example.com".to_string()))]);
         assert!(s.owned_by("edge-3-never-seen").unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_ownership_drops_the_row_and_is_a_no_op_on_an_unknown_token() {
+        let s = store();
+        let now = now_secs();
+        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        s.record_ownership("tok", Some("app.example.com"), "edge-1", now).unwrap();
+        assert!(s.lookup_by_token("tok").unwrap().is_some());
+        s.remove_ownership("tok").unwrap();
+        assert!(s.lookup_by_token("tok").unwrap().is_none(), "removed");
+        s.remove_ownership("never-existed").unwrap(); // no-op, not an error
+    }
+
+    #[test]
+    fn edge_mesh_handle_records_under_its_configured_local_edge_id_and_forgets_on_revoke() {
+        let s = store();
+        s.heartbeat("primary", "10.0.0.1:4437", now_secs()).unwrap();
+        let handle = EdgeMeshHandle::new(s.clone(), Arc::from("primary"));
+
+        handle.record("tok-a", Some("a.example.com"));
+        let (edge_id, _) = s.lookup_by_token("tok-a").unwrap().expect("recorded under the local edge id");
+        assert_eq!(edge_id, "primary");
+        assert_eq!(
+            s.lookup_by_host("a.example.com").unwrap().map(|(id, _)| id),
+            Some("primary".to_string()),
+            "hostname lookup resolves too"
+        );
+
+        // A token authorized with no hostname (Mesh-Plane only) records fine with hostname = None.
+        handle.record("tok-b", None);
+        assert!(s.lookup_by_token("tok-b").unwrap().is_some());
+
+        handle.forget("tok-a");
+        assert!(s.lookup_by_token("tok-a").unwrap().is_none(), "forgotten on revoke");
+        assert!(s.lookup_by_token("tok-b").unwrap().is_some(), "unrelated token untouched");
     }
 
     fn test_router(admin_token: Option<[u8; 32]>) -> (Router, Arc<SqliteEdgeMesh>) {
