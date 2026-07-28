@@ -419,6 +419,20 @@ const INSTALL_BOOTSTRAP_TTL_SECS: u64 = 600;
 ///
 /// The token is a secret: it is shown once to the authenticated owner and never
 /// logged, cached or persisted anywhere in cleartext.
+/// The Mesh-Plane tunnel rendezvous address (`host:mesh_edge_port`) a freshly
+/// built `ct-agent` should point `CT_AGENT_EDGE` at — derived from the portal's
+/// own public base URL (same host the edge's :443 front door and :4433 Mesh
+/// Plane both serve) plus this deployment's real mesh edge port (`/network-info`,
+/// [`crate::service::NetworkInfoResp`]), so the Install page never hardcodes or
+/// guesses a port that could drift from the actual deployment.
+fn edge_host_port(portal_base: &str) -> String {
+    let host = portal_base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    format!("{host}:{}", crate::service::NetworkInfoResp::from_env().mesh_edge_port)
+}
+
 async fn install_page(
     State(st): State<ApiState>,
     headers: HeaderMap,
@@ -472,33 +486,54 @@ async fn install_page(
             )
         })
         .collect::<String>();
+    let edge_host = edge_host_port(&st.portal_base);
+    let build_cmd = "git clone https://github.com/scimbe/CADS-Tunnel.git && cd CADS-Tunnel\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine";
+    let env_block = format!(
+        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
+        jt = token,
+        rt = routing_token,
+        id = id,
+        cp = st.portal_base,
+        edge = edge_host,
+    );
+    let run_cmd = "set -a; source .env; set +a\n./target/release/ct-agent onboard";
     let body = format!(
         r#"<h1>Install an agent</h1>
 <p class="help">Run this <strong>on the machine you want to expose</strong> &mdash;
 the <em>origin</em>: the server or device running the service you are tunnelling,
 not the device you are reading this on. The agent connects out to the relay and
 serves your origin through it (no inbound firewall port needed).</p>
-<div class="warn"><strong>&#9888; The one-line installer isn't live yet (#75).</strong> It will
-work once <code>ct-agent</code> prebuilt binaries ship. For now, use the tokens below with
-<code>ct-agent onboard</code> directly &mdash; see the
-<a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>.</div>
-<h2>Your tunnel's tokens (for manual onboarding)</h2>
-<p class="k"><strong>Single-use token — shown only once; reopen this Install page for a fresh one.</strong></p>
-<p class="help">Minted ready to use &mdash; accepted immediately, no separate approval step. Copy
-this into a <code>.env</code> file <strong>on the machine you want to expose</strong> (the
-<em>origin</em>), then <code>set -a; source .env; set +a</code> before running
-<code>ct-agent onboard</code>, rather than leaving it in your shell history.</p>
+<div class="warn"><strong>&#9888; The one-line installer isn't live yet (#75).</strong> Use the
+three steps below instead &mdash; they work today, no prebuilt binaries required.</div>
+
+<h2>1. Build <code>ct-agent</code> (Docker, no Rust toolchain needed)</h2>
+<div class="code-block">
+ <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <pre><code>{build_cmd}</code></pre>
+</div>
+
+<h2>2. Save your tunnel's tokens into a <code>.env</code> file</h2>
+<p class="k"><strong>Single-use join token — shown only once; reopen this Install page for a fresh one.</strong></p>
+<p class="help">Minted ready to use &mdash; accepted immediately, no separate approval step. Save this
+as <code>.env</code> <strong>next to the binary, on the machine you want to expose</strong>.</p>
 <div class="code-block">
  <div class="code-block-head"><span>.env</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
- <pre><code>CT_JOIN_TOKEN={jt}
-CT_AGENT_TOKEN={rt}
-# also set CT_AGENT_CP_URL, CT_AGENT_EDGE, CT_AGENT_ORIGIN (see the onboarding guide), then run: ct-agent onboard</code></pre>
+ <pre><code>{env_block}</code></pre>
 </div>
+
+<h2>3. Bring the tunnel up</h2>
+<div class="code-block">
+ <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <pre><code>{run_cmd}</code></pre>
+</div>
+<p class="help">That's it &mdash; <code>ct-agent</code> redeems the join token, binds your tunnel's
+routing token, and starts serving your origin through the relay end-to-end encrypted. See the
+<a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/onboarding/quickstart.md">onboarding guide</a>
+for troubleshooting.</p>
+
 <h2 class="muted">One-line installer &mdash; coming soon (not functional yet)</h2>
 {blocks}
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
-        jt = escape(&token),
-        rt = escape(&routing_token),
     );
     Html(page("install", &body)).into_response()
 }
@@ -883,8 +918,11 @@ mod tests {
                 "the routing token must not be embedded in the one-liner command"
             );
         }
-        // The manual block still exists (raw tokens shown once, separately).
-        assert!(html.contains("CT_JOIN_TOKEN=") && html.contains("manual onboarding"), "manual path retained");
+        // The working-today manual path still exists (raw tokens shown once, separately).
+        assert!(
+            html.contains("CT_AGENT_JOIN_TOKEN=") && html.contains("ct-agent onboard"),
+            "manual path retained"
+        );
     }
 
     #[tokio::test]
@@ -1332,7 +1370,7 @@ mod tests {
         let (status, html) = get(&app, &format!("/portal/tunnels/{id}/install"), Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("curl -fsSL https://portal.example/install.sh"));
-        assert!(html.contains("CT_JOIN_TOKEN="), "join token carried via env");
+        assert!(html.contains("CT_AGENT_JOIN_TOKEN="), "join token carried via env");
         assert!(html.contains("CT_AGENT_TOKEN="), "tunnel routing token carried via env (#27 RB2)");
         assert!(html.contains("irm https://portal.example/install.ps1 | iex"));
         assert!(html.contains("single-use") || html.contains("Single-use"), "warns token is single-use");
@@ -1356,8 +1394,24 @@ mod tests {
             "honestly flags the one-liner as non-functional until #75 ships"
         );
         assert!(
-            html.contains("manual onboarding") && html.contains("ct-agent onboard"),
+            html.contains("Build") && html.contains("ct-agent onboard"),
             "surfaces the working manual onboarding path with the tokens"
+        );
+        // The manual path must be genuinely runnable today: a real hermetic Docker
+        // build command (no Rust toolchain assumed) and the correct env var names
+        // ct-agent's onboard flow actually reads (CT_AGENT_CP_URL/CT_AGENT_EDGE),
+        // not just a vague pointer to "the onboarding guide".
+        assert!(
+            html.contains("docker run") && html.contains("cargo build --release -p ct-agent"),
+            "gives a real, working build command, not just a link"
+        );
+        assert!(
+            html.contains("CT_AGENT_CP_URL=https://portal.example"),
+            "carries the real control-plane URL, not a placeholder"
+        );
+        assert!(
+            html.contains("CT_AGENT_EDGE=portal.example:4433"),
+            "carries the real edge host:mesh-port, not a placeholder"
         );
         assert!(
             html.contains(".env"),
@@ -1468,7 +1522,7 @@ mod tests {
         post_form(&app, "/portal/tunnels", "alice", "name=web").await;
         let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
         let extract = |h: &str| {
-            h.split("CT_JOIN_TOKEN=")
+            h.split("CT_AGENT_JOIN_TOKEN=")
                 .nth(1)
                 .and_then(|s| s.split(|c| c == ' ' || c == '<').next())
                 .unwrap()
