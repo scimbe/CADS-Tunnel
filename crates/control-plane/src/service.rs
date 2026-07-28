@@ -2501,7 +2501,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
     <h3>Your subdomain</h3>
     <p>In the <strong>Standard</strong> tier you don't pick your own subdomain — it's assigned
     automatically from your project id and your account's unique user id (e.g.
-    <code>hello-world-a3f9.bunsenbrenner.org</code>), so names never collide and every subdomain traces
+    <code>hello-world-a1b2c3d4.bunsenbrenner.org</code>), so names never collide and every subdomain traces
     back to an account. A future tier may offer custom/vanity subdomains.</p>
    </div>
   </div>

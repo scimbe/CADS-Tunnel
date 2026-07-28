@@ -203,14 +203,17 @@ fn dns_label_from(name: &str) -> String {
     trimmed.chars().take(40).collect()
 }
 
-/// A short, stable, non-choosable per-account suffix (4 hex chars of
+/// A short, stable, non-choosable per-account suffix (8 hex chars / 4 bytes of
 /// SHA-256(subject)) — the "unique user id" half of the Standard tier's
 /// auto-assigned hostname `<name>-<user-id>.<zone>` (see the landing page's
-/// subdomain-policy step and the /publish onboarding).
+/// subdomain-policy step and the /publish onboarding). 4 bytes (~4 billion
+/// values) keeps collisions negligible at real scale — 2 bytes (65536 values)
+/// was fine for a demo but not for production: the birthday paradox makes a
+/// collision likely well under a thousand accounts.
 fn account_suffix(subject: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(subject.as_bytes());
-    hex(&digest[..2])
+    hex(&digest[..4])
 }
 
 /// Standard tier: the public hostname is always auto-assigned from the tunnel
@@ -256,7 +259,16 @@ async fn provision_tunnel(st: &ApiState, subject: &str, name: &str) {
         .map(|d| auto_hostname(d.client.domain(), name, subject))
         .as_deref()
         .and_then(ct_common::normalize_hostname);
-    let tunnel = match st.tunnels.create(subject, name, hostname.as_deref()) {
+    // The stored/displayed name is the hostname's own (already account-unique)
+    // first label when one was assigned -- e.g. "site-a1b2c3d4", not the bare
+    // "site" every account would otherwise show identically on its own tunnels
+    // page. Falls back to the plain name when no hostname was assigned (no DNS
+    // configured -- a Mesh-Plane-only tunnel has no hostname to borrow from).
+    let display_name = hostname
+        .as_deref()
+        .and_then(|h| h.split('.').next())
+        .unwrap_or(name);
+    let tunnel = match st.tunnels.create(subject, display_name, hostname.as_deref()) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("ct-cp: auto-provisioning a tunnel for {subject} failed: {e}");
@@ -351,7 +363,10 @@ async fn create_tunnel(
         .map(|d| auto_hostname(d.client.domain(), name, &subject))
         .as_deref()
         .and_then(ct_common::normalize_hostname);
-    let tunnel = match st.tunnels.create(&subject, name, hostname.as_deref()) {
+    // Same reasoning as provision_tunnel: show the account-unique hostname
+    // label, not the bare user-typed name two different accounts could share.
+    let display_name = hostname.as_deref().and_then(|h| h.split('.').next()).unwrap_or(name);
+    let tunnel = match st.tunnels.create(&subject, display_name, hostname.as_deref()) {
         Ok(t) => t,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -628,7 +643,7 @@ fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
         r#"<h1>Your tunnels</h1>
 {rows}
 <p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
-assigned hostname (e.g. <code>site-a3f9.bunsenbrenner.org</code>) &mdash; already set up for
+assigned hostname (e.g. <code>site-a1b2c3d4.bunsenbrenner.org</code>) &mdash; already set up for
 you above, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
 <h2>Create another tunnel</h2>
 <p class="help">Additional tunnels and custom/vanity hostnames are a planned paid tier, coming
@@ -1144,6 +1159,14 @@ mod tests {
         assert!(
             expected_host.starts_with("site-") && expected_host.ends_with(".bunsenbrenner.org"),
             "auto-assigned from the tunnel name + account suffix, not user-chosen: {expected_host}"
+        );
+        // The displayed/stored name matches the hostname's own label, not the
+        // bare "site" every account would otherwise show identically.
+        assert_ne!(tunnel.name, "site", "the tunnel's name is account-unique, not the literal default");
+        assert_eq!(
+            Some(tunnel.name.as_str()),
+            expected_host.split('.').next(),
+            "the stored name is exactly the hostname's first label"
         );
 
         // The edge received authorize-host with this tunnel's routing token + auth.

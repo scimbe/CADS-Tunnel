@@ -144,6 +144,24 @@ impl PortalOidc {
             hint_param,
         )
     }
+
+    /// RP-Initiated Logout (OIDC): end the session at the IdP too, not just
+    /// locally. Clearing only our own session cookie leaves Keycloak's own SSO
+    /// session alive, so the next "sign in" click (or a silent re-auth) logs
+    /// the user straight back in without asking for credentials again --
+    /// which looks exactly like logout doing nothing. `post_logout_redirect_uri`
+    /// is the portal root (the callback URL with its `/callback` suffix
+    /// stripped); the realm's `ct-portal` client already allow-lists exactly
+    /// this in `post.logout.redirect.uris` (`docker/deploy/keycloak/ct-demo-realm.json`).
+    fn end_session_redirect(&self) -> String {
+        let portal_root = self.redirect_uri.trim_end_matches("/callback");
+        format!(
+            "{}/protocol/openid-connect/logout?client_id={}&post_logout_redirect_uri={}",
+            self.issuer(),
+            urlencode(&self.client_id),
+            urlencode(portal_root),
+        )
+    }
 }
 
 /// Build the customer portal router (#25 PP1): `GET /portal` (shell) and
@@ -428,9 +446,17 @@ async fn portal_home_authed(State(st): State<PortalState>, headers: HeaderMap) -
     }
 }
 
-/// `GET /portal/logout` (#25 PP3): clear the session cookie and return to the shell.
-async fn portal_logout() -> Response {
-    let mut resp = Redirect::to("/portal").into_response();
+/// `GET /portal/logout` (#25 PP3): clear the session cookie AND end the session
+/// at the IdP (RP-Initiated Logout, [`PortalOidc::end_session_redirect`]) --
+/// clearing only our own cookie leaves Keycloak's SSO session alive, so the
+/// next sign-in silently re-authenticates without asking for credentials
+/// again, which looks like logout not working. Falls back to a plain local
+/// redirect when OIDC isn't configured (dev/test).
+async fn portal_logout(State(st): State<PortalState>) -> Response {
+    let mut resp = match &st.oidc {
+        Some(cfg) => Redirect::to(&cfg.end_session_redirect()).into_response(),
+        None => Redirect::to("/portal").into_response(),
+    };
     set_cookie(&mut resp, &cleared_session_cookie());
     resp
 }
@@ -1564,8 +1590,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_clears_the_session_cookie() {
+    async fn logout_clears_the_session_cookie_and_ends_the_idp_session() {
+        // Clearing only our own cookie leaves Keycloak's SSO session alive, so the
+        // next sign-in silently re-authenticates -- logout must also redirect
+        // through the IdP's RP-Initiated Logout endpoint (#logout-fix).
         let app = portal_router(Some(cfg()), TEST_KEY);
+        let resp = app
+            .oneshot(Request::get("/portal/logout").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.starts_with("https://kc.example/realms/ct/protocol/openid-connect/logout?"),
+            "redirects through the IdP's end_session_endpoint, got {location}"
+        );
+        assert!(location.contains("client_id=ct-portal"));
+        assert!(
+            location.contains("post_logout_redirect_uri=https%3A%2F%2Fportal.example%2Fportal"),
+            "post_logout_redirect_uri is the portal root (allow-listed in the realm's \
+             post.logout.redirect.uris), got {location}"
+        );
+        let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.starts_with("ct_portal_session=;"), "session cookie cleared");
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn logout_falls_back_to_a_local_redirect_without_oidc() {
+        let app = portal_router(None, TEST_KEY);
         let resp = app
             .oneshot(Request::get("/portal/logout").body(Body::empty()).unwrap())
             .await
@@ -1573,8 +1626,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get("location").unwrap(), "/portal");
         let cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(cookie.starts_with("ct_portal_session=;"), "session cookie cleared");
-        assert!(cookie.contains("Max-Age=0"));
+        assert!(cookie.starts_with("ct_portal_session=;"), "session cookie still cleared");
     }
 
     #[test]
