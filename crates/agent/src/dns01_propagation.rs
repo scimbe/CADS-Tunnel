@@ -48,10 +48,22 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
 /// module then spends its whole timeout budget fighting: every subsequent
 /// poll for the next hour sees our own poisoned entry, not reality.
 ///
-/// `acme.sh` -- the manual path that has always worked here -- does exactly
-/// this and for exactly this reason ("Let's check each DNS record now.
-/// Sleeping for 20 seconds first." before `_check_dns_entries`). Matching it.
-const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(20);
+/// `acme.sh` -- the manual path that has always worked here -- does the same
+/// thing for the same reason ("Let's check each DNS record now. Sleeping for
+/// 20 seconds first." before `_check_dns_entries`).
+///
+/// The value is deliberately **not** acme.sh's 20s. Measured on this
+/// deployment's own deSEC zone, a freshly written TXT record reaches:
+///   - deSEC's own authoritative NS in ~11-55s,
+///   - Google's public resolver at ~38s,
+///   - Cloudflare's not yet at 53s.
+/// A 20s delay would therefore still fire the first lookup into a
+/// not-yet-visible record on this zone and re-poison the cache -- the exact
+/// bug this constant exists to prevent. 75s clears the measured worst case
+/// with margin. If a deployment's DNS is faster, lower it via
+/// `CT_ACME_DNS01_INITIAL_DELAY_SECS`; the cost of being too high is only a
+/// slower issuance, while too low silently breaks issuance for an hour.
+const DEFAULT_INITIAL_DELAY: Duration = Duration::from_secs(75);
 
 /// Cloudflare's own DoH endpoint, and the public (unauthenticated) 1.1.1.1
 /// resolver cache-purge endpoint the same one `acme.sh`'s `dns_desec`/
@@ -85,6 +97,13 @@ pub struct PropagationWaiter {
 impl PropagationWaiter {
     pub fn new(resolver_urls: Vec<String>, timeout: Duration) -> Self {
         Self::with_interval(resolver_urls, timeout, DEFAULT_INTERVAL)
+    }
+
+    /// Override the pre-check delay (see [`DEFAULT_INITIAL_DELAY`] -- too low
+    /// silently breaks issuance for an hour, too high only costs time).
+    pub fn with_initial_delay(mut self, initial_delay: Duration) -> Self {
+        self.initial_delay = initial_delay;
+        self
     }
 
     pub(crate) fn with_interval(resolver_urls: Vec<String>, timeout: Duration, interval: Duration) -> Self {

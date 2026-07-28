@@ -63,6 +63,11 @@ pub struct AcmeCertConfig {
     /// before giving up (deSEC and similar managed DNS backends replicate to
     /// public nameservers with a short but nonzero delay).
     pub dns01_propagation_timeout: Duration,
+    /// How long to wait after publishing before the FIRST public-resolver
+    /// lookup. Too low re-poisons the resolver cache with an NXDOMAIN that
+    /// outlives the whole timeout (the #229 root cause); too high only costs
+    /// issuance time. `None` uses the measured-safe default.
+    pub dns01_initial_delay: Option<Duration>,
 }
 
 pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -74,7 +79,10 @@ impl AcmeCertConfig {
     /// `/shared/acme-cert`), `CT_ACME_ACCOUNT_KEY_PATH` (default
     /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URLS`
     /// (comma-separated, defaults to two independent public DoH resolvers),
-    /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 180).
+    /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 180),
+    /// `CT_ACME_DNS01_INITIAL_DELAY_SECS` (default 75 -- see
+    /// `dns01_propagation::DEFAULT_INITIAL_DELAY`; lowering it risks
+    /// re-poisoning the resolver cache).
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -98,6 +106,10 @@ impl AcmeCertConfig {
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
             .unwrap_or_else(|| dns01_propagation::DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect());
+        let dns01_initial_delay = get("CT_ACME_DNS01_INITIAL_DELAY_SECS")
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs);
         let dns01_propagation_timeout = get("CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS")
             .filter(|s| !s.is_empty())
             .and_then(|s| s.parse::<u64>().ok())
@@ -112,6 +124,7 @@ impl AcmeCertConfig {
             account_key_path,
             dns01_resolver_urls,
             dns01_propagation_timeout,
+            dns01_initial_delay,
         })
     }
 
@@ -164,8 +177,11 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
         config.cp_url.clone(),
         config.routing_token.clone(),
     ));
-    let propagation =
+    let mut propagation =
         PropagationWaiter::new(config.dns01_resolver_urls.clone(), config.dns01_propagation_timeout);
+    if let Some(delay) = config.dns01_initial_delay {
+        propagation = propagation.with_initial_delay(delay);
+    }
     let issued = client.issue_certificate(&config.hostname, &publish, Some(&propagation)).await?;
 
     // Write key before cert (an origin polling for the cert file should never
@@ -464,6 +480,7 @@ mod tests {
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(5),
+            dns01_initial_delay: Some(Duration::ZERO),
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -503,6 +520,7 @@ mod tests {
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(5),
+            dns01_initial_delay: Some(Duration::ZERO),
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("publishing"), "{err}");
@@ -531,6 +549,7 @@ mod tests {
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(10),
+            dns01_initial_delay: Some(Duration::ZERO),
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -561,6 +580,7 @@ mod tests {
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_millis(200),
+            dns01_initial_delay: Some(Duration::ZERO),
         };
 
         let err = obtain_or_renew(&config).await.unwrap_err();
