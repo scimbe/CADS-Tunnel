@@ -2395,6 +2395,112 @@ pub fn landing_router() -> Router {
         .route("/llms.txt", get(llms_txt_handler))
 }
 
+/// This deployment's actual mesh/channel-broker/channel-relay ports (#214 follow-up: generic
+/// pipeline provisioning). A workflow-pipeline maintainer pointed `CT_CHANNEL_BROKER`/
+/// `CT_CHANNEL_RELAY` at the tunnel's Mesh-Plane rendezvous port (`4433`) instead of the
+/// Agent-Fabric channel broker/relay (`4435`/`4436`) — a completely different listener/protocol —
+/// because nothing told them which port served which purpose. `/network-info` closes that gap: a
+/// generic `ct-agent` (or any future pipeline's onboarding docs) reads this once instead of
+/// hardcoding or guessing port numbers.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct NetworkInfoResp {
+    /// The Mesh-Plane tunnel rendezvous port (`CT_EDGE_LISTEN`) — Client⇄Origin capability
+    /// tunnels. NOT the Agent-Fabric channel broker below; pointing `CT_CHANNEL_BROKER` here
+    /// fails every channel join immediately (wrong protocol, not an auth/membership refusal).
+    pub mesh_edge_port: u16,
+    /// The Agent-Fabric channel broker port (`CT_EDGE_CHANNEL_LISTEN`) — what `CT_CHANNEL_BROKER`
+    /// must point at.
+    pub channel_broker_port: u16,
+    /// The Agent-Fabric channel relay port (`CT_EDGE_CHANNEL_RELAY_LISTEN`) — what
+    /// `CT_CHANNEL_RELAY` must point at.
+    pub channel_relay_port: u16,
+}
+
+impl NetworkInfoResp {
+    /// Read from `CT_CP_MESH_EDGE_PORT`/`CT_CP_CHANNEL_BROKER_PORT`/`CT_CP_CHANNEL_RELAY_PORT`,
+    /// defaulting to the same `4433`/`4435`/`4436` defaults `docker/deploy/compose.selfhost.yml`
+    /// uses for the edge, so an unconfigured deployment still reports the right values.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Testable core: an injectable lookup instead of `std::env::var` directly, so tests never
+    /// mutate real process environment (racy under parallel `cargo test`).
+    fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Self {
+        let port = |name: &str, default: u16| -> u16 {
+            f(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        Self {
+            mesh_edge_port: port("CT_CP_MESH_EDGE_PORT", 4433),
+            channel_broker_port: port("CT_CP_CHANNEL_BROKER_PORT", 4435),
+            channel_relay_port: port("CT_CP_CHANNEL_RELAY_PORT", 4436),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NetworkInfoState {
+    info: NetworkInfoResp,
+}
+
+/// Build the `/network-info` router: a public, stateless `GET` returning this deployment's actual
+/// ports (read once at startup — see [`NetworkInfoResp::from_env`]).
+pub fn network_info_router() -> Router {
+    Router::new()
+        .route("/network-info", get(network_info_handler))
+        .with_state(NetworkInfoState { info: NetworkInfoResp::from_env() })
+}
+
+async fn network_info_handler(State(s): State<NetworkInfoState>) -> Json<NetworkInfoResp> {
+    Json(s.info)
+}
+
+#[cfg(test)]
+mod network_info_tests {
+    use super::*;
+
+    #[test]
+    fn network_info_defaults_match_the_selfhost_compose_ports() {
+        // No env configured -> the same 4433/4435/4436 docker/deploy/compose.selfhost.yml uses.
+        let info = NetworkInfoResp::from_lookup(|_| None);
+        assert_eq!(info.mesh_edge_port, 4433);
+        assert_eq!(info.channel_broker_port, 4435);
+        assert_eq!(info.channel_relay_port, 4436);
+    }
+
+    #[test]
+    fn network_info_honors_overrides_and_ignores_unparseable_values() {
+        let env = |k: &str| match k {
+            "CT_CP_MESH_EDGE_PORT" => Some("5000".to_string()),
+            "CT_CP_CHANNEL_BROKER_PORT" => Some("not-a-port".to_string()), // falls back to default
+            _ => None,
+        };
+        let info = NetworkInfoResp::from_lookup(env);
+        assert_eq!(info.mesh_edge_port, 5000, "explicit override honored");
+        assert_eq!(info.channel_broker_port, 4435, "unparseable value falls back to default, not 0/panic");
+        assert_eq!(info.channel_relay_port, 4436, "unset falls back to default");
+    }
+
+    #[tokio::test]
+    async fn network_info_endpoint_serves_the_computed_json() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = network_info_router();
+        let resp = app
+            .oneshot(Request::get("/network-info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let info: NetworkInfoResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info.mesh_edge_port, 4433);
+        assert_eq!(info.channel_broker_port, 4435);
+        assert_eq!(info.channel_relay_port, 4436);
+    }
+}
+
 async fn landing_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(LANDING_HTML)
 }
@@ -2613,6 +2719,7 @@ pub fn persistent_control_plane_router(
         .merge(payment_webhook_router(ledger.clone(), verifier))
         .merge(status)
         .merge(landing_router())
+        .merge(network_info_router())
         .merge(crate::portal::portal_router(
             crate::portal::PortalOidc::from_env(),
             webhook_secret,
@@ -5155,7 +5262,11 @@ mod tests {
             .unwrap();
         let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
         pipeline_registry
-            .publish("owner1", &ct_common::pipeline::PipelineSpec { id: "flappy".into(), roles: vec![] }, 1)
+            .publish(
+                "owner1",
+                &ct_common::pipeline::PipelineSpec { id: "flappy".into(), roles: vec![], operator_pubkey_hex: None },
+                1,
+            )
             .unwrap();
 
         let app = status_router(enrollment, registry, ledger, agent_directory, pipeline_registry, None);

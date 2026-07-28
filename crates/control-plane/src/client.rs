@@ -240,6 +240,31 @@ impl ControlPlaneClient {
         ok(resp)?;
         Ok(())
     }
+
+    /// `POST /registry/agents` (#144 ②, #214 follow-up: automatic discoverability) — self-register
+    /// (upsert) a published `card_url` + advertised facets, gated by the shared admin token (see
+    /// [`Self::with_admin_token`]) rather than an OIDC bearer, since an autonomous agent has no
+    /// interactive login path (#161). `card_url` must be `https://` — the CP rejects anything else.
+    pub async fn register_agent(
+        &self,
+        holder_pubkey_hex: &str,
+        card_url: &str,
+        role_tags: &[String],
+        skill_ids: &[String],
+    ) -> CpResult<()> {
+        let resp = self
+            .admin(self.http.post(format!("{}/registry/agents", self.base)))
+            .json(&serde_json::json!({
+                "holder_pubkey": holder_pubkey_hex,
+                "card_url": card_url,
+                "role_tags": role_tags,
+                "skill_ids": skill_ids,
+            }))
+            .send()
+            .await?;
+        ok(resp)?;
+        Ok(())
+    }
 }
 
 /// Map a non-success status to [`CpError::Status`].
@@ -485,5 +510,47 @@ mod tests {
         // A missing/invalid bearer token → the client surfaces a Status error (401).
         let no_auth = cp.register_channel(&channel_hex, &operator_hex, "").await;
         assert!(matches!(no_auth, Err(CpError::Status(_))), "a missing token is a Status error (401)");
+    }
+
+    /// #214 follow-up (automatic agent-directory registration): `ControlPlaneClient::register_agent`
+    /// with the admin token round-trips against the real `agent_directory_router` — makes
+    /// `ct-agent channel agent-card` able to publish discoverability as one step instead of a
+    /// separate manual `POST /registry/agents` the docs used to just describe.
+    #[tokio::test]
+    async fn client_registers_an_agent_against_the_directory_service() {
+        use crate::service::agent_directory_router;
+        use crate::storage::SqliteAgentDirectory;
+
+        let admin = [0x42u8; 32];
+        let admin_hex: String = admin.iter().map(|b| format!("{b:02x}")).collect();
+        let directory = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        let app = agent_directory_router(directory.clone(), Some(admin));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cp = ControlPlaneClient::new(format!("http://{addr}")).with_admin_token(admin_hex);
+        let holder_hex = "ab".repeat(32);
+        let roles = vec!["physics".to_string()];
+        let skills = vec!["game-mechanics".to_string()];
+        cp.register_agent(&holder_hex, "https://you.example/.well-known/agent-card.json", &roles, &skills)
+            .await
+            .unwrap();
+
+        let found = directory.search(Some("physics"), None).unwrap();
+        assert_eq!(found.len(), 1, "the registration round-trips into the searchable directory");
+        assert_eq!(found[0].holder_pubkey, holder_hex);
+        assert_eq!(found[0].card_url, "https://you.example/.well-known/agent-card.json");
+
+        // A non-https card_url is rejected (SSRF defence-in-depth) → the client surfaces 400.
+        let bad_url = cp.register_agent(&holder_hex, "http://not-https.example/card.json", &roles, &skills).await;
+        assert!(matches!(bad_url, Err(CpError::Status(_))), "non-https card_url is a Status error (400)");
+
+        // Missing/wrong admin token → the client surfaces 401.
+        let no_admin = ControlPlaneClient::new(format!("http://{addr}"));
+        let unauth = no_admin
+            .register_agent(&holder_hex, "https://you.example/.well-known/agent-card.json", &roles, &skills)
+            .await;
+        assert!(matches!(unauth, Err(CpError::Status(_))), "missing admin token is a Status error (401)");
     }
 }

@@ -54,7 +54,12 @@ binary.
      ct-agent channel agent-card
    ```
    Serve that directory over HTTPS (so `https://you.<zone>/.well-known/agent-card.json` resolves —
-   see D for the tunnel), and `POST` the card to `/registry/agents` to become discoverable.
+   see D for the tunnel). Add `CT_AGENT_CP_URL=<control-plane URL>` +
+   `CT_AGENT_CARD_URL=https://you.<zone>/.well-known/agent-card.json` +
+   `CT_CP_EDGE_ADMIN_TOKEN=<the shared admin token>` to the same command and it also `POST`s to
+   `/registry/agents` automatically (#214 follow-up) — no separate manual step to forget. Without
+   those three set, `agent-card` still writes the file locally and prints a reminder that this can
+   be automatic; nothing changes silently.
    Self-check any card with `ct-agent channel agent-card --verify <file>`.
 4. **Serve a capability** — a closed `ServiceType`: `code_generation` | `security_review` |
    `safety_check` | `text_generation`. In serve mode the accept side **re-admits successive peers
@@ -106,6 +111,7 @@ A pipeline is a small JSON doc naming the roles a job needs, published at `POST 
 ```json
 {
   "id": "my-new-pipeline",
+  "operator_pubkey_hex": "<64 hex — your channel-operator public key, from `channel operator-init`>",
   "roles": [
     { "service": "text_generation", "units": 1, "tag": "physics" },
     { "service": "text_generation", "units": 1, "tag": "art" }
@@ -115,8 +121,28 @@ A pipeline is a small JSON doc naming the roles a job needs, published at `POST 
 Any agent can `GET /registry/pipelines`, check its declared services/role_tags against each spec's
 roles (the same match `ct_common::pipeline::pipelines_supported_by_services` computes), and follow B
 to join. Once every role has a matching online offer, the pipeline convenes (an auction per role,
-one distinct provider per role) and runs. Publish your `operator_pubkey` + each role's
-`holder_pubkey` alongside the entry so joiners can complete B without a human.
+one distinct provider per role) and runs.
+
+`operator_pubkey_hex` is what makes joining **generic and coordination-free** (#214 follow-up): with
+it set, every role's channel id is `channel_id_for_pipeline_role(operator_pubkey, id, role.tag)` —
+derivable by ANYONE who reads the published spec, with no pairwise pubkey exchange. A bridge/joiner
+runs:
+```
+CT_CHANNEL_OPERATOR_PUBKEY=<operator_pubkey_hex from the spec> \
+CT_PIPELINE_ID=<the spec's id> CT_PIPELINE_ROLE=<the role tag you're joining> \
+CT_CHANNEL_HOLDER_KEY=<yours, from A.1> CT_CHANNEL_NOISE_PUBKEY=<yours> \
+  ct-agent channel join-pipeline-role
+```
+and hands the printed block (channel id + its own holder/noise pubkeys + noise attestation) to
+whoever registered the pipeline's channels (`POST /me/channels` + `/me/channels/:channel/members`,
+per B) — a one-way request, not a two-way exchange, so either side can act whenever it's ready. A
+spec with no `operator_pubkey_hex` (or one predating this field) implies no channel wiring, exactly
+today's behavior — nothing here is required.
+
+`ct-agent` learns which ports actually serve the mesh-plane tunnel vs. the Agent-Fabric channel
+broker/relay from `GET {cp_url}/network-info` (`mesh_edge_port`/`channel_broker_port`/
+`channel_relay_port`) instead of hardcoding `4433`/`4435`/`4436` — read it once, then use those
+values for `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` in B.3.
 
 ## D. Publish a browser-reachable site on your own subdomain
 
