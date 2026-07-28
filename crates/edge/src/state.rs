@@ -152,6 +152,20 @@ impl<H: Clone> EdgeState<H> {
         self.hosts.lock_safe().retain(|_, v| v != token);
     }
 
+    /// Every currently-authorized (hostname, token) pair, or `None` if
+    /// authorization was never required on this edge (host_auth still `None`).
+    /// Read-only — the operator-facing admin dump this deployment's own current
+    /// state can be backfilled from before touching a control-plane registry
+    /// that has no other way to learn what this edge already knows (#153: a
+    /// live edge holds authorizations the control plane never persisted itself
+    /// for hostnames bound via the loopback admin API directly).
+    pub fn dump_host_auth(&self) -> Option<Vec<(String, RoutingToken)>> {
+        self.host_auth
+            .lock_safe()
+            .as_ref()
+            .map(|m| m.iter().map(|(h, t)| (h.clone(), t.clone())).collect())
+    }
+
     /// Require hostname-ownership authorization (#23 BP4b): once enabled, an
     /// `'H'` bind is refused unless the control plane has authorized that
     /// (hostname, token) pair. Enabled at startup for a reachable `:443`.
@@ -499,6 +513,21 @@ mod tests {
         assert!(state.host_bind_allowed("x.test", &token(1)), "authorized pair allowed");
         assert!(!state.host_bind_allowed("x.test", &token(2)), "wrong token refused");
         assert!(!state.host_bind_allowed("y.test", &token(1)), "unauthorized host refused");
+    }
+
+    #[test]
+    fn dump_host_auth_reflects_current_authorizations_or_none_if_never_required() {
+        let state = EdgeState::<u32>::new();
+        assert_eq!(state.dump_host_auth(), None, "authorization never required -> None, not empty");
+
+        state.require_host_auth();
+        assert_eq!(state.dump_host_auth(), Some(vec![]), "required but nothing authorized yet -> empty");
+
+        state.authorize_host("a.test", token(1));
+        state.authorize_host("b.test", token(2));
+        let mut dump = state.dump_host_auth().unwrap();
+        dump.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(dump, vec![("a.test".to_string(), token(1)), ("b.test".to_string(), token(2))]);
     }
 
     #[test]

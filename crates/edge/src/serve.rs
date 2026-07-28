@@ -1165,6 +1165,55 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 Err(e) => eprintln!("ct-edge: invalid CT_EDGE_ADMIN_LISTEN '{addr}': {e}"),
             }
         }
+        // edge_mesh Phase 0 (#153): boot-time rehydration + periodic heartbeat
+        // against the control plane's ownership registry — only when it's
+        // configured (same CT_EDGE_CP_URL the channel broker already requires).
+        // CT_EDGE_ID defaults to "primary", matching the control plane's own
+        // default local-edge id, so a single-edge deployment needs zero extra
+        // config for this to work end to end. Rehydration replays every
+        // (token, hostname) pair the CP recorded this edge as owning back into
+        // `host_auth` — the actual fix for a restart silently forgetting every
+        // hostname authorization (the class of outage this session hit for
+        // real). The heartbeat keeps the CP's view of "is this edge live"
+        // fresh; CT_EDGE_PUBLIC_ADDR is what a peer edge would eventually use
+        // to reach this one (informational only until the cross-edge relay —
+        // a deliberately separate, later increment — exists).
+        if let Ok(cp_url) = std::env::var("CT_EDGE_CP_URL").map(|s| s.trim().to_string()) {
+            if !cp_url.is_empty() {
+                let edge_id = std::env::var("CT_EDGE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "primary".to_string());
+                let peer_addr = std::env::var("CT_EDGE_PUBLIC_ADDR")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "unknown".to_string());
+                eprintln!("ct-edge: mesh-registry heartbeat/rehydration enabled against {cp_url} (CT_EDGE_ID={edge_id})");
+                let rstate = state.clone();
+                let r_cp_url = cp_url.clone();
+                let r_edge_id = edge_id.clone();
+                tokio::spawn(async move {
+                    let pairs = crate::edge_mesh_client::rehydrate(&r_cp_url, &tok, &r_edge_id).await;
+                    let n = pairs.len();
+                    for pair in pairs {
+                        if let Some(host) = pair.hostname {
+                            rstate.authorize_host(&host, RoutingToken(pair.token));
+                        }
+                    }
+                    eprintln!(
+                        "ct-edge: rehydrated {n} hostname authorization(s) from {r_cp_url} (edge_id={r_edge_id})"
+                    );
+                });
+                let hstate_cp_url = cp_url.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        crate::edge_mesh_client::heartbeat(&hstate_cp_url, &tok, &edge_id, &peer_addr).await;
+                    }
+                });
+            }
+        }
     }
     let difficulty = config.pow_difficulty;
 

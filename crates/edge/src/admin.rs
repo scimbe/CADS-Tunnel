@@ -13,18 +13,20 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use quinn::Connection;
+use serde::Serialize;
 
 use crate::state::EdgeState;
 use ct_common::RoutingToken;
 
-/// Build the admin router (#27 revoke, #23 BP4b authorize-host).
+/// Build the admin router (#27 revoke, #23 BP4b authorize-host, #153 host-auth dump).
 pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
     Router::new()
         .route("/admin/revoke/:token", post(revoke))
         .route("/admin/authorize-host/:token/:host", post(authorize_host))
+        .route("/admin/host-auth-dump", get(host_auth_dump))
         .with_state(state)
 }
 
@@ -84,6 +86,39 @@ async fn authorize_host(
         }
         _ => StatusCode::BAD_REQUEST,
     }
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct HostAuthEntry {
+    hostname: String,
+    token: String,
+}
+
+/// `GET /admin/host-auth-dump` (#153): a **read-only** dump of every currently
+/// authorized (hostname, token) pair on this edge — this deployment's own
+/// live state, the only place it exists (the control plane's host-authorize
+/// proxy is a pure pass-through; it never persisted what it forwarded). Exists
+/// to safely backfill a durable control-plane-side ownership registry BEFORE
+/// this edge is ever restarted (a restart wipes `host_auth`, which is exactly
+/// the bug the registry fixes) — read this first, seed the registry, then it's
+/// safe to redeploy. Authenticated the same way as every other admin route.
+async fn host_auth_dump(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<HostAuthEntry>>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let entries = state
+        .dump_host_auth()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(hostname, token)| HostAuthEntry {
+            hostname,
+            token: token.0.iter().map(|b| format!("{b:02x}")).collect(),
+        })
+        .collect();
+    Ok(Json(entries))
 }
 
 /// Parse a 64-hex string into 32 bytes.
@@ -171,5 +206,45 @@ mod tests {
         assert_eq!(post(Some(secret_hex)).await.unwrap().status(), StatusCode::OK);
         assert!(state.host_bind_allowed("help.bunsenbrenner.org", &tok_token));
         assert!(!state.host_bind_allowed("evil.example", &tok_token), "only the authorized host");
+    }
+
+    #[tokio::test]
+    async fn host_auth_dump_is_admin_gated_and_reports_current_authorizations() {
+        // #153: the safe-backfill read path -- must require the admin token (it's
+        // a live inventory of every hostname this edge currently serves) and must
+        // report exactly what's actually authorized, in the hex form the control
+        // plane's ownership registry stores.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x44u8; 32];
+        state.set_admin_token(secret);
+        state.require_host_auth();
+        state.authorize_host("help.bunsenbrenner.org", RoutingToken([0xaa; 32]));
+        state.authorize_host("flappy-demo.bunsenbrenner.org", RoutingToken([0xbb; 32]));
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+
+        let get = |auth: Option<String>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get("/admin/host-auth-dump");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        assert_eq!(get(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no admin token -> 401");
+
+        let resp = get(Some(secret_hex)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let entries: Vec<HostAuthEntry> = serde_json::from_slice(&body).unwrap();
+        let mut pairs: Vec<(String, String)> = entries.into_iter().map(|e| (e.hostname, e.token)).collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("flappy-demo.bunsenbrenner.org".to_string(), "bb".repeat(32)),
+                ("help.bunsenbrenner.org".to_string(), "aa".repeat(32)),
+            ]
+        );
     }
 }
