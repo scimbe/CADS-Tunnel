@@ -36,6 +36,12 @@ pub struct RequiredRole {
     pub units: u64,
     /// The role tag agents advertise on their `AgentCard` for this role (e.g. `"physics"`).
     pub tag: String,
+    /// Optional per-role override of the pipeline's [`SelectionPolicy`]: `Some(p)` clears *this*
+    /// role with `p` regardless of the pipeline-wide default, `None` inherits it. Lets one pipeline
+    /// e.g. load-balance a fungible role while priority-failing-over a scarce one. `#[serde(default)]`
+    /// so specs published before this field existed deserialize as `None` (inherit) — unchanged.
+    #[serde(default)]
+    pub selection_policy: Option<SelectionPolicy>,
 }
 
 /// A workflow-pipeline spec — the roles that must ALL be filled for the pipeline to run. This is
@@ -54,6 +60,18 @@ pub struct PipelineSpec {
     /// implied, exactly today's behavior).
     #[serde(default)]
     pub operator_pubkey_hex: Option<String>,
+    /// The pipeline-wide default auction [`SelectionPolicy`] the designer publishes for this
+    /// workflow — the "list of possible strategies, changeable by config" surfaced via
+    /// `/registry/pipelines` so a bridge (or any joiner) can see how roles clear without a side
+    /// channel. A per-role [`RequiredRole::selection_policy`] overrides it for that role.
+    /// `#[serde(default)]` (→ [`SelectionPolicy::LowestFloor`]) so specs published before this field
+    /// existed still deserialize unchanged — the same discipline #223 used for `operator_pubkey_hex`.
+    ///
+    /// Note: the legacy [`convene`](Self::convene) deliberately ignores this field and always clears
+    /// `LowestFloor`, so no existing caller's behavior shifts when a spec starts declaring a policy;
+    /// [`convene_with_policy`](Self::convene_with_policy) is where it (and any per-role override) takes effect.
+    #[serde(default)]
+    pub selection_policy: SelectionPolicy,
 }
 
 impl PipelineSpec {
@@ -116,7 +134,7 @@ pub struct RoleAssignment {
     pub price: u64,
 }
 
-/// The rule [`convene_with`](PipelineSpec::convene_with) uses to pick the winner **among the offers
+/// The rule [`convene_with_policy`](PipelineSpec::convene_with_policy) uses to pick the winner **among the offers
 /// that already qualify** for a role (all equally valid/eligible — this only decides *which*
 /// qualifying offer wins, never whether a role is fillable). A workflow-pipeline owner selects the
 /// policy in their bridge config, so cheapest-price clearing can be traded for fair load
@@ -254,20 +272,23 @@ impl PipelineSpec {
             .collect()
     }
 
-    /// Convene the pipeline against the currently-online `offers` with the default
-    /// [`SelectionPolicy::LowestFloor`] auction (cheapest floor wins) — the original signature and
-    /// behavior, preserved unchanged for every existing caller. Equivalent to
-    /// [`convene_with`](Self::convene_with) with `LowestFloor` and a fresh [`SelectionState`].
+    /// Convene the pipeline against the currently-online `offers` with the cheapest-floor
+    /// [`SelectionPolicy::LowestFloor`] auction — the original signature and behavior, preserved
+    /// **byte-identically** for every existing caller. It deliberately ignores the (opt-in)
+    /// [`selection_policy`](Self::selection_policy) fields entirely and always clears `LowestFloor`,
+    /// so no existing call site can shift behavior just because a spec starts declaring a policy;
+    /// [`convene_with_policy`](Self::convene_with_policy) is the entry point that honors them.
     pub fn convene(
         &self,
         offers: &[CapacityOffer],
         now: UnixSeconds,
     ) -> Result<Vec<RoleAssignment>, PipelineError> {
-        self.convene_with(offers, now, SelectionPolicy::LowestFloor, &mut SelectionState::default())
+        self.convene_roles(offers, now, |_role| SelectionPolicy::LowestFloor, &mut SelectionState::default())
     }
 
     /// Convene the pipeline against the currently-online `offers`, clearing each role's auction with
-    /// the given [`SelectionPolicy`]. Runs a per-role auction and returns the winning
+    /// `policy` as the pipeline-wide default and honoring any per-role
+    /// [`RequiredRole::selection_policy`] override. Runs a per-role auction and returns the winning
     /// [`RoleAssignment`] for **every** role, or the first [`PipelineError::UnfilledRole`] if any
     /// role has no matchable offer online.
     ///
@@ -275,20 +296,36 @@ impl PipelineSpec {
     /// (signature + not expired), (b) its declared `services` contains the role's service (the
     /// #167 opt-in catalog — a generic empty-services offer never fills a role), and (c) it
     /// advertises at least the units the role needs. **Which** qualifying offer wins is decided by
-    /// `policy` (see [`SelectionPolicy`]); `LowestFloor` is the cheapest-floor auction `convene`
-    /// has always run. A provider wins **at most one** role per convene (#172 cross-role
-    /// exclusivity), so N roles sharing a `ServiceType` require N *distinct* online providers —
-    /// otherwise the surplus roles error, preserving the "not enough online → error" guarantee even
-    /// when the closed `ServiceType` set is coarser than the roles.
+    /// the role's effective policy (`role.selection_policy.unwrap_or(policy)`, see
+    /// [`SelectionPolicy`]); `LowestFloor` is the cheapest-floor auction `convene` has always run. A
+    /// provider wins **at most one** role per convene (#172 cross-role exclusivity), so N roles
+    /// sharing a `ServiceType` require N *distinct* online providers — otherwise the surplus roles
+    /// error, preserving the "not enough online → error" guarantee even when the closed
+    /// `ServiceType` set is coarser than the roles.
     ///
+    /// Pass `self.selection_policy` for `policy` to clear with the pipeline's own published default.
     /// `state` carries the cross-convene bookkeeping the stateful policies need; pass the *same*
     /// instance across successive convenes (the caller owns it). `LowestFloor` ignores it, so a
-    /// fresh `SelectionState::default()` is fine there.
-    pub fn convene_with(
+    /// fresh `SelectionState::default()` is fine when every effective policy is `LowestFloor`.
+    pub fn convene_with_policy(
         &self,
         offers: &[CapacityOffer],
         now: UnixSeconds,
         policy: SelectionPolicy,
+        state: &mut SelectionState,
+    ) -> Result<Vec<RoleAssignment>, PipelineError> {
+        self.convene_roles(offers, now, |role| role.selection_policy.unwrap_or(policy), state)
+    }
+
+    /// Shared convene core: `policy_for` maps each role to the [`SelectionPolicy`] that clears it, so
+    /// [`convene`](Self::convene) can pin `LowestFloor` (legacy, byte-identical) while
+    /// [`convene_with_policy`](Self::convene_with_policy) resolves per-role overrides. Eligibility
+    /// and #172 cross-role exclusivity are policy-independent and identical to the pre-policy code.
+    fn convene_roles(
+        &self,
+        offers: &[CapacityOffer],
+        now: UnixSeconds,
+        policy_for: impl Fn(&RequiredRole) -> SelectionPolicy,
         state: &mut SelectionState,
     ) -> Result<Vec<RoleAssignment>, PipelineError> {
         if self.roles.is_empty() {
@@ -317,7 +354,7 @@ impl PipelineSpec {
             if qualifying.is_empty() {
                 return Err(PipelineError::UnfilledRole { service: role.service });
             }
-            let o = policy.pick(&role.tag, &qualifying, state);
+            let o = policy_for(role).pick(&role.tag, &qualifying, state);
             assigned.push(o.holder_pubkey);
             assignments.push(RoleAssignment {
                 service: role.service,
@@ -456,8 +493,8 @@ mod tests {
         let op_hex = "11".repeat(32);
         let spec = PipelineSpec {
             id: "flappy-demo".to_string(),
-            roles: vec![RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() }],
-            operator_pubkey_hex: Some(op_hex.clone()),
+            roles: vec![RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None }],
+            operator_pubkey_hex: Some(op_hex.clone()), selection_policy: SelectionPolicy::LowestFloor,
         };
         let op = decode_hex_32(&op_hex).unwrap();
         assert_eq!(
@@ -478,10 +515,10 @@ mod tests {
         let spec = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into() },
-                RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into() },
+                RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into(), selection_policy: None },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into(), selection_policy: None },
             ],
-            operator_pubkey_hex: None,
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         // Two agents online: #1 offers SafetyCheck, #2 offers CodeGeneration — both roles fillable.
         let safety = offer(1, vec![SafetyCheck], 20, 50, 1000);
@@ -535,10 +572,10 @@ mod tests {
         let spec_same = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() },
-                RequiredRole { service: TextGeneration, units: 1, tag: "art".into() },
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: TextGeneration, units: 1, tag: "art".into(), selection_policy: None },
             ],
-            operator_pubkey_hex: None,
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         let s2 = offer(7, vec![TextGeneration], 20, 50, 1000);
         let sk = offer(8, vec![TextGeneration], 20, 40, 1000);
@@ -554,7 +591,7 @@ mod tests {
 
         // An empty spec convenes nothing.
         assert_eq!(
-            PipelineSpec { id: "e".into(), roles: vec![], operator_pubkey_hex: None }.convene(&[safety], 100),
+            PipelineSpec { id: "e".into(), roles: vec![], operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor }.convene(&[safety], 100),
             Err(PipelineError::Empty),
         );
     }
@@ -580,10 +617,10 @@ mod tests {
         let spec = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: CodeGeneration, units: 10, tag: "physics".into() },
-                RequiredRole { service: CodeGeneration, units: 10, tag: "art".into() },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "art".into(), selection_policy: None },
             ],
-            operator_pubkey_hex: None,
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         // source-2 advertises "physics" (+ an existing tag), sink advertises "art"; a stranger
         // advertises neither.
@@ -604,8 +641,8 @@ mod tests {
         // A role no card advertises → no one to invite.
         let spec2 = PipelineSpec {
             id: "x".into(),
-            roles: vec![RequiredRole { service: SafetyCheck, units: 1, tag: "nobody-has-this".into() }],
-            operator_pubkey_hex: None,
+            roles: vec![RequiredRole { service: SafetyCheck, units: 1, tag: "nobody-has-this".into(), selection_policy: None }],
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         assert!(spec2.invitations(&[card(5, vec!["physics"], vec![], 1000)], 100)[0].candidates.is_empty());
     }
@@ -618,16 +655,16 @@ mod tests {
         let flappy = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() },
-                RequiredRole { service: TextGeneration, units: 1, tag: "art".into() },
-                RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into() },
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: TextGeneration, units: 1, tag: "art".into(), selection_policy: None },
+                RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into(), selection_policy: None },
             ],
-            operator_pubkey_hex: None,
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         let audit = PipelineSpec {
             id: "audit".into(),
-            roles: vec![RequiredRole { service: SecurityReview, units: 1, tag: "reviewer".into() }],
-            operator_pubkey_hex: None,
+            roles: vec![RequiredRole { service: SecurityReview, units: 1, tag: "reviewer".into(), selection_policy: None }],
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
 
         // A text-generation agent (source-2/sink) supports flappy's physics + art, but NOT its
@@ -660,10 +697,10 @@ mod tests {
         let spec = PipelineSpec {
             id: "flappy".into(),
             roles: vec![
-                RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into() },
-                RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into() },
+                RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into(), selection_policy: None },
+                RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into(), selection_policy: None },
             ],
-            operator_pubkey_hex: None,
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         };
         let guard = offer(1, vec![SafetyCheck], 20, 50, 1000); // provider holder(1), price 50
         let coder = offer(2, vec![CodeGeneration], 20, 40, 1000); // provider holder(2), price 40
@@ -714,15 +751,15 @@ mod tests {
     fn physics_spec() -> PipelineSpec {
         PipelineSpec {
             id: "flappy".into(),
-            roles: vec![RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() }],
-            operator_pubkey_hex: None,
+            roles: vec![RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None }],
+            operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor,
         }
     }
 
     #[test]
-    fn lowest_floor_is_the_default_and_convene_matches_convene_with() {
+    fn lowest_floor_is_the_default_and_convene_matches_convene_with_policy() {
         // Back-compat contract: the default policy is LowestFloor, and the old `convene` is exactly
-        // `convene_with(LowestFloor, fresh state)` — cheapest floor still wins, nothing regresses.
+        // `convene_with_policy(LowestFloor, fresh state)` — cheapest floor still wins, nothing regresses.
         assert_eq!(SelectionPolicy::default(), SelectionPolicy::LowestFloor);
         let spec = physics_spec();
         let dear = offer(1, vec![TextGeneration], 20, 50, 1000);
@@ -730,9 +767,9 @@ mod tests {
         let offers = [dear, cheap];
         let via_default = spec.convene(&offers, 100).unwrap();
         let via_policy = spec
-            .convene_with(&offers, 100, SelectionPolicy::LowestFloor, &mut SelectionState::default())
+            .convene_with_policy(&offers, 100, SelectionPolicy::LowestFloor, &mut SelectionState::default())
             .unwrap();
-        assert_eq!(via_default, via_policy, "convene() == convene_with(LowestFloor, fresh)");
+        assert_eq!(via_default, via_policy, "convene() == convene_with_policy(LowestFloor, fresh)");
         assert_eq!(via_default[0].provider, holder(2), "cheapest floor wins by default");
         assert_eq!(via_default[0].price, 30);
     }
@@ -749,7 +786,7 @@ mod tests {
         ];
         let mut state = SelectionState::default();
         let winners: Vec<[u8; 32]> = (0..4)
-            .map(|_| spec.convene_with(&offers, 100, SelectionPolicy::RoundRobin, &mut state).unwrap()[0].provider)
+            .map(|_| spec.convene_with_policy(&offers, 100, SelectionPolicy::RoundRobin, &mut state).unwrap()[0].provider)
             .collect();
         assert_ne!(winners[0], winners[1], "never the same provider twice in a row");
         assert_eq!(winners[0], winners[2], "cycles back after all providers had a turn");
@@ -768,7 +805,7 @@ mod tests {
         // Two equal providers → least-calls balances 1:1 over an even number of jobs.
         let two = [p1.clone(), p2.clone()];
         for _ in 0..4 {
-            spec.convene_with(&two, 100, SelectionPolicy::LeastCalls, &mut state).unwrap();
+            spec.convene_with_policy(&two, 100, SelectionPolicy::LeastCalls, &mut state).unwrap();
         }
         assert_eq!(state.served_counts.get(&holder(1)).copied().unwrap_or(0), 2);
         assert_eq!(state.served_counts.get(&holder(2)).copied().unwrap_or(0), 2);
@@ -778,7 +815,7 @@ mod tests {
         // can take as an alternative").
         let three = [p1, p2, offer(3, vec![TextGeneration], 20, 50, 1000)];
         let next: Vec<[u8; 32]> = (0..2)
-            .map(|_| spec.convene_with(&three, 100, SelectionPolicy::LeastCalls, &mut state).unwrap()[0].provider)
+            .map(|_| spec.convene_with_policy(&three, 100, SelectionPolicy::LeastCalls, &mut state).unwrap()[0].provider)
             .collect();
         assert!(next.iter().all(|w| *w == holder(3)), "the fresh copy drains the backlog first");
         assert_eq!(state.served_counts.get(&holder(3)).copied().unwrap_or(0), 2, "copy caught up");
@@ -795,20 +832,90 @@ mod tests {
         let mut state = SelectionState::default();
 
         let first = spec
-            .convene_with(&[p1.clone(), p2.clone()], 100, SelectionPolicy::RoundRobin, &mut state)
+            .convene_with_policy(&[p1.clone(), p2.clone()], 100, SelectionPolicy::RoundRobin, &mut state)
             .unwrap()[0]
             .provider;
         let (survivor_offer, survivor) =
             if first == holder(1) { (p2, holder(2)) } else { (p1, holder(1)) };
         let a = spec
-            .convene_with(&[survivor_offer], 100, SelectionPolicy::RoundRobin, &mut state)
+            .convene_with_policy(&[survivor_offer], 100, SelectionPolicy::RoundRobin, &mut state)
             .unwrap();
         assert_eq!(a[0].provider, survivor, "re-clears over the live set → automatic failover");
 
         assert_eq!(
-            spec.convene_with(&[], 100, SelectionPolicy::RoundRobin, &mut state),
+            spec.convene_with_policy(&[], 100, SelectionPolicy::RoundRobin, &mut state),
             Err(PipelineError::UnfilledRole { service: TextGeneration }),
             "all offline → unfilled, exactly as before",
         );
+    }
+
+    #[test]
+    fn selection_policy_fields_default_and_old_specs_still_deserialize() {
+        // #223 discipline: a PipelineSpec published before selection_policy existed has neither the
+        // pipeline field nor a per-role override in its JSON → both must default (LowestFloor /
+        // inherit), so old published specs behave exactly as before.
+        let json = r#"{"id":"old","roles":[{"service":"TextGeneration","units":1,"tag":"physics"}]}"#;
+        let spec: PipelineSpec = serde_json::from_str(json).expect("pre-policy spec still parses");
+        assert_eq!(spec.selection_policy, SelectionPolicy::LowestFloor, "pipeline default is LowestFloor");
+        assert_eq!(spec.roles[0].selection_policy, None, "role inherits (no override)");
+        // And it round-trips (serialize → deserialize is stable), so re-publishing doesn't drift.
+        let round: PipelineSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(round, spec);
+    }
+
+    #[test]
+    fn convene_ignores_the_published_policy_but_convene_with_policy_honors_it() {
+        // The published pipeline default must NOT leak into the legacy convene() (byte-identical
+        // guarantee), yet convene_with_policy(spec.selection_policy, ..) must actually use it.
+        let mut spec = physics_spec();
+        spec.selection_policy = SelectionPolicy::RoundRobin; // published default = round-robin
+        let offers = [
+            offer(1, vec![TextGeneration], 20, 50, 1000),
+            offer(2, vec![TextGeneration], 20, 50, 1000),
+        ];
+        // Legacy convene(): still lowest-floor (ties → holder key), so it pins the SAME provider
+        // every call regardless of the spec's declared RoundRobin.
+        let a = spec.convene(&offers, 100).unwrap()[0].provider;
+        let b = spec.convene(&offers, 100).unwrap()[0].provider;
+        assert_eq!(a, b, "convene() ignores the published policy and stays deterministic lowest-floor");
+        // convene_with_policy(spec.selection_policy, ..) honors it → alternates across the two.
+        let mut state = SelectionState::default();
+        let w0 = spec.convene_with_policy(&offers, 100, spec.selection_policy, &mut state).unwrap()[0].provider;
+        let w1 = spec.convene_with_policy(&offers, 100, spec.selection_policy, &mut state).unwrap()[0].provider;
+        assert_ne!(w0, w1, "convene_with_policy applies the pipeline's published RoundRobin default");
+    }
+
+    #[test]
+    fn per_role_override_beats_the_pipeline_default() {
+        // A two-role pipeline: pipeline default = LeastCalls, but one role pins RoundRobin. Each role
+        // must clear under its own effective policy (override wins for the role that sets it).
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole {
+                    service: TextGeneration,
+                    units: 1,
+                    tag: "physics".into(),
+                    selection_policy: Some(SelectionPolicy::RoundRobin),
+                },
+                RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into(), selection_policy: None },
+            ],
+            operator_pubkey_hex: None,
+            selection_policy: SelectionPolicy::LeastCalls,
+        };
+        // physics has two interchangeable text providers; guard has two safety providers.
+        let phys_a = offer(1, vec![TextGeneration], 20, 50, 1000);
+        let phys_b = offer(2, vec![TextGeneration], 20, 50, 1000);
+        let guard_a = offer(3, vec![SafetyCheck], 20, 50, 1000);
+        let guard_b = offer(4, vec![SafetyCheck], 20, 50, 1000);
+        let offers = [phys_a, phys_b, guard_a, guard_b];
+        let mut state = SelectionState::default();
+
+        // Two convenes. physics (override=RoundRobin) must alternate; guard (inherits LeastCalls)
+        // balances too, but the point is the override is applied independently per role.
+        let r0 = spec.convene_with_policy(&offers, 100, spec.selection_policy, &mut state).unwrap();
+        let r1 = spec.convene_with_policy(&offers, 100, spec.selection_policy, &mut state).unwrap();
+        assert_ne!(r0[0].provider, r1[0].provider, "physics role rotates under its RoundRobin override");
+        assert_ne!(r0[1].provider, r1[1].provider, "guard role balances under the inherited LeastCalls default");
     }
 }

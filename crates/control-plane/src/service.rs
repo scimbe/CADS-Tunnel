@@ -5264,7 +5264,7 @@ mod tests {
         pipeline_registry
             .publish(
                 "owner1",
-                &ct_common::pipeline::PipelineSpec { id: "flappy".into(), roles: vec![], operator_pubkey_hex: None },
+                &ct_common::pipeline::PipelineSpec { id: "flappy".into(), roles: vec![], operator_pubkey_hex: None, selection_policy: ct_common::pipeline::SelectionPolicy::LowestFloor },
                 1,
             )
             .unwrap();
