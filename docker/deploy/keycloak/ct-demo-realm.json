@@ -16,6 +16,15 @@
       "defaultAction": true,
       "priority": 10,
       "config": {}
+    },
+    {
+      "alias": "delete_account",
+      "name": "Delete Account",
+      "providerId": "delete_account",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 60,
+      "config": {}
     }
   ],
   "defaultSignatureAlgorithm": "RS256",

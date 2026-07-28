@@ -75,6 +75,10 @@ struct ApiState {
     edge_admin: Option<EdgeAdmin>,
     /// Automatic DNS for tunnel hostnames (#38 DL2); `None` disables it.
     dns: Option<DnsAutopilot>,
+    /// Keycloak's own Account Console (password change, sessions, self-service
+    /// account deletion) — `None` when OIDC isn't configured, in which case the
+    /// account page simply omits the link rather than pointing at nothing.
+    account_console_url: Option<Arc<str>>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -88,6 +92,7 @@ pub fn portal_api_router(
     portal_base: &str,
     edge_admin: Option<(String, String)>,
     dns: Option<(DesecClient, String)>,
+    account_console_url: Option<String>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -104,6 +109,7 @@ pub fn portal_api_router(
             client,
             edge_ip: Arc::from(edge_ip),
         }),
+        account_console_url: account_console_url.map(Arc::from),
     };
     Router::new()
         .route("/portal/account", get(account_page))
@@ -137,7 +143,13 @@ async fn account_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
         Err(resp) => return resp,
     };
     let balance = st.ledger.balance(&account).unwrap_or(0);
-    Html(account_html(&subject, &hex(&account.0), balance)).into_response()
+    Html(account_html(
+        &subject,
+        &hex(&account.0),
+        balance,
+        st.account_console_url.as_deref(),
+    ))
+    .into_response()
 }
 
 /// Credits to add, from the buy-credits form.
@@ -472,7 +484,7 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     let run_cmd = "set -a; source .env; set +a\n./target/release/ct-agent onboard";
     let body = format!(
         r#"<h1>Install an agent</h1>
-<p class="help">Run this <strong>on the machine you want to expose</strong> &mdash;
+<p class="help">Save this <strong>on the machine you want to expose</strong> &mdash;
 the <em>origin</em>: the server or device running the service you are tunnelling,
 not the device you are reading this on. The agent connects out to the relay and
 serves your origin through it (no inbound firewall port needed).</p>
@@ -488,6 +500,9 @@ as <code>.env</code> <strong>next to the binary, on the machine you want to expo
 
 <details>
  <summary>How to bring your tunnel up with these tokens</summary>
+ <p class="help">For doing it yourself by hand, step by step. If you'd rather have an AI agent do
+ this part for you instead, use the Claude Code prompt on the
+ <a href="/#get-started">landing page</a> — it downloads, builds, and runs all of this on its own.</p>
  <h3>1. Build <code>ct-agent</code> (Docker, no Rust toolchain needed)</h3>
  <div class="code-block">
   <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
@@ -762,7 +777,20 @@ pub(crate) fn page(title: &str, body: &str) -> String {
     )
 }
 
-fn account_html(subject: &str, account_hex: &str, balance: u64) -> String {
+fn account_html(subject: &str, account_hex: &str, balance: u64, account_console_url: Option<&str>) -> String {
+    // Password change, active-session review, and self-service account
+    // deletion all live in Keycloak's own Account Console -- not reimplemented
+    // here. Omitted (not a dead link) when OIDC isn't configured.
+    let manage_section = match account_console_url {
+        Some(url) => format!(
+            r#"<h2>Manage your account</h2>
+<p class="help">Change your password, review active sessions, or delete your account entirely --
+all handled by your identity provider, not by CADS-Tunnel itself.</p>
+<a class="btn sec" href="{url}" target="_blank" rel="noopener">Open Account Console &rarr;</a>"#,
+            url = escape(url)
+        ),
+        None => String::new(),
+    };
     let body = format!(
         r#"<h1>Your account</h1>
 <div class="row"><span class="k">Subject</span><span class="v">{subject}</span></div>
@@ -772,10 +800,12 @@ fn account_html(subject: &str, account_hex: &str, balance: u64) -> String {
 <form method="post" action="/portal/account/credits">
  <input type="number" name="credits" min="1" value="100" required>
  <button type="submit">Create payment intent</button>
-</form>"#,
+</form>
+{manage_section}"#,
         subject = escape(subject),
         account = escape(account_hex),
         balance = balance,
+        manage_section = manage_section,
     );
     page("your account", &body)
 }
@@ -848,7 +878,17 @@ mod tests {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
-        portal_api_router(KEY, ledger, tunnels, enrollment, bootstrap, "https://portal.example", None, None)
+        portal_api_router(
+            KEY,
+            ledger,
+            tunnels,
+            enrollment,
+            bootstrap,
+            "https://portal.example",
+            None,
+            None,
+            None,
+        )
     }
 
     #[tokio::test]
@@ -881,6 +921,49 @@ mod tests {
         assert!(html.contains("Credit&nbsp;balance"), "shows the balance row");
         assert!(html.contains("/portal/account/credits"), "offers buy-credits");
         assert!(html.contains("/portal/logout"), "offers sign-out");
+        // No OIDC configured in test_app() -- omitted, not a dead link.
+        assert!(
+            !html.contains("Account Console"),
+            "no account-console link when OIDC/account_console_url isn't configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_page_links_to_the_idp_account_console_when_configured() {
+        // Password change, sessions, and self-service account deletion are all
+        // Keycloak's own Account Console -- CADS-Tunnel doesn't reimplement any
+        // of it, just links there.
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels,
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            Some("https://auth.example/realms/ct-demo/account".to_string()),
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/portal/account")
+                    .header("cookie", session_header("kc-user-1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(
+            html.contains(r#"href="https://auth.example/realms/ct-demo/account""#),
+            "links to the real account console URL"
+        );
+        assert!(html.contains("delete your account") || html.contains("Delete your account"),
+            "explains that deletion is available via the account console");
     }
 
     #[tokio::test]
@@ -1087,6 +1170,7 @@ mod tests {
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
+            None,
         );
 
         let status = post_form(&app, &format!("/portal/tunnels/{}/delete", created.id), "alice", "").await;
@@ -1149,6 +1233,7 @@ mod tests {
             "https://portal.example",
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             Some((desec, "1.2.3.4".to_string())),
+            None,
         );
 
         // Viewing the tunnels page auto-provisions the one Standard-tier tunnel.
@@ -1218,6 +1303,7 @@ mod tests {
             "https://portal.example",
             None,
             Some((desec, "45.133.9.145".to_string())),
+            None,
         );
 
         // Viewing the tunnels page auto-provisions the tunnel with its auto-assigned

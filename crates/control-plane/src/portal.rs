@@ -126,6 +126,14 @@ impl PortalOidc {
         crate::oidc::jwks_uri_for(self.issuer())
     }
 
+    /// Keycloak's own Account Console for this realm -- where a customer can
+    /// change their password, review active sessions, and (once the realm's
+    /// `delete_account` required action is enabled) delete their own account,
+    /// without CADS-Tunnel reimplementing any of that itself.
+    pub(crate) fn account_console_url(&self) -> String {
+        format!("{}/account", self.issuer())
+    }
+
     /// Build the Authorization Code redirect URL, carrying a CSRF `state`. `idp_hint`
     /// (Keycloak's `kc_idp_hint`) sends the browser straight to a specific brokered
     /// identity provider (e.g. `google`, `github`) instead of Keycloak's own

@@ -3031,30 +3031,36 @@ pub fn persistent_control_plane_router(
         .merge(status)
         .merge(landing_router())
         .merge(network_info_router())
-        .merge(crate::portal::portal_router(
-            crate::portal::PortalOidc::from_env(),
-            webhook_secret,
-        ))
-        .merge(crate::portal_api::portal_api_router(
-            webhook_secret,
-            ledger.clone(),
-            tunnels.clone(),
-            enrollment.clone(),
-            bootstrap.clone(),
-            &std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
-            // #27 RB4b: propagate tunnel revokes to the edge when both the admin
-            // URL and shared secret are configured.
-            edge_admin_config.clone(),
-            // #38 DL2: automatic tunnel-hostname DNS via deSEC, pointing A records
-            // at the edge's public IP. Enabled when the deSEC config + edge IP are set.
-            match (
-                ct_dns::provider::DesecClient::from_env(),
-                std::env::var("CT_CP_DNS_EDGE_IP").ok().filter(|s| !s.is_empty()),
-            ) {
-                (Some(client), Some(ip)) => Some((client, ip)),
-                _ => None,
-            },
-        ))
+        .merge({
+            let oidc_cfg = crate::portal::PortalOidc::from_env();
+            let account_console_url = oidc_cfg.as_ref().map(|c| c.account_console_url());
+            crate::portal::portal_router(oidc_cfg, webhook_secret).merge(
+                crate::portal_api::portal_api_router(
+                    webhook_secret,
+                    ledger.clone(),
+                    tunnels.clone(),
+                    enrollment.clone(),
+                    bootstrap.clone(),
+                    &std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string()),
+                    // #27 RB4b: propagate tunnel revokes to the edge when both the admin
+                    // URL and shared secret are configured.
+                    edge_admin_config.clone(),
+                    // #38 DL2: automatic tunnel-hostname DNS via deSEC, pointing A records
+                    // at the edge's public IP. Enabled when the deSEC config + edge IP are set.
+                    match (
+                        ct_dns::provider::DesecClient::from_env(),
+                        std::env::var("CT_CP_DNS_EDGE_IP").ok().filter(|s| !s.is_empty()),
+                    ) {
+                        (Some(client), Some(ip)) => Some((client, ip)),
+                        _ => None,
+                    },
+                    // Keycloak's own Account Console (password change, sessions, and
+                    // self-service account deletion) -- linked from /portal/account
+                    // instead of CADS-Tunnel reimplementing any of it.
+                    account_console_url,
+                ),
+            )
+        })
         .merge(pki)
         // #75 IS3b: serve /install.sh + /install.ps1 (the portal one-liner targets
         // that were 404ing). CT_PORTAL_BASE_URL is the origin the served scripts POST

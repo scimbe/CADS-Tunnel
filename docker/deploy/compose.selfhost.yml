@@ -45,6 +45,16 @@ services:
       CT_CP_MESH_EDGE_PORT: "${EDGE_PORT:-4433}"
       CT_CP_CHANNEL_BROKER_PORT: "${EDGE_CHANNEL_PORT:-4435}"
       CT_CP_CHANNEL_RELAY_PORT: "${EDGE_CHANNEL_RELAY_PORT:-4436}"
+      # #38 DL2: the edge's public IP, so the portal's tunnel-hostname DNS
+      # autopilot (crates/control-plane/src/portal_api.rs DnsAutopilot) can
+      # auto-create the A record for a Standard-tier tunnel's auto-assigned
+      # hostname. Not a secret (it's the same IP bunsenbrenner.org's own DNS
+      # already publishes) -- defaulted here rather than requiring a .env
+      # entry, since without it st.dns stays None and NO tunnel ever gets an
+      # auto-assigned hostname at all (silently -- this was the actual cause
+      # of the very first real account's tunnel showing a bare "site" name
+      # with no hostname).
+      CT_CP_DNS_EDGE_IP: "${CT_CP_DNS_EDGE_IP:-57.131.133.91}"
     env_file:
       - .env
     volumes:
