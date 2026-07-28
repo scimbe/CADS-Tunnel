@@ -3130,6 +3130,14 @@ pub fn persistent_control_plane_router(
         // edge_mesh Phase 0: heartbeat/lookup/rehydrate — admin-token-gated the same as
         // every other internal machine-writer surface here.
         .merge(crate::edge_mesh::edge_mesh_router(edge_mesh_store.clone(), admin_token))
+        // ACME DNS-01 challenge-publish (ADR-0003 follow-up): an agent proves hostname
+        // ownership via its routing token (checked against edge_mesh) instead of ever
+        // holding the zone-wide DNS credential itself. Absent when no DNS-01 backend
+        // is configured (same deSEC config the A-record autopilot already reads).
+        .merge(crate::dns01_challenge::dns01_challenge_router(
+            edge_mesh_store.clone(),
+            ct_dns::provider::DesecClient::from_env().map(ct_dns::provider::Dns01Provider::Desec),
+        ))
         // #214: public, admin-token-gated host-authorization proxy to the edge — lets a
         // remote pipeline maintainer holding just the admin token self-serve hostname
         // binds (the same shared secret /enroll/issue already requires), no operator

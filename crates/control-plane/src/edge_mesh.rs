@@ -151,6 +151,23 @@ impl SqliteEdgeMesh {
             .optional()
     }
 
+    /// Whether `token` is the recorded owner of exactly `hostname` — the
+    /// authorization check the ACME DNS-01 endpoint gates on (#153 follow-up):
+    /// an agent proves it may claim `_acme-challenge.<hostname>` by presenting
+    /// the routing token this registry already knows is bound to that
+    /// hostname, so no separate credential/allowlist is needed.
+    pub fn token_owns_hostname(&self, token: &str, hostname: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM mesh_ownership WHERE token = ?1 AND hostname = ?2",
+                params![token, hostname],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
+    }
+
     /// Which edge (id, peer_addr) owns `hostname`, if any.
     pub fn lookup_by_host(&self, hostname: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
@@ -368,6 +385,19 @@ mod tests {
 
         assert!(s.lookup_by_token("unknown").unwrap().is_none());
         assert!(s.lookup_by_host("unknown.example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn token_owns_hostname_matches_only_the_exact_recorded_pair() {
+        let s = store();
+        let now = now_secs();
+        s.record_ownership("deadbeef", Some("app.example.com"), "edge-1", now).unwrap();
+        s.record_ownership("cafef00d", Some("other.example.com"), "edge-1", now).unwrap();
+
+        assert!(s.token_owns_hostname("deadbeef", "app.example.com").unwrap());
+        assert!(!s.token_owns_hostname("deadbeef", "other.example.com").unwrap(), "wrong hostname for this token");
+        assert!(!s.token_owns_hostname("cafef00d", "app.example.com").unwrap(), "wrong token for this hostname");
+        assert!(!s.token_owns_hostname("unknown", "app.example.com").unwrap(), "unknown token");
     }
 
     #[test]

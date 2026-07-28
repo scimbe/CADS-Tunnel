@@ -8,6 +8,9 @@ license-file.workspace = true
 [dependencies]
 ct-common = { path = "../common" }
 ct-control-plane = { path = "../control-plane" }
+# ACME (ADR-0003): Dns01Provider (SelfHosted ct-dns / deSEC) publishes the
+# _acme-challenge TXT record the DNS-01 validation reads.
+ct-dns = { path = "../dns" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -17,9 +20,17 @@ rand = "0.8"
 rcgen = "0.13"
 axum = "0.7"
 tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 base64 = "0.22"
+# ACME (ADR-0003): JWS signing (ES256, RFC 7515) for the account-key-signed protocol
+# requests — a direct dependency (not just transitive via rustls's "ring" feature) so
+# ct-agent can drive ring::signature::EcdsaKeyPair itself.
+ring = "0.17"
+# ACME (ADR-0003): the network driver's HTTP client — rustls-tls to match the rest of
+# the workspace's zero-OpenSSL policy (control-plane/edge/dns already do this).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 libp2p = { workspace = true }
 libp2p-stream = { workspace = true }
 tokio-util = { workspace = true }

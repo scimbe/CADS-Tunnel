@@ -2,6 +2,9 @@
 //! key; mints Capabilities. See ADR-0004 (transport), ADR-0005 (identity).
 
 pub mod acme;
+pub mod acme_client;
+pub mod acme_jws;
+pub mod acme_orchestrate;
 pub mod capability;
 pub mod channel;
 pub mod channel_run;

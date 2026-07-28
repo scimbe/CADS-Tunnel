@@ -37,6 +37,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // `certificate` subcommand (ADR-0003): obtain (and keep renewed) a real,
+    // publicly-trusted certificate for this tunnel's hostname via ACME DNS-01 --
+    // the agent's own private key never leaves this machine; the operator only
+    // ever sees the DNS-01 challenge value, via the control plane's
+    // /agent/dns01-challenge (proven by this tunnel's own routing token, never
+    // a DNS credential). Writes fullchain.pem/privkey.pem where the origin's own
+    // webserver (Caddy) already expects a static cert pair, and re-checks every
+    // few hours, only actually contacting the ACME server once renewal is due.
+    if std::env::args().nth(1).as_deref() == Some("certificate") {
+        let config = ct_agent::acme_orchestrate::AcmeCertConfig::from_env()?;
+        ct_agent::acme_orchestrate::run_renewal_loop(config).await;
+    }
+
     // `channel` subcommand (#72 AF4 / #98/#100): bring this agent up as one side of
     // an Agent-Fabric A2A channel and pipe stdin/stdout over the encrypted Noise_IK
     // tunnel to the paired peer. Config comes from CT_CHANNEL_* so it fits a one-liner.
