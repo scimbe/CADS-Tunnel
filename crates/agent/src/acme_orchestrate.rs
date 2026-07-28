@@ -52,11 +52,13 @@ pub struct AcmeCertConfig {
     /// Where to persist the ACME account key (PKCS#8 DER) so renewals reuse
     /// the same account instead of registering a new one every run.
     pub account_key_path: PathBuf,
-    /// DNS-over-HTTPS resolver used to confirm the `_acme-challenge` TXT
+    /// DNS-over-HTTPS resolvers used to confirm the `_acme-challenge` TXT
     /// record is publicly visible before validation is triggered (see
-    /// `crate::dns01_propagation`). Defaults to a public resolver reachable
+    /// `crate::dns01_propagation`) -- more than one independent resolver
+    /// operator, so a single resolver's stale negative cache (from an
+    /// earlier attempt at the same hostname) can't block a retry. Reachable
     /// over 443 even when outbound UDP/53 is blocked.
-    pub dns01_resolver_url: String,
+    pub dns01_resolver_urls: Vec<String>,
     /// How long to wait for that TXT record to become publicly resolvable
     /// before giving up (deSEC and similar managed DNS backends replicate to
     /// public nameservers with a short but nonzero delay).
@@ -70,9 +72,9 @@ impl AcmeCertConfig {
     /// `CT_AGENT_HOSTNAME` (all required), `CT_ACME_DIRECTORY_URL` (defaults
     /// to Let's Encrypt production), `CT_ACME_CERT_OUT_DIR` (default
     /// `/shared/acme-cert`), `CT_ACME_ACCOUNT_KEY_PATH` (default
-    /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URL`
-    /// (default a public DoH resolver), `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS`
-    /// (default 90).
+    /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URLS`
+    /// (comma-separated, defaults to two independent public DoH resolvers),
+    /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 90).
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -92,9 +94,10 @@ impl AcmeCertConfig {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| cert_out_dir.join("acme-account-key.der"));
-        let dns01_resolver_url = get("CT_ACME_DNS01_RESOLVER_URL")
+        let dns01_resolver_urls = get("CT_ACME_DNS01_RESOLVER_URLS")
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| dns01_propagation::DEFAULT_RESOLVER_URL.to_string());
+            .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+            .unwrap_or_else(|| dns01_propagation::DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect());
         let dns01_propagation_timeout = get("CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS")
             .filter(|s| !s.is_empty())
             .and_then(|s| s.parse::<u64>().ok())
@@ -107,7 +110,7 @@ impl AcmeCertConfig {
             directory_url,
             cert_out_dir,
             account_key_path,
-            dns01_resolver_url,
+            dns01_resolver_urls,
             dns01_propagation_timeout,
         })
     }
@@ -162,7 +165,7 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
         config.routing_token.clone(),
     ));
     let propagation =
-        PropagationWaiter::new(config.dns01_resolver_url.clone(), config.dns01_propagation_timeout);
+        PropagationWaiter::new(config.dns01_resolver_urls.clone(), config.dns01_propagation_timeout);
     let issued = client.issue_certificate(&config.hostname, &publish, Some(&propagation)).await?;
 
     // Write key before cert (an origin polling for the cert file should never
@@ -242,7 +245,10 @@ mod tests {
         assert_eq!(cfg.directory_url, DEFAULT_ACME_DIRECTORY, "defaults to Let's Encrypt production");
         assert_eq!(cfg.cert_out_dir, PathBuf::from("/shared/acme-cert"));
         assert_eq!(cfg.account_key_path, PathBuf::from("/shared/acme-cert/acme-account-key.der"));
-        assert_eq!(cfg.dns01_resolver_url, dns01_propagation::DEFAULT_RESOLVER_URL);
+        assert_eq!(
+            cfg.dns01_resolver_urls,
+            dns01_propagation::DEFAULT_RESOLVER_URLS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
         assert_eq!(cfg.dns01_propagation_timeout, dns01_propagation::DEFAULT_TIMEOUT);
     }
 
@@ -255,7 +261,7 @@ mod tests {
             "CT_ACME_DIRECTORY_URL" => Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_string()),
             "CT_ACME_CERT_OUT_DIR" => Some("/tmp/my-certs".to_string()),
             "CT_ACME_ACCOUNT_KEY_PATH" => Some("/tmp/my-account.der".to_string()),
-            "CT_ACME_DNS01_RESOLVER_URL" => Some("https://dns.google/resolve".to_string()),
+            "CT_ACME_DNS01_RESOLVER_URLS" => Some("https://dns.google/resolve, https://dns.quad9.net/dns-query".to_string()),
             "CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS" => Some("30".to_string()),
             _ => None,
         };
@@ -263,7 +269,10 @@ mod tests {
         assert!(cfg.directory_url.contains("staging"));
         assert_eq!(cfg.cert_out_dir, PathBuf::from("/tmp/my-certs"));
         assert_eq!(cfg.account_key_path, PathBuf::from("/tmp/my-account.der"));
-        assert_eq!(cfg.dns01_resolver_url, "https://dns.google/resolve");
+        assert_eq!(
+            cfg.dns01_resolver_urls,
+            vec!["https://dns.google/resolve".to_string(), "https://dns.quad9.net/dns-query".to_string()]
+        );
         assert_eq!(cfg.dns01_propagation_timeout, Duration::from_secs(30));
     }
 
@@ -453,7 +462,7 @@ mod tests {
             directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
-            dns01_resolver_url: format!("{base}/doh"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(5),
         };
 
@@ -492,7 +501,7 @@ mod tests {
             directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
-            dns01_resolver_url: format!("{base}/doh"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(5),
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
@@ -520,7 +529,7 @@ mod tests {
             directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
-            dns01_resolver_url: format!("{base}/doh"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_secs(10),
         };
 
@@ -550,7 +559,7 @@ mod tests {
             directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
-            dns01_resolver_url: format!("{base}/doh"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
             dns01_propagation_timeout: Duration::from_millis(200),
         };
 
