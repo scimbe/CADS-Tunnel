@@ -2457,20 +2457,28 @@ const LANDING_HTML: &str = r#"<!doctype html>
      <div class="code-block-head"><span>&#128203; prompt.txt — ready to paste into Claude Code</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
      <template><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
 
-1. Download and unpack the starter template:
+1. Check whether a `.env` file already exists in this directory.
+   - If it exists: load it now with `set -a; source .env; set +a` before doing
+     anything else, and keep it loaded/updated for the rest of this session.
+   - If it does NOT exist: stop and ask me to open
+     https://bunsenbrenner.org/portal/tunnels, click Install on my tunnel, and
+     paste the shown `.env` block into a new `.env` file here. Don't continue
+     until it exists and is loaded.
+2. Download and unpack the starter template:
    curl -LO https://bunsenbrenner.org/downloads/hello-world-pipeline.zip
    unzip hello-world-pipeline.zip && cd hello-world-pipeline
-2. Read the template's README.md (and https://bunsenbrenner.org/llms.txt for the
+3. Read the template's README.md (and https://bunsenbrenner.org/llms.txt for the
    full AI-agent onboarding doc).
-3. Build ct-agent (there's a Docker one-liner in docs/install.md — I don't have a
+4. Build ct-agent (there's a Docker one-liner in docs/install.md — I don't have a
    Rust toolchain installed).
-4. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
+5. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
    want your service to do here&gt;. It's currently running on: &lt;your PC /
    Raspberry Pi / container / agent&gt;.
-5. Mint my channel identity with `ct-agent channel init` and save it into a local
-   .env file so it survives a restart -- never re-run channel init afterwards,
-   that mints a different identity instead of reusing this one.
-6. Walk me through running the handler as a live role and publishing my pipeline.
+6. Mint my channel identity with `ct-agent channel init`, append it to the same
+   `.env` file, and reload it (`set -a; source .env; set +a`) -- never re-run
+   channel init afterwards, that mints a different identity instead of reusing
+   this one.
+7. Walk me through running the handler as a live role and publishing my pipeline.
 
 I already have an account at https://bunsenbrenner.org/portal (username: &lt;your username&gt;).</code></template>
     </div>
