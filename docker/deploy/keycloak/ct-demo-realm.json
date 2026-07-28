@@ -36,7 +36,9 @@
         "https://bunsenbrenner.org/portal/callback",
         "http://localhost:8090/portal/callback"
       ],
-      "webOrigins": ["+"],
+      "webOrigins": [
+        "+"
+      ],
       "attributes": {
         "access.token.signed.response.alg": "RS256",
         "id.token.signed.response.alg": "RS256",
@@ -58,7 +60,10 @@
           }
         }
       ],
-      "defaultClientScopes": ["email", "profile"]
+      "defaultClientScopes": [
+        "email",
+        "profile"
+      ]
     }
   ],
   "identityProviders": [
@@ -101,5 +106,12 @@
         "syncMode": "IMPORT"
       }
     }
-  ]
+  ],
+  "loginTheme": "ct-bunsenbrenner",
+  "internationalizationEnabled": true,
+  "supportedLocales": [
+    "en",
+    "de"
+  ],
+  "defaultLocale": "en"
 }

@@ -85,6 +85,10 @@ services:
       KC_GITLAB_CLIENT_SECRET: "${KC_GITLAB_CLIENT_SECRET:-}"
     volumes:
       - ./keycloak/ct-demo-realm.json:/opt/keycloak/data/import/ct-demo-realm.json:ro
+      # Custom login theme (ct-bunsenbrenner): real Terms-and-Conditions text (EN/DE,
+      # linking the live Nutzungsbedingungen/Datenschutz/Impressum pages) instead of
+      # Keycloak's built-in "Terms and conditions to be defined" placeholder.
+      - ./keycloak/themes/ct-bunsenbrenner:/opt/keycloak/themes/ct-bunsenbrenner:ro
     # #48: NO published port — Keycloak is reached only through the edge :443 front
     # door (auth.<zone>) and internally as keycloak:8080. Nothing to open on the host.
     expose:
