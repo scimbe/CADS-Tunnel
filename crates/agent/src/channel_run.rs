@@ -2487,6 +2487,47 @@ impl AgentCardCliConfig {
     pub fn write_card(&self, now: u64) -> std::io::Result<std::path::PathBuf> {
         crate::well_known::write_agent_card_for_origin(&self.build_card(now), &self.out_dir)
     }
+
+    /// This card's role tags as its `skill_ids` for `POST /registry/agents` (the id half of each
+    /// [`Skill`](ct_common::channel::Skill), matching what the directory search matches against).
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.skills.iter().map(|s| s.id.clone()).collect()
+    }
+}
+
+/// Optional auto-registration inputs for `ct-agent channel agent-card` (#214 follow-up: automatic
+/// agent discoverability). Publishing a card used to be TWO separate manual steps — write it
+/// locally, then remember to also `POST` it to `/registry/agents` — and the second step was easy
+/// to forget entirely (the empty "AI agents" list on the operator landing page was exactly this:
+/// nobody had ever run it). When all three of `CT_AGENT_CP_URL`/`CT_AGENT_CARD_URL`/
+/// `CT_CP_EDGE_ADMIN_TOKEN` are present, `agent-card` folds both into one command. Absent →
+/// unchanged behavior (card written locally only) — this is purely additive, opt-in by presence.
+pub struct AgentCardAutoRegister {
+    /// Control-plane base URL (`CT_AGENT_CP_URL`, same var other subcommands use).
+    pub cp_url: String,
+    /// The public `https://` URL this card will be served at once written (`CT_AGENT_CARD_URL`) —
+    /// the CP rejects anything else (SSRF defence-in-depth).
+    pub card_url: String,
+    /// The shared machine-writer admin token (`CT_CP_EDGE_ADMIN_TOKEN`) — self-registration is
+    /// gated by this, not an OIDC bearer, since an autonomous agent has no interactive login (#161).
+    pub admin_token: String,
+}
+
+impl AgentCardAutoRegister {
+    /// `None` if any required var is absent — auto-registration is opt-in, never required.
+    pub fn from_env() -> Option<Self> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (the `from_env` seam — testable without touching the real env).
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let present = |k: &str| f(k).filter(|s| !s.trim().is_empty());
+        Some(Self {
+            cp_url: present("CT_AGENT_CP_URL")?,
+            card_url: present("CT_AGENT_CARD_URL")?,
+            admin_token: present("CT_CP_EDGE_ADMIN_TOKEN")?,
+        })
+    }
 }
 
 /// CLI/env config for a **`CapacityOffer`** (#152 — the seller side of the #147 marketplace over the
@@ -2849,6 +2890,35 @@ mod tests {
         let bad_key: HashMap<String, String> = [("CT_CHANNEL_HOLDER_KEY", "zz"), ("CT_AGENT_CARD_ROLES", "central")]
             .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         assert!(AgentCardCliConfig::from_lookup(|k| bad_key.get(k).cloned()).is_err(), "bad holder key rejected");
+    }
+
+    #[test]
+    fn agent_card_auto_register_is_opt_in_by_presence_of_all_three_vars() {
+        // #214 follow-up: auto-registration only activates when CT_AGENT_CP_URL,
+        // CT_AGENT_CARD_URL, AND CT_CP_EDGE_ADMIN_TOKEN are ALL present — any one missing means
+        // "unchanged behavior" (card written locally only), never a partial/guessed registration.
+        let all: HashMap<String, String> = [
+            ("CT_AGENT_CP_URL", "https://bunsenbrenner.org"),
+            ("CT_AGENT_CARD_URL", "https://you.example/.well-known/agent-card.json"),
+            ("CT_CP_EDGE_ADMIN_TOKEN", "deadbeef"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let reg = AgentCardAutoRegister::from_lookup(|k| all.get(k).cloned()).expect("all three present");
+        assert_eq!(reg.cp_url, "https://bunsenbrenner.org");
+        assert_eq!(reg.card_url, "https://you.example/.well-known/agent-card.json");
+        assert_eq!(reg.admin_token, "deadbeef");
+
+        for missing in ["CT_AGENT_CP_URL", "CT_AGENT_CARD_URL", "CT_CP_EDGE_ADMIN_TOKEN"] {
+            let mut partial = all.clone();
+            partial.remove(missing);
+            assert!(
+                AgentCardAutoRegister::from_lookup(|k| partial.get(k).cloned()).is_none(),
+                "missing {missing} -> no auto-registration, not a best-effort partial call"
+            );
+        }
+        assert!(AgentCardAutoRegister::from_lookup(|_| None).is_none());
     }
 
     #[tokio::test]

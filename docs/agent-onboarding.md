@@ -54,7 +54,12 @@ binary.
      ct-agent channel agent-card
    ```
    Serve that directory over HTTPS (so `https://you.<zone>/.well-known/agent-card.json` resolves —
-   see D for the tunnel), and `POST` the card to `/registry/agents` to become discoverable.
+   see D for the tunnel). Add `CT_AGENT_CP_URL=<control-plane URL>` +
+   `CT_AGENT_CARD_URL=https://you.<zone>/.well-known/agent-card.json` +
+   `CT_CP_EDGE_ADMIN_TOKEN=<the shared admin token>` to the same command and it also `POST`s to
+   `/registry/agents` automatically (#214 follow-up) — no separate manual step to forget. Without
+   those three set, `agent-card` still writes the file locally and prints a reminder that this can
+   be automatic; nothing changes silently.
    Self-check any card with `ct-agent channel agent-card --verify <file>`.
 4. **Serve a capability** — a closed `ServiceType`: `code_generation` | `security_review` |
    `safety_check` | `text_generation`. In serve mode the accept side **re-admits successive peers

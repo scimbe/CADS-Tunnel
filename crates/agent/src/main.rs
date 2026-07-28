@@ -139,6 +139,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .as_secs();
             let path = cfg.write_card(now)?;
             println!("{}", path.display());
+            // #214 follow-up: fold "tell the registry" into the same command when the operator
+            // supplied CT_AGENT_CP_URL/CT_AGENT_CARD_URL/CT_CP_EDGE_ADMIN_TOKEN — the empty "AI
+            // agents" list on the operator landing page was exactly this manual step never
+            // having been run. Absent -> unchanged behavior, just a note that it CAN be automatic.
+            match ct_agent::channel_run::AgentCardAutoRegister::from_env() {
+                Some(reg) => {
+                    let holder_hex: String =
+                        cfg.build_card(now).holder_pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                    let cp_url = reg.cp_url.clone();
+                    ct_control_plane::client::ControlPlaneClient::new(reg.cp_url)
+                        .with_admin_token(reg.admin_token)
+                        .register_agent(&holder_hex, &reg.card_url, &cfg.role_tags, &cfg.skill_ids())
+                        .await
+                        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                    eprintln!("registered at {cp_url}/registry/agents (card_url={})", reg.card_url);
+                }
+                None => eprintln!(
+                    "ct-agent: not auto-registered with /registry/agents — set CT_AGENT_CP_URL, \
+                     CT_AGENT_CARD_URL (the https:// URL this card will be served at), and \
+                     CT_CP_EDGE_ADMIN_TOKEN to do this automatically next time."
+                ),
+            }
             return Ok(());
         }
         // Plane-brokered flow (#98/#103) when an edge rendezvous is configured: present
