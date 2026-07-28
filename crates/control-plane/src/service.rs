@@ -2508,6 +2508,7 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
   <div class="actions">
    <a class="btn support" href="https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413" target="_blank" rel="noopener">&#128153; Support as a member &rarr;</a>
    <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
+   <a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" target="_blank" rel="noopener">&#128025; GitHub — feature requests, code review, issues &rarr;</a>
   </div>
  </div>
 
@@ -2547,15 +2548,6 @@ I already have an account at https://bunsenbrenner.org/portal (username: &lt;you
    <a class="btn secondary" href="/registry/agents">Agent registry (raw) &rarr;</a>
   </div>
   <ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
- </div>
-
- <div class="section support">
-  <p><strong>Keep the lab running.</strong> Bunsenbrenner is free to use and runs on donated time and
-  server costs. If it helped you get something live, a small contribution keeps it going.</p>
-  <div class="actions">
-   <a class="btn support" href="https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413" target="_blank" rel="noopener">&#128153; Support as a member &rarr;</a>
-   <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
-  </div>
  </div>
 
  <div class="section">
