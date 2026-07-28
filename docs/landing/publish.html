@@ -10,6 +10,12 @@
  .lede{font-size:1.15rem;color:#c9d1d9;margin:.5rem 0 0}
  .sub{color:#8b949e;font-size:1rem;margin-top:.5rem}
  a{color:#58a6ff}
+ .cookie-notice{position:fixed;left:1rem;right:1rem;bottom:1rem;max-width:40rem;margin:0 auto;background:#161b22;
+  border:1px solid #30363d;border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:#c9d1d9;
+  box-shadow:0 4px 20px rgba(0,0,0,.4);z-index:100;display:none}
+ .cookie-notice.show{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;justify-content:space-between}
+ .cookie-notice button{background:#238636;color:#fff;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
+ .cookie-notice button:hover{background:#2ea043}
  .steps{counter-reset:step;list-style:none;padding:0;margin:1rem 0}
  .steps>li{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1.1rem 1.3rem;margin-bottom:1rem;position:relative}
  .steps>li::before{counter-increment:step;content:counter(step);position:absolute;left:-.9rem;top:-.9rem;width:2rem;height:2rem;border-radius:50%;background:#238636;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.95rem}
@@ -127,4 +133,12 @@ try it."
 </p>
 </div>
 
+<div class="cookie-notice" id="cookie-notice">
+ <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
+ analytics, no marketing cookies. See the <a href="/datenschutz">Datenschutzerklärung</a>.</span>
+ <button onclick="document.getElementById('cookie-notice').classList.remove('show');localStorage.setItem('ct-cookie-notice-seen','1')">Got it</button>
+</div>
+<script>
+ if(!localStorage.getItem('ct-cookie-notice-seen')){ document.getElementById('cookie-notice').classList.add('show'); }
+</script>
 </body></html>

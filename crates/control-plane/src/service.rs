@@ -2312,6 +2312,14 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .legal-foot{color:#8b949e;font-size:.8rem;margin-top:.5rem}
  .legal-foot a{color:#8b949e;text-decoration:underline}
  .legal-foot a:hover{color:#c9d1d9}
+ .cta-box{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:1.3rem 1.5rem;margin:2rem 0}
+ .cookie-notice{position:fixed;left:1rem;right:1rem;bottom:1rem;max-width:40rem;margin:0 auto;background:#161b22;
+  border:1px solid #30363d;border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:#c9d1d9;
+  box-shadow:0 4px 20px rgba(0,0,0,.4);z-index:100;display:none}
+ .cookie-notice.show{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;justify-content:space-between}
+ .cookie-notice a{color:#58a6ff}
+ .cookie-notice button{background:#238636;color:#fff;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
+ .cookie-notice button:hover{background:#2ea043}
 </style></head><body>
 <div class="top">
  <h1>CADS-Tunnel — operator status</h1>
@@ -2343,6 +2351,16 @@ const LANDING_HTML: &str = r#"<!doctype html>
  <a class="btn secondary" href="/registry/agents">Agent registry (raw) &rarr;</a>
 </div>
 <ul class="list" id="agent-list"><li class="empty">loading…</li></ul>
+
+<div class="cta-box">
+ <h2 style="margin-top:0">&#128293; Have your own idea? Publish it — with Claude Code doing the wiring</h2>
+ <p style="color:#c9d1d9;margin:.4rem 0 .8rem">
+  Register, download the hello-world starter, then hand Claude Code (or any coding agent) one prompt —
+  it reads the docs, mints your identity, and turns the template into your service. Runs on whatever
+  you already have: a laptop, a Raspberry Pi, a container, your own agent.
+ </p>
+ <a class="btn" href="/publish">Get your first success in 4 steps &rarr;</a>
+</div>
 
 <div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
 <div class="legal-foot"><a href="/impressum">Impressum</a> · <a href="/datenschutz">Datenschutzerklärung</a> · <a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
@@ -2384,7 +2402,16 @@ const LANDING_HTML: &str = r#"<!doctype html>
  }
  refresh(); refreshPipelines(); refreshAgents();
  setInterval(refresh,5000); setInterval(refreshPipelines,15000); setInterval(refreshAgents,15000);
-</script></body></html>"#;
+</script>
+<div class="cookie-notice" id="cookie-notice">
+ <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
+ analytics, no marketing cookies. See the <a href="/datenschutz">Datenschutzerklärung</a>.</span>
+ <button onclick="document.getElementById('cookie-notice').classList.remove('show');localStorage.setItem('ct-cookie-notice-seen','1')">Got it</button>
+</div>
+<script>
+ if(!localStorage.getItem('ct-cookie-notice-seen')){ document.getElementById('cookie-notice').classList.add('show'); }
+</script>
+</body></html>"#;
 
 /// The AI-agent onboarding doc (`docs/agent-onboarding.md`, #174), embedded so the control plane can
 /// serve it live at `/llms.txt` — the machine-readable entry point the operator status page links to
@@ -5203,6 +5230,12 @@ mod tests {
             !html.contains("src=\"http") && !html.contains("<link") && !html.contains("//cdn"),
             "no externally-sourced scripts/styles/images (CSP-safe)"
         );
+        // A simple, honest cookie notice (not a consent gate -- only strictly-necessary cookies are
+        // set, so DSGVO/TTDSG §25 Abs.2 Nr.2 requires no consent, just transparency): dismissible,
+        // remembered via localStorage, linking to the actual Datenschutzerklärung.
+        assert!(html.contains(r#"id="cookie-notice""#), "shows the cookie notice");
+        assert!(html.contains("technically necessary cookies"), "explains what cookies are set and why");
+        assert!(html.contains("ct-cookie-notice-seen"), "remembers dismissal so it doesn't nag on every visit");
         // #194: fail closed — with no CT_CP_EDGE_ADMIN_TOKEN set (unset in the test env → admin_token
         // = None), the unauthenticated client-supplied-account billing writer must NOT be served;
         // /billing/issue is absent (404), not an open account-debit endpoint.
