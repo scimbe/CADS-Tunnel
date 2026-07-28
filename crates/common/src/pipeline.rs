@@ -43,6 +43,42 @@ pub struct RequiredRole {
 pub struct PipelineSpec {
     pub id: String,
     pub roles: Vec<RequiredRole>,
+    /// The channel-operator public key (64 hex chars) whose grants/ownership govern this
+    /// pipeline's Agent-Fabric role channels (#214 follow-up: generic pipeline provisioning).
+    /// Publishing it here — alongside `id` and each role's `tag`, both already public — lets any
+    /// bridge or role-serving agent derive every role's [`ChannelId`] via
+    /// [`crate::channel::channel_id_for_pipeline_role`] with **no coordination round-trip**: no
+    /// GitHub-comment pubkey relay, no per-pipeline core change. `#[serde(default)]` so specs
+    /// published before this field existed still deserialize (as `None` — no channel wiring
+    /// implied, exactly today's behavior).
+    #[serde(default)]
+    pub operator_pubkey_hex: Option<String>,
+}
+
+impl PipelineSpec {
+    /// This pipeline's derived [`ChannelId`] for `role_tag`, iff `role_tag` is one of its
+    /// declared roles AND `operator_pubkey_hex` is set and valid hex. `None` otherwise — a spec
+    /// with no operator key declares no channel wiring (today's behavior, unchanged); an unknown
+    /// role tag has no channel to derive.
+    pub fn role_channel_id(&self, role_tag: &str) -> Option<crate::channel::ChannelId> {
+        if !self.roles.iter().any(|r| r.tag == role_tag) {
+            return None;
+        }
+        let hex = self.operator_pubkey_hex.as_deref()?;
+        let operator = decode_hex_32(hex)?;
+        Some(crate::channel::channel_id_for_pipeline_role(&operator, &self.id, role_tag))
+    }
+}
+
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Why a pipeline could not convene.
@@ -289,6 +325,37 @@ mod tests {
     }
 
     #[test]
+    fn spec_without_operator_pubkey_still_deserializes_and_derives_no_channel() {
+        // Backward compat: a PipelineSpec published before operator_pubkey_hex existed has no
+        // such field in its JSON at all -> must still deserialize (as None), and role_channel_id
+        // must return None (no channel wiring implied) rather than panic or guess.
+        let json = r#"{"id":"old-pipeline","roles":[{"service":"TextGeneration","units":1,"tag":"physics"}]}"#;
+        let spec: PipelineSpec = serde_json::from_str(json).expect("old-shape JSON still parses");
+        assert_eq!(spec.operator_pubkey_hex, None);
+        assert_eq!(spec.role_channel_id("physics"), None, "no operator key -> no derivable channel");
+    }
+
+    #[test]
+    fn role_channel_id_derives_only_for_declared_roles_with_a_valid_operator_key() {
+        let op_hex = "11".repeat(32);
+        let spec = PipelineSpec {
+            id: "flappy-demo".to_string(),
+            roles: vec![RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() }],
+            operator_pubkey_hex: Some(op_hex.clone()),
+        };
+        let op = decode_hex_32(&op_hex).unwrap();
+        assert_eq!(
+            spec.role_channel_id("physics"),
+            Some(crate::channel::channel_id_for_pipeline_role(&op, "flappy-demo", "physics")),
+            "matches the canonical derivation any independent joiner would compute"
+        );
+        assert_eq!(spec.role_channel_id("art"), None, "role not declared by this pipeline -> no channel");
+
+        let bad = PipelineSpec { operator_pubkey_hex: Some("not-hex".into()), ..spec };
+        assert_eq!(bad.role_channel_id("physics"), None, "malformed hex -> None, not a panic");
+    }
+
+    #[test]
     fn pipeline_convenes_only_when_every_role_has_an_online_offer() {
         // Maintainer vision (frozen): a pipeline auctions each declared role and RAISES an error if
         // a role can't be filled by an online offer — never half-arranges.
@@ -298,6 +365,7 @@ mod tests {
                 RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into() },
                 RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into() },
             ],
+            operator_pubkey_hex: None,
         };
         // Two agents online: #1 offers SafetyCheck, #2 offers CodeGeneration — both roles fillable.
         let safety = offer(1, vec![SafetyCheck], 20, 50, 1000);
@@ -354,6 +422,7 @@ mod tests {
                 RequiredRole { service: TextGeneration, units: 1, tag: "physics".into() },
                 RequiredRole { service: TextGeneration, units: 1, tag: "art".into() },
             ],
+            operator_pubkey_hex: None,
         };
         let s2 = offer(7, vec![TextGeneration], 20, 50, 1000);
         let sk = offer(8, vec![TextGeneration], 20, 40, 1000);
@@ -369,7 +438,7 @@ mod tests {
 
         // An empty spec convenes nothing.
         assert_eq!(
-            PipelineSpec { id: "e".into(), roles: vec![] }.convene(&[safety], 100),
+            PipelineSpec { id: "e".into(), roles: vec![], operator_pubkey_hex: None }.convene(&[safety], 100),
             Err(PipelineError::Empty),
         );
     }
@@ -398,6 +467,7 @@ mod tests {
                 RequiredRole { service: CodeGeneration, units: 10, tag: "physics".into() },
                 RequiredRole { service: CodeGeneration, units: 10, tag: "art".into() },
             ],
+            operator_pubkey_hex: None,
         };
         // source-2 advertises "physics" (+ an existing tag), sink advertises "art"; a stranger
         // advertises neither.
@@ -419,6 +489,7 @@ mod tests {
         let spec2 = PipelineSpec {
             id: "x".into(),
             roles: vec![RequiredRole { service: SafetyCheck, units: 1, tag: "nobody-has-this".into() }],
+            operator_pubkey_hex: None,
         };
         assert!(spec2.invitations(&[card(5, vec!["physics"], vec![], 1000)], 100)[0].candidates.is_empty());
     }
@@ -435,10 +506,12 @@ mod tests {
                 RequiredRole { service: TextGeneration, units: 1, tag: "art".into() },
                 RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into() },
             ],
+            operator_pubkey_hex: None,
         };
         let audit = PipelineSpec {
             id: "audit".into(),
             roles: vec![RequiredRole { service: SecurityReview, units: 1, tag: "reviewer".into() }],
+            operator_pubkey_hex: None,
         };
 
         // A text-generation agent (source-2/sink) supports flappy's physics + art, but NOT its
@@ -474,6 +547,7 @@ mod tests {
                 RequiredRole { service: SafetyCheck, units: 5, tag: "guard".into() },
                 RequiredRole { service: CodeGeneration, units: 10, tag: "coder".into() },
             ],
+            operator_pubkey_hex: None,
         };
         let guard = offer(1, vec![SafetyCheck], 20, 50, 1000); // provider holder(1), price 50
         let coder = offer(2, vec![CodeGeneration], 20, 40, 1000); // provider holder(2), price 40

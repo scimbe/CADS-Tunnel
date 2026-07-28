@@ -2258,6 +2258,7 @@ mod tests {
                 RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "physics".into() },
                 RequiredRole { service: ServiceType::TextGeneration, units: 1, tag: "art".into() },
             ],
+            operator_pubkey_hex: None,
         };
         assert!(reg.publish("alice", &spec, 100).unwrap(), "owner publishes");
         assert_eq!(reg.get("flappy").unwrap(), Some(spec.clone()), "published spec round-trips");
@@ -2265,7 +2266,7 @@ mod tests {
         assert_eq!(reg.list().unwrap(), vec![("flappy".to_string(), "alice".to_string())], "discoverable in the list");
 
         // Owner-scoped: a different owner cannot overwrite the published spec.
-        let hijack = PipelineSpec { id: "flappy".into(), roles: vec![] };
+        let hijack = PipelineSpec { id: "flappy".into(), roles: vec![], operator_pubkey_hex: None };
         assert!(!reg.publish("mallory", &hijack, 200).unwrap(), "non-owner cannot overwrite");
         assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 2, "spec unchanged after hijack attempt");
 
@@ -2273,6 +2274,7 @@ mod tests {
         let updated = PipelineSpec {
             id: "flappy".into(),
             roles: vec![RequiredRole { service: ServiceType::SafetyCheck, units: 1, tag: "guard".into() }],
+            operator_pubkey_hex: None,
         };
         assert!(reg.publish("alice", &updated, 300).unwrap(), "owner re-publish");
         assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 1, "owner re-publish updates the spec");

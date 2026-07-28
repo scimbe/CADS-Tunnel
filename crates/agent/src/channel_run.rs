@@ -1176,6 +1176,78 @@ impl OperatorIdentity {
     }
 }
 
+/// Inputs for `ct-agent channel join-pipeline-role` (#214 follow-up: generic pipeline
+/// provisioning). Unlike [`MemberMaterialRequest`] — which needs `CT_CHANNEL_BRIDGE_HOLDER`, the
+/// COUNTERPART's public key, so both sides must exchange keys before either can derive the
+/// channel id — this derives the id from PUBLIC, PUBLISHED information only (the operator's
+/// pubkey, the pipeline's id, and the role tag: exactly what `GET /registry/pipelines/:id`
+/// returns). A bridge that needs a role's output and any agent capable of serving it each run this
+/// independently and land on the *same* channel id with **no coordination round-trip** — no
+/// GitHub-comment pubkey relay, no waiting on the other side. Reads the operator's PUBLIC key +
+/// the pipeline id + role tag (all public, from the pipeline registry), the caller's own holder
+/// PRIVATE key (to derive its pubkey and sign the attestation), and the caller's noise PUBLIC key.
+/// Pure local compute — nothing is minted, nothing leaves the box.
+pub struct PipelineRoleMaterialRequest {
+    operator_pubkey: [u8; 32],
+    pipeline_id: String,
+    role: String,
+    holder: SigningKey,
+    noise_pubkey: [u8; 32],
+}
+
+impl PipelineRoleMaterialRequest {
+    /// Read from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Parse from a variable lookup (the `from_env` seam — testable without touching the real env).
+    pub fn from_lookup(f: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        Ok(Self {
+            operator_pubkey: req_hex32(
+                &f,
+                "CT_CHANNEL_OPERATOR_PUBKEY",
+                "64 hex operator pubkey (from the pipeline registry entry's operator_pubkey_hex)",
+            )?,
+            pipeline_id: req_str(&f, "CT_PIPELINE_ID", "the pipeline's published id")?,
+            role: req_str(&f, "CT_PIPELINE_ROLE", "the role tag you're joining (a role.tag from the pipeline spec)")?,
+            holder: req_key(&f, "CT_CHANNEL_HOLDER_KEY", "64 hex; your holder PRIVATE key")?,
+            noise_pubkey: req_hex32(&f, "CT_CHANNEL_NOISE_PUBKEY", "64 hex; your noise PUBLIC key")?,
+        })
+    }
+
+    /// `(channel_id, holder_pubkey, noise_attestation)` — the derived material. The channel id is
+    /// this pipeline role's canonical address (independent of who else has or hasn't joined yet);
+    /// the attestation is this holder's signed binding of its noise key (#101), which the
+    /// pipeline's channel owner relays so the peer can pin the key safely.
+    fn compute(&self) -> (ct_common::channel::ChannelId, [u8; 32], [u8; 64]) {
+        use ct_common::channel::{channel_id_for_pipeline_role, member_noise_attest_bytes};
+        let holder_pubkey = self.holder.verifying_key().to_bytes();
+        let channel = channel_id_for_pipeline_role(&self.operator_pubkey, &self.pipeline_id, &self.role);
+        let attestation = self
+            .holder
+            .sign(&member_noise_attest_bytes(&channel, &holder_pubkey, &self.noise_pubkey))
+            .to_bytes();
+        (channel, holder_pubkey, attestation)
+    }
+
+    /// The paste-able block the caller hands to the pipeline's channel owner (whoever ran
+    /// `POST /me/channels` for this role) so it can `POST /me/channels/:channel/members` on the
+    /// caller's behalf.
+    pub fn render(&self) -> String {
+        let (channel, holder_pubkey, attestation) = self.compute();
+        format!(
+            "pipeline_id       = {}\nrole              = {}\nholder_pubkey     = {}\nnoise_pubkey      = {}\nchannel_id        = {}\nnoise_attestation = {}\n",
+            self.pipeline_id,
+            self.role,
+            hex_encode(&holder_pubkey),
+            hex_encode(&self.noise_pubkey),
+            hex_encode(&channel.0),
+            hex_encode(&attestation),
+        )
+    }
+}
+
 /// Inputs for `ct-agent channel grant` (#117-operator-flow): an operator signs one
 /// member's grant from the environment, parsed like [`ChannelJoinCliConfig::from_lookup`].
 /// `CT_CHANNEL_OPERATOR_KEY` is the operator's own key (from `channel operator-init`);
@@ -3108,6 +3180,61 @@ mod tests {
         assert!(block.contains(&hx(&channel.0)) && block.contains(&hx(&attestation)) && block.contains(&hx(&noise_pub)));
         // a missing required input errors clearly.
         assert!(MemberMaterialRequest::from_lookup(|_| None).is_err());
+    }
+
+    #[test]
+    fn pipeline_role_material_computes_verifiable_channel_id_and_attestation_independent_of_counterpart() {
+        // #214 follow-up (generic pipeline provisioning): unlike member-material, this needs NO
+        // counterpart pubkey — two independent callers (a bridge and a role-serving agent) with
+        // the same (operator, pipeline_id, role) must derive the identical channel_id with zero
+        // coordination, and each caller's own attestation must verify.
+        use ct_common::channel::{channel_id_for_pipeline_role, verify_member_noise_attestation};
+        let operator = [0x1eu8; 32];
+        let holder_seed = [0x55u8; 32];
+        let holder = SigningKey::from_bytes(&holder_seed);
+        let noise_pub = [0x77u8; 32];
+        let hx = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let env = move |k: &str| match k {
+            "CT_CHANNEL_OPERATOR_PUBKEY" => Some(hx(&operator)),
+            "CT_PIPELINE_ID" => Some("flappy-demo".to_string()),
+            "CT_PIPELINE_ROLE" => Some("physics".to_string()),
+            "CT_CHANNEL_HOLDER_KEY" => Some(hx(&holder_seed)),
+            "CT_CHANNEL_NOISE_PUBKEY" => Some(hx(&noise_pub)),
+            _ => None,
+        };
+        let req = PipelineRoleMaterialRequest::from_lookup(&env).unwrap();
+        let (channel, holder_pub, attestation) = req.compute();
+        assert_eq!(holder_pub, holder.verifying_key().to_bytes(), "holder pubkey derived from the private key");
+        assert_eq!(
+            channel,
+            channel_id_for_pipeline_role(&operator, "flappy-demo", "physics"),
+            "canonical pipeline-role id — no CT_CHANNEL_BRIDGE_HOLDER (counterpart pubkey) needed at all"
+        );
+        assert!(
+            verify_member_noise_attestation(&channel, &holder_pub, &noise_pub, &attestation),
+            "the emitted attestation verifies against the canonical verifier"
+        );
+
+        // A second, independent caller for the SAME pipeline role (different holder identity)
+        // derives the SAME channel_id — the whole point: no round-trip needed to agree.
+        let other_holder_seed = [0x99u8; 32];
+        let other_env = move |k: &str| match k {
+            "CT_CHANNEL_OPERATOR_PUBKEY" => Some(hx(&operator)),
+            "CT_PIPELINE_ID" => Some("flappy-demo".to_string()),
+            "CT_PIPELINE_ROLE" => Some("physics".to_string()),
+            "CT_CHANNEL_HOLDER_KEY" => Some(hx(&other_holder_seed)),
+            "CT_CHANNEL_NOISE_PUBKEY" => Some(hx(&noise_pub)),
+            _ => None,
+        };
+        let (other_channel, _, _) = PipelineRoleMaterialRequest::from_lookup(&other_env).unwrap().compute();
+        assert_eq!(channel, other_channel, "same pipeline+role -> same channel, independent of which holder asks");
+
+        // the rendered block carries pipeline_id, role, and all derived values.
+        let block = req.render();
+        assert!(block.contains("flappy-demo") && block.contains("physics") && block.contains(&hx(&channel.0)));
+
+        // a missing required input errors clearly.
+        assert!(PipelineRoleMaterialRequest::from_lookup(|_| None).is_err());
     }
 
     #[test]

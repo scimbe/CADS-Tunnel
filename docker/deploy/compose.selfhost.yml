@@ -38,6 +38,13 @@ services:
       # one secret (already required for the front door / tunnel revoke) also turns on
       # the Agent-Fabric channel broker end-to-end, with no extra step.
       CT_CP_EDGE_ADMIN_TOKEN: "${CT_EDGE_ADMIN_TOKEN:-}"
+      # #214 follow-up (generic pipeline provisioning): GET /network-info reports these so a
+      # generic ct-agent never hardcodes/guesses which port serves which purpose (the 4433-vs-
+      # 4435/4436 mesh-edge-vs-channel-broker mixup). SAME shell vars the edge block below reads,
+      # so the two can never drift out of sync from a single .env source of truth.
+      CT_CP_MESH_EDGE_PORT: "${EDGE_PORT:-4433}"
+      CT_CP_CHANNEL_BROKER_PORT: "${EDGE_CHANNEL_PORT:-4435}"
+      CT_CP_CHANNEL_RELAY_PORT: "${EDGE_CHANNEL_RELAY_PORT:-4436}"
     env_file:
       - .env
     volumes:

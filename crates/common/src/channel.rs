@@ -67,6 +67,41 @@ pub fn channel_id_for_link(
     ChannelId(h.finalize().into())
 }
 
+/// The domain separating a derived per-pipeline-role channel id from every other hashed object.
+const PIPELINE_ROLE_CHANNEL_DOMAIN: &[u8] = b"ct-pipeline-role-channel-v1";
+
+/// Derive the deterministic [`ChannelId`] for a workflow pipeline's role (#214 follow-up: generic
+/// pipeline provisioning). Unlike [`channel_id_for_link`] — bound to a *specific pair* of holders,
+/// so the two endpoints must already know each other's public key before they can agree on an id
+/// — this id is derived from information a pipeline publisher makes public via
+/// `POST /registry/pipelines` (the operator's key, the pipeline's id, the role tag): any bridge
+/// that needs a role's output and any agent that can serve it independently compute the *same*
+/// `ChannelId` with **no coordination round-trip** — no GitHub-comment pubkey relay, no
+/// operator-mediated pairwise derivation. Both are then free to self-join via the existing
+/// `POST /me/channels/:channel/members` self-service API using their own OIDC bearer token, so a
+/// brand-new pipeline never requires touching core: it just needs a `pipeline_id` and its roles'
+/// tags, both of which the publisher already declares.
+///
+/// A domain-separated SHA-256 over `domain || operator_pubkey || len(pipeline_id) || pipeline_id
+/// || len(role) || role`, built via [`Preimage`] so the two variable-length fields are
+/// length-prefixed and cannot collide (`pipeline_id="ab", role="c"` and `pipeline_id="a",
+/// role="bc"` hash to different ids, unlike naive concatenation).
+///
+/// This is a channel *address* only, like [`channel_id_for_link`]; it authorizes nothing on its
+/// own — membership is still governed by `/me/channels` ownership plus the operator-signed
+/// [`SignedChannelGrant`]/attested Noise key each member presents.
+pub fn channel_id_for_pipeline_role(operator_pubkey: &[u8; 32], pipeline_id: &str, role: &str) -> ChannelId {
+    use sha2::{Digest, Sha256};
+    let preimage = Preimage::new(PIPELINE_ROLE_CHANNEL_DOMAIN)
+        .fixed(operator_pubkey)
+        .var_bytes(pipeline_id.as_bytes())
+        .var_bytes(role.as_bytes())
+        .finish();
+    let mut h = Sha256::new();
+    h.update(&preimage);
+    ChannelId(h.finalize().into())
+}
+
 /// The set of channels an operator's declared overlay **authorizes** (#107-enforce /
 /// #102-broker-enforce): given the overlay as its holder-pair links, the `ChannelId`s those
 /// links derive via [`channel_id_for_link`]. This is the *enforcement* counterpart to grant
@@ -2782,6 +2817,51 @@ mod tests {
             CapacityBid::signing_bytes(&h, CapacityKind::CloudApiQuota, "m", 5, 500, 7, 9, &ta, None),
             e_none, "CapacityBid (None service) preimage drifted"
         );
+    }
+
+    #[test]
+    fn channel_id_for_pipeline_role_is_deterministic_and_collision_resistant() {
+        // #214 follow-up: bridge + server must derive the SAME id with no round-trip, and
+        // distinct (operator, pipeline_id, role) triples must derive DIFFERENT ids — including
+        // the classic variable-length-field collision a naive concatenation would allow.
+        let op_a = [0x11u8; 32];
+        let op_b = [0x22u8; 32];
+
+        let id1 = channel_id_for_pipeline_role(&op_a, "flappy-demo", "physics");
+        let id1_again = channel_id_for_pipeline_role(&op_a, "flappy-demo", "physics");
+        assert_eq!(id1, id1_again, "deterministic: same inputs -> same id every time");
+
+        let id_other_role = channel_id_for_pipeline_role(&op_a, "flappy-demo", "art");
+        assert_ne!(id1, id_other_role, "distinct role -> distinct channel");
+
+        let id_other_pipeline = channel_id_for_pipeline_role(&op_a, "cookbook-demo", "physics");
+        assert_ne!(id1, id_other_pipeline, "distinct pipeline_id -> distinct channel");
+
+        let id_other_operator = channel_id_for_pipeline_role(&op_b, "flappy-demo", "physics");
+        assert_ne!(id1, id_other_operator, "distinct operator -> distinct channel (cross-operator isolation)");
+
+        // Injectivity at the pipeline_id/role boundary: "ab"+"c" must not collide with "a"+"bc".
+        let boundary_1 = channel_id_for_pipeline_role(&op_a, "ab", "c");
+        let boundary_2 = channel_id_for_pipeline_role(&op_a, "a", "bc");
+        assert_ne!(boundary_1, boundary_2, "var-length fields must be length-prefixed, not just concatenated");
+    }
+
+    #[test]
+    fn channel_id_for_pipeline_role_golden_vector_is_frozen() {
+        // Pin the exact preimage bytes (DOMAIN ‖ operator ‖ len(pipeline_id) ‖ pipeline_id ‖
+        // len(role) ‖ role) so a future refactor cannot silently change every published pipeline's
+        // channel ids.
+        use sha2::{Digest, Sha256};
+        let op = [0x11u8; 32];
+        let mut e = Vec::new();
+        e.extend_from_slice(PIPELINE_ROLE_CHANNEL_DOMAIN);
+        e.extend_from_slice(&op);
+        e.extend_from_slice(&11u32.to_le_bytes());
+        e.extend_from_slice(b"flappy-demo");
+        e.extend_from_slice(&7u32.to_le_bytes());
+        e.extend_from_slice(b"physics");
+        let expected = ChannelId(Sha256::digest(&e).into());
+        assert_eq!(channel_id_for_pipeline_role(&op, "flappy-demo", "physics"), expected);
     }
 
     #[test]

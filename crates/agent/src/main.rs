@@ -67,6 +67,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             print!("{}", req.render());
             return Ok(());
         }
+        // #214 follow-up `ct-agent channel join-pipeline-role`: the generic-provisioning analogue
+        // of `member-material` — derives a PUBLISHED PIPELINE's role channel_id (from
+        // CT_CHANNEL_OPERATOR_PUBKEY + CT_PIPELINE_ID + CT_PIPELINE_ROLE, all public/discoverable
+        // via GET /registry/pipelines/:id) instead of a pairwise link, so a bridge and a
+        // role-serving agent never need to exchange keys before either can compute the same id.
+        if std::env::args().nth(2).as_deref() == Some("join-pipeline-role") {
+            let req = ct_agent::channel_run::PipelineRoleMaterialRequest::from_env()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            print!("{}", req.render());
+            return Ok(());
+        }
         // #117 `ct-agent channel grant`: as the operator, sign a member's grant (from
         // CT_CHANNEL_OPERATOR_KEY + CT_GRANT_*) and print the CT_CHANNEL_GRANT hex the
         // member uses — self-service admission, no central provisioning.
