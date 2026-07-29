@@ -75,6 +75,11 @@ pub struct AcmeCertConfig {
     /// DNS to those servers is impossible, or in hermetic tests whose mock
     /// hostname has no real zone.
     pub dns01_use_authoritative: bool,
+    /// How many complete ACME orders to attempt when DNS-01 keeps losing the
+    /// propagation race (#229). `None` uses the built-in default; keep it low
+    /// -- every attempt is a real order against the CA's failed-validation
+    /// rate limit.
+    pub dns01_attempts: Option<u32>,
 }
 
 pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -87,6 +92,8 @@ impl AcmeCertConfig {
     /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URLS`
     /// (comma-separated, defaults to two independent public DoH resolvers),
     /// `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` (default 180),
+    /// `CT_ACME_DNS01_ATTEMPTS` (default 3 -- whole-order retries on the
+    /// propagation race; every attempt costs a real CA order),
     /// `CT_ACME_DNS01_INITIAL_DELAY_SECS` (default 75 -- see
     /// `dns01_propagation::DEFAULT_INITIAL_DELAY`; lowering it risks
     /// re-poisoning the resolver cache).
@@ -132,6 +139,9 @@ impl AcmeCertConfig {
             dns01_resolver_urls,
             dns01_propagation_timeout,
             dns01_initial_delay,
+            dns01_attempts: get("CT_ACME_DNS01_ATTEMPTS")
+                .filter(|v| !v.is_empty())
+                .and_then(|v| v.parse::<u32>().ok()),
             dns01_use_authoritative: get("CT_ACME_DNS01_AUTHORITATIVE")
                 .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
                 .unwrap_or(true),
@@ -207,9 +217,16 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     } else {
         None
     };
-    let issued = client
-        .issue_certificate(&config.hostname, &publish, Some(&propagation), authoritative.as_ref())
-        .await?;
+    let issued = match config.dns01_attempts {
+        Some(n) => {
+            client
+                .issue_certificate_with_attempts(&config.hostname, &publish, Some(&propagation), authoritative.as_ref(), n)
+                .await?
+        }
+        None => {
+            client.issue_certificate(&config.hostname, &publish, Some(&propagation), authoritative.as_ref()).await?
+        }
+    };
 
     // Write key before cert (an origin polling for the cert file should never
     // see a cert with no matching key on disk yet).
@@ -509,6 +526,7 @@ mod tests {
             dns01_propagation_timeout: Duration::from_secs(5),
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -550,6 +568,7 @@ mod tests {
             dns01_propagation_timeout: Duration::from_secs(5),
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
         };
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("publishing"), "{err}");
@@ -580,6 +599,7 @@ mod tests {
             dns01_propagation_timeout: Duration::from_secs(10),
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
         };
 
         let did_issue = obtain_or_renew(&config).await.unwrap();
@@ -612,6 +632,7 @@ mod tests {
             dns01_propagation_timeout: Duration::from_millis(200),
             dns01_initial_delay: Some(Duration::ZERO),
             dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
         };
 
         let err = obtain_or_renew(&config).await.unwrap_err();

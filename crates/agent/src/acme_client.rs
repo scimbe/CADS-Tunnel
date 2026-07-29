@@ -33,6 +33,26 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How many complete orders to attempt when DNS-01 validation keeps losing the
+/// propagation race (#229). Kept small on purpose: every attempt is a real
+/// order against the CA, and Let's Encrypt's failed-validation limit is 5 per
+/// hostname per hour, so this must leave the operator room to retry by hand.
+const DNS01_ATTEMPTS: u32 = 3;
+/// Pause between attempts -- long enough for the zone to settle further,
+/// short enough that a successful retry still feels like one command.
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Whether an error is the DNS-01 propagation race worth a fresh order, as
+/// opposed to something a retry cannot fix (bad account, malformed CSR,
+/// network down, CA refusing the identifier).
+fn is_dns01_failure(e: &BoxError) -> bool {
+    let m = e.to_string();
+    m.contains("DNS-01 authoritative check failed")
+        || m.contains("DNS-01 propagation check failed")
+        || m.contains("publishing the DNS-01 challenge record failed")
+        || (m.contains("became invalid") && m.contains("dns"))
+}
+
 /// A successfully issued certificate: the PEM chain plus the private key that
 /// signed its CSR. The private key **never leaves this process** except in
 /// this return value, which the caller persists directly to disk (ADR-0003:
@@ -137,7 +157,60 @@ impl AcmeClient {
     /// [`crate::dns01_propagation`]). Pass `None` only when `publish` is
     /// backed by something with no real propagation delay (e.g. an in-process
     /// test store).
+    /// Order a certificate, retrying the **whole order** on a DNS-01
+    /// validation failure (#229).
+    ///
+    /// Retrying matters because the thing that makes DNS-01 fail here is not
+    /// observable from the client at all: the zone's nameservers are anycast,
+    /// so the records this host can see from its own location say nothing
+    /// about what Let's Encrypt's other validation perspectives see on the
+    /// far side of the world. Two back-to-back runs of identical code, one
+    /// minute apart, produced one "During secondary validation: NXDOMAIN"
+    /// failure and one issued certificate.
+    ///
+    /// An authorization that has gone invalid cannot be retried (RFC 8555) --
+    /// a fresh order, with a fresh challenge token, is the only way forward.
+    /// Each attempt also re-publishes and re-waits, so a later attempt starts
+    /// from a strictly more-propagated zone than the one before it. That
+    /// turns unpredictable variance into a slower success rather than a hard
+    /// failure. Non-DNS failures (network, account, CSR) are returned
+    /// immediately -- retrying those would just burn CA rate limits.
     pub async fn issue_certificate(
+        &mut self,
+        hostname: &str,
+        publish: &Dns01Provider,
+        propagation: Option<&PropagationWaiter>,
+        authoritative: Option<&AuthoritativeChecker>,
+    ) -> Result<IssuedCert, BoxError> {
+        self.issue_certificate_with_attempts(hostname, publish, propagation, authoritative, DNS01_ATTEMPTS).await
+    }
+
+    pub(crate) async fn issue_certificate_with_attempts(
+        &mut self,
+        hostname: &str,
+        publish: &Dns01Provider,
+        propagation: Option<&PropagationWaiter>,
+        authoritative: Option<&AuthoritativeChecker>,
+        attempts: u32,
+    ) -> Result<IssuedCert, BoxError> {
+        let mut last_err: Option<BoxError> = None;
+        for attempt in 1..=attempts.max(1) {
+            match self.issue_once(hostname, publish, propagation, authoritative).await {
+                Ok(cert) => return Ok(cert),
+                Err(e) if is_dns01_failure(&e) && attempt < attempts => {
+                    eprintln!(
+                        "ct-agent: DNS-01 validation attempt {attempt}/{attempts} failed ({e});                          starting a fresh order -- the record propagates further with every attempt"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "certificate issuance failed with no recorded error".into()))
+    }
+
+    async fn issue_once(
         &mut self,
         hostname: &str,
         publish: &Dns01Provider,
@@ -513,6 +586,45 @@ mod tests {
         assert!(*mock.seen_kid.lock().unwrap(), "requests after account registration use kid, not jwk");
         // The challenge TXT was cleaned up after validation -- no stale record left.
         assert!(store.txt("_acme-challenge.shop.example.test").is_empty(), "challenge TXT cleared post-issuance");
+    }
+
+    #[test]
+    fn only_dns01_race_failures_are_worth_a_fresh_order() {
+        // Retrying costs a real CA order and eats into Let's Encrypt's
+        // 5-failed-validations-per-hostname-per-hour budget, so the classifier
+        // must be narrow: the propagation race yes, everything else no.
+        let retryable: Vec<BoxError> = vec![
+            "DNS-01 authoritative check failed: TXT ... still missing from: ns2.desec.org".into(),
+            "DNS-01 propagation check failed: did not become publicly resolvable".into(),
+            "publishing the DNS-01 challenge record failed: control plane returned 502".into(),
+            "authorization https://acme/authz/1 became invalid: {\"type\":\"urn:ietf:params:acme:error:dns\"}".into(),
+        ];
+        for e in &retryable {
+            assert!(is_dns01_failure(e), "should retry: {e}");
+        }
+
+        let fatal: Vec<BoxError> = vec![
+            "account registration failed: 400".into(),
+            "order creation failed: 429".into(),
+            "ACME directory fetch failed: 503".into(),
+            "order finalize did not reach valid (status=invalid)".into(),
+            "csr generation failed".into(),
+        ];
+        for e in &fatal {
+            assert!(!is_dns01_failure(e), "must NOT retry: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_dns_failure_is_returned_immediately_without_burning_more_orders() {
+        // Pointing at a directory URL that does not resolve fails before any
+        // order exists; that must surface at once, not after N attempts.
+        let account = AccountKey::generate().unwrap();
+        let err = match AcmeClient::discover("http://127.0.0.1:1/directory", account).await {
+            Ok(_) => panic!("discover against a dead port must not succeed"),
+            Err(e) => e,
+        };
+        assert!(!is_dns01_failure(&err), "a transport failure is not a DNS-01 race");
     }
 
     #[tokio::test]
