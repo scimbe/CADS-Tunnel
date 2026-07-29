@@ -51,10 +51,10 @@ struct AcmeBrokerState {
     tunnels: Arc<SqliteTunnelStore>,
     /// The edge admin API's (url, token) — same pair
     /// [`crate::portal_api`]'s `authorize_hostname` already uses — needed
-    /// here so [`issuance_complete`] can revert a hostname's tier back to
-    /// ordinary passthrough (`?tier` absent) the moment it reaches Grün.
-    /// `None` when unconfigured: the tier push is then simply skipped
-    /// (logged), matching this crate's "absent unless configured" style.
+    /// here so [`issuance_complete`] can revert a hostname's channel tier back
+    /// to ordinary passthrough (`?channel_tier` absent) the moment it reaches
+    /// Grün. `None` when unconfigured: the channel-tier push is then simply
+    /// skipped (logged), matching this crate's "absent unless configured" style.
     edge_admin: Option<(String, String)>,
 }
 
@@ -74,20 +74,29 @@ pub fn acme_broker_router(
         .with_state(AcmeBrokerState { edge_mesh, tunnels, edge_admin })
 }
 
-/// Push this hostname's current certificate tier to the edge (#233): the
-/// SAME `POST /admin/authorize-host/:token/:host[?tier=gelb]` call
+/// Push this hostname's current **channel** tier to the edge (#233) — which
+/// TLS termination channel serves it (shared wildcard cert vs. its own).
+/// Named `channel_tier`/`push_channel_tier` specifically to stay distinct
+/// from the unrelated user-facing *feature* tier (Standard/paid, see
+/// `portal_api.rs`). The SAME `POST
+/// /admin/authorize-host/:token/:host[?channel_tier=gelb]` call
 /// `portal_api::authorize_hostname` already makes, just re-issued whenever
-/// the tier itself changes rather than only at tunnel creation. `gelb=true`
-/// on the Rot->Gelb transition (so the edge starts terminating with the
-/// shared wildcard cert); `gelb=false` once a hostname reaches Grün (so the
-/// edge reverts to ordinary passthrough and the browser sees the origin's
-/// own, now-issued certificate). Best-effort and logged, never fails the
-/// caller — exactly [`crate::portal_api::authorize_hostname`]'s own posture,
-/// since the hostname's DB state is already correct either way.
-async fn push_tier(edge_admin: &Option<(String, String)>, tunnels: &SqliteTunnelStore, hostname: &str, gelb: bool) {
+/// the channel tier itself changes rather than only at tunnel creation.
+/// `gelb=true` on the Rot->Gelb transition (so the edge starts terminating
+/// with the shared wildcard cert); `gelb=false` once a hostname reaches Grün
+/// (so the edge reverts to ordinary passthrough and the browser sees the
+/// origin's own, now-issued certificate). Best-effort and logged, never fails
+/// the caller — exactly [`crate::portal_api::authorize_hostname`]'s own
+/// posture, since the hostname's DB state is already correct either way.
+async fn push_channel_tier(
+    edge_admin: &Option<(String, String)>,
+    tunnels: &SqliteTunnelStore,
+    hostname: &str,
+    gelb: bool,
+) {
     let Some((url, token)) = edge_admin else {
         eprintln!(
-            "ct-cp: acme_broker: tier push SKIPPED for {hostname} (gelb={gelb}) — edge admin API not \
+            "ct-cp: acme_broker: channel-tier push SKIPPED for {hostname} (gelb={gelb}) — edge admin API not \
              configured (set CT_CP_EDGE_ADMIN_URL + CT_CP_EDGE_ADMIN_TOKEN)"
         );
         return;
@@ -95,18 +104,18 @@ async fn push_tier(edge_admin: &Option<(String, String)>, tunnels: &SqliteTunnel
     let routing_token = match tunnels.routing_token_for_hostname(hostname) {
         Ok(Some(t)) => t,
         Ok(None) => {
-            eprintln!("ct-cp: acme_broker: tier push for {hostname} skipped — no routing token on record");
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} skipped — no routing token on record");
             return;
         }
         Err(e) => {
-            eprintln!("ct-cp: acme_broker: tier push for {hostname} failed to look up routing token: {e}");
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed to look up routing token: {e}");
             return;
         }
     };
     let endpoint = format!(
         "{}/admin/authorize-host/{routing_token}/{hostname}{}",
         url.trim_end_matches('/'),
-        if gelb { "?tier=gelb" } else { "" }
+        if gelb { "?channel_tier=gelb" } else { "" }
     );
     match crate::portal_api::edge_admin_http_client()
         .post(&endpoint)
@@ -115,10 +124,10 @@ async fn push_tier(edge_admin: &Option<(String, String)>, tunnels: &SqliteTunnel
         .await
     {
         Ok(r) if r.status().is_success() => {
-            eprintln!("ct-cp: acme_broker: tier push for {hostname} (gelb={gelb}) succeeded")
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} (gelb={gelb}) succeeded")
         }
-        Ok(r) => eprintln!("ct-cp: acme_broker: tier push for {hostname} returned {}", r.status()),
-        Err(e) => eprintln!("ct-cp: acme_broker: tier push for {hostname} failed: {e}"),
+        Ok(r) => eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} returned {}", r.status()),
+        Err(e) => eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed: {e}"),
     }
 }
 
@@ -182,7 +191,7 @@ async fn issuance_complete(
     // ordinary passthrough -- otherwise it would stay stuck terminating with
     // the shared wildcard cert forever, the browser never seeing the
     // origin's own newly-issued one.
-    push_tier(&state.edge_admin, &state.tunnels, &hostname, false).await;
+    push_channel_tier(&state.edge_admin, &state.tunnels, &hostname, false).await;
     Ok(StatusCode::OK)
 }
 
@@ -281,17 +290,17 @@ async fn sweep_once(
     let now = now_secs();
 
     // 1. Rot -> Gelb safety net: `portal_api::authorize_hostname` already
-    // pushes tier=gelb synchronously on the happy path; this catches the
+    // pushes channel_tier=gelb synchronously on the happy path; this catches the
     // cases where that push failed or raced (edge admin unset, transient
     // error), and is also simply where a fresh admission-loop tick learns
     // about newly-reachable hostnames at all.
     for hostname in tunnels.rot_hostnames()? {
         if edge_mesh.lookup_by_host(&hostname)?.is_some() && tunnels.enter_gelb_queue(&hostname, now)? {
-            push_tier(edge_admin, tunnels, &hostname, true).await;
+            push_channel_tier(edge_admin, tunnels, &hostname, true).await;
         }
     }
 
-    // 2. Re-affirm tier=gelb for every currently-Gelb hostname (#229
+    // 2. Re-affirm channel_tier=gelb for every currently-Gelb hostname (#229
     // follow-up): the edge's `gelb_hosts` is in-memory-only with no
     // rehydration on restart, so any edge restart silently reverts these
     // hosts to plain SNI passthrough -- which forwards raw TLS bytes to a
@@ -299,7 +308,7 @@ async fn sweep_once(
     // Re-pushing every tick is a cheap, idempotent no-op on the edge in the
     // steady state and self-heals within one tick of any restart.
     for hostname in tunnels.gelb_hostnames()? {
-        push_tier(edge_admin, tunnels, &hostname, true).await;
+        push_channel_tier(edge_admin, tunnels, &hostname, true).await;
     }
 
     // 3. Lapse expired claims -- must run before the admission sweep below so
@@ -324,8 +333,8 @@ async fn sweep_once(
 /// decides whether to spawn it at all, matching this crate's "absent unless
 /// configured" convention). Best-effort: a sweep error is logged, not fatal,
 /// so a transient DB hiccup never kills the loop. `edge_admin` is the same
-/// (url, token) pair the router's tier-push uses — passed here too so the
-/// Rot->Gelb transition can push `tier=gelb` the moment it happens, not only
+/// (url, token) pair the router's channel-tier-push uses — passed here too so the
+/// Rot->Gelb transition can push `channel_tier=gelb` the moment it happens, not only
 /// on the next tunnel-creation-time push.
 pub async fn run_admission_loop(
     tunnels: Arc<SqliteTunnelStore>,
@@ -468,7 +477,7 @@ mod tests {
         tunnels.create("alice", "web", Some("app.example.com")).unwrap();
         // Not yet edge-authorized -> stays rot through a sweep. No edge_admin
         // configured (None) -- proves the sweep still runs to completion and
-        // simply skips (logs) the tier push, rather than failing the tick.
+        // simply skips (logs) the channel-tier push, rather than failing the tick.
         sweep_once(&tunnels, &edge_mesh, &None).await.unwrap();
         assert_eq!(tunnels.cert_admission_for_hostname("app.example.com").unwrap().unwrap().status, "rot");
 
@@ -513,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_pushes_tier_gelb_to_the_edge_and_issuance_complete_reverts_it() {
         // #233: the end-to-end wiring -- a Rot->Gelb promotion must reach the
-        // edge's real authorize-host endpoint with `?tier=gelb`, and
+        // edge's real authorize-host endpoint with `?channel_tier=gelb`, and
         // completing an issuance must push again with NO tier (reverting to
         // ordinary passthrough), using the tunnel's actual routing token.
         let (edge_url, calls) = spawn_mock_edge_admin().await;
@@ -529,13 +538,13 @@ mod tests {
         {
             let seen = calls.lock().unwrap();
             // One push from the Rot->Gelb promotion itself, one from the
-            // same-tick Gelb re-affirm pass (#229 follow-up) -- both `tier=gelb`
+            // same-tick Gelb re-affirm pass (#229 follow-up) -- both `channel_tier=gelb`
             // for the same host, since the re-affirm pass sees the row it just promoted.
             assert_eq!(seen.len(), 2, "promotion push + same-tick re-affirm push");
             for call in seen.iter() {
                 assert!(
                     call.0.contains(&format!("/admin/authorize-host/{}/app.example.com", t.routing_token))
-                        && call.0.contains("tier=gelb"),
+                        && call.0.contains("channel_tier=gelb"),
                     "{}",
                     call.0
                 );
@@ -556,8 +565,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let seen = calls.lock().unwrap();
-        assert_eq!(seen.len(), 3, "issuance-complete pushes a third, reverting tier update");
-        assert!(!seen[2].0.contains("tier="), "no tier param -> revert to ordinary passthrough: {}", seen[2].0);
+        assert_eq!(seen.len(), 3, "issuance-complete pushes a third, reverting channel-tier update");
+        assert!(!seen[2].0.contains("channel_tier="), "no channel_tier param -> revert to ordinary passthrough: {}", seen[2].0);
     }
 
     #[tokio::test]
@@ -565,7 +574,7 @@ mod tests {
         // #229 follow-up: the edge's `gelb_hosts` is in-memory-only and has no
         // rehydration on restart -- any edge restart silently reverts a
         // still-Gelb hostname to ordinary SNI passthrough. Proves the sweep
-        // re-pushes tier=gelb on a LATER tick too, not only at the moment of
+        // re-pushes channel_tier=gelb on a LATER tick too, not only at the moment of
         // the Rot->Gelb transition, so an edge restart self-heals within one
         // tick no matter when it happens.
         let (edge_url, calls) = spawn_mock_edge_admin().await;
@@ -587,9 +596,9 @@ mod tests {
         let after_second_tick = calls.lock().unwrap().len();
         assert!(
             after_second_tick > after_first_tick,
-            "a second tick with no new transition must still re-push tier=gelb for the still-Gelb hostname"
+            "a second tick with no new transition must still re-push channel_tier=gelb for the still-Gelb hostname"
         );
         let seen = calls.lock().unwrap();
-        assert!(seen.last().unwrap().0.contains("tier=gelb"));
+        assert!(seen.last().unwrap().0.contains("channel_tier=gelb"));
     }
 }

@@ -101,7 +101,7 @@ pub struct EdgeState<H> {
     /// (`serve_sni_passthrough`), exactly today's behavior — a host only
     /// ever gets TLS-terminated at the edge with the wildcard cert when the
     /// control plane has explicitly pushed it here via
-    /// `POST /admin/authorize-host/:token/:host?tier=gelb`.
+    /// `POST /admin/authorize-host/:token/:host?channel_tier=gelb`.
     gelb_hosts: Mutex<HashSet<String>>,
     /// Per-token fixed-window rendezvous rate limit (#86, ADR-0018). `None` = off
     /// (no cap). `Some(limiter)` caps how many rendezvous a single routing token may

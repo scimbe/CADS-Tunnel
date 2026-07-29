@@ -35,8 +35,8 @@ fn edge_admin_http_client_with(timeout: std::time::Duration) -> reqwest::Client 
 }
 
 /// The edge admin client with the production timeout — a hung edge must not wedge
-/// the portal request. `pub(crate)`: also reused by `acme_broker`'s tier-push
-/// calls (#233), the same shared secret and endpoint shape as here.
+/// the portal request. `pub(crate)`: also reused by `acme_broker`'s
+/// channel-tier-push calls (#233), the same shared secret and endpoint shape as here.
 pub(crate) fn edge_admin_http_client() -> reqwest::Client {
     edge_admin_http_client_with(std::time::Duration::from_secs(5))
 }

@@ -68,30 +68,33 @@ async fn revoke(
 }
 
 #[derive(serde::Deserialize, Default)]
-struct TierQuery {
-    /// Rot/Gelb/Grün certificate tier (#233). Absent (the default for every
-    /// existing caller — nothing before this feature ever sent it) means
-    /// "not Gelb", i.e. ordinary SNI-passthrough: fully backward-compatible,
-    /// no existing authorize-host call can accidentally start terminating
-    /// TLS for a host the operator didn't explicitly mark.
+struct ChannelTierQuery {
+    /// Rot/Gelb/Grün **channel** tier (#233) — which TLS termination channel
+    /// serves this host (shared wildcard cert vs. the customer's own). Named
+    /// `channel_tier` specifically to stay distinct from the unrelated
+    /// user-facing *feature* tier (Standard/paid, see `portal_api.rs`). Absent
+    /// (the default for every existing caller — nothing before this feature
+    /// ever sent it) means "not Gelb", i.e. ordinary SNI-passthrough: fully
+    /// backward-compatible, no existing authorize-host call can accidentally
+    /// start terminating TLS for a host the operator didn't explicitly mark.
     #[serde(default)]
-    tier: Option<String>,
+    channel_tier: Option<String>,
 }
 
-/// `POST /admin/authorize-host/:token/:host[?tier=gelb]` (#23 BP4b, #233): the
-/// control plane authorizes `host` to be bound by `token` (called when a
-/// customer sets a hostname on a tunnel they own), and separately records
-/// whether `host` is currently in the Gelb certificate tier (served via the
-/// shared front-door wildcard cert) — `?tier=gelb` sets it, any other value
-/// or its absence clears it (e.g. the control plane re-pushes with no `tier`
-/// once a hostname reaches Grün, reverting it to ordinary passthrough so the
-/// browser sees the origin's own newly-issued certificate). Authenticated by
-/// the shared admin secret.
+/// `POST /admin/authorize-host/:token/:host[?channel_tier=gelb]` (#23 BP4b,
+/// #233): the control plane authorizes `host` to be bound by `token` (called
+/// when a customer sets a hostname on a tunnel they own), and separately
+/// records whether `host` is currently in the Gelb channel tier (served via
+/// the shared front-door wildcard cert) — `?channel_tier=gelb` sets it, any
+/// other value or its absence clears it (e.g. the control plane re-pushes
+/// with no `channel_tier` once a hostname reaches Grün, reverting it to
+/// ordinary passthrough so the browser sees the origin's own newly-issued
+/// certificate). Authenticated by the shared admin secret.
 async fn authorize_host(
     State(state): State<Arc<EdgeState<Connection>>>,
     headers: HeaderMap,
     Path((token, host)): Path<(String, String)>,
-    Query(q): Query<TierQuery>,
+    Query(q): Query<ChannelTierQuery>,
 ) -> StatusCode {
     if !admin_authed(&state, &headers) {
         return StatusCode::UNAUTHORIZED;
@@ -100,7 +103,7 @@ async fn authorize_host(
     match parse_token_hex(&token) {
         Some(t) if !host.is_empty() => {
             state.authorize_host(host, RoutingToken(t));
-            state.set_cert_tier(host, q.tier.as_deref() == Some("gelb"));
+            state.set_cert_tier(host, q.channel_tier.as_deref() == Some("gelb"));
             StatusCode::OK
         }
         _ => StatusCode::BAD_REQUEST,
@@ -229,10 +232,11 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_host_sets_and_clears_the_gelb_cert_tier_via_the_query_param() {
-        // #233: `?tier=gelb` marks a host Gelb; a later call with no `tier`
-        // (the control plane's own push once a hostname reaches Grün) clears
-        // it back to ordinary passthrough. No existing caller ever sends this
-        // param, so its absence must be indistinguishable from today.
+        // #233: `?channel_tier=gelb` marks a host Gelb; a later call with no
+        // `channel_tier` (the control plane's own push once a hostname
+        // reaches Grün) clears it back to ordinary passthrough. No existing
+        // caller ever sends this param, so its absence must be
+        // indistinguishable from today.
         let state = Arc::new(EdgeState::<Connection>::new());
         let secret = [0x55u8; 32];
         state.set_admin_token(secret);
@@ -252,12 +256,12 @@ mod tests {
         assert!(!state.is_gelb("gelb.bunsenbrenner.org"), "never marked -> not gelb");
 
         assert_eq!(
-            post(format!("/admin/authorize-host/{tok}/gelb.bunsenbrenner.org?tier=gelb")).await.unwrap().status(),
+            post(format!("/admin/authorize-host/{tok}/gelb.bunsenbrenner.org?channel_tier=gelb")).await.unwrap().status(),
             StatusCode::OK
         );
         assert!(state.is_gelb("gelb.bunsenbrenner.org"));
 
-        // No `tier` param at all -> today's exact shape, and clears a previous Gelb mark.
+        // No `channel_tier` param at all -> today's exact shape, and clears a previous Gelb mark.
         assert_eq!(
             post(format!("/admin/authorize-host/{tok}/gelb.bunsenbrenner.org")).await.unwrap().status(),
             StatusCode::OK

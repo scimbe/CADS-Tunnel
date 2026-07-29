@@ -1371,7 +1371,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // tier — same env-var/loading convention as Portal/Auth IdP
                     // above. `None` (unset, or unusable per #142) means every
                     // BrowserTunnel host stays on ordinary passthrough even if
-                    // the control plane ever pushes `tier=gelb` for one — there
+                    // the control plane ever pushes `channel_tier=gelb` for one — there
                     // is no cert to terminate with, so the arm falls through.
                     let wildcard_tls =
                         build_front_door_cert("Wildcard", "CT_EDGE_WILDCARD_CERT", "CT_EDGE_WILDCARD_KEY");

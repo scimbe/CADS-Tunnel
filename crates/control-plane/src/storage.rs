@@ -1423,7 +1423,7 @@ impl SqliteTunnelStore {
     /// The routing token bound to `hostname`, unscoped by subject (#233): the
     /// admission broker/loop operates on hostnames directly (it isn't acting
     /// on behalf of any particular logged-in customer), so it needs the
-    /// token to push a tier update to the edge the same way
+    /// token to push a channel-tier update to the edge the same way
     /// [`crate::portal_api`]'s `authorize_hostname` already does. Mirrors
     /// [`Self::all`]'s "admin/migration read, deliberately not customer-facing"
     /// precedent rather than reusing the owner-scoped lookups above.
@@ -1504,7 +1504,7 @@ impl SqliteTunnelStore {
     /// rehydration on restart, unlike the host-authorization map -- an edge
     /// restart silently drops every host back to ordinary SNI passthrough,
     /// which forwards raw TLS bytes to a Gelb-tier's plain-HTTP origin. The
-    /// admission sweep re-affirms `tier=gelb` for every row here on each tick
+    /// admission sweep re-affirms `channel_tier=gelb` for every row here on each tick
     /// so that gap self-heals within one tick of any edge restart, current or
     /// future, without a new edge-side rehydration protocol.
     pub fn gelb_hostnames(&self) -> rusqlite::Result<Vec<String>> {
