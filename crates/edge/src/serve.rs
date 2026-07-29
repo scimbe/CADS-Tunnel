@@ -1063,8 +1063,92 @@ where
                 }
             }
         }
+        b'M' => {
+            // Edge-to-edge mesh relay (ADR-0021 Part 1): a PEER edge that got a
+            // local miss for `host` dials here to reach the Agent this edge
+            // actually owns. Authenticated by the shared CT_EDGE_ADMIN_TOKEN
+            // (the same secret the control plane already uses to authorize
+            // this edge) rather than a distinct PKI leaf -- deliberately reuses
+            // the one constant-time admin-token check every other privileged
+            // edge operation already goes through, so only a genuine peer edge
+            // (or the operator) can reach this role, never a Client or Agent.
+            let mut admin_token = [0u8; 32];
+            stream.read_exact(&mut admin_token).await?;
+            let mut hl = [0u8; 2];
+            stream.read_exact(&mut hl).await?;
+            let hlen = u16::from_be_bytes(hl) as usize;
+            if hlen == 0 || hlen > 253 {
+                return Err("invalid mesh-relay hostname length".into());
+            }
+            let mut host = vec![0u8; hlen];
+            stream.read_exact(&mut host).await?;
+            let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
+
+            if !state.admin_revoke_ok(&admin_token) {
+                stream.write_all(b"NO").await?;
+                stream.flush().await?;
+                return Err("mesh-relay auth rejected".into());
+            }
+            let Some(token) = state.route_host(host) else {
+                stream.write_all(b"NO").await?;
+                stream.flush().await?;
+                return Err(format!("mesh-relay: no local route for '{host}'").into());
+            };
+            stream.write_all(b"OK").await?;
+            stream.flush().await?;
+
+            match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
+                Ok(()) => Ok(()),
+                Err(mut stream) => {
+                    let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
+                    let mut agent = join(agent_recv, agent_send);
+                    let (a, b) = relay(&mut stream, &mut agent).await?;
+                    state.note_relay(a + b);
+                    Ok(())
+                }
+            }
+        }
         other => Err(format!("unknown TCP role byte: {other}").into()),
     }
+}
+
+/// Dial a peer edge (ADR-0021 Part 1) that owns `host` and relay `inbound` to
+/// it over the mesh-relay role. Used as the cache-miss fallback when this
+/// edge has no local route for `host` but the control plane's registry says
+/// another edge does. `edge_cert` is the SAME internal Mesh-Plane CA root this
+/// edge already trusts Agents against (`crate::pki`) -- reused for transport
+/// encryption between edges too; `admin_token` (not the cert) is what actually
+/// authorizes the 'M' role on the receiving side.
+pub async fn relay_via_peer_edge<S>(
+    mut inbound: S,
+    peer_addr: &str,
+    host: &str,
+    edge_cert: rustls::pki_types::CertificateDer<'static>,
+    admin_token: [u8; 32],
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let target: std::net::SocketAddr = peer_addr.parse().map_err(|_| "invalid peer_addr")?;
+    let mut peer = crate::transport::tcp_tls_connect(target, edge_cert).await?;
+
+    let host_bytes = host.as_bytes();
+    let host_len: u16 = host_bytes.len().try_into().map_err(|_| "hostname too long for the mesh-relay frame")?;
+    let mut msg = vec![b'M'];
+    msg.extend_from_slice(&admin_token);
+    msg.extend_from_slice(&host_len.to_be_bytes());
+    msg.extend_from_slice(host_bytes);
+    peer.write_all(&msg).await?;
+    peer.flush().await?;
+
+    let mut ack = [0u8; 2];
+    peer.read_exact(&mut ack).await?;
+    if &ack != b"OK" {
+        return Err(format!("peer edge refused mesh-relay for '{host}'").into());
+    }
+
+    relay(&mut inbound, &mut peer).await?;
+    Ok(())
 }
 
 /// Path of the persisted CA signing key: `edge-ca-key.pem` beside the published
@@ -1961,6 +2045,130 @@ mod tests {
             Some(token),
             "hostname routes over the TCP fallback (was impossible before)"
         );
+    }
+
+    #[tokio::test]
+    async fn mesh_relay_reaches_a_hostname_owned_by_a_peer_edge() {
+        // ADR-0021 Part 1: a Client lands on edge A, which has no local route
+        // for `host` -- edge A discovers (out of band here; in production via
+        // the control plane's GET /internal/edges/lookup) that edge B owns it,
+        // dials edge B over the 'M' mesh-relay role, and the Client's bytes
+        // reach the Agent parked on edge B. Two independent `EdgeState`s and
+        // two independent real TCP+TLS listeners -- not one process's
+        // in-memory state -- the bar `edge_mesh.rs`'s own doc comment sets.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let admin_token = [0x42u8; 32];
+        let host = "app.example.test";
+
+        // Edge B: owns `host`, has a real Agent parked (TCP-fallback 'B' role).
+        let (listener_b, acceptor_b, cert_b) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let state_b: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        state_b.set_admin_token(admin_token);
+        let state_b2 = state_b.clone();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = match listener_b.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let acceptor = acceptor_b.clone();
+                let state = state_b2.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(tcp).await {
+                        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                        let _ = serve_tcp_connection(tls, &state, &challenge).await;
+                    }
+                });
+            }
+        });
+
+        // The Agent: registers + binds `host` on edge B directly, then echoes
+        // one request as "world" (standing in for a real origin round-trip).
+        let agent_task = tokio::spawn({
+            let cert_b = cert_b.clone();
+            async move {
+                let mut stream = crate::transport::tcp_tls_connect(addr_b, cert_b).await.unwrap();
+                let token = RoutingToken([0x77; 32]);
+                let mut msg = vec![b'B'];
+                msg.extend_from_slice(&token.0);
+                msg.extend_from_slice(&(host.len() as u16).to_be_bytes());
+                msg.extend_from_slice(host.as_bytes());
+                stream.write_all(&msg).await.unwrap();
+                stream.flush().await.unwrap();
+                let mut ack = [0u8; 2];
+                stream.read_exact(&mut ack).await.unwrap();
+                assert_eq!(&ack, b"OK", "agent registers directly on edge B");
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], b"hello", "agent sees the Client's bytes via the mesh relay");
+                stream.write_all(b"world").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        // Edge A: a completely separate EdgeState -- genuinely has no local route.
+        let state_a: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        assert!(state_a.route_host(host).is_none(), "edge A has no local route for host");
+
+        // Wait for the Agent to actually be parked on edge B before relaying,
+        // avoiding a race where the Client's bytes arrive before it's ready.
+        for _ in 0..200 {
+            if state_b.route_host(host).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(state_b.route_host(host).is_some(), "agent is registered on edge B");
+
+        let (mut client_side, edge_a_inbound) = tokio::io::duplex(4096);
+        let peer_addr_b = addr_b.to_string();
+        let host_owned = host.to_string();
+        let relay_task = tokio::spawn(async move {
+            relay_via_peer_edge(edge_a_inbound, &peer_addr_b, &host_owned, cert_b, admin_token).await
+        });
+
+        client_side.write_all(b"hello").await.unwrap();
+        client_side.flush().await.unwrap();
+        let mut resp = [0u8; 1024];
+        let n = client_side.read(&mut resp).await.unwrap();
+        assert_eq!(&resp[..n], b"world", "Client's bytes reached the Agent on edge B via edge A's mesh relay");
+
+        drop(client_side);
+        agent_task.await.unwrap();
+        let _ = relay_task.await;
+    }
+
+    #[tokio::test]
+    async fn mesh_relay_is_rejected_with_the_wrong_admin_token() {
+        // The 'M' role's authorization: a mesh-relay attempt presenting the
+        // WRONG shared admin token must be refused, not silently relayed.
+        let (listener_b, acceptor_b, cert_b) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let state_b: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        state_b.set_admin_token([0x42u8; 32]);
+        let host = "app.example.test";
+        state_b.register_host(host, RoutingToken([0x77; 32]));
+        tokio::spawn(async move {
+            let (tcp, _) = listener_b.accept().await.unwrap();
+            if let Ok(tls) = acceptor_b.accept(tcp).await {
+                let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                let _ = serve_tcp_connection(tls, &state_b, &challenge).await;
+            }
+        });
+
+        let (_client_side, edge_a_inbound) = tokio::io::duplex(4096);
+        let wrong_token = [0x99u8; 32]; // != the [0x42; 32] edge B is configured with
+        let result =
+            relay_via_peer_edge(edge_a_inbound, &addr_b.to_string(), host, cert_b, wrong_token).await;
+        assert!(result.is_err(), "wrong admin token must be refused, not relayed");
     }
 
     #[tokio::test]

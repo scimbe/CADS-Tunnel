@@ -102,6 +102,36 @@ pub async fn heartbeat(cp_url: &str, admin_token: &[u8; 32], id: &str, peer_addr
         .await;
 }
 
+#[derive(Deserialize)]
+struct OwnerResp {
+    #[allow(dead_code)]
+    edge_id: String,
+    peer_addr: String,
+}
+
+/// Ask the control plane which edge (ADR-0021 Part 1) owns `hostname`, for the
+/// edge-to-edge mesh-relay fallback when a Client lands on an edge that has no
+/// local route for it. Fail-soft: `None` on any transport/auth/parse failure or
+/// a genuine 404 (nobody owns this hostname) -- the caller's existing "no
+/// tunnel registered" error path is the correct fallback either way, so a
+/// registry hiccup never turns into a hard failure beyond what already existed
+/// before this feature.
+pub async fn lookup_owner_by_host(cp_url: &str, admin_token: &[u8; 32], hostname: &str) -> Option<String> {
+    let client = reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build().ok()?;
+    let url = format!("{}/internal/edges/lookup", cp_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .query(&[("host", hostname)])
+        .header("x-ct-admin-token", hex(admin_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<OwnerResp>().await.ok().map(|o| o.peer_addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +242,51 @@ mod tests {
 
         // Unreachable CP: same, no panic.
         heartbeat("http://127.0.0.1:1", &secret, "primary", "10.0.0.5:4433").await;
+    }
+
+    async fn spawn_mock_lookup(secret: [u8; 32], known_host: &'static str, peer_addr: &'static str) -> String {
+        let app = Router::new().route(
+            "/internal/edges/lookup",
+            get(move |headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<Value>| async move {
+                if !admin_ok(&headers, &secret) {
+                    return (StatusCode::UNAUTHORIZED, "").into_response();
+                }
+                match q.get("host").and_then(Value::as_str) {
+                    Some(h) if h == known_host => {
+                        (StatusCode::OK, AxJson(serde_json::json!({"edge_id": "edge-2", "peer_addr": peer_addr})))
+                            .into_response()
+                    }
+                    _ => (StatusCode::NOT_FOUND, "no owner recorded").into_response(),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn lookup_owner_by_host_returns_the_peer_addr_on_a_hit() {
+        let secret = [0x55u8; 32];
+        let base = spawn_mock_lookup(secret, "app.example.com", "10.0.0.9:4433").await;
+
+        let hit = lookup_owner_by_host(&base, &secret, "app.example.com").await;
+        assert_eq!(hit.as_deref(), Some("10.0.0.9:4433"));
+    }
+
+    #[tokio::test]
+    async fn lookup_owner_by_host_fails_soft_on_miss_wrong_token_or_unreachable_cp() {
+        let secret = [0x66u8; 32];
+        let base = spawn_mock_lookup(secret, "app.example.com", "10.0.0.9:4433").await;
+
+        assert!(lookup_owner_by_host(&base, &secret, "unknown.example.com").await.is_none(), "no owner -> None");
+        assert!(lookup_owner_by_host(&base, &[0u8; 32], "app.example.com").await.is_none(), "wrong token -> None");
+        assert!(
+            lookup_owner_by_host("http://127.0.0.1:1", &secret, "app.example.com").await.is_none(),
+            "unreachable CP -> None, not a panic"
+        );
     }
 }
