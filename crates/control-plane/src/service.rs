@@ -3243,6 +3243,7 @@ pub fn persistent_control_plane_router(
                     // instead of CADS-Tunnel reimplementing any of it.
                     account_console_url,
                     edge_mesh.clone(),
+                    admin_token,
                 ),
             )
         })

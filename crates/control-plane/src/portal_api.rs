@@ -11,8 +11,8 @@ use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use serde::Deserialize;
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
 
 
 use crate::accounts::AccountId;
@@ -86,6 +86,11 @@ struct ApiState {
     /// Always present (no config gate): purely additive bookkeeping alongside the
     /// edge-authorize call, never blocking tunnel creation on its own.
     edge_mesh: EdgeMeshHandle,
+    /// Shared admin secret gating [`admin_provision_tunnel`] -- the operator-only
+    /// escape hatch for a custom/vanity hostname (today's Standard tier only ever
+    /// auto-assigns one). `None` disables the route entirely (404s), matching
+    /// this crate's "absent unless configured" convention.
+    admin_token: Option<[u8; 32]>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -101,6 +106,7 @@ pub fn portal_api_router(
     dns: Option<(DesecClient, String)>,
     account_console_url: Option<String>,
     edge_mesh: EdgeMeshHandle,
+    admin_token: Option<[u8; 32]>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -119,6 +125,7 @@ pub fn portal_api_router(
         }),
         account_console_url: account_console_url.map(Arc::from),
         edge_mesh,
+        admin_token,
     };
     Router::new()
         .route("/portal/account", get(account_page))
@@ -129,7 +136,69 @@ pub fn portal_api_router(
         .route("/portal/tunnels/:id/install", get(install_page))
         .route("/portal/tunnels/:id/grants", get(grants_page).post(add_grant))
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
+        .route("/admin/provision-tunnel", post(admin_provision_tunnel))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct ProvisionTunnelReq {
+    subject: String,
+    name: String,
+    hostname: String,
+}
+
+#[derive(Serialize)]
+struct ProvisionTunnelResp {
+    routing_token: String,
+    hostname: String,
+}
+
+/// `POST /admin/provision-tunnel` (operator-only, `x-ct-admin-token`): create a
+/// tunnel with an explicit, chosen hostname rather than the Standard tier's
+/// auto-assigned one -- e.g. a vanity subdomain for a known project/maintainer.
+/// Runs the SAME edge-authorize + DNS-A-record side effects
+/// ([`authorize_hostname`]) as the self-service path, so the resulting tunnel
+/// is a real `subject_tunnels` row that participates in the Rot/Gelb/Grün
+/// admission broker exactly like any other -- the recipient can run
+/// `ct-agent certificate` against it like any Standard-tier customer.
+async fn admin_provision_tunnel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ProvisionTunnelReq>,
+) -> Response {
+    let Some(expected) = st.admin_token else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let authed = headers
+        .get("x-ct-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            if s.len() != 64 {
+                return None;
+            }
+            let mut out = [0u8; 32];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+            }
+            Some(out)
+        })
+        .is_some_and(|got| got.iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0);
+    if !authed {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(hostname) = ct_common::normalize_hostname(&req.hostname) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    let name = req.name.trim();
+    if name.is_empty() || req.subject.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "subject and name are required").into_response();
+    }
+    let tunnel = match st.tunnels.create(req.subject.trim(), name, Some(&hostname)) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    authorize_hostname(&st, &tunnel).await;
+    Json(ProvisionTunnelResp { routing_token: tunnel.routing_token.clone(), hostname }).into_response()
 }
 
 /// Resolve the caller's account from the session, or an early response
@@ -1034,6 +1103,7 @@ mod tests {
             None,
             None,
             test_edge_mesh(),
+            None,
         );
         (app, tunnels)
     }
@@ -1094,6 +1164,7 @@ mod tests {
             None,
             Some("https://auth.example/realms/ct-demo/account".to_string()),
             test_edge_mesh(),
+            None,
         );
         let resp = app
             .oneshot(
@@ -1401,6 +1472,7 @@ mod tests {
             None,
             None,
             edge_mesh,
+            None,
         );
 
         let status = post_form(&app, &format!("/portal/tunnels/{}/delete", created.id), "alice", "").await;
@@ -1474,6 +1546,7 @@ mod tests {
             Some((desec, "1.2.3.4".to_string())),
             None,
             EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary")),
+            None,
         );
 
         // Viewing the tunnels page auto-provisions the one Standard-tier tunnel.
@@ -1515,6 +1588,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_provision_tunnel_requires_the_admin_token_and_creates_a_custom_hostname() {
+        // Operator-only escape hatch for a vanity hostname the Standard tier's
+        // auto-assign would never produce -- proves it's gated, actually creates
+        // the requested hostname verbatim (not a "site-<suffix>" auto name), and
+        // runs the same edge-authorize side effect as the self-service path.
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x77u8; 32];
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
+            Some(secret),
+        );
+
+        let body = r#"{"subject":"flappy-demo-maintainer","name":"flappy-demo","hostname":"flappy-demo.bunsenbrenner.org"}"#;
+        let post_provision = |token_header: Option<String>| {
+            let app = app.clone();
+            let mut req = Request::post("/admin/provision-tunnel").header("content-type", "application/json");
+            if let Some(t) = token_header {
+                req = req.header("x-ct-admin-token", t);
+            }
+            let req = req.body(Body::from(body)).unwrap();
+            async move { app.oneshot(req).await.unwrap() }
+        };
+
+        assert_eq!(
+            post_provision(None).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "no token -> refused"
+        );
+        assert_eq!(
+            post_provision(Some(hex(&[0x11u8; 32]))).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token -> refused"
+        );
+
+        let resp = post_provision(Some(hex(&secret))).await;
+        assert_eq!(resp.status(), StatusCode::OK, "correct admin token -> provisions");
+        let respbody = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&respbody).unwrap();
+        assert_eq!(parsed["hostname"], "flappy-demo.bunsenbrenner.org", "the EXACT requested hostname, not auto-assigned");
+        let routing_token = parsed["routing_token"].as_str().unwrap().to_string();
+
+        let created = &tunnels.list_for_subject("flappy-demo-maintainer").unwrap()[0];
+        assert_eq!(created.hostname.as_deref(), Some("flappy-demo.bunsenbrenner.org"));
+        assert_eq!(created.routing_token, routing_token);
+    }
+
+    #[tokio::test]
     async fn install_page_carries_the_tunnels_own_assigned_hostname_not_a_bare_mesh_tunnel() {
         // The agent should never have to copy its own already-assigned hostname
         // by hand from the tunnels list -- the install page's .env carries it
@@ -1540,6 +1674,7 @@ mod tests {
             Some((desec, "1.2.3.4".to_string())),
             None,
             EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
+            None,
         );
 
         assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK);
@@ -1568,6 +1703,7 @@ mod tests {
             None,
             None,
             EdgeMeshHandle::new(no_dns_mesh, Arc::from("primary")),
+            None,
         );
         assert_eq!(get(&no_dns_app, "/portal/tunnels", Some("bob")).await.0, StatusCode::OK);
         let bare_tunnel = &no_dns_tunnels.list_for_subject("bob").unwrap()[0];
@@ -1621,6 +1757,7 @@ mod tests {
             Some((desec, "45.133.9.145".to_string())),
             None,
             test_edge_mesh(),
+            None,
         );
 
         // Viewing the tunnels page auto-provisions the tunnel with its auto-assigned
