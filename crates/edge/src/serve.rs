@@ -251,6 +251,49 @@ where
     Ok(())
 }
 
+/// Rot/Gelb/Grün certificate tier (#233), **Gelb** leg: terminate the
+/// browser's TLS with the shared front-door **wildcard** certificate (rather
+/// than passing raw TLS bytes through to the Origin, which doesn't hold a
+/// certificate of its own yet), then relay the DECRYPTED application bytes
+/// onward to the Agent over the same tunnel mechanism every other route
+/// uses. The customer's own origin must therefore serve plain HTTP while a
+/// hostname is Gelb — it starts speaking TLS itself again only once the
+/// control plane flips it to Grün (`state.set_cert_tier(host, false)`),
+/// which reverts new connections to [`serve_sni_passthrough`] so the
+/// browser sees the origin's own, now-issued certificate.
+///
+/// `inbound` is the already-Prepend-joined stream (buffered ClientHello +
+/// the rest of the socket) — the same shape [`serve_sni_passthrough`] takes,
+/// so both legs plug into [`serve_front_door`]'s `BrowserTunnel` arm
+/// identically; the only difference is TLS-terminate-then-relay-plaintext
+/// versus relay-raw-bytes-through.
+///
+/// Known, deliberate gap (not silently dropped): unlike
+/// [`serve_sni_passthrough`], this does not yet special-case a parked
+/// TCP-fallback agent ([`EdgeState::has_tcp_agent`]) — only the QUIC relay
+/// path. A Gelb-tier customer whose agent is on a UDP/QUIC-blocked network
+/// would fail to connect until that parity is added; tracked as a follow-up,
+/// not a reason to hold back the (far more common) QUIC path.
+pub async fn serve_gelb_terminated<S>(
+    inbound: S,
+    host: &str,
+    state: &EdgeState<Connection>,
+    wildcard_acceptor: &tokio_rustls::TlsAcceptor,
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let token = state
+        .route_host(host)
+        .ok_or_else(|| format!("no tunnel registered for host '{host}'"))?;
+    let mut tls = wildcard_acceptor.accept(inbound).await?;
+    let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
+    let mut agent = join(agent_recv, agent_send);
+    let (a, b) = relay(&mut tls, &mut agent).await?;
+    state.note_relay(a + b);
+    Ok(())
+}
+
 /// Resolve the `CT_CP_PROXY_ADDR` Portal upstream — a `host:port` (or literal
 /// `IP:port`) — for the `:443` front door (#31; mirrors #45's `resolve_addr` on
 /// the agent). A hostname like `control-plane:8090`, the natural docker-compose
@@ -552,6 +595,7 @@ pub async fn serve_front_door(
     default_host: Option<&str>,
     challenge: &Challenge,
     channel: Option<&ChannelFrontDoor>,
+    wildcard_acceptor: Option<&tokio_rustls::TlsAcceptor>,
 ) -> Result<(), BoxError> {
     // #121 Phase B1: the member's reflexive (post-NAT) source, captured from the accepted TCP
     // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
@@ -601,13 +645,24 @@ pub async fn serve_front_door(
                 }
             }
         }
-        crate::sni::FrontDoorRoute::BrowserTunnel(_host) => {
+        crate::sni::FrontDoorRoute::BrowserTunnel(host) => {
             let joined = Prepend {
                 pre: hello,
                 pos: 0,
                 inner: inbound,
             };
-            serve_sni_passthrough(joined, state).await
+            // #233: a hostname the control plane has explicitly marked Gelb
+            // gets edge-terminated with the shared wildcard cert instead of
+            // passthrough; every other hostname (not yet provisioned, or
+            // already Grün with its own real cert) is completely unaffected
+            // -- this is the ONLY new branch in this arm, the passthrough
+            // call below is untouched.
+            match wildcard_acceptor {
+                Some(wildcard) if state.is_gelb(&host) => {
+                    serve_gelb_terminated(joined, &host, state, wildcard).await
+                }
+                _ => serve_sni_passthrough(joined, state).await,
+            }
         }
         // #106 frontdoor-wire: a channel member whose network blocks the channel port
         // (`:4435`) reached the `:443` front door with the channel ALPN. Without a
@@ -1296,6 +1351,14 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         let tls = build_front_door_cert("Auth IdP", "CT_EDGE_AUTH_CERT", "CT_EDGE_AUTH_KEY");
                         proxies.insert(host.to_ascii_lowercase(), (addr, tls));
                     }
+                    // #233: the shared front-door wildcard cert backing the Gelb
+                    // tier — same env-var/loading convention as Portal/Auth IdP
+                    // above. `None` (unset, or unusable per #142) means every
+                    // BrowserTunnel host stays on ordinary passthrough even if
+                    // the control plane ever pushes `tier=gelb` for one — there
+                    // is no cert to terminate with, so the arm falls through.
+                    let wildcard_tls =
+                        build_front_door_cert("Wildcard", "CT_EDGE_WILDCARD_CERT", "CT_EDGE_WILDCARD_KEY");
                     let n_proxies = proxies.len();
                     let proxies = std::sync::Arc::new(proxies);
                     let default_host = std::sync::Arc::new(default_host);
@@ -1360,6 +1423,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let proxies = proxies.clone();
                             let default_host = default_host.clone();
                             let channel_fd = channel_fd.clone();
+                            let wildcard_tls = wildcard_tls.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for the connection's lifetime
                                 let mut nonce = [0u8; 16];
@@ -1377,6 +1441,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     default_host.as_deref(),
                                     &challenge,
                                     channel_fd.as_ref(),
+                                    wildcard_tls.as_ref(),
                                 )
                                 .await
                                 {
@@ -2517,6 +2582,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn front_door_terminates_gelb_hosts_with_the_wildcard_cert_and_relays_to_the_agent() {
+        // #233: a hostname the control plane has marked Gelb gets its TLS
+        // TERMINATED at the edge with the SHARED wildcard certificate
+        // (rather than passed through raw -- the origin doesn't hold a
+        // certificate of its own yet) and the DECRYPTED bytes relayed
+        // onward to the agent exactly like any other tunnel route. Proven
+        // end-to-end through the real `:443` front door (not just the
+        // `serve_gelb_terminated` function in isolation), a real QUIC agent,
+        // and a real rustls browser handshake that only succeeds because it
+        // trusts the WILDCARD cert specifically (not an origin-specific one
+        // -- if the edge had instead raw-passed-through, there would be no
+        // origin TLS listener at all for it to validate against).
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        // The shared wildcard cert (stands in for `*.bunsenbrenner.org`).
+        let certified = rcgen::generate_simple_self_signed(vec!["app.example.test".to_string()]).unwrap();
+        let wildcard_cert = certified.cert.der().clone();
+        let wildcard_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![wildcard_cert.clone()], wildcard_key)
+            .unwrap();
+        let wildcard_tls = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        // A plain-HTTP "origin": a Gelb-tier customer serves HTTP, not TLS,
+        // since TLS is now terminated at the edge instead.
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut sock, _) = origin.accept().await.unwrap();
+            let mut b = [0u8; 1024];
+            let n = sock.read(&mut b).await.unwrap();
+            assert!(
+                b[..n].starts_with(b"GET "),
+                "origin sees a PLAINTEXT request -- TLS was already stripped at the edge"
+            );
+            sock.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 10\r\n\r\nhello gelb")
+                .await
+                .unwrap();
+            sock.shutdown().await.unwrap();
+        });
+
+        // Edge + a real QUIC agent relaying the tunnel stream verbatim to the
+        // plain origin (same registration dance as the passthrough test above).
+        let token = RoutingToken([0x77; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.register_host("app.example.test", token.clone());
+        state.set_cert_tier("app.example.test", true); // <-- the new bit: Gelb
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let edge_addr = server.local_addr().unwrap();
+        let state_e = state.clone();
+        let edge_srv = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            let _ = serve_connection(&conn, &state_e, &challenge).await;
+            conn.closed().await;
+        });
+        let agent_ep = build_client_endpoint(cert).expect("agent ep");
+        let agent_conn = agent_ep
+            .connect(edge_addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("agent conn");
+        let (mut a_s, mut a_r) = agent_conn.open_bi().await.unwrap();
+        a_s.write_all(b"A").await.unwrap();
+        a_s.write_all(&token.0).await.unwrap();
+        a_s.finish().unwrap();
+        assert_eq!(a_r.read_to_end(8).await.unwrap(), b"OK");
+        let agent_task = tokio::spawn(async move {
+            let (e_send, e_recv) = agent_conn.accept_bi().await.unwrap();
+            let mut edge_side = tokio::io::join(e_recv, e_send);
+            let mut origin_tcp = tokio::net::TcpStream::connect(origin_addr).await.unwrap();
+            let _ = crate::relay::relay(&mut edge_side, &mut origin_tcp).await;
+        });
+
+        // The public `:443` front door, wired with the wildcard acceptor. No
+        // `proxies` entries -- this host is an ordinary BrowserTunnel, not a
+        // configured terminate-host.
+        let dummy_acceptor = {
+            let c = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+            let cfg = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![c.cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der())),
+                )
+                .unwrap();
+            tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
+        };
+        let proxies: std::collections::HashMap<String, ProxyTarget> = std::collections::HashMap::new();
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls))
+                .await
+        });
+
+        // Browser: a real rustls handshake trusting the WILDCARD cert
+        // specifically (not an origin-specific one) -- proving the EDGE, not
+        // the origin, terminated this TLS session.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(wildcard_cert).unwrap();
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let tcp = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("app.example.test").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.expect("browser trusts the shared wildcard cert");
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: app.example.test\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains("200 OK") && text.contains("hello gelb"),
+            "round-tripped through edge-terminated TLS to the plain-HTTP origin: {text}"
+        );
+
+        origin_task.await.unwrap();
+        agent_task.abort();
+        edge_srv.abort();
+        fd_task.abort();
+    }
+
+    #[tokio::test]
     async fn agent_binds_a_hostname_via_the_h_role() {
         // #23 BP3: an agent binds host -> token over the edge protocol (role 'H'),
         // so an SNI-routed browser can later reach this tunnel. Case-insensitive.
@@ -2603,7 +2799,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None).await
         });
 
         // Client: send the ClientHello (SNI=portal.test) + extra, read it echoed.
@@ -2737,7 +2933,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
-            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None)
+            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None)
                 .await
         });
 
@@ -2825,7 +3021,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None).await
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None).await
         });
 
         // Browser -> SNI=auth.test -> AUTH cert terminates -> AUTH upstream.
@@ -2963,7 +3159,7 @@ mod tests {
                         std::collections::HashMap::new();
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
-                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx),
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None,
                     )
                     .await;
                 });

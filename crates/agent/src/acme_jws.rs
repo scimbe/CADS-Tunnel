@@ -9,6 +9,7 @@
 //! 7515/7638-grounded tests, not just structural round-trips.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use ring::hmac;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde::Serialize;
@@ -93,6 +94,44 @@ impl AccountKey {
         // classic "signature verifies with openssl but not with a JWS validator"
         // encoding mismatch.
         Ok(sig.as_ref().to_vec())
+    }
+
+    /// Build the `externalAccountBinding` JWS (RFC 8555 §7.3.4) a second public
+    /// CA (ZeroSSL, Google Trust Services, ...) requires inside `newAccount` to
+    /// tie this ACME account to a pre-existing account at that CA. Distinct
+    /// from every other signature this type produces: it is signed with the
+    /// CA-issued **HMAC** key (`eab_hmac_key_b64url`, base64url as the CA hands
+    /// it out), not this account's own ES256 key — the whole point is proving
+    /// "the party who holds the EAB secret also holds this ACME key", so
+    /// signing it with the ACME key itself would prove nothing.
+    pub fn external_account_binding(
+        &self,
+        eab_kid: &str,
+        eab_hmac_key_b64url: &str,
+        new_account_url: &str,
+    ) -> Result<Value, BoxError> {
+        let hmac_key_bytes = URL_SAFE_NO_PAD
+            .decode(eab_hmac_key_b64url)
+            .map_err(|e| format!("EAB HMAC key is not valid base64url: {e}"))?;
+        #[derive(Serialize)]
+        struct EabProtected<'a> {
+            alg: &'static str,
+            kid: &'a str,
+            url: &'a str,
+        }
+        let protected_json =
+            serde_json::to_string(&EabProtected { alg: "HS256", kid: eab_kid, url: new_account_url })?;
+        let protected_b64 = b64url(protected_json.as_bytes());
+        // Payload is this account's own public JWK -- what the EAB binds to.
+        let payload_b64 = b64url(serde_json::to_string(&self.jwk())?.as_bytes());
+        let signing_input = format!("{protected_b64}.{payload_b64}");
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &hmac_key_bytes);
+        let signature = hmac::sign(&key, signing_input.as_bytes());
+        Ok(serde_json::json!({
+            "protected": protected_b64,
+            "payload": payload_b64,
+            "signature": b64url(signature.as_ref()),
+        }))
     }
 
     /// Build a signed JWS body (RFC 7515 §7.2 flattened form, which is what every
@@ -237,6 +276,38 @@ mod tests {
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(jws["protected"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(protected["kid"], "https://acme.example/acct/123");
         assert!(protected.get("jwk").is_none(), "kid requests never re-carry the full jwk");
+    }
+
+    #[test]
+    fn external_account_binding_is_hmac_signed_with_the_eab_key_not_the_account_key() {
+        let key = AccountKey::generate().unwrap();
+        // A throwaway 32-byte HMAC key, base64url-encoded the way a CA hands one out.
+        let hmac_key_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let binding = key
+            .external_account_binding("eab-kid-123", &hmac_key_b64, "https://acme.example/new-account")
+            .unwrap();
+
+        let protected: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(binding["protected"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(protected["alg"], "HS256", "EAB is HMAC-signed, never ES256");
+        assert_eq!(protected["kid"], "eab-kid-123");
+        assert_eq!(protected["url"], "https://acme.example/new-account");
+
+        let payload: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(binding["payload"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(payload, key.jwk(), "EAB payload binds to this account's own public JWK");
+
+        // Recompute the HMAC independently and confirm it matches -- proves the
+        // signature is actually over signing_input with the EAB key, not a stub.
+        let signing_input = format!("{}.{}", binding["protected"].as_str().unwrap(), binding["payload"].as_str().unwrap());
+        let hmac_key_bytes = URL_SAFE_NO_PAD.decode(&hmac_key_b64).unwrap();
+        let verify_key = hmac::Key::new(hmac::HMAC_SHA256, &hmac_key_bytes);
+        hmac::verify(&verify_key, signing_input.as_bytes(), &URL_SAFE_NO_PAD.decode(binding["signature"].as_str().unwrap()).unwrap())
+            .expect("signature verifies against the EAB HMAC key");
+
+        // A different EAB key must NOT verify -- proves this isn't vacuously true.
+        let wrong_key = hmac::Key::new(hmac::HMAC_SHA256, &[9u8; 32]);
+        assert!(hmac::verify(&wrong_key, signing_input.as_bytes(), &URL_SAFE_NO_PAD.decode(binding["signature"].as_str().unwrap()).unwrap()).is_err());
     }
 
     #[test]

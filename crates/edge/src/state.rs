@@ -94,6 +94,15 @@ pub struct EdgeState<H> {
     /// a hostname may only be bound by the token the control plane authorized for
     /// it — so an anonymous `'H'` bind on a public `:443` can't claim a name.
     host_auth: Mutex<Option<HashMap<String, RoutingToken>>>,
+    /// Rot/Gelb/Grün certificate tier (#233): hostnames currently in the
+    /// **Gelb** tier — live via the shared front-door wildcard certificate,
+    /// not yet on their own agent-held one. Absence here (the default for
+    /// every hostname on a fresh boot) means ordinary SNI-passthrough
+    /// (`serve_sni_passthrough`), exactly today's behavior — a host only
+    /// ever gets TLS-terminated at the edge with the wildcard cert when the
+    /// control plane has explicitly pushed it here via
+    /// `POST /admin/authorize-host/:token/:host?tier=gelb`.
+    gelb_hosts: Mutex<HashSet<String>>,
     /// Per-token fixed-window rendezvous rate limit (#86, ADR-0018). `None` = off
     /// (no cap). `Some(limiter)` caps how many rendezvous a single routing token may
     /// drive per window — the second half of the layered rendezvous-flood defense
@@ -118,6 +127,7 @@ impl<H: Clone> EdgeState<H> {
             revoked: Mutex::new(HashSet::new()),
             admin_token: Mutex::new(None),
             host_auth: Mutex::new(None),
+            gelb_hosts: Mutex::new(HashSet::new()),
             rendezvous_limiter: Mutex::new(None),
             registrations: Counter::default(),
             relays: Counter::default(),
@@ -222,6 +232,37 @@ impl<H: Clone> EdgeState<H> {
     pub fn route_host(&self, host: &str) -> Option<RoutingToken> {
         let key = ct_common::normalize_hostname(host)?;
         self.hosts.lock_safe().get(&key).cloned()
+    }
+
+    /// Set whether `host` is currently in the **Gelb** certificate tier
+    /// (#233) — the control plane calls this (via the admin API) every time
+    /// a hostname's tier changes, in both directions: `true` when it enters
+    /// Gelb (live via the shared wildcard cert), `false` once it reaches
+    /// Grün (its own cert exists; revert to ordinary passthrough so the
+    /// browser sees the origin's own certificate again). A malformed
+    /// hostname is silently a no-op, same as [`Self::register_host`].
+    pub fn set_cert_tier(&self, host: &str, gelb: bool) {
+        let Some(key) = ct_common::normalize_hostname(host) else {
+            return;
+        };
+        let mut gelb_hosts = self.gelb_hosts.lock_safe();
+        if gelb {
+            gelb_hosts.insert(key);
+        } else {
+            gelb_hosts.remove(&key);
+        }
+    }
+
+    /// Whether `host` is currently in the Gelb tier — `false` for any
+    /// hostname never explicitly marked so (a fresh boot, or one the control
+    /// plane has never pushed a tier for), which is exactly what preserves
+    /// today's ordinary SNI-passthrough behavior for every hostname this
+    /// feature doesn't touch.
+    pub fn is_gelb(&self, host: &str) -> bool {
+        match ct_common::normalize_hostname(host) {
+            Some(key) => self.gelb_hosts.lock_safe().contains(&key),
+            None => false,
+        }
     }
 
     /// Note a completed relay of `bytes` total bytes (both directions), and a
@@ -539,6 +580,27 @@ mod tests {
         assert_eq!(state.route_host("app.example."), Some(token(7)), "trailing dot collapses");
         assert!(!state.register_host("bad host", token(8)), "malformed hostname refused at bind");
         assert_eq!(state.route_host("bad host"), None);
+    }
+
+    #[test]
+    fn cert_tier_defaults_to_not_gelb_and_is_toggleable_both_ways() {
+        // #233: a fresh boot (or any hostname the control plane never pushed a
+        // tier for) must default to false -- that's what keeps every existing,
+        // already-gruen hostname on ordinary passthrough with zero config.
+        let state = EdgeState::<u32>::new();
+        assert!(!state.is_gelb("app.example"), "never marked -> not gelb, the safe default");
+
+        state.set_cert_tier("App.Example.", true);
+        assert!(state.is_gelb("app.example"), "normalized the same way register_host/route_host do");
+
+        // Gelb -> Grün: the control plane reverts the tier once the hostname's
+        // own real cert exists, and passthrough must resume.
+        state.set_cert_tier("app.example", false);
+        assert!(!state.is_gelb("app.example"));
+
+        // A malformed hostname is a silent no-op, same as register_host.
+        state.set_cert_tier("bad host", true);
+        assert!(!state.is_gelb("bad host"));
     }
 
     #[test]

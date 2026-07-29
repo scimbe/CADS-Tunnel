@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod a2a;
+pub mod acme_ca;
 pub mod channel;
 pub mod cookbook;
 pub mod credential;

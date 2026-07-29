@@ -109,9 +109,13 @@ pair your origin's webserver (Caddy, etc.) already knows how to load. It
 re-checks every few hours and only actually contacts Let's Encrypt once the
 existing cert is old enough to renew (`crates/agent/src/acme_orchestrate.rs`).
 
-Set `CT_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory`
-to test against Let's Encrypt's staging environment first — production has real
-per-hostname rate limits.
+The ACME directory URL (and CA choice generally) is no longer agent-side
+config: `ct-agent` polls the control-plane's admission broker
+(`crates/control-plane/src/acme_broker.rs`, #233) before every issuance and
+renewal, and uses whichever CA/directory it assigns — there is no local
+override or fallback. To test against staging, point the control plane's own
+`ct-agent`-facing test fixtures at
+`https://acme-staging-v02.api.letsencrypt.org/directory` instead.
 
 ## 5. Verify
 After a cert run publishes a challenge, from anywhere:

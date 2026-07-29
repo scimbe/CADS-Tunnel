@@ -35,8 +35,9 @@ fn edge_admin_http_client_with(timeout: std::time::Duration) -> reqwest::Client 
 }
 
 /// The edge admin client with the production timeout — a hung edge must not wedge
-/// the portal request.
-fn edge_admin_http_client() -> reqwest::Client {
+/// the portal request. `pub(crate)`: also reused by `acme_broker`'s tier-push
+/// calls (#233), the same shared secret and endpoint shape as here.
+pub(crate) fn edge_admin_http_client() -> reqwest::Client {
     edge_admin_http_client_with(std::time::Duration::from_secs(5))
 }
 
@@ -124,6 +125,7 @@ pub fn portal_api_router(
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
+        .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
         .route("/portal/tunnels/:id/install", get(install_page))
         .route("/portal/tunnels/:id/grants", get(grants_page).post(add_grant))
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
@@ -261,7 +263,24 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
         provision_tunnel(&st, &subject, "site").await;
     }
     match st.tunnels.list_authorized_for_subject(&subject) {
-        Ok(tunnels) => Html(tunnels_html(&tunnels)).into_response(),
+        Ok(tunnels) => {
+            // #233: fetch each hostname's Rot/Gelb/Grün admission state
+            // alongside its tunnel row -- best-effort per-row (a lookup
+            // failure just omits that row's tier badge rather than failing
+            // the whole page, matching this handler's existing tolerance
+            // for partial data).
+            let rows: Vec<_> = tunnels
+                .into_iter()
+                .map(|(t, owned)| {
+                    let admission = t
+                        .hostname
+                        .as_deref()
+                        .and_then(|h| st.tunnels.cert_admission_for_hostname(h).ok().flatten());
+                    (t, owned, admission)
+                })
+                .collect();
+            Html(tunnels_html(&rows)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -442,6 +461,30 @@ async fn delete_tunnel(
                     redact_routing_tokens(&e.to_string())
                 ),
             }
+        }
+    }
+    Redirect::to("/portal/tunnels").into_response()
+}
+
+/// `POST /portal/tunnels/:id/reclaim-cert-slot` (#233): the customer's
+/// explicit re-request after a lapsed claim window — the only way a lapsed
+/// hostname re-enters the Gelb queue (never automatic, per the admission
+/// broker's design: a lapse must cost the same as starting over, at the
+/// back of the queue). Owner-scoped via the existing `tunnel_hostname`
+/// lookup; a no-op (redirect, no error surfaced) for a stranger's tunnel id
+/// or a hostname that isn't actually `lapsed` — [`SqliteTunnelStore::reclaim_cert_slot`]
+/// itself already guards both.
+async fn reclaim_cert_slot(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    if let Some(hostname) = st.tunnels.tunnel_hostname(&subject, &id).ok().flatten() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(e) = st.tunnels.reclaim_cert_slot(&subject, &hostname, now) {
+            eprintln!("ct-cp: reclaim-cert-slot for {hostname} failed: {e}");
         }
     }
     Redirect::to("/portal/tunnels").into_response()
@@ -648,10 +691,68 @@ fn grants_html(id: &str, grantees: &[String]) -> String {
     page("share tunnel", &body)
 }
 
-fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
+/// Rot/Gelb/Grün status badge + (when applicable) the persistent private-key
+/// disclosure and queue/claim details for one tunnel's row (#233). Returns
+/// an empty string for a Mesh-Plane-only tunnel (no hostname, so no
+/// admission state at all) — nothing new to show, today's row is unaffected.
+fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String {
+    match admission.status.as_str() {
+        // Deliberately does not repeat the phrase "privaten Schlüssel" here (even
+        // to reassure) -- it must appear ONLY in the Gelb warning, so a customer
+        // (or a test) scanning for that exact phrase gets an unambiguous signal
+        // of which tier they are actually in.
+        "gruen" => r#"<div class="tier tier-gruen">🟢 Grün &mdash; eigenes, vollständig eigenständiges
+ Zertifikat aktiv.</div>"#
+            .to_string(),
+        "rot" => {
+            r#"<div class="tier tier-rot">🔴 Rot &mdash; Ihre Subdomain wird gerade eingerichtet.</div>"#
+                .to_string()
+        }
+        _ /* gelb */ => {
+            let disclosure = r#"<p class="help">Solange <strong>Gelb</strong> aktiv ist, wird Ihre Subdomain
+ über ein gemeinsam genutztes Zertifikat ausgeliefert &mdash; der Betreiber besitzt in dieser Phase
+ auch den privaten Schlüssel dieses Zertifikats. Sobald Ihr eigenes Zertifikat ausgestellt ist
+ (Status Grün), gilt das nicht mehr.</p>"#;
+            match admission.claim_state.as_str() {
+                "offered" => {
+                    let deadline_note = match admission.claim_deadline {
+                        Some(d) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|dur| dur.as_secs() as i64)
+                                .unwrap_or(0);
+                            let hours_left = ((d - now).max(0)) / 3600;
+                            format!(" &mdash; noch ca. {hours_left}h Zeit, das eigene Zertifikat zu erhalten")
+                        }
+                        None => String::new(),
+                    };
+                    format!(
+                        r#"<div class="tier tier-gelb">🟡 Gelb &mdash; Sie sind an der Reihe{deadline_note}.</div>{disclosure}"#
+                    )
+                }
+                "lapsed" => format!(
+                    r#"<div class="tier tier-gelb">🟡 Gelb &mdash; die Frist ist abgelaufen.</div>{disclosure}
+<form class="inline" method="post" action="/portal/tunnels/{id}/reclaim-cert-slot">
+ <button class="sec" type="submit">Erneut anfragen</button></form>"#
+                ),
+                _ => {
+                    let position_note = match admission.queue_position {
+                        Some(p) => format!(" &mdash; Warteschlangenposition {}", p + 1),
+                        None => String::new(),
+                    };
+                    format!(
+                        r#"<div class="tier tier-gelb">🟡 Gelb &mdash; bereits erreichbar{position_note}.</div>{disclosure}"#
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool, Option<crate::storage::CertAdmission>)]) -> String {
     let rows = tunnels
         .iter()
-        .map(|(t, owned)| {
+        .map(|(t, owned, admission)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -675,9 +776,10 @@ fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool)]) -> String {
  <span class="k">(shared with you)</span>"#
                 )
             };
+            let tier = admission.as_ref().map(|a| cert_tier_html(&id, a)).unwrap_or_default();
             format!(
                 r#"<div class="row"><span class="v">{name}{host}</span><span>{owner_actions}
-</span></div>"#,
+</span></div>{tier}"#,
                 name = escape(&t.name),
             )
         })
@@ -772,6 +874,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  ol.steps{{color:#8b949e;font-size:.86rem;margin:.2rem 0;padding-left:1.2rem}}
  ol.steps li{{margin:.35rem 0}} ol.steps strong{{color:#e6edf3}}
  .warn{{background:#3d1e00;border:1px solid #7d4e00;color:#f0c674;border-radius:8px;padding:.7rem .9rem;margin:1rem 0;font-size:.88rem;line-height:1.6}}
+ .tier{{font-size:.85rem;margin:.2rem 0 .1rem}} .tier-rot{{color:#f85149}} .tier-gelb{{color:#f0c674}} .tier-gruen{{color:#3fb950}}
  .warn code{{background:#2a1500;border-color:#7d4e00}} h2.muted{{color:#6e7681}}
  .btn.disabled,button:disabled,input:disabled{{opacity:.45;cursor:not-allowed;pointer-events:none}}
  .code-block{{margin:.6rem 0 1rem;border:1px solid #30363d;border-radius:8px;overflow:hidden;background:#0d1117}}
@@ -909,14 +1012,21 @@ mod tests {
     }
 
     fn test_app() -> Router {
+        test_app_with_tunnels().0
+    }
+
+    /// Same as [`test_app`] but also returns the `SqliteTunnelStore` directly,
+    /// so a test can drive cert-tier state (#233: `enter_gelb_queue`,
+    /// `offer_claim`, ...) before hitting the page.
+    fn test_app_with_tunnels() -> (Router, Arc<SqliteTunnelStore>) {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
         let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
-        portal_api_router(
+        let app = portal_api_router(
             KEY,
             ledger,
-            tunnels,
+            tunnels.clone(),
             enrollment,
             bootstrap,
             "https://portal.example",
@@ -924,7 +1034,8 @@ mod tests {
             None,
             None,
             test_edge_mesh(),
-        )
+        );
+        (app, tunnels)
     }
 
     #[tokio::test]
@@ -1161,6 +1272,80 @@ mod tests {
             html.contains("machine you want to expose"),
             "explains the one-liner runs on the origin, not the browsing device"
         );
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_shows_the_cert_tier_badge_and_the_private_key_disclosure_while_gelb() {
+        // #233: a customer must see their subdomain's Rot/Gelb/Grün status, and
+        // while Gelb specifically, a persistent (not one-time) disclosure that
+        // the operator holds this certificate's private key.
+        let (app, tunnels) = test_app_with_tunnels();
+        // Seed the tunnel directly with a hostname (no DNS backend configured
+        // in this harness, so the page's own auto-provision wouldn't assign one).
+        let hostname = "site-abc.example.com".to_string();
+        tunnels.create("alice", "site", Some(&hostname)).unwrap();
+
+        // Rot (freshly created, not yet queued): the badge shows, no disclosure.
+        let (_, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(html.contains("Rot"), "shows the Rot badge: {html}");
+        assert!(!html.contains("privaten Schlüssel"), "no disclosure needed while Rot");
+
+        // Gelb, queued (not yet offered): disclosure IS shown.
+        tunnels.enter_gelb_queue(&hostname, 100).unwrap();
+        let (_, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(html.contains("Gelb"), "shows the Gelb badge");
+        assert!(html.contains("privaten Schlüssel"), "persistent disclosure while Gelb: {html}");
+
+        // Gelb, offered: the claim-deadline note appears too.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        tunnels.offer_claim(&hostname, "letsencrypt", now, now + 3600).unwrap();
+        let (_, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(html.contains("Zeit"), "shows a claim-window time note: {html}");
+        assert!(html.contains("privaten Schlüssel"), "disclosure still shown while offered");
+
+        // Gruen: no disclosure, no reclaim form.
+        tunnels.record_issuance_complete(&hostname, "example.com", now).unwrap();
+        let (_, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(html.contains("Grün"), "shows the Grün badge");
+        assert!(!html.contains("privaten Schlüssel"), "no disclosure once Grün");
+        assert!(!html.contains("reclaim-cert-slot"), "no reclaim action once Grün");
+    }
+
+    #[tokio::test]
+    async fn reclaim_cert_slot_only_reenters_the_queue_from_lapsed_and_only_for_the_owner() {
+        // #233: re-request after a lapse must (a) require ownership, (b) be a
+        // no-op unless the hostname is actually `lapsed`, and (c) land the
+        // hostname back at the queue's back (fresh queued_at), never restoring
+        // its old position.
+        let (app, tunnels) = test_app_with_tunnels();
+        let alice_hostname = "alice-site.example.com".to_string();
+        let alice_id = tunnels.create("alice", "site", Some(&alice_hostname)).unwrap().id;
+
+        // Not lapsed yet (still rot) -> reclaim is a no-op, still rot.
+        let status = post_form(&app, &format!("/portal/tunnels/{alice_id}/reclaim-cert-slot"), "alice", "").await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "redirects back regardless");
+        assert_eq!(tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().status, "rot");
+
+        // Queue it, offer it, then let it lapse.
+        tunnels.enter_gelb_queue(&alice_hostname, 100).unwrap();
+        tunnels.offer_claim(&alice_hostname, "letsencrypt", 100, 200).unwrap();
+        tunnels.lapse_expired_claims(300).unwrap();
+        assert_eq!(tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().claim_state, "lapsed");
+
+        // A stranger cannot reclaim alice's tunnel.
+        let _ = get(&app, "/portal/tunnels", Some("bob")).await; // provisions bob's own tunnel
+        post_form(&app, &format!("/portal/tunnels/{alice_id}/reclaim-cert-slot"), "bob", "").await;
+        assert_eq!(
+            tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().claim_state,
+            "lapsed",
+            "bob cannot reclaim alice's slot"
+        );
+
+        // Alice reclaims her own -> back to none/gelb, queued_at reset.
+        post_form(&app, &format!("/portal/tunnels/{alice_id}/reclaim-cert-slot"), "alice", "").await;
+        let a = tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap();
+        assert_eq!(a.claim_state, "none");
+        assert_eq!(a.status, "gelb");
     }
 
     #[tokio::test]

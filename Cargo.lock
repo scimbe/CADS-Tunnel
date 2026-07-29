@@ -488,6 +488,7 @@ dependencies = [
  "ct-dns",
  "ct-edge",
  "ed25519-dalek",
+ "hickory-resolver",
  "http-body-util",
  "libc",
  "libp2p",
@@ -563,6 +564,7 @@ name = "ct-dns"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "hickory-resolver",
  "http-body-util",
  "reqwest",
  "serde_json",

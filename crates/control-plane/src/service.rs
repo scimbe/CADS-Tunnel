@@ -3059,9 +3059,10 @@ pub fn persistent_control_plane_router(
     }
     let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(edge_mesh_store.clone(), local_edge_id);
     // Where to reach the edge's admin API (host-authorize/revoke, #23 BP4b / #27
-    // RB4b) — hoisted here (rather than inline at each of its two call sites
-    // below) so both the portal's automatic authorize-on-create-tunnel AND the
-    // new public authorize-host proxy (#214) read the exact same config.
+    // RB4b) — hoisted here (rather than inline at each of its call sites below)
+    // so the portal's automatic authorize-on-create-tunnel, the public
+    // authorize-host proxy (#214), and the admission broker's tier-push (#233)
+    // all read the exact same config.
     let edge_admin_config = match (
         std::env::var("CT_CP_EDGE_ADMIN_URL").ok().filter(|s| !s.is_empty()),
         std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()),
@@ -3069,6 +3070,27 @@ pub fn persistent_control_plane_router(
         (Some(url), Some(token)) => Some((url, token)),
         _ => None,
     };
+    // #233: the Rot/Gelb/Grün admission-queue sweep. Opt-in and off by
+    // default (matches this crate's "absent unless configured" convention
+    // for every other internal writer) -- a deployment that hasn't set this
+    // simply never promotes anything past Rot, so turning the feature on is
+    // a deliberate, single-flag operator action, not a side effect of an
+    // upgrade.
+    if std::env::var("CT_CP_ACME_BROKER_ENABLED").ok().as_deref() == Some("1") {
+        let tick_secs = std::env::var("CT_CP_ACME_BROKER_TICK_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+        let broker_tunnels = tunnels.clone();
+        let broker_edge_mesh = edge_mesh_store.clone();
+        let broker_edge_admin = edge_admin_config.clone();
+        tokio::spawn(crate::acme_broker::run_admission_loop(
+            broker_tunnels,
+            broker_edge_mesh,
+            broker_edge_admin,
+            std::time::Duration::from_secs(tick_secs),
+        ));
+    }
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
     // the stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(
@@ -3136,7 +3158,17 @@ pub fn persistent_control_plane_router(
         // is configured (same deSEC config the A-record autopilot already reads).
         .merge(crate::dns01_challenge::dns01_challenge_router(
             edge_mesh_store.clone(),
+            tunnels.clone(),
             ct_dns::provider::DesecClient::from_env().map(ct_dns::provider::Dns01Provider::Desec),
+        ))
+        // #233: Rot/Gelb/Grün admission-broker endpoints (agent admission poll +
+        // issuance-complete callback). Always mounted -- unlike the sweep loop
+        // above, these need no DNS backend and are harmless no-ops until the
+        // loop is enabled (a hostname just reports `rot` forever).
+        .merge(crate::acme_broker::acme_broker_router(
+            edge_mesh_store.clone(),
+            tunnels.clone(),
+            edge_admin_config.clone(),
         ))
         // #214: public, admin-token-gated host-authorization proxy to the edge — lets a
         // remote pipeline maintainer holding just the admin token self-serve hostname

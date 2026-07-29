@@ -19,22 +19,36 @@ use ct_dns::provider::Dns01Provider;
 use serde::Deserialize;
 
 use crate::edge_mesh::SqliteEdgeMesh;
+use crate::storage::SqliteTunnelStore;
 
 #[derive(Clone)]
 struct Dns01State {
     edge_mesh: Arc<SqliteEdgeMesh>,
     provider: Arc<Dns01Provider>,
+    /// The admission broker's ledger (#233 follow-up): [`publish`] refuses to
+    /// place a challenge record for a hostname the broker hasn't currently
+    /// admitted, even for its legitimate owner. Without this, a customer
+    /// could bypass `ct-agent`'s admission poll entirely — run their own
+    /// ACME client, hit this endpoint directly with their own (genuinely
+    /// valid) routing token, and obtain a real certificate outside the
+    /// queue, whenever they like, consuming the operator's shared per-CA
+    /// rate-limit budget unpaced.
+    tunnels: Arc<SqliteTunnelStore>,
 }
 
 /// Build the DNS-01 challenge router. `None` when no DNS-01 backend is
 /// configured (nothing to proxy to) — mirrors every other optional-config
 /// router in this crate (e.g. [`crate::service::edge_authorize_host_router`]).
-pub fn dns01_challenge_router(edge_mesh: Arc<SqliteEdgeMesh>, provider: Option<Dns01Provider>) -> Router {
+pub fn dns01_challenge_router(
+    edge_mesh: Arc<SqliteEdgeMesh>,
+    tunnels: Arc<SqliteTunnelStore>,
+    provider: Option<Dns01Provider>,
+) -> Router {
     match provider {
         Some(provider) => Router::new()
             .route("/agent/dns01-challenge", post(publish))
             .route("/agent/dns01-challenge/clear", post(clear))
-            .with_state(Dns01State { edge_mesh, provider: Arc::new(provider) }),
+            .with_state(Dns01State { edge_mesh, provider: Arc::new(provider), tunnels }),
         None => Router::new(),
     }
 }
@@ -75,6 +89,25 @@ async fn publish(
     Json(req): Json<ChallengeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize(&state, &req.token, &req.hostname).await?;
+    // #233: ownership alone is not enough -- the admission broker must have
+    // actually admitted this hostname (an open claim offer, or already
+    // permanently `gruen`) before its challenge record gets published at
+    // all. This is what makes the queue/pacing actually binding rather than
+    // advisory: the only way to get Let's Encrypt (or any CA) to see a valid
+    // `_acme-challenge` record for this hostname is through this endpoint,
+    // and this endpoint now refuses outside an admitted window.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    match state.tunnels.cert_admission_for_hostname(&req.hostname) {
+        Ok(Some(admission)) if admission.may_issue_now(now) => {}
+        Ok(Some(admission)) => {
+            return Err((
+                StatusCode::TOO_EARLY,
+                format!("{} is not currently admitted to issue (status={})", req.hostname, admission.status),
+            ))
+        }
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "no tunnel with this hostname".to_string())),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
     let record_name = dns01_record_name(&req.hostname);
     state.provider.set_txt(&record_name, &req.value).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
 
@@ -138,14 +171,32 @@ mod tests {
         Arc::new(SqliteEdgeMesh::open_in_memory().unwrap())
     }
 
+    fn tunnels() -> Arc<SqliteTunnelStore> {
+        Arc::new(SqliteTunnelStore::open_in_memory().unwrap())
+    }
+
+    /// Create a tunnel row for `hostname` and admit it straight to `gruen` --
+    /// the shortest path to "the admission broker says yes" for tests whose
+    /// point is ownership authorization, not admission status itself.
+    fn admit(tunnels: &SqliteTunnelStore, hostname: &str) {
+        tunnels.create("subject", hostname, Some(hostname)).unwrap();
+        tunnels.enter_gelb_queue(hostname, 0).unwrap();
+        tunnels.offer_claim(hostname, "letsencrypt", 0, 1).unwrap();
+        tunnels.record_issuance_complete(hostname, "example.com", 0).unwrap();
+    }
+
     #[tokio::test]
     async fn publish_and_clear_require_the_owning_token_and_touch_only_that_hostname() {
         let edge_mesh = store();
         edge_mesh.record_ownership("deadbeef", Some("app.example.com"), "edge-1", 0).unwrap();
         edge_mesh.record_ownership("cafef00d", Some("other.example.com"), "edge-1", 0).unwrap();
+        let tunnels = tunnels();
+        admit(&tunnels, "app.example.com");
+        admit(&tunnels, "other.example.com");
         let dns_store = Arc::new(AcmeDnsStore::new());
         let app = dns01_challenge_router(
             edge_mesh,
+            tunnels,
             Some(Dns01Provider::SelfHosted(dns_store.clone())),
         );
 
@@ -204,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn router_is_absent_with_no_provider_configured() {
-        let app = dns01_challenge_router(store(), None);
+        let app = dns01_challenge_router(store(), tunnels(), None);
         let resp = app
             .oneshot(
                 Request::post("/agent/dns01-challenge")
@@ -218,5 +269,40 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no route mounted when nothing is configured");
         let _ = to_bytes(resp.into_body(), usize::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_a_legitimately_owned_hostname_that_isnt_admitted_yet() {
+        // #233: proves the fix for "a customer runs their own ACME client
+        // straight against this endpoint, bypassing ct-agent's admission poll
+        // entirely" -- ownership alone (a real, correctly-recorded token) must
+        // NOT be enough once the broker exists; the hostname must actually be
+        // in an admitted window (or already gruen).
+        let edge_mesh = store();
+        edge_mesh.record_ownership("deadbeef", Some("app.example.com"), "edge-1", 0).unwrap();
+        let tunnels = tunnels();
+        tunnels.create("subject", "app.example.com", Some("app.example.com")).unwrap();
+        // Deliberately left `rot` -- never entered the Gelb queue, never offered.
+        let dns_store = Arc::new(AcmeDnsStore::new());
+        let app =
+            dns01_challenge_router(edge_mesh, tunnels, Some(Dns01Provider::SelfHosted(dns_store.clone())));
+
+        let resp = app
+            .oneshot(
+                Request::post("/agent/dns01-challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"token": "deadbeef", "hostname": "app.example.com", "value": "v"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_EARLY, "owning the hostname is not enough without admission");
+        assert!(
+            dns_store.txt("_acme-challenge.app.example.com").is_empty(),
+            "the challenge record must never be published for a not-yet-admitted hostname"
+        );
     }
 }

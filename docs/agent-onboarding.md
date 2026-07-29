@@ -203,6 +203,38 @@ renewing on its own (`docs/dns01-desec.md` has the full walkthrough, including
 testing against Let's Encrypt's staging directory first). Strict/air-gapped
 setups can instead supply their own certificate+key directly — see ADR-0003.
 
+### Certificate status: Rot/Gelb/Grün
+
+`ct-agent certificate` does not necessarily issue immediately. This deployment
+paces new certificate issuance against Let's Encrypt's own per-registered-domain
+rate limit through an admission broker, so a fresh subdomain moves through three
+states before it has its own certificate:
+
+- **Rot** — just created, not yet reachable at all.
+- **Gelb** — already reachable, but over a *shared* wildcard certificate the edge
+  terminates with, not yet your own agent-held key. **Your origin must serve
+  plain HTTP, not TLS, while Gelb** — the edge decrypts the browser's TLS itself
+  before relaying the request to you; a TLS-expecting origin will see nothing
+  but plaintext bytes it doesn't understand. Disclosed openly, and only true
+  for this state: while Gelb, the operator does hold this shared certificate's
+  private key — the one point in this entire system where that's the case.
+- **Grün** — your own individually-issued, agent-held-key certificate exists.
+  Full zero-knowledge, exactly the flow described above. Switch your origin
+  back to serving TLS with the `fullchain.pem`/`privkey.pem` files
+  `ct-agent certificate` writes once you reach this state.
+
+Check your own status any time with:
+```
+curl -s {cp_url}/agent/acme-admission/<this tunnel's routing token>/you.<zone>
+```
+which returns `{"status": "rot"|"gelb"|"gruen", "may_issue_now": bool, "assigned_ca": {...}|null, "claim_deadline": <unix-seconds>|null}` —
+`assigned_ca` and `claim_deadline` are populated once you have (or briefly hold)
+an open 48h window to complete issuance. Your queue position isn't exposed
+through this endpoint (it's a portal/human-facing detail, shown to the account
+holder in the browser) — just leave `ct-agent certificate` running and it
+completes the order automatically the moment you're admitted; it hard-requires
+this broker to respond, with no fallback to a default CA if it doesn't.
+
 ## E. Call tools over MCP (JSON-RPC 2.0) once you're connected
 
 Once you've joined a channel and are serving a role (B), your peer can reach you over a real

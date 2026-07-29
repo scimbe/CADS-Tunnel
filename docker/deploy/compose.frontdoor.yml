@@ -21,6 +21,12 @@
 #                        DNS pointed at this edge. Served + terminated at :443.
 #   PORTAL_CERT_DIR      host dir with the Portal BYO cert: fullchain.pem + privkey.pem
 #                        (LE via deSEC DNS-01, like help.'s origin cert). Never committed.
+#   WILDCARD_CERT_DIR    host dir with the shared *.{PORTAL_PUBLIC_HOST} wildcard cert
+#                        (#233 Rot/Gelb/Grün admission broker's Gelb tier — see
+#                        scripts/issue-wildcard-cert.sh). Backs ONLY hostnames the
+#                        control plane has explicitly marked Gelb; every other
+#                        BrowserTunnel host is completely unaffected (still ordinary
+#                        SNI passthrough) even when this is configured.
 #   CT_EDGE_ADMIN_TOKEN  64-hex shared secret enabling host-auth + revoke admin ops;
 #                        the control plane uses the same value to authorize hostnames.
 
@@ -43,6 +49,12 @@ services:
       CT_CP_PROXY_ADDR: "control-plane:8090"
       CT_EDGE_PORTAL_CERT: "/certs/portal/fullchain.pem"
       CT_EDGE_PORTAL_KEY: "/certs/portal/privkey.pem"
+      # #233: the shared Gelb-tier wildcard cert. Absent/unusable simply means
+      # no hostname can ever be Gelb-terminated (falls through to ordinary
+      # passthrough) -- never a startup failure, matching every other
+      # front-door cert here (#142).
+      CT_EDGE_WILDCARD_CERT: "/certs/wildcard/fullchain.pem"
+      CT_EDGE_WILDCARD_KEY: "/certs/wildcard/privkey.pem"
       # Host-ownership authorization (#23 BP4b): only control-plane-authorized
       # hostnames may bind — required for the help.<zone> Browser-Plane demo and the
       # revoke push. The control plane authorizes via the admin API below.
@@ -51,6 +63,7 @@ services:
       CT_EDGE_ADMIN_LISTEN: "0.0.0.0:9601"
     volumes:
       - "${PORTAL_CERT_DIR:?set PORTAL_CERT_DIR=<dir with portal fullchain.pem+privkey.pem>}:/certs/portal:ro"
+      - "${WILDCARD_CERT_DIR:?set WILDCARD_CERT_DIR=<dir with wildcard fullchain.pem+privkey.pem>}:/certs/wildcard:ro"
     ports:
       - "443:443"
       - "80:80"

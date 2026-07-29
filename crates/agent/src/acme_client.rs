@@ -74,6 +74,10 @@ pub struct AcmeClient {
     account: AccountKey,
     account_url: Option<String>,
     nonce: Option<String>,
+    /// External Account Binding (`kid`, HMAC key base64url) -- required by
+    /// every CA in the top-CA list except Let's Encrypt (#233: second/third
+    /// CA integration). `None` for CAs that don't use EAB.
+    eab: Option<(String, String)>,
 }
 
 impl AcmeClient {
@@ -89,7 +93,16 @@ impl AcmeClient {
         }
         let json: Value = resp.json().await?;
         let directory = acme::parse_directory(&json).ok_or("malformed ACME directory (missing a required URL)")?;
-        Ok(Self { http, directory, account, account_url: None, nonce: None })
+        Ok(Self { http, directory, account, account_url: None, nonce: None, eab: None })
+    }
+
+    /// Attach External Account Binding credentials (RFC 8555 §7.3.4), used on
+    /// the next (lazy) [`Self::register_account`] call. Every CA in the
+    /// top-CA list except Let's Encrypt requires this to create an account —
+    /// omit it for Let's Encrypt or any other CA that doesn't use EAB.
+    pub fn with_eab(mut self, kid: impl Into<String>, hmac_key_b64url: impl Into<String>) -> Self {
+        self.eab = Some((kid.into(), hmac_key_b64url.into()));
+        self
     }
 
     async fn fresh_nonce(&mut self) -> Result<String, BoxError> {
@@ -136,8 +149,12 @@ impl AcmeClient {
     /// Register (or, per RFC 8555, idempotently re-resolve) the ACME account
     /// tied to this client's key. Must be called once before any order.
     pub async fn register_account(&mut self) -> Result<(), BoxError> {
-        let payload = serde_json::json!({ "termsOfServiceAgreed": true });
         let url = self.directory.new_account.clone();
+        let mut payload = serde_json::json!({ "termsOfServiceAgreed": true });
+        if let Some((kid, hmac_key_b64url)) = self.eab.clone() {
+            let binding = self.account.external_account_binding(&kid, &hmac_key_b64url, &url)?;
+            payload["externalAccountBinding"] = binding;
+        }
         let resp = self.post_signed(&url, Some(&payload)).await?;
         if !resp.status().is_success() {
             return Err(format!("account registration failed: {}", resp.status()).into());
@@ -437,6 +454,8 @@ mod tests {
         authz_status: Mutex<&'static str>,
         nonce_uses: Mutex<u32>,
         seen_kid: Mutex<bool>,
+        seen_eab: Mutex<Option<Value>>,
+        seen_new_order_identifiers: Mutex<Vec<Value>>,
     }
 
     async fn spawn_mock_acme() -> (String, Arc<MockAcme>) {
@@ -449,6 +468,8 @@ mod tests {
             authz_status: Mutex::new("pending"),
             nonce_uses: Mutex::new(0),
             seen_kid: Mutex::new(false),
+            seen_eab: Mutex::new(None),
+            seen_new_order_identifiers: Mutex::new(Vec::new()),
         });
 
         let app = Router::new()
@@ -498,6 +519,18 @@ mod tests {
         // retry to actually run and succeed.
         let mut uses = s.nonce_uses.lock().unwrap();
         *uses += 1;
+        // Decode the JWS payload (not just the outer envelope) so a test can
+        // assert on whether `externalAccountBinding` was actually sent, not
+        // just that the request happened.
+        if let Ok(jws) = serde_json::from_slice::<Value>(&body) {
+            if let Some(payload_b64) = jws.get("payload").and_then(|p| p.as_str()) {
+                if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
+                    if let Ok(payload) = serde_json::from_slice::<Value>(&decoded) {
+                        *s.seen_eab.lock().unwrap() = payload.get("externalAccountBinding").cloned();
+                    }
+                }
+            }
+        }
         if *uses == 1 {
             return (
                 StatusCode::BAD_REQUEST,
@@ -528,6 +561,13 @@ mod tests {
         )
         .unwrap();
         *s.seen_kid.lock().unwrap() = protected.get("kid").is_some();
+        if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(jws["payload"].as_str().unwrap()) {
+            if let Ok(payload) = serde_json::from_slice::<Value>(&decoded) {
+                if let Some(ids) = payload.get("identifiers").and_then(|v| v.as_array()) {
+                    s.seen_new_order_identifiers.lock().unwrap().push(serde_json::json!(ids));
+                }
+            }
+        }
         let _ = headers;
         let mut h = nonce_headers();
         h.insert("location", format!("{}/order/1", s.base).parse().unwrap());
@@ -640,6 +680,70 @@ mod tests {
             Err(e) => e,
         };
         assert!(!is_dns01_failure(&err), "a transport failure is not a DNS-01 race");
+    }
+
+    #[tokio::test]
+    async fn register_account_omits_eab_by_default() {
+        // Let's Encrypt (and any CA without EAB) must never receive the field
+        // at all -- some CAs reject a newAccount that carries an empty/junk one.
+        let (base, mock) = spawn_mock_acme().await;
+        let account = AccountKey::generate().unwrap();
+        let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
+        client.register_account().await.unwrap();
+        assert!(mock.seen_eab.lock().unwrap().is_none(), "no EAB configured -> none sent");
+    }
+
+    #[tokio::test]
+    async fn register_account_carries_eab_when_configured_for_a_second_ca() {
+        // ZeroSSL / Google Trust Services (#233) require externalAccountBinding
+        // in every newAccount -- this is what `with_eab` exists for.
+        let (base, mock) = spawn_mock_acme().await;
+        let account = AccountKey::generate().unwrap();
+        let hmac_key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 32]);
+        let mut client = AcmeClient::discover(&format!("{base}/directory"), account)
+            .await
+            .unwrap()
+            .with_eab("kid-abc", &hmac_key_b64);
+        client.register_account().await.unwrap();
+
+        let seen = mock.seen_eab.lock().unwrap().clone().expect("EAB must be present in the newAccount payload");
+        let protected: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(seen["protected"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(protected["kid"], "kid-abc");
+        assert_eq!(protected["alg"], "HS256");
+    }
+
+    #[tokio::test]
+    async fn every_order_this_hostname_ever_makes_requests_the_identical_single_identifier() {
+        // This is the invariant the "renewal is exempt from CA rate limits"
+        // property (letsencrypt.org/docs/rate-limits/, "Non-ARI Renewals")
+        // depends on: a renewal must request the EXACT same identifier set as
+        // the issuance before it. Batching several customers' hostnames into
+        // one order to save on order count would both break that exemption
+        // and put multiple customers behind one shared certificate/key --
+        // this test exists so nobody "optimizes" that in by accident.
+        let (base, mock) = spawn_mock_acme().await;
+        let account = AccountKey::generate().unwrap();
+        let store = Arc::new(AcmeDnsStore::new());
+        let publish = Dns01Provider::SelfHosted(store);
+
+        let mut client = AcmeClient::discover(&format!("{base}/directory"), account).await.unwrap();
+        client.issue_certificate("renew-me.example.test", &publish, None, None).await.unwrap();
+        // A second "issuance" against the same mock stands in for a later renewal run.
+        client.issue_certificate("renew-me.example.test", &publish, None, None).await.unwrap();
+
+        let orders = mock.seen_new_order_identifiers.lock().unwrap().clone();
+        assert_eq!(orders.len(), 2, "both the issuance and the renewal reached new-order");
+        for order in &orders {
+            assert_eq!(
+                *order,
+                serde_json::json!([{"type": "dns", "value": "renew-me.example.test"}]),
+                "every order for this hostname carries exactly one identifier, always the same one"
+            );
+        }
+        assert_eq!(orders[0], orders[1], "issuance and renewal request the identical identifier set");
     }
 
     #[tokio::test]

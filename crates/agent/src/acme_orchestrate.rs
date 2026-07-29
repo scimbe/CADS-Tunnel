@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use ct_dns::provider::{Dns01Provider, RemoteAgentDns01Client};
+use serde::Deserialize;
 
 use crate::acme_client::AcmeClient;
 use crate::acme_jws::AccountKey;
@@ -35,6 +36,65 @@ const RENEW_AFTER_DAYS: u64 = 60;
 /// the ACME server itself is only ever contacted when renewal is actually due.
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// How often to poll the admission broker (#233) while a hostname hasn't
+/// reached `gruen` yet — the 48h claim window needs a much tighter loop than
+/// a settled renewal cadence does. Once `gruen`, [`CHECK_INTERVAL`] takes
+/// back over.
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// The CA a control-plane admission broker has assigned a hostname to, as
+/// returned by `GET /agent/acme-admission/:token/:hostname`. Mirrors
+/// `ct-control-plane`'s `acme_broker::AssignedCaResponse` (duplicated rather
+/// than shared across the crate boundary, same precedent as
+/// `dns01_challenge.rs`'s `dns01_record_name`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct AdmissionCa {
+    #[allow(dead_code)]
+    name: String,
+    directory_url: String,
+    requires_eab: bool,
+    eab_kid: Option<String>,
+    eab_hmac_key_b64url: Option<String>,
+}
+
+/// Response shape of `GET /agent/acme-admission/:token/:hostname`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct Admission {
+    status: String,
+    may_issue_now: bool,
+    assigned_ca: Option<AdmissionCa>,
+}
+
+/// Poll the control-plane's admission broker (#233) for `hostname`. Returns
+/// `None` on ANY failure — network error, non-2xx, unparseable body — which
+/// is exactly what an older control-plane without this endpoint yet (a 404)
+/// or one with the broker feature disabled looks like from here. This is a
+/// deliberate backward-compatibility choice: [`obtain_or_renew`] treats `None`
+/// as "no admission gate configured, proceed exactly as before this feature
+/// existed" rather than blocking issuance on a control-plane that doesn't
+/// speak this protocol yet.
+async fn poll_admission(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) -> Option<Admission> {
+    let url = format!("{}/agent/acme-admission/{token}/{hostname}", cp_url.trim_end_matches('/'));
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Admission>().await.ok()
+}
+
+/// Tell the admission broker an issuance just completed, so it can flip this
+/// hostname to `gruen` and record the CA it used against the rate-limit
+/// ledger. Best-effort: if this fails, the cert is already safely on disk
+/// (the whole point is never blocking on this), and the broker's own
+/// `record_issuance_complete` is naturally idempotent — a later successful
+/// call (e.g. after a renewal) still records correctly.
+async fn notify_issuance_complete(http: &reqwest::Client, cp_url: &str, token: &str, hostname: &str) {
+    let url = format!("{}/agent/acme-issuance-complete/{token}/{hostname}", cp_url.trim_end_matches('/'));
+    if let Err(e) = http.post(&url).send().await {
+        eprintln!("ct-agent: acme-issuance-complete callback failed (non-fatal, cert is already written): {e}");
+    }
+}
+
 /// Everything one issuance/renewal run needs.
 #[derive(Debug)]
 pub struct AcmeCertConfig {
@@ -44,10 +104,6 @@ pub struct AcmeCertConfig {
     pub routing_token: String,
     /// The hostname to request a certificate for.
     pub hostname: String,
-    /// ACME directory URL. Defaults to Let's Encrypt production;
-    /// **must** be overridden to the staging directory for any testing —
-    /// production has real per-hostname rate limits.
-    pub directory_url: String,
     /// Where to write `fullchain.pem`/`privkey.pem` (created if missing).
     pub cert_out_dir: PathBuf,
     /// Where to persist the ACME account key (PKCS#8 DER) so renewals reuse
@@ -82,12 +138,9 @@ pub struct AcmeCertConfig {
     pub dns01_attempts: Option<u32>,
 }
 
-pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
-
 impl AcmeCertConfig {
     /// Read from the environment: `CT_AGENT_CP_URL`, `CT_AGENT_TOKEN`,
-    /// `CT_AGENT_HOSTNAME` (all required), `CT_ACME_DIRECTORY_URL` (defaults
-    /// to Let's Encrypt production), `CT_ACME_CERT_OUT_DIR` (default
+    /// `CT_AGENT_HOSTNAME` (all required), `CT_ACME_CERT_OUT_DIR` (default
     /// `/shared/acme-cert`), `CT_ACME_ACCOUNT_KEY_PATH` (default
     /// `<cert_out_dir>/acme-account-key.der`), `CT_ACME_DNS01_RESOLVER_URLS`
     /// (comma-separated, defaults to two independent public DoH resolvers),
@@ -96,7 +149,11 @@ impl AcmeCertConfig {
     /// propagation race; every attempt costs a real CA order),
     /// `CT_ACME_DNS01_INITIAL_DELAY_SECS` (default 75 -- see
     /// `dns01_propagation::DEFAULT_INITIAL_DELAY`; lowering it risks
-    /// re-poisoning the resolver cache).
+    /// re-poisoning the resolver cache). The ACME directory URL and any EAB
+    /// credentials are no longer configured here at all (#233): the
+    /// admission broker at `cp_url` is the sole source of both, for every
+    /// issuance and every renewal alike -- there is no locally-configured
+    /// fallback.
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -107,8 +164,6 @@ impl AcmeCertConfig {
             get("CT_AGENT_TOKEN").filter(|s| !s.is_empty()).ok_or("CT_AGENT_TOKEN is required")?;
         let hostname =
             get("CT_AGENT_HOSTNAME").filter(|s| !s.is_empty()).ok_or("CT_AGENT_HOSTNAME is required")?;
-        let directory_url =
-            get("CT_ACME_DIRECTORY_URL").filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_ACME_DIRECTORY.to_string());
         let cert_out_dir = PathBuf::from(
             get("CT_ACME_CERT_OUT_DIR").filter(|s| !s.is_empty()).unwrap_or_else(|| "/shared/acme-cert".to_string()),
         );
@@ -133,7 +188,6 @@ impl AcmeCertConfig {
             cp_url,
             routing_token,
             hostname,
-            directory_url,
             cert_out_dir,
             account_key_path,
             dns01_resolver_urls,
@@ -185,14 +239,46 @@ fn load_or_generate_account_key(path: &Path) -> Result<AccountKey, BoxError> {
 
 /// Obtain a certificate if none exists yet, or renew it if the existing one
 /// is old enough ([`RENEW_AFTER_DAYS`]). No-op (returns `Ok(false)`) when a
-/// recent enough cert is already on disk.
+/// recent enough cert is already on disk **or** when the admission broker
+/// (#233) says this hostname isn't eligible to issue yet (still `rot`, or
+/// `gelb` waiting for its turn in the queue) — the caller should simply try
+/// again later, exactly like today's "cert is still fresh" no-op.
+///
+/// The admission broker is a **hard requirement**, not an optional
+/// enhancement with a fallback: no legacy/mixed-version compatibility path is
+/// maintained here. If it doesn't answer, that is a real failure to surface,
+/// not something to silently work around by falling back to a locally
+/// configured directory/EAB — the broker is what decides which CA a
+/// hostname's own certificate ever comes from, and that decision must never
+/// be second-guessed client-side.
 pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> {
     if !needs_renewal(&config.cert_path()) {
         return Ok(false);
     }
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let admission = poll_admission(&http, &config.cp_url, &config.routing_token, &config.hostname)
+        .await
+        .ok_or("admission broker did not respond -- cannot determine whether this hostname may issue yet")?;
+    if !admission.may_issue_now {
+        eprintln!(
+            "ct-agent: {} not yet eligible to issue (status={}); waiting on the admission broker",
+            config.hostname, admission.status
+        );
+        return Ok(false);
+    }
+    let ca = admission
+        .assigned_ca
+        .as_ref()
+        .ok_or("admission broker says this hostname may issue now, but assigned it no CA")?;
+    let directory_url = ca.directory_url.clone();
+    let eab = if ca.requires_eab { ca.eab_kid.clone().zip(ca.eab_hmac_key_b64url.clone()) } else { None };
+
     std::fs::create_dir_all(&config.cert_out_dir)?;
     let account = load_or_generate_account_key(&config.account_key_path)?;
-    let mut client = AcmeClient::discover(&config.directory_url, account).await?;
+    let mut client = AcmeClient::discover(&directory_url, account).await?;
+    if let Some((kid, hmac_key)) = eab {
+        client = client.with_eab(kid, hmac_key);
+    }
     let publish = Dns01Provider::RemoteAgent(RemoteAgentDns01Client::new(
         config.cp_url.clone(),
         config.routing_token.clone(),
@@ -235,9 +321,12 @@ pub async fn obtain_or_renew(config: &AcmeCertConfig) -> Result<bool, BoxError> 
     eprintln!(
         "ct-agent: obtained a certificate for {} ({} -> {})",
         config.hostname,
-        config.directory_url,
+        directory_url,
         config.cert_out_dir.display()
     );
+    // Tell the admission broker (#233) so it can flip this hostname to
+    // `gruen` and log the completed issuance against the CA it assigned.
+    notify_issuance_complete(&http, &config.cp_url, &config.routing_token, &config.hostname).await;
     Ok(true)
 }
 
@@ -252,18 +341,47 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)
 }
 
-/// Run [`obtain_or_renew`] once immediately, then keep checking every
-/// [`CHECK_INTERVAL`] forever — the entry point `ct-agent certificate` runs.
-/// A failed attempt is logged, not fatal: the next tick tries again, the same
-/// resilience posture as every other long-running `ct-agent` subcommand.
+/// Run [`obtain_or_renew`] once immediately, then keep checking forever — the
+/// entry point `ct-agent certificate` runs. A failed attempt is logged, not
+/// fatal: the next tick tries again, the same resilience posture as every
+/// other long-running `ct-agent` subcommand.
+///
+/// Sleep interval is dynamic (#233): [`CHECK_INTERVAL`] (6h) once a cert is
+/// issued or no admission broker is configured, but [`ADMISSION_POLL_INTERVAL`]
+/// (15min) whenever this hostname is known to still be waiting (`rot`/`gelb`)
+/// — a 48h claim window needs a much tighter loop than a settled renewal
+/// cadence to actually be responsive.
 pub async fn run_renewal_loop(config: AcmeCertConfig) -> ! {
     loop {
-        match obtain_or_renew(&config).await {
-            Ok(true) => {}
-            Ok(false) => eprintln!("ct-agent: existing certificate for {} is still fresh", config.hostname),
-            Err(e) => eprintln!("ct-agent: certificate obtain/renew failed: {e}"),
-        }
-        tokio::time::sleep(CHECK_INTERVAL).await;
+        let sleep_for = match obtain_or_renew(&config).await {
+            Ok(true) => CHECK_INTERVAL,
+            Ok(false) => {
+                eprintln!("ct-agent: existing certificate for {} is still fresh, or not yet admitted", config.hostname);
+                admission_poll_interval(&config).await
+            }
+            Err(e) => {
+                eprintln!("ct-agent: certificate obtain/renew failed: {e}");
+                CHECK_INTERVAL
+            }
+        };
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+/// Which interval [`run_renewal_loop`] should sleep for next: a fresh,
+/// independent admission poll purely to read `status` (separate from
+/// [`obtain_or_renew`]'s own poll, which is already done by the time this
+/// runs) — cheap (one HTTP GET, at most every 15 minutes), and keeps this
+/// concern decoupled from `obtain_or_renew`'s `Result<bool, _>` return shape
+/// rather than growing that into a richer type every existing test asserts
+/// against as a plain bool.
+async fn admission_poll_interval(config: &AcmeCertConfig) -> Duration {
+    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(10)).build() else {
+        return CHECK_INTERVAL;
+    };
+    match poll_admission(&http, &config.cp_url, &config.routing_token, &config.hostname).await {
+        Some(a) if a.status != "gruen" => ADMISSION_POLL_INTERVAL,
+        _ => CHECK_INTERVAL,
     }
 }
 
@@ -302,7 +420,6 @@ mod tests {
             ("CT_AGENT_HOSTNAME", "app.example.com"),
         ]))
         .unwrap();
-        assert_eq!(cfg.directory_url, DEFAULT_ACME_DIRECTORY, "defaults to Let's Encrypt production");
         assert_eq!(cfg.cert_out_dir, PathBuf::from("/shared/acme-cert"));
         assert_eq!(cfg.account_key_path, PathBuf::from("/shared/acme-cert/acme-account-key.der"));
         assert_eq!(
@@ -318,7 +435,6 @@ mod tests {
             "CT_AGENT_CP_URL" => Some("https://cp.example".to_string()),
             "CT_AGENT_TOKEN" => Some("deadbeef".to_string()),
             "CT_AGENT_HOSTNAME" => Some("app.example.com".to_string()),
-            "CT_ACME_DIRECTORY_URL" => Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_string()),
             "CT_ACME_CERT_OUT_DIR" => Some("/tmp/my-certs".to_string()),
             "CT_ACME_ACCOUNT_KEY_PATH" => Some("/tmp/my-account.der".to_string()),
             "CT_ACME_DNS01_RESOLVER_URLS" => Some("https://dns.google/resolve, https://dns.quad9.net/dns-query".to_string()),
@@ -326,7 +442,6 @@ mod tests {
             _ => None,
         };
         let cfg = AcmeCertConfig::from_env_with(env).unwrap();
-        assert!(cfg.directory_url.contains("staging"));
         assert_eq!(cfg.cert_out_dir, PathBuf::from("/tmp/my-certs"));
         assert_eq!(cfg.account_key_path, PathBuf::from("/tmp/my-account.der"));
         assert_eq!(
@@ -359,6 +474,27 @@ mod tests {
 
     // --- End-to-end: obtain_or_renew against a mock ACME + mock control plane ---
 
+    /// The admission broker's answer a mock control plane hands back. Default
+    /// (see `spawn_mock_with_doh_delay` below) is "go ahead now, using this
+    /// same mock's own ACME directory" -- exactly what every pre-#233 test in
+    /// this module needs, since the admission broker is now a hard
+    /// requirement for `obtain_or_renew` with no fallback. Tests that need to
+    /// exercise the broker's OTHER behaviors (not yet eligible, a different
+    /// assigned CA) overwrite this mutex before calling `obtain_or_renew`.
+    #[derive(Clone)]
+    struct MockAdmission {
+        status: &'static str,
+        may_issue_now: bool,
+        assigned_ca: Option<MockAssignedCa>,
+    }
+    #[derive(Clone)]
+    struct MockAssignedCa {
+        directory_url: String,
+        requires_eab: bool,
+        eab_kid: Option<String>,
+        eab_hmac_key_b64url: Option<String>,
+    }
+
     struct MockAll {
         base: String,
         order_status: Mutex<&'static str>,
@@ -366,6 +502,8 @@ mod tests {
         cp_publish_ok: bool,
         doh_hits: Mutex<u32>,
         doh_answers_after: u32,
+        admission: Mutex<MockAdmission>,
+        issuance_complete_hits: Mutex<u32>,
     }
 
     async fn spawn_mock(cp_publish_ok: bool) -> (String, Arc<MockAll>) {
@@ -383,6 +521,17 @@ mod tests {
             cp_publish_ok,
             doh_hits: Mutex::new(0),
             doh_answers_after,
+            admission: Mutex::new(MockAdmission {
+                status: "gelb",
+                may_issue_now: true,
+                assigned_ca: Some(MockAssignedCa {
+                    directory_url: format!("http://{addr}/directory"),
+                    requires_eab: false,
+                    eab_kid: None,
+                    eab_hmac_key_b64url: None,
+                }),
+            }),
+            issuance_complete_hits: Mutex::new(0),
         });
 
         fn nonce() -> HeaderMap {
@@ -468,6 +617,25 @@ mod tests {
         async fn dns01_clear() -> StatusCode {
             StatusCode::OK
         }
+        async fn acme_admission(AxState(s): AxState<Arc<MockAll>>) -> impl axum::response::IntoResponse {
+            let a = s.admission.lock().unwrap().clone();
+            let body = serde_json::json!({
+                "status": a.status,
+                "may_issue_now": a.may_issue_now,
+                "assigned_ca": a.assigned_ca.map(|ca| serde_json::json!({
+                    "name": "mock-ca",
+                    "directory_url": ca.directory_url,
+                    "requires_eab": ca.requires_eab,
+                    "eab_kid": ca.eab_kid,
+                    "eab_hmac_key_b64url": ca.eab_hmac_key_b64url,
+                })),
+            });
+            (StatusCode::OK, AxJson(body))
+        }
+        async fn acme_issuance_complete(AxState(s): AxState<Arc<MockAll>>) -> StatusCode {
+            *s.issuance_complete_hits.lock().unwrap() += 1;
+            StatusCode::OK
+        }
         // Stands in for a public DoH resolver: immediately echoes back whatever
         // value the last dns01_publish call recorded, so the propagation check
         // in obtain_or_renew sees the record as already visible -- no real
@@ -501,6 +669,8 @@ mod tests {
             .route("/cert/1", post(get_cert))
             .route("/agent/dns01-challenge", post(dns01_publish))
             .route("/agent/dns01-challenge/clear", post(dns01_clear))
+            .route("/agent/acme-admission/:token/:hostname", get(acme_admission))
+            .route("/agent/acme-issuance-complete/:token/:hostname", post(acme_issuance_complete))
             .route("/doh", get(doh))
             .with_state(state.clone());
         tokio::spawn(async move {
@@ -519,7 +689,6 @@ mod tests {
             cp_url: base.clone(),
             routing_token: "deadbeef".to_string(),
             hostname: "app.example.com".to_string(),
-            directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
@@ -561,7 +730,6 @@ mod tests {
             cp_url: base.clone(),
             routing_token: "not-the-owner".to_string(),
             hostname: "app.example.com".to_string(),
-            directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
@@ -592,7 +760,6 @@ mod tests {
             cp_url: base.clone(),
             routing_token: "deadbeef".to_string(),
             hostname: "app.example.com".to_string(),
-            directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
@@ -625,7 +792,6 @@ mod tests {
             cp_url: base.clone(),
             routing_token: "deadbeef".to_string(),
             hostname: "app.example.com".to_string(),
-            directory_url: format!("{base}/directory"),
             cert_out_dir: dir.clone(),
             account_key_path: dir.join("account.der"),
             dns01_resolver_urls: vec![format!("{base}/doh")],
@@ -638,6 +804,96 @@ mod tests {
         let err = obtain_or_renew(&config).await.unwrap_err();
         assert!(err.to_string().contains("DNS-01 propagation check failed"), "{err}");
         assert!(!config.cert_path().exists(), "no cert file written when propagation never confirms");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #233: the admission broker is a hard requirement, not an optional
+    // enhancement with a legacy fallback -- these pin that down directly.
+
+    #[tokio::test]
+    async fn obtain_or_renew_skips_issuance_when_the_admission_broker_says_not_yet() {
+        let (base, mock) = spawn_mock(true).await;
+        *mock.admission.lock().unwrap() = MockAdmission { status: "gelb", may_issue_now: false, assigned_ca: None };
+        let dir = std::env::temp_dir().join(format!("ct-acme-e2e-not-admitted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = AcmeCertConfig {
+            cp_url: base.clone(),
+            routing_token: "deadbeef".to_string(),
+            hostname: "app.example.com".to_string(),
+            cert_out_dir: dir.clone(),
+            account_key_path: dir.join("account.der"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
+            dns01_propagation_timeout: Duration::from_secs(5),
+            dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
+        };
+
+        let did_issue = obtain_or_renew(&config).await.unwrap();
+        assert!(!did_issue, "admission broker says not yet eligible -> quiet no-op, not an error");
+        assert!(!config.cert_path().exists());
+        assert!(mock.dns01_hits.lock().unwrap().is_empty(), "never even attempted a DNS-01 publish");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn obtain_or_renew_requires_the_admission_broker_to_answer_at_all() {
+        // No mock server, no admission endpoint to reach -- this must be a
+        // hard failure (no fallback to some locally-assumed directory).
+        let dir = std::env::temp_dir().join(format!("ct-acme-e2e-no-broker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = AcmeCertConfig {
+            cp_url: "http://127.0.0.1:1".to_string(),
+            routing_token: "deadbeef".to_string(),
+            hostname: "app.example.com".to_string(),
+            cert_out_dir: dir.clone(),
+            account_key_path: dir.join("account.der"),
+            dns01_resolver_urls: vec![],
+            dns01_propagation_timeout: Duration::from_secs(5),
+            dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
+        };
+        let err = obtain_or_renew(&config).await.unwrap_err();
+        assert!(err.to_string().contains("admission broker did not respond"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn obtain_or_renew_uses_the_admission_brokers_assigned_ca_authoritatively() {
+        let (base, mock) = spawn_mock(true).await;
+        // Point this hostname at a SECOND mock ACME server via the admission
+        // response -- proving the broker's assignment is what actually gets
+        // used, not just a same-server coincidence.
+        let (base2, _mock2) = spawn_mock(true).await;
+        *mock.admission.lock().unwrap() = MockAdmission {
+            status: "gelb",
+            may_issue_now: true,
+            assigned_ca: Some(MockAssignedCa {
+                directory_url: format!("{base2}/directory"),
+                requires_eab: false,
+                eab_kid: None,
+                eab_hmac_key_b64url: None,
+            }),
+        };
+        let dir = std::env::temp_dir().join(format!("ct-acme-e2e-assigned-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = AcmeCertConfig {
+            cp_url: base.clone(),
+            routing_token: "deadbeef".to_string(),
+            hostname: "app.example.com".to_string(),
+            cert_out_dir: dir.clone(),
+            account_key_path: dir.join("account.der"),
+            dns01_resolver_urls: vec![format!("{base}/doh")],
+            dns01_propagation_timeout: Duration::from_secs(5),
+            dns01_initial_delay: Some(Duration::ZERO),
+            dns01_use_authoritative: false,
+            dns01_attempts: Some(1),
+        };
+
+        let did_issue = obtain_or_renew(&config).await.unwrap();
+        assert!(did_issue, "succeeded via the admission broker's assigned directory (a different mock server)");
+        assert_eq!(*mock.issuance_complete_hits.lock().unwrap(), 1, "completion callback fired exactly once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

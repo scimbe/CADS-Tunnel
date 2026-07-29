@@ -3,6 +3,7 @@
 //! payload. See ADR-0005 (enrollment/identity), ADR-0017 (thin control plane).
 
 pub mod accounts;
+pub mod acme_broker;
 pub mod billing;
 pub mod client;
 pub mod credential;
