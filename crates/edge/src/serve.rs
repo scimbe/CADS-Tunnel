@@ -1601,6 +1601,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 },
                                 None => None,
                             };
+                            crate::transport::apply_tcp_keepalive(&tcp);
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
                             let proxies = proxies.clone();
@@ -1683,6 +1684,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 },
                 None => None,
             };
+            crate::transport::apply_tcp_keepalive(&tcp);
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
             tokio::spawn(async move {

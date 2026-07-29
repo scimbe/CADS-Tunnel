@@ -22,6 +22,22 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Enable TCP keepalive on `stream` (#229) -- see the matching helper in
+/// `ct-agent`'s `transport.rs` for the full rationale: a parked TLS-TCP
+/// fallback registration is a plain, silent TCP connection with nothing to
+/// refresh it, so an idle NAT/firewall mapping between the Agent and this
+/// Edge can be dropped without either side noticing until a Client is
+/// delivered onto the now-dead connection. Applied here on the Edge's own
+/// accept side too, for the same reason and for symmetry with any
+/// intermediate stateful device on this leg of the path. Best-effort.
+pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(20))
+        .with_interval(std::time::Duration::from_secs(20));
+    let _ = sock.set_tcp_keepalive(&ka);
+}
+
 fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), BoxError> {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert = certified.cert.der().clone();

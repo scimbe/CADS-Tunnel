@@ -430,6 +430,26 @@ pub async fn tcp_tls_connect_channel(
 /// Harmless on the direct TLS listeners (they advertise no ALPN, so the offer is
 /// ignored). The thin [`tcp_tls_connect`] / [`tcp_tls_connect_channel`] wrappers
 /// pin the two protocol strings.
+/// Enable TCP keepalive on `stream` (#229): a parked TLS-TCP fallback
+/// registration is otherwise a plain, silent TCP connection with nothing to
+/// refresh it over however long it sits waiting for a Client -- over a real,
+/// geographically distant network, any NAT/firewall between the Agent and
+/// the Edge can drop an idle mapping without either endpoint noticing, so a
+/// Client later delivered onto that "parked" connection gets nothing back
+/// (found live: reproduced on hugging's real UDP-blocked network, never on a
+/// same-host hermetic/loopback test, exactly what an idle-NAT-drop
+/// hypothesis predicts). 20s/20s is comfortably under common NAT idle
+/// timeouts (typically 60s+) while staying cheap. Best-effort: unsupported
+/// platforms or an already-broken socket just don't get the option, same as
+/// today.
+fn apply_tcp_keepalive(stream: &TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(20));
+    let _ = sock.set_tcp_keepalive(&ka);
+}
+
 pub async fn tcp_tls_connect_with_alpn(
     addr: SocketAddr,
     edge_cert: CertificateDer<'static>,
@@ -444,6 +464,7 @@ pub async fn tcp_tls_connect_with_alpn(
     cfg.alpn_protocols = vec![alpn.to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
     let tcp = TcpStream::connect(addr).await?;
+    apply_tcp_keepalive(&tcp);
     let server_name = rustls::pki_types::ServerName::try_from("localhost")?;
     Ok(connector.connect(server_name, tcp).await?)
 }
@@ -460,6 +481,23 @@ mod tests {
     #[test]
     fn prefers_quic_when_udp_reachable() {
         assert_eq!(select_transport(true), Transport::Quic);
+    }
+
+    #[tokio::test]
+    async fn apply_tcp_keepalive_actually_sets_the_socket_option() {
+        // #229: a parked TLS-TCP fallback connection is otherwise a plain,
+        // silent TCP socket an idle NAT/firewall can drop unnoticed. Prove
+        // apply_tcp_keepalive isn't a silent no-op -- read the option back.
+        let bind = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = bind.local_addr().unwrap();
+        let accept = tokio::spawn(async move { bind.accept().await.unwrap().0 });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let _server = accept.await.unwrap();
+
+        let sock = socket2::SockRef::from(&client);
+        assert!(!sock.keepalive().unwrap(), "keepalive is off by default before applying it");
+        apply_tcp_keepalive(&client);
+        assert!(sock.keepalive().unwrap(), "apply_tcp_keepalive must actually enable SO_KEEPALIVE");
     }
 
     #[tokio::test]
