@@ -75,11 +75,41 @@ async fn publish(
     Json(req): Json<ChallengeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize(&state, &req.token, &req.hostname).await?;
-    state
-        .provider
-        .set_txt(&dns01_record_name(&req.hostname), &req.value)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let record_name = dns01_record_name(&req.hostname);
+    state.provider.set_txt(&record_name, &req.value).await.map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    // deSEC-specific (#229): `set_txt` returning success only means deSEC's
+    // API accepted the write, not that its anycast fleet serves it yet --
+    // measured up to 152s to fully converge, and the single nearest node
+    // behind ns1.desec.io/ns2.desec.org can each individually claim success
+    // while a third of the fleet (reachable by Let's Encrypt's own remote
+    // validation perspectives) still does not have the record. Wait here,
+    // on the control plane, so the agent needs no DNS capability of its own
+    // (this is also what makes the check work on a host with outbound
+    // UDP/53 blocked entirely, unlike doing this client-side) and so a 200
+    // response means what it says: this is actually live.
+    if matches!(state.provider.as_ref(), Dns01Provider::Desec(_)) {
+        use ct_dns::convergence::{wait_for_convergence, Convergence, DEFAULT_TIMEOUT, DESEC_NODES};
+        match wait_for_convergence(DESEC_NODES, &record_name, &req.value, DEFAULT_TIMEOUT).await {
+            Convergence::Converged { .. } => {}
+            // We could not reach any node ourselves -- a fact about the
+            // control plane's own network, not about deSEC. The write did
+            // succeed per deSEC's own API; don't fail an otherwise-good
+            // publish over our own inability to double-check it.
+            Convergence::NoNodesReachable => {
+                eprintln!("ct-cp: dns01-challenge: could not reach any deSEC node to confirm convergence for {record_name}; proceeding anyway");
+            }
+            Convergence::TimedOut { lagging } => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "published, but not yet converged across all deSEC nodes after {DEFAULT_TIMEOUT:?} -- still lagging: {}",
+                        lagging.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
     Ok(StatusCode::OK)
 }
 

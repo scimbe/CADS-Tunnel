@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod client;
+pub mod convergence;
 pub mod message;
 pub mod provider;
 pub mod server;
