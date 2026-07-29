@@ -1499,6 +1499,22 @@ impl SqliteTunnelStore {
         rows.collect()
     }
 
+    /// Every hostname currently in the Gelb tier, any `claim_state` (#229
+    /// follow-up: `EdgeState::gelb_hosts` is edge-local, in-memory, and has no
+    /// rehydration on restart, unlike the host-authorization map -- an edge
+    /// restart silently drops every host back to ordinary SNI passthrough,
+    /// which forwards raw TLS bytes to a Gelb-tier's plain-HTTP origin. The
+    /// admission sweep re-affirms `tier=gelb` for every row here on each tick
+    /// so that gap self-heals within one tick of any edge restart, current or
+    /// future, without a new edge-side rehydration protocol.
+    pub fn gelb_hostnames(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT hostname FROM subject_tunnels WHERE status = 'gelb' AND hostname IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// Hostnames queued (Gelb, unclaimed, unassigned) in strict FIFO order --
     /// the admission sweep's candidate list, oldest `queued_at` first.
     pub fn gelb_queue_fifo(&self) -> rusqlite::Result<Vec<String>> {

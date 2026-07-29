@@ -291,11 +291,22 @@ async fn sweep_once(
         }
     }
 
-    // 2. Lapse expired claims -- must run before the admission sweep below so
+    // 2. Re-affirm tier=gelb for every currently-Gelb hostname (#229
+    // follow-up): the edge's `gelb_hosts` is in-memory-only with no
+    // rehydration on restart, so any edge restart silently reverts these
+    // hosts to plain SNI passthrough -- which forwards raw TLS bytes to a
+    // Gelb-tier's plain-HTTP origin, producing handshake failures downstream.
+    // Re-pushing every tick is a cheap, idempotent no-op on the edge in the
+    // steady state and self-heals within one tick of any restart.
+    for hostname in tunnels.gelb_hostnames()? {
+        push_tier(edge_admin, tunnels, &hostname, true).await;
+    }
+
+    // 3. Lapse expired claims -- must run before the admission sweep below so
     // a just-lapsed hostname's freed budget can be reused the same tick.
     tunnels.lapse_expired_claims(now)?;
 
-    // 3. Admit as much of the FIFO queue as current CA headroom allows.
+    // 4. Admit as much of the FIFO queue as current CA headroom allows.
     for hostname in tunnels.gelb_queue_fifo()? {
         let domain = registered_domain(&hostname);
         match pick_ca(tunnels, &domain, now)? {
@@ -517,18 +528,23 @@ mod tests {
         sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
         {
             let seen = calls.lock().unwrap();
-            assert_eq!(seen.len(), 1, "exactly one tier push for the Rot->Gelb transition");
-            assert!(
-                seen[0].0.contains(&format!("/admin/authorize-host/{}/app.example.com", t.routing_token))
-                    && seen[0].0.contains("tier=gelb"),
-                "{}",
-                seen[0].0
-            );
-            assert_eq!(seen[0].1.as_deref(), Some("sekret"));
+            // One push from the Rot->Gelb promotion itself, one from the
+            // same-tick Gelb re-affirm pass (#229 follow-up) -- both `tier=gelb`
+            // for the same host, since the re-affirm pass sees the row it just promoted.
+            assert_eq!(seen.len(), 2, "promotion push + same-tick re-affirm push");
+            for call in seen.iter() {
+                assert!(
+                    call.0.contains(&format!("/admin/authorize-host/{}/app.example.com", t.routing_token))
+                        && call.0.contains("tier=gelb"),
+                    "{}",
+                    call.0
+                );
+                assert_eq!(call.1.as_deref(), Some("sekret"));
+            }
         }
 
         // Complete the issuance (front-of-queue offer already exists after the sweep).
-        let app = acme_broker_router(edge_mesh, tunnels, edge_admin);
+        let app = acme_broker_router(edge_mesh.clone(), tunnels.clone(), edge_admin.clone());
         let resp = app
             .oneshot(
                 Request::post(format!("/agent/acme-issuance-complete/{}/app.example.com", t.routing_token))
@@ -540,7 +556,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let seen = calls.lock().unwrap();
-        assert_eq!(seen.len(), 2, "issuance-complete pushes a second tier update");
-        assert!(!seen[1].0.contains("tier="), "no tier param -> revert to ordinary passthrough: {}", seen[1].0);
+        assert_eq!(seen.len(), 3, "issuance-complete pushes a third, reverting tier update");
+        assert!(!seen[2].0.contains("tier="), "no tier param -> revert to ordinary passthrough: {}", seen[2].0);
+    }
+
+    #[tokio::test]
+    async fn sweep_re_affirms_tier_gelb_on_every_tick_even_with_no_new_transition() {
+        // #229 follow-up: the edge's `gelb_hosts` is in-memory-only and has no
+        // rehydration on restart -- any edge restart silently reverts a
+        // still-Gelb hostname to ordinary SNI passthrough. Proves the sweep
+        // re-pushes tier=gelb on a LATER tick too, not only at the moment of
+        // the Rot->Gelb transition, so an edge restart self-heals within one
+        // tick no matter when it happens.
+        let (edge_url, calls) = spawn_mock_edge_admin().await;
+        let edge_admin = Some((edge_url, "sekret".to_string()));
+
+        let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", 0).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+
+        sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
+        let after_first_tick = calls.lock().unwrap().len();
+        assert!(after_first_tick >= 1, "at least the promotion push happened");
+
+        // Simulate an edge restart wiping `gelb_hosts` -- nothing in this
+        // store changes, there is no new Rot->Gelb transition to trigger.
+        sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
+        let after_second_tick = calls.lock().unwrap().len();
+        assert!(
+            after_second_tick > after_first_tick,
+            "a second tick with no new transition must still re-push tier=gelb for the still-Gelb hostname"
+        );
+        let seen = calls.lock().unwrap();
+        assert!(seen.last().unwrap().0.contains("tier=gelb"));
     }
 }
