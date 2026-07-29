@@ -634,7 +634,7 @@ mod tests {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let proxies: std::collections::HashMap<String, ct_edge::serve::ProxyTarget> =
                 std::collections::HashMap::new();
-            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge, None, None).await;
+            let _ = serve_front_door(tcp, &state_e, &acceptor, &proxies, None, &challenge, None, None, None).await;
         });
 
         // Agent: TLS-TCP connect (ALPN=ct-edge set in tcp_tls_connect) + register.

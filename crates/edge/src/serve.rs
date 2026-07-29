@@ -612,6 +612,7 @@ pub async fn serve_front_door(
     challenge: &Challenge,
     channel: Option<&ChannelFrontDoor>,
     wildcard_acceptor: Option<&tokio_rustls::TlsAcceptor>,
+    mesh_relay: Option<&MeshRelayConfig>,
 ) -> Result<(), BoxError> {
     // #121 Phase B1: the member's reflexive (post-NAT) source, captured from the accepted TCP
     // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
@@ -667,6 +668,27 @@ pub async fn serve_front_door(
                 pos: 0,
                 inner: inbound,
             };
+            // ADR-0021 Part 1: a genuine LOCAL miss (no route on this edge at
+            // all) tries the mesh-relay fallback first, when configured --
+            // off by default (CT_EDGE_MESH_RELAY_ENABLED), so this is a no-op
+            // until an operator actually runs a second edge. A raw byte relay
+            // to whichever peer edge the registry says owns `host`, same as
+            // `serve_sni_passthrough` relays raw bytes to a local Agent --
+            // the peer edge applies its OWN tier dispatch (Gelb/Grün/etc), not
+            // this one's, since it's the one that actually owns the tunnel.
+            // A miss on the mesh lookup too (nobody owns it anywhere, or the
+            // registry is unreachable) falls through to today's unchanged
+            // behavior below.
+            if state.route_host(&host).is_none() {
+                if let Some(mesh) = mesh_relay {
+                    if let Some(peer_addr) =
+                        crate::edge_mesh_client::lookup_owner_by_host(&mesh.cp_url, &mesh.admin_token, &host).await
+                    {
+                        return relay_via_peer_edge(joined, &peer_addr, &host, mesh.edge_cert.clone(), mesh.admin_token)
+                            .await;
+                    }
+                }
+            }
             // #233: a hostname the control plane has explicitly marked Gelb
             // gets edge-terminated with the shared wildcard cert instead of
             // passthrough; every other hostname (not yet provisioned, or
@@ -1112,6 +1134,18 @@ where
     }
 }
 
+/// Everything [`serve_front_door`] needs to attempt the ADR-0021 Part 1
+/// mesh-relay fallback on a local routing miss. `None` anywhere this is
+/// threaded through means the feature is off -- the existing "no tunnel
+/// registered" error path is completely unchanged, which is the default
+/// (opt in via `CT_EDGE_MESH_RELAY_ENABLED`, see [`run_edge`]).
+#[derive(Clone)]
+pub struct MeshRelayConfig {
+    pub cp_url: String,
+    pub admin_token: [u8; 32],
+    pub edge_cert: rustls::pki_types::CertificateDer<'static>,
+}
+
 /// Dial a peer edge (ADR-0021 Part 1) that owns `host` and relay `inbound` to
 /// it over the mesh-relay role. Used as the cache-miss fallback when this
 /// edge has no local route for `host` but the control plane's registry says
@@ -1474,6 +1508,40 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // is no cert to terminate with, so the arm falls through.
                     let wildcard_tls =
                         build_front_door_cert("Wildcard", "CT_EDGE_WILDCARD_CERT", "CT_EDGE_WILDCARD_KEY");
+                    // ADR-0021 Part 1: the mesh-relay fallback for a genuine local
+                    // routing miss -- OFF by default (CT_EDGE_MESH_RELAY_ENABLED),
+                    // a no-op until an operator actually runs a second edge.
+                    // Reuses the same CT_EDGE_CP_URL/CT_EDGE_ADMIN_TOKEN the
+                    // rehydrate/heartbeat registry client already requires, and
+                    // this edge's own published Mesh-Plane CA root (`ca_root`).
+                    let mesh_relay_config = if std::env::var("CT_EDGE_MESH_RELAY_ENABLED")
+                        .map(|v| {
+                            let v = v.trim();
+                            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+                        })
+                        .unwrap_or(false)
+                    {
+                        match (
+                            std::env::var("CT_EDGE_CP_URL").ok().filter(|s| !s.is_empty()),
+                            std::env::var("CT_EDGE_ADMIN_TOKEN").ok().and_then(|s| parse_admin_token_hex(&s)),
+                        ) {
+                            (Some(cp_url), Some(admin_token)) => {
+                                eprintln!(
+                                    "ct-edge: mesh-relay fallback ENABLED against {cp_url} (CT_EDGE_MESH_RELAY_ENABLED)"
+                                );
+                                Some(MeshRelayConfig { cp_url, admin_token, edge_cert: ca_root.clone() })
+                            }
+                            _ => {
+                                eprintln!(
+                                    "ct-edge: CT_EDGE_MESH_RELAY_ENABLED set but CT_EDGE_CP_URL/CT_EDGE_ADMIN_TOKEN \
+                                     missing -- mesh-relay stays off"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let n_proxies = proxies.len();
                     let proxies = std::sync::Arc::new(proxies);
                     let default_host = std::sync::Arc::new(default_host);
@@ -1539,6 +1607,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let default_host = default_host.clone();
                             let channel_fd = channel_fd.clone();
                             let wildcard_tls = wildcard_tls.clone();
+                            let mesh_relay_config = mesh_relay_config.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for the connection's lifetime
                                 let mut nonce = [0u8; 16];
@@ -1557,6 +1626,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     &challenge,
                                     channel_fd.as_ref(),
                                     wildcard_tls.as_ref(),
+                                    mesh_relay_config.as_ref(),
                                 )
                                 .await
                                 {
@@ -3014,7 +3084,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls))
+            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None)
                 .await
         });
 
@@ -3205,7 +3275,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None).await
         });
 
         // Client: send the ClientHello (SNI=portal.test) + extra, read it echoed.
@@ -3339,7 +3409,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
-            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None)
+            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None)
                 .await
         });
 
@@ -3427,7 +3497,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None).await
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None).await
         });
 
         // Browser -> SNI=auth.test -> AUTH cert terminates -> AUTH upstream.
@@ -3565,7 +3635,7 @@ mod tests {
                         std::collections::HashMap::new();
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
-                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None,
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None,
                     )
                     .await;
                 });
