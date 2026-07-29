@@ -212,13 +212,21 @@ fn ca_response_for(name: &str) -> Option<AssignedCaResponse> {
 /// itself. Absent (both `None`) for Let's Encrypt and for any CA this
 /// deployment hasn't been given credentials for yet.
 fn eab_for_ca(name: &str) -> (Option<String>, Option<String>) {
+    eab_for_ca_with(name, |k| std::env::var(k).ok())
+}
+
+/// Testable core of [`eab_for_ca`] behind an injectable lookup, matching this
+/// crate's `from_env_with` convention elsewhere -- avoids mutating real
+/// process env vars (flaky under parallel test execution) just to prove
+/// [`pick_ca`]'s EAB-credential gate.
+fn eab_for_ca_with(name: &str, get: impl Fn(&str) -> Option<String>) -> (Option<String>, Option<String>) {
     let (kid_var, hmac_var) = match name {
         "zerossl" => ("CT_CP_ACME_EAB_ZEROSSL_KID", "CT_CP_ACME_EAB_ZEROSSL_HMAC"),
         "google-trust-services" => ("CT_CP_ACME_EAB_GTS_KID", "CT_CP_ACME_EAB_GTS_HMAC"),
         "ssl.com" => ("CT_CP_ACME_EAB_SSLCOM_KID", "CT_CP_ACME_EAB_SSLCOM_HMAC"),
         _ => return (None, None),
     };
-    let get = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let get = |k: &str| get(k).filter(|s| !s.is_empty());
     (get(kid_var), get(hmac_var))
 }
 
@@ -258,15 +266,44 @@ fn budget_for(ca_name: &str) -> i64 {
 }
 
 /// Pick the CA with the greatest remaining headroom for `domain` right now,
-/// or `None` if every CA in the active rotation is at or over its budget.
-/// Least-utilized-first rather than a fixed round-robin counter or fixed
-/// weights: GTS's real free-tier cap is unverified (see
+/// or `None` if every CA in the active rotation is at or over its budget --
+/// or, just as importantly, has no CA left that could actually complete an
+/// order. Least-utilized-first rather than a fixed round-robin counter or
+/// fixed weights: GTS's real free-tier cap is unverified (see
 /// `ct_common::acme_ca`'s own doc comments), so hardcoding a weight for an
 /// unverified limit would be worse than adapting to actual usage.
+///
+/// A CA that `requires_eab` but has no EAB credentials configured for this
+/// deployment (`eab_for_ca` returns `(None, None)`) is skipped entirely, not
+/// merely deprioritized (found live, #229): `assigned_ca` is permanent once
+/// offered (never rewritten), so assigning a CA this deployment can't
+/// actually authenticate to would permanently strand that hostname at
+/// Gelb -- ZeroSSL's real free-tier budget (200/7d) so outweighs Let's
+/// Encrypt's (40/7d) that it would win this pick almost every time an
+/// operator forgot to configure its EAB credentials, silently breaking
+/// Gelb->Grün for nearly every future admission, not just the one that
+/// happened to surface it.
 fn pick_ca(tunnels: &SqliteTunnelStore, domain: &str, now: i64) -> rusqlite::Result<Option<&'static str>> {
+    pick_ca_with(tunnels, domain, now, eab_for_ca)
+}
+
+/// Testable core of [`pick_ca`] behind an injectable EAB lookup (same
+/// rationale as [`eab_for_ca_with`]).
+fn pick_ca_with(
+    tunnels: &SqliteTunnelStore,
+    domain: &str,
+    now: i64,
+    eab_lookup: impl Fn(&str) -> (Option<String>, Option<String>),
+) -> rusqlite::Result<Option<&'static str>> {
     let since = now - BUDGET_WINDOW_SECS;
     let mut best: Option<(&'static str, i64)> = None;
     for ca in ct_common::acme_ca::active_rotation() {
+        if ca.requires_eab {
+            let (kid, hmac) = eab_lookup(ca.name);
+            if kid.is_none() || hmac.is_none() {
+                continue;
+            }
+        }
         let budget = budget_for(ca.name);
         let (used, reserved) = tunnels.ca_budget_usage(ca.name, domain, since)?;
         let headroom = budget - used - reserved;
@@ -436,6 +473,14 @@ mod tests {
         assert_eq!(registered_domain("bunsenbrenner.org"), "bunsenbrenner.org", "no leftmost label to strip");
     }
 
+    /// An EAB lookup standing in for "every CA has its credentials
+    /// configured" -- the tests that exercise budget-based selection care
+    /// about that logic specifically, not the EAB gate (covered separately
+    /// below), so they inject this rather than depend on real process env vars.
+    fn all_eab_configured(_name: &str) -> (Option<String>, Option<String>) {
+        (Some("kid".to_string()), Some("hmac".to_string()))
+    }
+
     #[test]
     fn pick_ca_favors_the_least_utilized_ca_and_returns_none_when_all_are_exhausted() {
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
@@ -452,7 +497,7 @@ mod tests {
             tunnels.record_issuance_complete(&host, "example.com", 3).unwrap();
         }
 
-        let picked = pick_ca(&tunnels, "example.com", 100).unwrap();
+        let picked = pick_ca_with(&tunnels, "example.com", 100, all_eab_configured).unwrap();
         assert_ne!(picked, Some("letsencrypt"), "letsencrypt is down to 5 headroom, others have their full budget");
 
         // Exhaust every CA's budget entirely -- no CA should be pickable.
@@ -467,7 +512,38 @@ mod tests {
                 tunnels2.record_issuance_complete(&host, "example.com", 1).unwrap();
             }
         }
-        assert_eq!(pick_ca(&tunnels2, "example.com", 100).unwrap(), None, "every CA exhausted -- nothing pickable");
+        assert_eq!(
+            pick_ca_with(&tunnels2, "example.com", 100, all_eab_configured).unwrap(),
+            None,
+            "every CA exhausted -- nothing pickable"
+        );
+    }
+
+    #[test]
+    fn pick_ca_never_assigns_a_ca_that_requires_eab_but_has_no_credentials_configured() {
+        // #229: assigned_ca is permanent once offered (never rewritten), so
+        // picking a CA this deployment can't actually authenticate to would
+        // permanently strand that hostname at Gelb. ZeroSSL's budget (200/7d)
+        // dwarfs Let's Encrypt's (40/7d), so with no EAB lookup at all it
+        // would otherwise win every single time.
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let none_configured = |_: &str| (None, None);
+        let picked = pick_ca_with(&tunnels, "example.com", 100, none_configured).unwrap();
+        assert_eq!(
+            picked,
+            Some("letsencrypt"),
+            "letsencrypt needs no EAB and has full budget -- the only CA that's actually usable"
+        );
+
+        // Once ZeroSSL's credentials ARE configured, it wins back on budget headroom.
+        let with_zerossl = |name: &str| {
+            if name == "zerossl" {
+                (Some("kid".to_string()), Some("hmac".to_string()))
+            } else {
+                (None, None)
+            }
+        };
+        assert_eq!(pick_ca_with(&tunnels, "example.com", 100, with_zerossl).unwrap(), Some("zerossl"));
     }
 
     #[tokio::test]
