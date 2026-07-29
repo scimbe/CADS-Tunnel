@@ -15,8 +15,9 @@ use ct_common::ratelimit::RateLimiter;
 use ct_common::RoutingToken;
 use ct_common::sync::MutexExt;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A concurrency cap for the edge accept loop (#86 SEC86b, ADR-0018's connection-
 /// flood half): at most `max` connections are handled at once. [`try_admit`] hands
@@ -83,6 +84,13 @@ pub struct EdgeState<H> {
     /// single-use (one Client per registration) -- `deliver_to_tcp_agent`
     /// pops the oldest.
     tcp_agents: Mutex<HashMap<RoutingToken, std::collections::VecDeque<oneshot::Sender<BoxedStream>>>>,
+    /// Woken every time [`park_tcp_agent`](Self::park_tcp_agent) adds a fresh
+    /// registration, for any token. Lets [`wait_for_tcp_agent`](Self::wait_for_tcp_agent)
+    /// block briefly instead of polling when a Client arrives between two of the
+    /// Agent-side pool's registration cycles (#229 follow-up: a real browser's
+    /// burst of parallel connections can momentarily exceed the pool size even
+    /// though a slot frees up milliseconds later).
+    tcp_agent_parked: Notify,
     /// Browser Plane (#23): public hostname -> routing token, so an SNI-routed
     /// TLS connection can be mapped to a tunnel without the Client protocol.
     /// Hostnames are stored lowercased. The payload stays blind (TLS ciphertext
@@ -129,6 +137,7 @@ impl<H: Clone> EdgeState<H> {
             candidates: Mutex::new(HashMap::new()),
             direct: Mutex::new(HashMap::new()),
             tcp_agents: Mutex::new(HashMap::new()),
+            tcp_agent_parked: Notify::new(),
             hosts: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashSet::new()),
             admin_token: Mutex::new(None),
@@ -302,6 +311,12 @@ impl<H: Clone> EdgeState<H> {
     pub fn park_tcp_agent(&self, token: RoutingToken) -> oneshot::Receiver<BoxedStream> {
         let (tx, rx) = oneshot::channel();
         self.tcp_agents.lock_safe().entry(token).or_default().push_back(tx);
+        // `notify_one` (not `notify_waiters`): it stores a permit when nobody is
+        // currently waiting, so a park() that races ahead of a concurrent
+        // `wait_for_tcp_agent`'s has_tcp_agent-then-notified() check is never
+        // lost. One permit per available slot is exactly the right amount of
+        // wakeup for a FIFO queue where each park() adds one deliverable slot.
+        self.tcp_agent_parked.notify_one();
         rx
     }
 
@@ -332,6 +347,36 @@ impl<H: Clone> EdgeState<H> {
     /// Whether at least one TCP-fallback agent is currently parked for `token`.
     pub fn has_tcp_agent(&self, token: &RoutingToken) -> bool {
         self.tcp_agents.lock_safe().get(token).is_some_and(|q| !q.is_empty())
+    }
+
+    /// Wait up to `timeout` for a TCP-fallback registration to appear for
+    /// `token`, returning `true` as soon as one does (or immediately, if one
+    /// is already parked) and `false` if `timeout` elapses first. For a
+    /// Client whose rendezvous found the Agent-side pool momentarily
+    /// exhausted (a real browser's burst of parallel connections can exceed
+    /// the pool size for a few milliseconds even though a worker is about to
+    /// cycle free) -- a short, bounded wait here turns what would otherwise
+    /// be a hard connection failure into a brief, invisible delay.
+    ///
+    /// Race-free: `park_tcp_agent` uses `Notify::notify_one`, which stores a
+    /// permit when called with nobody currently waiting, so a park() that
+    /// lands between this method's `has_tcp_agent` check and its `notified()`
+    /// call is never missed (see `park_tcp_agent`'s doc comment).
+    pub async fn wait_for_tcp_agent(&self, token: &RoutingToken, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.has_tcp_agent(token) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            // A wakeup here may be for a different token (Notify is shared,
+            // not per-token) -- loop back to the has_tcp_agent recheck above,
+            // which is correct if occasionally wasteful.
+            let _ = tokio::time::timeout(remaining, self.tcp_agent_parked.notified()).await;
+        }
     }
 
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
@@ -803,6 +848,55 @@ mod tests {
         let _rx = state.park_tcp_agent(token(9));
         state.remove(&token(9));
         assert!(!state.has_tcp_agent(&token(9)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_tcp_agent_returns_immediately_when_already_parked() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let _rx = state.park_tcp_agent(token(10));
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            state.wait_for_tcp_agent(&token(10), Duration::from_secs(5)),
+        )
+        .await
+        .expect("must not block when a registration is already parked");
+        assert!(waited);
+    }
+
+    #[tokio::test]
+    async fn wait_for_tcp_agent_wakes_up_when_a_registration_arrives_during_the_wait() {
+        // #229 follow-up: a momentarily-exhausted pool (a burst of parallel
+        // browser connections) should be caught by a short bounded wait once
+        // the Agent's next worker cycles round and parks a fresh registration,
+        // rather than the Client failing outright.
+        let state: std::sync::Arc<EdgeState<u32>> = std::sync::Arc::new(EdgeState::new());
+        assert!(!state.has_tcp_agent(&token(11)));
+
+        let s = state.clone();
+        let waiter = tokio::spawn(async move { s.wait_for_tcp_agent(&token(11), Duration::from_secs(5)).await });
+
+        // Give the waiter a moment to actually be polling `notified()` before
+        // the registration lands, then park one.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let _rx = state.park_tcp_agent(token(11));
+
+        let waited = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_for_tcp_agent must return promptly once a registration lands")
+            .expect("task did not panic");
+        assert!(waited);
+    }
+
+    #[tokio::test]
+    async fn wait_for_tcp_agent_times_out_when_nothing_arrives() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let waited = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.wait_for_tcp_agent(&token(12), Duration::from_millis(50)),
+        )
+        .await
+        .expect("wait_for_tcp_agent must respect its own timeout");
+        assert!(!waited);
     }
 
     #[test]

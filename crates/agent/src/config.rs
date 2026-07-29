@@ -58,10 +58,13 @@ pub struct AgentConfig {
     /// (#229): each is single-use and one-Client-at-a-time, so with a pool of
     /// 1 (the old, implicit behavior) a real browser page load's parallel
     /// per-origin connections drop every one but the first. `CT_AGENT_TCP_
-    /// FALLBACK_POOL_SIZE`; default 4 (a typical browser opens ~6 per
-    /// origin -- a smaller pool than that trades a little parallelism for
-    /// fewer concurrent connections to the Edge). Only used in TLS-TCP
-    /// fallback mode; QUIC already multiplexes and needs no pool.
+    /// FALLBACK_POOL_SIZE`; default 6, matching the per-origin HTTP/1.1
+    /// connection cap real browsers (Chrome, Firefox, Safari) actually use --
+    /// a smaller pool trades away exactly the parallelism a real page load
+    /// needs, which is the failure mode #229 was filed over. The Edge also
+    /// tolerates brief bursts past the pool size with a short bounded wait
+    /// (`wait_for_tcp_agent`) rather than failing outright. Only used in
+    /// TLS-TCP fallback mode; QUIC already multiplexes and needs no pool.
     pub tcp_fallback_pool_size: usize,
 }
 
@@ -163,7 +166,7 @@ impl AgentConfig {
 }
 
 /// See [`AgentConfig::tcp_fallback_pool_size`].
-const DEFAULT_TCP_FALLBACK_POOL_SIZE: usize = 4;
+const DEFAULT_TCP_FALLBACK_POOL_SIZE: usize = 6;
 
 #[cfg(test)]
 mod tests {

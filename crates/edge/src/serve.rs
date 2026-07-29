@@ -52,6 +52,14 @@ pub async fn register_agent(
 /// giving up with an opaque "no relay" (issue #2, mode b).
 const RELAY_OPEN_BI_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a Client rendezvous will wait for a TCP-fallback registration to
+/// free up before giving up (#229 follow-up: a real browser's burst of
+/// parallel connections can momentarily exceed the Agent-side pool size).
+/// Short enough to stay well under the Client's own tunnel timeout (8s, see
+/// [`RELAY_OPEN_BI_TIMEOUT`]'s doc comment) even when combined with the
+/// `open_agent_stream` attempt that precedes it.
+const TCP_FALLBACK_DELIVER_WAIT: Duration = Duration::from_millis(1500);
+
 /// First 8 hex chars of a token, for correlating an Edge trace line with a
 /// field-supplied token during cross-host diagnosis.
 fn token_hex(token: &RoutingToken) -> String {
@@ -241,14 +249,35 @@ where
             Err(_) => Err("tcp-fallback agent vanished before delivery".into()),
         };
     }
-    let (mut agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-    // Replay the buffered ClientHello to the Agent first, then relay the rest so
-    // the browser<->origin TLS handshake completes end-to-end through the tunnel.
-    agent_send.write_all(&hello).await?;
-    let mut agent = join(agent_recv, agent_send);
-    let (a, b) = relay(&mut inbound, &mut agent).await?;
-    state.note_relay(a + b);
-    Ok(())
+    match open_agent_stream(state, &token).await {
+        Ok((mut agent_send, agent_recv)) => {
+            // Replay the buffered ClientHello to the Agent first, then relay the
+            // rest so the browser<->origin TLS handshake completes end-to-end.
+            agent_send.write_all(&hello).await?;
+            let mut agent = join(agent_recv, agent_send);
+            let (a, b) = relay(&mut inbound, &mut agent).await?;
+            state.note_relay(a + b);
+            Ok(())
+        }
+        Err(e) => {
+            // No QUIC registration -- likely a TCP-fallback-only agent (UDP
+            // blocked) whose pool was momentarily exhausted by a burst of
+            // parallel browser connections (#229 follow-up: real page loads
+            // open several at once). Give it a brief window to free a slot
+            // rather than failing this request outright.
+            if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
+                let joined: crate::state::BoxedStream = Box::new(Prepend {
+                    pre: hello,
+                    pos: 0,
+                    inner: inbound,
+                });
+                if state.deliver_to_tcp_agent(&token, joined).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Rot/Gelb/Grün certificate tier (#233), **Gelb** leg: terminate the
@@ -303,11 +332,25 @@ where
         };
     }
     let mut tls = tls;
-    let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-    let mut agent = join(agent_recv, agent_send);
-    let (a, b) = relay(&mut tls, &mut agent).await?;
-    state.note_relay(a + b);
-    Ok(())
+    match open_agent_stream(state, &token).await {
+        Ok((agent_send, agent_recv)) => {
+            let mut agent = join(agent_recv, agent_send);
+            let (a, b) = relay(&mut tls, &mut agent).await?;
+            state.note_relay(a + b);
+            Ok(())
+        }
+        Err(e) => {
+            // Same momentarily-exhausted-pool recovery as serve_sni_passthrough
+            // (#229 follow-up).
+            if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
+                let boxed: crate::state::BoxedStream = Box::new(tls);
+                if state.deliver_to_tcp_agent(&token, boxed).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Resolve the `CT_CP_PROXY_ADDR` Portal upstream — a `host:port` (or literal
@@ -847,10 +890,27 @@ pub async fn serve_connection(
                     }
                 }
             }
-            let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-            let (a, b) = relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
-            state.note_relay(a + b); // #10 O2
-            Ok(None)
+            match open_agent_stream(state, &token).await {
+                Ok((agent_send, agent_recv)) => {
+                    let (a, b) =
+                        relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
+                    state.note_relay(a + b); // #10 O2
+                    Ok(None)
+                }
+                Err(e) => {
+                    // Same momentarily-exhausted-pool recovery as
+                    // serve_sni_passthrough (#229 follow-up): this QUIC client
+                    // may be reaching an agent that is TCP-fallback-only.
+                    if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
+                        && state
+                            .deliver_to_tcp_agent(&token, Box::new(join(recv, send)))
+                            .is_ok()
+                    {
+                        return Ok(None);
+                    }
+                    Err(e)
+                }
+            }
         }
         b'D' => {
             // Agent advertises its direct-path listener (M11.4b-ii):
@@ -1076,13 +1136,26 @@ where
             // Prefer a parked TCP-fallback agent; else relay to a QUIC agent.
             match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
-                Err(mut stream) => {
-                    let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-                    let mut agent = join(agent_recv, agent_send);
-                    let (a, b) = relay(&mut stream, &mut agent).await?;
-                    state.note_relay(a + b); // #10 O2
-                    Ok(())
-                }
+                Err(stream) => match open_agent_stream(state, &token).await {
+                    Ok((agent_send, agent_recv)) => {
+                        let mut stream = stream;
+                        let mut agent = join(agent_recv, agent_send);
+                        let (a, b) = relay(&mut stream, &mut agent).await?;
+                        state.note_relay(a + b); // #10 O2
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Momentarily-exhausted pool recovery (#229 follow-up):
+                        // give a burst of parallel browser connections a brief
+                        // window to find a freed-up TCP-fallback slot.
+                        if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
+                            && state.deliver_to_tcp_agent(&token, stream).is_ok()
+                        {
+                            return Ok(());
+                        }
+                        Err(e)
+                    }
+                },
             }
         }
         b'M' => {
@@ -1121,13 +1194,25 @@ where
 
             match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
-                Err(mut stream) => {
-                    let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
-                    let mut agent = join(agent_recv, agent_send);
-                    let (a, b) = relay(&mut stream, &mut agent).await?;
-                    state.note_relay(a + b);
-                    Ok(())
-                }
+                Err(stream) => match open_agent_stream(state, &token).await {
+                    Ok((agent_send, agent_recv)) => {
+                        let mut stream = stream;
+                        let mut agent = join(agent_recv, agent_send);
+                        let (a, b) = relay(&mut stream, &mut agent).await?;
+                        state.note_relay(a + b);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Momentarily-exhausted pool recovery (#229 follow-up),
+                        // same as the 'C' arm above.
+                        if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
+                            && state.deliver_to_tcp_agent(&token, stream).is_ok()
+                        {
+                            return Ok(());
+                        }
+                        Err(e)
+                    }
+                },
             }
         }
         other => Err(format!("unknown TCP role byte: {other}").into()),
