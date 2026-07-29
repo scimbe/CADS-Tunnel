@@ -99,18 +99,33 @@ pub async fn wait_for_convergence(
     loop {
         let mut lagging = Vec::new();
         let mut answered = 0usize;
-        for (host, ip) in &addrs {
-            match txt_at(*ip, name).await {
-                Ok(values) => {
+        for (host, ips) in &addrs {
+            // Try every address this node resolved to (typically one IPv4 and
+            // one IPv6) and take the first that actually answers, rather than
+            // only the first address hickory happened to return. One address
+            // family being unreachable from this host is not the same as the
+            // node being down -- conflating them silently halved the fleet
+            // this checked on a host whose outbound UDP/53 over IPv6 stalled
+            // while IPv4 to the very same node answered immediately. That
+            // would have reintroduced this module's own root cause (a check
+            // quietly covering fewer nodes than it claims to) one layer down.
+            let mut node_answered = false;
+            for ip in ips {
+                if let Ok(values) = txt_at(*ip, name).await {
+                    node_answered = true;
                     answered += 1;
                     if !values.iter().any(|v| v == expected) {
                         lagging.push(host.clone());
                     }
+                    break;
                 }
-                // A node we cannot reach is not evidence of lag. Excluding it
-                // is deliberate: treating unreachable as lagging would stall
-                // every issuance behind one unreachable node.
-                Err(_) => {}
+            }
+            // Every address for this node failed -- that IS a real gap in
+            // this check's coverage, unlike a single-address miss. Surface
+            // it as lagging (conservative: keep waiting) rather than quietly
+            // dropping the node from consideration.
+            if !node_answered {
+                lagging.push(format!("{host} (unreachable on all {} address(es))", ips.len()));
             }
         }
         if answered == 0 {
@@ -126,9 +141,10 @@ pub async fn wait_for_convergence(
     }
 }
 
-/// Resolve each node hostname to one address, skipping any that no longer
-/// resolve so a stale entry cannot block issuance.
-async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, std::net::IpAddr)> {
+/// Resolve each node hostname to every address it has (typically one IPv4 and
+/// one IPv6), skipping any node that no longer resolves at all so a stale
+/// entry cannot block issuance.
+async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<std::net::IpAddr>)> {
     let Ok(system) = Resolver::builder_tokio() else {
         return Vec::new();
     };
@@ -136,8 +152,9 @@ async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, std::net::IpAddr)> {
     let mut out = Vec::new();
     for host in nodes {
         if let Ok(lookup) = system.lookup_ip(format!("{host}.")).await {
-            if let Some(ip) = lookup.iter().next() {
-                out.push((host.to_string(), ip));
+            let ips: Vec<_> = lookup.iter().collect();
+            if !ips.is_empty() {
+                out.push((host.to_string(), ips));
             }
         }
     }
