@@ -54,11 +54,30 @@ pub async fn serve_stream_to_origin(
 /// path joins its two half-streams; the TLS-TCP fallback hands its whole stream
 /// straight in. Either way the browser's TLS terminates AT the Origin — the
 /// Edge only ever relays opaque bytes.
+///
+/// Dials the Origin **lazily**, only once the Client has actually sent its
+/// first bytes (#229 follow-up), rather than eagerly the moment this function
+/// is entered. The TCP-fallback path in particular can sit parked for an
+/// arbitrary amount of time — however long until the Edge delivers a real
+/// Client — waiting with an Origin connection already open the whole time.
+/// An eagerly-opened connection can idle past the Origin's own read/keep-alive
+/// timeout before a Client ever arrives, so the very first real request lands
+/// on an already-dead connection and never completes, even though the
+/// Client↔Edge TLS layer works perfectly every time. Since this relay only
+/// ever carries request/response protocols (HTTP, or the Noise handshake in
+/// [`serve_noise_bridge`]), the Client always speaks first, so waiting for
+/// its first chunk before dialing costs nothing.
 pub async fn serve_duplex_to_origin<T>(mut client: T, origin: SocketAddr) -> Result<(), BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut first = [0u8; 4096];
+    let n = client.read(&mut first).await?;
+    if n == 0 {
+        return Ok(()); // Client closed before ever sending anything -- nothing to relay.
+    }
     let mut tcp = TcpStream::connect(origin).await?;
+    tcp.write_all(&first[..n]).await?;
     copy_bidirectional(&mut client, &mut tcp).await?;
     Ok(())
 }
@@ -1276,5 +1295,47 @@ mod tests {
         conn.close(0u32.into(), b"done");
         agent.abort();
         origin.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_duplex_to_origin_dials_the_origin_lazily_after_the_clients_first_bytes() {
+        // #229 follow-up: dialing the Origin eagerly (before any Client has
+        // actually arrived) leaves an idle connection open for however long
+        // this Agent sits parked waiting for a real Client -- long enough, in
+        // practice, to outlive the Origin's own idle/keep-alive timeout, so
+        // the very first real request lands on an already-dead connection.
+        // Prove the Origin is untouched while the Client side is silent, and
+        // only dialed once real bytes actually arrive.
+        let ol = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = ol.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted_w = accepted.clone();
+        let origin = tokio::spawn(async move {
+            let (mut s, _) = ol.accept().await.unwrap();
+            accepted_w.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut b = [0u8; 1024];
+            let n = s.read(&mut b).await.unwrap();
+            assert_eq!(&b[..n], b"hello origin");
+            s.write_all(b"hi client").await.unwrap();
+        });
+
+        let (mut client_side, agent_side) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move { serve_duplex_to_origin(agent_side, origin_addr).await });
+
+        // Give the relay every chance to have dialed already, if it were going
+        // to dial eagerly -- it must not have.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!accepted.load(std::sync::atomic::Ordering::SeqCst), "must not dial the Origin before the Client sends anything");
+
+        client_side.write_all(b"hello origin").await.unwrap();
+        client_side.flush().await.unwrap();
+        let mut resp = [0u8; 1024];
+        let n = client_side.read(&mut resp).await.unwrap();
+        assert_eq!(&resp[..n], b"hi client");
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst), "dials once the Client actually speaks");
+
+        drop(client_side);
+        let _ = relay.await;
+        let _ = origin.await;
     }
 }
