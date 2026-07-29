@@ -2789,98 +2789,49 @@ mod tests {
         let _ = edge.await;
     }
 
-    /// Wraps an `AsyncRead + AsyncWrite` half, recording whether `shutdown()`
-    /// was ever called on it -- used to distinguish a graceful close (sends a
-    /// TLS close_notify on a real TLS stream) from an abrupt drop.
-    use std::io;
-    use std::pin::Pin;
-    struct ShutdownTracker<S> {
-        inner: S,
-        shutdown_called: Arc<std::sync::atomic::AtomicBool>,
-    }
-    impl<S: AsyncRead + Unpin> AsyncRead for ShutdownTracker<S> {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-        }
-    }
-    impl<S: AsyncWrite + Unpin> AsyncWrite for ShutdownTracker<S> {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<io::Result<usize>> {
-            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-        }
-        fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-        }
-        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
-            let this = self.get_mut();
-            this.shutdown_called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Pin::new(&mut this.inner).poll_shutdown(cx)
-        }
-    }
-
     #[tokio::test]
-    #[ignore = "hangs -- needs debugging before re-enabling (#229 follow-up graceful-shutdown-on-eviction test)"]
-    async fn a_superseded_tcp_agent_registration_is_shut_down_gracefully_not_dropped() {
-        // #229 follow-up (found live): a LATER 'A'/'B' registration for the
-        // SAME token overwrites the earlier one's park slot (state.rs's
-        // `park_tcp_agent` HashMap insert), which used to just silently drop
-        // the earlier stream -- an abrupt close with no TLS close_notify, so
-        // the superseded Agent's rustls client misreported a normal takeover
-        // as "peer closed connection without sending TLS close_notify" /
-        // unexpected-eof, exactly what a duplicate/overlapping Agent process
-        // for one token produces in the field. The 'A' arm must now shut the
-        // superseded stream down gracefully instead.
+    async fn a_second_concurrent_tcp_agent_registration_does_not_evict_the_first() {
+        // #229 follow-up: `park_tcp_agent` used to be a HashMap::insert, so a
+        // second 'A'/'B' registration for the SAME token silently evicted the
+        // first (an abrupt close the superseded Agent misreported as a
+        // connection failure) -- exactly what happens once an Agent pools
+        // several concurrent registrations on purpose (a real browser page
+        // load opens multiple parallel connections per origin; one parked
+        // slot could only ever serve one). Now additive: both stay parked,
+        // and two deliveries are each served by a DIFFERENT registration.
         let token = RoutingToken([0x99; 32]);
-        let state = Arc::new(EdgeState::<Connection>::new());
-        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
 
-        let (first_peer, first_edge) = tokio::io::duplex(1024);
-        let shutdown_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tracked_first_edge = ShutdownTracker { inner: first_edge, shutdown_called: shutdown_called.clone() };
-        let state_1 = state.clone();
-        let chal_1 = challenge.clone();
-        let first = tokio::spawn(async move {
-            serve_tcp_connection(tracked_first_edge, &state_1, &chal_1).await
-        });
+        let first_rx = state.park_tcp_agent(token.clone());
+        let second_rx = state.park_tcp_agent(token.clone());
+        assert!(state.has_tcp_agent(&token), "at least one parked");
 
-        let mut first_peer = first_peer;
-        let mut hdr = vec![b'A'];
-        hdr.extend_from_slice(&token.0);
-        first_peer.write_all(&hdr).await.unwrap();
-        let mut ok = [0u8; 2];
-        first_peer.read_exact(&mut ok).await.unwrap();
-        assert_eq!(&ok, b"OK");
-        while !state.has_tcp_agent(&token) {
-            tokio::task::yield_now().await;
-        }
+        let (a_client, a_edge) = tokio::io::duplex(64);
+        let (b_client, b_edge) = tokio::io::duplex(64);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(a_edge))
+            .map_err(|_| "first delivery failed")
+            .unwrap();
+        state
+            .deliver_to_tcp_agent(&token, Box::new(b_edge))
+            .map_err(|_| "second delivery failed")
+            .unwrap();
+        assert!(!state.has_tcp_agent(&token), "both slots consumed, pool now empty");
 
-        // A second registration for the SAME token supersedes the first.
-        let (mut second_peer, second_edge) = tokio::io::duplex(1024);
-        let state_2 = state.clone();
-        let chal_2 = challenge.clone();
-        let second = tokio::spawn(async move { serve_tcp_connection(second_edge, &state_2, &chal_2).await });
-        let mut hdr2 = vec![b'A'];
-        hdr2.extend_from_slice(&token.0);
-        second_peer.write_all(&hdr2).await.unwrap();
-        let mut ok2 = [0u8; 2];
-        second_peer.read_exact(&mut ok2).await.unwrap();
-        assert_eq!(&ok2, b"OK");
-
-        let _ = first.await;
-        assert!(
-            shutdown_called.load(std::sync::atomic::Ordering::SeqCst),
-            "the superseded registration must be shut down gracefully, not just dropped"
-        );
-
-        drop(second_peer);
-        let _ = second.await;
+        // The FIRST park's receiver got the FIRST delivered stream (FIFO), not
+        // dropped/evicted by the second park -- prove each is independently
+        // usable by relaying one byte each way through both simultaneously.
+        let mut first_stream = first_rx.await.expect("first registration received a stream");
+        let mut second_stream = second_rx.await.expect("second registration received a stream");
+        let mut a_client = a_client;
+        let mut b_client = b_client;
+        a_client.write_all(b"A").await.unwrap();
+        b_client.write_all(b"B").await.unwrap();
+        let mut buf = [0u8; 1];
+        first_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"A", "first registration got the first delivery");
+        second_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"B", "second registration got the second delivery, not evicted");
     }
 
     #[tokio::test]

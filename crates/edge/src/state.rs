@@ -73,10 +73,16 @@ pub struct EdgeState<H> {
     /// Agent-advertised direct-path listener: (address, cert DER) a Client can
     /// connect to directly, bypassing the Edge relay (M11.4b).
     direct: Mutex<HashMap<RoutingToken, (SocketAddr, Vec<u8>)>>,
-    /// Parked TCP-fallback agents (issue #3 / P1.2c-3): a `token` maps to a
-    /// sender the Client handler uses to hand its stream to the waiting agent.
-    /// Unlike QUIC agents these are single-use (one client per registration).
-    tcp_agents: Mutex<HashMap<RoutingToken, oneshot::Sender<BoxedStream>>>,
+    /// Parked TCP-fallback agents (issue #3 / P1.2c-3, pooled since #229): a
+    /// `token` maps to a FIFO queue of senders, one per concurrently-parked
+    /// registration -- the Agent-side pool (`run_agent_tcp_fallback`) holds
+    /// several of these open at once so more than one simultaneous Client can
+    /// be served (a real browser page load opens several parallel
+    /// connections per origin; a single parked slot could only ever satisfy
+    /// one, dropping every other simultaneous request). Each entry is still
+    /// single-use (one Client per registration) -- `deliver_to_tcp_agent`
+    /// pops the oldest.
+    tcp_agents: Mutex<HashMap<RoutingToken, std::collections::VecDeque<oneshot::Sender<BoxedStream>>>>,
     /// Browser Plane (#23): public hostname -> routing token, so an SNI-routed
     /// TLS connection can be mapped to a tunnel without the Client protocol.
     /// Hostnames are stored lowercased. The payload stays blind (TLS ciphertext
@@ -289,32 +295,43 @@ impl<H: Clone> EdgeState<H> {
     }
 
     /// Park a TCP-fallback agent for `token`: returns a receiver that resolves to
-    /// a Client's stream once one rendezvouses for this token (single-tunnel).
-    /// The agent then relays its own stream to the received one.
+    /// a Client's stream once one rendezvouses for this token. Additive -- an
+    /// existing parked registration for the same token is NOT evicted (#229:
+    /// the Agent-side pool holds several of these open concurrently on
+    /// purpose, so more than one simultaneous Client can be served).
     pub fn park_tcp_agent(&self, token: RoutingToken) -> oneshot::Receiver<BoxedStream> {
         let (tx, rx) = oneshot::channel();
-        self.tcp_agents.lock_safe().insert(token, tx);
+        self.tcp_agents.lock_safe().entry(token).or_default().push_back(tx);
         rx
     }
 
-    /// Hand a Client's `stream` to a parked TCP-fallback agent for `token`.
-    /// Returns the stream back as `Err` if no TCP agent is waiting (so the caller
-    /// can fall through to the QUIC route), consuming the registration on success.
+    /// Hand a Client's `stream` to the oldest parked TCP-fallback agent for
+    /// `token`. Returns the stream back as `Err` if none is waiting (so the
+    /// caller can fall through to the QUIC route), consuming that one
+    /// registration (FIFO) on success -- the rest of the pool, if any, stays
+    /// parked for the next concurrent Client.
     pub fn deliver_to_tcp_agent(
         &self,
         token: &RoutingToken,
         stream: BoxedStream,
     ) -> Result<(), BoxedStream> {
-        let tx = self.tcp_agents.lock_safe().remove(token);
-        match tx {
-            Some(tx) => tx.send(stream),
-            None => Err(stream),
+        let mut agents = self.tcp_agents.lock_safe();
+        let Some(queue) = agents.get_mut(token) else {
+            return Err(stream);
+        };
+        let Some(tx) = queue.pop_front() else {
+            return Err(stream);
+        };
+        if queue.is_empty() {
+            agents.remove(token);
         }
+        drop(agents);
+        tx.send(stream)
     }
 
-    /// Whether a TCP-fallback agent is currently parked for `token`.
+    /// Whether at least one TCP-fallback agent is currently parked for `token`.
     pub fn has_tcp_agent(&self, token: &RoutingToken) -> bool {
-        self.tcp_agents.lock_safe().contains_key(token)
+        self.tcp_agents.lock_safe().get(token).is_some_and(|q| !q.is_empty())
     }
 
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):

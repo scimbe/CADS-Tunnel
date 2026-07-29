@@ -54,6 +54,15 @@ pub struct AgentConfig {
     /// the Agent also tries the edge's unified `:443` front door (TLS-TCP with
     /// `ALPN=ct-edge`). `CT_AGENT_FALLBACK_443`; default `false`.
     pub fallback_443: bool,
+    /// How many TLS-TCP fallback registrations to hold parked concurrently
+    /// (#229): each is single-use and one-Client-at-a-time, so with a pool of
+    /// 1 (the old, implicit behavior) a real browser page load's parallel
+    /// per-origin connections drop every one but the first. `CT_AGENT_TCP_
+    /// FALLBACK_POOL_SIZE`; default 4 (a typical browser opens ~6 per
+    /// origin -- a smaller pool than that trades a little parallelism for
+    /// fewer concurrent connections to the Edge). Only used in TLS-TCP
+    /// fallback mode; QUIC already multiplexes and needs no pool.
+    pub tcp_fallback_pool_size: usize,
 }
 
 /// Resolve a `host:port` (or `IP:port`) to a [`SocketAddr`] (#45). A literal
@@ -82,6 +91,7 @@ impl AgentConfig {
             browser_forward: false,
             hostname: None,
             fallback_443: false,
+            tcp_fallback_pool_size: DEFAULT_TCP_FALLBACK_POOL_SIZE,
         })
     }
 
@@ -134,9 +144,26 @@ impl AgentConfig {
                 !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
             })
             == Some(true);
+        cfg.tcp_fallback_pool_size = match get("CT_AGENT_TCP_FALLBACK_POOL_SIZE") {
+            Some(s) if !s.trim().is_empty() => s
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| format!("invalid CT_AGENT_TCP_FALLBACK_POOL_SIZE '{s}': {e}"))
+                .and_then(|n| {
+                    if n == 0 {
+                        Err("CT_AGENT_TCP_FALLBACK_POOL_SIZE must be at least 1".to_string())
+                    } else {
+                        Ok(n)
+                    }
+                })?,
+            _ => DEFAULT_TCP_FALLBACK_POOL_SIZE,
+        };
         Ok(cfg)
     }
 }
+
+/// See [`AgentConfig::tcp_fallback_pool_size`].
+const DEFAULT_TCP_FALLBACK_POOL_SIZE: usize = 4;
 
 #[cfg(test)]
 mod tests {

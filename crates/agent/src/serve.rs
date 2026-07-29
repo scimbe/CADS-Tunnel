@@ -475,10 +475,48 @@ async fn serve_quic_connection(
 }
 
 /// Serve the Agent over the **TLS-TCP fallback** when UDP/QUIC to the Edge is
-/// blocked (issue #3 / P1.2c-4): connect, register over the stream, and serve one
-/// Client's Noise tunnel over it. Single-tunnel — a TCP agent has one stream and
-/// no QUIC-style multiplexing, so it carries one Client at a time.
+/// blocked (issue #3 / P1.2c-4): run [`config.tcp_fallback_pool_size`]
+/// independent registration workers concurrently (#229) rather than just
+/// one. Each individual registration is still single-use/single-Client (no
+/// QUIC-style multiplexing within one TCP connection) -- pooling several of
+/// them is what lets more than one simultaneous Client be served at once, the
+/// way a real browser's several-parallel-connections-per-origin page load
+/// needs. A pool of 1 (`CT_AGENT_TCP_FALLBACK_POOL_SIZE=1`) reproduces the
+/// old, implicit one-at-a-time behavior exactly.
+///
+/// [`config.tcp_fallback_pool_size`]: AgentConfig::tcp_fallback_pool_size
 async fn run_agent_tcp_fallback(
+    config: &AgentConfig,
+    edge_cert: CertificateDer<'static>,
+    token: RoutingToken,
+    origin_keys: Arc<Vec<[u8; 32]>>,
+) -> Result<(), BoxError> {
+    let n = config.tcp_fallback_pool_size.max(1);
+    let mut workers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let config = config.clone();
+        let edge_cert = edge_cert.clone();
+        let token = token.clone();
+        let origin_keys = Arc::clone(&origin_keys);
+        workers.push(tokio::spawn(async move {
+            run_agent_tcp_fallback_worker(&config, edge_cert, token, origin_keys).await
+        }));
+    }
+    // If any one worker gives up (its own backoff exhausted), that's fatal to
+    // the whole fallback mode, matching the pre-pool single-worker behavior --
+    // a customer running with a pool > 1 should learn about a systemic outage
+    // as loudly as they would have with a pool of 1.
+    for w in workers {
+        w.await??;
+    }
+    Ok(())
+}
+
+/// One TCP-fallback pool worker (#229): connect, register, serve one Client,
+/// repeat -- the body [`run_agent_tcp_fallback`] runs N of concurrently. Each
+/// registration is still single-use/single-Client; see that function's doc
+/// for why several of these run at once.
+async fn run_agent_tcp_fallback_worker(
     config: &AgentConfig,
     edge_cert: CertificateDer<'static>,
     token: RoutingToken,
@@ -642,7 +680,11 @@ mod tests {
         };
 
         // Agent: run the TCP fallback (connect + register + serve one tunnel).
-        let cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        // Pool size 1: this test's mock edge accepts exactly 2 connections
+        // total (one Agent registration + one Client), so the default pool
+        // (#229) would have the Agent alone consume both.
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), &origin_addr.to_string()).unwrap();
+        cfg.tcp_fallback_pool_size = 1;
         let ca_root_a = ca_root.clone();
         let a_token = token.clone();
         let agent = tokio::spawn(async move {
@@ -1146,6 +1188,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_fallback_pool_holds_n_registrations_parked_concurrently() {
+        // #229: a real browser page load opens several parallel connections
+        // per origin. With the old implicit pool-of-1, only ever one
+        // registration was parked at a time -- every simultaneous Client
+        // beyond the first got "no agent tunnel for token" even though the
+        // Agent process was completely healthy. Proves a pool of N actually
+        // holds N registrations parked AT ONCE (not released until this test
+        // says so), rather than one-at-a-time.
+        use ct_edge::pki::{build_dual_edge_from_ca, Ca};
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        const POOL: usize = 4;
+
+        let ca = Ca::new("pool-ca").unwrap();
+        let (_ep, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+            &ca,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            vec!["localhost".to_string()],
+        )
+        .await
+        .unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let registered = Arc::new(AtomicUsize::new(0));
+
+        // Edge: accept POOL registrations, ack each, then hold every stream
+        // open (parked, not dropped/relayed) so they stay outstanding at once
+        // -- proving the Agent actually opened POOL concurrent connections
+        // rather than opening #2 only after #1 finished.
+        let registered_e = registered.clone();
+        let edge = tokio::spawn(async move {
+            let mut held = Vec::with_capacity(POOL);
+            for _ in 0..POOL {
+                let (tcp, _) = tcp_listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let mut hdr = [0u8; 33];
+                tls.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], b'A');
+                tls.write_all(b"OK").await.unwrap();
+                tls.flush().await.unwrap();
+                registered_e.fetch_add(1, SeqCst);
+                held.push(tls); // keep it open -- prove it doesn't need to close first
+            }
+            // Hold until the test has observed all POOL, then let them drop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut cfg = AgentConfig::parse(&tcp_addr.to_string(), "127.0.0.1:9").unwrap();
+        cfg.tcp_fallback_pool_size = POOL;
+        let agent = tokio::spawn(async move {
+            let _ =
+                run_agent_tcp_fallback(&cfg, ca_root, RoutingToken([0x44u8; 32]), Arc::new(vec![[0u8; 32]])).await;
+        });
+
+        // If pooling didn't work (still one-at-a-time), this never reaches
+        // POOL within the bound -- the 2nd+ registration would only start
+        // once the edge released the 1st, which it deliberately never does
+        // here until the sleep above ends.
+        let mut reached = 0;
+        for _ in 0..300 {
+            reached = registered.load(SeqCst);
+            if reached >= POOL {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(reached, POOL, "all {POOL} registrations were parked concurrently, not one-at-a-time");
+
+        agent.abort();
+        edge.abort();
+    }
+
+    #[tokio::test]
     async fn run_agent_registers_and_serves_relayed_streams() {
         use ct_common::noise::{client_handshake_for, frame, generate_static_keypair};
         use ct_common::{Capability, OriginIdentity};
@@ -1205,6 +1321,7 @@ mod tests {
             browser_forward: false,
             hostname: None,
             fallback_443: false,
+            tcp_fallback_pool_size: 4,
         };
         let token_a = token.clone();
         let origin_priv = origin_kp.private;
