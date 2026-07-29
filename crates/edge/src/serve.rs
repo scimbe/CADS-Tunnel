@@ -268,12 +268,13 @@ where
 /// identically; the only difference is TLS-terminate-then-relay-plaintext
 /// versus relay-raw-bytes-through.
 ///
-/// Known, deliberate gap (not silently dropped): unlike
-/// [`serve_sni_passthrough`], this does not yet special-case a parked
-/// TCP-fallback agent ([`EdgeState::has_tcp_agent`]) — only the QUIC relay
-/// path. A Gelb-tier customer whose agent is on a UDP/QUIC-blocked network
-/// would fail to connect until that parity is added; tracked as a follow-up,
-/// not a reason to hold back the (far more common) QUIC path.
+/// Handles a parked TCP-fallback agent (UDP/QUIC blocked) the same as
+/// [`serve_sni_passthrough`] does — hand it the stream directly via
+/// [`EdgeState::deliver_to_tcp_agent`] rather than [`open_agent_stream`],
+/// which only ever looks at the QUIC registration and would otherwise fail
+/// "no agent tunnel for token" for a live but QUIC-less agent (found live,
+/// #229: an agent behind a UDP-blocking network hit exactly this before the
+/// fallback case was added here).
 pub async fn serve_gelb_terminated<S>(
     inbound: S,
     host: &str,
@@ -286,7 +287,22 @@ where
     let token = state
         .route_host(host)
         .ok_or_else(|| format!("no tunnel registered for host '{host}'"))?;
-    let mut tls = wildcard_acceptor.accept(inbound).await?;
+    let tls = wildcard_acceptor.accept(inbound).await?;
+    // #233 follow-up (found live, #229): a TCP-fallback agent (UDP/QUIC
+    // blocked) is parked with no QUIC connection to open a stream on at all
+    // -- `open_agent_stream` below would always fail "no agent tunnel for
+    // token" for it, indistinguishable from a genuinely dead agent. Hand it
+    // the DECRYPTED stream directly, the same way `serve_sni_passthrough`
+    // hands it the raw (still-encrypted) one -- the only difference is TLS
+    // already came off at the edge here.
+    if state.has_tcp_agent(&token) {
+        let boxed: crate::state::BoxedStream = Box::new(tls);
+        return match state.deliver_to_tcp_agent(&token, boxed) {
+            Ok(()) => Ok(()),
+            Err(_) => Err("tcp-fallback agent vanished before delivery".into()),
+        };
+    }
+    let mut tls = tls;
     let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
     let mut agent = join(agent_recv, agent_send);
     let (a, b) = relay(&mut tls, &mut agent).await?;
@@ -2710,6 +2726,79 @@ mod tests {
         agent_task.abort();
         edge_srv.abort();
         fd_task.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_gelb_terminated_delivers_the_decrypted_stream_to_a_parked_tcp_fallback_agent() {
+        // #229 (found live): an agent on a UDP/QUIC-blocked network registers
+        // over the TLS-TCP fallback, not QUIC -- `open_agent_stream` alone
+        // always fails "no agent tunnel for token" for it (there is no QUIC
+        // registration to open a stream on), indistinguishable from a
+        // genuinely dead agent. `serve_gelb_terminated` must hand the
+        // DECRYPTED stream to the parked TCP-fallback agent instead, exactly
+        // like `serve_sni_passthrough` already does for the raw one.
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        let certified = rcgen::generate_simple_self_signed(vec!["app.example.test".to_string()]).unwrap();
+        let wildcard_cert = certified.cert.der().clone();
+        let wildcard_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![wildcard_cert.clone()], wildcard_key)
+            .unwrap();
+        let wildcard_tls = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        let token = RoutingToken([0x88; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.register_host("app.example.test", token.clone());
+        state.set_cert_tier("app.example.test", true);
+        // Park a TCP-fallback "agent" instead of registering one over QUIC --
+        // this is the exact state a UDP-blocked agent leaves the edge in.
+        let parked_rx = state.park_tcp_agent(token.clone());
+        assert!(state.has_tcp_agent(&token), "agent is parked, not QUIC-registered");
+
+        let (browser_side, edge_inbound) = tokio::io::duplex(64 * 1024);
+        let state_g = state.clone();
+        let gelb_task = tokio::spawn(async move {
+            serve_gelb_terminated(edge_inbound, "app.example.test", &state_g, &wildcard_tls).await
+        });
+
+        // The "agent": receives the delivered (already-decrypted) stream and
+        // echoes back a fixed HTTP response, exactly as a plain-HTTP Gelb-tier
+        // origin would.
+        let agent_task = tokio::spawn(async move {
+            let mut stream = parked_rx.await.expect("agent receives the delivered stream");
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(buf[..n].starts_with(b"GET "), "agent sees a PLAINTEXT request -- TLS already stripped");
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 15\r\n\r\nhello tcp-agent")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(wildcard_cert).unwrap();
+        let ccfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let sni = rustls::pki_types::ServerName::try_from("app.example.test").unwrap();
+        let mut tls = connector.connect(sni, browser_side).await.expect("browser trusts the wildcard cert");
+        tls.write_all(b"GET / HTTP/1.0\r\nHost: app.example.test\r\n\r\n").await.unwrap();
+        let mut resp = Vec::new();
+        tls.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains("200 OK") && text.contains("hello tcp-agent"),
+            "delivered through the TCP-fallback path, not silently dropped: {text}"
+        );
+
+        agent_task.await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), gelb_task).await;
     }
 
     #[tokio::test]
