@@ -83,9 +83,13 @@ pub enum Convergence {
     NoNodesReachable,
 }
 
-/// Poll every node in `nodes` until all of them serve `expected` for `name`.
+/// Poll every node in `nodes` until all of them serve `expected` for `name`,
+/// a record in `zone` (used only for the SOA reachability probe below --
+/// pass the zone the caller already knows, e.g. from its own `DesecClient`,
+/// rather than have this module guess it from `name`).
 pub async fn wait_for_convergence(
     nodes: &[&str],
+    zone: &str,
     name: &str,
     expected: &str,
     timeout: Duration,
@@ -111,19 +115,39 @@ pub async fn wait_for_convergence(
             // quietly covering fewer nodes than it claims to) one layer down.
             let mut node_answered = false;
             for ip in ips {
-                if let Ok(values) = txt_at(*ip, name).await {
-                    node_answered = true;
-                    answered += 1;
-                    if !values.iter().any(|v| v == expected) {
-                        lagging.push(host.clone());
+                match txt_at(*ip, name).await {
+                    Ok(values) => {
+                        node_answered = true;
+                        answered += 1;
+                        if !values.iter().any(|v| v == expected) {
+                            lagging.push(host.clone());
+                        }
+                        break;
                     }
-                    break;
+                    // This cannot be read off the TXT query's own error: hickory
+                    // renders BOTH a genuine "no such record" answer from a live,
+                    // reachable server AND a bare timeout with the same "no
+                    // records found" text (confirmed directly against this same
+                    // fleet -- see dns01_authoritative.rs, which hit the exact
+                    // same rendering ambiguity for the same reason). Ask the same
+                    // address for the zone's SOA, which every authoritative
+                    // server for the zone must serve: an SOA answer proves the
+                    // node is live and the TXT miss is real lag; no SOA answer
+                    // means we could not reach this node at all.
+                    Err(_) => {
+                        if soa_reachable(*ip, zone).await {
+                            node_answered = true;
+                            answered += 1;
+                            lagging.push(host.clone());
+                            break;
+                        }
+                    }
                 }
             }
-            // Every address for this node failed -- that IS a real gap in
-            // this check's coverage, unlike a single-address miss. Surface
-            // it as lagging (conservative: keep waiting) rather than quietly
-            // dropping the node from consideration.
+            // Every address for this node failed even the SOA probe -- that IS
+            // a real gap in this check's coverage, unlike a single-address
+            // miss. Surface it as lagging (conservative: keep waiting) rather
+            // than quietly dropping the node from consideration.
             if !node_answered {
                 lagging.push(format!("{host} (unreachable on all {} address(es))", ips.len()));
             }
@@ -176,6 +200,24 @@ async fn txt_at(server: std::net::IpAddr, name: &str) -> Result<Vec<String>, Str
     Ok(lookup.iter().map(|t| t.to_string()).collect())
 }
 
+/// Ask one node for the zone's SOA -- a record every authoritative server for
+/// that zone must serve. Used purely as a liveness probe: a TXT-query error
+/// alone cannot distinguish "this node is live and simply doesn't have the
+/// record yet" from "this node never answered at all", since both render
+/// with the same "no records found" text.
+async fn soa_reachable(server: std::net::IpAddr, zone: &str) -> bool {
+    let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
+    let config = ResolverConfig::from_parts(None, Vec::new(), group);
+    let mut opts = ResolverOpts::default();
+    opts.timeout = QUERY_TIMEOUT;
+    opts.attempts = 1;
+    opts.cache_size = 0;
+    let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+        .with_options(opts)
+        .build();
+    resolver.soa_lookup(format!("{zone}.")).await.is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,7 +243,7 @@ mod tests {
         // is a fact about our network. Reporting it as lag would block an
         // issuance that is actually fine.
         let outcome =
-            wait_for_convergence(&["192.0.2.1.invalid"], "_acme-challenge.example.invalid", "v", Duration::from_millis(50))
+            wait_for_convergence(&["192.0.2.1.invalid"], "example.invalid", "_acme-challenge.example.invalid", "v", Duration::from_millis(50))
                 .await;
         assert_eq!(outcome, Convergence::NoNodesReachable);
     }
@@ -211,7 +253,7 @@ mod tests {
         // An empty list must never read as "everything agrees" -- that would
         // silently disable the check.
         let outcome =
-            wait_for_convergence(&[], "_acme-challenge.example.invalid", "v", Duration::from_millis(50)).await;
+            wait_for_convergence(&[], "example.invalid", "_acme-challenge.example.invalid", "v", Duration::from_millis(50)).await;
         assert_eq!(outcome, Convergence::NoNodesReachable);
     }
 }

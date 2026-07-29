@@ -88,9 +88,9 @@ async fn publish(
     // (this is also what makes the check work on a host with outbound
     // UDP/53 blocked entirely, unlike doing this client-side) and so a 200
     // response means what it says: this is actually live.
-    if matches!(state.provider.as_ref(), Dns01Provider::Desec(_)) {
+    if let Dns01Provider::Desec(client) = state.provider.as_ref() {
         use ct_dns::convergence::{wait_for_convergence, Convergence, DEFAULT_TIMEOUT, DESEC_NODES};
-        match wait_for_convergence(DESEC_NODES, &record_name, &req.value, DEFAULT_TIMEOUT).await {
+        match wait_for_convergence(DESEC_NODES, client.domain(), &record_name, &req.value, DEFAULT_TIMEOUT).await {
             Convergence::Converged { .. } => {}
             // We could not reach any node ourselves -- a fact about the
             // control plane's own network, not about deSEC. The write did
