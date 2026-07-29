@@ -310,6 +310,21 @@ impl AcmeClient {
         if let Some(checker) = authoritative {
             match checker.wait_for_all(record_name, txt_value).await {
                 Ok(()) => return self.complete_challenge(challenge_url, authz_url).await,
+                // Not one authoritative server answered us. That is a fact
+                // about THIS host's network -- outbound UDP/53 blocked, most
+                // often -- and says nothing about whether the record is live
+                // for Let's Encrypt. Failing here would block issuance that
+                // would otherwise succeed, which is exactly what happened on
+                // a reporter's host (#229). Fall through to the weaker
+                // public-resolver check instead of refusing outright.
+                Err(e) if e.contains(crate::dns01_authoritative::UNREACHABLE_MARKER) => {
+                    eprintln!(
+                        "ct-agent: {e}\n\
+                         ct-agent: falling back to public-resolver checking for DNS-01 -- weaker than \
+                         querying the authoritative servers, so a propagation race is likelier; the \
+                         whole-order retry is what covers that."
+                    );
+                }
                 Err(e) => return Err(format!("DNS-01 authoritative check failed: {e}").into()),
             }
         }

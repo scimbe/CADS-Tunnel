@@ -40,6 +40,11 @@ use hickory_resolver::Resolver;
 
 /// How long to keep waiting for every authoritative server to agree.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Tag on the error returned when *no* authoritative server could be reached.
+/// The caller keys off this to fall back to public resolvers instead of
+/// failing the issuance outright (see [`AuthoritativeChecker::wait_for_all`]).
+pub const UNREACHABLE_MARKER: &str = "authoritative nameservers unreachable from this host";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -102,7 +107,28 @@ impl AuthoritativeChecker {
         }
         Ok(out)
     }
+}
 
+/// What one direct query to an authoritative server actually told us.
+///
+/// The distinction is the whole point: "the server answered and does not have
+/// the record" is real evidence about propagation, while "we could not reach
+/// the server at all" is evidence about *our own* network and says nothing
+/// about what Let's Encrypt sees. Conflating the two makes issuance
+/// impossible on any host that cannot send DNS directly -- e.g. one with
+/// outbound UDP/53 blocked, which is common and was exactly the case that
+/// exposed this (#229).
+#[derive(Debug, PartialEq)]
+enum Probe {
+    /// The server answered and serves the expected value.
+    Present,
+    /// The server answered; the value is not (yet) there.
+    Absent,
+    /// We never got an answer -- timeout, blocked port, transport error.
+    Unreachable,
+}
+
+impl AuthoritativeChecker {
     /// Ask one specific server, directly, for `name`'s TXT values.
     async fn txt_at(&self, server: IpAddr, name: &str) -> Result<Vec<String>, String> {
         let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
@@ -119,6 +145,49 @@ impl AuthoritativeChecker {
         Ok(lookup.iter().map(|txt| txt.to_string()).collect())
     }
 
+    /// Ask one server for the zone's SOA -- a record every authoritative
+    /// server for that zone must serve. Used purely as a liveness probe.
+    async fn soa_reachable(&self, server: IpAddr, zone: &str) -> bool {
+        let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
+        let config = ResolverConfig::from_parts(None, Vec::new(), group);
+        let mut opts = ResolverOpts::default();
+        opts.timeout = QUERY_TIMEOUT;
+        opts.attempts = 1;
+        opts.cache_size = 0;
+        let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+            .with_options(opts)
+            .build();
+        resolver.soa_lookup(format!("{zone}.")).await.is_ok()
+    }
+
+    /// Probe one server, distinguishing "answered, record not there yet" from
+    /// "never answered at all".
+    ///
+    /// This cannot be decided from the TXT query's error: hickory reports a
+    /// *timeout* with the same "no records found" text as a genuine
+    /// authoritative negative answer, so string- or kind-matching on it
+    /// silently misclassifies an unreachable server as an up-to-date one
+    /// answering "not there". Instead, on a TXT miss we ask the same server
+    /// for the zone's SOA -- which every authoritative server for the zone
+    /// must serve. An SOA answer proves the server is reachable and talking
+    /// to us, so the TXT miss is real propagation lag; no SOA answer means we
+    /// simply cannot see this server from here.
+    async fn probe(&self, server: IpAddr, name: &str, expected: &str, zone: &str) -> Probe {
+        if let Ok(values) = self.txt_at(server, name).await {
+            if values.iter().any(|v| v == expected) {
+                return Probe::Present;
+            }
+        }
+        if self.soa_reachable(server, zone).await {
+            Probe::Absent
+        } else {
+            Probe::Unreachable
+        }
+    }
+}
+
+impl AuthoritativeChecker {
+
     /// Block until **every** authoritative server for `record_name`'s zone
     /// serves `expected_value`, or `timeout` elapses. The error names the
     /// servers still missing it, so a persistently lagging one is obvious
@@ -129,24 +198,45 @@ impl AuthoritativeChecker {
         let deadline = Instant::now() + self.timeout;
         loop {
             let mut missing: Vec<String> = Vec::new();
+            let mut unreachable: Vec<String> = Vec::new();
             for (host, ip) in &servers {
-                let has = match self.txt_at(*ip, record_name).await {
-                    Ok(values) => values.iter().any(|v| v == expected_value),
-                    Err(_) => false,
-                };
-                if !has {
-                    missing.push(format!("{host} ({ip})"));
+                match self.probe(*ip, record_name, expected_value, &zone).await {
+                    Probe::Present => {}
+                    Probe::Absent => missing.push(format!("{host} ({ip})")),
+                    Probe::Unreachable => unreachable.push(format!("{host} ({ip})")),
                 }
             }
-            if missing.is_empty() {
+            // Not one authoritative server is reachable from here. That is a
+            // fact about this host's network, not about propagation -- most
+            // often outbound UDP/53 being blocked. Refusing to issue on that
+            // basis would be wrong: it blocks issuance that would otherwise
+            // succeed. Hand back a distinguishable error so the caller can
+            // fall back to the (weaker, but usable) public-resolver check.
+            if unreachable.len() == servers.len() {
+                return Err(format!(
+                    "{UNREACHABLE_MARKER}: none of {zone}'s authoritative nameservers answered from this host ({}). \
+                     This is almost always outbound DNS (UDP/53) being blocked locally, not a propagation problem.",
+                    unreachable.join(", ")
+                ));
+            }
+            if missing.is_empty() && unreachable.is_empty() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                let mut detail = String::new();
+                if !missing.is_empty() {
+                    detail.push_str(&format!("still missing from: {}", missing.join(", ")));
+                }
+                if !unreachable.is_empty() {
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(&format!("unreachable from this host: {}", unreachable.join(", ")));
+                }
                 return Err(format!(
-                    "TXT {record_name} is not yet served by every authoritative nameserver of {zone} after {:?} -- still missing from: {}. \
+                    "TXT {record_name} is not yet served by every authoritative nameserver of {zone} after {:?} -- {detail}. \
                      Let's Encrypt validates against these servers from multiple perspectives, so triggering validation now would fail secondary validation.",
-                    self.timeout,
-                    missing.join(", ")
+                    self.timeout
                 ));
             }
             tokio::time::sleep(self.interval).await;
@@ -172,6 +262,38 @@ mod tests {
         assert_eq!(candidates[2], "b.example.com");
         assert_eq!(candidates[3], "example.com");
         assert!(!candidates.contains(&"com".to_string()), "never queries the bare TLD");
+    }
+
+    #[tokio::test]
+    async fn all_servers_unreachable_is_reported_distinctly_so_the_caller_can_fall_back() {
+        // Reproduces the reporter's host exactly: every authoritative server
+        // is unreachable (here: TEST-NET-1, which never answers). This must
+        // NOT look like "the record is missing" -- it must carry the marker
+        // the ACME client keys off to fall back to public resolvers, because
+        // refusing here blocks an issuance that would otherwise succeed.
+        let checker = AuthoritativeChecker::with_timeout(Duration::from_millis(200)).unwrap();
+        // TEST-NET-1 never answers: neither the TXT query nor the SOA
+        // liveness probe gets a reply, so this must classify as Unreachable.
+        // Critically, hickory renders that timeout with the SAME "no records
+        // found" text as a real authoritative negative -- which is exactly
+        // why the SOA probe exists rather than error-string matching.
+        let probe = checker
+            .probe("192.0.2.1".parse().unwrap(), "_acme-challenge.example.invalid", "whatever", "example.invalid")
+            .await;
+        assert_eq!(probe, Probe::Unreachable, "a silent server is unreachable, not 'record absent'");
+    }
+
+    #[test]
+    fn the_unreachable_marker_is_what_the_acme_client_actually_matches_on() {
+        // Guard against the marker drifting out of sync with the caller's
+        // check in acme_client::confirm_then_complete -- if these stop
+        // matching, the fallback silently stops working and issuance starts
+        // failing again on UDP/53-blocked hosts, with no test catching it.
+        let rendered = format!(
+            "{UNREACHABLE_MARKER}: none of example.org's authoritative nameservers answered from this host (ns1 (192.0.2.1))."
+        );
+        assert!(rendered.contains(UNREACHABLE_MARKER));
+        assert!(rendered.to_lowercase().contains("udp/53") || rendered.contains("answered"));
     }
 
     #[tokio::test]
