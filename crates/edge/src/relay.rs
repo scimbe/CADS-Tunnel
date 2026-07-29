@@ -33,6 +33,38 @@ where
 /// of waiting for more source data — and the per-direction byte count + trace
 /// make a stalled direction visible in real time (issue #2, mode b: the agent's
 /// reply reached the edge but never made it back to the client).
+/// Render an error together with its full `source()` chain.
+///
+/// Without this, a relay failure surfaces as the bare top-level message. For
+/// quinn that message is `"connection lost"` — the `WriteError`/`ReadError`
+/// variant name — which says a connection died but not *why*: the actual
+/// [`quinn::ConnectionError`] (`TimedOut`, `Reset`, `ApplicationClosed`, a
+/// transport error) is one `source()` hop down and was being dropped on the
+/// floor. That distinction is the whole diagnosis for a mid-flight relay
+/// death (#214): an idle-timeout death and a peer reset need opposite fixes,
+/// and "connection lost" alone cannot tell them apart.
+fn with_cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let text = s.to_string();
+        // quinn re-states the outer message on some hops; don't repeat it.
+        if !out.ends_with(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        src = s.source();
+    }
+    out
+}
+
+/// Annotate a relay I/O failure with its direction and full cause chain,
+/// keeping the original `ErrorKind` so callers can still match on it.
+fn relay_io_error(e: std::io::Error, dir: &str, label: &str) -> std::io::Error {
+    let kind = e.kind();
+    std::io::Error::new(kind, format!("relay {label} {dir}: {}", with_cause_chain(&e)))
+}
+
 async fn pump_dir<R, W>(mut r: R, mut w: W, dir: &str, label: &str) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -41,7 +73,7 @@ where
     let mut buf = [0u8; 16 * 1024];
     let mut total: u64 = 0;
     loop {
-        let n = r.read(&mut buf).await?;
+        let n = r.read(&mut buf).await.map_err(|e| relay_io_error(e, dir, label))?;
         if n == 0 {
             let _ = w.shutdown().await;
             break;
@@ -50,8 +82,8 @@ where
             relay_trace(format_args!("relay {label} {dir}: first {n} bytes"));
         }
         total += n as u64;
-        w.write_all(&buf[..n]).await?;
-        w.flush().await?;
+        w.write_all(&buf[..n]).await.map_err(|e| relay_io_error(e, dir, label))?;
+        w.flush().await.map_err(|e| relay_io_error(e, dir, label))?;
     }
     relay_trace(format_args!("relay {label} {dir}: {total} bytes total then EOF"));
     Ok(total)
@@ -105,9 +137,15 @@ pub async fn relay_two_connections(
     conn_b: &quinn::Connection,
     label: &str,
 ) -> std::io::Result<(u64, u64)> {
-    let to_io = |e: quinn::ConnectionError| std::io::Error::new(std::io::ErrorKind::Other, e);
-    let (send_a, recv_a) = conn_a.accept_bi().await.map_err(to_io)?;
-    let (send_b, recv_b) = conn_b.accept_bi().await.map_err(to_io)?;
+    // Name the stage as well as the ConnectionError: "connection lost" during
+    // stream setup and during the pump are different failures (#214).
+    let to_io = |stage: &'static str| {
+        move |e: quinn::ConnectionError| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("{label} {stage}: {e}"))
+        }
+    };
+    let (send_a, recv_a) = conn_a.accept_bi().await.map_err(to_io("accept_bi(a)"))?;
+    let (send_b, recv_b) = conn_b.accept_bi().await.map_err(to_io("accept_bi(b)"))?;
     relay_quic(send_a, recv_a, send_b, recv_b, label).await
 }
 
@@ -123,12 +161,18 @@ pub async fn relay_initiator_to_acceptor(
     acceptor_conn: &quinn::Connection,
     label: &str,
 ) -> std::io::Result<(u64, u64)> {
-    let to_io = |e: quinn::ConnectionError| std::io::Error::new(std::io::ErrorKind::Other, e);
+    // Name the stage as well as the ConnectionError: "connection lost" during
+    // stream setup and during the pump are different failures (#214).
+    let to_io = |stage: &'static str| {
+        move |e: quinn::ConnectionError| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("{label} {stage}: {e}"))
+        }
+    };
     // Initiator opened its data stream (actualised by Noise msg1) — accept it.
-    let (send_i, recv_i) = initiator_conn.accept_bi().await.map_err(to_io)?;
+    let (send_i, recv_i) = initiator_conn.accept_bi().await.map_err(to_io("accept_bi(initiator)"))?;
     // Open the data stream toward the acceptor; it becomes visible to the acceptor's
     // accept_bi as soon as relay_quic writes the first relayed bytes into it.
-    let (send_a, recv_a) = acceptor_conn.open_bi().await.map_err(to_io)?;
+    let (send_a, recv_a) = acceptor_conn.open_bi().await.map_err(to_io("open_bi(acceptor)"))?;
     // a = initiator, b = acceptor: recv_i (msg1…) → send_a, recv_a (msg2…) → send_i.
     relay_quic(send_i, recv_i, send_a, recv_a, label).await
 }
@@ -157,6 +201,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cause_chain_surfaces_the_underlying_reason_not_just_connection_lost() {
+        // #214: quinn's WriteError/ReadError::ConnectionLost displays as the
+        // bare string "connection lost", which is exactly the message that
+        // made this bug undiagnosable -- it says a connection died but hides
+        // WHICH ConnectionError killed it. The chain must carry that through.
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "timed out")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection lost")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let rendered = with_cause_chain(&Outer(Inner));
+        assert!(rendered.contains("connection lost"), "keeps the top-level message: {rendered}");
+        assert!(rendered.contains("timed out"), "and reveals the real cause: {rendered}");
+    }
+
+    #[test]
+    fn relay_io_error_names_the_direction_and_preserves_the_kind() {
+        // A stalled direction is half the diagnosis -- which way was dead
+        // narrows a mid-flight relay death considerably. The ErrorKind must
+        // survive so existing callers can still match on it.
+        let src = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "connection lost");
+        let e = relay_io_error(src, "a->b", "chan-42");
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "kind is preserved for callers");
+        let text = e.to_string();
+        assert!(text.contains("a->b"), "names the direction: {text}");
+        assert!(text.contains("chan-42"), "names the channel: {text}");
+    }
 
     #[tokio::test]
     async fn relay_streams_splices_two_generic_duplexes_both_directions() {
