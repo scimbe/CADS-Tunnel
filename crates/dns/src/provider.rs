@@ -204,20 +204,73 @@ impl DesecClient {
             self.base.trim_end_matches('/'),
             self.domain
         );
-        let resp = self
-            .http
-            .patch(&url)
-            .header("Authorization", format!("Token {}", self.token))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!("deSEC returned {} for {name}", resp.status()))
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let resp = self
+                .http
+                .patch(&url)
+                .header("Authorization", format!("Token {}", self.token))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+            // deSEC throttles writes. A throttled request is not a failure --
+            // it is a "come back shortly", and treating it as fatal surfaced
+            // to an agent as an opaque 502 mid-issuance (#229). acme.sh's own
+            // deSEC hook paces its writes for exactly this reason.
+            if is_throttled(status) && attempt <= THROTTLE_RETRIES {
+                let wait = retry_after(&resp).unwrap_or(THROTTLE_BACKOFF * attempt);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            // Carry deSEC's own message through. Without the body all an
+            // operator sees is the status, which is what made the throttling
+            // above look like a generic gateway fault instead of a rate limit.
+            let detail = resp.text().await.unwrap_or_default();
+            let detail = detail.trim();
+            return Err(if detail.is_empty() {
+                format!("deSEC returned {status} for {name}")
+            } else {
+                format!("deSEC returned {status} for {name}: {}", truncate(detail, 300))
+            });
         }
     }
+}
+
+/// How many times to re-send a write deSEC throttled before giving up.
+const THROTTLE_RETRIES: u32 = 4;
+/// Base pause when deSEC throttles without saying how long to wait.
+const THROTTLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether this status means "throttled, retry shortly" rather than a real
+/// failure. 429 is deSEC's documented throttle; 503 is the transient-overload
+/// case that behaves the same from a caller's point of view.
+fn is_throttled(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+}
+
+/// Honour a `Retry-After` (delta-seconds form) when the server sends one --
+/// guessing a backoff when the server has told us the answer is needless.
+fn retry_after(resp: &reqwest::Response) -> Option<std::time::Duration> {
+    let secs: u64 = resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()?;
+    // Don't let a hostile or broken header stall issuance indefinitely.
+    Some(std::time::Duration::from_secs(secs.min(60)))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Derive the deSEC `subname` for a full record name under `domain`
@@ -240,6 +293,7 @@ mod tests {
     use super::*;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
     use axum::routing::patch;
     use axum::Router;
     use std::sync::Mutex;
@@ -315,6 +369,83 @@ mod tests {
         client.clear_txt("_acme-challenge.bunsenbrenner.org").await.unwrap();
         let (_p, _a, body) = captured.lock().unwrap().clone().unwrap();
         assert!(body.contains("\"records\":[]"), "empty records clears it");
+    }
+
+    #[tokio::test]
+    async fn a_throttled_write_is_retried_not_surfaced_as_a_failure() {
+        // deSEC rate-limits writes. Treating a throttle as fatal is what
+        // reached an agent as an opaque 502 mid-issuance (#229) -- it must be
+        // waited out and retried instead.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let seen = calls.clone();
+        let app = Router::new().route(
+            "/domains/:domain/rrsets/",
+            patch(move |_body: String| {
+                let seen = seen.clone();
+                async move {
+                    // Throttle the first two, then accept -- proving the
+                    // retry loop actually re-sends rather than giving up.
+                    if seen.fetch_add(1, Ordering::SeqCst) < 2 {
+                        (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "0")], "rate limited")
+                            .into_response()
+                    } else {
+                        StatusCode::OK.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        client.set_txt("_acme-challenge.bunsenbrenner.org", "v").await.expect("succeeds after being throttled");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two throttles then the accepted write");
+    }
+
+    #[tokio::test]
+    async fn a_real_failure_carries_desecs_own_message_not_just_a_status() {
+        // Hiding the body is what made a rate limit indistinguishable from a
+        // gateway fault to whoever read the agent's error.
+        let app = Router::new().route(
+            "/domains/:domain/rrsets/",
+            patch(|_body: String| async {
+                (StatusCode::BAD_REQUEST, "{\"ttl\":[\"Ensure this value is greater than or equal to 3600.\"]}")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        let err = client.set_txt("_acme-challenge.bunsenbrenner.org", "v").await.unwrap_err();
+        assert!(err.contains("400"), "keeps the status: {err}");
+        assert!(err.contains("greater than or equal to 3600"), "and carries deSEC's own words: {err}");
+    }
+
+    #[test]
+    fn retry_after_is_capped_so_a_bad_header_cannot_stall_issuance() {
+        assert_eq!(truncate("abc", 10), "abc");
+        assert!(truncate(&"x".repeat(500), 300).ends_with('…'));
+        assert!(is_throttled(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_throttled(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_throttled(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_throttled(reqwest::StatusCode::UNAUTHORIZED));
     }
 
     #[tokio::test]
