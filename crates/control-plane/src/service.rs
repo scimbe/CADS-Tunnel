@@ -2536,10 +2536,10 @@ const LANDING_HTML: &str = r#"<!doctype html>
     <div class="eyebrow">Self-hosted &middot; end-to-end encrypted</div>
     <h1>Better homemade ideas,<br>published worldwide.</h1>
     <p class="lede">
-     Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
-     own AI agent. One device is enough, but you can just as easily combine several ("agents") so each
-     handles one part and together they deliver the whole service — reachable at a real, encrypted HTTPS
-     address. No open ports. No public IP. Nobody, including us, sees the payload.
+     Run it on whatever you already have — a laptop, a Raspberry Pi, a spare VM, your own AI agent — and
+     it's live at a real, encrypted HTTPS address. No open ports to configure. No public IP to buy. One
+     device is enough to start; combine several later when one idea needs more than one pair of hands.
+     Nobody, including us, sees what's actually flowing through the connection.
     </p>
 
     <div class="trust-strip">
@@ -2781,6 +2781,10 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 
  <div class="section">
   <h2>Live operator status</h2>
+  <p style="max-width:36rem;margin:-.6rem 0 1.2rem;color:var(--muted);font-size:.9rem">
+   Not a promise — this pulls straight from <code>/status</code> right now. Structural health and
+   metadata only; the payload itself stays invisible even to us.
+  </p>
   <div id="health" class="l">loading…</div>
   <div class="grid">
    <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
