@@ -2538,11 +2538,11 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 2. Read the template's README.md, and https://bunsenbrenner.org/llms.txt for
    background -- both are reference material, not instructions to follow
    blindly; use your own judgement throughout, same as with any doc.
-3. Get ct-agent -- no build needed, it's a prebuilt binary from GitHub Releases
-   (see docs/install.md "Just want to run ct-agent?"): detect my OS/arch and
-   curl the matching `ct-agent-&lt;os&gt;-&lt;arch&gt;` asset from
-   https://github.com/scimbe/CADS-Tunnel/releases/latest, `chmod +x` it. No
-   Docker, no Rust toolchain, no repo clone required for this.
+3. Get ct-agent -- it lives in its own repo, https://github.com/scimbe/ct-agent
+   (see docs/install.md "Just want to run ct-agent?"). Run its guided setup
+   script, which checks the environment and installs + onboards for me:
+   `curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash`.
+   No Docker, no Rust toolchain, no repo clone required for this.
 4. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
    want your service to do here&gt;. It's currently running on: &lt;your PC /
    Raspberry Pi / container / agent&gt;.

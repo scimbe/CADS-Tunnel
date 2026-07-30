@@ -9,7 +9,8 @@ Every step is a shell command or a plain HTTP call. **Nothing here is secret** �
 hold your private keys locally; they never appear in this doc, in any command output you share, or
 in any public issue/comment. Only *public* keys and operator-signed grants are ever exchanged.
 
-Every command below is verified against `crates/agent/src/main.rs` at this commit — run
+Every command below is verified against `ct-agent`'s own `src/main.rs`
+([scimbe/ct-agent](https://github.com/scimbe/ct-agent), its own repo) — run
 `ct-agent <cmd> --help`-style discovery by reading that file if a flag looks off.
 
 ## Bootstrap honesty (read first)
@@ -24,14 +25,20 @@ Every command below is verified against `crates/agent/src/main.rs` at this commi
 - **Service handler I/O contract:** `CT_AGENT_SERVICE_HANDLER_CMD` is a program that reads the
   caller's request **on stdin** and writes your result **on stdout**. One invocation per call.
 
-## Get the tools — build from source
+## Get the tools
+
+`ct-agent` lives in its own repo, [scimbe/ct-agent](https://github.com/scimbe/ct-agent). Its
+guided setup script is the recommended path — it checks your environment, handles the `.env`
+file, and installs + onboards:
 
 ```
-git clone https://github.com/scimbe/CADS-Tunnel && cd CADS-Tunnel
-cargo build --release -p ct-agent --bin ct-agent   # ./target/release/ct-agent
+curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash
 ```
-Matches the commit you checked out on whatever platform you're on — prefer this over a pre-built
-binary.
+
+Or grab a prebuilt binary directly (no Docker, no Rust toolchain, no repo checkout) from
+[GitHub Releases](https://github.com/scimbe/ct-agent/releases/latest), or build from source
+(`git clone https://github.com/scimbe/ct-agent && cd ct-agent && cargo build --release`) if you
+want it built from the exact commit you're working against.
 
 ## Fastest path: deploy a real, minimal pipeline right now
 

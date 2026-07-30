@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::header;
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
 
@@ -299,7 +299,7 @@ pub fn brokered_channel_one_liner(p: &BrokeredChannelOneLiner, os: InstallOs) ->
 /// It detects OS+arch, downloads the matching prebuilt `ct-agent` from `release_base`,
 /// and execs `ct-agent channel` — which reads the `CT_CHANNEL_*` config (role, addr,
 /// Noise keys) from the environment the one-liner set, so no key is ever a script
-/// argument. Mirrors [`render_install_sh`]; the served route is in [`installer_router`].
+/// argument. The served route is in [`installer_router`].
 pub fn render_channel_sh(portal_base: &str, release_base: &str) -> String {
     let base = release_base.trim_end_matches('/');
     let portal = portal_base.trim_end_matches('/');
@@ -404,159 +404,13 @@ Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
 & $exe channel
 "#;
 
-/// Render the POSIX `/install.sh` script the Unix one-liner pipes into `sh`
-/// (#75 IS3a). It detects OS+arch, downloads the matching prebuilt `ct-agent`
-/// binary from `release_base` (the GitHub-Releases-style asset base, e.g.
-/// `https://github.com/scimbe/CADS-Tunnel/releases/latest/download`), and execs
-/// `ct-agent onboard` — which reads `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN` from the
-/// environment the one-liner set, so no secret is ever a script argument. This is
-/// the served script CONTENT; wiring the `/install.sh` route is IS3b and the
-/// prebuilt release binaries it downloads are IS2.
-///
-/// `edge_addr` is this deployment's mesh-plane `host:port` (`CT_AGENT_EDGE`) —
-/// deployment-wide, so safe to bake into the shared script alongside
-/// `portal`/`base`. Also exports `CT_AGENT_CP_URL`/`CT_AGENT_EDGE_CERT_URL`
-/// (both = `portal`) and, if not already set, a locally-generated `CT_AGENT_ID`.
-/// Without these, a real onboarding attempt either fails outright
-/// (`CT_AGENT_CP_URL is required for onboarding`) or — worse — hangs forever:
-/// `ct-agent`'s cert fetch falls back to polling a shared-docker-volume path
-/// that only exists inside this deployment's own compose network, and by design
-/// (main.rs) waits indefinitely rather than giving up, since other deployments
-/// rely on that same wait succeeding once the edge publishes its cert. This was
-/// live-verified missing (a real external onboarding attempt hung exactly this
-/// way) — the fix is every entry point setting `CT_AGENT_EDGE_CERT_URL`, not
-/// changing that fallback's behavior.
-///
-/// `release_base`/`edge_addr` are trusted config (never user input); any
-/// trailing slash on `portal_base`/`release_base` is trimmed. The script is
-/// `set -eu`, fails loudly on an unsupported OS/arch, and installs into a fresh
-/// temp dir.
-pub fn render_install_sh(portal_base: &str, release_base: &str, edge_addr: &str) -> String {
-    let base = release_base.trim_end_matches('/');
-    let portal = portal_base.trim_end_matches('/');
-    format!(
-        r#"#!/bin/sh
-# CADS-Tunnel agent installer (#75). Piped from the portal one-liner:
-#   curl -fsSL <portal>/install.sh | CT_BOOTSTRAP=... sh
-# Run this on the machine you want to expose (the origin), not your laptop.
-set -eu
-
-os=$(uname -s | tr '[:upper:]' '[:lower:]')
-arch=$(uname -m)
-case "$arch" in
-  x86_64|amd64) arch=x86_64 ;;
-  aarch64|arm64) arch=aarch64 ;;
-  *) echo "ct-agent install: unsupported architecture '$arch'" >&2; exit 1 ;;
-esac
-case "$os" in
-  linux|darwin) ;;
-  *) echo "ct-agent install: unsupported OS '$os' (use the manual path)" >&2; exit 1 ;;
-esac
-
-# #90/#97 SEC90b: if a short-lived bootstrap token is set, redeem it server-side
-# over TLS for the real tokens (kept off the command line / shell history / ps);
-# otherwise fall back to tokens set directly in the environment (manual path). The
-# redeemed bundle and its tokens are hex, so each is lifted with a single sed — no
-# nested-JSON parsing and no eval of server data.
-if [ -n "${{CT_BOOTSTRAP:-}}" ]; then
-  resp=$(curl -fsSL -X POST -H 'content-type: application/json' \
-    --data "{{\"token\":\"$CT_BOOTSTRAP\"}}" "{portal}/bootstrap/redeem")
-  bundle=$(printf '%s' "$resp" | sed -n 's/.*"secret":"\([^"]*\)".*/\1/p')
-  CT_JOIN_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_JOIN_TOKEN=\([^;"]*\).*/\1/p')
-  CT_AGENT_TOKEN=$(printf '%s' "$bundle" | sed -n 's/.*CT_AGENT_TOKEN=\([^;"]*\).*/\1/p')
-  export CT_JOIN_TOKEN CT_AGENT_TOKEN
-fi
-: "${{CT_JOIN_TOKEN:?set CT_BOOTSTRAP (or CT_JOIN_TOKEN) from the portal install page}}"
-: "${{CT_AGENT_TOKEN:?set CT_BOOTSTRAP (or CT_AGENT_TOKEN) from the portal install page}}"
-
-# Deployment-wide config ct-agent's onboard flow requires -- not secrets, so
-# safe to default here; override any of these yourself if you know better.
-: "${{CT_AGENT_CP_URL:={portal}}}"
-: "${{CT_AGENT_EDGE:={edge_addr}}}"
-: "${{CT_AGENT_EDGE_CERT_URL:={portal}}}"
-: "${{CT_AGENT_ID:=agent-$(date +%s)-$$}}"
-export CT_AGENT_CP_URL CT_AGENT_EDGE CT_AGENT_EDGE_CERT_URL CT_AGENT_ID
-
-asset="ct-agent-${{os}}-${{arch}}"
-url="{base}/${{asset}}"
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-echo "ct-agent install: downloading $url" >&2
-curl -fsSL "$url" -o "$tmp/ct-agent"
-chmod +x "$tmp/ct-agent"
-# Tokens are inherited from the environment (never on the command line).
-exec "$tmp/ct-agent" onboard
-"#,
-        base = base,
-        portal = portal,
-        edge_addr = edge_addr,
-    )
-}
-
-/// Render the PowerShell `/install.ps1` script the Windows one-liner pipes into
-/// `iex` (#75 IS4 — the Windows analog of [`render_install_sh`]). It detects the
-/// arch, downloads the matching prebuilt `ct-agent-windows-<arch>.exe` from
-/// `release_base`, and runs `ct-agent onboard` — which reads
-/// `CT_JOIN_TOKEN`/`CT_AGENT_TOKEN` from the environment the one-liner set (never a
-/// command argument). `release_base`/`edge_addr` are trusted config, trailing
-/// slash on `portal_base`/`release_base` trimmed. Also sets
-/// `CT_AGENT_CP_URL`/`CT_AGENT_EDGE`/`CT_AGENT_EDGE_CERT_URL`/`CT_AGENT_ID` --
-/// see [`render_install_sh`]'s doc comment for why these matter (missing
-/// `CT_AGENT_EDGE_CERT_URL` in particular hangs the agent forever, not just
-/// errors). This is the served script CONTENT; the `/install.ps1` route is IS3b
-/// and the prebuilt release binaries are IS2. Uses a placeholder + replace
-/// rather than `format!` so PowerShell's `{}` blocks need no brace-escaping.
-pub fn render_install_ps1(portal_base: &str, release_base: &str, edge_addr: &str) -> String {
-    INSTALL_PS1_TEMPLATE
-        .replace("__RELEASE_BASE__", release_base.trim_end_matches('/'))
-        .replace("__PORTAL_BASE__", portal_base.trim_end_matches('/'))
-        .replace("__EDGE_ADDR__", edge_addr)
-}
-
-const INSTALL_PS1_TEMPLATE: &str = r#"#Requires -Version 5
-# CADS-Tunnel agent installer (#75). Piped from the portal one-liner:
-#   $env:CT_BOOTSTRAP='...'; irm <portal>/install.ps1 | iex
-# Run this on the machine you want to expose (the origin), not your laptop.
-$ErrorActionPreference = 'Stop'
-# #90/#97 SEC90b: redeem a short-lived bootstrap token server-side over TLS for the
-# real tokens (kept off the command line); else fall back to env tokens (manual path).
-if ($env:CT_BOOTSTRAP) {
-  $resp = Invoke-RestMethod -Method Post -Uri '__PORTAL_BASE__/bootstrap/redeem' -ContentType 'application/json' -Body (ConvertTo-Json @{ token = $env:CT_BOOTSTRAP })
-  $bundle = $resp.secret
-  if ($bundle -match 'CT_JOIN_TOKEN=([^;]*)')  { $env:CT_JOIN_TOKEN  = $Matches[1] }
-  if ($bundle -match 'CT_AGENT_TOKEN=([^;]*)') { $env:CT_AGENT_TOKEN = $Matches[1] }
-}
-if (-not $env:CT_JOIN_TOKEN)  { Write-Error 'ct-agent install: set CT_BOOTSTRAP (or CT_JOIN_TOKEN) from the portal install page';  exit 1 }
-if (-not $env:CT_AGENT_TOKEN) { Write-Error 'ct-agent install: set CT_BOOTSTRAP (or CT_AGENT_TOKEN) from the portal install page'; exit 1 }
-# Deployment-wide config ct-agent's onboard flow requires -- not secrets, so
-# safe to default here; override any of these yourself if you know better.
-if (-not $env:CT_AGENT_CP_URL)        { $env:CT_AGENT_CP_URL = '__PORTAL_BASE__' }
-if (-not $env:CT_AGENT_EDGE)          { $env:CT_AGENT_EDGE = '__EDGE_ADDR__' }
-if (-not $env:CT_AGENT_EDGE_CERT_URL) { $env:CT_AGENT_EDGE_CERT_URL = '__PORTAL_BASE__' }
-if (-not $env:CT_AGENT_ID)            { $env:CT_AGENT_ID = "agent-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$PID" }
-$arch = switch ($env:PROCESSOR_ARCHITECTURE) {
-  'AMD64' { 'x86_64' }
-  'ARM64' { 'aarch64' }
-  default { Write-Error "ct-agent install: unsupported architecture '$($env:PROCESSOR_ARCHITECTURE)'"; exit 1 }
-}
-$asset = "ct-agent-windows-$arch.exe"
-$url = "__RELEASE_BASE__/$asset"
-$dir = Join-Path $env:TEMP ("ct-agent-" + [System.Guid]::NewGuid().ToString())
-New-Item -ItemType Directory -Path $dir -Force | Out-Null
-$exe = Join-Path $dir $asset
-Write-Host "ct-agent install: downloading $url"
-Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-# Tokens are inherited from the environment (never on the command line).
-& $exe onboard
-"#;
-
-/// Serve `/install.sh` and `/install.ps1` (#75 IS3b) — the routes every portal
-/// install one-liner (`curl -fsSL <portal>/install.sh | … sh`, `irm
-/// <portal>/install.ps1 | iex`) fetches. Before this, both URLs 404'd and the
-/// customer command dead-ended (the reported bug). `release_base` is the trusted
-/// GitHub-Releases asset base the rendered scripts download the prebuilt
-/// `ct-agent` from (IS2); it is config, never user input. Serving is read-only and
-/// carries no secret — the tokens live only in the environment the one-liner sets.
+/// `/install.sh` and `/install.ps1` (#75 IS3b originally, now retired in favor of
+/// ct-agent's own richer setup script) redirect to that script's raw content
+/// (`serve_install_sh`/`serve_install_ps1`) rather than serving a rendered one —
+/// any existing `curl -fsSL <portal>/install.sh | … sh` one-liner keeps working
+/// transparently. `/channel.sh`/`/channel.ps1` are unaffected: a different
+/// subcommand (Agent-Fabric channel setup, not the tunnel-install path this
+/// script's replacement covers), still rendered and served directly.
 pub fn installer_router(portal_base: String, release_base: String, edge_addr: String) -> Router {
     Router::new()
         .route("/install.sh", get(serve_install_sh))
@@ -581,20 +435,21 @@ struct InstallerState {
     edge_addr: Arc<String>,
 }
 
-async fn serve_install_sh(State(st): State<InstallerState>) -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        render_install_sh(&st.portal_base, &st.release_base, &st.edge_addr),
-    )
-        .into_response()
+/// `ct-agent` moved to its own repo (scimbe/ct-agent), which ships a much richer
+/// guided setup script (environment checks, a Docker mode, Rot/Gelb/Grün status
+/// reporting, stop/reset commands) than this thin one-liner ever did. Rather than
+/// leave old `curl -fsSL <portal>/install.sh | sh` links/docs dead, redirect them
+/// straight to that script's raw content -- `curl -fsSL` follows redirects, so
+/// existing invocations keep working transparently and just get the better script.
+const CT_AGENT_SETUP_SH: &str = "https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh";
+const CT_AGENT_SETUP_PS1: &str = "https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1";
+
+async fn serve_install_sh() -> Redirect {
+    Redirect::temporary(CT_AGENT_SETUP_SH)
 }
 
-async fn serve_install_ps1(State(st): State<InstallerState>) -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        render_install_ps1(&st.portal_base, &st.release_base, &st.edge_addr),
-    )
-        .into_response()
+async fn serve_install_ps1() -> Redirect {
+    Redirect::temporary(CT_AGENT_SETUP_PS1)
 }
 
 async fn serve_channel_sh(State(st): State<InstallerState>) -> Response {
@@ -616,96 +471,6 @@ async fn serve_channel_ps1(State(st): State<InstallerState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn install_ps1_detects_arch_downloads_and_onboards() {
-        let ps = render_install_ps1(
-            "https://portal.example/",
-            "https://github.com/scimbe/CADS-Tunnel/releases/latest/download/",
-            "portal.example:4433",
-        );
-        assert!(ps.contains("#Requires -Version 5"), "PowerShell header");
-        assert!(ps.contains("$ErrorActionPreference = 'Stop'"), "fail-fast");
-        assert!(ps.contains("PROCESSOR_ARCHITECTURE"), "detects arch");
-        assert!(ps.contains("'AMD64'") && ps.contains("'ARM64'") && ps.contains("x86_64") && ps.contains("aarch64"), "normalises arch");
-        assert!(ps.contains(r#"$asset = "ct-agent-windows-$arch.exe""#), "per-arch windows asset");
-        assert!(
-            ps.contains(r#"$url = "https://github.com/scimbe/CADS-Tunnel/releases/latest/download/$asset""#),
-            "downloads from the release base (trailing slash trimmed)"
-        );
-        assert!(ps.contains("$env:CT_JOIN_TOKEN") && ps.contains("$env:CT_AGENT_TOKEN"), "requires the env tokens");
-        assert!(ps.contains("& $exe onboard"), "runs the agent onboarding");
-        // No secret is ever a positional argument.
-        assert!(!ps.contains("onboard $env:CT_JOIN_TOKEN"), "tokens stay in the env, not argv");
-        // #90/#97 SEC90b: redeems CT_BOOTSTRAP against the portal (trailing slash trimmed).
-        assert!(ps.contains("if ($env:CT_BOOTSTRAP)"), "has the bootstrap-redeem branch");
-        assert!(
-            ps.contains("-Uri 'https://portal.example/bootstrap/redeem'"),
-            "redeems against the portal origin"
-        );
-        // A real onboarding attempt hung forever waiting for a shared-volume cert
-        // path that only exists inside the operator's own compose network -- these
-        // four must be set (defaulted here, not left for the user to guess) or
-        // onboard() either errors outright or hangs indefinitely (main.rs).
-        assert!(ps.contains("$env:CT_AGENT_CP_URL = 'https://portal.example'"), "sets CT_AGENT_CP_URL");
-        assert!(ps.contains("$env:CT_AGENT_EDGE = 'portal.example:4433'"), "sets CT_AGENT_EDGE");
-        assert!(
-            ps.contains("$env:CT_AGENT_EDGE_CERT_URL = 'https://portal.example'"),
-            "sets CT_AGENT_EDGE_CERT_URL so the agent self-fetches the CA root instead of hanging"
-        );
-        assert!(ps.contains("$env:CT_AGENT_ID = "), "generates an agent id if the caller didn't set one");
-    }
-
-    #[test]
-    fn install_sh_detects_os_arch_downloads_and_onboards() {
-        let sh = render_install_sh(
-            "https://portal.example/",
-            "https://github.com/scimbe/CADS-Tunnel/releases/latest/download/",
-            "portal.example:4433",
-        );
-        // POSIX + fail-fast.
-        assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang");
-        assert!(sh.contains("set -eu"), "fail-fast");
-        // OS + arch detection with a normalised asset name.
-        assert!(sh.contains("uname -s") && sh.contains("uname -m"), "detects OS + arch");
-        assert!(sh.contains("aarch64") && sh.contains("x86_64"), "normalises arch aliases");
-        assert!(sh.contains(r#"asset="ct-agent-${os}-${arch}""#), "per-OS/arch asset name");
-        // Downloads from the release base (trailing slash trimmed — no `//`).
-        assert!(
-            sh.contains(r#"url="https://github.com/scimbe/CADS-Tunnel/releases/latest/download/${asset}""#),
-            "downloads the matching binary from the release base"
-        );
-        // Requires the tokens from the env (not as args) and execs onboard.
-        assert!(sh.contains("CT_JOIN_TOKEN:?") && sh.contains("CT_AGENT_TOKEN:?"), "requires the env tokens");
-        assert!(sh.contains(r#"exec "$tmp/ct-agent" onboard"#), "execs the agent onboarding");
-        // No secret is ever a positional argument.
-        assert!(!sh.contains("onboard $CT_JOIN_TOKEN") && !sh.contains("onboard \""), "tokens stay in the env");
-        // #90/#97 SEC90b: redeems CT_BOOTSTRAP against the portal (trailing slash trimmed).
-        assert!(sh.contains(r#"if [ -n "${CT_BOOTSTRAP:-}" ]; then"#), "has the bootstrap-redeem branch");
-        assert!(
-            sh.contains("https://portal.example/bootstrap/redeem"),
-            "redeems against the portal origin"
-        );
-        assert!(!sh.contains("$CT_BOOTSTRAP\" \\"), "bootstrap token is not on a command line as an arg");
-        // A real onboarding attempt hung forever waiting for a shared-volume cert
-        // path that only exists inside the operator's own compose network -- these
-        // four must be set (defaulted here, not left for the user to guess) or
-        // onboard() either errors outright or hangs indefinitely (main.rs).
-        assert!(sh.contains(": \"${CT_AGENT_CP_URL:=https://portal.example}\""), "defaults CT_AGENT_CP_URL");
-        assert!(sh.contains(": \"${CT_AGENT_EDGE:=portal.example:4433}\""), "defaults CT_AGENT_EDGE");
-        assert!(
-            sh.contains(": \"${CT_AGENT_EDGE_CERT_URL:=https://portal.example}\""),
-            "defaults CT_AGENT_EDGE_CERT_URL so the agent self-fetches the CA root instead of hanging"
-        );
-        assert!(
-            sh.contains(": \"${CT_AGENT_ID:=agent-"),
-            "generates an agent id if the caller didn't set one"
-        );
-        assert!(
-            sh.contains("export CT_AGENT_CP_URL CT_AGENT_EDGE CT_AGENT_EDGE_CERT_URL CT_AGENT_ID"),
-            "actually exports the defaulted vars for the exec'd process"
-        );
-    }
 
     #[tokio::test]
     async fn channel_scripts_are_served_and_exec_ct_agent_channel() {
@@ -884,208 +649,43 @@ mod tests {
         assert_eq!(InstallOs::parse("plan9"), None);
     }
 
-    /// #75 IS5 — end-to-end: fetch `/install.sh` from the real route, then actually
-    /// *run* it and prove the whole path works — OS/arch detection, the download
-    /// step, and `exec ct-agent onboard` with the tokens inherited from the
-    /// environment (never argv). Hermetic: a fake `curl` on `PATH` intercepts the
-    /// binary download and drops a stub `ct-agent` (so no network / no published
-    /// release is needed), and the stub records how it was invoked. Unix-only —
-    /// the served script is POSIX `sh`.
-    #[cfg(unix)]
+    /// ct-agent moved to its own repo with a much richer setup script; `/install.sh`
+    /// and `/install.ps1` now redirect to it rather than serving a rendered
+    /// one-liner, so any existing `curl -fsSL <portal>/install.sh | sh` (curl
+    /// follows redirects) keeps working transparently and gets the better script.
     #[tokio::test]
-    async fn served_install_sh_runs_end_to_end_with_tokens_from_the_env() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use http_body_util::BodyExt;
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-        use tower::ServiceExt;
-
-        // The served script — fetched through the real route, not rendered inline.
-        let app = installer_router(
-            "https://portal.example".to_string(),
-            "http://release.invalid/base".to_string(),
-            "portal.example:4433".to_string(),
-        );
-        let resp = app
-            .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let script = String::from_utf8(body.to_vec()).unwrap();
-
-        // A private working dir (pid-scoped so parallel test runs don't collide).
-        let dir = std::env::temp_dir().join(format!("ct-is5-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("bin")).unwrap();
-        let write_exec = |path: &std::path::Path, body: &str| {
-            fs::write(path, body).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        };
-
-        // Stub ct-agent: records the subcommand + both secrets + the four
-        // deployment-config vars (#153: these hung real onboarding forever when
-        // missing) so we can assert every one of them actually arrived via env.
-        let stub = dir.join("ct-agent-stub");
-        write_exec(
-            &stub,
-            "#!/bin/sh\necho \"$1|$CT_JOIN_TOKEN|$CT_AGENT_TOKEN|$CT_AGENT_CP_URL|$CT_AGENT_EDGE|$CT_AGENT_EDGE_CERT_URL|$CT_AGENT_ID\" > \"$CT_IS5_OUT\"\n",
-        );
-        // Fake curl: ignore everything except `-o <target>`, into which it copies the
-        // stub — standing in for downloading the release binary.
-        write_exec(
-            &dir.join("bin/curl"),
-            "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift 2;; *) shift;; esac; done\ncp \"$CT_IS5_STUB\" \"$out\"\n",
-        );
-        let script_path = dir.join("install.sh");
-        fs::write(&script_path, &script).unwrap();
-        let out = dir.join("out.txt");
-
-        let status = Command::new("sh")
-            .arg(&script_path)
-            .env("PATH", format!("{}/bin:{}", dir.display(), std::env::var("PATH").unwrap_or_default()))
-            .env("CT_JOIN_TOKEN", "join-XYZ")
-            .env("CT_AGENT_TOKEN", "agent-XYZ")
-            .env("CT_IS5_STUB", &stub)
-            .env("CT_IS5_OUT", &out)
-            .status()
-            .expect("run served install.sh");
-        assert!(status.success(), "the served installer runs to completion");
-
-        let recorded = fs::read_to_string(&out).expect("stub ct-agent ran");
-        let fields: Vec<&str> = recorded.trim().split('|').collect();
-        assert_eq!(
-            fields[..3],
-            ["onboard", "join-XYZ", "agent-XYZ"],
-            "ct-agent is exec'd with `onboard` and both tokens inherited from the env (not argv)"
-        );
-        // #153: without these, onboard() either errors ("CT_AGENT_CP_URL is
-        // required") or -- missing CT_AGENT_EDGE_CERT_URL specifically -- hangs
-        // forever polling a shared-volume path that doesn't exist outside the
-        // operator's own compose network. Proves the script's own `:=` defaults
-        // actually reach the exec'd process, not just that they're in the source.
-        assert_eq!(fields[3], "https://portal.example", "CT_AGENT_CP_URL defaulted and exported");
-        assert_eq!(fields[4], "portal.example:4433", "CT_AGENT_EDGE defaulted and exported");
-        assert_eq!(
-            fields[5], "https://portal.example",
-            "CT_AGENT_EDGE_CERT_URL defaulted and exported -- the actual missing piece that hung a real onboarding attempt"
-        );
-        assert!(fields[6].starts_with("agent-"), "CT_AGENT_ID auto-generated when unset: {}", fields[6]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// #90/#97 SEC90b end-to-end: with only CT_BOOTSTRAP set, the served install.sh
-    /// redeems it server-side, extracts the two real tokens from the bundle, and
-    /// onboards with them — proving the sed extraction + export works in a real POSIX
-    /// `sh` and that no real token was ever on the command line.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn served_install_sh_redeems_a_bootstrap_token_for_the_real_tokens() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use http_body_util::BodyExt;
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-        use tower::ServiceExt;
-
-        let app = installer_router(
-            "https://portal.example".to_string(),
-            "http://release.invalid/base".to_string(),
-            "portal.example:4433".to_string(),
-        );
-        let resp = app
-            .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let script = String::from_utf8(body.to_vec()).unwrap();
-
-        let dir = std::env::temp_dir().join(format!("ct-is5b-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("bin")).unwrap();
-        let write_exec = |path: &std::path::Path, body: &str| {
-            fs::write(path, body).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-        };
-
-        let stub = dir.join("ct-agent-stub");
-        write_exec(&stub, "#!/bin/sh\necho \"$1|$CT_JOIN_TOKEN|$CT_AGENT_TOKEN\" > \"$CT_IS5_OUT\"\n");
-        // Fake curl: a `-o <target>` call is the binary download (copy the stub); any
-        // other call is the /bootstrap/redeem POST — emit the {secret:...} JSON the
-        // real handler returns, wrapping the shell-tractable bundle.
-        write_exec(
-            &dir.join("bin/curl"),
-            "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=$2; shift 2;; *) shift;; esac; done\nif [ -n \"$out\" ]; then cp \"$CT_IS5_STUB\" \"$out\"; else printf '%s' '{\"secret\":\"CT_JOIN_TOKEN=join-BOOT;CT_AGENT_TOKEN=agent-BOOT\"}'; fi\n",
-        );
-        let script_path = dir.join("install.sh");
-        fs::write(&script_path, &script).unwrap();
-        let out = dir.join("out.txt");
-
-        let status = Command::new("sh")
-            .arg(&script_path)
-            .env("PATH", format!("{}/bin:{}", dir.display(), std::env::var("PATH").unwrap_or_default()))
-            // Only the bootstrap token is present — NOT the real tokens.
-            .env("CT_BOOTSTRAP", "boot-XYZ")
-            .env_remove("CT_JOIN_TOKEN")
-            .env_remove("CT_AGENT_TOKEN")
-            .env("CT_IS5_STUB", &stub)
-            .env("CT_IS5_OUT", &out)
-            .status()
-            .expect("run served install.sh with a bootstrap token");
-        assert!(status.success(), "the served installer redeems + runs to completion");
-
-        let recorded = fs::read_to_string(&out).expect("stub ct-agent ran");
-        assert_eq!(
-            recorded.trim(),
-            "onboard|join-BOOT|agent-BOOT",
-            "the bootstrap token was redeemed server-side into the two real tokens, passed via env"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn installer_routes_serve_the_scripts_that_were_404ing() {
-        // #75 IS3b (the reported bug): the portal one-liners curl/irm these two
-        // URLs, which had no route and returned 404 live. Assert they now serve the
-        // rendered scripts (200 + the matching renderer body + release base) so the
-        // customer command no longer dead-ends.
+    async fn install_routes_redirect_to_the_ct_agent_setup_scripts() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
-        use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let portal = "https://portal.example";
-        let base = "https://github.com/scimbe/CADS-Tunnel/releases/latest/download";
-        let edge = "portal.example:4433";
-        let app = installer_router(portal.to_string(), base.to_string(), edge.to_string());
+        let app = installer_router(
+            "https://portal.example".to_string(),
+            "http://release.invalid/base".to_string(),
+            "portal.example:4433".to_string(),
+        );
 
-        // /install.sh -> 200 shell script.
         let resp = app
             .clone()
             .oneshot(Request::get("/install.sh").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "/install.sh is served, not 404");
-        let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
-        assert!(ct.starts_with("text/x-shellscript"), "sh content-type: {ct}");
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let sh = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(sh, render_install_sh(portal, base, edge), "serves exactly the rendered installer");
-        assert!(sh.starts_with("#!/bin/sh") && sh.contains(base), "real script for this release base");
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT, "/install.sh redirects, not 404");
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh")
+        );
 
-        // /install.ps1 -> 200 PowerShell script.
         let resp = app
             .clone()
             .oneshot(Request::get("/install.ps1").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "/install.ps1 is served, not 404");
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let ps = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(ps, render_install_ps1(portal, base, edge), "serves exactly the rendered PowerShell installer");
-        assert!(ps.contains("#Requires -Version 5") && ps.contains(base), "real ps1 for this release base");
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT, "/install.ps1 redirects, not 404");
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1")
+        );
     }
 
     #[test]

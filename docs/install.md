@@ -2,28 +2,27 @@
 
 ## Just want to run `ct-agent`? Skip the repo entirely.
 
-If you're exposing a tunnel, serving a pipeline role, or publishing a pipeline — not
-running the core system (control-plane + edge) yourself — you don't need to clone or
-build anything. A prebuilt `ct-agent` binary ships with every release:
+`ct-agent` lives in its own repo, [scimbe/ct-agent](https://github.com/scimbe/ct-agent) —
+if you're exposing a tunnel, serving a pipeline role, or publishing a pipeline (not
+running the core system yourself), that's the only place you need. Its guided setup
+script checks your environment, walks you through a `.env` file (from your tunnel's
+Install page on the portal), and installs + onboards for you:
 
 ```bash
-curl -fsSL https://bunsenbrenner.org/install.sh | CT_JOIN_TOKEN=<yours> CT_AGENT_TOKEN=<yours> sh
+curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash
 ```
 
-That downloads the right `ct-agent` for your OS/arch from
-[GitHub Releases](https://github.com/scimbe/CADS-Tunnel/releases/latest) and runs
-`ct-agent onboard`. If you only need the binary itself (e.g. for `ct-agent channel …` —
-publishing/joining a workflow pipeline, no tunnel involved), grab it directly and skip
-`onboard`:
-
-```bash
-curl -fsSL https://github.com/scimbe/CADS-Tunnel/releases/latest/download/ct-agent-linux-x86_64 \
-  -o ct-agent && chmod +x ct-agent   # macOS: ct-agent-darwin-<x86_64|aarch64>; Windows: see install.ps1
+```powershell
+irm https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1 | iex
 ```
 
-No Docker, no Rust toolchain, no repo checkout, on any of these paths. The rest of this
-page is for the **operator** side — building/running the control plane + edge
-themselves (self-hosting, or contributing to core development).
+Add `--docker`/`-Docker` to run it as a container instead of directly on the host. See
+that repo's README for all flags, prebuilt binaries (no Docker, no Rust toolchain, no
+repo checkout needed on any path), and a minimal Docker image if you'd rather run it
+that way from the start.
+
+The rest of this page is for the **operator** side — building/running the control
+plane + edge themselves (self-hosting, or contributing to core development).
 
 ## 1. Get the code
 

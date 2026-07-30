@@ -12,23 +12,30 @@ can route your traffic but never read it.
 
 - **Provider-blind payload** — Noise (`Noise_IK_25519_ChaChaPoly_BLAKE2s`) end-to-end.
 - **Agent-to-agent overlay** — direct, Noise-secured channels between agents, edge-brokered (rendezvous or relay), composed into a best-connectivity mesh by a latency-weighted overlay optimizer and a per-user Topology Editor.
-- **One-command onboarding** — `ct-agent onboard`: install → enroll → tunnel.
+- **One-command onboarding** — a guided setup script: install → enroll → tunnel.
 - **Deploy your way** — hosted Kubernetes bundle or a self-host Docker Compose file.
 - **Durable & self-healing** — SQLite-backed state, liveness/readiness probes.
 - **Rotating PKI** — internal CA, clients trust the CA root (no re-pinning).
 - **Abuse-resistant** — proof-of-work gate + per-account rate limits.
 - **Trustworthy payment** — credits apply only from a signature-verified provider webhook.
 
+## Related projects
+
+`ct-agent` — the customer-run agent (custodian of your origin's private key) — is its
+**own separate repository**, [scimbe/ct-agent](https://github.com/scimbe/ct-agent), with
+its own releases and guided setup scripts. This repo (CADS-Tunnel) is the core system:
+control plane, edge, and the tunnel/client crates it's built from.
+
 ## Architecture
 
-A Rust Cargo workspace of six crates. Five form the tunnel and depend only on
-`ct-common`; `ct-dns` is a standalone DNS-01 responder for the front door's certs:
+A Rust Cargo workspace of five crates (`ct-agent` lives in its own repo, see above).
+Four form the tunnel core and depend only on `ct-common`; `ct-dns` is a standalone
+DNS-01 responder for the front door's certs:
 
 | Crate | Responsibility |
 |-------|----------------|
 | `ct-common` | wire types, Noise, PoW, framing, metrics, overlay optimizer |
 | `ct-edge` | provider-blind relay (role dispatch, QUIC/TLS), A2A channel broker |
-| `ct-agent` | customer-run; custodian of the origin key; serve path |
 | `ct-control-plane` | enrollment, tunnel registry/rendezvous, billing, Topology Editor API |
 | `ct-client` | tunnel setup, operating modes, bench harness |
 | `ct-dns` | authoritative DNS-01 responder for ACME (front door certs) |
@@ -100,3 +107,11 @@ operations.
 Research / academic project. The core protocol, productionization (persistence,
 identity, PKI, deployment, onboarding, hardening, payment) and documentation are
 implemented and tested; see [`docs/planning/PROGRESS.md`](docs/planning/PROGRESS.md).
+
+## Support the project
+
+Bunsenbrenner (the live deployment) is free to use and runs on donated time and
+server costs. If it helped you get something live, a small contribution keeps it going:
+
+- [Support as a member](https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413)
+- [Buy me a coffee](https://buymeacoffee.com/bunsenbrenner)
