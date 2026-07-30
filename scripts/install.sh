@@ -3,8 +3,10 @@
 #
 # One command to take a fresh Linux/macOS box to a working core system: install
 # the build dependencies + a recent Rust toolchain, build the Cargo workspace,
-# and install the core `ct-*` binaries onto PATH — after which you can bring up
-# an **agent** (`ct-agent channel --serve`) or run a **pipeline** (a bridge that
+# and install the core `ct-*` binaries onto PATH. `ct-agent` itself now lives in
+# its own repo (github.com/scimbe/ct-agent, with its own scripts/setup.sh) — see
+# that repo to bring up an **agent**; this script builds the **core** binaries
+# (control-plane/edge/dns/client) or run a **pipeline** (a bridge that
 # orchestrates role agents, e.g. the CADS-flappy-demo / CADS-cookbook-demo
 # reference pipelines).
 #
@@ -16,7 +18,7 @@
 #   ./scripts/install.sh --prefix ~/.local   # install binaries under ~/.local/bin
 #   ./scripts/install.sh --no-toolchain  # assume Rust is already present (>= 1.85)
 #   ./scripts/install.sh --no-deps       # skip the system-package step
-#   ./scripts/install.sh --crates agent,client   # install a subset
+#   ./scripts/install.sh --crates client,dns   # install a subset
 #
 # Env overrides: CADS_PREFIX (install root, default ~/.cargo), NO_COLOR (disable colour).
 set -euo pipefail
@@ -31,7 +33,7 @@ INSTALL_TOOLCHAIN=1
 INSTALL_DEPS=1
 MIN_RUST_MAJOR=1
 MIN_RUST_MINOR=85           # idna_adapter needs the edition2024 Cargo feature (Rust 1.85+)
-CRATES=(agent client control-plane edge dns)
+CRATES=(client control-plane edge dns agent-tools)
 
 # --- pretty output ------------------------------------------------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -138,16 +140,16 @@ print_next_steps() {
   local bindir="$PREFIX/bin"
   echo
   log "done — core system installed"
-  echo "  binaries: ${bindir}  (ct-agent, ct-client, ct-control-plane, ct-edge, ct-dns, + bridges)"
+  echo "  binaries: ${bindir}  (ct-client, ct-control-plane, ct-edge, ct-dns, ct-crew-bridge, ct-cookbook-bridge, + tools)"
   case ":$PATH:" in
     *":$bindir:"*) : ;;
     *) warn "add it to PATH:  export PATH=\"$bindir:\$PATH\"" ;;
   esac
   cat <<EOF
 
-  Bring up an AGENT (serve a role over the tunnel):
-    export CT_AGENT_CP_URL="https://<control-plane>" CT_AGENT_JOIN_TOKEN="<single-use-token>"
-    ct-agent channel --serve            # persistent MCP-over-channel service
+  Bring up an AGENT (ct-agent now lives in its own repo, github.com/scimbe/ct-agent):
+    curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash
+    # or: git clone https://github.com/scimbe/ct-agent && (cd ct-agent && ./scripts/setup.sh)
 
   Run a PIPELINE (reference demos, now their own repos):
     git clone https://github.com/scimbe/CADS-flappy-demo   && (cd CADS-flappy-demo   && ./run-demo.sh)
