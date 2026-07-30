@@ -233,6 +233,14 @@ impl EdgeMeshHandle {
             eprintln!("ct-cp: edge_mesh remove_ownership failed: {e}");
         }
     }
+
+    /// Look up which edge (if any) owns `host`, straight through to the
+    /// underlying registry -- used by the Rot->Gelb synchronous promotion
+    /// (`acme_broker::try_promote_rot_to_gelb`) to confirm the edge already
+    /// knows about a hostname before promoting it.
+    pub fn lookup_by_host(&self, host: &str) -> rusqlite::Result<Option<(String, String)>> {
+        self.store.lookup_by_host(host)
+    }
 }
 
 #[derive(Deserialize)]

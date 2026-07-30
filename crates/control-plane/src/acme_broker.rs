@@ -314,6 +314,37 @@ fn pick_ca_with(
     Ok(best.map(|(name, _)| name))
 }
 
+/// Promote one hostname from Rot to Gelb right now, if it's ready (the edge
+/// already knows it owns this hostname). Called synchronously from
+/// [`crate::portal_api::authorize_hostname`] right after a successful edge
+/// authorize, so a freshly-created tunnel reaches Gelb immediately instead of
+/// waiting for the next [`run_admission_loop`] tick (up to
+/// `CT_CP_ACME_BROKER_TICK_SECS`, default 60s) — found live (#233 follow-up):
+/// despite this module's own doc comments long claiming `authorize_hostname`
+/// "already pushes channel_tier=gelb synchronously on the happy path", no call
+/// site ever actually did that; every fresh tunnel silently sat in Rot for a
+/// full tick no matter how fast the edge-authorize itself was. `sweep_once`'s
+/// Rot→Gelb step remains as the safety net (edge admin unset, a transient
+/// error here, or a restart missing this synchronous path) — not the primary
+/// mechanism it was always meant to be.
+pub(crate) async fn try_promote_rot_to_gelb(
+    tunnels: &SqliteTunnelStore,
+    edge_mesh: &crate::edge_mesh::EdgeMeshHandle,
+    edge_admin: &Option<(String, String)>,
+    hostname: &str,
+) {
+    let now = now_secs();
+    match edge_mesh.lookup_by_host(hostname).map(|owned| owned.is_some()) {
+        Ok(true) => match tunnels.enter_gelb_queue(hostname, now) {
+            Ok(true) => push_channel_tier(edge_admin, tunnels, hostname, true).await,
+            Ok(false) => {} // already past Rot (e.g. a retry) -- nothing to do
+            Err(e) => eprintln!("ct-cp: acme_broker: enter_gelb_queue for {hostname} failed: {e}"),
+        },
+        Ok(false) => {} // edge doesn't know this hostname yet -- the sweep will catch it
+        Err(e) => eprintln!("ct-cp: acme_broker: edge_mesh lookup for {hostname} failed: {e}"),
+    }
+}
+
 /// One admission-loop tick: Rot→Gelb safety net (pushing the Gelb tier to the
 /// edge as each hostname is promoted), claim-deadline lapses, then offer CA
 /// assignments to as much of the Gelb queue as current budget allows
@@ -326,11 +357,11 @@ async fn sweep_once(
 ) -> rusqlite::Result<()> {
     let now = now_secs();
 
-    // 1. Rot -> Gelb safety net: `portal_api::authorize_hostname` already
-    // pushes channel_tier=gelb synchronously on the happy path; this catches the
-    // cases where that push failed or raced (edge admin unset, transient
-    // error), and is also simply where a fresh admission-loop tick learns
-    // about newly-reachable hostnames at all.
+    // 1. Rot -> Gelb safety net: `portal_api::authorize_hostname` calls
+    // `try_promote_rot_to_gelb` synchronously on the happy path; this catches
+    // the cases where that call failed or raced (edge admin unset, transient
+    // error), and is also where a fresh admission-loop tick learns about any
+    // hostname the synchronous path missed.
     for hostname in tunnels.rot_hostnames()? {
         if edge_mesh.lookup_by_host(&hostname)?.is_some() && tunnels.enter_gelb_queue(&hostname, now)? {
             push_channel_tier(edge_admin, tunnels, &hostname, true).await;

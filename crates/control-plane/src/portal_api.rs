@@ -417,6 +417,13 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
                 // edge_mesh Phase 0: record that this deployment's local edge now owns
                 // this (token, hostname) pair -- best-effort, never blocks the caller.
                 st.edge_mesh.record(&tunnel.routing_token, Some(host));
+                // #233 follow-up: promote Rot -> Gelb right now instead of waiting up
+                // to a full admission-loop tick (found live testing a fresh tunnel --
+                // nothing previously did this synchronously despite doc comments
+                // elsewhere assuming it already happened here).
+                let edge_admin_tuple = Some((edge.url.to_string(), edge.token.to_string()));
+                crate::acme_broker::try_promote_rot_to_gelb(&st.tunnels, &st.edge_mesh, &edge_admin_tuple, host)
+                    .await;
             }
             Ok(r) => eprintln!("ct-cp: edge authorize-host for {host} returned {}", r.status()),
             Err(e) => eprintln!("ct-cp: edge authorize-host for {host} failed: {e}"),
@@ -1495,23 +1502,27 @@ mod tests {
         // (host -> token) at the edge so the agent's 'H' bind is accepted under
         // required auth.
         use axum::extract::{Path as AxPath, State as AxState};
-        use axum::http::HeaderMap as AxHeaderMap;
+        use axum::http::{HeaderMap as AxHeaderMap, Uri as AxUri};
         use std::sync::Mutex;
 
-        let received: Arc<Mutex<Option<(String, String, String)>>> = Arc::new(Mutex::new(None));
+        // A Vec, not a single slot: the happy path now hits this endpoint twice
+        // (the plain authorize, then the #233 synchronous Rot->Gelb channel-tier
+        // push) -- a single slot would silently only keep the last one.
+        let received: Arc<Mutex<Vec<(String, String, String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         let mock = Router::new()
             .route(
                 "/admin/authorize-host/:token/:host",
                 post(
-                    |AxState(rec): AxState<Arc<Mutex<Option<(String, String, String)>>>>,
+                    |AxState(rec): AxState<Arc<Mutex<Vec<(String, String, String, Option<String>)>>>>,
                      headers: AxHeaderMap,
+                     uri: AxUri,
                      AxPath((token, host)): AxPath<(String, String)>| async move {
                         let auth = headers
                             .get("x-ct-admin-token")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("")
                             .to_string();
-                        *rec.lock().unwrap() = Some((token, host, auth));
+                        rec.lock().unwrap().push((token, host, auth, uri.query().map(str::to_string)));
                         StatusCode::OK
                     },
                 ),
@@ -1568,7 +1579,8 @@ mod tests {
         );
 
         // The edge received authorize-host with this tunnel's routing token + auth.
-        let (token, host, auth) = received.lock().unwrap().clone().expect("edge authorize called");
+        let calls = received.lock().unwrap().clone();
+        let (token, host, auth, _) = calls.first().cloned().expect("edge authorize called");
         assert_eq!(token, tunnel.routing_token, "authorizes the tunnel's routing token");
         assert_eq!(host, expected_host);
         assert_eq!(auth, "edge-secret");
@@ -1585,6 +1597,20 @@ mod tests {
             Some("primary".to_string()),
             "resolvable by hostname too"
         );
+
+        // #233: Rot -> Gelb must happen synchronously right here, not only on
+        // the next (up-to-60s) admission-loop tick -- this is exactly the bug
+        // the user caught live ("why does Rot->Gelb take up to two minutes").
+        assert!(
+            tunnels.gelb_hostnames().unwrap().contains(&expected_host),
+            "hostname enters the Gelb queue synchronously on the happy path, not after a sweep tick"
+        );
+        let gelb_push = calls
+            .iter()
+            .find(|(_, h, _, q)| h == &expected_host && q.as_deref() == Some("channel_tier=gelb"))
+            .expect("a second authorize-host call pushed channel_tier=gelb synchronously");
+        assert_eq!(gelb_push.0, tunnel.routing_token);
+        assert_eq!(gelb_push.2, "edge-secret");
     }
 
     #[tokio::test]
