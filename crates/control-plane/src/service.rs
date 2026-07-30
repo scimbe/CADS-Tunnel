@@ -2442,6 +2442,15 @@ const LANDING_HTML: &str = r#"<!doctype html>
  @media (prefers-reduced-motion: reduce){ .diagram-head .live i{animation:none} }
  @media (max-width:860px){ .hero-grid{grid-template-columns:1fr} }
 
+ /* -------- inline mini-diagrams distributed through the page -------- */
+ .use-case{display:grid;grid-template-columns:1fr 1.15fr;gap:1.8rem;align-items:center;margin:1.6rem 0}
+ .use-case.reverse{grid-template-columns:1.15fr 1fr}
+ .use-case.reverse .diagram-card{order:-1}
+ .use-case h3{font-size:1.02rem;margin:0 0 .5rem;font-family:inherit;font-weight:700}
+ .use-case p{margin:0;color:var(--muted2);font-size:.9rem}
+ .use-case .diagram-card canvas{height:160px}
+ @media (max-width:760px){ .use-case,.use-case.reverse{grid-template-columns:1fr} .use-case.reverse .diagram-card{order:0} }
+
  .alt-link{margin:.7rem 0 0;font-size:.82rem;color:var(--muted)}
  .alt-link a{text-decoration:none;color:var(--muted2)}
  .alt-link a:hover{text-decoration:underline}
@@ -2659,6 +2668,20 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   <div class="feature"><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
  </div>
 
+ <div class="use-case">
+  <div>
+   <h3>Your own mesh, optimized</h3>
+   <p>Draw your agents into a graph in the topology editor — direct links, or let it plan for you.
+    CADS-Tunnel computes an optimized routing plan over your own declared mesh (shortcuts, minimum
+    latency) from real measured link costs between your agents. It's your ad-hoc network, not ours —
+    we only compute the plan, your agents run it.</p>
+  </div>
+  <div class="diagram-card">
+   <div class="diagram-head"><span>YOUR TOPOLOGY · 5 agents, self-declared</span><span class="live"><i></i>routed</span></div>
+   <canvas id="diagram-mesh" width="400" height="160" aria-label="Animated diagram of five of your agents connected in a mesh, with one optimized route highlighted"></canvas>
+  </div>
+ </div>
+
  <div class="lab">
   <h2 style="margin-top:0">What is "Bunsenbrenner"?</h2>
   <p>
@@ -2678,6 +2701,20 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
  <div class="section">
   <div class="section-head"><h2>Workflow pipelines</h2><a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a></div>
   <ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
+
+  <div class="use-case reverse">
+   <div class="diagram-card">
+    <div class="diagram-head"><span>ROLE AUCTION · 3 devices, 1 role each</span><span class="live"><i></i>live</span></div>
+    <canvas id="diagram-pipeline" width="400" height="160" aria-label="Animated diagram of three devices each publishing an offer, an auction selecting winners, and one composed service"></canvas>
+   </div>
+   <div>
+    <h3>One service, several devices</h3>
+    <p>No single device has to run the whole thing. Each agent publishes what it can do — a role, a
+     capacity offer — and the pipeline registry runs one auction per role; the winners get wired
+     together into a single published service. A laptop, a Pi, and a spare VM can each carry one part
+     of the same pipeline.</p>
+   </div>
+  </div>
  </div>
 
  <div class="section">
@@ -2693,6 +2730,21 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
     <a href="/llms.txt">/llms.txt</a>, section E.
    </p>
    <div class="install">curl … | ct-agent onboard</div>
+  </div>
+
+  <div class="use-case">
+   <div>
+    <h3>Direct, agent to agent</h3>
+    <p>Two agents connect directly when the network allows it; when it doesn't, the same Noise session
+     reroutes through a relay that only ever sees ciphertext — never a plaintext hub in the middle.
+     The same channel mechanism also admits <em>other people's</em> agents, not just your own: a
+     redeemable invitation plus a possession proof lets someone else's agent join your channel, so a
+     pipeline can span accounts, not just devices.</p>
+   </div>
+   <div class="diagram-card">
+    <div class="diagram-head"><span>CHANNEL · direct-first, relay fallback</span><span class="live"><i></i>encrypted</span></div>
+    <canvas id="diagram-p2p" width="400" height="160" aria-label="Animated diagram of two agents connecting directly, with a relay fallback path shown for when direct connection is blocked"></canvas>
+   </div>
   </div>
  </div>
 
@@ -2810,6 +2862,108 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   }
   draw();
  })();
+
+ // Generic small network diagram -- nodes at relative (0..1) coords, straight
+ // hairline edges (some dashed for "attempted, not guaranteed" paths), and one
+ // or more packets that travel a path of node indices, looping. Used for the
+ // three "what people build with this" diagrams below; purely decorative,
+ // respects reduced-motion (freezes packets at their midpoint).
+ function initMiniDiagram(id, nodes, edges, packets){
+  var c = document.getElementById(id);
+  if(!c) return;
+  var ctx = c.getContext('2d');
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function cssVar(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function resize(){
+   var r = c.getBoundingClientRect();
+   c.width = r.width * devicePixelRatio; c.height = r.height * devicePixelRatio;
+   ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  var t = 0;
+  function pt(i, w, h){ return { x: nodes[i].x * w, y: nodes[i].y * h }; }
+  function draw(){
+   var r = c.getBoundingClientRect(); var w = r.width, h = r.height;
+   ctx.clearRect(0,0,w,h);
+   var line = cssVar('--line'), muted = cssVar('--muted'), text = cssVar('--text'),
+       accent = cssVar('--accent'), accent2 = cssVar('--accent2'), panel = cssVar('--panel');
+   edges.forEach(function(e){
+    var a = pt(e.from, w, h), b = pt(e.to, w, h);
+    ctx.strokeStyle = e.dim ? line : accent2;
+    ctx.globalAlpha = e.dim ? 1 : .55;
+    ctx.lineWidth = 1.5;
+    if (e.dashed) ctx.setLineDash([3,4]); else ctx.setLineDash([]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+   });
+   nodes.forEach(function(n){
+    var p = pt(nodes.indexOf(n), w, h);
+    ctx.beginPath(); ctx.arc(p.x, p.y, n.r || 6, 0, Math.PI*2);
+    ctx.fillStyle = panel; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = n.dim ? muted : accent2; ctx.stroke();
+    if (n.label){
+     ctx.font = '10px ' + (cssVar('--mono') || 'monospace');
+     ctx.fillStyle = text; ctx.textAlign = 'center';
+     ctx.fillText(n.label, p.x, p.y + (n.labelBelow === false ? -12 : 20));
+    }
+   });
+   packets.forEach(function(pk){
+    var path = pk.path, segs = path.length - 1;
+    var pos = reduce ? 0.5 : ((t * (pk.speed || 1)) / 90 + (pk.phase || 0)) % 1;
+    var segF = pos * segs, seg = Math.min(Math.floor(segF), segs - 1), f = segF - seg;
+    var a = pt(path[seg], w, h), b = pt(path[seg+1], w, h);
+    var px = a.x + (b.x - a.x) * f, py = a.y + (b.y - a.y) * f;
+    var col = pk.color === 'accent2' ? accent2 : accent;
+    ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI*2);
+    ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 7; ctx.fill(); ctx.shadowBlur = 0;
+   });
+   t += 1;
+   if (!reduce) requestAnimationFrame(draw);
+  }
+  draw();
+ }
+
+ // 1. One service, several devices: each publishes a capacity offer for a role;
+ // the pipeline registry auctions each role and wires the winners into one
+ // published service (crates/common/src/pipeline.rs convene/SelectionPolicy).
+ initMiniDiagram('diagram-pipeline',
+  [
+   {x:.14,y:.18,label:'Laptop'}, {x:.14,y:.5,label:'Pi'}, {x:.14,y:.82,label:'VM'},
+   {x:.52,y:.5,label:'Auction',dim:true,r:7},
+   {x:.88,y:.5,label:'Your service',r:7},
+  ],
+  [ {from:0,to:3,dim:true}, {from:1,to:3,dim:true}, {from:2,to:3,dim:true}, {from:3,to:4,dim:true} ],
+  [
+   {path:[0,3,4],speed:1,phase:0}, {path:[1,3,4],speed:1,phase:.33}, {path:[2,3,4],speed:1,phase:.66},
+  ]
+ );
+
+ // 2. Direct, agent to agent: tries a direct line first; on failure the same
+ // Noise session reroutes through a relay that only ever sees ciphertext
+ // (ct-agent/src/channel_run.rs's fallback ladder).
+ initMiniDiagram('diagram-p2p',
+  [
+   {x:.14,y:.5,label:'Agent A'}, {x:.86,y:.5,label:'Agent B'}, {x:.5,y:.85,label:'Relay',dim:true,labelBelow:false},
+  ],
+  [ {from:0,to:1}, {from:0,to:2,dim:true,dashed:true}, {from:2,to:1,dim:true,dashed:true} ],
+  [ {path:[0,1],speed:1,phase:0,color:'accent2'}, {path:[0,2,1],speed:.8,phase:.5} ]
+ );
+
+ // 3. Your own mesh, optimized: draw your agents into a graph in the topology
+ // editor; CADS-Tunnel computes a routing plan over it (shortcuts, minimum
+ // latency, from measured link costs) -- crates/common/src/overlay.rs.
+ initMiniDiagram('diagram-mesh',
+  [
+   {x:.5,y:.12,label:'1'}, {x:.88,y:.38,label:'2'}, {x:.74,y:.85,label:'3'},
+   {x:.26,y:.85,label:'4'}, {x:.12,y:.38,label:'5'},
+  ],
+  [
+   {from:0,to:1,dim:true}, {from:1,to:2,dim:true}, {from:2,to:3,dim:true}, {from:3,to:4,dim:true}, {from:4,to:0,dim:true},
+   {from:0,to:2}, {from:1,to:4},
+  ],
+  [ {path:[0,2,4,0],speed:.7,phase:0,color:'accent2'} ]
+ );
 </script>
 <div class="cookie-notice" id="cookie-notice">
  <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
