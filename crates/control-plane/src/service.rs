@@ -2537,11 +2537,6 @@ const LANDING_HTML: &str = r#"<!doctype html>
       <input id="email" name="login_hint" type="email" placeholder="you@example.com" autocomplete="email" required>
       <button class="btn" type="submit">Continue &rarr;</button>
      </div>
-     <p class="fine"><strong>No password to set up here, no payment details.</strong> This takes you to
-      our secure sign-in — your first tunnel is created automatically the moment you're in. This is
-      the identity your subdomain and your published pipelines/agents will be tied to; once it exists,
-      click <strong>Install</strong> on it and copy the <code>.env</code> block into the directory where
-      that tunnel will run.</p>
      <p class="alt-signin">Already have an account? <a href="/portal">Sign in →</a></p>
     </form>
    </div>
