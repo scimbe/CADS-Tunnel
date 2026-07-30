@@ -411,7 +411,7 @@ Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
 /// transparently. `/channel.sh`/`/channel.ps1` are unaffected: a different
 /// subcommand (Agent-Fabric channel setup, not the tunnel-install path this
 /// script's replacement covers), still rendered and served directly.
-pub fn installer_router(portal_base: String, release_base: String, edge_addr: String) -> Router {
+pub fn installer_router(portal_base: String, release_base: String) -> Router {
     Router::new()
         .route("/install.sh", get(serve_install_sh))
         .route("/install.ps1", get(serve_install_ps1))
@@ -421,18 +421,16 @@ pub fn installer_router(portal_base: String, release_base: String, edge_addr: St
         .with_state(InstallerState {
             portal_base: Arc::new(portal_base),
             release_base: Arc::new(release_base),
-            edge_addr: Arc::new(edge_addr),
         })
 }
 
-/// Served-script config: the portal origin (for the bootstrap-redeem call the
-/// install scripts make), the release asset base (for the `ct-agent` download),
-/// and this deployment's mesh-plane `host:port` (`CT_AGENT_EDGE`).
+/// Served-script config: the portal origin (for the bootstrap-redeem call
+/// /channel.sh|.ps1 make) and the release asset base (for the `ct-agent`
+/// download). `/install.sh`|`.ps1` need neither -- they're a plain redirect.
 #[derive(Clone)]
 struct InstallerState {
     portal_base: Arc<String>,
     release_base: Arc<String>,
-    edge_addr: Arc<String>,
 }
 
 /// `ct-agent` moved to its own repo (scimbe/ct-agent), which ships a much richer
@@ -501,7 +499,7 @@ mod tests {
         assert!(ps.contains("if ($env:CT_BOOTSTRAP)"), "ps has the bootstrap-redeem branch");
 
         // Route: GET /channel.sh -> 200 serving exactly the rendered script.
-        let app = installer_router(portal.to_string(), base.to_string(), "portal.example:4433".to_string());
+        let app = installer_router(portal.to_string(), base.to_string());
         let resp = app
             .clone()
             .oneshot(Request::get("/channel.sh").body(Body::empty()).unwrap())
@@ -662,7 +660,6 @@ mod tests {
         let app = installer_router(
             "https://portal.example".to_string(),
             "http://release.invalid/base".to_string(),
-            "portal.example:4433".to_string(),
         );
 
         let resp = app
