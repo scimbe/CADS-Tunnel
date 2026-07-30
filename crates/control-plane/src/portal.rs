@@ -143,7 +143,25 @@ impl PortalOidc {
     /// the username/email field on Keycloak's own login+register form -- lets the
     /// landing page's email-first entry point hand the typed address straight
     /// through instead of the visitor retyping it a second time.
-    fn authorize_redirect(&self, state: &str, idp_hint: Option<&str>, login_hint: Option<&str>) -> String {
+    /// `start_at_register` swaps the target from Keycloak's login form to its
+    /// registration form (`/protocol/openid-connect/registrations`, same params,
+    /// Keycloak's own documented deep link) -- the landing page's email-first CTA
+    /// is a new-visitor path, so it should land someone with no account yet
+    /// straight on "create an account", not on a login screen with the register
+    /// link buried. `/portal`'s own "Sign in" links keep going through the
+    /// ordinary `/auth` login form via `false`.
+    fn authorize_redirect(
+        &self,
+        state: &str,
+        idp_hint: Option<&str>,
+        login_hint: Option<&str>,
+        start_at_register: bool,
+    ) -> String {
+        let base = if start_at_register {
+            std::borrow::Cow::Owned(self.authorize_url.replace("/protocol/openid-connect/auth", "/protocol/openid-connect/registrations"))
+        } else {
+            std::borrow::Cow::Borrowed(&self.authorize_url)
+        };
         let hint_param = idp_hint
             .map(|h| format!("&kc_idp_hint={}", urlencode(h)))
             .unwrap_or_default();
@@ -153,7 +171,7 @@ impl PortalOidc {
             .unwrap_or_default();
         format!(
             "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}{}{}",
-            self.authorize_url,
+            base,
             urlencode(&self.client_id),
             urlencode(&self.redirect_uri),
             urlencode(state),
@@ -360,11 +378,15 @@ async fn portal_home() -> Html<&'static str> {
 /// passed through, since this value is embedded verbatim into a redirect URL.
 /// `login_hint` comes from the landing page's email-first entry point -- passed
 /// through as-is (urlencoded at the call site); it only pre-fills a form field,
-/// never authenticates anything, so it needs no allowlisting.
+/// never authenticates anything, so it needs no allowlisting. `register`, when
+/// present at all (any value, including empty), routes to Keycloak's
+/// registration form instead of its login form -- also not a security-relevant
+/// value, just which of Keycloak's own two forms to land on.
 #[derive(Deserialize)]
 struct LoginQuery {
     kc_idp_hint: Option<String>,
     login_hint: Option<String>,
+    register: Option<String>,
 }
 
 fn known_idp_hint(hint: Option<&str>) -> Option<&str> {
@@ -379,8 +401,13 @@ async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>
             // response came back to the same browser we sent out.
             let state = random_state();
             let hint = known_idp_hint(q.kc_idp_hint.as_deref());
-            let mut resp =
-                Redirect::to(&cfg.authorize_redirect(&state, hint, q.login_hint.as_deref())).into_response();
+            let mut resp = Redirect::to(&cfg.authorize_redirect(
+                &state,
+                hint,
+                q.login_hint.as_deref(),
+                q.register.is_some(),
+            ))
+            .into_response();
             set_cookie(&mut resp, &state_cookie(&state));
             resp
         }
@@ -1227,6 +1254,48 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let loc = resp.headers().get("location").unwrap().to_str().unwrap();
         assert!(loc.contains("login_hint=me%40example.com"), "email is passed through, got {loc}");
+    }
+
+    #[tokio::test]
+    async fn login_with_register_lands_on_keycloaks_registration_form_not_login() {
+        // The landing page's email-first CTA is a new-visitor path -- a first-time
+        // visitor typing their email and hitting "Continue" should land on
+        // Keycloak's own account-creation form, not its login form with the
+        // register link buried in it. /portal/login?register (any value, or bare)
+        // swaps the target from .../auth to .../registrations, Keycloak's own
+        // documented deep link for this, keeping every other param identical.
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg.clone()), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login?register=1&login_hint=me%40example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            loc.starts_with("https://kc.example/realms/ct/protocol/openid-connect/registrations?"),
+            "routes to the registrations form, got {loc}"
+        );
+        assert!(loc.contains("login_hint=me%40example.com"), "still carries the email, got {loc}");
+        assert!(loc.contains("client_id=ct-portal") && loc.contains("state="), "other params unaffected, got {loc}");
+
+        // Without ?register, the ordinary /portal "Sign in" links still land on login.
+        let app2 = portal_router(Some(cfg), TEST_KEY);
+        let resp2 = app2.oneshot(Request::get("/portal/login").body(Body::empty()).unwrap()).await.unwrap();
+        let loc2 = resp2.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            loc2.starts_with("https://kc.example/realms/ct/protocol/openid-connect/auth?"),
+            "plain /portal/login still goes to the login form, got {loc2}"
+        );
     }
 
     fn cfg() -> PortalOidc {
