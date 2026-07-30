@@ -2733,7 +2733,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   </div>
  </div>
 
- <div class="section">
+ <div class="section" id="mcp">
   <h2>MCP</h2>
   <div class="mcp-strip">
    <p>
