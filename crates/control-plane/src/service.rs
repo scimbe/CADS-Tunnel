@@ -2712,7 +2712,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   </p>
  </div>
 
- <div class="section">
+ <div class="section" id="pipelines-usecase">
   <div class="section-head"><h2>Workflow pipelines</h2><a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a></div>
   <ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
 
