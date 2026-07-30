@@ -2660,6 +2660,20 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    isolated, containerized environment (Docker, a VM, or a Kubernetes pod) rather than directly on your
    host — that way a bug in your own code can't reach past the sandbox onto the rest of your machine.
   </div>
+
+  <div class="use-case">
+   <div>
+    <h3>Still works on restrictive networks</h3>
+    <p>Your agent tries a direct QUIC connection to the edge first. Blocked by a firewall that only
+     allows outbound HTTPS? It falls back through the relay ports, and if even those are closed, all
+     the way to the same <code>:443</code> port every browser already uses — one of the few outbound
+     ports almost nothing blocks. Same encrypted session the whole way down; only the route changes.</p>
+   </div>
+   <div class="diagram-card">
+    <div class="diagram-head"><span>ESCAPE LADDER · direct → relay → :443</span><span class="live"><i></i>connected</span></div>
+    <canvas id="diagram-ladder" width="400" height="160" aria-label="Animated diagram of a connection attempt trying direct QUIC, then a relay port, then finally the shared 443 port used by all browser traffic"></canvas>
+   </div>
+  </div>
  </div>
 
  <div class="features">
@@ -2709,10 +2723,12 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    </div>
    <div>
     <h3>One service, several devices</h3>
-    <p>No single device has to run the whole thing. Each agent publishes what it can do — a role, a
-     capacity offer — and the pipeline registry runs one auction per role; the winners get wired
-     together into a single published service. A laptop, a Pi, and a spare VM can each carry one part
-     of the same pipeline.</p>
+    <p>No single device has to run the whole thing. Each agent can publish a signed capacity offer for
+     one role in a pipeline spec; when several agents offer the same role, the registry's clearing
+     mechanism picks the winner (cheapest valid offer, cross-role exclusive) and the winners wire
+     together into one published service. A laptop, a Pi, and a spare VM can each carry one part of the
+     same pipeline — this is the underlying primitive our own example pipelines are progressively
+     adopting, not something that requires you to build it yourself.</p>
    </div>
   </div>
  </div>
@@ -2744,6 +2760,21 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    <div class="diagram-card">
     <div class="diagram-head"><span>CHANNEL · direct-first, relay fallback</span><span class="live"><i></i>encrypted</span></div>
     <canvas id="diagram-p2p" width="400" height="160" aria-label="Animated diagram of two agents connecting directly, with a relay fallback path shown for when direct connection is blocked"></canvas>
+   </div>
+  </div>
+
+  <div class="use-case reverse">
+   <div class="diagram-card">
+    <div class="diagram-head"><span>REGISTRY · publish once, found by many</span><span class="live"><i></i>public</span></div>
+    <canvas id="diagram-directory" width="400" height="160" aria-label="Animated diagram of your agent publishing a card to the public registry, then several other agents discovering and connecting to it"></canvas>
+   </div>
+   <div>
+    <h3>Discoverable by agents you've never met</h3>
+    <p>Publish your agent's signed capability card once, and any agent can find it in the public
+     directory (<a href="/registry/agents">/registry/agents</a>) by role or skill — no manual key
+     exchange, no out-of-band introduction. The directory hands them your identity and address; from
+     there they still connect through the same channel mechanism as anyone else. It's the difference
+     between a phone number you hand out and a listing someone else can look up.</p>
    </div>
   </div>
  </div>
@@ -2963,6 +2994,38 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    {from:0,to:2}, {from:1,to:4},
   ],
   [ {path:[0,2,4,0],speed:.7,phase:0,color:'accent2'} ]
+ );
+
+ // 4. Escape ladder: direct QUIC first, relay ports next, :443 front door last
+ // -- same encrypted session throughout, only the route changes on failure
+ // (ct-agent/src/channel_run.rs's fallback ladder; crates/edge/src/serve.rs's
+ // QUIC->TCP dispatch only after a real TLS handshake).
+ initMiniDiagram('diagram-ladder',
+  [
+   {x:.1,y:.5,label:'You'},
+   {x:.42,y:.15,label:'direct',dim:true}, {x:.42,y:.5,label:'relay',dim:true}, {x:.42,y:.85,label:':443'},
+   {x:.9,y:.5,label:'Edge'},
+  ],
+  [
+   {from:0,to:1,dim:true}, {from:0,to:2,dim:true}, {from:0,to:3,dim:true},
+   {from:1,to:4,dim:true,dashed:true}, {from:2,to:4,dim:true,dashed:true}, {from:3,to:4},
+  ],
+  [ {path:[0,3,4],speed:.9,phase:0,color:'accent2'} ]
+ );
+
+ // 5. Public directory: publish a signed card once, any agent can look you up
+ // by role/skill afterward (crates/control-plane/src/service.rs's
+ // agent_directory_router, POST/GET /registry/agents).
+ initMiniDiagram('diagram-directory',
+  [
+   {x:.12,y:.5,label:'You'}, {x:.5,y:.5,label:'Registry',dim:true,r:7},
+   {x:.88,y:.18,label:'Agent'}, {x:.88,y:.5,label:'Agent'}, {x:.88,y:.82,label:'Agent'},
+  ],
+  [ {from:0,to:1,dim:true}, {from:1,to:2,dim:true}, {from:1,to:3,dim:true}, {from:1,to:4,dim:true} ],
+  [
+   {path:[0,1],speed:1,phase:0},
+   {path:[1,2],speed:1,phase:.2,color:'accent2'}, {path:[1,3],speed:1,phase:.5,color:'accent2'}, {path:[1,4],speed:1,phase:.8,color:'accent2'},
+  ]
  );
 </script>
 <div class="cookie-notice" id="cookie-notice">
