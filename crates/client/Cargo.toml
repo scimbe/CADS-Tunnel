@@ -18,6 +18,6 @@ ct-edge = { path = "../edge" }
 # (bench.rs, rendezvous.rs) still exercise it end-to-end, now via a pinned git dep.
 # Pinned by commit (no tagged release exists yet); switch to `tag = "vX.Y.Z"` once
 # one does, same rev as crates/agent-tools's ct-agent dependency.
-ct-agent = { git = "https://github.com/scimbe/ct-agent", rev = "56a1db44ee93c07ae8763bad4243ecd1611ce6c3" }
+ct-agent = { git = "https://github.com/scimbe/ct-agent", rev = "0d6adb649612646d6a4901f4608a9a3fc5530d53" }
 ct-control-plane = { path = "../control-plane" }
 axum = "0.7"
