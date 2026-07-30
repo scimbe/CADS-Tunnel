@@ -39,8 +39,8 @@
 
 use std::time::{Duration, Instant};
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::Resolver;
 
 /// deSEC's per-node hostnames, discovered by probing and confirmed to resolve
@@ -172,7 +172,9 @@ async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<std::net::IpAddr>)> {
     let Ok(system) = Resolver::builder_tokio() else {
         return Vec::new();
     };
-    let system = system.build();
+    let Ok(system) = system.build() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for host in nodes {
         if let Ok(lookup) = system.lookup_ip(format!("{host}.")).await {
@@ -187,17 +189,25 @@ async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<std::net::IpAddr>)> {
 
 /// Query one specific node directly for `name`'s TXT values.
 async fn txt_at(server: std::net::IpAddr, name: &str) -> Result<Vec<String>, String> {
-    let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
-    let config = ResolverConfig::from_parts(None, Vec::new(), group);
+    let name_server = NameServerConfig::udp_and_tcp(server);
+    let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
     let mut opts = ResolverOpts::default();
     opts.timeout = QUERY_TIMEOUT;
     opts.attempts = 1;
     opts.cache_size = 0;
-    let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+    let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
-        .build();
+        .build()
+        .map_err(|e| e.to_string())?;
     let lookup = resolver.txt_lookup(format!("{name}.")).await.map_err(|e| e.to_string())?;
-    Ok(lookup.iter().map(|t| t.to_string()).collect())
+    Ok(lookup
+        .answers()
+        .iter()
+        .filter_map(|rec| match &rec.data {
+            hickory_resolver::proto::rr::RData::TXT(txt) => Some(txt.to_string()),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Ask one node for the zone's SOA -- a record every authoritative server for
@@ -206,15 +216,18 @@ async fn txt_at(server: std::net::IpAddr, name: &str) -> Result<Vec<String>, Str
 /// record yet" from "this node never answered at all", since both render
 /// with the same "no records found" text.
 async fn soa_reachable(server: std::net::IpAddr, zone: &str) -> bool {
-    let group = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
-    let config = ResolverConfig::from_parts(None, Vec::new(), group);
+    let name_server = NameServerConfig::udp_and_tcp(server);
+    let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
     let mut opts = ResolverOpts::default();
     opts.timeout = QUERY_TIMEOUT;
     opts.attempts = 1;
     opts.cache_size = 0;
-    let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+    let Ok(resolver) = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
-        .build();
+        .build()
+    else {
+        return false;
+    };
     resolver.soa_lookup(format!("{zone}.")).await.is_ok()
 }
 

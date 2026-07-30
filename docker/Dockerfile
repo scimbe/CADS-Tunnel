@@ -3,7 +3,7 @@
 #
 # Multi-stage: build all node binaries in release, then ship them in a slim
 # runtime. docker compose runs this one image with per-node commands
-# (ct-edge / ct-agent / ct-client). Build context is the repo root:
+# (ct-edge / ct-client / ct-control-plane). Build context is the repo root:
 #   docker build -f docker/Dockerfile -t ct-testbed .
 #
 # Build caching (#47): the release compile of the whole workspace + its dep tree
@@ -16,6 +16,12 @@
 # no caching), so install the `docker-buildx` plugin if rebuilds stay cold. Cache
 # mounts are not part of the built image layer, so the binaries are copied out to
 # /build/bin for the runtime stage to COPY --from.
+#
+# ct-agent itself was extracted to its own repo (scimbe/ct-agent) and is NOT built
+# here -- no self-host compose service ever ran it ("customers run their own agents,
+# outbound-only"). What stayed behind in crates/agent-tools (ct-crew-bridge,
+# ct-cookbook-bridge, metrics_probe, udp_echo) is still built as part of this
+# workspace, same as before.
 #
 # #165: the builder is pinned to `-bookworm` explicitly, matching the runtime's
 # `debian:bookworm-slim` glibc (2.36). The unsuffixed `rust:1-slim` tag floats to
@@ -32,7 +38,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --workspace --bins \
     && mkdir -p /build/bin \
-    && cp target/release/ct-edge target/release/ct-agent target/release/ct-client \
+    && cp target/release/ct-edge target/release/ct-client \
           target/release/ct-control-plane target/release/cp_selftest \
           target/release/metrics_probe target/release/udp_echo \
           target/release/quic_echo target/release/direct_bench \
@@ -44,7 +50,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/bin/ct-edge /usr/local/bin/ct-edge
-COPY --from=builder /build/bin/ct-agent /usr/local/bin/ct-agent
 COPY --from=builder /build/bin/ct-client /usr/local/bin/ct-client
 COPY --from=builder /build/bin/ct-control-plane /usr/local/bin/ct-control-plane
 COPY --from=builder /build/bin/cp_selftest /usr/local/bin/cp_selftest

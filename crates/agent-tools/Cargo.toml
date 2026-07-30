@@ -1,0 +1,55 @@
+[package]
+name = "ct-agent-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+# Demo bridges (ct-crew-bridge, ct-cookbook-bridge -- kept in core per #219) and
+# test/diagnostic tools (natlab, metrics_probe, udp_echo) that stayed in CADS-Tunnel
+# when ct-agent itself was extracted to its own repo (scimbe/ct-agent). Only `natlab`
+# actually depends on ct-agent (its nat_lab_* test harness functions); the rest depend
+# on nothing from ct-agent at all -- crew_bridge/cookbook_bridge only need ct-common's
+# crew/cookbook orchestration primitives, and metrics_probe/udp_echo are standalone.
+
+[dependencies]
+ct-common = { path = "../common" }
+axum = "0.7"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync"] }
+tokio-stream = "0.1"
+
+[features]
+# See ct-agent's own `nat-lab` feature doc comment -- required to build `natlab`.
+nat-lab = ["ct-agent/nat-lab"]
+
+[dependencies.ct-agent]
+# Pinned by commit (no tagged release exists yet -- cutting one triggers ct-agent's
+# release.yml matrix build/publish, a deliberate, separately-confirmed step). Bump
+# this rev deliberately, in lockstep with ct-client's dev-dependency below, once a
+# real release exists switch both to `tag = "vX.Y.Z"`. natlab's nat_lab_relay/
+# listen/dial live here and nowhere else.
+git = "https://github.com/scimbe/ct-agent"
+rev = "56a1db44ee93c07ae8763bad4243ecd1611ce6c3"
+optional = true
+
+[[bin]]
+name = "ct-crew-bridge"
+path = "src/bin/crew_bridge.rs"
+
+[[bin]]
+name = "ct-cookbook-bridge"
+path = "src/bin/cookbook_bridge.rs"
+
+[[bin]]
+name = "metrics_probe"
+path = "src/bin/metrics_probe.rs"
+
+[[bin]]
+name = "udp_echo"
+path = "src/bin/udp_echo.rs"
+
+[[bin]]
+name = "natlab"
+path = "src/bin/natlab.rs"
+required-features = ["nat-lab"]

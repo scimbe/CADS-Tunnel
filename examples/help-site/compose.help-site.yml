@@ -33,12 +33,13 @@ services:
     restart: unless-stopped
 
   help-agent:
-    # The workspace ct-agent image, in Browser-Plane mode.
+    # ct-agent, in Browser-Plane mode -- built from the standalone scimbe/ct-agent
+    # repo (see Agent.Dockerfile), not from CADS-Tunnel workspace source.
     build:
-      context: ../..
-      dockerfile: docker/Dockerfile
+      context: .
+      dockerfile: Agent.Dockerfile
       args:
-        - CRATE=ct-agent
+        - CT_AGENT_REF=${CT_AGENT_REF:-56a1db44ee93c07ae8763bad4243ecd1611ce6c3}
     environment:
       - CT_AGENT_MODE=browser                       # SNI passthrough to the origin
       - CT_AGENT_HOSTNAME=help.bunsenbrenner.org     # bound at the edge via 'H'
@@ -66,7 +67,7 @@ services:
       # rejoined automatically instead of the agent giving up after 10 tries and
       # exiting — which, holding a single-use join token, can't cleanly re-onboard.
       - CT_AGENT_RECONNECT_MAX_ATTEMPTS=0
-    # #45: docker/Dockerfile has no ENTRYPOINT, so `command` is the full argv — it
+    # #45: Agent.Dockerfile has no ENTRYPOINT, so `command` is the full argv — it
     # must name the binary (ct-agent), then the subcommand. `["onboard"]` alone
     # tries to exec a binary literally named "onboard", which doesn't exist.
     command: ["ct-agent", "onboard"]

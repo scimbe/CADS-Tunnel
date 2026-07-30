@@ -16,7 +16,7 @@ serde_json = "1"
 # AD5 convergence check (#229): confirms a DNS-01 TXT record has reached every
 # deSEC anycast node -- not just the nearest one behind ns1.desec.io/ns2.desec.org
 # -- before the control plane tells the caller publish is done.
-hickory-resolver = { version = "0.25", default-features = false, features = ["tokio", "system-config"] }
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

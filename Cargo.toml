@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/common",
-    "crates/agent",
+    "crates/agent-tools",
     "crates/edge",
     "crates/control-plane",
     "crates/client",
@@ -37,3 +37,16 @@ libp2p = { version = "0.56", default-features = false, features = ["tokio", "noi
 libp2p-stream = "0.4.0-alpha"
 # Bridges libp2p's `futures` async-IO streams to Tokio's AsyncRead/AsyncWrite.
 tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+
+# ct-agent (crates/agent-tools's optional dep, ct-client's dev-dep) lives in its own
+# repo (scimbe/ct-agent) and pins ct-common/ct-control-plane/ct-dns via a git dependency
+# on THIS repo. Without this patch, Cargo would fetch a second, separately-compiled
+# copy of those three crates just to satisfy ct-agent -- a diamond dependency whose
+# types don't unify with this workspace's own local ct-common etc., breaking anything
+# (like ct-client's integration tests) that uses both ct-agent and this workspace's
+# local crates together. This patch redirects ct-agent's git-sourced deps back onto
+# the local workspace paths, so there's exactly one compiled ct-common/etc. everywhere.
+[patch."https://github.com/scimbe/CADS-Tunnel"]
+ct-common = { path = "crates/common" }
+ct-control-plane = { path = "crates/control-plane" }
+ct-dns = { path = "crates/dns" }
