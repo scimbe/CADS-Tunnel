@@ -2353,118 +2353,152 @@ const LANDING_HTML: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bunsenbrenner.org — create at home, publish world wide</title>
 <style>
- :root{--bg:#0b0e13;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--border2:#3d4551;--text:#e6edf3;--muted:#8b949e;--muted2:#c9d1d9;--accent:#238636;--accent2:#2ea043;--link:#58a6ff}
+ :root{
+  --bg:#0c111d; --panel:#141b2c; --panel2:#1a2338; --line:#2a3450; --line-soft:#212a41;
+  --text:#eef1f7; --muted:#8a93ad; --muted2:#c3c9db;
+  --accent:#d98a4f; --accent-soft:#a8683a; --accent2:#5fb8ab;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif;
+ }
+ @media (prefers-color-scheme: light){
+  :root{
+   --bg:#f5f7fb; --panel:#ffffff; --panel2:#eef1f8; --line:#d7deec; --line-soft:#e3e8f3;
+   --text:#131a2c; --muted:#5b6478; --muted2:#333d54;
+   --accent:#b8672f; --accent-soft:#8f4f24; --accent2:#2f8a7d;
+  }
+ }
  *{box-sizing:border-box}
  html{scroll-behavior:smooth}
  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
- a{color:var(--link)}
- code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ a{color:inherit}
+ code{font-family:var(--mono)}
+ h1,h2,h3{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}
 
- .hero{position:relative;overflow:hidden;padding:2.2rem 1.5rem 3.5rem;
-  background:
-   radial-gradient(ellipse 70% 55% at 15% -15%, rgba(255,166,87,.16), transparent 60%),
-   radial-gradient(ellipse 55% 45% at 95% -10%, rgba(248,81,73,.14), transparent 60%),
-   var(--bg);
-  border-bottom:1px solid var(--border)}
- .hero-inner{max-width:66rem;margin:0 auto}
- .hero-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.75rem;margin-bottom:2.4rem}
- .brand{font-size:1.35rem;font-weight:800;letter-spacing:-.02em;display:flex;align-items:center;gap:.4rem}
- .brand .tld{color:var(--muted);font-weight:600}
- .hero-nav{display:flex;gap:.6rem;flex-wrap:wrap}
+ .hero{border-bottom:1px solid var(--line);
+  background-image:linear-gradient(var(--line-soft) 1px, transparent 1px),linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+  background-size:34px 34px}
+ .hero-inner{max-width:68rem;margin:0 auto;padding:0 1.5rem}
+ .hero-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;row-gap:.6rem;column-gap:.75rem;padding:1.4rem 0}
+ .brand{font-size:1.24rem;font-weight:700;letter-spacing:-.01em;display:flex;align-items:center;gap:.55rem;font-family:var(--serif);flex-shrink:0}
+ .brand .flame{width:9px;height:9px;border-radius:50%;background:var(--accent);flex-shrink:0;box-shadow:0 0 0 3px rgba(217,138,79,.22)}
+ .brand .tld{color:var(--muted);font-weight:400}
+ .hero-nav{display:flex;align-items:center;flex-wrap:wrap;gap:.6rem 1.2rem;font-size:.88rem;min-width:0}
+ .hero-nav a.plain{text-decoration:none;color:var(--muted2);white-space:nowrap}
+ .hero-nav a.plain:hover{color:var(--text)}
 
- .hero-content{max-width:46rem;margin:0 auto;text-align:center;display:flex;flex-direction:column;align-items:center}
- h1{font-size:clamp(2.1rem,5.5vw,3.4rem);line-height:1.15;letter-spacing:-.02em;margin:0 0 1.1rem;font-weight:800;
-  background:linear-gradient(100deg,#fff4e6 5%,#ffa657 50%,#f85149 100%);
-  -webkit-background-clip:text;background-clip:text;color:transparent}
- .lede{font-size:1.2rem;color:var(--muted2);max-width:38rem;margin:0 0 1.4rem}
+ .hero-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:3rem;align-items:center;padding:2.6rem 0 3.4rem}
 
- .badges{display:flex;gap:.6rem;flex-wrap:wrap;justify-content:center;margin:0 0 2.6rem}
- .badge{display:inline-flex;align-items:center;gap:.45rem;background:rgba(22,27,34,.7);border:1px solid var(--border);
-  border-radius:999px;padding:.4rem 1rem;font-size:.82rem;color:var(--muted2);backdrop-filter:blur(6px)}
+ .eyebrow{font-family:var(--mono);font-size:.76rem;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2);
+  display:flex;align-items:center;gap:.5rem;margin:0 0 1.1rem}
+ .eyebrow::before{content:"";width:1.4rem;height:1px;background:var(--accent2)}
 
- a.btn{display:inline-flex;align-items:center;gap:.4rem;background:linear-gradient(135deg,var(--accent2),var(--accent));
-  color:#fff;padding:.65rem 1.3rem;border-radius:9px;font-weight:600;text-decoration:none;border:1px solid transparent;
-  box-shadow:0 2px 12px rgba(35,134,54,.35);transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}
- a.btn:hover{transform:translateY(-1px);box-shadow:0 4px 18px rgba(35,134,54,.45);filter:brightness(1.05)}
+ h1{font-size:clamp(2rem,4.3vw,2.9rem);line-height:1.15;margin:0 0 1.05rem;color:var(--text)}
+ .lede{font-size:1.06rem;color:var(--muted2);max-width:34rem;margin:0 0 1.6rem}
+
+ .trust-strip{display:flex;flex-wrap:wrap;gap:1.2rem;margin:0 0 1.7rem;font-size:.83rem;color:var(--muted)}
+ .trust-strip span{display:flex;align-items:center;gap:.45rem}
+ .trust-strip .dot{width:6px;height:6px;border-radius:50%;background:var(--accent2);flex-shrink:0}
+
+ a.btn{display:inline-flex;align-items:center;gap:.4rem;background:var(--accent);color:#20130a;
+  padding:.65rem 1.2rem;border-radius:6px;font-weight:600;font-size:.92rem;text-decoration:none;border:1px solid transparent;
+  transition:filter .15s ease,transform .15s ease}
+ a.btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
  a.btn:active{transform:translateY(0)}
- a.btn.secondary{background:rgba(33,38,45,.7);border:1px solid var(--border);box-shadow:none}
- a.btn.secondary:hover{background:#262c34;border-color:var(--border2);box-shadow:0 4px 14px rgba(0,0,0,.25)}
- a.btn.support{background:linear-gradient(135deg,#a371f7,#8957e5);box-shadow:0 2px 12px rgba(137,87,229,.3)}
- a.btn.support:hover{box-shadow:0 4px 18px rgba(137,87,229,.4)}
- a.btn.big{padding:.85rem 1.7rem;font-size:1.05rem}
+ a.btn.secondary{background:transparent;color:var(--text);border-color:var(--line)}
+ a.btn.secondary:hover{background:var(--panel2);border-color:var(--muted)}
 
- .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1.2rem;margin:0 0 2.2rem;
-  text-align:left}
+ .join{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1.15rem 1.25rem;max-width:30rem}
+ .join label{display:block;font-family:var(--mono);font-size:.72rem;letter-spacing:.05em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:.55rem}
+ .join-row{display:flex;gap:.55rem}
+ .join input[type=email]{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:6px;
+  padding:.62rem .8rem;color:var(--text);font-size:.94rem;font-family:inherit}
+ .join input[type=email]:focus{outline:none;border-color:var(--accent2)}
+ .join button{cursor:pointer}
+ .join .fine{margin:.75rem 0 0;font-size:.79rem;color:var(--muted)}
+ .join .fine strong{color:var(--muted2);font-weight:600}
+ .alt-signin{margin:.85rem 0 0;font-size:.82rem;color:var(--muted)}
+ .alt-signin a{color:var(--muted2);text-decoration:underline}
+
+ .diagram-card{border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden}
+ .diagram-head{display:flex;justify-content:space-between;align-items:center;padding:.75rem .95rem;
+  border-bottom:1px solid var(--line);font-family:var(--mono);font-size:.7rem;color:var(--muted)}
+ .diagram-head .live{display:flex;align-items:center;gap:.4rem;color:var(--accent2)}
+ .diagram-head .live i{width:6px;height:6px;border-radius:50%;background:var(--accent2);display:inline-block;
+  animation:pulse 1.6s ease-in-out infinite;font-style:normal}
+ @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+ canvas#net{display:block;width:100%;height:220px}
+ .diagram-foot{display:flex;justify-content:space-between;padding:.65rem .95rem;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:.68rem;color:var(--muted)}
+ @media (prefers-reduced-motion: reduce){ .diagram-head .live i{animation:none} }
+ @media (max-width:860px){ .hero-grid{grid-template-columns:1fr} }
+
  .alt-link{margin:.7rem 0 0;font-size:.82rem;color:var(--muted)}
- .alt-link a{text-decoration:none}
+ .alt-link a{text-decoration:none;color:var(--muted2)}
  .alt-link a:hover{text-decoration:underline}
- .step{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:14px;
-  padding:1.5rem 1.4rem 1.4rem;position:relative;transition:border-color .15s ease,transform .15s ease,box-shadow .15s ease}
- .step:hover{border-color:var(--border2);transform:translateY(-3px);box-shadow:0 12px 28px rgba(0,0,0,.35)}
- .step-n{position:absolute;top:-1rem;left:1.3rem;width:2.1rem;height:2.1rem;border-radius:50%;
-  background:linear-gradient(135deg,#3fb950,#238636);color:#fff;display:flex;align-items:center;justify-content:center;
-  font-weight:700;font-size:.95rem;box-shadow:0 3px 10px rgba(35,134,54,.45);border:2px solid var(--bg)}
- .step h3{margin:.7rem 0 .5rem;font-size:1.08rem;letter-spacing:-.01em}
- .step p{color:var(--muted2);font-size:.92rem;margin:0 0 .9rem}
 
- .code-block{margin-top:.7rem;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#0d1117}
- .code-block-head{display:flex;justify-content:space-between;align-items:center;gap:.8rem;background:#161b22;
-  padding:.6rem .6rem .6rem .9rem}
- .code-block-head span{font-size:.8rem;color:var(--muted2)}
- .copy-btn{background:#21262d;border:1px solid var(--border);color:var(--text);flex-shrink:0;
-  border-radius:7px;padding:.35rem .7rem;font-size:.78rem;font-weight:600;cursor:pointer;transition:background .15s ease}
- .copy-btn:hover{background:#30363d}
+ .code-block{margin-top:.7rem;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--bg)}
+ .code-block-head{display:flex;justify-content:space-between;align-items:center;gap:.8rem;background:var(--panel2);
+  padding:.55rem .55rem .55rem .9rem;font-family:var(--mono);font-size:.74rem;color:var(--muted)}
+ .copy-btn{background:var(--panel);border:1px solid var(--line);color:var(--text);flex-shrink:0;font-family:var(--mono);
+  border-radius:6px;padding:.35rem .7rem;font-size:.72rem;font-weight:600;cursor:pointer;transition:border-color .15s ease}
+ .copy-btn:hover{border-color:var(--muted)}
 
- .callout{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--link);border-radius:10px;
-  padding:1.1rem 1.3rem;font-size:.92rem;color:var(--muted2)}
- .callout a{color:var(--link)}
+ .callout{background:var(--panel);border:1px solid var(--line);border-left:2px solid var(--accent2);border-radius:8px;
+  padding:1.1rem 1.3rem;font-size:.92rem;color:var(--muted2);margin-top:2rem}
+ .callout a{color:var(--accent2)}
 
- main{max-width:66rem;margin:0 auto;padding:3rem 1.5rem 2rem}
- .features{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin:0 0 3rem}
- .feature{padding:1.2rem 1.3rem;border:1px solid var(--border);border-radius:12px;background:var(--panel)}
- .feature .icon{font-size:1.4rem;margin-bottom:.5rem}
- .feature h3{margin:0 0 .3rem;font-size:1rem} .feature p{margin:0;color:var(--muted);font-size:.87rem}
+ main{max-width:68rem;margin:0 auto;padding:3.2rem 1.5rem 2rem}
+ .features{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:0 0 3rem}
+ .feature{padding:1.25rem 1.35rem;background:var(--panel)}
+ .feature h3{margin:0 0 .35rem;font-size:1rem;font-family:inherit;font-weight:700} .feature p{margin:0;color:var(--muted);font-size:.87rem}
 
- .lab{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--border);border-radius:14px;
-  padding:1.7rem 1.9rem;margin-bottom:3rem}
+ .lab{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1.7rem 1.9rem;margin-bottom:3rem}
  .lab h2{margin-top:0}
 
- h2{font-size:1.2rem;color:var(--muted2);margin:0 0 .8rem;font-weight:700;letter-spacing:-.01em}
+ h2{font-size:1.22rem;color:var(--text);margin:0 0 .8rem}
  .section{margin-bottom:3rem}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem;margin-top:1rem}
- .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:1.1rem;transition:border-color .15s ease}
- .card:hover{border-color:var(--border2)}
- .n{font-size:2rem;font-weight:700} .l{color:var(--muted);font-size:.85rem}
- .ok{color:#3fb950} .bad{color:#f85149}
- ul.list{list-style:none;margin:.5rem 0 0;padding:0;display:flex;flex-direction:column;gap:.5rem}
- ul.list li{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:.8rem 1.05rem;
-  display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;transition:border-color .15s ease}
- ul.list li:hover{border-color:var(--border2)}
- ul.list .id{font-weight:600} ul.list .meta{color:var(--muted);font-size:.85rem}
- ul.list a{text-decoration:none} ul.list a:hover{text-decoration:underline}
+ .section-head{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;flex-wrap:wrap;margin-bottom:.6rem}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:1rem}
+ .card{background:var(--panel);padding:1.05rem 1.2rem}
+ .n{font-family:var(--mono);font-size:1.7rem;font-weight:600;font-variant-numeric:tabular-nums} .l{color:var(--muted);font-size:.85rem}
+ .ok{color:var(--accent2)} .bad{color:#e5654f}
+ ul.list{list-style:none;margin:.5rem 0 0;padding:0;display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden}
+ ul.list li{background:var(--panel);padding:.8rem 1.05rem;
+  display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}
+ ul.list .id{font-weight:600;font-family:var(--mono);font-size:.88rem} ul.list .meta{color:var(--muted);font-size:.85rem}
+ ul.list a{text-decoration:none;color:var(--muted2)} ul.list a:hover{text-decoration:underline}
  .empty{color:var(--muted);font-size:.85rem;padding:.5rem 0}
 
- .support{background:linear-gradient(135deg,rgba(163,113,247,.1),rgba(88,166,255,.08));border:1px solid var(--border);
-  border-radius:14px;padding:1.6rem 1.8rem;display:flex;justify-content:space-between;align-items:center;gap:1.5rem;flex-wrap:wrap}
+ .mcp-strip{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1.3rem;
+  border:1px solid var(--line);border-radius:12px;padding:1.4rem 1.6rem;background:var(--panel)}
+ .mcp-strip p{margin:0;color:var(--muted2);font-size:.92rem;max-width:40rem}
+ .mcp-strip .install{font-family:var(--mono);font-size:.76rem;background:var(--bg);border:1px solid var(--line);
+  border-radius:6px;padding:.55rem .85rem;color:var(--muted);white-space:nowrap}
+
+ .support{background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:1.6rem 1.8rem;display:flex;justify-content:space-between;align-items:center;gap:1.5rem;flex-wrap:wrap}
  .support p{margin:0;color:var(--muted2);max-width:32rem;font-size:.95rem}
  .support .actions{display:flex;gap:.7rem;flex-wrap:wrap}
 
- footer.site-footer{border-top:1px solid var(--border);background:var(--panel);padding:2rem 1.5rem}
- footer.site-footer .footer-inner{max-width:66rem;margin:0 auto;display:flex;justify-content:space-between;
+ footer.site-footer{border-top:1px solid var(--line);padding:2rem 1.5rem}
+ footer.site-footer .footer-inner{max-width:68rem;margin:0 auto;display:flex;justify-content:space-between;
   align-items:center;flex-wrap:wrap;gap:1rem}
  footer.site-footer .foot{color:var(--muted);font-size:.82rem;max-width:34rem}
- footer.site-footer .legal-links{display:flex;gap:.4rem;flex-wrap:wrap;font-size:.85rem;color:var(--muted)}
- footer.site-footer .legal-links a{color:var(--muted);text-decoration:underline}
- footer.site-footer .legal-links a:hover{color:var(--muted2)}
+ footer.site-footer .legal-links{display:flex;gap:.9rem;flex-wrap:wrap;font-size:.83rem;font-family:var(--mono)}
+ footer.site-footer .legal-links a{color:var(--muted2);text-decoration:none}
+ footer.site-footer .legal-links a:hover{text-decoration:underline}
  footer.site-footer .copyright{color:var(--muted);font-size:.8rem;width:100%;margin-top:1.2rem;padding-top:1.2rem;
-  border-top:1px solid var(--border)}
+  border-top:1px solid var(--line)}
 
  .cookie-notice{position:fixed;left:1rem;right:1rem;bottom:1rem;max-width:40rem;margin:0 auto;background:var(--panel);
-  border:1px solid var(--border);border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:var(--muted2);
-  box-shadow:0 4px 20px rgba(0,0,0,.4);z-index:100;display:none}
+  border:1px solid var(--line);border-radius:10px;padding:1rem 1.2rem;font-size:.85rem;color:var(--muted2);
+  box-shadow:0 10px 30px rgba(0,0,0,.3);z-index:100;display:none}
  .cookie-notice.show{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;justify-content:space-between}
- .cookie-notice button{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
- .cookie-notice button:hover{background:var(--accent2)}
+ .cookie-notice button{background:var(--accent);color:#20130a;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
 
  @media (max-width:640px){ .support{flex-direction:column;align-items:flex-start} }
 </style></head><body>
@@ -2472,50 +2506,74 @@ const LANDING_HTML: &str = r#"<!doctype html>
 <header class="hero">
  <div class="hero-inner">
   <div class="hero-top">
-   <div class="brand">&#128293; Bunsenbrenner<span class="tld">.org</span></div>
+   <div class="brand"><span class="flame"></span>Bunsenbrenner<span class="tld">.org</span></div>
    <div class="hero-nav">
-    <a class="btn secondary" href="/llms.txt">&#129302; For AI agents &rarr;</a>
-    <a class="btn" href="/portal">Zum Kundenportal — Anmelden &rarr;</a>
+    <a class="plain" href="/llms.txt">For AI agents &rarr;</a>
+    <a class="btn secondary" href="/portal">Sign in &rarr;</a>
    </div>
   </div>
 
-  <div class="hero-content">
-   <h1>Better homemade ideas,<br>published worldwide.</h1>
-   <p class="lede">
-    Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
-    own AI agent. One device is enough, but you can just as easily combine several ("agents") so each
-    handles one part and together they deliver the whole service — reachable at a real, encrypted HTTPS
-    address. No open ports. No public IP. Nobody, including us, sees the payload.
-   </p>
-   <div class="badges">
-    <span class="badge">&#129302; Many devices, one service</span>
-    <span class="badge">&#128274; Zero-knowledge transport</span>
-    <span class="badge">&#127760; No public IP needed</span>
-    <span class="badge">&#9889; First success in minutes</span>
+  <div class="hero-grid" id="get-started">
+   <div>
+    <div class="eyebrow">Self-hosted &middot; end-to-end encrypted</div>
+    <h1>Better homemade ideas,<br>published worldwide.</h1>
+    <p class="lede">
+     Run your idea on whatever you already have — a laptop, a Raspberry Pi, a spare VM, a container, your
+     own AI agent. One device is enough, but you can just as easily combine several ("agents") so each
+     handles one part and together they deliver the whole service — reachable at a real, encrypted HTTPS
+     address. No open ports. No public IP. Nobody, including us, sees the payload.
+    </p>
+
+    <div class="trust-strip">
+     <span><span class="dot"></span>Open source — audit the code yourself</span>
+     <span><span class="dot"></span>Zero-knowledge transport</span>
+     <span><span class="dot"></span>No credit card required</span>
+     <span><span class="dot"></span>First tunnel live in minutes</span>
+    </div>
+
+    <form class="join" action="/portal/login" method="get">
+     <label for="email">Get your tunnel</label>
+     <div class="join-row">
+      <input id="email" name="login_hint" type="email" placeholder="you@example.com" autocomplete="email" required>
+      <button class="btn" type="submit">Continue &rarr;</button>
+     </div>
+     <p class="fine"><strong>No password to set up here, no payment details.</strong> This takes you to
+      our secure sign-in — your first tunnel is created automatically the moment you're in. This is
+      the identity your subdomain and your published pipelines/agents will be tied to; once it exists,
+      click <strong>Install</strong> on it and copy the <code>.env</code> block into the directory where
+      that tunnel will run.</p>
+     <p class="alt-signin">Already have an account? <a href="/portal">Sign in →</a></p>
+    </form>
+   </div>
+
+   <div class="diagram-card">
+    <div class="diagram-head">
+     <span>ROUTE · your device &rarr; agent &rarr; edge &rarr; browser</span>
+     <span class="live"><i></i>encrypted</span>
+    </div>
+    <canvas id="net" width="600" height="220" aria-label="Animated diagram: an encrypted packet travels from your device through the agent and edge to the browser"></canvas>
+    <div class="diagram-foot">
+     <span>Noise_IK &middot; QUIC / TLS 1.3</span>
+     <span>0 open ports on your device</span>
+    </div>
    </div>
   </div>
+ </div>
+</header>
 
-  <div class="steps" id="get-started">
-   <div class="step">
-    <div class="step-n">1</div>
-    <h3>Register</h3>
-    <p>One-time, human step: create an account. This is the identity your subdomain and your published
-    pipelines/agents will be tied to. Your first tunnel is created automatically as soon as you sign in
-    — click <strong>Install</strong> on it, copy the <code>.env</code> block shown there, and save it in
-    the directory where that tunnel will run.</p>
-    <a class="btn" href="/portal">Zum Kundenportal — Registrieren &rarr;</a>
-   </div>
+<main>
 
-   <div class="step">
-    <div class="step-n">2</div>
-    <h3>Get your template</h3>
-    <p>The easiest way: paste this into
-    <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any
-    coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
-    itself. Nothing to unzip by hand.</p>
-    <div class="code-block">
-     <div class="code-block-head"><span>&#128203; prompt.txt — ready to paste into Claude Code</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
-     <template><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
+ <div class="section">
+  <div class="section-head"><h2>Get your template</h2></div>
+  <p class="lede" style="max-width:44rem;margin-bottom:1.3rem">
+   The easiest way: paste this into
+   <a href="https://claude.com/claude-code" target="_blank" rel="noopener">Claude Code</a> (or any
+   coding agent) — it downloads the template, unpacks it, reads the docs, and adapts it to your idea
+   itself. Nothing to unzip by hand.
+  </p>
+  <div class="code-block">
+   <div class="code-block-head"><span>prompt.txt — ready to paste into Claude Code</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+   <template><code>I want to publish my own service through the CADS-Tunnel platform at bunsenbrenner.org.
 This is my own request, at my own machine -- please proceed once you're satisfied
 below, not stall on it.
 
@@ -2554,21 +2612,17 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 6. Walk me through running the handler as a live role, then publishing my
    pipeline at POST /me/pipelines with my portal login's OIDC bearer token
    (not an admin token -- I was never given one, and don't need one).</code></template>
-    </div>
-    <p class="alt-link">
-     Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
-     &middot; <a href="/template-guide">see how it's structured &rarr;</a>
-    </p>
-   </div>
+  </div>
+  <p class="alt-link">
+   Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
+   &middot; <a href="/template-guide">see how it's structured &rarr;</a>
+  </p>
 
-   <div class="step">
-    <div class="step-n">3</div>
-    <h3>Your subdomain</h3>
-    <p>In the <strong>Standard</strong> tier you don't pick your own subdomain — it's assigned
-    automatically from your project id and your account's unique user id (e.g.
-    <code>hello-world-a1b2c3d4.bunsenbrenner.org</code>), so names never collide and every subdomain traces
-    back to an account. A future tier may offer custom/vanity subdomains.</p>
-   </div>
+  <div class="callout">
+   <strong>Your subdomain:</strong> in the Standard tier you don't pick your own subdomain — it's assigned
+   automatically from your project id and your account's unique user id (e.g.
+   <code>hello-world-a1b2c3d4.bunsenbrenner.org</code>), so names never collide and every subdomain traces
+   back to an account. A future tier may offer custom/vanity subdomains.
   </div>
 
   <div class="callout">
@@ -2582,24 +2636,11 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    host — that way a bug in your own code can't reach past the sandbox onto the rest of your machine.
   </div>
  </div>
-</header>
-
-<main>
-
- <div class="section support">
-  <p><strong>Keep the lab running.</strong> Bunsenbrenner is free to use and runs on donated time and
-  server costs. If it helped you get something live, a small contribution keeps it going.</p>
-  <div class="actions">
-   <a class="btn support" href="https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413" target="_blank" rel="noopener">&#128153; Support as a member &rarr;</a>
-   <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">&#9749; Buy me a coffee &rarr;</a>
-   <a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" target="_blank" rel="noopener">&#128025; GitHub — feature requests, code review, issues &rarr;</a>
-  </div>
- </div>
 
  <div class="features">
-  <div class="feature"><div class="icon">&#128274;</div><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
-  <div class="feature"><div class="icon">&#128421;</div><h3>Any hardware</h3><p>Laptop, Raspberry Pi, spare VM, container, or your own AI agent — nothing runs on our infrastructure.</p></div>
-  <div class="feature"><div class="icon">&#129302;</div><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
+  <div class="feature"><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
+  <div class="feature"><h3>Any hardware</h3><p>Laptop, Raspberry Pi, spare VM, container, or your own AI agent — nothing runs on our infrastructure.</p></div>
+  <div class="feature"><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
  </div>
 
  <div class="lab">
@@ -2619,38 +2660,24 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
  </div>
 
  <div class="section">
-  <h2>Workflow pipelines</h2>
-  <div style="display:flex;gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem">
-   <a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a>
-  </div>
+  <div class="section-head"><h2>Workflow pipelines</h2><a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a></div>
   <ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
  </div>
 
  <div class="section">
-  <h2>MCP — your agent's tools, reachable by other agents</h2>
-  <p>
-   Once your <code>ct-agent channel --serve</code> process is joined to a channel, it answers real
-   <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">Model Context Protocol</a>
-   requests (JSON-RPC 2.0, protocol version <code>2024-11-05</code>) from whichever peer it's
-   channeled with — <code>initialize</code>, <code>tools/list</code>, <code>tools/call</code>, over
-   the same end-to-end-encrypted Agent-Fabric channel your tunnel already uses. There is nothing
-   separate to install: it's the same <code>ct-agent</code> binary, turned on by which env vars you
-   set.
-  </p>
-  <p>
-   This is <strong>agent-to-agent</strong>, not "add bunsenbrenner.org to your own coding assistant's
-   <code>.mcp.json</code>" — another agent that has joined a channel with you calls your tools;
-   your own coding agent (Claude Code, etc.) isn't a channel member itself. A generic bridge that
-   would let a local MCP client dial in that way doesn't exist yet.
-  </p>
-  <ul class="list">
-   <li><code>ping</code> — always on, nothing to set.</li>
-   <li><code>agent/card</code> — your signed capability card, once <code>CT_AGENT_CARD_*</code> is set.</li>
-   <li><code>auction/offer</code>, <code>auction/bid</code> — once <code>CT_AGENT_OFFER_*</code> is set.</li>
-   <li><code>service/&lt;slug&gt;</code> — a plain <code>{input} -&gt; {output}</code> tool, once
-    <code>CT_AGENT_SERVICE_HANDLER_CMD</code> + <code>CT_AGENT_SERVICES</code> are set.</li>
-  </ul>
-  <p class="alt-link">Full wire details and env vars: <a href="/llms.txt">/llms.txt</a>, section E.</p>
+  <h2>MCP</h2>
+  <div class="mcp-strip">
+   <p>
+    Once your <code>ct-agent channel --serve</code> process joins a channel, it answers real
+    <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">Model Context Protocol</a>
+    requests from whichever peer it's channeled with — over the same end-to-end-encrypted connection
+    your tunnel already uses. That's agent-to-agent, not something you add to your own coding
+    assistant's <code>.mcp.json</code>. Nothing separate to install: it's the same <code>ct-agent</code>
+    binary, turned on by which env vars you set. Full wire details and env vars:
+    <a href="/llms.txt">/llms.txt</a>, section E.
+   </p>
+   <div class="install">curl … | ct-agent onboard</div>
+  </div>
  </div>
 
  <div class="section">
@@ -2665,12 +2692,22 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   </div>
  </div>
 
+ <div class="section support">
+  <p><strong>Keep the lab running.</strong> Bunsenbrenner is free to use and runs on donated time and
+  server costs. If it helped you get something live, a small contribution keeps it going.</p>
+  <div class="actions">
+   <a class="btn" href="https://steady.page/plans/77a32d9c-c399-4ca1-9515-7a628c7a9413" target="_blank" rel="noopener">Support as a member &rarr;</a>
+   <a class="btn secondary" href="https://buymeacoffee.com/bunsenbrenner" target="_blank" rel="noopener">Buy me a coffee &rarr;</a>
+   <a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" target="_blank" rel="noopener">GitHub — feature requests, code review, issues &rarr;</a>
+  </div>
+ </div>
+
 </main>
 
 <footer class="site-footer">
  <div class="footer-inner">
   <div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
-  <div class="legal-links"><a href="/impressum">Impressum</a> · <a href="/datenschutz">Datenschutzerklärung</a> · <a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
+  <div class="legal-links"><a href="/impressum">Impressum</a><a href="/datenschutz">Datenschutzerklärung</a><a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
   <div class="copyright">&copy; Bunsenbrenner.org — Martin Becke</div>
  </div>
 </footer>
@@ -2709,6 +2746,54 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
  }
  refresh(); refreshPipelines();
  setInterval(refresh,5000); setInterval(refreshPipelines,15000);
+
+ // Network schematic animation -- device -> agent -> edge -> browser, an
+ // encrypted packet travels the path. Purely decorative; respects reduced-motion.
+ (function(){
+  var c = document.getElementById('net');
+  if(!c) return;
+  var ctx = c.getContext('2d');
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function cssVar(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function resize(){
+   var r = c.getBoundingClientRect();
+   c.width = r.width * devicePixelRatio; c.height = r.height * devicePixelRatio;
+   ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  var labels = ['Device','Agent','Edge','Browser'];
+  var t = 0;
+  function draw(){
+   var r = c.getBoundingClientRect(); var w = r.width, h = r.height;
+   ctx.clearRect(0,0,w,h);
+   var line = cssVar('--line'), muted = cssVar('--muted'), text = cssVar('--text'),
+       accent = cssVar('--accent'), accent2 = cssVar('--accent2'), panel = cssVar('--panel');
+   var n = labels.length, pad = 40;
+   var xs = []; for (var i=0;i<n;i++){ xs.push(pad + (w-2*pad) * (i/(n-1))); }
+   var y = h/2 - 8;
+   ctx.strokeStyle = line; ctx.lineWidth = 2;
+   ctx.beginPath(); ctx.moveTo(xs[0], y); ctx.lineTo(xs[n-1], y); ctx.stroke();
+   for (var i=0;i<n;i++){
+    ctx.beginPath(); ctx.arc(xs[i], y, 7, 0, Math.PI*2);
+    ctx.fillStyle = panel; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = (i===0||i===n-1) ? muted : accent2; ctx.stroke();
+    ctx.font = '11px ' + (cssVar('--mono') || 'monospace');
+    ctx.fillStyle = text; ctx.textAlign = 'center';
+    ctx.fillText(labels[i], xs[i], y + 26);
+   }
+   var pos = reduce ? 0.5 : (Math.sin(t/60) + 1) / 2;
+   var px = xs[0] + (xs[n-1]-xs[0]) * pos;
+   ctx.beginPath(); ctx.arc(px, y, 4, 0, Math.PI*2);
+   ctx.fillStyle = accent; ctx.shadowColor = accent; ctx.shadowBlur = 8; ctx.fill(); ctx.shadowBlur = 0;
+   ctx.font = '10px ' + (cssVar('--mono') || 'monospace');
+   ctx.fillStyle = muted; ctx.textAlign = 'left';
+   ctx.fillText('ciphertext only -- 0 bytes of payload visible to the operator', pad, h/2 + 52);
+   t += 1;
+   if (!reduce) requestAnimationFrame(draw);
+  }
+  draw();
+ })();
 </script>
 <div class="cookie-notice" id="cookie-notice">
  <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
@@ -5876,9 +5961,13 @@ mod tests {
             ("/nutzungsbedingungen", vec!["Freistellung", "Nutzerdienst", "§§ 7", "TMG"]),
             (
                 // The human "get started" onboarding now lives inline on the landing page itself.
+                // #237 redesign: the entry point is an email-first join form (login_hint into the
+                // existing Keycloak/OIDC flow), not a bare "Register" button -- so this checks for
+                // that CTA's own copy instead of the retired word.
                 "/",
                 vec![
-                    "Register",
+                    "Get your tunnel",
+                    "login_hint",
                     "hello-world-pipeline",
                     "Claude Code",
                     "Standard",

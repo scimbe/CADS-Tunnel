@@ -139,17 +139,26 @@ impl PortalOidc {
     /// identity provider (e.g. `google`, `github`) instead of Keycloak's own
     /// provider-chooser screen -- the "Continue with Google/GitHub" buttons on the
     /// portal shell use this so picking a provider is a single click, not two.
-    fn authorize_redirect(&self, state: &str, idp_hint: Option<&str>) -> String {
+    /// `login_hint` is the standard OIDC param (Keycloak honors it) that pre-fills
+    /// the username/email field on Keycloak's own login+register form -- lets the
+    /// landing page's email-first entry point hand the typed address straight
+    /// through instead of the visitor retyping it a second time.
+    fn authorize_redirect(&self, state: &str, idp_hint: Option<&str>, login_hint: Option<&str>) -> String {
         let hint_param = idp_hint
             .map(|h| format!("&kc_idp_hint={}", urlencode(h)))
             .unwrap_or_default();
+        let login_hint_param = login_hint
+            .filter(|h| !h.is_empty())
+            .map(|h| format!("&login_hint={}", urlencode(h)))
+            .unwrap_or_default();
         format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}{}",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}{}{}",
             self.authorize_url,
             urlencode(&self.client_id),
             urlencode(&self.redirect_uri),
             urlencode(state),
             hint_param,
+            login_hint_param,
         )
     }
 
@@ -349,9 +358,13 @@ async fn portal_home() -> Html<&'static str> {
 /// Allowlisted against the identity providers actually declared in the `ct-demo`
 /// realm (`keycloak/ct-demo-realm.json`) -- anything else is dropped rather than
 /// passed through, since this value is embedded verbatim into a redirect URL.
+/// `login_hint` comes from the landing page's email-first entry point -- passed
+/// through as-is (urlencoded at the call site); it only pre-fills a form field,
+/// never authenticates anything, so it needs no allowlisting.
 #[derive(Deserialize)]
 struct LoginQuery {
     kc_idp_hint: Option<String>,
+    login_hint: Option<String>,
 }
 
 fn known_idp_hint(hint: Option<&str>) -> Option<&str> {
@@ -366,7 +379,8 @@ async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>
             // response came back to the same browser we sent out.
             let state = random_state();
             let hint = known_idp_hint(q.kc_idp_hint.as_deref());
-            let mut resp = Redirect::to(&cfg.authorize_redirect(&state, hint)).into_response();
+            let mut resp =
+                Redirect::to(&cfg.authorize_redirect(&state, hint, q.login_hint.as_deref())).into_response();
             set_cookie(&mut resp, &state_cookie(&state));
             resp
         }
@@ -1187,6 +1201,32 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::SEE_OTHER);
         let loc2 = resp2.headers().get("location").unwrap().to_str().unwrap();
         assert!(!loc2.contains("kc_idp_hint"), "an unrecognized hint is dropped, not reflected, got {loc2}");
+    }
+
+    #[tokio::test]
+    async fn login_passes_the_landing_pages_email_through_as_a_login_hint() {
+        // The landing page's email-first entry point submits straight to
+        // /portal/login?login_hint=<email> -- Keycloak pre-fills its own
+        // login+register form with it. No allowlist needed (unlike kc_idp_hint):
+        // this only pre-fills a form field client-side, it authenticates nothing.
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login?login_hint=me%40example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(loc.contains("login_hint=me%40example.com"), "email is passed through, got {loc}");
     }
 
     fn cfg() -> PortalOidc {
