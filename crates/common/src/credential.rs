@@ -22,12 +22,21 @@ pub struct Credential {
 
 impl Credential {
     /// Canonical bytes covered by the issuer signature.
+    ///
+    /// #249: previously a raw `format!("ct-cred:v1|{tenant}|{agent}|{expires_at}")` with an
+    /// unescaped `|` separator — two distinct `(tenant, agent)` pairs could serialize identically
+    /// (e.g. `tenant="a|b", agent="c"` vs `tenant="a", agent="b|c"`, both `TenantId`/`AgentId` being
+    /// unvalidated `String`s), so an issuer signature over one verified as valid over the other —
+    /// real identity confusion. [`crate::preimage::Preimage`]'s `var_bytes` length-prefixes each
+    /// field, so no byte content in `tenant`/`agent` can shift the field boundary; this is a wire
+    /// format change (any credential signed under the old scheme no longer verifies), acceptable
+    /// since credentials are explicitly short-lived (see module docs).
     pub fn signing_bytes(&self) -> Vec<u8> {
-        format!(
-            "ct-cred:v1|{}|{}|{}",
-            self.tenant.0, self.agent.0, self.expires_at
-        )
-        .into_bytes()
+        crate::preimage::Preimage::new(b"ct-cred:v1")
+            .var_bytes(self.tenant.0.as_bytes())
+            .var_bytes(self.agent.0.as_bytes())
+            .u64(self.expires_at)
+            .finish()
     }
 }
 
@@ -178,6 +187,24 @@ mod tests {
                 signature,
             },
         )
+    }
+
+    #[test]
+    fn signing_bytes_is_injective_across_a_shifted_tenant_agent_boundary() {
+        // #249: the old `format!("ct-cred:v1|{tenant}|{agent}|{expires_at}")` let a `|` inside
+        // tenant/agent shift the field boundary -- tenant="a|b",agent="c" and tenant="a",agent="b|c"
+        // both serialized to the same bytes, so a signature over one verified as valid over the
+        // other. Length-prefixed encoding must keep these two distinct.
+        let a = Credential { tenant: TenantId("a|b".into()), agent: AgentId("c".into()), expires_at: 100 };
+        let b = Credential { tenant: TenantId("a".into()), agent: AgentId("b|c".into()), expires_at: 100 };
+        assert_ne!(a.signing_bytes(), b.signing_bytes(), "shifted tenant/agent boundary must not collide");
+
+        // A signature over A must not verify as a signature over B.
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let sig_a = sk.sign(&a.signing_bytes());
+        let signed_as_b = SignedCredential { credential: b, signature: sig_a.to_bytes() };
+        assert_eq!(verify(&pk, &signed_as_b, 50), Err(CredError::BadSignature));
     }
 
     #[test]
