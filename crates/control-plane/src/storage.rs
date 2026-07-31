@@ -1759,6 +1759,17 @@ impl SqliteChannelStore {
         // #101 SEC101b: the member's attestation over its Noise key (holder-signed),
         // stored so the edge can relay it and the peer can verify the key is genuine.
         ensure_column(&conn, "channel_members", "noise_attestation", "BLOB")?;
+        // #248-follow: additive migration so an already-deployed channel store gains
+        // the self-service allow-list table in place, same pattern as #44's `ensure_column`.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_allowlist (
+                 channel   BLOB NOT NULL,
+                 email     TEXT NOT NULL,
+                 added_by  TEXT NOT NULL,
+                 added_at  INTEGER NOT NULL,
+                 PRIMARY KEY (channel, email)
+             );",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -2016,6 +2027,141 @@ impl SqliteChannelStore {
         conn.execute(
             "DELETE FROM channel_members WHERE channel = ?1 AND holder = ?2",
             params![&channel.0[..], &holder[..]],
+        )?;
+        Ok(true)
+    }
+
+    /// Add `email` (case-insensitively) to `channel`'s self-service **allow-list**
+    /// (#248-follow): any portal user who later logs in with a matching *verified*
+    /// id_token email may claim their own membership on this channel without the
+    /// owner manually exchanging holder keys over e.g. a GitHub issue. Owner-scoped
+    /// like [`add_member`](Self::add_member); idempotent (re-adding just refreshes
+    /// `added_at`). Returns `false` if `owner` doesn't own `channel`.
+    pub fn allowlist_add(
+        &self,
+        channel: &ChannelId,
+        owner: &str,
+        email: &str,
+        now: u64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_allowlist (channel, email, added_by, added_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&channel.0[..], email.to_ascii_lowercase(), owner, now as i64],
+        )?;
+        Ok(true)
+    }
+
+    /// Remove `email` from `channel`'s allow-list. Owner-scoped, idempotent; `false`
+    /// if not the owner (or unknown channel). Does **not** revoke an already-claimed
+    /// membership — that's still [`remove_member`](Self::remove_member); this only
+    /// stops a *future* claim.
+    pub fn allowlist_remove(&self, channel: &ChannelId, owner: &str, email: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM channel_allowlist WHERE channel = ?1 AND email = ?2",
+            params![&channel.0[..], email.to_ascii_lowercase()],
+        )?;
+        Ok(true)
+    }
+
+    /// List `channel`'s allow-listed emails. Owner-scoped: `None` if `owner` doesn't
+    /// own `channel` (or it's unknown), `Some(emails)` otherwise (empty when no
+    /// entries).
+    pub fn allowlist_list(&self, channel: &ChannelId, owner: &str) -> rusqlite::Result<Option<Vec<String>>> {
+        let conn = self.conn.lock_safe();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT email FROM channel_allowlist WHERE channel = ?1 ORDER BY added_at ASC",
+        )?;
+        let emails = stmt
+            .query_map(params![&channel.0[..]], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(emails))
+    }
+
+    /// Whether `email` (case-insensitive) is allow-listed on `channel` — the gate the
+    /// self-service **claim** endpoint checks against the caller's own *verified*
+    /// session email. Deliberately **not** owner-scoped: the claimant isn't the owner.
+    pub fn allowlist_contains(&self, channel: &ChannelId, email: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM channel_allowlist WHERE channel = ?1 AND email = ?2",
+                params![&channel.0[..], email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Self-service claim (#248-follow): add `holder` as a member of `channel`,
+    /// authorized not by an owner-signed request but by `email` being on the
+    /// channel's own allow-list — the counterpart to
+    /// [`add_member`](Self::add_member) for a caller who **isn't** the owner.
+    /// Returns `false` (no write) when `email` isn't allow-listed for `channel`
+    /// (covers an unknown channel too, since its allow-list is then empty).
+    /// Idempotent, same as `add_member`: re-claiming refreshes the recorded Noise
+    /// key. The allow-list check and the insert happen under the same lock, so a
+    /// concurrent `allowlist_remove` can't race a claim into landing anyway.
+    pub fn claim_via_allowlist(
+        &self,
+        channel: &ChannelId,
+        email: &str,
+        holder: &[u8; 32],
+        noise_pubkey: &[u8; 32],
+        noise_attestation: &[u8; 64],
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let allowed: bool = conn
+            .query_row(
+                "SELECT 1 FROM channel_allowlist WHERE channel = ?1 AND email = ?2",
+                params![&channel.0[..], email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !allowed {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_members (channel, holder, noise_pubkey, noise_attestation) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&channel.0[..], &holder[..], &noise_pubkey[..], &noise_attestation[..]],
         )?;
         Ok(true)
     }
@@ -3811,6 +3957,50 @@ mod tests {
         // Owner may re-key their own channel (agent rotates its operator key).
         assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
         assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+    }
+
+    #[test]
+    fn allowlist_is_owner_scoped_case_insensitive_and_claim_adds_the_member_248() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x55; 32]);
+        let op = [0x22u8; 32];
+        let holder = [0x66u8; 32];
+        let noise = [0x77u8; 32];
+        let attest = [0x88u8; 64];
+        assert!(s.register_channel(&ch, &op, "alice").unwrap());
+
+        // Non-owner can't manage the allow-list.
+        assert!(!s.allowlist_add(&ch, "mallory", "nat@example.com", 1_000).unwrap());
+        assert_eq!(s.allowlist_list(&ch, "mallory").unwrap(), None, "mallory isn't the owner");
+
+        // Owner adds an email (idempotent), case-insensitively stored/matched.
+        assert!(s.allowlist_add(&ch, "alice", "Nat@Example.com", 1_000).unwrap());
+        assert!(s.allowlist_add(&ch, "alice", "nat@example.com", 2_000).unwrap(), "re-add is idempotent");
+        assert_eq!(s.allowlist_list(&ch, "alice").unwrap(), Some(vec!["nat@example.com".to_string()]));
+        assert!(s.allowlist_contains(&ch, "NAT@EXAMPLE.COM").unwrap(), "lookup is case-insensitive too");
+        assert!(!s.allowlist_contains(&ch, "someone-else@example.com").unwrap());
+
+        // An email NOT on the allow-list can't claim.
+        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest).unwrap());
+        assert!(!s.is_member(&ch, &holder).unwrap());
+
+        // The allow-listed email claims successfully (owner never involved in this call).
+        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest).unwrap());
+        assert!(s.is_member(&ch, &holder).unwrap());
+
+        // Owner removes the email; a FUTURE claim by a new holder is refused, but the
+        // already-claimed membership above is untouched (allow-list ≠ membership).
+        assert!(!s.allowlist_remove(&ch, "mallory", "nat@example.com").unwrap(), "non-owner can't remove");
+        assert!(s.allowlist_remove(&ch, "alice", "nat@example.com").unwrap());
+        assert!(s.allowlist_remove(&ch, "alice", "nat@example.com").unwrap(), "remove is idempotent");
+        assert_eq!(s.allowlist_list(&ch, "alice").unwrap(), Some(vec![]));
+        assert!(s.is_member(&ch, &holder).unwrap(), "de-listing doesn't revoke an existing member");
+        let another_holder = [0x99u8; 32];
+        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest).unwrap());
+
+        // An unknown channel's allow-list is always empty -> claim always false.
+        let unknown = ChannelId([0xAB; 32]);
+        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest).unwrap());
     }
 
     #[test]

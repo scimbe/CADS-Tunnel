@@ -241,6 +241,54 @@ impl ControlPlaneClient {
         Ok(())
     }
 
+    /// `POST /me/channels/:channel/allowlist` (#248-follow) — allow-list `email` for
+    /// self-service claiming on `channel` (owner-scoped: `bearer_token`'s subject must
+    /// own it). Lets an operator manage the channel's allow-list from `ct-agent`
+    /// instead of only the portal web UI.
+    pub async fn channel_allowlist_add(&self, channel_hex: &str, email: &str, bearer_token: &str) -> CpResult<()> {
+        let resp = self
+            .http
+            .post(format!("{}/me/channels/{channel_hex}/allowlist", self.base))
+            .header("authorization", format!("Bearer {bearer_token}"))
+            .json(&serde_json::json!({ "email": email }))
+            .send()
+            .await?;
+        ok(resp)?;
+        Ok(())
+    }
+
+    /// `POST /me/channels/:channel/allowlist/:email/remove` (#248-follow) — de-list
+    /// `email` (owner-scoped). Only stops a *future* claim; an already-claimed member
+    /// keeps their grant.
+    pub async fn channel_allowlist_remove(&self, channel_hex: &str, email: &str, bearer_token: &str) -> CpResult<()> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/me/channels/{channel_hex}/allowlist/{}/remove",
+                self.base,
+                urlencode_path_segment(email),
+            ))
+            .header("authorization", format!("Bearer {bearer_token}"))
+            .send()
+            .await?;
+        ok(resp)?;
+        Ok(())
+    }
+
+    /// `GET /me/channels/:channel/allowlist` (#248-follow) — list allow-listed emails
+    /// (owner-scoped).
+    pub async fn channel_allowlist_list(&self, channel_hex: &str, bearer_token: &str) -> CpResult<Vec<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/me/channels/{channel_hex}/allowlist", self.base))
+            .header("authorization", format!("Bearer {bearer_token}"))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: AllowlistBody = resp.json().await?;
+        Ok(body.emails)
+    }
+
     /// `POST /registry/agents` (#144 ②, #214 follow-up: automatic discoverability) — self-register
     /// (upsert) a published `card_url` + advertised facets, gated by the shared admin token (see
     /// [`Self::with_admin_token`]) rather than an OIDC bearer, since an autonomous agent has no
@@ -275,6 +323,27 @@ fn ok(resp: reqwest::Response) -> CpResult<reqwest::Response> {
     } else {
         Err(CpError::Status(status))
     }
+}
+
+/// Percent-encode one URL path segment (RFC 3986 unreserved chars pass through
+/// unescaped, everything else — including `@` and `.`'s surrounding bytes when
+/// they're not ASCII-alnum/`-`/`_`/`.`/`~` — is escaped). Just enough for an email
+/// address in a path segment (`channel_allowlist_remove`); not a general URL encoder.
+fn urlencode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct AllowlistBody {
+    emails: Vec<String>,
 }
 
 #[derive(Deserialize)]

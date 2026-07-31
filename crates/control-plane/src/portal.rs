@@ -34,12 +34,20 @@ const SESSION_COOKIE: &str = "ct_portal_session";
 const SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 
 /// The identity extracted from a verified id_token at the OIDC callback: the
-/// durable account key (`sub`) plus the optional `email` claim used only to make
-/// the access-list decision (#43) — never stored or logged beyond that.
+/// durable account key (`sub`) plus the optional `email` claim used to make the
+/// access-list decision (#43) and, when the IdP also asserts `email_verified`
+/// (#248-follow), carried into the session so the channel-allowlist self-service
+/// claim can trust it without a second round-trip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExchangedIdentity {
     pub subject: String,
     pub email: Option<String>,
+    /// The id_token's own `email_verified` claim. `false` for any IdP/claim shape
+    /// that doesn't explicitly assert it — #248-follow's allow-list claim only
+    /// ever trusts an email carried with this `true`, so an unverified-email IdP
+    /// (or one that omits the claim) simply can't self-claim, only fall back to
+    /// the existing owner-driven `/me/channels/*/members` flow.
+    pub email_verified: bool,
 }
 
 /// Exchanges an authorization `code` for the authenticated identity (OIDC `sub` and
@@ -365,7 +373,12 @@ fn identity_from_verified_id_token(
         .get("email")
         .and_then(|s| s.as_str())
         .map(|s| s.to_string());
-    Ok(ExchangedIdentity { subject, email })
+    let email_verified = data
+        .claims
+        .get("email_verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(ExchangedIdentity { subject, email, email_verified })
 }
 
 async fn portal_home() -> Html<&'static str> {
@@ -464,11 +477,21 @@ async fn portal_callback(
                 }
             }
             let subject = identity.subject;
+            // #248-follow: only a *verified* email rides along in the session — an
+            // unverified or absent one means the allow-list claim route simply won't
+            // find a usable email later (falls back to the owner-driven flow), never
+            // a spoofable one.
+            let verified_email = identity.email_verified.then_some(identity.email).flatten();
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let token = sign_session(&st.session_key, &subject, now + SESSION_TTL_SECS);
+            let token = sign_session_with_email(
+                &st.session_key,
+                &subject,
+                verified_email.as_deref(),
+                now + SESSION_TTL_SECS,
+            );
             let mut resp = Redirect::to("/portal/home").into_response();
             set_cookie(&mut resp, &session_cookie(&token));
             set_cookie(&mut resp, &cleared_state_cookie());
@@ -554,26 +577,63 @@ fn session_mac(key: &[u8], payload: &[u8]) -> Vec<u8> {
     m.finalize().into_bytes().to_vec()
 }
 
-/// Mint a signed session token for `subject`, valid until `exp` (unix seconds).
-/// Format: `<hex(subject)>:<exp>.<hex(hmac)>` — opaque, tamper-evident, and the
-/// subject carries no secret. Minted at the callback once the code is exchanged.
+/// Mint a signed session token for `subject`, valid until `exp` (unix seconds), no
+/// email. Format: `<hex(subject)>:<exp>:.<hex(hmac)>` — opaque, tamper-evident, and
+/// the subject carries no secret. Since #248-follow, production only ever mints via
+/// [`sign_session_with_email`] (the callback always knows whether it has a verified
+/// email); this bare form is now purely a test convenience for call sites that don't
+/// care about the email field.
+#[cfg(test)]
 fn sign_session(key: &[u8], subject: &str, exp: u64) -> String {
-    let payload = format!("{}:{exp}", hex(subject.as_bytes()));
+    sign_session_with_email(key, subject, None, exp)
+}
+
+/// [`sign_session`] plus an optional verified email (#248-follow), carried the same
+/// tamper-evident way: `<hex(subject)>:<exp>:<hex(email) or empty>.<hex(hmac)>`. The
+/// email segment is empty (not merely absent) when there's none, so parsing stays a
+/// fixed 3-field split — an older 2-field token from before this addition fails the
+/// MAC check outright (payload bytes differ) rather than silently misparsing, so it
+/// just bounces the visitor to log in again, same as any other invalid session.
+fn sign_session_with_email(key: &[u8], subject: &str, email: Option<&str>, exp: u64) -> String {
+    let email_hex = email.map(|e| hex(e.as_bytes())).unwrap_or_default();
+    let payload = format!("{}:{exp}:{email_hex}", hex(subject.as_bytes()));
     format!("{payload}.{}", hex(&session_mac(key, payload.as_bytes())))
+}
+
+/// The verified claims carried by a session token (#248-follow): the durable
+/// subject, plus the verified email (if any) minted alongside it at login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionClaims {
+    pub subject: String,
+    pub email: Option<String>,
 }
 
 /// Verify a session token and return its subject if the MAC checks out and it
 /// has not expired (`now` in unix seconds). Constant-time MAC comparison.
 fn verify_session(key: &[u8], token: &str, now: u64) -> Option<String> {
+    verify_session_full(key, token, now).map(|c| c.subject)
+}
+
+/// [`verify_session`], also returning the session's verified email (#248-follow).
+fn verify_session_full(key: &[u8], token: &str, now: u64) -> Option<SessionClaims> {
     let (payload, tag_hex) = token.rsplit_once('.')?;
-    let (sub_hex, exp_str) = payload.split_once(':')?;
+    let mut parts = payload.splitn(3, ':');
+    let sub_hex = parts.next()?;
+    let exp_str = parts.next()?;
+    let email_hex = parts.next().unwrap_or("");
     if exp_str.parse::<u64>().ok()? <= now {
         return None;
     }
     if !ct_eq(&session_mac(key, payload.as_bytes()), &unhex(tag_hex)?) {
         return None;
     }
-    String::from_utf8(unhex(sub_hex)?).ok()
+    let subject = String::from_utf8(unhex(sub_hex)?).ok()?;
+    let email = if email_hex.is_empty() {
+        None
+    } else {
+        String::from_utf8(unhex(email_hex)?).ok()
+    };
+    Some(SessionClaims { subject, email })
 }
 
 /// Constant-time byte-slice equality, so MAC verification leaks no timing.
@@ -600,6 +660,18 @@ pub(crate) fn session_subject_for(key: &[u8], headers: &HeaderMap) -> Option<Str
     verify_session(key, &cookie_value(headers, SESSION_COOKIE)?, now)
 }
 
+/// Resolve the full session claims (subject + verified email, if any) from a
+/// request's session cookie against `key` (#248-follow). Shared with the
+/// channel-allowlist claim route (`portal_api`), which needs the verified email
+/// `session_subject_for` deliberately doesn't expose.
+pub(crate) fn session_claims_for(key: &[u8], headers: &HeaderMap) -> Option<SessionClaims> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    verify_session_full(key, &cookie_value(headers, SESSION_COOKIE)?, now)
+}
+
 /// Mint a valid session token for `subject` (test helper for sibling modules).
 #[cfg(test)]
 pub(crate) fn sign_session_for_test(key: &[u8], subject: &str) -> String {
@@ -608,6 +680,16 @@ pub(crate) fn sign_session_for_test(key: &[u8], subject: &str) -> String {
         .unwrap()
         .as_secs();
     sign_session(key, subject, now + SESSION_TTL_SECS)
+}
+
+/// Mint a valid session token carrying a verified email too (test helper, #248-follow).
+#[cfg(test)]
+pub(crate) fn sign_session_with_email_for_test(key: &[u8], subject: &str, email: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sign_session_with_email(key, subject, Some(email), now + SESSION_TTL_SECS)
 }
 
 /// The session cookie: HttpOnly, Secure, SameSite=Lax, scoped to `/portal`.
@@ -828,18 +910,21 @@ mod tests {
                 Ok(ExchangedIdentity {
                     subject: subject.to_string(),
                     email: None,
+                    email_verified: false,
                 })
             })
         })
     }
 
-    /// An injected exchanger returning a fixed subject + email (#43 gate tests).
+    /// An injected exchanger returning a fixed subject + **verified** email (#43
+    /// gate tests, #248-follow allow-list-claim tests).
     fn stub_exchanger_email(subject: &'static str, email: &'static str) -> Exchanger {
         Arc::new(move |_code| {
             Box::pin(async move {
                 Ok(ExchangedIdentity {
                     subject: subject.to_string(),
                     email: Some(email.to_string()),
+                    email_verified: true,
                 })
             })
         })
@@ -1561,6 +1646,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_carries_the_verified_email_into_the_session_248() {
+        // #248-follow: `stub_exchanger_email` returns `email_verified: true`, so the
+        // minted session's claims carry the email too, not just the subject — the
+        // allow-list claim route reads exactly this.
+        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger_email("kc-user-9", "dev@becke.biz"), None);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with("ct_portal_session=") && !c.contains("ct_portal_session=;"))
+            .expect("session cookie set");
+        let token = session.strip_prefix("ct_portal_session=").and_then(|s| s.split(';').next()).unwrap();
+        let claims = session_claims_for(TEST_KEY, &HeaderMap::from_iter([(
+            COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={token}")).unwrap(),
+        )]))
+        .expect("valid session");
+        assert_eq!(claims.subject, "kc-user-9");
+        assert_eq!(claims.email.as_deref(), Some("dev@becke.biz"));
+    }
+
+    #[tokio::test]
     async fn callback_gate_rejects_disallowed_domain_without_a_session() {
         // #43: a non-allowed-domain subject is 403'd with the access-list page and
         // NO session cookie — an obvious acceptance-policy rejection.
@@ -1663,6 +1780,29 @@ mod tests {
         assert!(verify_session(TEST_KEY, &bad, now).is_none());
         // Garbage -> rejected, no panic.
         assert!(verify_session(TEST_KEY, "not-a-token", now).is_none());
+    }
+
+    #[test]
+    fn session_with_email_roundtrips_and_email_less_session_has_no_email_248() {
+        let now = 1_000_000u64;
+        // A session minted with a verified email carries it through `verify_session_full`.
+        let tok = sign_session_with_email(TEST_KEY, "kc-user-9", Some("nat@example.com"), now + SESSION_TTL_SECS);
+        let claims = verify_session_full(TEST_KEY, &tok, now).expect("valid session");
+        assert_eq!(claims.subject, "kc-user-9");
+        assert_eq!(claims.email.as_deref(), Some("nat@example.com"));
+        // `verify_session` (subject-only callers) still works unchanged.
+        assert_eq!(verify_session(TEST_KEY, &tok, now).as_deref(), Some("kc-user-9"));
+
+        // A plain `sign_session` (no email) carries `None` — never a stray empty string.
+        let tok_no_email = sign_session(TEST_KEY, "kc-user-9", now + SESSION_TTL_SECS);
+        let claims = verify_session_full(TEST_KEY, &tok_no_email, now).expect("valid session");
+        assert_eq!(claims.email, None);
+
+        // Tampering with an email-carrying session is still rejected the same way.
+        let mut bad = tok.clone();
+        let last = bad.pop().unwrap();
+        bad.push(if last == 'a' { 'b' } else { 'a' });
+        assert!(verify_session_full(TEST_KEY, &bad, now).is_none());
     }
 
     #[tokio::test]

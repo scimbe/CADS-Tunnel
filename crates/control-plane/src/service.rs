@@ -740,6 +740,10 @@ pub struct AuthedChannelState {
 ///   the channel is already owned by another subject
 /// * `POST /me/channels/:channel/members` `{holder}` → add a member (owner-scoped)
 /// * `POST /me/channels/:channel/members/:holder/remove` → remove a member (revocation)
+/// * `POST /me/channels/:channel/allowlist` `{email}` → allow-list an email for
+///   self-service claiming (#248-follow, owner-scoped)
+/// * `GET /me/channels/:channel/allowlist` → list allow-listed emails (owner-scoped)
+/// * `POST /me/channels/:channel/allowlist/:email/remove` → de-list an email (owner-scoped)
 pub fn authed_channel_router(
     channels: Arc<SqliteChannelStore>,
     verifier: Arc<OidcVerifier>,
@@ -750,6 +754,14 @@ pub fn authed_channel_router(
         .route(
             "/me/channels/:channel/members/:holder/remove",
             post(channel_remove_member),
+        )
+        .route(
+            "/me/channels/:channel/allowlist",
+            post(channel_allowlist_add).get(channel_allowlist_list),
+        )
+        .route(
+            "/me/channels/:channel/allowlist/:email/remove",
+            post(channel_allowlist_remove),
         )
         .with_state(AuthedChannelState { channels, verifier })
 }
@@ -1926,6 +1938,101 @@ async fn channel_remove_member(
     let ok = state
         .channels
         .remove_member(&ChannelId(channel), &owner, &holder)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
+    }
+}
+
+/// Loose email-syntax sanity check (#248-follow) — this is NOT verification (that's
+/// the IdP's job via `email_verified`, checked at claim time), just enough to reject
+/// obvious garbage before it lands in the allow-list: one `@`, a non-empty local part
+/// and a domain part containing at least one `.`, total length bounded.
+fn plausible_email(email: &str) -> bool {
+    if email.is_empty() || email.len() > 254 {
+        return false;
+    }
+    match email.split_once('@') {
+        Some((local, domain)) => !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.'),
+        None => false,
+    }
+}
+
+#[derive(Deserialize)]
+struct AllowlistEmailReq {
+    email: String,
+}
+
+#[derive(Serialize)]
+struct AllowlistResp {
+    emails: Vec<String>,
+}
+
+/// `POST /me/channels/:channel/allowlist` (#248-follow): owner-scoped, add `email`
+/// to the channel's self-service allow-list. See [`SqliteChannelStore::allowlist_add`].
+async fn channel_allowlist_add(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<AllowlistEmailReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    if !plausible_email(&req.email) {
+        return Err((StatusCode::BAD_REQUEST, "malformed email".to_string()));
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let ok = state
+        .channels
+        .allowlist_add(&ChannelId(channel), &owner, &req.email, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
+    }
+}
+
+/// `GET /me/channels/:channel/allowlist` (#248-follow): owner-scoped list of
+/// allow-listed emails.
+async fn channel_allowlist_list(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+) -> Result<Json<AllowlistResp>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let emails = state
+        .channels
+        .allowlist_list(&ChannelId(channel), &owner)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match emails {
+        Some(emails) => Ok(Json(AllowlistResp { emails })),
+        None => Err((StatusCode::FORBIDDEN, "not the channel owner".to_string())),
+    }
+}
+
+/// `POST /me/channels/:channel/allowlist/:email/remove` (#248-follow): owner-scoped
+/// removal from the allow-list. Path-encoded email, mirroring
+/// `/members/:holder/remove`'s shape; only stops *future* claims (an already-claimed
+/// member keeps their grant — use the existing member-remove route to revoke that).
+async fn channel_allowlist_remove(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path((channel_hex, email)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    // axum's `Path` extractor percent-decodes each segment already — `email` here is
+    // the raw address, not the wire-encoded form.
+    let ok = state
+        .channels
+        .allowlist_remove(&ChannelId(channel), &owner, &email)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if ok {
         Ok(StatusCode::OK)
@@ -3614,6 +3721,10 @@ pub fn persistent_control_plane_router(
                     admin_token,
                 ),
             )
+            // #248-follow: the session-authed channel-allowlist self-service claim —
+            // same session key as the portal login above, so a claim just works right
+            // after a portal login with no separate auth step.
+            .merge(crate::portal_api::channel_claim_router(webhook_secret, channels.clone()))
         })
         .merge(pki)
         // /install.sh + /install.ps1 now just redirect to ct-agent's own setup
@@ -3786,7 +3897,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
@@ -3807,7 +3918,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
+pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
     if s.len() != 128 {
         return None;
     }
@@ -5783,6 +5894,98 @@ mod tests {
             None,
             "a revoked member is no longer authorized"
         );
+    }
+
+    #[tokio::test]
+    async fn channel_allowlist_routes_are_owner_scoped_248() {
+        // #248-follow: the allow-list management routes share `authed_channel_router`'s
+        // owner-scoping with the member routes tested above.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_channel_router(channels, verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let ch = "c3".repeat(32);
+        let op = "d4".repeat(32);
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let get = |path: String, bearer: Option<String>| {
+            let mut req = Request::get(&path);
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        assert_eq!(
+            post("/me/channels".into(), Some(alice.clone()), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#))
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Non-owner: can't add, can't list (403, not an empty list — no membership leak).
+        assert_eq!(
+            post(format!("/me/channels/{ch}/allowlist"), Some(mallory.clone()), r#"{"email":"nat@example.com"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(get(format!("/me/channels/{ch}/allowlist"), Some(mallory.clone())).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // Malformed email is rejected before it ever reaches storage.
+        assert_eq!(
+            post(format!("/me/channels/{ch}/allowlist"), Some(alice.clone()), r#"{"email":"not-an-email"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // Owner adds, then lists.
+        assert_eq!(
+            post(format!("/me/channels/{ch}/allowlist"), Some(alice.clone()), r#"{"email":"Nat@Example.com"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let resp = get(format!("/me/channels/{ch}/allowlist"), Some(alice.clone())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["emails"], serde_json::json!(["nat@example.com"]), "stored lowercased");
+
+        // Non-owner can't remove either.
+        assert_eq!(
+            post(format!("/me/channels/{ch}/allowlist/nat@example.com/remove"), Some(mallory), String::new())
+                .await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Owner removes it; list is empty again.
+        assert_eq!(
+            post(format!("/me/channels/{ch}/allowlist/nat@example.com/remove"), Some(alice.clone()), String::new())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let resp = get(format!("/me/channels/{ch}/allowlist"), Some(alice)).await.unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["emails"], serde_json::json!([]));
     }
 
     #[tokio::test]

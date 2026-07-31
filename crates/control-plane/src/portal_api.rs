@@ -1017,6 +1017,94 @@ all handled by your identity provider, not by CADS-Tunnel itself.</p>
     page("your account", &body)
 }
 
+/// Shared state for the self-service channel-allowlist **claim** route (#248-follow):
+/// just the session key + the channel store, kept deliberately separate from the
+/// much larger [`ApiState`] so this addition doesn't have to thread a new param
+/// through every existing `portal_api_router` call site.
+#[derive(Clone)]
+struct ClaimState {
+    session_key: Arc<[u8]>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+}
+
+/// Build the channel-allowlist claim router (#248-follow): `POST
+/// /portal/channels/:channel/claim`, session-cookie authed. Mount alongside
+/// [`portal_api_router`] wherever the channel store is already in scope.
+pub fn channel_claim_router(session_key: &[u8], channels: Arc<crate::storage::SqliteChannelStore>) -> Router {
+    Router::new()
+        .route("/portal/channels/:channel/claim", post(claim_channel))
+        .with_state(ClaimState {
+            session_key: Arc::from(session_key.to_vec()),
+            channels,
+        })
+}
+
+#[derive(Deserialize)]
+struct ClaimReq {
+    holder: String,
+    noise_pubkey: String,
+    noise_attestation: String,
+}
+
+#[derive(Serialize)]
+struct ClaimResp {
+    claimed: bool,
+}
+
+/// `POST /portal/channels/:channel/claim` (#248-follow): the self-service
+/// counterpart to the owner-driven `POST /me/channels/:channel/members` — a portal
+/// user whose **verified** session email is on the channel's allow-list
+/// ([`crate::storage::SqliteChannelStore::allowlist_add`]) can add themselves as a
+/// member directly, no manual out-of-band exchange with the owner needed. Requires:
+/// (1) a valid portal session, (2) that session carrying a *verified* email (an
+/// unverified/absent one — see [`crate::portal::ExchangedIdentity::email_verified`]
+/// — simply can't use this route, matching the owner-driven flow's own trust bar),
+/// (3) the same holder-signed Noise-key attestation `channel_add_member` requires
+/// (#101 SEC101b), and (4) that email actually being allow-listed for this channel.
+async fn claim_channel(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<ClaimReq>,
+) -> Result<Json<ClaimResp>, (StatusCode, String)> {
+    let claims = crate::portal::session_claims_for(&st.session_key, &headers)
+        .ok_or((StatusCode::UNAUTHORIZED, "log in to the portal first".to_string()))?;
+    let email = claims
+        .email
+        .ok_or((StatusCode::FORBIDDEN, "your session has no verified email — log in again".to_string()))?;
+    let channel = crate::service::hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let holder = crate::service::hex_decode_32(&req.holder)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let noise_pubkey = crate::service::hex_decode_32(&req.noise_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
+    let noise_attestation = crate::service::hex_decode_64(&req.noise_attestation)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_attestation".to_string()))?;
+    // #101 SEC101b, same bar as the owner-driven `channel_add_member`: the Noise key
+    // must be attested by the holder itself, so a spoofed/forged key is rejected here
+    // too — the allow-list only authorizes *which* email may join, not *what key*.
+    if !ct_common::channel::verify_member_noise_attestation(
+        &ct_common::channel::ChannelId(channel),
+        &holder,
+        &noise_pubkey,
+        &noise_attestation,
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "noise_attestation does not verify against the holder key".to_string(),
+        ));
+    }
+    let claimed = st
+        .channels
+        .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if claimed {
+        Ok(Json(ClaimResp { claimed: true }))
+    } else {
+        Err((StatusCode::FORBIDDEN, "this email is not allow-listed for this channel".to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,5 +2132,77 @@ mod tests {
         let b = extract(&get(&app, &format!("/portal/tunnels/{id}/install?os=linux"), Some("alice")).await.1);
         assert_ne!(a, b, "a fresh token is minted per request");
         assert!(!a.is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_claim_requires_a_verified_session_email_on_the_allowlist_248() {
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x5cu8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
+        let app = channel_claim_router(KEY, channels.clone());
+
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let holder_sk = SigningKey::from_bytes(&[0xc3u8; 32]);
+        let holder_bytes = holder_sk.verifying_key().to_bytes();
+        let noise = [0xd4u8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder_bytes, &noise)).to_bytes();
+        let body = |holder: &[u8; 32], noise: &[u8; 32], attest: &[u8; 64]| {
+            serde_json::json!({
+                "holder": hex(holder),
+                "noise_pubkey": hex(noise),
+                "noise_attestation": hex(attest),
+            })
+            .to_string()
+        };
+        let ch_hex = hex(&ch.0);
+        let post = |cookie: Option<String>, body: String| {
+            let mut req = Request::post(format!("/portal/channels/{ch_hex}/claim")).header("content-type", "application/json");
+            if let Some(c) = &cookie {
+                req = req.header("cookie", c.clone());
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        // No session at all -> 401.
+        assert_eq!(
+            post(None, body(&holder_bytes, &noise, &attest)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // A session with NO verified email (plain `sign_session_for_test`) -> 403.
+        let unverified_cookie = format!("ct_portal_session={}", sign_session_for_test(KEY, "someone"));
+        assert_eq!(
+            post(Some(unverified_cookie), body(&holder_bytes, &noise, &attest)).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "no verified email on the session -> can't claim"
+        );
+
+        // A verified email NOT on the allow-list -> 403, and no member is recorded.
+        let stranger_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "stranger", "stranger@example.com"));
+        assert_eq!(
+            post(Some(stranger_cookie), body(&holder_bytes, &noise, &attest)).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(!channels.is_member(&ch, &holder_bytes).unwrap());
+
+        // The allow-listed verified email succeeds and becomes a real member.
+        let allowed_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "nat-subject", "nat@example.com"));
+        let resp = post(Some(allowed_cookie.clone()), body(&holder_bytes, &noise, &attest)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(channels.is_member(&ch, &holder_bytes).unwrap());
+
+        // A forged/unattested Noise key is rejected even for an allow-listed email (#101).
+        let other_holder = [0x99u8; 32];
+        let s = post(Some(allowed_cookie), body(&other_holder, &noise, &[0u8; 64])).await.unwrap().status();
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(!channels.is_member(&ch, &other_holder).unwrap());
     }
 }
