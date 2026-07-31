@@ -22,8 +22,26 @@ use ct_control_plane::service::persistent_control_plane_router;
 /// Fetch a realm JWKS document over HTTP(S) for the startup verifier (#42 KC2-c).
 /// Best-effort: any transport/status/parse failure yields `None`, so a missing or
 /// not-yet-ready IdP leaves the /me/* endpoints disabled rather than aborting boot.
+///
+/// #295: a bare `reqwest::Client::new()` has no timeout, so a hanging IdP (or a
+/// MITM on an `http://` `CT_OIDC_ISSUER` that accepts the connection but never
+/// answers) blocked `main()` forever — the control plane never finished booting
+/// and never started serving anything, not even the unauthenticated routes. The
+/// portal's own OIDC back-channel already guards this (#96, `oidc_http_client`),
+/// but that's a private helper of the `portal` module, unreachable from this bin
+/// crate; this mirrors its bound (10s total + 5s connect) rather than sharing it.
+/// A timeout here just becomes another `None` — fail-fast into "/me/* disabled",
+/// never a hang.
+fn jwks_fetch_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 async fn fetch_jwks(url: String) -> Option<serde_json::Value> {
-    let resp = reqwest::Client::new().get(&url).send().await.ok()?;
+    let resp = jwks_fetch_client().get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         eprintln!("ct-control-plane: JWKS fetch {url} -> HTTP {}", resp.status());
         return None;

@@ -1141,7 +1141,13 @@ fn edge_authorize_host_router(
             edge_admin_url: Arc::from(edge_admin_url),
             edge_admin_token: Arc::from(edge_admin_token),
             admin_token,
-            http: reqwest::Client::new(),
+            // #296: a bare `reqwest::Client::new()` has no timeout, so a hanging edge
+            // admin endpoint wedged this proxy's request (and its caller) forever —
+            // a sibling of #112, which fixed the exact same class in portal_api.rs's
+            // `create_tunnel`/`delete_tunnel` via this same 5s-timeout client, but
+            // never touched this call site. Reusing it here instead of duplicating
+            // the builder.
+            http: crate::portal_api::edge_admin_http_client(),
             edge_mesh,
         })
 }

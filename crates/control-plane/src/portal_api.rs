@@ -22,6 +22,15 @@ use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
+/// #297: map a storage/DB error to a generic 500 instead of leaking `e`'s `Display`
+/// (SQLite internals — constraint/table/column names, schema state) to the caller.
+/// The real error still reaches the operator, just server-side in the log, tagged
+/// with `context` (the handler/call site) so it's still diagnosable.
+fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
+    eprintln!("ct-cp portal: {context}: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+}
+
 /// Shared HTTP client for the edge admin API calls (#112): a hung edge admin
 /// endpoint must not block the portal's authenticated request path (create /
 /// delete tunnel). Mirrors the timeout guard already on the OIDC client
@@ -195,7 +204,7 @@ async fn admin_provision_tunnel(
     }
     let tunnel = match st.tunnels.create(req.subject.trim(), name, Some(&hostname)) {
         Ok(t) => t,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("admin_provision_tunnel/create", e).into_response(),
     };
     authorize_hostname(&st, &tunnel).await;
     Json(ProvisionTunnelResp { routing_token: tunnel.routing_token.clone(), hostname }).into_response()
@@ -209,7 +218,7 @@ fn account_for_session(st: &ApiState, headers: &HeaderMap) -> Result<(String, Ac
     let account = st
         .ledger
         .account_for_subject(&subject)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
+        .map_err(|e| internal_error("account_for_session", e).into_response())?;
     Ok((subject, account))
 }
 
@@ -255,7 +264,7 @@ async fn buy_credits(
     }
     let intent = match st.ledger.create_intent(&account, form.credits) {
         Ok(id) => id,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("buy_credits/create_intent", e).into_response(),
     };
     let body = format!(
         r#"<h1>Payment intent created</h1>
@@ -326,7 +335,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     };
     let owns_one = match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(rows) => rows.iter().any(|(_, owned)| *owned),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("tunnels_page/list(owns_one)", e).into_response(),
     };
     if !owns_one {
         provision_tunnel(&st, &subject, "site").await;
@@ -350,7 +359,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                 .collect();
             Html(tunnels_html(&rows)).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
 }
 
@@ -473,7 +482,7 @@ async fn create_tunnel(
                 .into_response();
         }
         Ok(_) => {}
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("create_tunnel/list(owns_one)", e).into_response(),
     }
     let hostname = st
         .dns
@@ -486,7 +495,7 @@ async fn create_tunnel(
     let display_name = hostname.as_deref().and_then(|h| h.split('.').next()).unwrap_or(name);
     let tunnel = match st.tunnels.create(&subject, display_name, hostname.as_deref()) {
         Ok(t) => t,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("create_tunnel/create", e).into_response(),
     };
     authorize_hostname(&st, &tunnel).await;
     Redirect::to("/portal/tunnels").into_response()
@@ -597,7 +606,7 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     let routing_token = match st.tunnels.routing_token_if_authorized(&subject, &id) {
         Ok(Some(t)) => t,
         Ok(None) => return (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("install_page/routing_token_if_authorized", e).into_response(),
     };
     // Best-effort: a Mesh-Plane-only tunnel (no DNS configured) has no
     // hostname, and this must never fail the page over that -- only the
@@ -607,7 +616,7 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     // Mint a fresh single-use join token bound to the customer (subject as tenant).
     let token = match st.enrollment.issue_join_token(&TenantId(subject.clone())) {
         Ok(t) => hex(&t.0),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return internal_error("install_page/issue_join_token", e).into_response(),
     };
     let edge_host = edge_host_port(&st.portal_base);
     let build_cmd = "git clone https://github.com/scimbe/CADS-Tunnel.git && cd CADS-Tunnel\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine";
@@ -683,7 +692,7 @@ struct GrantForm {
 fn grant_err(e: GrantError) -> Response {
     match e {
         GrantError::NotOwner => (StatusCode::NOT_FOUND, "no such tunnel").into_response(),
-        GrantError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        GrantError::Db(e) => internal_error("grant_err", e).into_response(),
     }
 }
 
@@ -1097,7 +1106,7 @@ async fn claim_channel(
     let claimed = st
         .channels
         .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| internal_error("claim_channel/claim_via_allowlist", e))?;
     if claimed {
         Ok(Json(ClaimResp { claimed: true }))
     } else {
