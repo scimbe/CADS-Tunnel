@@ -2395,7 +2395,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
  h1{font-size:clamp(2rem,4.3vw,2.9rem);line-height:1.15;margin:0 0 1.05rem;color:var(--text)}
  .lede{font-size:1.06rem;color:var(--muted2);max-width:34rem;margin:0 0 1.6rem}
 
- .trust-strip{display:flex;flex-wrap:wrap;gap:1.2rem;margin:0 0 1.7rem;font-size:.83rem;color:var(--muted)}
+ .trust-strip{display:flex;flex-wrap:wrap;gap:1.2rem;margin:1.1rem 0 0;font-size:.83rem;color:var(--muted)}
  .trust-strip span{display:flex;align-items:center;gap:.45rem}
  .trust-strip .dot{width:6px;height:6px;border-radius:50%;background:var(--accent2);flex-shrink:0}
 
@@ -2466,6 +2466,24 @@ const LANDING_HTML: &str = r#"<!doctype html>
   padding:1.1rem 1.3rem;font-size:.92rem;color:var(--muted2);margin-top:2rem}
  .callout a{color:var(--accent2)}
 
+ .demo-carousel{display:flex;gap:1rem;overflow-x:auto;padding:.2rem .1rem .9rem;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch}
+ .demo-carousel::-webkit-scrollbar{height:6px}
+ .demo-carousel::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}
+ .demo-card{flex:0 0 auto;width:min(80vw,300px);scroll-snap-align:start;background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:1.1rem 1.2rem;display:flex;flex-direction:column;gap:.7rem}
+ .demo-card-top{display:flex;align-items:center;justify-content:space-between;gap:.55rem;font-family:var(--mono)}
+ .demo-name{color:var(--muted2);font-weight:600;font-size:.82rem}
+ .demo-badge{display:flex;align-items:center;gap:.4rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-size:.66rem}
+ .demo-badge.live{color:var(--accent2)}
+ .demo-badge i{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;font-style:normal}
+ .demo-badge.live i{animation:pulse 1.6s ease-in-out infinite}
+ .demo-card p{margin:0;color:var(--muted2);font-size:.87rem;flex:1}
+ .demo-links{display:flex;align-items:center;gap:1rem}
+ .demo-links a.btn{padding:.45rem .95rem;font-size:.83rem}
+ .demo-links a.plain{color:var(--muted2);text-decoration:none;font-size:.83rem}
+ .demo-links a.plain:hover{text-decoration:underline}
+ @media (prefers-reduced-motion: reduce){ .demo-badge.live i{animation:none} }
+
  main{max-width:68rem;margin:0 auto;padding:3.2rem 1.5rem 2rem}
  .features{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:var(--line);
   border:1px solid var(--line);border-radius:12px;overflow:hidden;margin:0 0 3rem}
@@ -2534,20 +2552,13 @@ const LANDING_HTML: &str = r#"<!doctype html>
   <div class="hero-grid" id="get-started">
    <div>
     <div class="eyebrow">Self-hosted &middot; end-to-end encrypted</div>
-    <h1>Better homemade ideas,<br>published worldwide.</h1>
+    <h1>Better homemade ideas.</h1>
     <p class="lede">
      Run it on whatever you already have — a laptop, a Raspberry Pi, a spare VM, your own AI agent — and
      it's live at a real, encrypted HTTPS address. No open ports to configure. No public IP to buy. One
      device is enough to start; combine several later when one idea needs more than one pair of hands.
      Nobody, including us, sees what's actually flowing through the connection.
     </p>
-
-    <div class="trust-strip">
-     <span><span class="dot"></span>Open source — audit the code yourself</span>
-     <span><span class="dot"></span>Zero-knowledge transport</span>
-     <span><span class="dot"></span>No credit card required</span>
-     <span><span class="dot"></span>First tunnel live in minutes</span>
-    </div>
 
     <form class="join" action="/portal/login" method="get">
      <input type="hidden" name="register" value="1">
@@ -2571,15 +2582,23 @@ const LANDING_HTML: &str = r#"<!doctype html>
     </form>
    </div>
 
-   <div class="diagram-card">
-    <div class="diagram-head">
-     <span>ROUTE · your device &rarr; agent &rarr; edge &rarr; browser</span>
-     <span class="live"><i></i>encrypted</span>
+   <div>
+    <div class="diagram-card">
+     <div class="diagram-head">
+      <span>ROUTE · your device &rarr; agent &rarr; edge &rarr; browser</span>
+      <span class="live"><i></i>encrypted</span>
+     </div>
+     <canvas id="net" width="600" height="220" aria-label="Animated diagram: an encrypted packet travels from your device through the agent and edge to the browser"></canvas>
+     <div class="diagram-foot">
+      <span>Noise_IK &middot; QUIC / TLS 1.3</span>
+      <span>0 open ports on your device</span>
+     </div>
     </div>
-    <canvas id="net" width="600" height="220" aria-label="Animated diagram: an encrypted packet travels from your device through the agent and edge to the browser"></canvas>
-    <div class="diagram-foot">
-     <span>Noise_IK &middot; QUIC / TLS 1.3</span>
-     <span>0 open ports on your device</span>
+    <div class="trust-strip">
+     <span><span class="dot"></span>Open source — audit the code yourself</span>
+     <span><span class="dot"></span>Zero-knowledge transport</span>
+     <span><span class="dot"></span>No credit card required</span>
+     <span><span class="dot"></span>First tunnel live in minutes</span>
     </div>
    </div>
   </div>
@@ -2587,6 +2606,37 @@ const LANDING_HTML: &str = r#"<!doctype html>
 </header>
 
 <main>
+
+ <div class="section" id="demos">
+  <div class="section-head"><h2>See it live</h2><a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" target="_blank" rel="noopener">All demos on GitHub &rarr;</a></div>
+  <div class="demo-carousel">
+   <div class="demo-card">
+    <div class="demo-card-top"><span class="demo-name">flappy-demo</span><span class="demo-badge live"><i></i>live</span></div>
+    <p>Flappy Pipeline Studio — customize and generate your own Flappy Bird game over the Agent-Fabric channel.</p>
+    <div class="demo-links"><a class="btn" href="https://flappy-demo.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-flappy-demo" target="_blank" rel="noopener">Source</a></div>
+   </div>
+   <div class="demo-card">
+    <div class="demo-card-top"><span class="demo-name">cookbook-demo</span><span class="demo-badge"><i></i>source</span></div>
+    <p>Recipe generator with photo input, wired over the Agent-Fabric channel — a reference pipeline. Live instance coming soon.</p>
+    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-cookbook-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
+   </div>
+   <div class="demo-card">
+    <div class="demo-card-top"><span class="demo-name">a2a-demo</span><span class="demo-badge"><i></i>source</span></div>
+    <p>Live dashboard over a real Agent-Fabric channel call between two independent ct-agent processes.</p>
+    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-a2a-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
+   </div>
+   <div class="demo-card">
+    <div class="demo-card-top"><span class="demo-name">auction-demo</span><span class="demo-badge"><i></i>source</span></div>
+    <p>Live dashboard over CADS-Tunnel's real workflow-pipeline auction algorithm (ct_common::pipeline).</p>
+    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-auction-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
+   </div>
+   <div class="demo-card">
+    <div class="demo-card-top"><span class="demo-name">p2p-vault</span><span class="demo-badge"><i></i>source</span></div>
+    <p>Encrypted, CRDT-versioned, gossip-converging P2P file share for CADS-Tunnel-connected agents — the core only coordinates, it never touches file bytes.</p>
+    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-p2p-vault" target="_blank" rel="noopener">Source &rarr;</a></div>
+   </div>
+  </div>
+ </div>
 
  <div class="section">
   <div class="section-head"><h2>Get your template</h2></div>
@@ -2642,13 +2692,6 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
    &middot; <a href="/template-guide">see how it's structured &rarr;</a>
   </p>
-
-  <div class="callout">
-   <strong>Your subdomain:</strong> in the Standard tier you don't pick your own subdomain — it's assigned
-   automatically from your project id and your account's unique user id (e.g.
-   <code>hello-world-a1b2c3d4.bunsenbrenner.org</code>), so names never collide and every subdomain traces
-   back to an account. A future tier may offer custom/vanity subdomains.
-  </div>
 
   <div class="callout">
    <strong>Security model, plainly stated:</strong> the tunnel exposes exactly one thing — the service
@@ -2917,7 +2960,10 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   window.addEventListener('resize', resize);
   resize();
   var t = 0;
-  function pt(i, w, h){ return { x: nodes[i].x * w, y: nodes[i].y * h }; }
+  function pt(i, w, h){
+   var mx = Math.min(w * .12, 34);
+   return { x: mx + nodes[i].x * (w - mx * 2), y: nodes[i].y * h };
+  }
   function draw(){
    var r = c.getBoundingClientRect(); var w = r.width, h = r.height;
    ctx.clearRect(0,0,w,h);
