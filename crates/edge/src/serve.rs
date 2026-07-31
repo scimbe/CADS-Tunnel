@@ -597,16 +597,83 @@ impl ChannelFrontDoor {
     /// CP-backed [`crate::channel_authorize::ChannelAuthorizer`] in production) and the
     /// dedicated `acceptor` that advertises the `ct-edge-channel` ALPN (#118). The
     /// pairer starts empty and is shared across every connection this context serves.
+    ///
+    /// #256: unlike the QUIC broker's own accept loop (which sweeps `drain_expired` on every
+    /// iteration — see `run_channel_broker_loop`), the `:443` front door has no equivalent
+    /// per-accept sweep point (each connection is dispatched independently by
+    /// `serve_front_door`, not pulled from one serial loop that owns this pairer), so a lone
+    /// parked member whose partner never arrives was held — and its TLS stream + socket kept
+    /// open — forever: unbounded memory/FD growth on a long-running edge. Spawns a periodic
+    /// reaper here instead, at the one place this pairer is actually constructed, so every
+    /// caller gets it for free with no risk of forgetting to wire it up per front-door
+    /// instance. Ticks at a fraction of the park TTL so an expired member is reaped promptly,
+    /// not up to a full TTL late.
     pub fn new(
         resolver: Arc<dyn ChannelMemberResolver>,
         acceptor: tokio_rustls::TlsAcceptor,
     ) -> Self {
+        let pairer: Arc<
+            std::sync::Mutex<
+                crate::channel_broker::ChannelPairer<
+                    crate::channel_broker::AdmittedStreamMember<FrontDoorChannelStream>,
+                >,
+            >,
+        > = Arc::new(std::sync::Mutex::new(crate::channel_broker::ChannelPairer::new()));
+        spawn_front_door_pairer_reaper(
+            pairer.clone(),
+            Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
+            unix_now,
+        );
         Self {
-            pairer: Arc::new(std::sync::Mutex::new(crate::channel_broker::ChannelPairer::new())),
+            pairer,
             resolver,
             acceptor,
         }
     }
+}
+
+/// The real wall clock, as `UnixSeconds` — the production `now_fn` for
+/// [`spawn_front_door_pairer_reaper`] (and every other "sample real time" call site in this
+/// module that doesn't already have a local helper).
+fn unix_now() -> ct_common::channel::UnixSeconds {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// #256: periodically evict `:443` channel members parked past their park TTL with no
+/// partner. Dropping the drained `WaitingMember`s closes their `TlsStream` (and the
+/// underlying `TcpStream`) via `Drop` — no explicit shutdown call needed, unlike the QUIC
+/// broker's `conn.close(..)` (a `quinn::Connection` has no implicit-drop teardown semantics
+/// the peer would ever observe). Runs for the process lifetime, mirroring every other
+/// "never returns" background task in this module (e.g. `run_channel_broker_loop`).
+/// `interval`/`now_fn` are injected so a test can observe real eviction on a fast clock
+/// instead of waiting out the real `CHANNEL_PARK_TTL_SECS`. Generic over the pairer's
+/// member type `T` (production always instantiates it at
+/// `AdmittedStreamMember<FrontDoorChannelStream>` via [`ChannelFrontDoor::new`]) so a test
+/// can park a lightweight fake member instead of a real TLS stream.
+fn spawn_front_door_pairer_reaper<T, N>(
+    pairer: Arc<std::sync::Mutex<crate::channel_broker::ChannelPairer<T>>>,
+    interval: Duration,
+    now_fn: N,
+) where
+    T: Send + 'static,
+    N: Fn() -> ct_common::channel::UnixSeconds + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            let expired = pairer.lock().unwrap().drain_expired(now_fn());
+            if !expired.is_empty() {
+                eprintln!(
+                    "ct-edge: front-door channel pairer reaped {} member(s) parked past their TTL with no partner",
+                    expired.len()
+                );
+            }
+        }
+    });
 }
 
 /// Bounds one `:443` channel join's admission read (#105 parity with the QUIC broker's
@@ -618,8 +685,8 @@ const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a lone first-arriving `:443` channel member stays parked in the pairer,
 /// waiting for its partner, before it is eligible for eviction via
 /// [`crate::channel_broker::ChannelPairer::drain_expired`] (#109 #3). Generous, since the
-/// two holders of a channel may reach `:443` seconds apart. (A reaper that actually calls
-/// `drain_expired` on the front-door pairer is a separate concern — see the packet note.)
+/// two holders of a channel may reach `:443` seconds apart. Actually evicted by the periodic
+/// reaper [`ChannelFrontDoor::new`] spawns (#256) — this constant alone only marks eligibility.
 const CHANNEL_PARK_TTL_SECS: u64 = 30;
 
 /// Bound how long a public `:443` client may take to deliver its complete TLS ClientHello
@@ -2056,6 +2123,52 @@ mod tests {
         assert!(
             resolve_channel_relay_addr(hi, None).is_err(),
             "the port+1 default saturating onto the rendezvous port is refused, not silently bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn front_door_pairer_reaper_evicts_a_lone_member_past_its_deadline() {
+        // #256: the QUIC broker's own accept loop sweeps `drain_expired` on every iteration,
+        // but the `:443` front door has no equivalent per-accept sweep point, so a lone parked
+        // member with no partner was held forever. `spawn_front_door_pairer_reaper` is the fix
+        // — prove it actually evicts on a real (injected, fast) clock, not just that the wiring
+        // compiles. `T = u8` here: the pairer itself doesn't care what a member's payload is
+        // (see `WaitingMember`'s own doc comment — "opaque to the pairer"), so a real TLS
+        // stream isn't needed to exercise the reaper's sweep-and-evict behavior.
+        use crate::channel_broker::{ChannelPairer, WaitingMember};
+        use ct_common::channel::ChannelId;
+
+        let pairer: Arc<std::sync::Mutex<ChannelPairer<u8>>> =
+            Arc::new(std::sync::Mutex::new(ChannelPairer::new()));
+
+        // Park one lone member whose deadline is already in the past relative to the fake
+        // clock's first tick — it has no partner, so it must be reaped, not held forever.
+        pairer.lock().unwrap().offer(WaitingMember {
+            channel: ChannelId([7u8; 32]),
+            holder: [1u8; 32],
+            deadline: 100,
+            payload: 0u8,
+        });
+        assert_eq!(pairer.lock().unwrap().len(), 1, "parked before the reaper ticks");
+
+        // A fake clock that reports far past the deadline from its very first read, ticking
+        // the reaper at a real (but tiny) interval instead of the production 10s cadence.
+        let now: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let now_reader = now.clone();
+        spawn_front_door_pairer_reaper(
+            pairer.clone(),
+            Duration::from_millis(5),
+            move || now_reader.load(std::sync::atomic::Ordering::SeqCst),
+        );
+
+        // Give the spawned task a handful of real ticks to run — generous relative to the 5ms
+        // interval, but nowhere near the real CHANNEL_PARK_TTL_SECS this replaces waiting for.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            pairer.lock().unwrap().len(),
+            0,
+            "the reaper must have evicted the expired lone member by now"
         );
     }
 
