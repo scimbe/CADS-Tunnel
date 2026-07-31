@@ -10,6 +10,7 @@ pub mod edge_mesh_client;
 pub mod observe;
 pub mod pki;
 pub mod relay;
+pub mod relay_gate;
 pub mod rendezvous;
 pub mod serve;
 pub mod sni;

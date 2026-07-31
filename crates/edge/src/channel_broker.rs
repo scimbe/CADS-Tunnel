@@ -739,8 +739,29 @@ pub(crate) async fn finish_relay_pair(
             // path was structurally unreachable for it — live-reproduced via #248's cross-NAT test.
             // Purely additive: `parse_channel_ack` already treats a missing `r=` as backward-compatible
             // `None`, so this changes nothing for any client that doesn't look for the token.
-            let a_ack = format!("OK r={}", a.observed);
-            let b_ack = format!("OK r={}", b.observed);
+            //
+            // #134-follow (real gated hole-punch E2E test): this completer ALSO never relayed the
+            // peer's attested Noise key/holder/attestation — unlike `finish_rendezvous_pair` and
+            // `finish_relay_pair_over_streams`, both of which already carry it via `member_ack_suffix`/
+            // `write_member_ack`. Every relay-only member joining over the direct QUIC relay port (the
+            // ONLY path `join_via_relay_dcutr`/`join_via_relay_gate_dcutr` use) therefore always got
+            // `peer_noise_pubkey: None` and failed with "needs the peer's relayed Noise key (#101)" --
+            // the #136 NAT-to-NAT DCUtR upgrade had never actually completed against a real deployed
+            // edge, only in in-process tests that bypass this completer entirely. Fixed by including
+            // the endpoint + `member_ack_suffix` exactly as `finish_rendezvous_pair` does (a relay-only
+            // member's `req.endpoint` is already the relay-only sentinel, harmless to echo back).
+            let a_ack = format!(
+                "OK {}{} r={}",
+                b.req.endpoint,
+                member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
+                a.observed
+            );
+            let b_ack = format!(
+                "OK {}{} r={}",
+                a.req.endpoint,
+                member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
+                b.observed
+            );
             quic_ack_member(&mut a.send, a_ack.as_bytes(), PairSide::A).await?;
             quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
             let (init_conn, acc_conn) = if pairing.initiator_holder == a.req.grant.grant.holder {
@@ -1454,7 +1475,11 @@ mod tests {
             let _ = send.write_all(&sig).await;
         }
         let _ = send.finish();
-        recv.read_to_end(128).await.unwrap_or_default()
+        // 512, matching the real client's cap (`present_channel_join_on_stream`'s
+        // `recv.take(512)`) -- a rich relay ack (endpoint + noise + holder + attestation,
+        // #134-follow) can exceed the old 128-byte cap, which silently truncated to empty
+        // via `unwrap_or_default()` rather than failing loudly.
+        recv.read_to_end(512).await.unwrap_or_default()
     }
 
     fn join_request(channel: [u8; 32], holder: u8, endpoint: &str) -> ChannelJoinRequest {
@@ -2238,7 +2263,7 @@ mod tests {
             let c = build_client_endpoint(cert).expect("client");
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
             let ack_a = present_join(&conn, &req_a.encode(), &holder_a).await;
-            assert!(ack_a.starts_with(b"OK r="), "A admitted to relay with its observed reflexive, got {:?}", String::from_utf8_lossy(&ack_a));
+            assert!(ack_a.starts_with(b"OK 203.0.113.2:7002 r="), "A admitted to relay with B's endpoint + its own observed reflexive, got {:?}", String::from_utf8_lossy(&ack_a));
             let (mut s, mut r) = conn.open_bi().await.expect("a data bi"); // initiator opens
             s.write_all(b"tunnel A->B via edge").await.expect("a write");
             let mut got = vec![0u8; 20];
@@ -2250,7 +2275,7 @@ mod tests {
             let c = build_client_endpoint(cert_b).expect("client");
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
             let ack_b = present_join(&conn, &req_b.encode(), &holder_b).await;
-            assert!(ack_b.starts_with(b"OK r="), "B admitted to relay with its observed reflexive, got {:?}", String::from_utf8_lossy(&ack_b));
+            assert!(ack_b.starts_with(b"OK 203.0.113.1:7001 r="), "B admitted to relay with A's endpoint + its own observed reflexive, got {:?}", String::from_utf8_lossy(&ack_b));
             let (mut s, mut r) = conn.accept_bi().await.expect("b data bi"); // acceptor accepts the edge-opened stream
             let mut got = vec![0u8; 20];
             r.read_exact(&mut got).await.expect("b read");
@@ -2326,8 +2351,8 @@ mod tests {
 
         let text_a = String::from_utf8_lossy(&ack_a);
         let text_b = String::from_utf8_lossy(&ack_b);
-        let r_a = text_a.strip_prefix("OK r=").expect("A's ack carries its own r= token");
-        let r_b = text_b.strip_prefix("OK r=").expect("B's ack carries its own r= token");
+        let r_a = text_a.strip_prefix("OK 203.0.113.4:7004 r=").expect("A's ack carries B's endpoint + its own r= token");
+        let r_b = text_b.strip_prefix("OK 203.0.113.3:7003 r=").expect("B's ack carries A's endpoint + its own r= token");
 
         // Both connected from loopback, so each reflexive is 127.0.0.1:<ephemeral port>; the
         // real assertion is that the two are DIFFERENT (each got its own address, not a shared
@@ -2337,6 +2362,83 @@ mod tests {
         assert_eq!(addr_a.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert_eq!(addr_b.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert_ne!(addr_a.port(), addr_b.port(), "each member's own reflexive port, not swapped or shared");
+    }
+
+    #[tokio::test]
+    async fn broker_channel_relay_relays_each_members_peer_attested_noise_key() {
+        // #134-follow (found live while E2E-verifying the real gated relay-gate hole-punch):
+        // `finish_relay_pair` (the QUIC-native completer -- the ONLY completer
+        // `join_via_relay_dcutr`/`join_via_relay_gate_dcutr` reach) acked a bare `OK r=<observed>`,
+        // never relaying the peer's attested Noise key/holder/attestation -- unlike
+        // `finish_rendezvous_pair` and `finish_relay_pair_over_streams`, both of which already
+        // carry it via `member_ack_suffix`/`write_member_ack`. Every real `CT_CHANNEL_RELAY_ONLY`
+        // DCUtR join therefore failed against a real deployed edge with "needs the peer's relayed
+        // Noise key (#101)" -- the #136 NAT-to-NAT upgrade had never actually completed outside an
+        // in-process test that bypasses this completer entirely. Proves each side's ack now carries
+        // the OTHER side's endpoint + noise + holder + attestation, hex-encoded, positioned exactly
+        // where `parse_channel_ack` (ct-agent) expects them.
+        let pk = operator_pubkey();
+        let channel = [0xE2u8; 32];
+        let holder_a = holder_sk(0xa5);
+        let holder_b = holder_sk(0xb6);
+        let noise_a = [0x11u8; 32];
+        let noise_b = [0x22u8; 32];
+        let attest_a = [0x33u8; 64];
+        let attest_b = [0x44u8; 64];
+        let holder_a_pub = holder_a.verifying_key().to_bytes();
+        let holder_b_pub = holder_b.verifying_key().to_bytes();
+        let req_a = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_a, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.5:7005".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_b, Direction::Accept, 1_000),
+            endpoint: "203.0.113.6:7006".to_string(),
+        };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&server, 500, move |c, h| {
+                let ret = if h == holder_a_pub { (pk, Some(noise_a), Some(attest_a)) } else { (pk, Some(noise_b), Some(attest_b)) };
+                async move { (c.0 == channel).then_some(ret) }
+            })
+            .await
+            .map(|_| ())
+        });
+
+        let cert_b = cert.clone();
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_a.encode(), &holder_a).await;
+            conn.close(0u32.into(), b"done");
+            ack
+        });
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_b.encode(), &holder_b).await;
+            conn.close(0u32.into(), b"done");
+            ack
+        });
+
+        let ack_a = a.await.expect("a");
+        let ack_b = b.await.expect("b");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
+
+        let text_a = String::from_utf8_lossy(&ack_a);
+        let text_b = String::from_utf8_lossy(&ack_b);
+        assert_eq!(
+            text_a.split(" r=").next().unwrap(),
+            format!("OK 203.0.113.6:7006 {} {} {}", hex_of(&noise_b), hex_of(&holder_b_pub), hex_of(&attest_b)),
+            "A's ack carries B's endpoint + attested Noise key + holder + attestation, got {text_a:?}"
+        );
+        assert_eq!(
+            text_b.split(" r=").next().unwrap(),
+            format!("OK 203.0.113.5:7005 {} {} {}", hex_of(&noise_a), hex_of(&holder_a_pub), hex_of(&attest_a)),
+            "B's ack carries A's endpoint + attested Noise key + holder + attestation, got {text_b:?}"
+        );
     }
 
     /// One relay member for the concurrency test: connect over QUIC, run the admission
@@ -2364,7 +2466,7 @@ mod tests {
         let client = build_client_endpoint(cert).expect("client");
         let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
         let ack = present_join(&conn, &req.encode(), &holder).await;
-        assert!(ack.starts_with(b"OK r="), "member admitted + paired with its observed reflexive, got {:?}", String::from_utf8_lossy(&ack));
+        assert!(ack.starts_with(b"OK 203.0.113.9:7000 r="), "member admitted + paired with its own observed reflexive, got {:?}", String::from_utf8_lossy(&ack));
         let mut got = [0u8; 1];
         if direction == Direction::Initiate {
             let (mut s, mut r) = conn.open_bi().await.expect("init data bi"); // initiator opens

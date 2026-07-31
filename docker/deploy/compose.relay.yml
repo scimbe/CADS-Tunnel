@@ -1,0 +1,67 @@
+# Optional real NAT-to-NAT hole-punch overlay (#134/#136). Adds an internal-only
+# Circuit-Relay v2 + DCUtR relay-node, reachable ONLY through the edge's `:443`
+# relay-gate leg (crates/edge/src/relay_gate.rs) -- no new public port, and the
+# relay-node itself is never published to the host or given a route to the public
+# network (the `relay_internal` network below is `internal: true`).
+#
+# OFF BY DEFAULT: opt in by naming it explicitly, same convention as compose.frontdoor.yml.
+#
+#   docker compose \
+#     -f docker/deploy/compose.selfhost.yml \
+#     -f docker/deploy/compose.frontdoor.yml \
+#     -f docker/deploy/compose.relay.yml \
+#     [-f docker/deploy/compose.sso.yml] \
+#     --env-file docker/deploy/.env up --build -d
+#
+# .env keys this overlay reads:
+#   CT_RELAY_NODE_KEY   64-hex ed25519 seed giving the relay-node a STABLE identity
+#                       across restarts (generate once: `openssl rand -hex 32`). SECRET.
+#   CT_RELAY_NODE_PEER  the libp2p PeerId the relay-node derives from that key -- printed
+#                       to its own logs on first boot (`docker compose logs relay-node`).
+#                       Set this AFTER the first boot, then restart edge to pick it up
+#                       (the edge conveys it to every relay-gate client per-connection,
+#                       so clients never need to know it separately).
+#
+# Requires CT_EDGE_CP_URL/CT_EDGE_ADMIN_TOKEN already configured (compose.selfhost.yml) --
+# the relay-gate leg reuses the SAME grant-authorization path the channel broker already
+# has, so no separate secret is needed there.
+
+name: ct-selfhost
+
+services:
+  relay-node:
+    build:
+      context: .
+      dockerfile: relay-node.Dockerfile
+    image: ct-relay-node
+    environment:
+      CT_RELAY_NODE_KEY: "${CT_RELAY_NODE_KEY:?set CT_RELAY_NODE_KEY=<64-hex ed25519 seed, e.g. openssl rand -hex 32>}"
+      CT_RELAY_LISTEN: "/ip4/0.0.0.0/tcp/4437"
+    networks:
+      relay_internal:
+        ipv4_address: 172.30.0.10
+    restart: unless-stopped
+    # Deliberately no `ports:` -- this process must never be reachable except via the
+    # edge's relay-gate leg over relay_internal (an `internal: true` network with no
+    # route to the host or the public internet).
+
+  edge:
+    environment:
+      # The relay-gate leg (#134) activates ONLY when both of these + CT_EDGE_CP_URL/
+      # CT_EDGE_ADMIN_TOKEN (already set above) are present -- same opt-in-by-presence
+      # pattern as the channel broker.
+      CT_EDGE_RELAY_UPSTREAM: "172.30.0.10:4437"
+      CT_EDGE_RELAY_NODE_PEER: "${CT_RELAY_NODE_PEER:?set CT_RELAY_NODE_PEER=<peer id from relay-node's first-boot log>}"
+    networks:
+      default: {}
+      relay_internal: {}
+    depends_on:
+      relay-node:
+        condition: service_started
+
+networks:
+  relay_internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

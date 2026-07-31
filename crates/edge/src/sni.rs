@@ -21,6 +21,14 @@ pub const CT_EDGE_ALPN: &str = "ct-edge";
 /// [`CT_EDGE_ALPN`], mirroring the #31/#46 classic-tunnel fallback.
 pub const CT_EDGE_CHANNEL_ALPN: &str = "ct-edge-channel";
 
+/// ALPN protocol id a real NAT-to-NAT hole-punch relay client advertises on the
+/// unified :443 front door: a ClientHello carrying it is routed to the gated
+/// Circuit-Relay v2 relay (`RelayGate` — grant + possession pre-auth, then a raw
+/// byte splice to the internal relay-node process). Multiplexed onto :443 rather
+/// than a dedicated port so the relay stays reachable only through the same TLS
+/// front door every other :443 leg uses, with no new public listener.
+pub const CT_EDGE_RELAY_ALPN: &str = "ct-edge-relay";
+
 /// Return the raw `extensions` block of a buffered TLS ClientHello record, or
 /// `None` if `buf` is not a ClientHello. Fully bounds-checked — never panics.
 fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
@@ -129,6 +137,12 @@ pub enum FrontDoorRoute {
     /// ALPN (#106): hand off to the channel broker (rendezvous + relay), the `:443`
     /// fallback for members that cannot reach the channel port `:4435`.
     ChannelBroker,
+    /// Real NAT-to-NAT hole-punch relay — the client advertised the `ct-edge-relay`
+    /// ALPN: hand off to the gated Circuit-Relay v2 relay after a grant + possession
+    /// pre-auth (see `relay_gate.rs`). Distinct from `ChannelBroker`: this leg never
+    /// interprets the bytes it forwards past the pre-auth handshake — it splices raw
+    /// libp2p protocol bytes to an internal relay-node process.
+    RelayGate,
     /// Terminate TLS + reverse-proxy to a configured terminate-host's upstream —
     /// the Portal (control plane) or, since #48, any additional host such as the
     /// Keycloak IdP (`auth.<zone>`). The `String` is the matched, lowercased host;
@@ -162,6 +176,11 @@ pub fn classify_front_door(
     // ALPN discriminator wins ahead of any SNI-based routing.
     if alpn.iter().any(|p| p == CT_EDGE_CHANNEL_ALPN) {
         return FrontDoorRoute::ChannelBroker;
+    }
+    // Same ALPN-before-SNI precedence as the channel leg above -- a relay client
+    // carries no SNI either.
+    if alpn.iter().any(|p| p == CT_EDGE_RELAY_ALPN) {
+        return FrontDoorRoute::RelayGate;
     }
     if let Some(sni) = sni.map(|s| s.to_ascii_lowercase()) {
         if let Some(h) = terminate_hosts
@@ -382,6 +401,27 @@ mod tests {
         );
         // The two data-plane ALPN ids are distinct.
         assert_ne!(CT_EDGE_ALPN, CT_EDGE_CHANNEL_ALPN);
+    }
+
+    #[test]
+    fn classify_front_door_routes_the_relay_alpn_to_the_relay_gate() {
+        // A NAT-to-NAT hole-punch relay client -> RelayGate, winning ahead of SNI just
+        // like the other two data-plane ALPN ids.
+        let s = |v: &str| v.to_string();
+        let hosts = ["portal.z", "auth.z"];
+        let default = Some("portal.z");
+        assert_eq!(
+            classify_front_door(&[s(CT_EDGE_RELAY_ALPN)], None, &hosts, default),
+            FrontDoorRoute::RelayGate
+        );
+        assert_eq!(
+            classify_front_door(&[s(CT_EDGE_RELAY_ALPN)], Some("portal.z"), &hosts, default),
+            FrontDoorRoute::RelayGate,
+            "relay ALPN wins over a terminate-host SNI"
+        );
+        // All three data-plane ALPN ids are pairwise distinct.
+        assert_ne!(CT_EDGE_ALPN, CT_EDGE_RELAY_ALPN);
+        assert_ne!(CT_EDGE_CHANNEL_ALPN, CT_EDGE_RELAY_ALPN);
     }
 
     #[test]

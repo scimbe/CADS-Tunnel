@@ -723,6 +723,7 @@ pub async fn serve_front_door(
     channel: Option<&ChannelFrontDoor>,
     wildcard_acceptor: Option<&tokio_rustls::TlsAcceptor>,
     mesh_relay: Option<&MeshRelayConfig>,
+    relay_gate: Option<&crate::relay_gate::RelayGateContext>,
 ) -> Result<(), BoxError> {
     // #121 Phase B1: the member's reflexive (post-NAT) source, captured from the accepted TCP
     // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
@@ -878,6 +879,26 @@ pub async fn serve_front_door(
                 });
             }
             Ok(())
+        }
+        // Real NAT-to-NAT hole-punch relay: grant + possession pre-auth
+        // (`relay_gate::admit_relay_gate`), then a raw byte splice to the internal
+        // relay-node — see `relay_gate.rs` for the full design rationale.
+        crate::sni::FrontDoorRoute::RelayGate => {
+            let Some(ctx) = relay_gate else {
+                return Err(
+                    "front door: relay gate not configured (set CT_EDGE_RELAY_UPSTREAM)".into(),
+                );
+            };
+            let joined = Prepend {
+                pre: hello,
+                pos: 0,
+                inner: inbound,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            crate::relay_gate::serve_relay_gate(joined, ctx, now).await
         }
         crate::sni::FrontDoorRoute::Reject => Ok(()),
     }
@@ -1746,6 +1767,57 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         }
                         _ => None,
                     };
+                    // Real NAT-to-NAT hole-punch relay (multiplexed onto :443, no new public
+                    // port): needs the same CP-backed membership resolver as the channel
+                    // broker above, PLUS the internal-only address of the relay-node process
+                    // this gate splices authorized connections to. Unset -> None (the
+                    // RelayGate arm refuses with a clear "not configured" error) -- opt-in,
+                    // same style as mesh-relay and the channel broker.
+                    let relay_gate_ctx: Option<crate::relay_gate::RelayGateContext> = match (
+                        std::env::var("CT_EDGE_CP_URL").ok().filter(|s| !s.is_empty()),
+                        std::env::var("CT_EDGE_ADMIN_TOKEN")
+                            .ok()
+                            .and_then(|s| parse_admin_token_hex(&s)),
+                        std::env::var("CT_EDGE_RELAY_UPSTREAM").ok().filter(|s| !s.is_empty()),
+                        // The relay-node's own stable libp2p PeerId (matches its
+                        // CT_RELAY_NODE_KEY) -- passed through in every pre-auth ack so a
+                        // requester, which never reaches the relay-node directly, can
+                        // address its Circuit-Relay v2 reservation/dial.
+                        std::env::var("CT_EDGE_RELAY_NODE_PEER").ok().filter(|s| !s.is_empty()),
+                    ) {
+                        (Some(cp_url), Some(admin_tok), Some(upstream_raw), Some(relay_node_peer)) => {
+                            match upstream_raw.parse::<std::net::SocketAddr>() {
+                                Ok(upstream) => {
+                                    let authorizer =
+                                        crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                                    let relay_acceptor = crate::pki::build_relay_gate_front_door_acceptor(
+                                        &ca,
+                                        vec!["localhost".to_string()],
+                                    )
+                                    .await?;
+                                    eprintln!(
+                                        "ct-edge: front-door :443 relay gate active \
+                                         (authorize via {cp_url}, relay-node at {upstream} \
+                                         (peer {relay_node_peer}), ct-edge-relay ALPN)"
+                                    );
+                                    Some(crate::relay_gate::RelayGateContext::new(
+                                        std::sync::Arc::new(authorizer),
+                                        relay_acceptor,
+                                        upstream,
+                                        relay_node_peer,
+                                    ))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ct-edge: CT_EDGE_RELAY_UPSTREAM '{upstream_raw}' is not a valid \
+                                         socket address ({e}) -- relay gate stays off"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
                     // #119 SEC: apply the #95 connection cap to the `:443` front door too
                     // — the most-exposed public port. Like the QUIC and TCP-fallback loops,
                     // acquire a permit and SHED over the cap by dropping the socket, so an
@@ -1774,6 +1846,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let channel_fd = channel_fd.clone();
                             let wildcard_tls = wildcard_tls.clone();
                             let mesh_relay_config = mesh_relay_config.clone();
+                            let relay_gate_ctx = relay_gate_ctx.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for the connection's lifetime
                                 let mut nonce = [0u8; 16];
@@ -1793,6 +1866,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     channel_fd.as_ref(),
                                     wildcard_tls.as_ref(),
                                     mesh_relay_config.as_ref(),
+                                    relay_gate_ctx.as_ref(),
                                 )
                                 .await
                                 {
@@ -3273,8 +3347,10 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None)
-                .await
+            serve_front_door(
+                tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None, None,
+            )
+            .await
         });
 
         // Browser: a real rustls handshake trusting the WILDCARD cert
@@ -3464,7 +3540,8 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None)
+                .await
         });
 
         // Client: send the ClientHello (SNI=portal.test) + extra, read it echoed.
@@ -3598,8 +3675,10 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
-            serve_front_door(tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None)
-                .await
+            serve_front_door(
+                tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None,
+            )
+            .await
         });
 
         // Browser: a real rustls TLS handshake to the edge, trusting the Portal
@@ -3686,7 +3765,8 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None).await
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None)
+                .await
         });
 
         // Browser -> SNI=auth.test -> AUTH cert terminates -> AUTH upstream.
@@ -3824,7 +3904,7 @@ mod tests {
                         std::collections::HashMap::new();
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
-                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None,
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None,
                     )
                     .await;
                 });

@@ -198,6 +198,25 @@ pub async fn build_channel_front_door_acceptor(
     Ok(TlsAcceptor::from(Arc::new(tls_cfg)))
 }
 
+/// Build a dedicated TLS acceptor for the `:443` front door's **relay-gate** leg (the
+/// real NAT-to-NAT hole-punch relay, multiplexed onto :443 rather than a new port).
+/// Structurally identical to [`build_channel_front_door_acceptor`] except its
+/// `ServerConfig` advertises `ct-edge-relay` instead — kept as its own dedicated
+/// acceptor for the same reason: the shared edge acceptor's ALPN list MUST stay empty,
+/// or an ALPN mismatch fatally alerts the `EdgeRelay` leg's `ct-edge` clients.
+pub async fn build_relay_gate_front_door_acceptor(
+    ca: &Ca,
+    sans: Vec<String>,
+) -> Result<TlsAcceptor, BoxError> {
+    install_crypto_provider();
+    let (cert, key) = ca.issue(sans)?;
+    let mut tls_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    tls_cfg.alpn_protocols = vec![crate::sni::CT_EDGE_RELAY_ALPN.as_bytes().to_vec()];
+    Ok(TlsAcceptor::from(Arc::new(tls_cfg)))
+}
+
 /// Build a QUIC client [`Endpoint`] that trusts a **CA root** — and therefore
 /// any leaf that CA signs (enabling Edge cert rotation without re-pinning).
 pub fn build_client_endpoint_trusting_ca(
