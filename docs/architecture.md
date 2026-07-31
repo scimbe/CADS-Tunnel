@@ -76,3 +76,15 @@ and the thesis chapter *Produktivierung*. In the code it spans persistence
 - Decisions in depth: [`docs/adr/`](adr/) (20 ADRs).
 - The specification: [`SPEC.md`](SPEC.md).
 - The development process the code was built by: [`DEVELOPMENT-PROCESS.md`](DEVELOPMENT-PROCESS.md).
+
+## Known gaps between documented intent and current behavior
+
+- **Declarative network policy doesn't gate anything live yet (#235).** The topology/overlay
+  store and its `Policy`/`authorized_channels` predicate (see `docs/planning/v1-first-task-packets.md`'s
+  `#107-enforce` entries) are real, tested code, but the edge broker's live admission path
+  (`channel_authorize`) doesn't consult them — the "(ii-b) live wiring" step described there
+  remains open even though the parent epics (#102, #107) are closed. Today, the only
+  live-enforced mechanism restricting which agents can talk to which is channel admission
+  itself, not the declarative overlay/policy language.
+- **The workflow-pipelines auction/marketplace demo path uses a hardcoded fixture, not a live
+  clearing (#180, open).** See #180 for the concrete gap and scope.

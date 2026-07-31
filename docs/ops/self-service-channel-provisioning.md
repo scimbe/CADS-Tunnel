@@ -135,6 +135,16 @@ per `docs/agent-onboarding.md`'s handler I/O contract).
 `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` accept a `host:port` directly since #214
 (`6d85644`) — a bare IP is no longer required.
 
+## Known gap: no CLI to mint a cross-account `SignedChannelInvitation` (#234)
+
+Everything above (`operator-init`, `channel init`, `provision-link-channel.sh`) provisions a
+channel between two sides that already coordinate their key material directly — it's not the
+same mechanism as a `SignedChannelInvitation` (the cross-account invitation type documented in
+`docs/reference` — the API endpoint shapes are real and verified, but there is currently no
+`ct-agent` CLI subcommand to actually *issue* one, only the `ct_common::channel` library
+primitives). If you need to invite an account you don't otherwise coordinate with directly, there
+is no tool for that today; see #234.
+
 ## Known open issue: "edge broker refused the channel join"
 
 At the time of writing, steps 1–3 above are verified working end-to-end against

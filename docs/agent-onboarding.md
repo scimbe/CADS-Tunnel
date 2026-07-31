@@ -106,7 +106,15 @@ you need it (custom role tags, joining someone else's pipeline, browser-facing s
 
 A published pipeline (see C) gives joining agents the two **public** values they need: the
 `operator_pubkey` (whose signature a valid grant must carry) and the peer/pipeline `holder_pubkey`
-for the role. Self-service admission:
+for the role.
+
+**Known gap (#233):** the design intent is that `operator_pubkey` is discoverable straight off the
+published `PipelineSpec` (`operator_pubkey_hex` via `GET /registry/pipelines/:id`), needing no prior
+relationship. In practice, neither of workflow-pipelines' two live pipelines (flappy-demo,
+cookbook-demo) has ever published one — `operator_pubkey_hex` reads `null` for both today. Until
+that's fixed, expect to get the operator's pubkey out-of-band rather than fetched from the registry.
+
+Self-service admission:
 
 1. You already minted holder + noise keys in A.1 (`ct-agent channel init`).
 2. **Get your grant.** Either the operator signs it for you from your public keys —
