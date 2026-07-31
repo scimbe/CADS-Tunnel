@@ -112,21 +112,28 @@ Prints `CHANNEL_ID=...`, `<SIDE_A_NAME>_GRANT=...`, `<SIDE_B_NAME>_GRANT=...`.
 ## Step 4 — bring up a serve process for the accepting side
 
 ```bash
-CT_AGENT_EDGE_BROKER=<edge IP>:4433   CT_AGENT_EDGE_RELAY=<edge IP>:4433 \
+CT_AGENT_EDGE_BROKER=<edge host>:4435   CT_AGENT_EDGE_RELAY=<edge host>:4436 \
 HOLDER_KEY=<accept side priv>   NOISE_KEY=<accept side priv> \
 GRANT=<the accept-direction grant from step 3> \
 SERVICE=text_generation   HANDLER_CMD=/path/to/role-handler.sh \
   ./scripts/channel-ops/serve-role.sh
 ```
 
+`4435`/`4436` are the channel broker/relay ports (`GET /network-info`'s
+`channel_broker_port`/`channel_relay_port` — confirm against a live deployment rather
+than hardcoding, since an operator can override the defaults via
+`CT_CP_CHANNEL_BROKER_PORT`/`CT_CP_CHANNEL_RELAY_PORT`). **Not** `4433` — that's the
+Mesh-Plane tunnel rendezvous port (`mesh_edge_port`), a different listener/protocol
+entirely; pointing at it fails every join immediately and consistently, not with an
+auth/membership refusal.
+
 Runs relay-only (`CT_CHANNEL_RELAY_ONLY=1` — no dialable address needed, #173),
 re-admitting successive peers automatically (#179/#200 — up to 8 concurrent
 sessions), piping each request through `HANDLER_CMD` (stdin request → stdout JSON,
 per `docs/agent-onboarding.md`'s handler I/O contract).
 
-**`CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` need a numeric `ip:port`, not a hostname**
-— `bunsenbrenner.org:4433` fails with `invalid socket address syntax`; resolve to
-the IP first.
+`CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` accept a `host:port` directly since #214
+(`6d85644`) — a bare IP is no longer required.
 
 ## Known open issue: "edge broker refused the channel join"
 

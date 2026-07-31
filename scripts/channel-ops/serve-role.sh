@@ -5,8 +5,8 @@
 # supervisor, docker, etc. — this script itself does none of that).
 #
 # Usage:
-#   CT_AGENT_EDGE_BROKER=bunsenbrenner.org:4433 \
-#   CT_AGENT_EDGE_RELAY=bunsenbrenner.org:4433 \
+#   CT_AGENT_EDGE_BROKER=bunsenbrenner.org:4435 \
+#   CT_AGENT_EDGE_RELAY=bunsenbrenner.org:4436 \
 #   HOLDER_KEY=<64-hex priv> NOISE_KEY=<64-hex priv> GRANT=<hex signed grant> \
 #   SERVICE=text_generation HANDLER_CMD=/path/to/physics-handler.sh \
 #     ./serve-role.sh
