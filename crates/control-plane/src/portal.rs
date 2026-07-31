@@ -42,8 +42,8 @@ pub struct ExchangedIdentity {
     pub email: Option<String>,
 }
 
-/// Exchanges an authorization `code` for the authenticated identity (OIDC `sub`
-/// + `email`). Injectable so the callback flow is hermetically testable without a
+/// Exchanges an authorization `code` for the authenticated identity (OIDC `sub` and
+/// `email`). Injectable so the callback flow is hermetically testable without a
 /// live IdP; the production default calls the token endpoint over TLS.
 type Exchanger =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<ExchangedIdentity, String>> + Send>> + Send + Sync>;

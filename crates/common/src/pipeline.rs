@@ -226,7 +226,7 @@ impl SelectionPolicy {
             SelectionPolicy::RoundRobin => {
                 // Deterministic ring so rotation is stable regardless of offer arrival order.
                 let mut ring: Vec<&CapacityOffer> = qualifying.to_vec();
-                ring.sort_by(|a, b| a.holder_pubkey.cmp(&b.holder_pubkey));
+                ring.sort_by_key(|a| a.holder_pubkey);
                 // Next provider strictly after the last winner. If the last winner is gone
                 // (offline) this lands on the next-higher key; if it was the highest (or unset),
                 // wrap to the ring start. Either way we advance over the *live* set → failover.
@@ -607,7 +607,7 @@ mod tests {
 
         // Take the CodeGeneration agent offline → the protocol raises UnfilledRole, not a partial run.
         assert_eq!(
-            spec.convene(&[safety.clone()], 100),
+            spec.convene(std::slice::from_ref(&safety), 100),
             Err(PipelineError::UnfilledRole { service: CodeGeneration }),
             "a role with no online offer fails the whole convene"
         );

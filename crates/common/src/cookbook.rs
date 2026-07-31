@@ -9,6 +9,7 @@
 //!     `{ingredients, steps, cookTime, difficulty, allergens}` — ingredient recognition + recipe logic.
 //!   * **sink** (presentation) emits a [`RecipeFragment`]:
 //!     `{dishName, theme, garnish, moodDescription}` — naming/theming/plating.
+//!
 //! The two merge into a [`RecipeCard`] the browser renders. `safety` (central) gates first, exactly
 //! like the flappy `safety_check`. Wire field names are camelCase to match the browser directly.
 

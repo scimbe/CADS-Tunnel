@@ -85,7 +85,7 @@ mod tests {
         assert!(issue_token_for_payment(&mut ledger, &acct, 1).is_err(), "no credit left");
 
         // Tokens are distinct.
-        tokens.sort_by(|a, b| a.0.cmp(&b.0));
+        tokens.sort_by_key(|a| a.0);
         tokens.dedup_by(|a, b| a.0 == b.0);
         assert_eq!(tokens.len(), 3, "each issued token is unique");
     }

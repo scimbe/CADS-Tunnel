@@ -360,7 +360,7 @@ pub fn register_auction_tools(
             if !bid.is_valid(now) {
                 return Err("bid signature invalid or expired".to_string());
             }
-            let window = if window_secs == 0 { 0 } else { now / window_secs };
+            let window = now.checked_div(window_secs).unwrap_or(0);
             if !limiter
                 .lock()
                 .map_err(|_| "auction rate limiter lock poisoned")?
@@ -501,7 +501,7 @@ pub fn register_chat_tool(
                 ));
             }
             let now = now_fn();
-            let window = if window_secs == 0 { 0 } else { now / window_secs };
+            let window = now.checked_div(window_secs).unwrap_or(0);
             if !limiter
                 .lock()
                 .map_err(|_| "chat rate limiter lock poisoned")?

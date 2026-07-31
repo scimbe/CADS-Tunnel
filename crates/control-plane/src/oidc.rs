@@ -303,7 +303,7 @@ ZQIDAQAB
     fn oidc_error_displays_a_reason() {
         let v = OidcVerifier::from_hs_secret(SECRET, ISSUER);
         let token = make_token(b"wrong-key", "user-42", ISSUER, now() + 3600);
-        let err = v.subject(&token).err().expect("bad signature errors");
+        let err = v.subject(&token).expect_err("bad signature errors");
         assert!(
             format!("{err}").starts_with("oidc verification failed:"),
             "Display renders the reason"
