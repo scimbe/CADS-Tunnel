@@ -182,6 +182,13 @@ impl ChannelAuthorizer {
     }
 
     async fn query(&self, channel: &ChannelId, holder: &[u8; 32]) -> Outcome {
+        // #231 follow-up: every Unresolved branch below used to return silently — the
+        // ONE outcome the fail-static cache exists to tolerate had no log line at all,
+        // so a real transport-class incident (CP unreachable, non-success status, a
+        // malformed response) was indistinguishable from routine operation in the
+        // edge's own log, even though it's exactly the condition operators most need to
+        // see. Pure observability: no change to which Outcome is returned, only that
+        // it's now visible.
         let resp = match self
             .client
             .post(&self.url)
@@ -194,7 +201,14 @@ impl ChannelAuthorizer {
             .await
         {
             Ok(r) => r,
-            Err(_) => return Outcome::Unresolved, // timeout / connection error
+            Err(e) => {
+                eprintln!(
+                    "ct-edge: channel-authorize UNRESOLVED [transport] channel={} holder={}: {e}",
+                    hex(&channel.0),
+                    hex(holder)
+                );
+                return Outcome::Unresolved; // timeout / connection error
+            }
         };
         // A clean, authoritative "no" from the CP — it definitely resolved the
         // request, and definitely said this holder isn't (or can't be proven to be) a
@@ -204,12 +218,28 @@ impl ChannelAuthorizer {
             return Outcome::Refused;
         }
         if !resp.status().is_success() {
+            eprintln!(
+                "ct-edge: channel-authorize UNRESOLVED [status={}] channel={} holder={}",
+                resp.status(),
+                hex(&channel.0),
+                hex(holder)
+            );
             return Outcome::Unresolved;
         }
         let Ok(body) = resp.json::<AuthorizeResp>().await else {
+            eprintln!(
+                "ct-edge: channel-authorize UNRESOLVED [unparseable-body] channel={} holder={}",
+                hex(&channel.0),
+                hex(holder)
+            );
             return Outcome::Unresolved; // 2xx with an unparseable body — CP-side bug, not a refusal
         };
         let Some(operator_pubkey) = hex_decode_32(&body.operator_pubkey) else {
+            eprintln!(
+                "ct-edge: channel-authorize UNRESOLVED [bad-operator-pubkey] channel={} holder={}",
+                hex(&channel.0),
+                hex(holder)
+            );
             return Outcome::Unresolved;
         };
         Outcome::Authorized(MemberResolution {
