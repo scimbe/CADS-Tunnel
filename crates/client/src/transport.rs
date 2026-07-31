@@ -31,7 +31,8 @@ fn install_crypto_provider() {
 /// rendezvous path in place of the sync `build_request`.
 pub(crate) async fn build_request_blocking(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
     let challenge = challenge.clone();
-    let solution = tokio::task::spawn_blocking(move || solve(&challenge))
+    let solve_token = token.clone();
+    let solution = tokio::task::spawn_blocking(move || solve(&challenge, &solve_token))
         .await
         .expect("pow solve task panicked");
     assemble_request(solution, token)
@@ -630,7 +631,7 @@ mod tests {
         assert_eq!(req.len(), 40, "solution(8) | token(32)");
         let solution = u64::from_le_bytes(req[..8].try_into().unwrap());
         assert!(
-            ct_common::pow::verify(&challenge, solution),
+            ct_common::pow::verify(&challenge, &token, solution),
             "the offloaded solve still produces a valid PoW solution"
         );
         assert_eq!(&req[8..], &token.0, "the token is appended after the solution");
