@@ -428,18 +428,19 @@ pub fn is_global_unicast(addr: std::net::SocketAddr) -> bool {
         return false;
     }
     match ip {
-        IpAddr::V4(v4) => {
-            // RFC1918 private + link-local (169.254/16) + shared/CGNAT (100.64/10).
-            if v4.is_private() || v4.is_link_local() {
-                return false;
-            }
-            let o = v4.octets();
-            if o[0] == 100 && (64..=127).contains(&o[1]) {
-                return false; // 100.64.0.0/10
-            }
-            true
-        }
+        IpAddr::V4(v4) => is_global_unicast_v4(v4),
         IpAddr::V6(v6) => {
+            // #267: an IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`)
+            // IPv6 address embeds a real IPv4 address that neither the `is_loopback`/
+            // `is_unspecified` check above nor the segment-mask checks below can see --
+            // `::ffff:127.0.0.1` and `::ffff:169.254.169.254` (cloud metadata) both
+            // classified as global-unicast before this fix, bypassing the SSRF filter
+            // `ct_edge::safe_endpoint` and the #104/#137 upgrade guard are both defined
+            // in terms of this function. Re-run the IPv4 classification on the embedded
+            // address before falling through to the native-IPv6 range checks.
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return is_global_unicast_v4(v4);
+            }
             let s0 = v6.segments()[0];
             if (s0 & 0xfe00) == 0xfc00 {
                 return false; // unique-local fc00::/7
@@ -450,6 +451,27 @@ pub fn is_global_unicast(addr: std::net::SocketAddr) -> bool {
             true
         }
     }
+}
+
+/// The IPv4 half of [`is_global_unicast`]'s classification, factored out so the same
+/// RFC1918/link-local/CGNAT logic applies uniformly whether the address arrived as a
+/// native `Ipv4Addr` or was unwrapped from an IPv4-mapped/IPv4-compatible `Ipv6Addr`
+/// (#267). Callers are expected to have already ruled out loopback/unspecified/
+/// multicast on the original address; `Ipv4Addr`'s own checks are included here too so
+/// this stays correct as a standalone helper regardless.
+fn is_global_unicast_v4(v4: std::net::Ipv4Addr) -> bool {
+    if v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() {
+        return false;
+    }
+    // RFC1918 private + link-local (169.254/16) + shared/CGNAT (100.64/10).
+    if v4.is_private() || v4.is_link_local() {
+        return false;
+    }
+    let o = v4.octets();
+    if o[0] == 100 && (64..=127).contains(&o[1]) {
+        return false; // 100.64.0.0/10
+    }
+    true
 }
 
 /// How a channel member can be reached, classified from what it **advertised** and the
@@ -3145,12 +3167,38 @@ mod tests {
             "127.0.0.1:22", "0.0.0.0:80", "224.0.0.1:80", "10.0.0.5:22", "172.16.0.1:22",
             "192.168.1.1:22", "169.254.169.254:80", "100.64.0.1:22", "[::1]:22", "[fe80::1]:22",
             "[fc00::1]:22", "[fd12:3456::1]:22",
+            // #267: IPv4-mapped/IPv4-compatible IPv6 addresses embedding a
+            // loopback/private/link-local/CGNAT IPv4 address must be rejected too --
+            // these all classified as global-unicast before the fix.
+            "[::ffff:127.0.0.1]:443", "[::ffff:169.254.169.254]:80", "[::ffff:10.0.0.5]:22",
+            "[::ffff:192.168.1.1]:22", "[::ffff:100.64.0.1]:22", "[::ffff:0.0.0.0]:80",
         ] {
             assert!(!is_global_unicast(bad.parse::<SocketAddr>().unwrap()), "{bad} must not be global-unicast");
         }
-        for ok in ["203.0.113.10:7001", "8.8.8.8:443", "[2001:4860:4860::8888]:443"] {
+        for ok in [
+            "203.0.113.10:7001", "8.8.8.8:443", "[2001:4860:4860::8888]:443",
+            // A genuinely public IPv4 address embedded in IPv4-mapped form must still
+            // be admitted -- the fix is a correctness fix, not a blanket new rejection.
+            "[::ffff:203.0.113.10]:7001",
+        ] {
             assert!(is_global_unicast(ok.parse::<SocketAddr>().unwrap()), "{ok} must be global-unicast");
         }
+    }
+
+    #[test]
+    fn is_global_unicast_v4_mapped_ssrf_bypass_is_closed() {
+        // #267 (frozen): a channel member could previously advertise/offer an
+        // IPv4-mapped IPv6 address pointing at loopback or cloud metadata and have it
+        // pass the SSRF filter, because std's Ipv6Addr::is_loopback/is_unspecified do
+        // NOT recognize `::ffff:127.0.0.1` as loopback, and the old V6 branch only
+        // checked the unique-local/link-local segment masks -- never unwrapping the
+        // embedded IPv4 address at all. Exercises exactly the two concrete targets the
+        // finding named.
+        use std::net::SocketAddr;
+        let cloud_metadata: SocketAddr = "[::ffff:169.254.169.254]:80".parse().unwrap();
+        let mapped_loopback: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        assert!(!is_global_unicast(cloud_metadata), "IPv4-mapped cloud metadata must be refused");
+        assert!(!is_global_unicast(mapped_loopback), "IPv4-mapped loopback must be refused");
     }
 
     #[test]
