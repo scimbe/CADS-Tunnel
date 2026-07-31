@@ -107,7 +107,8 @@ plane is the only thing that ever touches the real DNS zone), and writes
 `fullchain.pem`/`privkey.pem` to `CT_ACME_CERT_OUT_DIR` — the same static-file
 pair your origin's webserver (Caddy, etc.) already knows how to load. It
 re-checks every few hours and only actually contacts Let's Encrypt once the
-existing cert is old enough to renew (`crates/agent/src/acme_orchestrate.rs`).
+existing cert is old enough to renew (`ct-agent`'s own `src/acme_orchestrate.rs` —
+[scimbe/ct-agent](https://github.com/scimbe/ct-agent), its own repo).
 
 The ACME directory URL (and CA choice generally) is no longer agent-side
 config: `ct-agent` polls the control-plane's admission broker
