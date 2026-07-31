@@ -6098,7 +6098,8 @@ mod tests {
         let html = String::from_utf8_lossy(&body);
         // Self-contained (no external asset URLs) and renders the status figures.
         assert!(html.contains("Bunsenbrenner"), "has the Bunsenbrenner branding");
-        assert!(html.contains("published worldwide"), "has the onboarding tagline");
+        // #241 restructured the hero; "published worldwide" left with it.
+        assert!(html.contains("Better homemade ideas"), "has the hero headline");
         assert!(html.contains("operator status"), "has the live-status section");
         assert!(html.contains("fetch('/status')"), "fetches the status endpoint");
         assert!(
@@ -6246,15 +6247,15 @@ mod tests {
                 // The human "get started" onboarding now lives inline on the landing page itself.
                 // #237 redesign: the entry point is an email-first join form (login_hint into the
                 // existing Keycloak/OIDC flow), not a bare "Register" button -- so this checks for
-                // that CTA's own copy instead of the retired word.
+                // that CTA's own copy instead of the retired word. #241 dropped the "Your
+                // subdomain" callout (the only place "Standard"/"subdomain" appeared) as part of
+                // the hero restructure -- those two assertions went with it.
                 "/",
                 vec![
                     "Get your tunnel",
                     "login_hint",
                     "hello-world-pipeline",
                     "Claude Code",
-                    "Standard",
-                    "subdomain",
                     "Bunsenbrenner",
                     "not protection",
                 ],

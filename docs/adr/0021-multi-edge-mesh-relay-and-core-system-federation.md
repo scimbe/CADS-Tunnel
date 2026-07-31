@@ -1,9 +1,11 @@
 # ADR-0021 — Multi-edge mesh relay, and federation across independent core systems
 
 ## Status
-Proposed (planning + first implementation slice). Fills a gap this repo already
-referenced but never wrote down: `crates/control-plane/src/edge_mesh.rs`'s module
-doc has called itself "ADR-0021" since it was written, without this file existing.
+Part 1 implemented (off by default, `CT_EDGE_MESH_RELAY_ENABLED` — no second edge
+has been deployed for real yet, so it's dead-but-tested in production). Part 2
+(federation) is still proposed. Fills a gap this repo already referenced but
+never wrote down: `crates/control-plane/src/edge_mesh.rs`'s module doc has
+called itself "ADR-0021" since it was written, without this file existing.
 Builds on ADR-0006 (single-region Edge with a first-class Tunnel Registry, which
 explicitly deferred this) and reuses ADR-0020's Agent-Fabric trust-chain model
 for the federation question in Part 2.
@@ -19,12 +21,14 @@ survives an edge restart (an edge replays its own ownership rows from
 outage, #214), and round-robins new tunnel assignment across every edge that
 heartbeated recently (`assign_edge`, least-loaded by ownership-row count).
 
-What is **not** built: when a Client's connection lands on edge A but the
-hostname it wants is owned by edge B, A has no way to reach it. Today that's
-invisible because there is exactly one edge. It stops being invisible the
-moment a second edge is added for real capacity (not just registry-readiness)
-— which is precisely the "scaling to more than one \[edge in the] core system"
-work this session was asked to finish.
+What **is now built** (this ADR's Part 1, see Decision below): when a Client's
+connection lands on edge A but the hostname it wants is owned by edge B, A can
+reach it via the mesh-relay leg. It stays functionally invisible today because
+there is exactly one edge deployed for real — the relay path only ever fires
+on a genuine local-route miss, which can't happen with a single edge. It stops
+being invisible the moment a second edge is added for real capacity (not just
+registry-readiness) — which is precisely the "scaling to more than one \[edge
+in the] core system" work this session was asked to finish.
 
 ### Decision
 

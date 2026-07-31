@@ -17,15 +17,15 @@
 //! - **Lays the real groundwork for horizontal scale.** Once a second edge
 //!   exists, [`assign_edge`] starts round-robining new tunnels across every
 //!   edge that's heartbeated recently, and any edge can look up which peer
-//!   holds a token/hostname it doesn't have locally — the prerequisite for
-//!   the edge-to-edge mesh relay (not yet built; see the ADR for that
-//!   protocol's design) that lets a client land on *any* edge and still
-//!   reach the right tunnel.
+//!   holds a token/hostname it doesn't have locally via `GET
+//!   /internal/edges/lookup`.
 //!
-//! Deliberately NOT built yet: the edge-to-edge byte-relay itself. That's a
-//! new inter-node trust boundary that deserves testing against two real edge
-//! processes on a real network, not just mocks — see the ADR for the
-//! specified next step.
+//! The edge-to-edge byte-relay itself (ADR-0021 Part 1) IS built on top of
+//! that lookup — `crate::edge`'s `relay_via_peer_edge`/the `'M'`-framed
+//! relay role in `serve.rs` — but stays off by default
+//! (`CT_EDGE_MESH_RELAY_ENABLED`) until an operator actually runs a second
+//! edge; with exactly one edge every local route always hits, so the relay
+//! path is a no-op either way.
 
 use std::sync::{Arc, Mutex};
 
