@@ -14,7 +14,17 @@ pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// A Noise static keypair (X25519). The public half is the Origin Identity;
 /// the private half never leaves the Agent.
+///
+/// #250: `private` is zeroized on drop — without this, the long-lived Origin static
+/// secret survives in freed heap memory (recoverable from a core dump or, on some
+/// allocators, a later unrelated allocation) after the keypair goes out of scope or the
+/// process crashes. Noise_IK gives no forward secrecy against static-key compromise, so
+/// a recovered private key lets an attacker impersonate this Origin and decrypt every
+/// session pinned to it. `public` is not secret (it IS the Origin Identity clients pin)
+/// so it's skipped — zeroizing it would be pointless cost with no security benefit.
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct StaticKeypair {
+    #[zeroize(skip)]
     pub public: [u8; 32],
     pub private: [u8; 32],
 }
@@ -530,6 +540,29 @@ mod tests {
         let m = resp.write_message(&[], &mut b2).unwrap();
         ini.read_message(&b2[..m], &mut t).unwrap();
         (ini.into_transport_mode().unwrap(), resp.into_transport_mode().unwrap())
+    }
+
+    #[test]
+    fn static_keypair_zeroizes_the_private_key_on_drop() {
+        // #250: the private half must not survive in freed memory after the keypair is
+        // dropped — a recovered private key breaks impersonation resistance for every
+        // session pinned to this Origin (Noise_IK has no forward secrecy against static-key
+        // compromise). Heap-allocate so the write survives past drop long enough to observe
+        // (a stack slot can be reused/coalesced by the very next instruction, making a
+        // stack-based version of this check unreliable regardless of whether zeroize ran;
+        // a freed heap block is not touched again until something actually allocates into
+        // it, which nothing does between drop and the read below).
+        let kp = Box::new(generate_static_keypair());
+        let original_private = kp.private;
+        assert_ne!(original_private, [0u8; 32], "sanity: a freshly generated key is not all-zero");
+        let ptr = std::ptr::addr_of!(kp.private);
+        drop(kp);
+        // SAFETY: reading (not writing) memory this process just freed, before any other
+        // allocation can reuse it -- the standard pattern for asserting ZeroizeOnDrop
+        // actually ran, not a claim about safe access to freed memory in general.
+        let after = unsafe { std::ptr::read(ptr) };
+        assert_ne!(after, original_private, "private key bytes must be wiped, not left in freed memory");
+        assert_eq!(after, [0u8; 32], "zeroize overwrites with zero bytes");
     }
 
     #[test]

@@ -11,6 +11,7 @@ serde_json = "1"
 ed25519-dalek = "2"
 snow = "0.9"
 sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "sync", "macros"] }
 
 [dev-dependencies]
