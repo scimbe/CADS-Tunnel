@@ -607,8 +607,8 @@ impl SqliteAgentDirectory {
         Ok(all
             .into_iter()
             .filter(|e| {
-                role.map_or(true, |r| e.role_tags.iter().any(|t| t == r))
-                    && skill.map_or(true, |s| e.skill_ids.iter().any(|t| t == s))
+                role.is_none_or(|r| e.role_tags.iter().any(|t| t == r))
+                    && skill.is_none_or(|s| e.skill_ids.iter().any(|t| t == s))
             })
             .collect())
     }
@@ -1550,12 +1550,12 @@ impl SqliteTunnelStore {
     /// `lapsed`, awaiting an explicit customer re-request. Returns the number
     /// of rows lapsed this sweep.
     pub fn lapse_expired_claims(&self, now: i64) -> rusqlite::Result<usize> {
-        Ok(self.conn.lock_safe().execute(
+        self.conn.lock_safe().execute(
             "UPDATE subject_tunnels
              SET claim_state = 'lapsed', assigned_ca = NULL, claim_offered_at = NULL, claim_deadline = NULL
              WHERE claim_state = 'offered' AND claim_deadline < ?1",
             params![now],
-        )?)
+        )
     }
 
     /// Explicit customer re-request after a lapse (#233): back of the queue,
