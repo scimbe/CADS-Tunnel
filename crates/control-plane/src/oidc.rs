@@ -131,6 +131,37 @@ where
     OidcVerifier::from_rsa_components(&n, &e, issuer).ok()
 }
 
+/// Like [`verifier_from_jwks`], but retries the fetch+select step on a short backoff
+/// instead of giving up after one attempt (#271). The one-shot version means any
+/// transient blip at boot — the realm still warming up, a rotated key not yet
+/// propagated, a momentary network hiccup — permanently disables `/me/*` for the
+/// process's entire lifetime, indistinguishable from the realm genuinely having no
+/// usable key. `fetch` must be reusable (`Fn`, not `FnOnce`) so it can be called once
+/// per attempt; `sleep` is injected so tests exercise every retry without waiting on
+/// real backoff delays. `delays_ms[0]` is normally `0` (try immediately first).
+pub async fn verifier_from_jwks_with_retry<F, Fut, S, SFut>(
+    issuer: &str,
+    fetch: F,
+    delays_ms: &[u64],
+    sleep: S,
+) -> Option<OidcVerifier>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<serde_json::Value>>,
+    S: Fn(u64) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    for &delay in delays_ms {
+        if delay > 0 {
+            sleep(delay).await;
+        }
+        if let Some(v) = verifier_from_jwks(issuer, |url| fetch(url)).await {
+            return Some(v);
+        }
+    }
+    None
+}
+
 /// Select the RS256 **signing** key from a parsed JWKS document and return its
 /// base64url `(n, e)` components for [`OidcVerifier::from_rsa_components`] (#42
 /// KC2). Picks the first key with `kty=RSA` that is usable for signature
@@ -453,5 +484,57 @@ ZQIDAQAB
             verifier_from_jwks(ISSUER, |_url| async move { Some(ec_only) }).await.is_none(),
             "no RS256 key -> no verifier"
         );
+    }
+
+    #[tokio::test]
+    async fn verifier_from_jwks_with_retry_recovers_from_transient_failures() {
+        // #271: a JWKS fetch that fails the first two attempts (transport error, or a
+        // realm that hasn't published its RS256 key yet) and succeeds on the third
+        // still yields a working verifier — the one-shot version would give up forever.
+        let (n, e, token) = rsa_jwk_and_token("user-271");
+        let jwks = serde_json::json!({
+            "keys": [{ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k1", "n": n, "e": e }]
+        });
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let sleeps = std::sync::atomic::AtomicUsize::new(0);
+
+        let v = verifier_from_jwks_with_retry(
+            ISSUER,
+            |_url| {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let jwks = jwks.clone();
+                async move { if n < 2 { None } else { Some(jwks) } }
+            },
+            &[0, 10, 10, 10],
+            |_ms| {
+                sleeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {}
+            },
+        )
+        .await
+        .expect("verifier eventually built after transient failures");
+
+        assert_eq!(v.subject(&token).unwrap(), "user-271");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3, "third attempt succeeded");
+        assert_eq!(sleeps.load(std::sync::atomic::Ordering::SeqCst), 2, "slept before attempts 2 and 3, not before the first");
+    }
+
+    #[tokio::test]
+    async fn verifier_from_jwks_with_retry_gives_up_after_the_last_delay() {
+        // A realm that genuinely never has a usable key still returns None -- this is
+        // resilience against transient failures, not an infinite/unbounded retry.
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = verifier_from_jwks_with_retry(
+            ISSUER,
+            |_url| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { None }
+            },
+            &[0, 10, 10],
+            |_ms| async {},
+        )
+        .await;
+        assert!(result.is_none());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3, "tried exactly len(delays_ms) times");
     }
 }

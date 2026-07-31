@@ -16,7 +16,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ct_control_plane::oidc::{verifier_from_jwks, OidcVerifier};
+use ct_control_plane::oidc::{verifier_from_jwks_with_retry, OidcVerifier};
 use ct_control_plane::service::persistent_control_plane_router;
 
 /// Fetch a realm JWKS document over HTTP(S) for the startup verifier (#42 KC2-c).
@@ -67,14 +67,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=PEM {path})");
                 Some(verifier)
             }
-            _ => match verifier_from_jwks(&issuer, fetch_jwks).await {
+            // #271: retry with a short backoff instead of one shot — a realm still
+            // warming up, a rotated key not yet propagated, or a momentary network
+            // blip at exactly this moment must not permanently disable /me/* for the
+            // rest of this process's life. ~15.5s worst case across 6 attempts.
+            _ => match verifier_from_jwks_with_retry(
+                &issuer,
+                fetch_jwks,
+                &[0, 500, 1000, 2000, 4000, 8000],
+                |ms| tokio::time::sleep(std::time::Duration::from_millis(ms)),
+            )
+            .await
+            {
                 Some(v) => {
                     eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=JWKS)");
                     Some(v)
                 }
                 None => {
                     eprintln!(
-                        "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key — /me/* disabled"
+                        "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key after retrying — /me/* disabled"
                     );
                     None
                 }
