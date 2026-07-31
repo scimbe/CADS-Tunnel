@@ -2036,7 +2036,7 @@ mod tests {
         let extract = |h: &str| {
             h.split("CT_AGENT_JOIN_TOKEN=")
                 .nth(1)
-                .and_then(|s| s.split(|c| c == ' ' || c == '<').next())
+                .and_then(|s| s.split([' ', '<']).next())
                 .unwrap()
                 .to_string()
         };

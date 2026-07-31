@@ -2331,7 +2331,7 @@ mod tests {
                     (c.0 == chan_x || c.0 == chan_y).then_some((pk, None, None))
                 },
                 10_000,
-                |a, b, now| finish_relay_pair(a, b, now),
+                finish_relay_pair,
             )
             .await;
         });
@@ -2449,7 +2449,7 @@ mod tests {
                     (c.0 == chan_x || c.0 == chan_y).then_some((pk, None, None))
                 },
                 10_000,
-                |a, b, now| finish_rendezvous_pair(a, b, now),
+                finish_rendezvous_pair,
             )
             .await;
         });
@@ -2531,7 +2531,7 @@ mod tests {
                 || 500u64,
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan_y).then_some((pk, None, None)) },
                 10_000,
-                |a, b, now| finish_rendezvous_pair(a, b, now),
+                finish_rendezvous_pair,
             )
             .await;
         });
@@ -2596,7 +2596,7 @@ mod tests {
                     (c.0 == chan).then_some((pk, None, None))
                 },
                 park_ttl,
-                |a, b, now| finish_rendezvous_pair(a, b, now),
+                finish_rendezvous_pair,
             )
             .await;
         });
