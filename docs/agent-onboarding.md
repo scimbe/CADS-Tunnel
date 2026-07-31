@@ -12,6 +12,9 @@ in any public issue/comment. Only *public* keys and operator-signed grants are e
 Every command below is verified against `ct-agent`'s own `src/main.rs`
 ([scimbe/ct-agent](https://github.com/scimbe/ct-agent), its own repo) — run
 `ct-agent <cmd> --help`-style discovery by reading that file if a flag looks off.
+**Known gap (#239):** `ct-agent` has no working `--help`/`-h` flag today — an unrecognized first
+argument silently falls through to the default serve path instead of printing usage, so don't rely
+on `--help` for any subcommand; reading the source is genuinely the reference until this is fixed.
 
 ## Bootstrap honesty (read first)
 
@@ -201,6 +204,13 @@ tunnel on a hostname you choose (the operator stays payload-blind).
      ct-agent onboard
    ```
 3. `https://you.<zone>/` now reverse-proxies to your origin through the tunnel.
+
+**Known gap (#240):** the join token above is single-use — once redeemed, there is no supported
+re-onboard/reconnect path short of minting a fresh token. A standard process-manager restart policy
+(systemd `Restart=always`, Docker `restart: unless-stopped`, a k8s liveness restart) on an
+already-onboarded agent will crash-loop trying to redeem an already-spent token. Separately,
+leaving `CT_AGENT_EDGE_CERT_URL` unset on a non-default deployment makes the agent wait
+indefinitely rather than error — worth ruling out first if `onboard` seems to hang.
 
 TLS terminates at **your origin**, not the edge (ADR-0003) — it needs a real
 certificate for `you.<zone>`. Get one without ever handing anyone your private

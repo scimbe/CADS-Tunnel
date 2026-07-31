@@ -88,3 +88,10 @@ and the thesis chapter *Produktivierung*. In the code it spans persistence
   itself, not the declarative overlay/policy language.
 - **The workflow-pipelines auction/marketplace demo path uses a hardcoded fixture, not a live
   clearing (#180, open).** See #180 for the concrete gap and scope.
+- **The topology/overlay editor has no HTTP endpoint for authenticated operator-binding yet
+  (#237, open).** The enforcement predicate and the authenticated binding primitives are real and
+  tested (`docs/planning/v1-first-task-packets.md`'s `#107-enforce` entries), but there is no REST
+  route to actually bind a topology to an operator key from outside the control plane, so a drawn
+  overlay authorizes nothing today even before #235's live-wiring gap.
+- **Agent-Fabric NAT traversal (DCUtR hole-punch) is validated against a single 2-NAT lab setup
+  only, not the diversity of real-world NAT types (#238, open).**
