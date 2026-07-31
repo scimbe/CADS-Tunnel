@@ -69,7 +69,8 @@ and the security set: [whitepaper](docs/security/whitepaper.md) ·
 [TLS everywhere](docs/security/tls-everywhere.md) ·
 [dependency audit](docs/security/dependency-audit.md) ·
 [payment integration](docs/payment/integration.md) ·
-[product positioning](docs/product/positioning.md).
+[product positioning](docs/product/positioning.md) ·
+[comparison to the tunneling landscape](docs/product/comparison.md).
 
 **5. The bachelor thesis (draft)** — the academic write-up
 [**→ thesis PDF**](docs/thesis/thesis.pdf) (German, HAW template); LaTeX sources
