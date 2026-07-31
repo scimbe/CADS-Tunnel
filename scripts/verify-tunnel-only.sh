@@ -21,8 +21,16 @@ set -euo pipefail
 fail=0
 for f in "$@"; do
   [ -f "$f" ] || { echo "error: no such file: $f" >&2; exit 2; }
-  # A `ports:` mapping key at any indent, not inside a comment.
-  hits="$(grep -nE '^\s*ports:\s*$' "$f" || true)"
+  # A `ports:` mapping key at any indent. #318: the old pattern required
+  # `ports:` to end the line (`\s*$`), so it only caught the YAML block form
+  # (`ports:` alone, nested items on following lines) and silently missed the
+  # equally valid inline form (`ports: ["80:80"]`) -- a compose file using
+  # inline syntax to publish a host port sailed straight through this gate.
+  # A `:` starts a YAML mapping value only when followed by whitespace or
+  # end-of-line (compact `key:value` is a plain scalar, not a key), so
+  # matching `ports:` followed by whitespace-or-EOL catches every valid form
+  # of the key without over-matching an unrelated `ports:something` token.
+  hits="$(grep -nE '^\s*ports:(\s|$)' "$f" || true)"
   if [ -n "$hits" ]; then
     fail=1
     echo "✗ $f publishes a host port (breaks the tunnel-only invariant, #219):"

@@ -57,8 +57,20 @@ status=0
 
 fail() { echo "SECRET-GUARD FAIL: $1"; status=1; }
 
+# All git-tracked files -- captured ONCE, with the failure explicitly checked.
+# #316: `git ls-files | while … ; done` (the old shape) silently swallows a
+# non-zero `git ls-files` exit under `set -eu` (no pipefail in POSIX sh) --
+# the while loop just reads nothing and exits 0, so a guard that couldn't even
+# run (missing .git, corrupt index, git unavailable) still printed
+# "SECRET-GUARD OK" having scanned zero files. A guard that can't run must
+# fail loudly, never report clean.
+if ! tracked_files=$(git ls-files); then
+  echo "SECRET-GUARD FAIL: git ls-files failed -- cannot verify no secrets are committed"
+  exit 1
+fi
+
 # 1. No real .env files may be tracked (only *.example templates).
-env_tracked=$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.example$' || true)
+env_tracked=$(printf '%s\n' "$tracked_files" | grep -E '(^|/)\.env($|\.)' | grep -v '\.example$' || true)
 if [ -n "$env_tracked" ]; then
   fail "tracked .env file(s) with real values:"
   echo "$env_tracked"
@@ -70,7 +82,7 @@ if ! git check-ignore -q docker/deploy/.env 2>/dev/null; then
 fi
 
 # 3. Scan tracked text files for the credential shapes in $pattern.
-hits=$(git ls-files | while IFS= read -r f; do
+hits=$(printf '%s\n' "$tracked_files" | while IFS= read -r f; do
   case "$f" in
     *.example|scripts/check-no-secrets.sh) continue ;;  # templates + this scanner
   esac
