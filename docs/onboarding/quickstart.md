@@ -11,18 +11,21 @@ traffic but cannot read it.
 - The **control-plane URL** (from the hosted portal, or your self-hosted
   deployment — e.g. `https://cp.example.com`).
 - A **tenant** name you enroll under.
-- The `ct-agent` binary (or the `ct-testbed` image that ships it).
+- The `ct-agent` binary — its own repo, [scimbe/ct-agent](https://github.com/scimbe/ct-agent).
 - The address of the **edge** to dial and the **local origin** service you want
   to expose.
 
 ## Step 1 — issue a single-use join token (operator / portal)
 
 The portal does this for you. To do it by hand, ask the control plane to mint a
-token for your tenant:
+token for your tenant — `/enroll/issue` is admin-token gated (the same
+`CT_CP_EDGE_ADMIN_TOKEN` the edge/operator already hold), confirmed live: a call
+without it returns `401`, not a token:
 
 ```bash
 curl -sS -X POST "$CP_URL/enroll/issue" \
   -H 'content-type: application/json' \
+  -H "x-ct-admin-token: $CT_CP_EDGE_ADMIN_TOKEN" \
   -d '{"tenant":"my-tenant"}'
 # => {"token":"<64 hex chars>"}
 ```
