@@ -8,10 +8,13 @@
 //! `CT_CONTROL_PLANE_DB` (default `control-plane.db`),
 //! `CT_PAYMENT_WEBHOOK_SECRET` (the payment provider's webhook signing secret;
 //! if unset, a random secret is used so the webhook accepts nothing — payment is
-//! effectively disabled until a real secret is configured), and
-//! `CT_OIDC_ISSUER` + `CT_OIDC_PUBKEY_PATH` (the Keycloak realm issuer and a PEM
-//! file with the realm's RSA public key; when both are set the authenticated
-//! `/me/*` endpoints are mounted, otherwise they are absent).
+//! effectively disabled until a real secret is configured), `CT_PORTAL_SESSION_KEY`
+//! (#294: the portal session cookie's HMAC key — a **distinct** secret from the
+//! webhook one, since that one is shared with an external payment provider; if
+//! unset, a random key is used, so sessions just don't survive a restart until
+//! it's set), and `CT_OIDC_ISSUER` + `CT_OIDC_PUBKEY_PATH` (the Keycloak realm
+//! issuer and a PEM file with the realm's RSA public key; when both are set the
+//! authenticated `/me/*` endpoints are mounted, otherwise they are absent).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -134,7 +137,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    let app = persistent_control_plane_router(&db, &webhook_secret, oidc)?;
+    // #294: the portal session cookie's HMAC key MUST NOT be the payment webhook
+    // secret — that secret is shared by definition with an external payment
+    // provider, so reusing it as a session-signing key let anyone who learns it
+    // forge a `ct_portal_session` for any subject (SESSION_CTX is a public label,
+    // not a secret). A dedicated CT_PORTAL_SESSION_KEY; unset falls back to an
+    // unguessable random key (same pattern as the webhook secret above) — the
+    // portal simply forces a fresh login after every restart until it's set,
+    // never a shared/guessable key.
+    let session_key = match std::env::var("CT_PORTAL_SESSION_KEY") {
+        Ok(s) if !s.is_empty() => s.into_bytes(),
+        _ => {
+            eprintln!(
+                "ct-control-plane: CT_PORTAL_SESSION_KEY unset — using a random key \
+                 (portal sessions won't survive a restart until it's set)"
+            );
+            let mut buf = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut buf);
+            buf.to_vec()
+        }
+    };
+
+    let app = persistent_control_plane_router(&db, &webhook_secret, &session_key, oidc)?;
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("ct-control-plane: listening on {listen}, db={db}");
