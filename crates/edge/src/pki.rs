@@ -58,12 +58,33 @@ pub struct Ca {
 
 /// Write `bytes` to `path`, restricting the file to owner read/write (0600) on
 /// Unix so a persisted CA signing key is never world-readable.
+///
+/// #277: a prior `std::fs::write` (creates at the umask-default mode, typically
+/// 0644) followed by a separate `set_permissions(0600)` left a real TOCTOU
+/// window — under the microseconds between the two syscalls the freshly
+/// generated CA private key PEM sat world-readable, so any local user who
+/// `open()`'d it in that window (or just raced it, e.g. via a symlink/inotify
+/// watch) could read the root-of-trust key and mint arbitrary Edge leaf certs.
+/// `OpenOptionsExt::mode(0o600)` applies the restrictive mode atomically as
+/// part of the file's *creation* syscall itself (subject only to the umask
+/// stripping bits further, never widening them) — there is no window where the
+/// file exists at a broader mode.
 fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
-    std::fs::write(path, bytes)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
     }
     Ok(())
 }
@@ -385,6 +406,31 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// #277: the persisted CA key file must never be created at a mode broader
+    /// than owner-only (0600) — the actual bug was a *write-then-chmod* TOCTOU
+    /// window (unobservable after the fact, since by the time this test's own
+    /// `metadata()` call runs the chmod would already have happened even under
+    /// the old code) fixed by making the restrictive mode part of the file's
+    /// creation syscall itself. This asserts the resulting end-state mode as a
+    /// standing regression guard on that requirement.
+    #[cfg(unix)]
+    #[test]
+    fn ca_key_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let key_path = std::env::temp_dir()
+            .join(format!("ct-edge-ca-perm-{}.pem", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&key_path);
+
+        let _ca = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "CA key file must be owner-read/write only, got {mode:o}");
+
         let _ = std::fs::remove_file(&key_path);
     }
 
