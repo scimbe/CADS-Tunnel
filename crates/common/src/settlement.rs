@@ -936,6 +936,13 @@ impl SettlementOp {
 mod tests {
     use super::*;
 
+    /// #252: `Preimage::new` now length-prefixes the domain (`u32-LE len || domain`).
+    fn dom(d: &[u8]) -> Vec<u8> {
+        let mut v = (d.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(d);
+        v
+    }
+
     #[test]
     fn signing_bytes_golden_vectors_are_byte_identical_after_the_preimage_refactor() {
         // #184 (frozen): pin the EXACT preimage bytes for each fixed-field settlement primitive so the
@@ -949,7 +956,7 @@ mod tests {
 
         // Transfer: DOMAIN ‖ from ‖ to ‖ amount(LE) ‖ nonce(LE)
         let mut e = Vec::new();
-        e.extend_from_slice(TRANSFER_DOMAIN);
+        e.extend_from_slice(&dom(TRANSFER_DOMAIN));
         e.extend_from_slice(&a1);
         e.extend_from_slice(&a2);
         e.extend_from_slice(&7u64.to_le_bytes());
@@ -958,7 +965,7 @@ mod tests {
 
         // Hold: DOMAIN ‖ from ‖ to ‖ amount(LE) ‖ match_ref ‖ nonce(LE) ‖ expires_at(LE)
         let mut e = Vec::new();
-        e.extend_from_slice(HOLD_DOMAIN);
+        e.extend_from_slice(&dom(HOLD_DOMAIN));
         e.extend_from_slice(&a1);
         e.extend_from_slice(&a2);
         e.extend_from_slice(&7u64.to_le_bytes());
@@ -969,7 +976,7 @@ mod tests {
 
         // Vote: DOMAIN ‖ term(LE) ‖ candidate ‖ voter
         let mut e = Vec::new();
-        e.extend_from_slice(VOTE_DOMAIN);
+        e.extend_from_slice(&dom(VOTE_DOMAIN));
         e.extend_from_slice(&5u64.to_le_bytes());
         e.extend_from_slice(&a1);
         e.extend_from_slice(&a2);
@@ -977,7 +984,7 @@ mod tests {
 
         // LeaderAttestation: DOMAIN ‖ term(LE) ‖ leader ‖ block_hash
         let mut e = Vec::new();
-        e.extend_from_slice(LEADER_BLOCK_DOMAIN);
+        e.extend_from_slice(&dom(LEADER_BLOCK_DOMAIN));
         e.extend_from_slice(&5u64.to_le_bytes());
         e.extend_from_slice(&a1);
         e.extend_from_slice(&bhash);

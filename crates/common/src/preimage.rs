@@ -15,10 +15,18 @@
 //!
 //! These preimages were hand-rolled ~14 times, with the variable-length encoding written ≥3 different
 //! ways — precisely where a missed length-prefix could slip in. [`Preimage`] centralises the discipline:
-//! the domain seeds it, fixed fields append verbatim, and [`Preimage::var_bytes`] is the ONE place a
-//! variable-length field is length-prefixed — so injectivity is enforced *by construction*, not by a
-//! per-function convention. It is byte-for-byte compatible with the hand-rolled preimages it replaces
-//! (a golden-vector test pins each), so switching to it changes no signature on the wire.
+//! the domain seeds it (length-prefixed, #252), fixed fields append verbatim, and
+//! [`Preimage::var_bytes`] is the ONE place a variable-length field is length-prefixed — so
+//! injectivity is enforced *by construction*, not by a per-function convention.
+//!
+//! **#252 wire-format note**: the domain used to be appended verbatim with no length prefix — the
+//! one gap in an otherwise fully injective builder (see [`Preimage::new`]'s doc for the exact
+//! collision it allowed). Closing it means every signature produced by this builder changed on
+//! `main` as of #252 — this module is NOT byte-for-byte compatible with pre-#252 output the way it
+//! was originally byte-for-byte compatible with the hand-rolled preimages it replaced. Any
+//! already-signed object (a settlement transfer, channel grant, membership staple, …) minted before
+//! this change will not re-verify after it; there is no in-place migration for durably-stored
+//! pre-#252 signatures.
 
 /// A domain-separated signing preimage under construction. Build with [`Preimage::new`], append fields
 /// in canonical order, then [`Preimage::finish`] for the `Vec<u8>` the signer hashes/signs. The
@@ -29,9 +37,22 @@ pub struct Preimage {
 }
 
 impl Preimage {
-    /// Seed a preimage with its `domain` separator (always first, always present).
+    /// Seed a preimage with its `domain` separator (always first, always present), length-prefixed
+    /// as `u32-LE length ‖ domain` (#252).
+    ///
+    /// Before this, the domain was appended verbatim with no length prefix — the one place in this
+    /// otherwise-injective builder that wasn't itself length-delimited. That's a latent gap in the
+    /// domain-separation guarantee this module's own doc comment claims: if some domain string A is
+    /// ever a byte-prefix of another domain B, and A's first FIXED (non-length-prefixed) field
+    /// happens to complete B's suffix, the two preimages collide and a signature over one type
+    /// verifies as a signature over the other — exactly the cross-type forgery domain separation
+    /// exists to prevent. (Checked as of #252: none of the ~20 domains currently in use collide this
+    /// way, so this was not yet exploitable — but nothing enforced that, and a future domain addition
+    /// could silently introduce one.) Length-prefixing the domain itself closes the gap unconditionally,
+    /// the same way `var_bytes` already closes it for every other variable-length field.
     pub fn new(domain: &[u8]) -> Self {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&(domain.len() as u32).to_le_bytes());
         buf.extend_from_slice(domain);
         Self { buf }
     }
@@ -84,9 +105,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn domain_comes_first_and_fixed_fields_append_verbatim() {
+    fn domain_comes_first_length_prefixed_and_fixed_fields_append_verbatim() {
         let out = Preimage::new(b"dom").fixed(&[0xAA; 4]).u64(0x0102030405060708).finish();
         let mut expected = Vec::new();
+        expected.extend_from_slice(&3u32.to_le_bytes());
         expected.extend_from_slice(b"dom");
         expected.extend_from_slice(&[0xAA; 4]);
         expected.extend_from_slice(&0x0102030405060708u64.to_le_bytes());
@@ -100,8 +122,9 @@ mod tests {
         let a = Preimage::new(b"d").var_bytes(b"ab").var_bytes(b"c").finish();
         let b = Preimage::new(b"d").var_bytes(b"a").var_bytes(b"bc").finish();
         assert_ne!(a, b, "length-prefixing keeps distinct splits distinct");
-        // exact shape: len(2)‖"ab"‖len(1)‖"c"
+        // exact shape: len(1)‖"d"‖len(2)‖"ab"‖len(1)‖"c"
         let mut expected = Vec::new();
+        expected.extend_from_slice(&1u32.to_le_bytes());
         expected.extend_from_slice(b"d");
         expected.extend_from_slice(&2u32.to_le_bytes());
         expected.extend_from_slice(b"ab");
@@ -113,6 +136,18 @@ mod tests {
     #[test]
     fn tag_and_u32_are_single_and_four_byte_fields() {
         let out = Preimage::new(b"").tag(0x07).u32(0x11223344).finish();
-        assert_eq!(out, vec![0x07, 0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(out, [&0u32.to_le_bytes()[..], &[0x07, 0x44, 0x33, 0x22, 0x11]].concat());
+    }
+
+    #[test]
+    fn a_domain_that_is_a_byte_prefix_of_another_no_longer_collides() {
+        // #252: the exact scenario the length-prefix closes. Before this fix, domain "dom" followed
+        // by a first FIXED field starting with b'1' produced identical bytes to domain "dom1" with no
+        // leading field -- letting a signature over one object type verify as the other. With the
+        // domain itself length-prefixed, "dom" and "dom1" can never produce the same preimage no
+        // matter what follows.
+        let a = Preimage::new(b"dom").fixed(b"1payload").finish();
+        let b = Preimage::new(b"dom1").fixed(b"payload").finish();
+        assert_ne!(a, b, "a domain that is a byte-prefix of another must not collide");
     }
 }

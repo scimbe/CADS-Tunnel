@@ -2669,6 +2669,15 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    /// #252: every hand-built golden-vector `expected` below starts with a domain tag; since
+    /// `Preimage::new` now length-prefixes it (`u32-LE len || domain`), this is the one place that
+    /// prefix is spelled out, so a golden vector reads as domain‖fields exactly like before.
+    fn dom(d: &[u8]) -> Vec<u8> {
+        let mut v = (d.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(d);
+        v
+    }
+
     #[test]
     fn signing_bytes_golden_vectors_are_byte_identical_after_the_preimage_refactor_184() {
         // #184 slice 2 (frozen): pin the EXACT preimage bytes for each channel primitive migrated to
@@ -2684,7 +2693,7 @@ mod tests {
 
         // MembershipStaple: DOMAIN ‖ channel ‖ holder ‖ stapled_at(LE) ‖ expires_at(LE)
         let mut e = Vec::new();
-        e.extend_from_slice(MEMBERSHIP_STAPLE_DOMAIN);
+        e.extend_from_slice(&dom(MEMBERSHIP_STAPLE_DOMAIN));
         e.extend_from_slice(&ch.0);
         e.extend_from_slice(&a);
         e.extend_from_slice(&7u64.to_le_bytes());
@@ -2693,7 +2702,7 @@ mod tests {
 
         // BillingCommitment: DOMAIN ‖ channel ‖ holder ‖ payee ‖ terms_hash ‖ max_amount(LE) ‖ expires_at(LE)
         let mut e = Vec::new();
-        e.extend_from_slice(BILLING_COMMITMENT_DOMAIN);
+        e.extend_from_slice(&dom(BILLING_COMMITMENT_DOMAIN));
         e.extend_from_slice(&ch.0);
         e.extend_from_slice(&a);
         e.extend_from_slice(&b);
@@ -2704,7 +2713,7 @@ mod tests {
 
         // SettleReceipt: DOMAIN ‖ channel ‖ receiver ‖ terms_hash ‖ session_nonce ‖ bytes_delivered(LE) ‖ transfer_digest
         let mut e = Vec::new();
-        e.extend_from_slice(SETTLE_RECEIPT_DOMAIN);
+        e.extend_from_slice(&dom(SETTLE_RECEIPT_DOMAIN));
         e.extend_from_slice(&ch.0);
         e.extend_from_slice(&a);
         e.extend_from_slice(&b);
@@ -2715,7 +2724,7 @@ mod tests {
 
         // member_noise_attest_bytes: DOMAIN ‖ channel ‖ holder ‖ noise_pubkey
         let mut e = Vec::new();
-        e.extend_from_slice(b"ct-a2a-noise-attest-v1");
+        e.extend_from_slice(&dom(b"ct-a2a-noise-attest-v1"));
         e.extend_from_slice(&ch.0);
         e.extend_from_slice(&a);
         e.extend_from_slice(&b);
@@ -2724,7 +2733,7 @@ mod tests {
         // topology_operator_binding_bytes: DOMAIN ‖ len(u64 LE) ‖ topology_id ‖ operator_pubkey
         let topo = "my-topology-α"; // multibyte: len is BYTE length, not char count
         let mut e = Vec::new();
-        e.extend_from_slice(b"ct-topology-operator-v1");
+        e.extend_from_slice(&dom(b"ct-topology-operator-v1"));
         e.extend_from_slice(&(topo.len() as u64).to_le_bytes());
         e.extend_from_slice(topo.as_bytes());
         e.extend_from_slice(&a);
@@ -2753,7 +2762,7 @@ mod tests {
         let cells = vec![CellId([0x22; 32])];
         let chans = vec![ChannelId([0x33; 32])];
         let mut e = Vec::new();
-        e.extend_from_slice(AGENT_CARD_DOMAIN);
+        e.extend_from_slice(&dom(AGENT_CARD_DOMAIN));
         e.extend_from_slice(&h);
         e.extend_from_slice(&2u32.to_le_bytes());
         put_str(&mut e, "α");
@@ -2776,7 +2785,7 @@ mod tests {
         let models = vec!["m1".to_string(), "µ".to_string()];
         let svcs = vec![ServiceType::CodeGeneration, ServiceType::SafetyCheck];
         let mut e = Vec::new();
-        e.extend_from_slice(CAPACITY_OFFER_DOMAIN);
+        e.extend_from_slice(&dom(CAPACITY_OFFER_DOMAIN));
         e.extend_from_slice(&h);
         e.push(CapacityKind::CloudApiQuota.tag());
         e.extend_from_slice(&2u32.to_le_bytes());
@@ -2798,7 +2807,7 @@ mod tests {
         // UsageReceipt: DOMAIN ‖ provider ‖ consumer ‖ kind.tag ‖ model ‖ units ‖ match_ref ‖ issued ‖ req ‖ resp
         let (p, c, mref, rq, rs) = ([0x22u8; 32], [0x33u8; 32], [0x44u8; 32], [0x55u8; 32], [0x66u8; 32]);
         let mut e = Vec::new();
-        e.extend_from_slice(USAGE_RECEIPT_DOMAIN);
+        e.extend_from_slice(&dom(USAGE_RECEIPT_DOMAIN));
         e.extend_from_slice(&p);
         e.extend_from_slice(&c);
         e.push(CapacityKind::LocalHardware.tag());
@@ -2817,7 +2826,7 @@ mod tests {
         let ta = [0x77u8; 32];
         // Some(service) → 0x01 ‖ tag
         let mut e = Vec::new();
-        e.extend_from_slice(CAPACITY_BID_DOMAIN);
+        e.extend_from_slice(&dom(CAPACITY_BID_DOMAIN));
         e.extend_from_slice(&h);
         e.push(CapacityKind::CloudApiQuota.tag());
         put_str(&mut e, "m");
@@ -2876,7 +2885,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let op = [0x11u8; 32];
         let mut e = Vec::new();
-        e.extend_from_slice(PIPELINE_ROLE_CHANNEL_DOMAIN);
+        e.extend_from_slice(&dom(PIPELINE_ROLE_CHANNEL_DOMAIN));
         e.extend_from_slice(&op);
         e.extend_from_slice(&11u32.to_le_bytes());
         e.extend_from_slice(b"flappy-demo");
@@ -2903,7 +2912,7 @@ mod tests {
         assert_eq!(SignedAcceptance::hash_proposal(proposal), proposal_hash, "hash_proposal = SHA-256(text)");
 
         let mut e = Vec::new();
-        e.extend_from_slice(PROPOSAL_ACCEPTANCE_DOMAIN);
+        e.extend_from_slice(&dom(PROPOSAL_ACCEPTANCE_DOMAIN));
         e.extend_from_slice(&accepter);
         e.extend_from_slice(&proposer);
         e.push(ProposalDecision::Counter.tag()); // 2
