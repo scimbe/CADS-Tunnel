@@ -174,6 +174,12 @@ impl SqliteEnrollment {
                  tokens   BLOB NOT NULL
              );",
         )?;
+        // #292: additive migration (same pattern as #44's `ensure_column`) so an
+        // already-deployed store gains the timestamp `prune_batch_issuance` needs.
+        // Pre-migration rows default to 0 -- deliberately never pruned by age (we
+        // don't know their true age), so they don't vanish in one surprise sweep
+        // right after an upgrade; only rows minted from here on age out normally.
+        ensure_column(&conn, "batch_issuance", "created_at", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -218,6 +224,7 @@ impl SqliteEnrollment {
         tenant: &TenantId,
         count: usize,
         idempotency_key: &str,
+        now: u64,
     ) -> Result<Vec<JoinToken>, IssueBatchError> {
         let conn = self.conn.lock_safe();
         // Replay: return the previously-minted set for this key — but only if the retry
@@ -253,8 +260,8 @@ impl SqliteEnrollment {
             tokens.push(JoinToken(bytes));
         }
         conn.execute(
-            "INSERT INTO batch_issuance (idem_key, tenant, tokens) VALUES (?1, ?2, ?3)",
-            params![idempotency_key, tenant.0, blob],
+            "INSERT INTO batch_issuance (idem_key, tenant, tokens, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![idempotency_key, tenant.0, blob, now as i64],
         )?;
         Ok(tokens)
     }
@@ -337,6 +344,29 @@ impl SqliteEnrollment {
         self.conn
             .lock_safe()
             .query_row("SELECT COUNT(*) FROM agent_bindings", [], |r| r.get(0))
+    }
+
+    /// Delete already-redeemed join-token rows (#292 housekeeping); returns the
+    /// count removed. Unlike [`SqliteBootstrap::prune`] this needs no age check at
+    /// all — `redeem` already enforces single-use via the `redeemed` flag, so a
+    /// redeemed row can never be validly reused regardless of how old it is. Safe
+    /// to call periodically; live, unredeemed tokens are never touched.
+    pub fn prune_redeemed_join_tokens(&self) -> rusqlite::Result<usize> {
+        self.conn.lock_safe().execute("DELETE FROM join_tokens WHERE redeemed != 0", [])
+    }
+
+    /// Delete `batch_issuance` idempotency records older than `now - max_age_secs`
+    /// (#292 housekeeping); returns the count removed. Rows from before the
+    /// `created_at` column existed (`created_at = 0`) are never matched — their
+    /// true age is unknown, so this only ages out records minted after the
+    /// migration. `max_age_secs` should comfortably exceed any realistic retry
+    /// window for the idempotency key it guards (a stale key past this point
+    /// simply mints a fresh batch on the next reuse instead of replaying).
+    pub fn prune_batch_issuance(&self, now: u64, max_age_secs: u64) -> rusqlite::Result<usize> {
+        let cutoff = now.saturating_sub(max_age_secs) as i64;
+        self.conn
+            .lock_safe()
+            .execute("DELETE FROM batch_issuance WHERE created_at != 0 AND created_at < ?1", params![cutoff])
     }
 }
 
@@ -3603,22 +3633,22 @@ mod tests {
         // does NOT mint new ones — so a network blip can't create duplicate identities.
         let store = SqliteEnrollment::open_in_memory().unwrap();
 
-        let first = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
+        let first = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc", 1_000).unwrap();
         assert_eq!(first.len(), 3);
 
         // Replay with the same key → the exact same tokens, no new mint.
-        let replay = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
+        let replay = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc", 1_000).unwrap();
         assert_eq!(replay, first, "same idempotency key returns the same token set");
 
         // A DIFFERENT key mints a fresh, distinct set.
-        let other = store.issue_join_tokens_idempotent(&tenant(), 3, "req-xyz").unwrap();
+        let other = store.issue_join_tokens_idempotent(&tenant(), 3, "req-xyz", 1_000).unwrap();
         assert!(other.iter().all(|t| !first.contains(t)), "a different key mints distinct tokens");
 
         // The idempotently-minted tokens are real, single-use join tokens.
         assert!(store.redeem(&first[0], &AgentId("a".into()), [1u8; 32]).is_ok(), "an idempotent token redeems");
         // Replaying the key again AFTER one was redeemed still returns the same set (idempotency is
         // about issuance, not redemption state).
-        let replay2 = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc").unwrap();
+        let replay2 = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc", 1_000).unwrap();
         assert_eq!(replay2, first, "replay is stable regardless of downstream redemption");
     }
 
@@ -3628,11 +3658,11 @@ mod tests {
         // `count` or `tenant` must fail loudly (Conflict) instead of silently returning the original
         // set — otherwise a client key-reuse bug could hand tenant-A's tokens to a tenant-B retry.
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let first = store.issue_join_tokens_idempotent(&tenant(), 3, "req-1").unwrap();
+        let first = store.issue_join_tokens_idempotent(&tenant(), 3, "req-1", 1_000).unwrap();
         assert_eq!(first.len(), 3);
 
         // Same key, DIFFERENT count → Conflict, and nothing is re-minted.
-        let mismatch_count = store.issue_join_tokens_idempotent(&tenant(), 5, "req-1");
+        let mismatch_count = store.issue_join_tokens_idempotent(&tenant(), 5, "req-1", 1_000);
         assert!(
             matches!(mismatch_count, Err(IssueBatchError::Conflict)),
             "reusing a key with a different count is a Conflict"
@@ -3640,15 +3670,56 @@ mod tests {
 
         // Same key, DIFFERENT tenant → Conflict (won't leak tenant()'s tokens to another tenant).
         let mismatch_tenant =
-            store.issue_join_tokens_idempotent(&TenantId("other-tenant".into()), 3, "req-1");
+            store.issue_join_tokens_idempotent(&TenantId("other-tenant".into()), 3, "req-1", 1_000);
         assert!(
             matches!(mismatch_tenant, Err(IssueBatchError::Conflict)),
             "reusing a key with a different tenant is a Conflict"
         );
 
         // The original operation still replays cleanly — a rejected mismatch changed nothing.
-        let replay = store.issue_join_tokens_idempotent(&tenant(), 3, "req-1").unwrap();
+        let replay = store.issue_join_tokens_idempotent(&tenant(), 3, "req-1", 1_000).unwrap();
         assert_eq!(replay, first, "the matching retry still returns the original set after conflicts");
+    }
+
+    #[test]
+    fn prune_redeemed_join_tokens_removes_only_redeemed_rows_292() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let live = store.issue_join_token(&tenant()).unwrap();
+        let redeemed = store.issue_join_token(&tenant()).unwrap();
+        store.redeem(&redeemed, &AgentId("a".into()), [1u8; 32]).unwrap();
+
+        assert_eq!(store.prune_redeemed_join_tokens().unwrap(), 1, "exactly the redeemed row is pruned");
+        // A second prune immediately after finds nothing new to remove.
+        assert_eq!(store.prune_redeemed_join_tokens().unwrap(), 0);
+        // Pruning the redeemed row never touched the live, unredeemed one.
+        assert!(store.redeem(&live, &AgentId("b".into()), [2u8; 32]).is_ok(), "the live token still redeems");
+    }
+
+    #[test]
+    fn prune_batch_issuance_ages_out_old_records_but_spares_recent_and_legacy_292() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        // An "old" record (created_at = 1_000) and a "recent" one (created_at = 9_000).
+        store.issue_join_tokens_idempotent(&tenant(), 1, "old-key", 1_000).unwrap();
+        store.issue_join_tokens_idempotent(&tenant(), 1, "recent-key", 9_000).unwrap();
+
+        // now=10_000, max_age=5_000 -> cutoff=5_000: "old-key" (1_000) ages out, "recent-key" (9_000) doesn't.
+        assert_eq!(store.prune_batch_issuance(10_000, 5_000).unwrap(), 1);
+        // The pruned key's *next* use mints fresh (no longer replays the original set) --
+        // proven indirectly: re-issuing under the same key with a mismatched count would
+        // otherwise Conflict against the old record, but here it succeeds as a fresh mint.
+        let after_prune = store.issue_join_tokens_idempotent(&tenant(), 2, "old-key", 10_000);
+        assert!(after_prune.is_ok(), "a pruned idempotency key is gone, so reuse mints fresh instead of conflicting");
+
+        // A legacy row (created_at defaults to 0 pre-migration) is never matched, however old.
+        store
+            .conn
+            .lock_safe()
+            .execute(
+                "INSERT INTO batch_issuance (idem_key, tenant, tokens, created_at) VALUES ('legacy', 'x', X'00', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.prune_batch_issuance(u64::MAX, 0).unwrap(), 0, "created_at=0 legacy rows are never pruned");
     }
 
     #[test]

@@ -182,7 +182,12 @@ async fn issue_batch(
     let tokens = match req.idempotency_key.as_deref() {
         Some(key) => st
             .store
-            .issue_join_tokens_idempotent(&tenant, req.count, key)
+            .issue_join_tokens_idempotent(
+                &tenant,
+                req.count,
+                key,
+                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            )
             .map_err(|e| {
                 let code = match e {
                     IssueBatchError::Conflict => StatusCode::CONFLICT,
