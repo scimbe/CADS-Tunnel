@@ -530,7 +530,7 @@ pub fn holds_for_convened(
                 a.price,
                 role_match_ref(pipeline_id, a),
                 first_nonce + i as u64,
-                expires_at as u64,
+                expires_at,
             )
         })
         .collect()

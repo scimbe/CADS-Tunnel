@@ -166,7 +166,7 @@ fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8])
         .lock()
         .unwrap()
         .write_message(plaintext, &mut ct[2..])
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
     Ok(2 + len)
 }
@@ -185,7 +185,7 @@ where
     let (mut c_read, mut c_write) = tokio::io::split(cipher);
     let (mut p_read, mut p_write) = tokio::io::split(plain);
 
-    let noise_err = |e: snow::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let noise_err = |e: snow::Error| io::Error::other(e.to_string());
 
     // plaintext -> encrypt -> ciphertext frames
     let outbound = async {
@@ -301,7 +301,7 @@ where
     const CHUNK: usize = 16 * 1024;
     let relay_ts = Mutex::new(relay_transport);
     let mut relay_read = relay_read;
-    let noise_err = |e: snow::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+    let noise_err = |e: snow::Error| io::Error::other(e.to_string());
 
     // The direct session is **late-bound** (#104): the relay pump starts with only the relay
     // transport, and the freshly-handshaked direct session is delivered on `direct` once a

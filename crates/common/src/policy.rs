@@ -87,8 +87,8 @@ impl Selector {
     }
 
     fn matches(&self, a: &Agent) -> bool {
-        self.group.as_ref().map_or(true, |g| g == &a.group)
-            && self.label.as_ref().map_or(true, |l| l == &a.label)
+        self.group.as_ref().is_none_or(|g| g == &a.group)
+            && self.label.as_ref().is_none_or(|l| l == &a.label)
     }
 }
 

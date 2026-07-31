@@ -413,7 +413,7 @@ pub async fn client_tunnel_udp(
 
     let ts = Mutex::new(transport);
     // `e` infers to snow::Error (naming it needs snow as a direct dep).
-    let noise_err = |e| io::Error::new(io::ErrorKind::Other, format!("{e}"));
+    let noise_err = |e| io::Error::other(format!("{e}"));
 
     // Local datagram -> encrypt -> frame to the Edge.
     let to_edge = async {

@@ -141,7 +141,7 @@ pub async fn relay_two_connections(
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
         move |e: quinn::ConnectionError| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("{label} {stage}: {e}"))
+            std::io::Error::other(format!("{label} {stage}: {e}"))
         }
     };
     let (send_a, recv_a) = conn_a.accept_bi().await.map_err(to_io("accept_bi(a)"))?;
@@ -165,7 +165,7 @@ pub async fn relay_initiator_to_acceptor(
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
         move |e: quinn::ConnectionError| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("{label} {stage}: {e}"))
+            std::io::Error::other(format!("{label} {stage}: {e}"))
         }
     };
     // Initiator opened its data stream (actualised by Noise msg1) — accept it.

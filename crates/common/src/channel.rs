@@ -1052,7 +1052,7 @@ impl BillingPolicy {
         match self {
             BillingPolicy::None => true,
             BillingPolicy::Require { payee, terms_hash, min_amount } => {
-                commitment.map_or(false, |c| c.satisfies(now, payee, terms_hash, *min_amount))
+                commitment.is_some_and(|c| c.satisfies(now, payee, terms_hash, *min_amount))
             }
         }
     }
