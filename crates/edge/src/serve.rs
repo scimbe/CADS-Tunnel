@@ -727,7 +727,10 @@ pub async fn serve_front_door(
                     if let Some(peer_addr) =
                         crate::edge_mesh_client::lookup_owner_by_host(&mesh.cp_url, &mesh.admin_token, &host).await
                     {
-                        return relay_via_peer_edge(joined, &peer_addr, &host, mesh.edge_cert.clone(), mesh.admin_token)
+                        let target = safe_peer_edge_target(&peer_addr).ok_or(
+                            "mesh-relay registry returned an invalid or non-global-unicast peer_addr — refusing to dial (#253)",
+                        )?;
+                        return relay_via_peer_edge(joined, target, &host, mesh.edge_cert.clone(), mesh.admin_token)
                             .await;
                     }
                 }
@@ -1231,16 +1234,27 @@ pub struct MeshRelayConfig {
     pub edge_cert: rustls::pki_types::CertificateDer<'static>,
 }
 
+/// #253: validate a peer edge address from the control plane's ownership registry before
+/// [`relay_via_peer_edge`] ever dials it. `lookup_owner_by_host` returns a self-reported address
+/// with no independent check on this side — a compromised CP or a rogue registered edge could hand
+/// back a loopback/RFC1918/link-local/metadata target and this edge would dial it, admin-token in
+/// hand. Same global-unicast-only filter the direct channel-endpoint dial already uses
+/// (#137/#267's `ct_common::channel::is_global_unicast`) — the identical SSRF class, closed here.
+fn safe_peer_edge_target(peer_addr: &str) -> Option<std::net::SocketAddr> {
+    peer_addr.parse().ok().filter(|addr| ct_common::channel::is_global_unicast(*addr))
+}
+
 /// Dial a peer edge (ADR-0021 Part 1) that owns `host` and relay `inbound` to
 /// it over the mesh-relay role. Used as the cache-miss fallback when this
 /// edge has no local route for `host` but the control plane's registry says
 /// another edge does. `edge_cert` is the SAME internal Mesh-Plane CA root this
 /// edge already trusts Agents against (`crate::pki`) -- reused for transport
 /// encryption between edges too; `admin_token` (not the cert) is what actually
-/// authorizes the 'M' role on the receiving side.
+/// authorizes the 'M' role on the receiving side. `target` must already be validated (#253) --
+/// see [`safe_peer_edge_target`], applied by the one production caller below.
 pub async fn relay_via_peer_edge<S>(
     mut inbound: S,
-    peer_addr: &str,
+    target: std::net::SocketAddr,
     host: &str,
     edge_cert: rustls::pki_types::CertificateDer<'static>,
     admin_token: [u8; 32],
@@ -1248,7 +1262,6 @@ pub async fn relay_via_peer_edge<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let target: std::net::SocketAddr = peer_addr.parse().map_err(|_| "invalid peer_addr")?;
     let mut peer = crate::transport::tcp_tls_connect(target, edge_cert).await?;
 
     let host_bytes = host.as_bytes();
@@ -1977,6 +1990,33 @@ mod tests {
     }
 
     #[test]
+    fn safe_peer_edge_target_rejects_private_and_internal_ranges() {
+        // #253: peer_addr comes from the control plane's ownership registry, not from anything
+        // this edge itself controls -- a compromised CP or rogue registered edge must not be able
+        // to make this edge dial its own loopback/LAN/cloud-metadata surface.
+        for bad in [
+            "127.0.0.1:22",
+            "0.0.0.0:80",
+            "224.0.0.1:80",
+            "10.0.0.5:22",
+            "172.16.0.1:22",
+            "192.168.1.1:22",
+            "169.254.169.254:80", // cloud metadata
+            "100.64.0.1:22",      // CGNAT
+            "[::1]:22",
+            "[fe80::1]:22",
+            "[fc00::1]:22",
+            "not-an-address",
+            "",
+        ] {
+            assert!(safe_peer_edge_target(bad).is_none(), "{bad} must be rejected");
+        }
+        for ok in ["203.0.113.10:7001", "8.8.8.8:443", "[2001:4860:4860::8888]:443"] {
+            assert!(safe_peer_edge_target(ok).is_some(), "{ok} must be admitted");
+        }
+    }
+
+    #[test]
     fn channel_relay_addr_refuses_to_collide_with_the_rendezvous_port() {
         // #103 (frozen): the relay endpoint must be DISTINCT from the rendezvous — two accept
         // loops on one port silently break pairing (each member parks in a separate pairer).
@@ -2283,10 +2323,9 @@ mod tests {
         assert!(state_b.route_host(host).is_some(), "agent is registered on edge B");
 
         let (mut client_side, edge_a_inbound) = tokio::io::duplex(4096);
-        let peer_addr_b = addr_b.to_string();
         let host_owned = host.to_string();
         let relay_task = tokio::spawn(async move {
-            relay_via_peer_edge(edge_a_inbound, &peer_addr_b, &host_owned, cert_b, admin_token).await
+            relay_via_peer_edge(edge_a_inbound, addr_b, &host_owned, cert_b, admin_token).await
         });
 
         client_side.write_all(b"hello").await.unwrap();
@@ -2323,8 +2362,7 @@ mod tests {
 
         let (_client_side, edge_a_inbound) = tokio::io::duplex(4096);
         let wrong_token = [0x99u8; 32]; // != the [0x42; 32] edge B is configured with
-        let result =
-            relay_via_peer_edge(edge_a_inbound, &addr_b.to_string(), host, cert_b, wrong_token).await;
+        let result = relay_via_peer_edge(edge_a_inbound, addr_b, host, cert_b, wrong_token).await;
         assert!(result.is_err(), "wrong admin token must be refused, not relayed");
     }
 
