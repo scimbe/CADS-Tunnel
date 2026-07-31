@@ -99,6 +99,20 @@ pub struct MemberResolution {
 /// revoked mid-outage could still ride the stale entry.
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// How long a definitive refusal is remembered so a repeated identical `(channel,
+/// holder)` skips the CP round-trip entirely (#248-follow: live-reproduced against
+/// production — a single unidentified, non-backing-off client hammered ONE never-valid
+/// `(channel, holder)` pair continuously for hours, each attempt forcing a fresh CP
+/// HTTP round-trip inline in the admission gate, degrading CP response latency for
+/// every OTHER concurrent join enough to trip their own `channel join admission
+/// exchange stalled (#140)` bound — a real member's admission stalling because of an
+/// unrelated holder's junk traffic, not because of anything wrong with their own join).
+/// Deliberately short relative to [`CACHE_TTL`]: it only needs to absorb a tight retry
+/// loop, and a short TTL bounds how long a holder added as a member *right after* being
+/// refused would have to wait before that refusal stops shadowing the new membership
+/// (a legitimate registration racing a retry is the one case this must not break).
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
 type CacheKey = (ChannelId, [u8; 32]);
 
 /// Resolves channel-join authorization by querying the control plane's c-i endpoint.
@@ -109,6 +123,8 @@ pub struct ChannelAuthorizer {
     admin_token_hex: String,
     cache: Arc<Mutex<HashMap<CacheKey, (MemberResolution, Instant)>>>,
     cache_ttl: Duration,
+    negative_cache: Arc<Mutex<HashMap<CacheKey, Instant>>>,
+    negative_cache_ttl: Duration,
 }
 
 /// How the CP responded, coarsened to the three cases [`ChannelAuthorizer::resolve`]
@@ -147,6 +163,19 @@ impl ChannelAuthorizer {
         timeout: Duration,
         cache_ttl: Duration,
     ) -> Self {
+        Self::with_ttls(cp_base, admin_token, timeout, cache_ttl, NEGATIVE_CACHE_TTL)
+    }
+
+    /// Like [`with_timeout_and_cache_ttl`](Self::with_timeout_and_cache_ttl) but with an
+    /// explicit negative-cache TTL too (#248-follow) — exposed mainly so tests can use a
+    /// short TTL instead of waiting out the real [`NEGATIVE_CACHE_TTL`].
+    pub fn with_ttls(
+        cp_base: &str,
+        admin_token: &[u8; 32],
+        timeout: Duration,
+        cache_ttl: Duration,
+        negative_cache_ttl: Duration,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(timeout)
@@ -169,6 +198,8 @@ impl ChannelAuthorizer {
             admin_token_hex: hex(admin_token),
             cache: Arc::new(Mutex::new(HashMap::new())),
             cache_ttl,
+            negative_cache: Arc::new(Mutex::new(HashMap::new())),
+            negative_cache_ttl,
         }
     }
 
@@ -264,16 +295,35 @@ impl ChannelAuthorizer {
     /// this never admits anyone the CP hasn't actually vouched for at some point.
     pub async fn resolve(&self, channel: &ChannelId, holder: &[u8; 32]) -> Option<MemberResolution> {
         let key: CacheKey = (*channel, *holder);
+        // #248-follow: a repeated, still-fresh definitive refusal skips the CP round-trip
+        // entirely — the exact fix for a tight non-backing-off retry loop hammering ONE
+        // never-valid (channel, holder) pair (live-reproduced: it was degrading CP
+        // latency enough to stall OTHER, unrelated members' admissions). Checked before
+        // `query()`, not instead of it on a miss, so a fresh/expired entry still asks
+        // the CP normally.
+        if let Ok(neg) = self.negative_cache.lock() {
+            if neg.get(&key).is_some_and(|at| at.elapsed() < self.negative_cache_ttl) {
+                return None;
+            }
+        }
         match self.query(channel, holder).await {
             Outcome::Authorized(m) => {
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.insert(key, (m.clone(), Instant::now()));
+                }
+                // A holder that just resolved successfully must never be shadowed by a
+                // stale refusal from before it was added as a member.
+                if let Ok(mut neg) = self.negative_cache.lock() {
+                    neg.remove(&key);
                 }
                 Some(m)
             }
             Outcome::Refused => {
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.remove(&key);
+                }
+                if let Ok(mut neg) = self.negative_cache.lock() {
+                    neg.insert(key, Instant::now());
                 }
                 None
             }
@@ -524,5 +574,147 @@ mod tests {
         .await
         .expect("authorize must return within the bound, not hang on an unresponsive CP");
         assert_eq!(result, None, "an unresponsive CP fails closed to a refusal, not a hang");
+    }
+
+    /// A mock CP that counts every request it actually receives, always refusing (404)
+    /// — models the CP's real behavior against a never-valid `(channel, holder)`.
+    async fn spawn_counting_refusal_cp() -> (Arc<std::sync::atomic::AtomicU32>, String) {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        async fn always_refuse(
+            axum::extract::State(count): axum::extract::State<Arc<std::sync::atomic::AtomicU32>>,
+            headers: axum::http::HeaderMap,
+            Json(_body): Json<Value>,
+        ) -> Result<Json<Value>, axum::http::StatusCode> {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(&hex(&[0x7au8; 32])) {
+                return Err(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            Err(axum::http::StatusCode::NOT_FOUND)
+        }
+        let app = Router::new()
+            .route("/internal/channel/authorize", post(always_refuse))
+            .with_state(count.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (count, format!("http://{addr}"))
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_refusals_within_the_negative_ttl_never_reach_the_cp_248() {
+        // #248-follow (the actual bug): a tight retry loop hammering ONE never-valid
+        // (channel, holder) forced a fresh CP round-trip on every single attempt --
+        // live-reproduced as CP latency degradation stalling OTHER members' admissions.
+        // Prove the fix: N resolves for the same key within the negative TTL hit the CP
+        // exactly once.
+        let (count, base) = spawn_counting_refusal_cp().await;
+        let channel = ChannelId([0xC5u8; 32]);
+        let auth = ChannelAuthorizer::with_ttls(
+            &base,
+            &[0x7au8; 32],
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            Duration::from_secs(30), // long negative TTL -- this test controls timing itself
+        );
+
+        for _ in 0..10 {
+            assert!(auth.resolve(&channel, &[0x99u8; 32]).await.is_none(), "still refused");
+        }
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "10 identical refusals collapse to exactly 1 real CP round-trip"
+        );
+
+        // A DIFFERENT holder is a different cache key -- must not be shadowed by the
+        // first holder's negative-cache entry.
+        assert!(auth.resolve(&channel, &[0xaau8; 32]).await.is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2, "a different holder is its own CP round-trip");
+    }
+
+    #[tokio::test]
+    async fn a_negative_cache_entry_expires_after_its_ttl_248() {
+        let (count, base) = spawn_counting_refusal_cp().await;
+        let channel = ChannelId([0xC5u8; 32]);
+        let auth = ChannelAuthorizer::with_ttls(
+            &base,
+            &[0x7au8; 32],
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            Duration::from_millis(50), // short negative TTL so the test doesn't wait the real 5s
+        );
+
+        assert!(auth.resolve(&channel, &[0x99u8; 32]).await.is_none());
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(150)).await; // outlive the 50ms negative TTL
+        assert!(auth.resolve(&channel, &[0x99u8; 32]).await.is_none());
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an expired negative-cache entry asks the CP again, so a holder added right after being \
+             refused isn't shadowed forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_after_the_negative_ttl_expires_is_never_shadowed_248() {
+        // A negative cache entry legitimately shadows a same-key retry FOR ITS TTL --
+        // that's the entire point (it's what stops the flood from reaching the CP at
+        // all). What it must NOT do is shadow a real membership *forever*: once
+        // `negative_cache_ttl` elapses, a holder added in the meantime must resolve
+        // normally. This is a bounded-staleness guarantee (matching the existing
+        // positive-cache/#231 contract), not an instant-reflection one -- a holder
+        // refused and added again within the same TTL window has to wait out that
+        // window, same as `a_negative_cache_entry_expires_after_its_ttl_248` already
+        // covers for the generic "still refused" case; this variant proves the SUCCESS
+        // path specifically resolves once the cache stops blocking the query.
+        let member_now_valid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = member_now_valid.clone();
+        async fn newly_added_member(
+            axum::extract::State(flag): axum::extract::State<Arc<std::sync::atomic::AtomicBool>>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Result<Json<Value>, axum::http::StatusCode> {
+            if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(&hex(&[0x7au8; 32])) {
+                return Err(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            let holder = body.get("holder").and_then(|v| v.as_str()).unwrap_or("");
+            if holder == hex(&[0x33u8; 32]) && flag.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(Json(serde_json::json!({"operator_pubkey": hex(&[0xEEu8; 32])})))
+            } else {
+                Err(axum::http::StatusCode::NOT_FOUND)
+            }
+        }
+        let app = Router::new()
+            .route("/internal/channel/authorize", post(newly_added_member))
+            .with_state(flag);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let channel = ChannelId([0xC5u8; 32]);
+        let auth = ChannelAuthorizer::with_ttls(
+            &format!("http://{addr}"),
+            &[0x7au8; 32],
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            Duration::from_millis(50), // short negative TTL so the test doesn't wait the real 5s
+        );
+
+        assert!(auth.resolve(&channel, &[0x33u8; 32]).await.is_none(), "not a member yet");
+        member_now_valid.store(true, std::sync::atomic::Ordering::SeqCst); // operator adds them
+        // Still within the negative TTL: the cached refusal legitimately shadows the retry.
+        assert!(
+            auth.resolve(&channel, &[0x33u8; 32]).await.is_none(),
+            "a same-key retry inside the negative TTL is expected to still be shadowed"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await; // outlive the 50ms negative TTL
+        assert!(
+            auth.resolve(&channel, &[0x33u8; 32]).await.is_some(),
+            "once the negative TTL expires, the real membership resolves -- never shadowed forever"
+        );
     }
 }
