@@ -54,8 +54,12 @@ services:
       # NOTE: KEYCLOAK_ADMIN/_PASSWORD are the correct names for the pinned :25.0
       # image — KC_BOOTSTRAP_ADMIN_* are 26+ only and are silently ignored on 25,
       # leaving no admin user at all (so you can't fetch the client secret).
+      # #306: KEYCLOAK_ADMIN_PASSWORD has NO default — this overlay fronts the admin
+      # console on the public auth.<zone> host, so a forgotten KC_ADMIN_PASSWORD used
+      # to silently mean "admin"/"admin" reachable from the internet. Required, like
+      # every other real secret in this file (see KC_PORTAL_CLIENT_SECRET below).
       KEYCLOAK_ADMIN: "${KC_ADMIN_USER:-admin}"
-      KEYCLOAK_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD:-admin}"
+      KEYCLOAK_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD:?set KC_ADMIN_PASSWORD in .env -- no default, this console is public}"
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
