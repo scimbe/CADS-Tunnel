@@ -1753,6 +1753,21 @@ impl SqliteTunnelStore {
     /// usage in [`Self::ca_budget_usage`], letting the admission sweep
     /// over-issue against that CA's actual rate limit. Now either both land
     /// or neither does.
+    /// #261: only actually flips a hostname to `gruen` if it was in a state where
+    /// completing issuance makes sense -- already `gruen` (a renewal's harmless
+    /// idempotent re-affirmation, per this fn's own doc above) or `gelb` with a
+    /// live `offered` claim (a real admission window this hostname was actually
+    /// given). Without this guard, `issuance_complete`'s only real authorization is
+    /// "caller holds this hostname's routing token" -- the same token an agent
+    /// uses for every other tunnel operation -- so a buggy or malicious agent
+    /// could flip straight from `rot` (never even offered a CA) to `gruen`,
+    /// which reverts the edge to origin-passthrough for a hostname with no real
+    /// certificate: a self-inflicted TLS-handshake outage the DB would then
+    /// falsely report as a successful issuance. Returns `Ok(None)` (no ledger
+    /// row, no state change) when the precondition isn't met, distinct from the
+    /// pre-existing `Ok(None)` for "no assigned_ca on an otherwise-valid row" --
+    /// callers that need to tell those apart should check current state first,
+    /// same as the guard here does.
     pub fn record_issuance_complete(
         &self,
         hostname: &str,
@@ -1769,13 +1784,17 @@ impl SqliteTunnelStore {
             )
             .optional()?
             .flatten();
-        tx.execute(
+        let rows = tx.execute(
             "UPDATE subject_tunnels
              SET status = 'gruen', claim_state = 'none', claim_offered_at = NULL, claim_deadline = NULL,
                  pending_revert = 1
-             WHERE hostname = ?1",
+             WHERE hostname = ?1 AND (status = 'gruen' OR (status = 'gelb' AND claim_state = 'offered'))",
             params![hostname],
         )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
         if let Some(ca) = &ca {
             tx.execute(
                 "INSERT INTO acme_issuance_log (ca, domain, hostname, issued_at) VALUES (?1, ?2, ?3, ?4)",

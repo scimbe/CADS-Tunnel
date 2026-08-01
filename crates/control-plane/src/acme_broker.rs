@@ -218,6 +218,25 @@ async fn issuance_complete(
     Path((token, hostname)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize(&state, &token, &hostname).await?;
+    // #261: a valid routing token for this hostname is who-can-call, not
+    // what-they-can-claim -- reject completion outright unless this hostname
+    // was actually offered a CA (or is already gruen, a renewal) rather than
+    // trusting the agent's bare self-report of "I issued a certificate".
+    // Otherwise a buggy or malicious agent could flip a never-offered (`rot`)
+    // hostname straight to `gruen`, reverting the edge to origin-passthrough
+    // for a host with no real certificate -- a self-inflicted TLS outage the
+    // DB would then falsely record as a successful issuance.
+    let eligible = state
+        .tunnels
+        .cert_admission_for_hostname(&hostname)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some_and(|a| a.status == "gruen" || (a.status == "gelb" && a.claim_state == "offered"));
+    if !eligible {
+        return Err((
+            StatusCode::CONFLICT,
+            "hostname was never offered a CA (or the offer lapsed) -- issuance-complete refused".to_string(),
+        ));
+    }
     let domain = registered_domain(&hostname);
     state
         .tunnels
@@ -787,6 +806,74 @@ mod tests {
         let seen = calls.lock().unwrap();
         assert_eq!(seen.len(), 3, "issuance-complete pushes a third, reverting channel-tier update");
         assert!(!seen[2].0.contains("channel_tier="), "no channel_tier param -> revert to ordinary passthrough: {}", seen[2].0);
+    }
+
+    #[tokio::test]
+    async fn issuance_complete_is_refused_for_a_hostname_never_offered_a_ca_261() {
+        // #261: a valid routing token authenticates WHO is calling, not WHAT
+        // they're claiming -- a hostname that's never been through admission
+        // (still `rot`, no offer, no assigned_ca) must not be flippable
+        // straight to `gruen` by a bare self-report. Regression test for the
+        // exact scenario the finding described: no sweep, no offer, just a
+        // token holder calling issuance-complete directly.
+        let (edge_url, calls) = spawn_mock_edge_admin().await;
+        let edge_admin = Some((edge_url, "sekret".to_string()));
+
+        let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", now_secs()).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        // Deliberately no sweep_once() / no offer_claim() -- this hostname is
+        // still fresh `rot`, exactly as `create` left it.
+
+        let app = acme_broker_router(edge_mesh.clone(), tunnels.clone(), edge_admin.clone());
+        let resp = app
+            .oneshot(
+                Request::post(format!("/agent/acme-issuance-complete/{}/app.example.com", t.routing_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "a never-offered hostname must not complete issuance");
+
+        let admission = tunnels.cert_admission_for_hostname("app.example.com").unwrap().unwrap();
+        assert_eq!(admission.status, "rot", "refused call must not have mutated admission state");
+
+        assert!(calls.lock().unwrap().is_empty(), "refused call must never push a channel-tier revert to the edge");
+    }
+
+    #[tokio::test]
+    async fn issuance_complete_is_refused_after_a_claim_offer_lapses_261() {
+        // A narrower version of the same bug: an offer that WAS real but has
+        // since expired (never claimed) must not be completable either --
+        // `lapse_expired_claims` clears assigned_ca and flips claim_state, so
+        // this exercises the guard against a stale/replayed completion call
+        // arriving after the window closed, not just a never-offered host.
+        let (edge_url, calls) = spawn_mock_edge_admin().await;
+        let edge_admin = Some((edge_url, "sekret".to_string()));
+
+        let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", now_secs()).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        tunnels.enter_gelb_queue("app.example.com", 0).unwrap();
+        tunnels.offer_claim("app.example.com", "letsencrypt", 0, 10).unwrap();
+        tunnels.lapse_expired_claims(999).unwrap();
+
+        let app = acme_broker_router(edge_mesh.clone(), tunnels.clone(), edge_admin.clone());
+        let resp = app
+            .oneshot(
+                Request::post(format!("/agent/acme-issuance-complete/{}/app.example.com", t.routing_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "a lapsed offer must not be completable");
+        assert!(calls.lock().unwrap().is_empty(), "refused call must never push a channel-tier revert to the edge");
     }
 
     /// Like [`spawn_mock_edge_admin`], but every call fails (500) while `failing` is
