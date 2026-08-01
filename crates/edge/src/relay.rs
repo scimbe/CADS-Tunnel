@@ -17,6 +17,15 @@ fn relay_trace(args: std::fmt::Arguments<'_>) {
     }
 }
 
+/// #257: bound on `accept_bi`/`open_bi` while splicing a relay pair's data streams.
+/// Without this, a paired-but-stalling member that never actualizes its data stream
+/// (no credit sent, connection alive) hangs the setup `.await` forever, pinning both
+/// the relay task and the peer connection for a per-pair DoS on the relay-fallback
+/// path. Same 5s value as `serve.rs`'s `RELAY_OPEN_BI_TIMEOUT` for the analogous
+/// single-stream open — not shared cross-module since each file in this crate keeps
+/// its own local timeout constants (see channel_authorize.rs, relay_gate.rs).
+const RELAY_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Relay bytes both directions between `a` and `b` until both sides close.
 /// Returns `(bytes a→b, bytes b→a)`. The bytes are never inspected.
 pub async fn relay<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
@@ -137,6 +146,17 @@ pub async fn relay_two_connections(
     conn_b: &quinn::Connection,
     label: &str,
 ) -> std::io::Result<(u64, u64)> {
+    relay_two_connections_with_timeout(conn_a, conn_b, label, RELAY_SETUP_TIMEOUT).await
+}
+
+/// [`relay_two_connections`] with an injectable setup timeout (#257) — split out so a
+/// test can prove the timeout fires without a real 5s wait.
+async fn relay_two_connections_with_timeout(
+    conn_a: &quinn::Connection,
+    conn_b: &quinn::Connection,
+    label: &str,
+    setup_timeout: std::time::Duration,
+) -> std::io::Result<(u64, u64)> {
     // Name the stage as well as the ConnectionError: "connection lost" during
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
@@ -144,8 +164,17 @@ pub async fn relay_two_connections(
             std::io::Error::other(format!("{label} {stage}: {e}"))
         }
     };
-    let (send_a, recv_a) = conn_a.accept_bi().await.map_err(to_io("accept_bi(a)"))?;
-    let (send_b, recv_b) = conn_b.accept_bi().await.map_err(to_io("accept_bi(b)"))?;
+    let timed_out = |stage: &'static str| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{label} {stage}: relay setup timed out"))
+    };
+    let (send_a, recv_a) = tokio::time::timeout(setup_timeout, conn_a.accept_bi())
+        .await
+        .map_err(|_| timed_out("accept_bi(a)"))?
+        .map_err(to_io("accept_bi(a)"))?;
+    let (send_b, recv_b) = tokio::time::timeout(setup_timeout, conn_b.accept_bi())
+        .await
+        .map_err(|_| timed_out("accept_bi(b)"))?
+        .map_err(to_io("accept_bi(b)"))?;
     relay_quic(send_a, recv_a, send_b, recv_b, label).await
 }
 
@@ -161,6 +190,17 @@ pub async fn relay_initiator_to_acceptor(
     acceptor_conn: &quinn::Connection,
     label: &str,
 ) -> std::io::Result<(u64, u64)> {
+    relay_initiator_to_acceptor_with_timeout(initiator_conn, acceptor_conn, label, RELAY_SETUP_TIMEOUT).await
+}
+
+/// [`relay_initiator_to_acceptor`] with an injectable setup timeout (#257) — split out
+/// so a test can prove the timeout fires without a real 5s wait.
+async fn relay_initiator_to_acceptor_with_timeout(
+    initiator_conn: &quinn::Connection,
+    acceptor_conn: &quinn::Connection,
+    label: &str,
+    setup_timeout: std::time::Duration,
+) -> std::io::Result<(u64, u64)> {
     // Name the stage as well as the ConnectionError: "connection lost" during
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
@@ -168,11 +208,20 @@ pub async fn relay_initiator_to_acceptor(
             std::io::Error::other(format!("{label} {stage}: {e}"))
         }
     };
+    let timed_out = |stage: &'static str| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{label} {stage}: relay setup timed out"))
+    };
     // Initiator opened its data stream (actualised by Noise msg1) — accept it.
-    let (send_i, recv_i) = initiator_conn.accept_bi().await.map_err(to_io("accept_bi(initiator)"))?;
+    let (send_i, recv_i) = tokio::time::timeout(setup_timeout, initiator_conn.accept_bi())
+        .await
+        .map_err(|_| timed_out("accept_bi(initiator)"))?
+        .map_err(to_io("accept_bi(initiator)"))?;
     // Open the data stream toward the acceptor; it becomes visible to the acceptor's
     // accept_bi as soon as relay_quic writes the first relayed bytes into it.
-    let (send_a, recv_a) = acceptor_conn.open_bi().await.map_err(to_io("open_bi(acceptor)"))?;
+    let (send_a, recv_a) = tokio::time::timeout(setup_timeout, acceptor_conn.open_bi())
+        .await
+        .map_err(|_| timed_out("open_bi(acceptor)"))?
+        .map_err(to_io("open_bi(acceptor)"))?;
     // a = initiator, b = acceptor: recv_i (msg1…) → send_a, recv_a (msg2…) → send_i.
     relay_quic(send_i, recv_i, send_a, recv_a, label).await
 }
@@ -318,6 +367,41 @@ mod tests {
         conn_a.close(0u32.into(), b"gone");
         let done = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
         assert!(done.is_ok(), "relay tore down when a member dropped (no hang)");
+    }
+
+    #[tokio::test]
+    async fn relay_two_connections_times_out_when_a_paired_member_never_opens_its_stream_257() {
+        // #257: a member that connects and pairs but never actualizes its data stream
+        // (no accept_bi/open_bi call at all -- a stall, not a drop) must not pin the
+        // relay task and the peer connection forever. Prove the setup timeout fires and
+        // the function returns, using a short injected timeout so the test itself stays
+        // fast.
+        use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let relay_task = tokio::spawn(async move {
+            let ca = server.accept().await.expect("inc a").await.expect("conn a");
+            let cb = server.accept().await.expect("inc b").await.expect("conn b");
+            relay_two_connections_with_timeout(&ca, &cb, "test", std::time::Duration::from_millis(200)).await
+        });
+
+        let ea = build_client_endpoint(cert.clone()).expect("ea");
+        let conn_a = ea.connect(addr, "localhost").expect("cfg").await.expect("conn a");
+        let eb = build_client_endpoint(cert).expect("eb");
+        let _conn_b = eb.connect(addr, "localhost").expect("cfg").await.expect("conn b");
+        // conn_b intentionally never calls open_bi/accept_bi -- it just sits connected,
+        // exactly the stall this issue describes (paired, alive, no data stream ever
+        // actualized).
+        let _keep_a_alive = conn_a; // avoid an early drop reading as "connection lost" instead of a timeout
+
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task)
+            .await
+            .expect("the relay task itself must finish promptly")
+            .expect("task join");
+        let err = done.expect_err("a stalled peer must produce an error, not a byte count");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "the error is a timeout, not some other failure: {err}");
+        assert!(err.to_string().contains("relay setup timed out"), "message names the real cause: {err}");
     }
 
     #[tokio::test]
