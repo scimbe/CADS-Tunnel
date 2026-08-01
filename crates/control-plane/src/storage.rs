@@ -1204,6 +1204,14 @@ impl SqliteTunnelStore {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
+             -- #291: routing_token_for_hostname/cert_admission_for_hostname both query
+             -- by hostname, but no index covered it -- a full-table scan per lookup,
+             -- on the admission sweep's hot per-hostname poll path. Placed here (after
+             -- the `hostname` ensure_column above) rather than alongside the table's own
+             -- CREATE, so it's safe to add regardless of whether this DB predates #44's
+             -- hostname column.
+             CREATE INDEX IF NOT EXISTS idx_subject_tunnels_hostname
+                 ON subject_tunnels (hostname);
              CREATE TABLE IF NOT EXISTS acme_issuance_log (
                  id        INTEGER PRIMARY KEY AUTOINCREMENT,
                  ca        TEXT NOT NULL,
