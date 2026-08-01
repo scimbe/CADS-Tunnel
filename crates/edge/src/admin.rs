@@ -149,17 +149,23 @@ async fn host_auth_dump(
 struct TunnelStatusResp {
     connected: bool,
     registrations: usize,
+    /// Cumulative bytes received from / sent to this tunnel's clients since
+    /// this Edge process started (monitoring-feature byte counters,
+    /// 2026-08-01) -- `0` for a tunnel that has never relayed anything.
+    bytes_received: u64,
+    bytes_sent: u64,
 }
 
 /// `GET /admin/tunnel-status/:token` (monitoring feature v1, operator decision
-/// 2026-08-01): whether `token` currently has a live Agent registration, and how
-/// many (redundant Agents, #8, count separately). Read-only, admin-token-gated
-/// like every other route here. This is deliberately a per-tunnel query, not a
-/// bulk dump -- the control plane calls it once per tunnel it's rendering
-/// (owner-scoped in the portal; the operator may query any token directly for
-/// cross-tenant visibility, per the same admin-token trust already granted by
-/// every other route on this router). ADR-0016 still applies: this reveals only
-/// connection liveness, not payload or per-connection detail.
+/// 2026-08-01): whether `token` currently has a live Agent registration, how
+/// many (redundant Agents, #8, count separately), and its cumulative relay
+/// byte counts. Read-only, admin-token-gated like every other route here.
+/// This is deliberately a per-tunnel query, not a bulk dump -- the control
+/// plane calls it once per tunnel it's rendering (owner-scoped in the portal;
+/// the operator may query any token directly for cross-tenant visibility,
+/// per the same admin-token trust already granted by every other route on
+/// this router). ADR-0016 still applies: this reveals only connection
+/// liveness and byte volume, never payload or per-connection detail.
 async fn tunnel_status(
     State(state): State<Arc<EdgeState<Connection>>>,
     headers: HeaderMap,
@@ -173,9 +179,12 @@ async fn tunnel_status(
     };
     let token = RoutingToken(t);
     let registrations = state.registration_count(&token);
+    let (bytes_received, bytes_sent) = state.tunnel_bytes(&token);
     Ok(Json(TunnelStatusResp {
         connected: registrations > 0,
         registrations,
+        bytes_received,
+        bytes_sent,
     }))
 }
 
@@ -383,6 +392,19 @@ mod tests {
         let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
         assert!(!status.connected);
         assert_eq!(status.registrations, 0);
+        assert_eq!(status.bytes_received, 0, "never relayed anything -> 0");
+        assert_eq!(status.bytes_sent, 0);
+
+        // A relay against this token shows up in the byte counters (the
+        // registration/connected-ness fields are unaffected by relay activity
+        // alone -- `note_relay` never registers/deregisters an agent).
+        let t = RoutingToken(parse_token_hex(&tok_hex).unwrap());
+        state.note_relay(&t, 300, 120);
+        let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.bytes_received, 300, "client->agent direction");
+        assert_eq!(status.bytes_sent, 120, "agent->client direction");
 
         // Malformed token hex -> 400, not a panic.
         assert_eq!(

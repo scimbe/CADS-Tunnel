@@ -329,15 +329,26 @@ fn auto_hostname(zone: &str, name: &str, subject: &str) -> String {
 /// step to onboard with; see the tunnel's Install link for its tokens.
 /// Additional tunnels and custom hostnames are a planned paid tier (shown,
 /// disabled, in [`tunnels_html`]).
-/// Monitoring feature v1 (operator decision, 2026-08-01): "connected or not" for
-/// `routing_token_hex`, queried live from the edge's `GET /admin/tunnel-status/:token`
-/// (`crates/edge/src/admin.rs`). Best-effort like [`tunnels_page`]'s existing
-/// admission lookup: `None` when `edge_admin` isn't configured or the call fails,
-/// so a transient edge/network hiccup just omits the badge rather than failing the
-/// whole page. `routing_token` is server-side-only (never rendered) but the edge
-/// call itself needs it in the URL path, same trust boundary as every other
-/// edge-admin call this file already makes.
-async fn edge_tunnel_connected(st: &ApiState, routing_token_hex: &str) -> Option<bool> {
+/// Live per-tunnel status pulled from the edge's `GET /admin/tunnel-status/:token`
+/// (`crates/edge/src/admin.rs`) -- monitoring feature v1's connection flag
+/// plus the byte-counter follow-up (both 2026-08-01).
+#[derive(Deserialize, Clone, Copy)]
+struct EdgeTunnelStatus {
+    connected: bool,
+    #[serde(default)]
+    bytes_received: u64,
+    #[serde(default)]
+    bytes_sent: u64,
+}
+
+/// Monitoring feature: `routing_token_hex`'s live status, queried from the edge.
+/// Best-effort like [`tunnels_page`]'s existing admission lookup: `None` when
+/// `edge_admin` isn't configured or the call fails, so a transient edge/network
+/// hiccup just omits the badge rather than failing the whole page. `routing_token`
+/// is server-side-only (never rendered) but the edge call itself needs it in the
+/// URL path, same trust boundary as every other edge-admin call this file already
+/// makes.
+async fn edge_tunnel_status(st: &ApiState, routing_token_hex: &str) -> Option<EdgeTunnelStatus> {
     let edge = st.edge_admin.as_ref()?;
     let endpoint = format!("{}/admin/tunnel-status/{routing_token_hex}", edge.url.trim_end_matches('/'));
     let resp = edge_admin_http_client()
@@ -349,11 +360,7 @@ async fn edge_tunnel_connected(st: &ApiState, routing_token_hex: &str) -> Option
     if !resp.status().is_success() {
         return None;
     }
-    #[derive(Deserialize)]
-    struct TunnelStatusResp {
-        connected: bool,
-    }
-    resp.json::<TunnelStatusResp>().await.ok().map(|s| s.connected)
+    resp.json::<EdgeTunnelStatus>().await.ok()
 }
 
 async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
@@ -382,8 +389,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     .hostname
                     .as_deref()
                     .and_then(|h| st.tunnels.cert_admission_for_hostname(h).ok().flatten());
-                let connected = edge_tunnel_connected(&st, &t.routing_token).await;
-                rows.push((t, owned, admission, connected));
+                let status = edge_tunnel_status(&st, &t.routing_token).await;
+                rows.push((t, owned, admission, status));
             }
             Html(tunnels_html(&rows)).into_response()
         }
@@ -866,12 +873,34 @@ fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String
     }
 }
 
+/// Render a byte count the way a tunnel owner reads it -- `0 B`/`512 B`/`3.4 KB`/
+/// `1.2 GB`, one decimal past the first three-digit boundary, never more.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn tunnels_html(
-    tunnels: &[(crate::storage::SubjectTunnel, bool, Option<crate::storage::CertAdmission>, Option<bool>)],
+    tunnels: &[(
+        crate::storage::SubjectTunnel,
+        bool,
+        Option<crate::storage::CertAdmission>,
+        Option<EdgeTunnelStatus>,
+    )],
 ) -> String {
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, connected)| {
+        .map(|(t, owned, admission, status)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -896,17 +925,25 @@ fn tunnels_html(
                 )
             };
             let tier = admission.as_ref().map(|a| cert_tier_html(&id, a)).unwrap_or_default();
-            // Monitoring feature v1: live connection status, best-effort -- absent
-            // (edge unreachable, or CT_CP_EDGE_ADMIN_URL not configured) renders
-            // nothing rather than a misleading "offline".
-            let status = match connected {
-                Some(true) => r#" <span class="tier" style="color:#3fb950">🟢 Connected</span>"#.to_string(),
-                Some(false) => r#" <span class="tier" style="color:#8b949e">⚪ Not connected</span>"#.to_string(),
+            // Monitoring feature: live connection status + byte counters, best-effort
+            // -- absent (edge unreachable, or CT_CP_EDGE_ADMIN_URL not configured)
+            // renders nothing rather than a misleading "offline"/"0 B".
+            let status_badge = match status {
+                Some(s) if s.connected => r#" <span class="tier" style="color:#3fb950">🟢 Connected</span>"#.to_string(),
+                Some(_) => r#" <span class="tier" style="color:#8b949e">⚪ Not connected</span>"#.to_string(),
                 None => String::new(),
             };
+            let bytes_line = match status {
+                Some(s) if s.bytes_received > 0 || s.bytes_sent > 0 => format!(
+                    r#"<div class="row"><span class="k">↓ {} received · ↑ {} sent</span></div>"#,
+                    human_bytes(s.bytes_received),
+                    human_bytes(s.bytes_sent),
+                ),
+                _ => String::new(),
+            };
             format!(
-                r#"<div class="row"><span class="v">{name}{host}{status}</span><span>{owner_actions}
-</span></div>{tier}"#,
+                r#"<div class="row"><span class="v">{name}{host}{status_badge}</span><span>{owner_actions}
+</span></div>{bytes_line}{tier}"#,
                 name = escape(&t.name),
             )
         })
@@ -1241,6 +1278,18 @@ mod tests {
     use tower::ServiceExt;
 
     const KEY: &[u8] = b"portal-api-test-key";
+
+    #[test]
+    fn human_bytes_formats_at_the_unit_a_reader_would_expect() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(human_bytes(u64::MAX), "16777216.0 TB", "never panics/overflows at the top of the range");
+    }
 
     // #112 (frozen): a hung edge admin endpoint must NOT block the portal path.
     // The tuned client returns a timeout error promptly instead of hanging — the
@@ -1863,7 +1912,12 @@ mod tests {
                             "the portal must authenticate this call the same way as every other edge-admin call"
                         );
                         *seen.lock().unwrap() = Some(token);
-                        Json(serde_json::json!({"connected": conn.load(Ordering::SeqCst), "registrations": 1}))
+                        Json(serde_json::json!({
+                            "connected": conn.load(Ordering::SeqCst),
+                            "registrations": 1,
+                            "bytes_received": 2048,
+                            "bytes_sent": 1024,
+                        }))
                     }
                 }),
             )
@@ -1892,6 +1946,8 @@ mod tests {
         let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Connected"), "shows the connected badge");
+        assert!(html.contains("2.0 KB"), "shows bytes received, human-formatted: {html}");
+        assert!(html.contains("1.0 KB"), "shows bytes sent, human-formatted: {html}");
         let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
         assert_eq!(seen_token.lock().unwrap().as_deref(), Some(tunnel.routing_token.as_str()));
         assert!(!html.contains(&tunnel.routing_token), "the raw routing token itself is never rendered");

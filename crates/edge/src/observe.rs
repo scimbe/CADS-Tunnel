@@ -106,7 +106,7 @@ mod tests {
         let state: EdgeState<u32> = EdgeState::new();
         state.register(token(1), 10);
         state.register(token(1), 11); // redundant → 2 registrations
-        state.note_relay(150);
+        state.note_relay(&token(1), 100, 50);
         state.note_failover();
         let body = render_edge_metrics(&state);
         assert!(body.contains("ct_edge_registrations_total 2"), "{body}");

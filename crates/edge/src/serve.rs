@@ -158,7 +158,7 @@ pub async fn route_and_relay(
 ) -> Result<(), BoxError> {
     let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
     let (a, b) = relay_quic(client_send, client_recv, agent_send, agent_recv, &token_hex(token)).await?;
-    state.note_relay(a + b); // #10 O2
+    state.note_relay(token, a, b); // #10 O2
     Ok(())
 }
 
@@ -256,7 +256,7 @@ where
             agent_send.write_all(&hello).await?;
             let mut agent = join(agent_recv, agent_send);
             let (a, b) = relay(&mut inbound, &mut agent).await?;
-            state.note_relay(a + b);
+            state.note_relay(&token, a, b);
             Ok(())
         }
         Err(e) => {
@@ -336,7 +336,7 @@ where
         Ok((agent_send, agent_recv)) => {
             let mut agent = join(agent_recv, agent_send);
             let (a, b) = relay(&mut tls, &mut agent).await?;
-            state.note_relay(a + b);
+            state.note_relay(&token, a, b);
             Ok(())
         }
         Err(e) => {
@@ -999,7 +999,7 @@ pub async fn serve_connection(
                         let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut client, &mut agent).await?;
-                        state.note_relay(a + b);
+                        state.note_relay(&token, a, b);
                         return Ok(None);
                     }
                 }
@@ -1008,7 +1008,7 @@ pub async fn serve_connection(
                 Ok((agent_send, agent_recv)) => {
                     let (a, b) =
                         relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
-                    state.note_relay(a + b); // #10 O2
+                    state.note_relay(&token, a, b); // #10 O2
                     Ok(None)
                 }
                 Err(e) => {
@@ -1277,7 +1277,7 @@ where
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut stream, &mut agent).await?;
-                        state.note_relay(a + b); // #10 O2
+                        state.note_relay(&token, a, b); // #10 O2
                         Ok(())
                     }
                     Err(e) => {
@@ -1344,7 +1344,7 @@ where
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut stream, &mut agent).await?;
-                        state.note_relay(a + b);
+                        state.note_relay(&token, a, b);
                         Ok(())
                     }
                     Err(e) => {
