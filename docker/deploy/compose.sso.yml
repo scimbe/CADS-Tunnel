@@ -82,6 +82,14 @@ services:
       # drifts out of sync and every login 502s. The realm JSON substitutes this via
       # ${env.KC_PORTAL_CLIENT_SECRET}; the control-plane below reads the SAME var.
       KC_PORTAL_CLIENT_SECRET: "${KC_PORTAL_CLIENT_SECRET:?set KC_PORTAL_CLIENT_SECRET=<random hex; stable across Keycloak reimports>}"
+      # #310: the ct-portal client's redirectUris/post.logout.redirect.uris were
+      # hardcoded to bunsenbrenner.org in the committed realm JSON -- any self-hoster
+      # on their own domain got an unregistered-redirect-uri 400 on every login,
+      # unfixable short of hand-editing the committed realm file. The realm JSON now
+      # substitutes ${PORTAL_PUBLIC_URL}, same mechanism as KC_PORTAL_CLIENT_SECRET
+      # just above -- SAME var the control-plane's own CT_OIDC_REDIRECT_URI already
+      # derives from below, so the two can't drift.
+      PORTAL_PUBLIC_URL: "${PORTAL_PUBLIC_URL:?set PORTAL_PUBLIC_URL=https://<zone>}"
       KC_GOOGLE_CLIENT_SECRET: "${KC_GOOGLE_CLIENT_SECRET:-}"
       KC_GITHUB_CLIENT_ID: "${KC_GITHUB_CLIENT_ID:-}"
       KC_GITHUB_CLIENT_SECRET: "${KC_GITHUB_CLIENT_SECRET:-}"

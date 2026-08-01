@@ -46,7 +46,7 @@
       "serviceAccountsEnabled": false,
       "fullScopeAllowed": true,
       "redirectUris": [
-        "https://bunsenbrenner.org/portal/callback",
+        "${PORTAL_PUBLIC_URL}/portal/callback",
         "http://localhost:8090/portal/callback"
       ],
       "webOrigins": [
@@ -55,7 +55,7 @@
       "attributes": {
         "access.token.signed.response.alg": "RS256",
         "id.token.signed.response.alg": "RS256",
-        "post.logout.redirect.uris": "https://bunsenbrenner.org/portal##http://localhost:8090/portal"
+        "post.logout.redirect.uris": "${PORTAL_PUBLIC_URL}/portal##http://localhost:8090/portal"
       },
       "protocolMappers": [
         {
