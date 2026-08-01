@@ -929,6 +929,7 @@ pub fn authed_topology_router(
         .route("/me/topologies", post(topology_create).get(topology_list))
         .route("/me/topologies/:id", get(topology_view))
         .route("/me/topologies/:id/mode", axum::routing::put(topology_set_mode))
+        .route("/me/topologies/:id/operator", axum::routing::put(topology_set_operator))
         .route("/me/topologies/:id/suggest", post(topology_suggest))
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
@@ -1564,6 +1565,48 @@ async fn topology_remove_edge(
         Ok(StatusCode::OK)
     } else {
         Err((StatusCode::NOT_FOUND, "edge not removed (not owner or no such edge)".to_string()))
+    }
+}
+
+#[derive(Deserialize)]
+struct OperatorBindReq {
+    /// 64-hex operator ed25519 public key — the channel authority this topology's overlay
+    /// links derive channels under.
+    operator_pubkey: String,
+    /// 128-hex operator signature over
+    /// [`ct_common::channel::topology_operator_binding_bytes`] — proof the caller controls
+    /// `operator_pubkey`'s private half, not just its public bytes.
+    proof: String,
+}
+
+/// `PUT /me/topologies/:id/operator {operator_pubkey, proof}` — bind this topology to an
+/// operator key (#237, #107-enforce ii-a's REST surface): the prerequisite `#235`'s live
+/// admission-wiring needs to actually reach a topology from outside the control plane. Without
+/// this endpoint the crypto primitives (`topology_operator_binding_bytes`/
+/// `verify_topology_operator_binding`, already live in [`storage::TopologyStore::set_operator`])
+/// were real and tested but unreachable — drawn edges "authorized nothing" per the topology
+/// editor's own honest caveat. `404` (not `403`) on failure, matching [`topology_remove_edge`]'s
+/// idiom: a non-owner topology and a bad proof-of-possession are deliberately indistinguishable,
+/// so a caller probing topology ids learns nothing either way.
+async fn topology_set_operator(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<OperatorBindReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let operator_pubkey = hex_decode_32(&req.operator_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "operator_pubkey must be 64 hex chars".to_string()))?;
+    let proof = hex_decode_64(&req.proof)
+        .ok_or((StatusCode::BAD_REQUEST, "proof must be 128 hex chars".to_string()))?;
+    let bound = state
+        .topologies
+        .set_operator(&owner, &id, &operator_pubkey, &proof)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if bound {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "operator not bound (not owner, no such topology, or invalid proof-of-possession)".to_string()))
     }
 }
 
@@ -5429,6 +5472,64 @@ mod tests {
             StatusCode::NOT_FOUND,
             "removing an already-absent edge -> 404"
         );
+
+        // #237: PUT /me/topologies/:id/operator — the operator-binding endpoint's REST surface.
+        // Wraps the already-tested storage::TopologyStore::set_operator crypto primitive
+        // (topology_operator_binding_bytes/verify_topology_operator_binding), which had no HTTP
+        // route to reach it at all before this endpoint (#107-enforce ii-a, the drawn-edges
+        // "authorize nothing" gap).
+        {
+            use ed25519_dalek::{Signer, SigningKey};
+            let op = SigningKey::from_bytes(&[7u8; 32]);
+            let op_pub = op.verifying_key().to_bytes();
+            let genuine_proof = op.sign(&ct_common::channel::topology_operator_binding_bytes(&tid, &op_pub)).to_bytes();
+            let body = |pk: &[u8; 32], sig: &[u8; 64]| {
+                format!(r#"{{"operator_pubkey":"{}","proof":"{}"}}"#, hex_encode(pk), hex_encode(sig))
+            };
+
+            // Malformed hex -> 400, not a panic or a silent no-op.
+            assert_eq!(
+                send("PUT", format!("/me/topologies/{tid}/operator"), Some(&alice), r#"{"operator_pubkey":"nope","proof":"nope"}"#.into())
+                    .await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "malformed hex -> 400"
+            );
+
+            // A forged proof (signed by an attacker key, not `op`) -> 404, indistinguishable
+            // from a non-owner or a non-existent topology.
+            let attacker = SigningKey::from_bytes(&[9u8; 32]);
+            let forged = attacker.sign(&ct_common::channel::topology_operator_binding_bytes(&tid, &op_pub)).to_bytes();
+            assert_eq!(
+                send("PUT", format!("/me/topologies/{tid}/operator"), Some(&alice), body(&op_pub, &forged))
+                    .await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "forged proof-of-possession -> 404, not bound"
+            );
+
+            // A non-owner (mallory) can't bind alice's topology, even with a genuine proof.
+            assert_eq!(
+                send("PUT", format!("/me/topologies/{tid}/operator"), Some(&mallory), body(&op_pub, &genuine_proof))
+                    .await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "non-owner can't bind an operator key to alice's topology"
+            );
+
+            // The genuine owner, with a genuine proof, binds successfully.
+            assert_eq!(
+                send("PUT", format!("/me/topologies/{tid}/operator"), Some(&alice), body(&op_pub, &genuine_proof))
+                    .await.unwrap().status(),
+                StatusCode::OK,
+                "owner binds with a genuine proof-of-possession"
+            );
+
+            // Idempotent: binding the same (topology, operator, proof) again still succeeds.
+            assert_eq!(
+                send("PUT", format!("/me/topologies/{tid}/operator"), Some(&alice), body(&op_pub, &genuine_proof))
+                    .await.unwrap().status(),
+                StatusCode::OK,
+                "re-bind is idempotent"
+            );
+        }
 
         // Owner isolation: mallory can't see or edit alice's topology.
         assert_eq!(
