@@ -34,6 +34,11 @@ services:
       context: .
       dockerfile: relay-node.Dockerfile
     image: ct-relay-node
+    # #312: bounded like every other service on this shared, no-swap host (see
+    # compose.selfhost.yml's control-plane/edge limits for the full rationale).
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.5
     environment:
       CT_RELAY_NODE_KEY: "${CT_RELAY_NODE_KEY:?set CT_RELAY_NODE_KEY=<64-hex ed25519 seed, e.g. openssl rand -hex 32>}"
       CT_RELAY_LISTEN: "/ip4/0.0.0.0/tcp/4437"

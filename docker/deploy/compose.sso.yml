@@ -48,6 +48,13 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:25.0
     command: ["start-dev", "--import-realm"]
+    # #312: bounded like every other service on this shared, no-swap host (see
+    # compose.selfhost.yml's control-plane/edge limits for the full rationale) --
+    # sized well above Keycloak's real JVM baseline (~560MB observed) for GC/session
+    # headroom, not tightly.
+    mem_limit: 1536m
+    mem_reservation: 512m
+    cpus: 1.5
     environment:
       # Dev-mode bootstrap admin (override in .env for anything reachable). These
       # are Keycloak's own admin-console creds, unrelated to the portal client.

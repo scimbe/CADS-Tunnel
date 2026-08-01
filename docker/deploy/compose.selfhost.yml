@@ -18,6 +18,17 @@ services:
       dockerfile: docker/Dockerfile
     image: ct-testbed
     command: ["ct-control-plane"]
+    # #312: bounded, so a runaway/leaking co-located service (edge under PoW/relay
+    # load, Keycloak) can't OOM-kill this one on a shared single-host deploy -- this
+    # host runs with NO swap, so an unbounded container is one bad spike away from
+    # taking the whole stack down together. `mem_limit`/`cpus` (legacy top-level
+    # keys), NOT `deploy.resources.limits` -- the latter is silently a no-op under
+    # plain `docker compose up` (Swarm-only), which would make this fix a no-op too.
+    # Sized generously above this thin service's real footprint (~10MB idle) rather
+    # than tightly, so normal load never trips it.
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 1.0
     environment:
       CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
       CT_CONTROL_PLANE_DB: "/data/control-plane.db"
@@ -79,6 +90,13 @@ services:
   edge:
     image: ct-testbed
     command: ["ct-edge"]
+    # #312: same rationale as control-plane's own limit above -- edge is the one
+    # most likely to actually spike (PoW #202 solving under a flood, relay traffic),
+    # so this is both the most important service to bound AND the one that most
+    # needs its own headroom to not spuriously trip under legitimate load.
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: 1.5
     environment:
       CT_EDGE_LISTEN: "0.0.0.0:4433"
       CT_EDGE_POW_DIFFICULTY: "${EDGE_POW_DIFFICULTY:-16}"
