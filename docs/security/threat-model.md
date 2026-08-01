@@ -30,7 +30,7 @@ claim is "we can't read what you send", not anonymity.
 | On-path eavesdropper | Noise_IK E2E; QUIC/TLS transport; edge sees only ciphertext | shipped (M8, M20) |
 | Rogue/rotated edge cert | Internal CA, clients trust the CA root (rotation without re-pinning) | shipped (M20) |
 | Unauthenticated actor | OIDC bearer verification on `/me/*`; account derived from the token subject | shipped (M19) |
-| Rendezvous flood (unfunded) | PoW gate (always on) + per-token rendezvous rate limit and per-edge connection cap, both opt-in via `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` / `CT_EDGE_MAX_CONNECTIONS` | shipped (ADR-0018; #86) |
+| Rendezvous flood (unfunded) | PoW gate (always on) + per-token rendezvous rate limit (600/min) and per-edge connection cap (8192), both **on by default** since #95 — tune via `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` / `CT_EDGE_MAX_CONNECTIONS`, `0`/`off` disables either | shipped (ADR-0018; #86, defaults flipped on in #95) |
 | Single account exhausting issuance | Per-subject issuance rate limit → 429 before any ledger touch | shipped (M23.1) |
 | Vulnerable dependency | `cargo audit` against a committed, pinned `Cargo.lock` | shipped (M23.2) |
 | Committed credential leak | `scripts/check-no-secrets.sh` guard (PEM keys, cloud keys, tracked `.env`) | shipped (M23.3) |
@@ -43,14 +43,22 @@ claim is "we can't read what you send", not anonymity.
 | Secret | Where it lives | Handling |
 |--------|----------------|----------|
 | Keycloak realm signing key | Keycloak; the verifier fetches/holds the public half | never in this repo; issuer URL is public config, not a secret |
-| Edge internal CA key | Generated at edge startup, in memory | not persisted or committed; only the CA **root cert** is distributed |
+| Edge internal CA key | Generated on first boot, **persisted to disk** beside the published root cert (`edge-ca-key.pem`, owner-only `0600`, on the Edge's runtime/shared volume — `Ca::load_or_create` in `crates/edge/src/pki.rs`) | never committed; a fresh volume (or a wiped one) generates a new CA, which rotates the root under every pinned Agent/Client (issue #2) — back up or persist that volume across redeploys the same way `cpdata` is |
 | Origin Noise private key | Agent process (custodian) | only the public half travels (in the Capability) |
 | Deployment env (`CT_OIDC_ISSUER`, ports) | `docker/deploy/.env` (self-host) / K8s Secret (hosted) | `.env` is **gitignored**; only `.env.example` templates are committed; K8s secrets supplied out-of-band (sealed-secrets / external-secrets) |
 | Join token | Operator → agent, single-use | short-lived, consumed on first redeem |
 
 **Rules:** no real secret is ever committed; `Cargo.lock` is committed and pinned;
 `scripts/check-no-secrets.sh` runs in CI to enforce the no-committed-secrets rule;
-rotate the edge CA by restart (clients trust the CA root, so no re-pinning).
+the edge CA key is **stable across restarts/redeploys** by design (`Ca::load_or_create`
+reloads the persisted key so pinned Agents/Clients keep working, matching
+`docs/ops/runbook.md`) — a restart does **not** rotate it. To actually rotate the CA,
+delete `edge-ca-key.pem` from the Edge's runtime volume before restart; every Agent/Client
+pinned to the old root must then re-pin against the new one, so treat this as a
+break-glass operation, not routine maintenance. The self-host `docker-compose` case keeps
+this file on the same volume as the published cert; the Kubernetes case is tracked
+separately (#308: an `emptyDir`-mounted CA key does not survive pod rescheduling, which
+silently forces this same rotation-and-re-pin path on every reschedule).
 
 ## Residual risks
 
