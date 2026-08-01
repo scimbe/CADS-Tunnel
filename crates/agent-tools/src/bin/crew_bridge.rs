@@ -26,8 +26,28 @@ use axum::{
 };
 use ct_common::crew::{CrewBuildResponse, CrewConfig, RoleAuction, RoleBid};
 use serde_json::{json, Value};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
+
+/// #304: cap concurrently in-flight builds -- each one drives up to ~3 sequential/concurrent paid
+/// `claude -p` role calls (up to ~60s each, `ROLE_CMD_TIMEOUT`), unbounded before this. A burst of
+/// requests now queues behind `429` instead of spawning a detached task per request and exhausting
+/// the process table / running up real LLM cost. `CREW_MAX_CONCURRENT_BUILDS`-tunable; small default
+/// since this bridge fronts a demo, not a scaled service.
+fn build_semaphore() -> Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("CREW_MAX_CONCURRENT_BUILDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2);
+        Arc::new(Semaphore::new(n))
+    })
+    .clone()
+}
 
 /// Hard cap on a single role command (#188). A role is a `ct-agent channel … --call` doing a ~14s
 /// `claude -p`; generous so a legitimately slow crew isn't cut, but bounded so a *wedged* handler /
@@ -240,6 +260,13 @@ async fn run_crew_streaming(prompt: String, safety_cmd: String, physics_cmds: Ve
     }
     emit(&tx, json!({"stage": "safety", "status": "ok"})).await;
 
+    // #304: the browser already gave up (dropped the response stream, closing `rx`) -- don't start
+    // the two remaining paid role calls (up to ~60s each) for nobody to read. Doesn't abort work
+    // already in flight (safety_check just above), only what hasn't started yet.
+    if tx.is_closed() {
+        return;
+    }
+
     // 2. physics + art — independent once safety clears, run CONCURRENTLY (each ~14s claude -p over
     //    the tunnel; #173). Each branch emits its own start/done so the browser marks that crew
     //    member live and done as it actually happens — the live role-chain, not a canned replay.
@@ -290,6 +317,16 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     if prompt.len() < 3 {
         return (StatusCode::BAD_REQUEST, "say a bit more about the game you want").into_response();
     }
+    // #304: admit against the concurrency cap BEFORE spawning anything -- an over-cap request never
+    // starts a single paid role call. The permit is held by the spawned task for its whole lifetime
+    // (moved in below) and released automatically when it finishes.
+    let Ok(permit) = build_semaphore().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many builds in flight right now — try again shortly",
+        )
+            .into_response();
+    };
     let env = |k: &str| std::env::var(k).ok();
     let (safety, physics, art) = match (env("CREW_SAFETY_CMD"), env("CREW_PHYSICS_CMD"), env("CREW_ART_CMD")) {
         (Some(s), Some(p), Some(a)) => (s, p, a),
@@ -302,7 +339,10 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     // channel; the response body drains them. On any failure it emits a terminal {"stage":"error"}
     // and the browser falls back to its local stand-in — same fail-closed contract as before.
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
-    tokio::spawn(run_crew_streaming(prompt, safety, physics_cmds, art, tx));
+    tokio::spawn(async move {
+        let _permit = permit; // held for the whole build, released when this task ends
+        run_crew_streaming(prompt, safety, physics_cmds, art, tx).await;
+    });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
     Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -324,6 +364,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_semaphore_caps_concurrent_admits_at_the_configured_limit_304() {
+        // #304: default cap is 2 (no CREW_MAX_CONCURRENT_BUILDS set in the test env). The semaphore
+        // is a process-global OnceLock, so this is the only test in this file allowed to touch it.
+        let sem = build_semaphore();
+        let p1 = sem.clone().try_acquire_owned().expect("first permit admits");
+        let p2 = sem.clone().try_acquire_owned().expect("second permit admits (default cap is 2)");
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "a third concurrent build is refused, not queued/spawned"
+        );
+        drop(p1);
+        assert!(sem.try_acquire_owned().is_ok(), "releasing a permit frees a slot for the next build");
+        drop(p2);
+    }
 
     #[tokio::test]
     async fn run_with_fallbacks_tries_candidates_in_order_first_success_wins() {

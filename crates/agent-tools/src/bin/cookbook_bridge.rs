@@ -30,8 +30,27 @@ use axum::{
 use ct_common::cookbook::{RecipeBuildResponse, RecipeCard};
 use ct_common::crew::{RoleAuction, RoleBid};
 use serde_json::{json, Value};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
+
+/// #304: cap concurrently in-flight builds -- each one drives up to 4 sequential paid `claude -p`
+/// role calls (up to ~60s each, `ROLE_CMD_TIMEOUT`), unbounded before this. Same rationale as
+/// `ct-crew-bridge`'s own `build_semaphore` (duplicated per this crate's "separate, self-contained
+/// bridge per pipeline" convention, see the module doc). `COOKBOOK_MAX_CONCURRENT_BUILDS`-tunable.
+fn build_semaphore() -> Arc<Semaphore> {
+    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let n = std::env::var("COOKBOOK_MAX_CONCURRENT_BUILDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2);
+        Arc::new(Semaphore::new(n))
+    })
+    .clone()
+}
 
 /// Hard cap on a single role command (#188). A role is a `ct-agent channel … --call` doing a ~14s
 /// `claude -p`; generous so a legitimately slow role isn't cut, but bounded so a *wedged* handler /
@@ -244,6 +263,13 @@ async fn run_cookbook_streaming(
     }
     emit(&tx, json!({"stage": "safety", "status": "ok"})).await;
 
+    // #304: the browser already gave up (dropped the response stream, closing `rx`) -- don't start
+    // the remaining paid role calls for nobody to read. Doesn't abort work already in flight, only
+    // what hasn't started yet; checked again before each later paid stage below for the same reason.
+    if tx.is_closed() {
+        return;
+    }
+
     // 2. structure (source-2) — the photo bytes travel over the channel here, as base64 in the JSON
     //    the role receives; source-2's handler decodes it to a local temp file for its own claude -p.
     emit(&tx, json!({"stage": "structure", "status": "start"})).await;
@@ -259,6 +285,10 @@ async fn run_cookbook_streaming(
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("structure role unreachable: {e}")})).await,
     };
     emit(&tx, json!({"stage": "structure", "status": "done"})).await;
+
+    if tx.is_closed() {
+        return;
+    }
 
     // 3. presentation (sink) — names/themes/plates over the ACTUAL recipe, so it takes structure's
     //    output as context. Sequential (not parallel) because of this dependency.
@@ -276,6 +306,10 @@ async fn run_cookbook_streaming(
         Ok(c) => c,
         Err(e) => return emit(&tx, json!({"stage": "error", "message": format!("recipe fragments malformed: {e}")})).await,
     };
+
+    if tx.is_closed() {
+        return;
+    }
 
     // 5. review (#201 safety addenda) — a post-generation LLM review of the FINISHED recipe:
     //    inedible/poisonous items, contradictions with a stated dietary constraint (e.g.
@@ -316,6 +350,16 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     if prompt.len() < 3 {
         return (StatusCode::BAD_REQUEST, "tell me a bit more about what you want to cook").into_response();
     }
+    // #304: admit against the concurrency cap BEFORE spawning anything -- an over-cap request never
+    // starts a single paid role call. The permit is held by the spawned task for its whole lifetime
+    // (moved in below) and released automatically when it finishes.
+    let Ok(permit) = build_semaphore().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many builds in flight right now — try again shortly",
+        )
+            .into_response();
+    };
     // Optional photo of the ingredients, base64 in the JSON payload (#201 image transport).
     let image = body.get("image").and_then(Value::as_str).map(str::to_string);
     // #201 i18n: desired recipe language (BCP-47-ish, e.g. "en"/"de"); default English.
@@ -336,7 +380,10 @@ async fn build_handler(Json(body): Json<Value>) -> Response {
     // Stream NDJSON progress events as the crew runs. run_cookbook_streaming pushes lines onto the
     // channel; on any failure it emits a terminal {"stage":"error"} and the browser falls back.
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
-    tokio::spawn(run_cookbook_streaming(prompt, image, lang, safety, structure_cmds, presentation, review, tx));
+    tokio::spawn(async move {
+        let _permit = permit; // held for the whole build, released when this task ends
+        run_cookbook_streaming(prompt, image, lang, safety, structure_cmds, presentation, review, tx).await;
+    });
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(|line| Ok::<Vec<u8>, std::io::Error>(line.into_bytes()));
     Response::builder()
         .header("content-type", "application/x-ndjson")
@@ -358,6 +405,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_semaphore_caps_concurrent_admits_at_the_configured_limit_304() {
+        // #304: default cap is 2 (no COOKBOOK_MAX_CONCURRENT_BUILDS set in the test env). The
+        // semaphore is a process-global OnceLock, so this is the only test in this file allowed to
+        // touch it.
+        let sem = build_semaphore();
+        let p1 = sem.clone().try_acquire_owned().expect("first permit admits");
+        let p2 = sem.clone().try_acquire_owned().expect("second permit admits (default cap is 2)");
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "a third concurrent build is refused, not queued/spawned"
+        );
+        drop(p1);
+        assert!(sem.try_acquire_owned().is_ok(), "releasing a permit frees a slot for the next build");
+        drop(p2);
+    }
 
     async fn collect(prompt: &str, image: Option<String>, safety: String, structure: String, presentation: String, review: String) -> Vec<Value> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
