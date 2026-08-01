@@ -474,6 +474,55 @@ fn is_global_unicast_v4(v4: std::net::Ipv4Addr) -> bool {
     true
 }
 
+/// #276 (LAN-local fast path, piece 1's safety gate): whether a peer-offered **local**
+/// (private-range) direct-connect `candidate` is safe for THIS host to dial, given this
+/// host's OWN enumerated local address `local`.
+///
+/// A local candidate is never edge-observed the way [`is_global_unicast`]'s reflexive
+/// addresses are — it is just a string the offering peer chose to send — so accepting it
+/// outright would reopen exactly the SSRF shape `#137` closed, one hop later: a malicious
+/// peer could offer e.g. `192.168.1.1:80` (a LAN admin panel) or `169.254.169.254:80`
+/// (cloud instance metadata) and have an unwitting responder dial it.
+///
+/// **This is deliberately NOT gated by "the two members' public reflexive addresses
+/// match" alone.** Matching public IPs proves the two peers are co-located on the same
+/// *external* network; it says nothing about which of the offering peer's *claimed*
+/// private addresses are safe for the responder to reach into — a same-public-IP peer
+/// (e.g. sharing a coworking-space NAT) is not thereby authorized to direct the responder
+/// at arbitrary hosts on the responder's own LAN. A public-IP match is a legitimate cheap
+/// *pre-filter* (skip even trying when the peers clearly aren't co-located), but it must
+/// never be the sole gate before dialing.
+///
+/// The actual safety property enforced here: `candidate` must fall within the **same
+/// local subnet** as `local` — i.e. it must look like it is genuinely on the responder's
+/// own LAN, independent of anything the peer claims. A bare [`std::net::IpAddr`] carries
+/// no netmask, so this is a conservative heuristic prefix match (IPv4 `/24`, IPv6 `/64` —
+/// matching the same bucketing convention `ct-client`'s `local_egress_ip` classifier
+/// already uses for its own local-network heuristic), not an authoritative subnet lookup;
+/// a `candidate` outside a private/link-local/ULA range is rejected outright regardless of
+/// prefix (global-unicast candidates go through [`is_global_unicast`] instead, never
+/// through this path).
+pub fn same_local_subnet(local: std::net::IpAddr, candidate: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match (local, candidate) {
+        (IpAddr::V4(l), IpAddr::V4(c)) => {
+            if !(c.is_private() || c.is_link_local()) {
+                return false;
+            }
+            l.octets()[..3] == c.octets()[..3]
+        }
+        (IpAddr::V6(l), IpAddr::V6(c)) => {
+            let c_seg0 = c.segments()[0];
+            let c_is_ula_or_link_local = (c_seg0 & 0xfe00) == 0xfc00 || (c_seg0 & 0xffc0) == 0xfe80;
+            if !c_is_ula_or_link_local {
+                return false;
+            }
+            l.segments()[..4] == c.segments()[..4]
+        }
+        _ => false, // mixed address families never match
+    }
+}
+
 /// How a channel member can be reached, classified from what it **advertised** and the
 /// **reflexive** (post-NAT) source address the edge observed on its already-authenticated
 /// join connection (#121 Phase B1 — the AutoNAT analog). This is the input the later
@@ -3208,6 +3257,62 @@ mod tests {
         let mapped_loopback: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
         assert!(!is_global_unicast(cloud_metadata), "IPv4-mapped cloud metadata must be refused");
         assert!(!is_global_unicast(mapped_loopback), "IPv4-mapped loopback must be refused");
+    }
+
+    #[test]
+    fn same_local_subnet_accepts_only_a_genuinely_co_resident_private_candidate() {
+        // #276 piece 1's safety gate: a peer-offered LAN-local candidate is only safe to
+        // dial when it lands in the responder's OWN local /24 (v4) or /64 (v6) -- not
+        // merely because it's "some private address" the peer chose to send.
+        use std::net::IpAddr;
+        let my_v4: IpAddr = "192.168.1.42".parse().unwrap();
+        let same_subnet_v4: IpAddr = "192.168.1.7".parse().unwrap();
+        let different_subnet_v4: IpAddr = "192.168.2.7".parse().unwrap();
+        assert!(same_local_subnet(my_v4, same_subnet_v4), "same /24 -> accepted");
+        assert!(!same_local_subnet(my_v4, different_subnet_v4), "different /24 -> refused");
+
+        let my_v6: IpAddr = "fd12:3456:789a:1::1".parse().unwrap();
+        let same_subnet_v6: IpAddr = "fd12:3456:789a:1::99".parse().unwrap();
+        let different_subnet_v6: IpAddr = "fd12:3456:789a:2::99".parse().unwrap();
+        assert!(same_local_subnet(my_v6, same_subnet_v6), "same ULA /64 -> accepted");
+        assert!(!same_local_subnet(my_v6, different_subnet_v6), "different ULA /64 -> refused");
+    }
+
+    #[test]
+    fn same_local_subnet_refuses_a_malicious_offer_regardless_of_the_responders_own_address() {
+        // #276 piece 1's core SSRF-closing property: a malicious peer offering a LAN
+        // admin panel or cloud-metadata-adjacent address must be refused EVEN IF it
+        // happens to share the responder's public reflexive IP (that fact alone -- which
+        // this function deliberately does not take as input -- must never be sufficient).
+        use std::net::IpAddr;
+        let my_v4: IpAddr = "192.168.1.42".parse().unwrap();
+        // A LAN address that is NOT in the responder's own subnet -- e.g. a different
+        // office/home network the peer happens to also be private-addressed on.
+        let attacker_offered: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!same_local_subnet(my_v4, attacker_offered), "off-subnet private candidate refused");
+
+        // link-local (169.254/16, includes the cloud-metadata-adjacent range) is only
+        // ever accepted if it's in the responder's own /24 -- 169.254.169.254 specifically
+        // is refused here since the responder's own address is a different /24.
+        let cloud_metadata_ish: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(!same_local_subnet(my_v4, cloud_metadata_ish), "not in responder's own /24 -> refused");
+
+        // A public/global-unicast "candidate" is never accepted through this path at all
+        // (it belongs to is_global_unicast instead), regardless of any subnet match.
+        let public: IpAddr = "203.0.113.10".parse().unwrap();
+        assert!(!same_local_subnet(my_v4, public), "global-unicast candidate never accepted here");
+    }
+
+    #[test]
+    fn same_local_subnet_never_matches_across_address_families() {
+        // A v4 local address and a v6 candidate (or vice versa) can never "match" --
+        // there is no meaningful subnet comparison across families, so this must be a
+        // hard refusal, not a panic or a coincidental true.
+        use std::net::IpAddr;
+        let my_v4: IpAddr = "192.168.1.1".parse().unwrap();
+        let v6_candidate: IpAddr = "fd12:3456:789a:1::1".parse().unwrap();
+        assert!(!same_local_subnet(my_v4, v6_candidate));
+        assert!(!same_local_subnet(v6_candidate, my_v4));
     }
 
     #[test]
