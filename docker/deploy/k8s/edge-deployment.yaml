@@ -4,6 +4,13 @@
 # - replicas: 1: each edge mints its own internal CA at startup and writes the
 #   CA root to /shared; distributing one edge's root to clients is out of band.
 #   Multi-edge (shared CA / cert distribution) is a later concern.
+# - #308: /shared is now a ReadWriteOnce PVC (edge-pvc.yaml), not an emptyDir
+#   -- same reasoning as the control-plane's own PVC (control-plane-pvc.yaml):
+#   the CA root must survive pod restarts/rescheduling or every already-
+#   distributed pin breaks on ordinary pod churn. `strategy: Recreate` for the
+#   same reason the control plane uses it -- an RWO PVC can't be bound by two
+#   pods at once, so the old pod must fully terminate before a replacement
+#   binds the claim.
 # - No control-plane HTTP surface, so liveness/readiness use a TCP-socket probe
 #   on 4433 (the TLS-TCP fallback listener) as the "edge is accepting" signal.
 # - Hardened: non-root, read-only rootfs, all caps dropped. It needs no
@@ -18,6 +25,8 @@ metadata:
     app.kubernetes.io/part-of: CADS-Tunnel
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: ct-edge
@@ -75,7 +84,9 @@ spec:
             - name: shared
               mountPath: /shared
       volumes:
-        # The edge writes its CA root here; the operator extracts and distributes
-        # it to clients. emptyDir is enough — it is regenerated on each start.
+        # #308: persistent (PVC), not emptyDir -- see the header comment. The
+        # edge writes its CA root here; the operator extracts and distributes
+        # it to clients once, and it now survives every subsequent restart.
         - name: shared
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: ct-edge-shared

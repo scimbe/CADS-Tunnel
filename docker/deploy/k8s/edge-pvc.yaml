@@ -1,0 +1,31 @@
+# Durable state for the edge (#308): its self-minted internal CA (the root of
+# trust every Agent/Client pins) must survive pod restarts and rescheduling --
+# the same durability the self-host compose bundle already gets from its
+# `shared` named volume (docker/deploy/compose.selfhost.yml). Without this,
+# an emptyDir regenerates the CA on every pod restart (node drain, OOM-kill,
+# rolling update), silently invalidating every already-distributed CA root and
+# breaking every live tunnel handshake until each client re-fetches out of
+# band -- a full outage on ordinary pod churn, not just a rare event.
+#
+# ReadWriteOnce, same as the control-plane's own PVC: the edge is pinned to
+# replicas: 1 (each edge mints its own CA; multi-edge shared-CA distribution
+# is a separate, later concern per edge-deployment.yaml's own header comment)
+# with a Recreate strategy, so there is never a window where two pods try to
+# bind the same claim.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ct-edge-shared
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      # The CA key + leaf cert are a few KB total -- generous headroom over
+      # tight, not sized to actual data plane traffic (nothing data-plane-
+      # related lives here).
+      storage: 64Mi
