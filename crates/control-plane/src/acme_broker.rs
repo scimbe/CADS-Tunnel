@@ -88,28 +88,33 @@ pub fn acme_broker_router(
 /// origin's own, now-issued certificate). Best-effort and logged, never fails
 /// the caller — exactly [`crate::portal_api::authorize_hostname`]'s own
 /// posture, since the hostname's DB state is already correct either way.
+/// Returns whether the push actually reached the edge and succeeded (#264) -- the
+/// caller uses this to decide whether a Gruen revert is confirmed or needs a retry
+/// (see [`SqliteTunnelStore::pending_revert_hostnames`]); a Gelb-tier push has no
+/// such follow-up today (the sweep already unconditionally re-affirms every row in
+/// [`SqliteTunnelStore::gelb_hostnames`] every tick regardless of this return value).
 async fn push_channel_tier(
     edge_admin: &Option<(String, String)>,
     tunnels: &SqliteTunnelStore,
     hostname: &str,
     gelb: bool,
-) {
+) -> bool {
     let Some((url, token)) = edge_admin else {
         eprintln!(
             "ct-cp: acme_broker: channel-tier push SKIPPED for {hostname} (gelb={gelb}) — edge admin API not \
              configured (set CT_CP_EDGE_ADMIN_URL + CT_CP_EDGE_ADMIN_TOKEN)"
         );
-        return;
+        return false;
     };
     let routing_token = match tunnels.routing_token_for_hostname(hostname) {
         Ok(Some(t)) => t,
         Ok(None) => {
             eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} skipped — no routing token on record");
-            return;
+            return false;
         }
         Err(e) => {
             eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed to look up routing token: {e}");
-            return;
+            return false;
         }
     };
     let endpoint = format!(
@@ -124,10 +129,17 @@ async fn push_channel_tier(
         .await
     {
         Ok(r) if r.status().is_success() => {
-            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} (gelb={gelb}) succeeded")
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} (gelb={gelb}) succeeded");
+            true
         }
-        Ok(r) => eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} returned {}", r.status()),
-        Err(e) => eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed: {e}"),
+        Ok(r) => {
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} returned {}", r.status());
+            false
+        }
+        Err(e) => {
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed: {e}");
+            false
+        }
     }
 }
 
@@ -214,8 +226,15 @@ async fn issuance_complete(
     // Now that this hostname has its own real certificate, revert the edge to
     // ordinary passthrough -- otherwise it would stay stuck terminating with
     // the shared wildcard cert forever, the browser never seeing the
-    // origin's own newly-issued one.
-    push_channel_tier(&state.edge_admin, &state.tunnels, &hostname, false).await;
+    // origin's own newly-issued one. #264: `record_issuance_complete` already
+    // marked this hostname `pending_revert`; only clear that flag if the push
+    // actually landed -- a failure here is now retried by the sweep instead of
+    // silently forgotten (the DB said Gruen, the edge kept believing Gelb).
+    if push_channel_tier(&state.edge_admin, &state.tunnels, &hostname, false).await {
+        if let Err(e) = state.tunnels.clear_pending_revert(&hostname) {
+            eprintln!("ct-cp: acme_broker: failed to clear pending_revert for {hostname}: {e}");
+        }
+    }
     Ok(StatusCode::OK)
 }
 
@@ -360,7 +379,9 @@ pub(crate) async fn try_promote_rot_to_gelb(
     let now = now_secs();
     match edge_mesh.lookup_by_host(hostname).map(|owned| owned.is_some()) {
         Ok(true) => match tunnels.enter_gelb_queue(hostname, now) {
-            Ok(true) => push_channel_tier(edge_admin, tunnels, hostname, true).await,
+            Ok(true) => {
+                push_channel_tier(edge_admin, tunnels, hostname, true).await;
+            }
             Ok(false) => {} // already past Rot (e.g. a retry) -- nothing to do
             Err(e) => eprintln!("ct-cp: acme_broker: enter_gelb_queue for {hostname} failed: {e}"),
         },
@@ -401,6 +422,17 @@ async fn sweep_once(
     // steady state and self-heals within one tick of any restart.
     for hostname in tunnels.gelb_hostnames()? {
         push_channel_tier(edge_admin, tunnels, &hostname, true).await;
+    }
+
+    // 2b. Retry the Gelb->Gruen revert push for any hostname it didn't confirm land
+    // on yet (#264): unlike step 2 above, this is bounded and self-terminating --
+    // once the push succeeds, `clear_pending_revert` removes the hostname from
+    // `pending_revert_hostnames` for good, so this never grows into an ever-larger
+    // per-tick re-push of every Gruen hostname a deployment has ever issued.
+    for hostname in tunnels.pending_revert_hostnames()? {
+        if push_channel_tier(edge_admin, tunnels, &hostname, false).await {
+            tunnels.clear_pending_revert(&hostname)?;
+        }
     }
 
     // 3. Lapse expired claims -- must run before the admission sweep below so
@@ -733,6 +765,93 @@ mod tests {
         let seen = calls.lock().unwrap();
         assert_eq!(seen.len(), 3, "issuance-complete pushes a third, reverting channel-tier update");
         assert!(!seen[2].0.contains("channel_tier="), "no channel_tier param -> revert to ordinary passthrough: {}", seen[2].0);
+    }
+
+    /// Like [`spawn_mock_edge_admin`], but every call fails (500) while `failing` is
+    /// true -- lets a test force `push_channel_tier` to report failure on demand.
+    async fn spawn_mock_edge_admin_with_failure_toggle(
+    ) -> (String, Arc<Mutex<Vec<(String, Option<String>)>>>, Arc<std::sync::atomic::AtomicBool>) {
+        use axum::extract::{OriginalUri, State as AxState};
+        let calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        async fn authorize_host(
+            AxState((calls, failing)): AxState<(Arc<Mutex<Vec<(String, Option<String>)>>>, Arc<std::sync::atomic::AtomicBool>)>,
+            OriginalUri(uri): OriginalUri,
+            headers: axum::http::HeaderMap,
+        ) -> StatusCode {
+            let token_hdr = headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()).map(str::to_string);
+            calls.lock().unwrap().push((uri.to_string(), token_hdr));
+            if failing.load(std::sync::atomic::Ordering::SeqCst) {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::OK
+            }
+        }
+        let app = Router::new()
+            .route("/admin/authorize-host/:token/:host", axum::routing::post(authorize_host))
+            .with_state((calls.clone(), failing.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), calls, failing)
+    }
+
+    #[tokio::test]
+    async fn a_failed_revert_push_is_retried_by_the_sweep_until_it_lands_264() {
+        // #264: issuance_complete's revert push is best-effort -- a failure used to
+        // just get logged and forgotten, leaving the DB Gruen while the edge kept
+        // believing Gelb (terminating with the shared wildcard cert) forever. Prove
+        // the sweep now retries it, and stops retrying once it actually lands.
+        let (edge_url, calls, failing) = spawn_mock_edge_admin_with_failure_toggle().await;
+        let edge_admin = Some((edge_url, "sekret".to_string()));
+
+        let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", 0).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap(); // Rot -> Gelb
+
+        // Make the edge fail every push, then complete the issuance -- the revert
+        // push fails, but the endpoint still reports success to the caller
+        // (best-effort, unchanged), and the hostname is now Gruen + pending_revert.
+        failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let app = acme_broker_router(edge_mesh.clone(), tunnels.clone(), edge_admin.clone());
+        let resp = app
+            .oneshot(
+                Request::post(format!("/agent/acme-issuance-complete/{}/app.example.com", t.routing_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "issuance-complete still succeeds even though the revert push failed");
+        assert_eq!(
+            tunnels.pending_revert_hostnames().unwrap(),
+            vec!["app.example.com".to_string()],
+            "the failed revert is tracked as pending"
+        );
+
+        // Still failing: a sweep retries it, but it's still pending.
+        let calls_before = calls.lock().unwrap().len();
+        sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
+        assert!(calls.lock().unwrap().len() > calls_before, "the sweep retried the revert push");
+        assert_eq!(tunnels.pending_revert_hostnames().unwrap(), vec!["app.example.com".to_string()], "still pending -- still failing");
+
+        // The edge recovers: the next sweep's retry lands, and the flag clears.
+        failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
+        assert!(tunnels.pending_revert_hostnames().unwrap().is_empty(), "cleared once the retry actually succeeds");
+
+        // And it STAYS cleared -- a further sweep doesn't re-push a confirmed revert
+        // (bounded/self-terminating, unlike the unconditional Gelb re-affirm above).
+        let calls_before = calls.lock().unwrap().len();
+        sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
+        let revert_calls_since: usize =
+            calls.lock().unwrap()[calls_before..].iter().filter(|(uri, _)| !uri.contains("channel_tier=")).count();
+        assert_eq!(revert_calls_since, 0, "a confirmed revert is never re-pushed");
     }
 
     #[tokio::test]

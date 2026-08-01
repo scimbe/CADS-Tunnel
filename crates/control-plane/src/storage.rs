@@ -1290,6 +1290,10 @@ impl SqliteTunnelStore {
         ensure_column(&conn, "subject_tunnels", "claim_state", "TEXT NOT NULL DEFAULT 'none'")?;
         ensure_column(&conn, "subject_tunnels", "claim_offered_at", "INTEGER")?;
         ensure_column(&conn, "subject_tunnels", "claim_deadline", "INTEGER")?;
+        // #264: set alongside the Gruen transition, cleared once the edge confirms
+        // (or is believed to confirm) the channel_tier=gelb=false revert push --
+        // see record_issuance_complete / pending_revert_hostnames / clear_pending_revert.
+        ensure_column(&conn, "subject_tunnels", "pending_revert", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -1767,7 +1771,8 @@ impl SqliteTunnelStore {
             .flatten();
         tx.execute(
             "UPDATE subject_tunnels
-             SET status = 'gruen', claim_state = 'none', claim_offered_at = NULL, claim_deadline = NULL
+             SET status = 'gruen', claim_state = 'none', claim_offered_at = NULL, claim_deadline = NULL,
+                 pending_revert = 1
              WHERE hostname = ?1",
             params![hostname],
         )?;
@@ -1779,6 +1784,33 @@ impl SqliteTunnelStore {
         }
         tx.commit()?;
         Ok(ca)
+    }
+
+    /// Every Gruen hostname whose `channel_tier=gelb=false` revert push to the edge
+    /// hasn't been confirmed successful yet (#264): `issuance_complete`'s push is
+    /// best-effort, and a failure (network blip, edge 5xx) used to just get logged
+    /// and forgotten -- the DB said Gruen while the edge kept terminating with the
+    /// shared wildcard cert forever, since the sweep only ever re-affirmed Gelb
+    /// hosts, never reconciled a stuck-Gelb-on-the-edge Gruen host. The admission
+    /// sweep retries every row here each tick until [`Self::clear_pending_revert`]
+    /// confirms one actually landed.
+    pub fn pending_revert_hostnames(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT hostname FROM subject_tunnels WHERE status = 'gruen' AND pending_revert = 1 AND hostname IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// Mark `hostname`'s edge revert push as confirmed (#264) -- called once
+    /// [`crate::acme_broker::push_channel_tier`] reports success, so
+    /// [`Self::pending_revert_hostnames`] stops retrying it.
+    pub fn clear_pending_revert(&self, hostname: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock_safe()
+            .execute("UPDATE subject_tunnels SET pending_revert = 0 WHERE hostname = ?1", params![hostname])?;
+        Ok(())
     }
 
     /// How many certificates `ca` has issued for `domain` in the trailing
