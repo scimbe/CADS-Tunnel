@@ -302,7 +302,7 @@ pub fn register_settlement_tools(
             let account: [u8; 32] = from_hex(hex)
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
                 .ok_or("`account` must be 32-byte hex")?;
-            let chain = query.lock().map_err(|_| "settlement chain lock poisoned")?;
+            let mut chain = query.lock().map_err(|_| "settlement chain lock poisoned")?;
             Ok(json!({ "balance": chain.balance(&account) }))
         },
     );

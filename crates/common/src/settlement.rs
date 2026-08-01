@@ -228,6 +228,16 @@ fn block_hash(height: u64, prev_hash: &[u8; 32], transfers: &[Transfer]) -> [u8;
 pub struct Chain {
     genesis: BTreeMap<Account, Amount>,
     blocks: Vec<Block>,
+    /// #270: `(balances, nonces)` folded from genesis + every committed block, cached so repeated
+    /// [`balance`](Self::balance) queries don't each re-replay the whole chain (O(n) per call
+    /// otherwise — a single peer hammering a settlement query tool could monopolize the ledger's
+    /// lock/CPU as the chain grows). `None` means stale/uncomputed; every mutator ([`append`](Self::append),
+    /// [`accept_block`](Self::accept_block)) refreshes it to the post-mutation state directly (it
+    /// already computed that state to validate the new transfers, so this adds no extra replay) rather
+    /// than merely invalidating it. Never read directly — always through [`state`](Self::state), which
+    /// is the only thing that may populate it lazily (e.g. right after [`Clone`], which duplicates
+    /// whatever cache the source had).
+    cached_state: Option<(BTreeMap<Account, Amount>, BTreeMap<Account, u64>)>,
 }
 
 impl Chain {
@@ -240,7 +250,7 @@ impl Chain {
             transfers: Vec::new(),
             hash: block_hash(0, &[0u8; 32], &[]),
         };
-        Self { genesis, blocks: vec![genesis_block] }
+        Self { genesis, blocks: vec![genesis_block], cached_state: None }
     }
 
     /// The hash of the current tip (the block a new block links to).
@@ -259,8 +269,11 @@ impl Chain {
         self.blocks.last().expect("chain always has the genesis block")
     }
 
-    /// Fold genesis + all committed transfers into `(balances, next_nonce per sender)`.
-    fn state(&self) -> (BTreeMap<Account, Amount>, BTreeMap<Account, u64>) {
+    /// Fold genesis + all committed transfers into `(balances, next_nonce per sender)` from scratch —
+    /// O(total transfers ever committed). Only [`state`](Self::state) (the cache-populating path) and
+    /// [`is_valid`](Self::is_valid) (which must NOT trust the cache — it exists to catch exactly the
+    /// kind of tamper a cache would silently paper over) may call this directly.
+    fn compute_state(&self) -> (BTreeMap<Account, Amount>, BTreeMap<Account, u64>) {
         let balances = self.genesis.clone();
         let nonces = BTreeMap::new();
         let mut acc = (balances, nonces);
@@ -271,6 +284,18 @@ impl Chain {
             }
         }
         acc
+    }
+
+    /// #270: the cached, O(1)-when-warm counterpart to [`compute_state`](Self::compute_state) — every
+    /// read (e.g. repeated [`balance`](Self::balance) queries) goes through here instead of replaying
+    /// the whole chain each time. Populates the cache on first use (e.g. right after a [`Clone`], which
+    /// duplicates whatever cache state the source had, stale or not, so a lazily-empty cache must still
+    /// be handled); [`append`](Self::append)/[`accept_block`](Self::accept_block) keep it warm directly.
+    fn state(&mut self) -> &(BTreeMap<Account, Amount>, BTreeMap<Account, u64>) {
+        if self.cached_state.is_none() {
+            self.cached_state = Some(self.compute_state());
+        }
+        self.cached_state.as_ref().expect("just populated if it was None")
     }
 
     fn apply(balances: &mut BTreeMap<Account, Amount>, nonces: &mut BTreeMap<Account, u64>, t: &Transfer) {
@@ -312,7 +337,7 @@ impl Chain {
     /// overdraft) against the current state applied in order. Rejects the whole block on the first bad
     /// transfer — the chain is never left in a partially-applied state.
     pub fn append(&mut self, transfers: Vec<Transfer>) -> Result<(), ChainError> {
-        let (mut balances, mut nonces) = self.state();
+        let (mut balances, mut nonces) = self.state().clone();
         for t in &transfers {
             Self::validate_and_apply(&mut balances, &mut nonces, t)?;
         }
@@ -320,6 +345,10 @@ impl Chain {
         let prev_hash = self.tip_hash();
         let hash = block_hash(height, &prev_hash, &transfers);
         self.blocks.push(Block { height, prev_hash, transfers, hash });
+        // #270: `balances`/`nonces` above already reflect this block (validate_and_apply mutated
+        // them in place) — cache that directly instead of merely invalidating, so the next read
+        // doesn't re-replay the whole (now one block longer) chain.
+        self.cached_state = Some((balances, nonces));
         Ok(())
     }
 
@@ -355,16 +384,18 @@ impl Chain {
         {
             return Err(ChainError::BrokenChain { height: expected_height });
         }
-        let (mut balances, mut nonces) = self.state();
+        let (mut balances, mut nonces) = self.state().clone();
         for t in &block.transfers {
             Self::validate_and_apply(&mut balances, &mut nonces, t)?;
         }
         self.blocks.push(block);
+        // #270: same as append -- cache the post-accept state directly rather than invalidating.
+        self.cached_state = Some((balances, nonces));
         Ok(())
     }
 
     /// The balance of `account` = its genesis allocation plus/minus every committed transfer.
-    pub fn balance(&self, account: &Account) -> Amount {
+    pub fn balance(&mut self, account: &Account) -> Amount {
         self.state().0.get(account).copied().unwrap_or(0)
     }
 
@@ -390,6 +421,15 @@ impl Chain {
             prev_hash = block.hash;
         }
         Ok(())
+    }
+
+    /// #270 test-only introspection: whether [`state`](Self::state)'s cache is currently populated,
+    /// so a test can prove [`append`](Self::append)/[`accept_block`](Self::accept_block) keep it warm
+    /// directly rather than merely invalidating it (which would still leave the NEXT read doing a full
+    /// replay) without resorting to a timing-based test.
+    #[cfg(test)]
+    fn cache_is_warm(&self) -> bool {
+        self.cached_state.is_some()
     }
 }
 
@@ -1350,6 +1390,34 @@ mod tests {
         esc.refund(&m, 2_000).expect("after expiry the unreleased hold refunds");
         assert_eq!(esc.balance(&a), 100, "alice made whole (60 remaining + 40 refunded), no overflow");
         assert_eq!(esc.held_amount(&m), 0, "hold cleared by the refund");
+    }
+
+    #[test]
+    fn chain_balance_reads_a_warm_cache_kept_current_by_append_270() {
+        // #270: append/accept_block must keep the (balances, nonces) cache warm directly, not just
+        // invalidate it -- otherwise the very next balance() query still pays the full O(n) replay
+        // append itself already computed to validate the block, defeating the point of caching it.
+        let alice = key(1);
+        let bob = key(2);
+        let (a, b) = (acct(&alice), acct(&bob));
+
+        let mut chain = Chain::new(BTreeMap::from([(a, 100)]));
+        assert!(!chain.cache_is_warm(), "nothing computed yet on a fresh chain");
+
+        chain.append(vec![Transfer::sign_new(&alice, b, 10, 0)]).unwrap();
+        assert!(chain.cache_is_warm(), "append populates the cache directly from the state it already computed");
+
+        // Repeated balance() reads don't need to (and per cache_is_warm staying true, don't) recompute.
+        assert_eq!(chain.balance(&a), 90);
+        assert!(chain.cache_is_warm());
+        assert_eq!(chain.balance(&b), 10);
+        assert!(chain.cache_is_warm());
+
+        // A second append re-warms the cache to the NEW post-append state, not a stale one.
+        chain.append(vec![Transfer::sign_new(&alice, b, 5, 1)]).unwrap();
+        assert!(chain.cache_is_warm());
+        assert_eq!(chain.balance(&a), 85, "the cache reflects both appends, not just the first");
+        assert_eq!(chain.balance(&b), 15);
     }
 
     #[test]
