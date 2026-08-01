@@ -172,10 +172,19 @@ struct AdmissionResponse {
     claim_deadline: Option<i64>,
 }
 
+/// #263: this response carries EAB secrets (`assigned_ca.eab_hmac_key_b64url`) once
+/// `may_issue_now` is true. The endpoint stays GET (auth lives in the path, and
+/// `ct-agent`'s ACME flow already calls it that way — changing the method is a
+/// breaking wire change this fix doesn't need to make), but every response is marked
+/// `no-store` so a shared/intermediary cache in front of the control plane (CDN,
+/// reverse proxy) never persists a secret-bearing body, even one whose auth the cache
+/// can't see (it's in the path, not a header it necessarily keys on).
+const NO_STORE: (axum::http::HeaderName, &str) = (axum::http::header::CACHE_CONTROL, "no-store");
+
 async fn admission(
     State(state): State<AcmeBrokerState>,
     Path((token, hostname)): Path<(String, String)>,
-) -> Result<Json<AdmissionResponse>, (StatusCode, String)> {
+) -> Result<([(axum::http::HeaderName, &'static str); 1], Json<AdmissionResponse>), (StatusCode, String)> {
     authorize(&state, &token, &hostname).await?;
     let admission = state
         .tunnels
@@ -186,7 +195,10 @@ async fn admission(
     let may_issue_now = admission.may_issue_now(now_secs());
     let assigned_ca = if may_issue_now { admission.assigned_ca.as_deref().and_then(ca_response_for) } else { None };
 
-    Ok(Json(AdmissionResponse { status: admission.status, may_issue_now, assigned_ca, claim_deadline: admission.claim_deadline }))
+    Ok((
+        [NO_STORE],
+        Json(AdmissionResponse { status: admission.status, may_issue_now, assigned_ca, claim_deadline: admission.claim_deadline }),
+    ))
 }
 
 async fn issuance_complete(
@@ -464,6 +476,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admission_response_is_marked_no_store_263() {
+        // #263: this response can carry EAB secrets once may_issue_now is true --
+        // every response (secrets present or not) must tell a shared/intermediary
+        // cache never to persist it.
+        let (edge_mesh, tunnels) = stores();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        let app = acme_broker_router(edge_mesh, tunnels, None);
+        let path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
+
+        let resp = app.oneshot(Request::get(&path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(axum::http::header::CACHE_CONTROL).unwrap(), "no-store");
     }
 
     #[tokio::test]
