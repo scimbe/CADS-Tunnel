@@ -9,7 +9,7 @@ license-file.workspace = true
 # AD1 codec + store are dependency-free; AD2 adds the :53 responder; AD3 adds the
 # localhost HTTP API (axum) + the ct-dns binary; AD5 adds the DNS-01 provider
 # abstraction with a deSEC (https://desec.io) backend (reqwest + serde_json).
-tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time"] }
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "time", "sync"] }
 axum = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
@@ -19,6 +19,9 @@ serde_json = "1"
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# `test-util` (dev-only) enables tokio's paused clock for the #300 TCP idle-read
+# timeout test (`#[tokio::test(start_paused = true)]`), same purpose as ct-edge's
+# #111 Slowloris test and ct-common's #269 idle-timeout tests.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
