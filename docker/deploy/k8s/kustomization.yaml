@@ -10,14 +10,17 @@ kind: Kustomization
 namespace: ct-system
 resources:
   - namespace.yaml
+  - default-deny-networkpolicy.yaml
   - control-plane-config.yaml
   - control-plane-pvc.yaml
   - control-plane-deployment.yaml
   - control-plane-service.yaml
   - control-plane-ingress.yaml
   - control-plane-pdb.yaml
+  - control-plane-networkpolicy.yaml
   - edge-config.yaml
   - edge-pvc.yaml
   - edge-deployment.yaml
   - edge-service.yaml
   - edge-pdb.yaml
+  - edge-networkpolicy.yaml

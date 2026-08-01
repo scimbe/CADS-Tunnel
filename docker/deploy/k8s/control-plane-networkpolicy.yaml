@@ -1,0 +1,45 @@
+# #314: punches the two legitimate holes in default-deny-networkpolicy.yaml's
+# ingress lockdown for the control plane's :8090 HTTP API:
+#   1. the ingress controller (control-plane-ingress.yaml assumes
+#      `ingressClassName: nginx`, i.e. ingress-nginx) -- this is how the
+#      control plane is actually meant to be reached from outside the cluster.
+#      Selects the ingress-nginx namespace by its standard, automatically-
+#      applied `kubernetes.io/metadata.name` label (present on every namespace
+#      on any cluster new enough to support NetworkPolicy well, k8s 1.21+) --
+#      portable across CNIs, no manual namespace labeling needed. If your
+#      ingress controller lives in a differently-named namespace, change the
+#      label value below to match (same "adjust before deploy" posture as
+#      control-plane-ingress.yaml's own `cp.example.com` placeholder).
+#   2. the edge pod, which calls the control plane's internal API directly
+#      (host-ownership authorize/revoke, channel-broker authorize, metrics
+#      scrape -- CT_CP_EDGE_ADMIN_TOKEN-gated internal routes) over the
+#      cluster network, not through the ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ct-control-plane
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-control-plane
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ct-control-plane
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8090
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ct-edge
+      ports:
+        - protocol: TCP
+          port: 8090

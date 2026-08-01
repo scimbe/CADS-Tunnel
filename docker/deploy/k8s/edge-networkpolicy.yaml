@@ -1,0 +1,37 @@
+# #314: punches the edge's hole in default-deny-networkpolicy.yaml's ingress
+# lockdown. Unlike the control plane, the edge's exposed ports (4433/UDP+TCP,
+# see edge-config.yaml/edge-deployment.yaml) ARE the public product -- the
+# whole point of a tunnel edge is that arbitrary Agents and Clients on the
+# open internet dial in, via the ct-edge Service's `type: LoadBalancer`
+# (edge-service.yaml). There is no "internal-only" edge port in this k8s
+# deployment to lock down (unlike the compose self-host path's separate
+# admin/metrics listeners, CT_EDGE_ADMIN_LISTEN/CT_EDGE_METRICS_LISTEN --
+# neither is configured here, see edge-config.yaml).
+#
+# So this is deliberately a from-everywhere allow, scoped only to the actual
+# data-plane port -- the point of pairing it with the default-deny policy is
+# making that "this port is intentionally open to the internet, everything
+# else on this pod is not" explicit and auditable, not narrowing it further.
+# If a future change adds an edge admin/metrics port to the k8s deployment,
+# it must get its own explicitly-scoped allow rule here (or its own policy)
+# rather than silently riding on this one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ct-edge
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ct-edge
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: UDP
+          port: 4433
+        - protocol: TCP
+          port: 4433

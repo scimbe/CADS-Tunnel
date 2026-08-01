@@ -1,0 +1,31 @@
+# #314: namespace.yaml's own comment says objects live in ct-system "so the
+# operator can scope RBAC, quotas and network policies to the tunnel service"
+# -- but nothing here actually provided one, so the namespace boundary alone
+# gave zero L3/L4 isolation: any pod in any namespace in a shared cluster
+# could reach the control plane's :8090 (a partly-unauthenticated HTTP API,
+# cf. #87) or any port the edge later exposes beyond its deliberately-public
+# data plane.
+#
+# Default-deny all ingress to every pod in ct-system; control-plane-
+# networkpolicy.yaml and edge-networkpolicy.yaml then punch the specific,
+# documented holes each service actually needs. (No default-deny on egress:
+# this namespace's pods need outbound to arbitrary Agent-controlled
+# addresses -- QUIC dials, DNS-01 provider calls, etc. -- restricting egress
+# would need a much more specific allow-list per service, a separate,
+# larger piece of work than closing this namespace's open-by-default ingress.)
+#
+# Requires a NetworkPolicy-enforcing CNI (Calico, Cilium, etc.) to actually
+# take effect -- some CNIs (e.g. plain flannel) accept but silently don't
+# enforce NetworkPolicy objects; verify your cluster's CNI supports
+# enforcement before relying on this as your only control.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
