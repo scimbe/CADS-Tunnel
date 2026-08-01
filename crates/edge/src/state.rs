@@ -462,14 +462,24 @@ impl<H: Clone> EdgeState<H> {
     /// Register the Agent tunnel and record its Edge-observed peer candidate —
     /// the reflexive address a Client will hole-punch toward (M11.1). Returns the
     /// registration id (see [`register`](Self::register)).
+    ///
+    /// #282: `register` (the `agents` insert) runs FIRST, `candidates` second —
+    /// the reverse of this function's original order. This half of the #282
+    /// mitigation matters together with [`remove_registration`](Self::remove_registration)'s
+    /// own re-check: with `agents` populated before `candidates`, a concurrent
+    /// `remove_registration` that re-checks `agents` right before wiping
+    /// `candidates` reliably observes this registration and backs off, instead
+    /// of a residual empty-`agents`-but-about-to-insert-`candidates` window
+    /// letting the teardown race ahead of it.
     pub fn register_with_candidate(
         &self,
         token: RoutingToken,
         handle: H,
         candidate: SocketAddr,
     ) -> u64 {
-        self.candidates.lock_safe().insert(token.clone(), candidate);
-        self.register(token, handle)
+        let id = self.register(token.clone(), handle);
+        self.candidates.lock_safe().insert(token, candidate);
+        id
     }
 
     /// The Agent's Edge-observed peer candidate for `token`, if recorded.
@@ -518,19 +528,39 @@ impl<H: Clone> EdgeState<H> {
     /// connection dropped — leaving any other redundant Agents in place (#8).
     /// The token's candidate/direct entries are cleared only when the **last**
     /// Agent for the token is gone.
+    ///
+    /// #282: `agents`, `candidates`, `direct` and `hosts` are four independent
+    /// mutexes (no combined lock), so this can't be made fully atomic against a
+    /// *concurrent* `register_with_candidate` for the same token without a
+    /// larger lock-architecture change. What this DOES close: the original code
+    /// dropped the `agents` lock and then unconditionally wiped
+    /// candidates/direct/hosts — if a redundant Agent's `register_with_candidate`
+    /// landed in that window, its brand-new candidate/hostname route was wiped
+    /// out from under it, live in `agents` but unreachable until it happened to
+    /// re-advertise. Re-checking `agents` right before the wipe (combined with
+    /// `register_with_candidate` now populating `agents` before `candidates`,
+    /// so a racing registration is visible here) collapses that into a
+    /// sub-lock-acquisition window — not zero, but the practical difference
+    /// between "any register during the whole cleanup" and "a register landing
+    /// in the few instructions between two specific lock calls".
     pub fn remove_registration(&self, token: &RoutingToken, id: u64) {
         let mut agents = self.agents.lock_safe();
-        if let Some(v) = agents.get_mut(token) {
-            v.retain(|(rid, _)| *rid != id);
-            if v.is_empty() {
-                agents.remove(token);
-                drop(agents);
-                self.candidates.lock_safe().remove(token);
-                self.direct.lock_safe().remove(token);
-                // The tunnel is gone — drop its hostname routes too (#23 BP4a).
-                self.clear_hosts_for(token);
-            }
+        let Some(v) = agents.get_mut(token) else { return };
+        v.retain(|(rid, _)| *rid != id);
+        if !v.is_empty() {
+            return;
         }
+        agents.remove(token);
+        drop(agents);
+        // Re-check: a concurrent register_with_candidate may have already
+        // repopulated `agents` for this token in the gap above.
+        if self.agents.lock_safe().contains_key(token) {
+            return;
+        }
+        self.candidates.lock_safe().remove(token);
+        self.direct.lock_safe().remove(token);
+        // The tunnel is gone — drop its hostname routes too (#23 BP4a).
+        self.clear_hosts_for(token);
     }
 
     /// Remove **all** Agent tunnels (and candidate + direct + tcp) for `token` —
@@ -913,6 +943,42 @@ mod tests {
         state.register_with_candidate(token(2), 7u32, cand);
         assert_eq!(state.route(&token(2)), Some(7), "handle routable");
         assert_eq!(state.candidate(&token(2)), Some(cand), "candidate recorded");
+    }
+
+    #[test]
+    fn remove_registration_never_leaves_a_live_agent_without_its_candidate_282() {
+        // #282: a concurrent register_with_candidate that races a remove_registration
+        // teardown for the same token must never end up "live in agents but missing
+        // its candidate/hosts" -- exercised as a stress test (genuine thread
+        // concurrency, not a hand-crafted single interleaving) because the four maps
+        // involved are independent mutexes with no combined lock; this can't assert
+        // zero residual race window (documented on remove_registration itself), only
+        // that the invariant holds under real contention across many iterations.
+        use std::sync::Arc;
+        let state = Arc::new(EdgeState::<u32>::new());
+        let t = token(42);
+        let cand: std::net::SocketAddr = "203.0.113.7:51820".parse().unwrap();
+
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let state = Arc::clone(&state);
+                let t = t.clone();
+                scope.spawn(move || {
+                    for i in 0..200u64 {
+                        let id = state.register_with_candidate(t.clone(), i as u32, cand);
+                        // The invariant this bug violated: while this registration is
+                        // live, its candidate must be present.
+                        if state.registration_count(&t) > 0 {
+                            assert!(
+                                state.candidate(&t).is_some(),
+                                "a live registration with no candidate (#282 regression)"
+                            );
+                        }
+                        state.remove_registration(&t, id);
+                    }
+                });
+            }
+        });
     }
 
     #[test]
