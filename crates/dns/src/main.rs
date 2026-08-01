@@ -6,6 +6,10 @@
 //! - `CT_DNS_LISTEN`     — DNS listener (default `0.0.0.0:53`; needs privilege).
 //! - `CT_DNS_API_LISTEN` — mutation API (default `127.0.0.1:8053`; keep loopback).
 //! - `CT_DNS_API_TOKEN`  — optional `x-ct-dns-token` shared secret.
+//! - `CT_DNS_STORE_PATH` — optional path to persist published challenge records
+//!   (#302) so a restart mid-issuance doesn't lose a record Let's Encrypt's
+//!   multi-perspective validation hasn't seen yet. Unset -> in-memory only,
+//!   same as before.
 //!
 //! `ct-dns selftest`: validate a deSEC token + zone end to end — publish a TXT via
 //! the deSEC API, query the authoritative nameserver directly (bypassing global
@@ -41,7 +45,14 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         if token.is_some() { " (token required)" } else { "" }
     );
 
-    let store = Arc::new(AcmeDnsStore::new());
+    let store = match std::env::var("CT_DNS_STORE_PATH").ok().filter(|s| !s.is_empty()) {
+        Some(path) => {
+            let store = AcmeDnsStore::open(&path)?;
+            eprintln!("ct-dns: challenge store persisted to {path} (#302)");
+            Arc::new(store)
+        }
+        None => Arc::new(AcmeDnsStore::new()),
+    };
     tokio::try_join!(
         ct_dns::server::serve_udp(store.clone(), dns_listen),
         ct_dns::server::serve_tcp(store.clone(), dns_listen),
