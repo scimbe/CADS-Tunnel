@@ -15,7 +15,9 @@ resources:
   - control-plane-deployment.yaml
   - control-plane-service.yaml
   - control-plane-ingress.yaml
+  - control-plane-pdb.yaml
   - edge-config.yaml
   - edge-pvc.yaml
   - edge-deployment.yaml
   - edge-service.yaml
+  - edge-pdb.yaml

@@ -1,0 +1,26 @@
+# #311: replicas: 1 is forced (SQLite on a ReadWriteOnce PVC is a single
+# writer -- see control-plane-pvc.yaml/control-plane-deployment.yaml), but
+# without a PodDisruptionBudget, a voluntary eviction (kubectl drain for a
+# node update, cluster-autoscaler node consolidation, etc.) has no guard and
+# can take the only replica down for the whole drain -- Portal/Auth/tunnel
+# issuance all offline, for a project whose stated goal is survivability.
+#
+# minAvailable: 1 with replicas: 1 means the eviction API refuses a voluntary
+# eviction of the only pod (0 available would violate minAvailable: 1) --
+# real HA still requires moving SQLite off this single-writer PVC (e.g.
+# Postgres) so replicas can actually scale; until then this at least forces
+# an operator to explicitly override rather than silently losing the pod to
+# routine cluster maintenance.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ct-control-plane
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-control-plane
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ct-control-plane

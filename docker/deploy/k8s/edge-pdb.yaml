@@ -1,0 +1,18 @@
+# #311: same reasoning as control-plane-pdb.yaml -- the edge is also pinned
+# to replicas: 1 (each edge mints its own internal CA; multi-edge shared-CA
+# distribution is a later concern, see edge-deployment.yaml's header), so a
+# voluntary eviction with no PDB guard can take the entire data plane down
+# for the duration of a routine node drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ct-edge
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ct-edge
