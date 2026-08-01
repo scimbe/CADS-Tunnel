@@ -47,6 +47,7 @@ claim is "we can't read what you send", not anonymity.
 | Origin Noise private key | Agent process (custodian) | only the public half travels (in the Capability) |
 | Deployment env (`CT_OIDC_ISSUER`, ports) | `docker/deploy/.env` (self-host) / K8s Secret (hosted) | `.env` is **gitignored**; only `.env.example` templates are committed; K8s secrets supplied out-of-band (sealed-secrets / external-secrets) |
 | Join token | Operator → agent, single-use | short-lived, consumed on first redeem |
+| **Headless-pipeline customer TLS private key (#322)** | Generated transiently on the **operator's own machine** by `scripts/authorize-pipeline.sh` (real Let's Encrypt cert via DNS-01 against the operator's `DESEC_TOKEN`), then handed to the pipeline maintainer out of band | **Documented exception to ADR-0001/0003**, not an oversight — see Residual risk 6 below for why this exists and its actual exposure |
 
 **Rules:** no real secret is ever committed; `Cargo.lock` is committed and pinned;
 `scripts/check-no-secrets.sh` runs in CI to enforce the no-committed-secrets rule;
@@ -91,3 +92,33 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    free; the exposure it adds over a verified-email realm is bounded to **funded
    sybil abuse**, which is already residual #1 above. If SMTP is added later,
    flip `verifyEmail=true` to raise the bar; until then, accepted residual.
+6. **Operator-generated TLS keys for headless pipelines (#322)** — `docs/ops/runbook.md`'s
+   "Authorize a new pipeline hostname (headless agents)" procedure has the operator run
+   ACME DNS-01 (via their own `DESEC_TOKEN`) and generate a real Let's Encrypt cert +
+   private key **on the operator's own machine**, then hand `fullchain.pem`/`privkey.pem`
+   to the pipeline maintainer out of band. This is a genuine, acknowledged violation of
+   ADR-0001 ("TLS private keys and certificates live only on the customer's Agent/Origin,
+   never on the Edge") and ADR-0003 ("Operator-issued certificates are prohibited: they
+   would place the decrypting key on the operator side") — for every tunnel onboarded
+   this way, the "the operator cannot read your bytes" claim does not hold during the
+   transient window the key exists on the operator's machine, until the pipeline
+   maintainer rotates it themselves (they never do, in practice, since the delivered key
+   is what their origin's Caddyfile serves indefinitely). This exists because headless
+   pipeline agents (flappy-demo, cookbook-demo — no portal/Keycloak account, so no
+   session to drive the self-serve `POST /portal/tunnels` flow) have no path to the
+   properly zero-knowledge agent-side ACME flow ADR-0003 describes (the Agent generates
+   its own keypair and drives its own ACME client; the operator only satisfies the DNS-01
+   challenge, whose value derives from the ACME account-key thumbprint, never the
+   certificate key). **The real fix is agent-side**: `authorize()` in
+   `crates/control-plane/src/acme_broker.rs` gates the admission broker purely on
+   routing-token ownership, not a Keycloak session — so a headless pipeline agent that
+   already has a routing token (which `authorize-pipeline.sh` already mints) may already
+   be able to drive `ct-agent`'s own ACME client against this control plane's existing
+   `/agent/acme-admission/*` + DNS-01-challenge broker instead of the operator running
+   certbot locally. **Not verified or implemented this pass** — it needs real testing
+   against a live headless pipeline (flappy-demo or cookbook-demo) to confirm `ct-agent`'s
+   ACME orchestration actually works unattended for a static-Caddyfile origin, which is a
+   deliberate scope/testing decision, not a code change I want to make speculatively
+   against a runbook procedure live pipeline maintainers currently depend on. Until that's
+   done: accepted residual, now honestly documented instead of silently contradicting
+   ADR-0001/0003.

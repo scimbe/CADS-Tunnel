@@ -197,6 +197,18 @@ checkout with `docker/deploy/.env` present:
 ./scripts/authorize-pipeline.sh <hostname> [tenant] --skip-cert   # host-auth + token only, no cert
 ```
 
+> **#322 — this step is a documented exception to ADR-0001/0003, not the
+> zero-knowledge path.** Running ACME DNS-01 here means the operator's own
+> machine generates and transiently holds this hostname's real TLS **private**
+> key before handing it off — for the window it exists locally, the "the
+> operator cannot read your bytes" claim does not hold for this tunnel. This
+> is accepted because headless pipeline agents (no portal/Keycloak account)
+> have no path today to the properly zero-knowledge agent-side ACME flow
+> ADR-0003 describes. See `docs/security/threat-model.md` residual risk #6 for
+> the full rationale and the real (unimplemented) fix. Use this for demo/
+> pipeline hostnames you control the risk tolerance for — not as the general
+> onboarding path.
+
 It authorizes `<hostname>` at the edge (via the public, admin-gated `POST
 /registry/authorize-host/:token/:host`, #214 — no loopback access needed),
 **issues a real Let's Encrypt cert for that single hostname** (DNS-01 via the
