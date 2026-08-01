@@ -15,7 +15,7 @@
 //! fails the AEAD tag and no session forms — only the intended member can complete it.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use snow::TransportState;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -28,6 +28,19 @@ pub const A2A_MAX_MESSAGE: usize = 65519;
 
 fn noise_io(e: snow::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("noise: {e}"))
+}
+
+/// Opt-in timing visibility into the A2A handshake (found live, 2026-08-01, debugging why a
+/// cross-NAT channel round to a real remote peer would hang until the caller's own outer
+/// timeout fired with zero diagnostic signal in between): neither [`a2a_initiate`] nor
+/// [`a2a_respond`] has any internal timeout of its own on the peer's handshake response --
+/// they rely entirely on whatever the caller wraps them in, and until now gave no visibility
+/// into whether/how long that read was actually blocked. Silent unless `CT_DEBUG_A2A_TIMING`
+/// is set (any value), so normal operation is unaffected; the env check only runs once per
+/// handshake, not a hot path. Callers needing this in a long-running process (not a one-shot
+/// CLI process like ct-agent) should cache the env lookup themselves.
+fn debug_a2a_timing_enabled() -> bool {
+    std::env::var_os("CT_DEBUG_A2A_TIMING").is_some()
 }
 
 /// Initiator half of the A2A handshake: run `Noise_IK` over `(send, recv)` pinning the
@@ -44,12 +57,30 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let debug = debug_a2a_timing_enabled();
     let mut hs = client_handshake(own_noise_private, peer_noise_pubkey).map_err(noise_io)?;
     let mut buf = [0u8; 1024];
     let mut tmp = [0u8; 1024];
     let n = hs.write_message(&[], &mut buf).map_err(noise_io)?;
     send.write_all(&frame(&buf[..n])).await?;
-    let m2 = read_frame(recv).await?;
+    if debug {
+        eprintln!("ct-a2a-timing: initiator sent handshake message 1, waiting for the peer's message 2...");
+    }
+    let wait_start = Instant::now();
+    let m2 = match read_frame(recv).await {
+        Ok(m2) => {
+            if debug {
+                eprintln!("ct-a2a-timing: initiator received message 2 after {:?}", wait_start.elapsed());
+            }
+            m2
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("ct-a2a-timing: initiator's read for message 2 failed after {:?}: {e}", wait_start.elapsed());
+            }
+            return Err(e);
+        }
+    };
     hs.read_message(&m2, &mut tmp).map_err(noise_io)?;
     hs.into_transport_mode().map_err(noise_io)
 }
@@ -65,10 +96,28 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    let debug = debug_a2a_timing_enabled();
     let mut hs = origin_handshake(own_noise_private).map_err(noise_io)?;
     let mut buf = [0u8; 1024];
     let mut tmp = [0u8; 1024];
-    let m1 = read_frame(recv).await?;
+    if debug {
+        eprintln!("ct-a2a-timing: responder waiting for the initiator's message 1...");
+    }
+    let wait_start = Instant::now();
+    let m1 = match read_frame(recv).await {
+        Ok(m1) => {
+            if debug {
+                eprintln!("ct-a2a-timing: responder received message 1 after {:?}", wait_start.elapsed());
+            }
+            m1
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("ct-a2a-timing: responder's read for message 1 failed after {:?}: {e}", wait_start.elapsed());
+            }
+            return Err(e);
+        }
+    };
     hs.read_message(&m1, &mut tmp).map_err(noise_io)?;
     let n = hs.write_message(&[], &mut buf).map_err(noise_io)?;
     send.write_all(&frame(&buf[..n])).await?;
