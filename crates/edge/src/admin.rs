@@ -21,12 +21,14 @@ use serde::Serialize;
 use crate::state::EdgeState;
 use ct_common::RoutingToken;
 
-/// Build the admin router (#27 revoke, #23 BP4b authorize-host, #153 host-auth dump).
+/// Build the admin router (#27 revoke, #23 BP4b authorize-host, #153 host-auth dump,
+/// monitoring-feature v1 tunnel-status).
 pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
     Router::new()
         .route("/admin/revoke/:token", post(revoke))
         .route("/admin/authorize-host/:token/:host", post(authorize_host))
         .route("/admin/host-auth-dump", get(host_auth_dump))
+        .route("/admin/tunnel-status/:token", get(tunnel_status))
         .with_state(state)
 }
 
@@ -141,6 +143,40 @@ async fn host_auth_dump(
         })
         .collect();
     Ok(Json(entries))
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct TunnelStatusResp {
+    connected: bool,
+    registrations: usize,
+}
+
+/// `GET /admin/tunnel-status/:token` (monitoring feature v1, operator decision
+/// 2026-08-01): whether `token` currently has a live Agent registration, and how
+/// many (redundant Agents, #8, count separately). Read-only, admin-token-gated
+/// like every other route here. This is deliberately a per-tunnel query, not a
+/// bulk dump -- the control plane calls it once per tunnel it's rendering
+/// (owner-scoped in the portal; the operator may query any token directly for
+/// cross-tenant visibility, per the same admin-token trust already granted by
+/// every other route on this router). ADR-0016 still applies: this reveals only
+/// connection liveness, not payload or per-connection detail.
+async fn tunnel_status(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<Json<TunnelStatusResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let Some(t) = parse_token_hex(&token) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let token = RoutingToken(t);
+    let registrations = state.registration_count(&token);
+    Ok(Json(TunnelStatusResp {
+        connected: registrations > 0,
+        registrations,
+    }))
 }
 
 /// Parse a 64-hex string into 32 bytes.
@@ -306,6 +342,52 @@ mod tests {
                 ("flappy-demo.bunsenbrenner.org".to_string(), "bb".repeat(32)),
                 ("help.bunsenbrenner.org".to_string(), "aa".repeat(32)),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_status_is_admin_gated_and_reports_live_registration_count() {
+        // Monitoring feature v1 (2026-08-01): the per-tunnel "connected or not" query --
+        // must require the admin token, and must report the live registration count
+        // (0 for never-registered/unknown). The boolean/count logic itself
+        // (registered -> connected, redundant agents -> count > 1, evicted -> not
+        // connected) is proven directly against EdgeState in state.rs's own
+        // `tunnel_status_reflects_registration_count` test (generic over the handle
+        // type, no real quinn::Connection needed); this test covers the HTTP/auth
+        // layer this endpoint hardcodes EdgeState<Connection> for.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x66u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let tok_hex = "cc".repeat(32);
+
+        let get = |auth: Option<String>, path: String| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get(path);
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        assert_eq!(
+            get(None, format!("/admin/tunnel-status/{tok_hex}")).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "no admin token -> 401"
+        );
+
+        // Never registered -> connected=false, registrations=0.
+        let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
+        assert!(!status.connected);
+        assert_eq!(status.registrations, 0);
+
+        // Malformed token hex -> 400, not a panic.
+        assert_eq!(
+            get(Some(secret_hex), "/admin/tunnel-status/not-hex".to_string()).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

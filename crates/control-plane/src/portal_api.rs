@@ -329,6 +329,33 @@ fn auto_hostname(zone: &str, name: &str, subject: &str) -> String {
 /// step to onboard with; see the tunnel's Install link for its tokens.
 /// Additional tunnels and custom hostnames are a planned paid tier (shown,
 /// disabled, in [`tunnels_html`]).
+/// Monitoring feature v1 (operator decision, 2026-08-01): "connected or not" for
+/// `routing_token_hex`, queried live from the edge's `GET /admin/tunnel-status/:token`
+/// (`crates/edge/src/admin.rs`). Best-effort like [`tunnels_page`]'s existing
+/// admission lookup: `None` when `edge_admin` isn't configured or the call fails,
+/// so a transient edge/network hiccup just omits the badge rather than failing the
+/// whole page. `routing_token` is server-side-only (never rendered) but the edge
+/// call itself needs it in the URL path, same trust boundary as every other
+/// edge-admin call this file already makes.
+async fn edge_tunnel_connected(st: &ApiState, routing_token_hex: &str) -> Option<bool> {
+    let edge = st.edge_admin.as_ref()?;
+    let endpoint = format!("{}/admin/tunnel-status/{routing_token_hex}", edge.url.trim_end_matches('/'));
+    let resp = edge_admin_http_client()
+        .get(&endpoint)
+        .header("x-ct-admin-token", edge.token.as_ref())
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    #[derive(Deserialize)]
+    struct TunnelStatusResp {
+        connected: bool,
+    }
+    resp.json::<TunnelStatusResp>().await.ok().map(|s| s.connected)
+}
+
 async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
     let Some(subject) = session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
@@ -342,21 +369,22 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     }
     match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(tunnels) => {
-            // #233: fetch each hostname's Rot/Gelb/Grün admission state
-            // alongside its tunnel row -- best-effort per-row (a lookup
-            // failure just omits that row's tier badge rather than failing
-            // the whole page, matching this handler's existing tolerance
-            // for partial data).
-            let rows: Vec<_> = tunnels
-                .into_iter()
-                .map(|(t, owned)| {
-                    let admission = t
-                        .hostname
-                        .as_deref()
-                        .and_then(|h| st.tunnels.cert_admission_for_hostname(h).ok().flatten());
-                    (t, owned, admission)
-                })
-                .collect();
+            // #233: fetch each hostname's Rot/Gelb/Grün admission state, and
+            // (monitoring v1) its live connection status, alongside its tunnel row
+            // -- best-effort per-row (a lookup failure just omits that row's badge
+            // rather than failing the whole page, matching this handler's existing
+            // tolerance for partial data). Sequential, not concurrent: Standard tier
+            // is one tunnel per account, so this is at most one extra HTTP round
+            // trip per page view today.
+            let mut rows = Vec::with_capacity(tunnels.len());
+            for (t, owned) in tunnels {
+                let admission = t
+                    .hostname
+                    .as_deref()
+                    .and_then(|h| st.tunnels.cert_admission_for_hostname(h).ok().flatten());
+                let connected = edge_tunnel_connected(&st, &t.routing_token).await;
+                rows.push((t, owned, admission, connected));
+            }
             Html(tunnels_html(&rows)).into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
@@ -838,10 +866,12 @@ fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String
     }
 }
 
-fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool, Option<crate::storage::CertAdmission>)]) -> String {
+fn tunnels_html(
+    tunnels: &[(crate::storage::SubjectTunnel, bool, Option<crate::storage::CertAdmission>, Option<bool>)],
+) -> String {
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission)| {
+        .map(|(t, owned, admission, connected)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -866,8 +896,16 @@ fn tunnels_html(tunnels: &[(crate::storage::SubjectTunnel, bool, Option<crate::s
                 )
             };
             let tier = admission.as_ref().map(|a| cert_tier_html(&id, a)).unwrap_or_default();
+            // Monitoring feature v1: live connection status, best-effort -- absent
+            // (edge unreachable, or CT_CP_EDGE_ADMIN_URL not configured) renders
+            // nothing rather than a misleading "offline".
+            let status = match connected {
+                Some(true) => r#" <span class="tier" style="color:#3fb950">🟢 Connected</span>"#.to_string(),
+                Some(false) => r#" <span class="tier" style="color:#8b949e">⚪ Not connected</span>"#.to_string(),
+                None => String::new(),
+            };
             format!(
-                r#"<div class="row"><span class="v">{name}{host}</span><span>{owner_actions}
+                r#"<div class="row"><span class="v">{name}{host}{status}</span><span>{owner_actions}
 </span></div>{tier}"#,
                 name = escape(&t.name),
             )
@@ -1793,6 +1831,99 @@ mod tests {
             .expect("a second authorize-host call pushed channel_tier=gelb synchronously");
         assert_eq!(gelb_push.0, tunnel.routing_token);
         assert_eq!(gelb_push.2, "edge-secret");
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_shows_live_connection_status_from_the_edge_248() {
+        // Monitoring feature v1 (2026-08-01): the portal queries the edge's
+        // GET /admin/tunnel-status/:token for the caller's own tunnel and renders a
+        // Connected/Not-connected badge -- best-effort (the page must still render
+        // if the edge call fails), and must never be shown for a tunnel the caller
+        // doesn't own (implicitly covered: tunnels_page only ever queries the
+        // caller's own routing_token).
+        use axum::extract::{Path as AxPath, State as AxState};
+        use axum::http::HeaderMap as AxHeaderMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let seen_token: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let connected = Arc::new(AtomicBool::new(true));
+        let seen = seen_token.clone();
+        let conn = connected.clone();
+        let mock = Router::new()
+            .route("/admin/authorize-host/:token/:host", post(|| async { StatusCode::OK }))
+            .route(
+                "/admin/tunnel-status/:token",
+                axum::routing::get(move |AxState(_): AxState<()>, headers: AxHeaderMap, AxPath(token): AxPath<String>| {
+                    let seen = seen.clone();
+                    let conn = conn.clone();
+                    async move {
+                        assert_eq!(
+                            headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()),
+                            Some("edge-secret"),
+                            "the portal must authenticate this call the same way as every other edge-admin call"
+                        );
+                        *seen.lock().unwrap() = Some(token);
+                        Json(serde_json::json!({"connected": conn.load(Ordering::SeqCst), "registrations": 1}))
+                    }
+                }),
+            )
+            .with_state(());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels.clone(),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+            None,
+            None,
+            EdgeMeshHandle::new(Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()), Arc::from("primary")),
+            None,
+        );
+
+        // Connected -> the green badge, and the edge was queried with this exact
+        // tunnel's routing token (server-side only, never rendered itself).
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Connected"), "shows the connected badge");
+        let tunnel = &tunnels.list_for_subject("alice").unwrap()[0];
+        assert_eq!(seen_token.lock().unwrap().as_deref(), Some(tunnel.routing_token.as_str()));
+        assert!(!html.contains(&tunnel.routing_token), "the raw routing token itself is never rendered");
+
+        // Not connected -> the different badge, not a page failure.
+        connected.store(false, Ordering::SeqCst);
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Not connected"));
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_renders_fine_when_edge_admin_is_unconfigured_248() {
+        // Best-effort per tunnels_page's own established tolerance (#233's admission
+        // lookup has the same posture): no edge_admin configured -> no status badge,
+        // but the page must still render successfully, not error out.
+        let app = portal_api_router(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None, // no edge_admin
+            None,
+            None,
+            EdgeMeshHandle::new(Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()), Arc::from("primary")),
+            None,
+        );
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!html.contains("Connected") && !html.contains("Not connected"));
     }
 
     #[tokio::test]

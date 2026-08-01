@@ -512,6 +512,17 @@ impl<H: Clone> EdgeState<H> {
         self.agents.lock_safe().get(token).map_or(0, Vec::len)
     }
 
+    /// Is `token` currently connected (at least one live Agent registration)?
+    /// The per-tunnel counterpart to [`active_tunnels`](Self::active_tunnels)'s
+    /// fleet-wide gauge -- monitoring-feature v1 (operator decision, 2026-08-01):
+    /// "connected or not" is the first piece of per-tunnel status surfaced to a
+    /// tunnel's own owner (and, via the admin API, to the operator for any
+    /// tunnel) -- see `crates/edge/src/admin.rs`'s `tunnel_status` route. Pure
+    /// read of already-tracked state, no new bookkeeping.
+    pub fn tunnel_status(&self, token: &RoutingToken) -> bool {
+        self.registration_count(token) > 0
+    }
+
     /// Distinct routing tokens with at least one live Agent — the number of
     /// tunnels the Edge is currently serving (observability gauge, #10).
     pub fn active_tunnels(&self) -> usize {
@@ -679,6 +690,25 @@ mod tests {
         state.register(token(1), 42u32);
         assert_eq!(state.route(&token(1)), Some(42));
         assert!(state.is_known(&token(1)));
+    }
+
+    #[test]
+    fn tunnel_status_reflects_registration_count() {
+        // Monitoring feature v1 (2026-08-01): never registered -> false; one live
+        // registration -> true; a second redundant one (#8) -> still true.
+        let state = EdgeState::new();
+        assert!(!state.tunnel_status(&token(1)), "never registered -> not connected");
+        let id_a = state.register(token(1), 1u32);
+        assert!(state.tunnel_status(&token(1)));
+        let id_b = state.register(token(1), 2u32);
+        assert!(state.tunnel_status(&token(1)), "still connected with two redundant agents");
+        // Evicting one of two still leaves it connected; evicting the last does not.
+        state.remove_registration(&token(1), id_a);
+        assert!(state.tunnel_status(&token(1)), "one of two evicted -> still connected");
+        state.remove_registration(&token(1), id_b);
+        assert!(!state.tunnel_status(&token(1)), "last one evicted -> not connected");
+        // A different, never-registered token is unaffected.
+        assert!(!state.tunnel_status(&token(2)));
     }
 
     #[test]
