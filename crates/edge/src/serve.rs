@@ -1907,9 +1907,26 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         match addr.parse::<SocketAddr>() {
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
                 Ok(rl) => {
+                    // #255: same global ConnectionCap as the other accept loops (QUIC, TCP
+                    // fallback, :443 front door) -- this listener is public and previously
+                    // spawned an unbounded task per accepted connection, so a flood here
+                    // could exhaust FDs/tasks for the whole edge process regardless of the
+                    // caps already enforced everywhere else.
+                    let conn_cap_redirect = conn_cap.clone();
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = rl.accept().await {
+                            let permit = match &conn_cap_redirect {
+                                Some(cap) => match cap.try_admit() {
+                                    Some(p) => Some(p),
+                                    None => {
+                                        drop(tcp); // shed: over the cap, close cheaply
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
                             tokio::spawn(async move {
+                                let _permit = permit; // held for the connection's lifetime
                                 let _ = serve_http_redirect(tcp).await;
                             });
                         }
