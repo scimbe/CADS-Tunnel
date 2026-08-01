@@ -79,6 +79,24 @@ HANDLER_CMD_IN_CONTAINER="/opt/handler/$HANDLER_BASENAME"
 
 echo "serve-role-container: starting $CONTAINER_NAME SERVICE=$SERVICE HANDLER=$HANDLER_BASENAME via broker=$CT_AGENT_EDGE_BROKER (image=$IMAGE)" >&2
 
+# #320: run as the CALLING host user, not root. The container's role handler needs
+# read access to $CLAUDE_HOME to invoke `claude` at all (that's the whole point of
+# this bind mount), so a compromised/prompt-injected handler can still read and
+# exfiltrate the credentials it's legitimately handed — no `--user` change closes
+# that; only a credentials-proxy that never exposes the raw secret would (a real
+# architecture change, out of scope here, see the issue). What running as the host
+# UID *does* close is the broader root-in-container blast radius: without it the
+# container process is real root (host UID 0, full CAP_DAC_OVERRIDE), able to read
+# the credentials regardless of their host file permissions and with every other
+# root-only privilege besides. Running as the host UID means the kernel's own
+# permission check on the bind-mounted files applies same as on the host — no
+# capability bypass — and confines the process to exactly the access its owning
+# user already has, matching this repo's other "don't run containers as root"
+# findings (#305).
+RUNTIME_UID="$(id -u)"
+RUNTIME_GID="$(id -g)"
+RUNTIME_HOME="/home/ct-role"
+
 RUNTIME_ENV="$(mktemp)"
 trap 'rm -f "$RUNTIME_ENV"' EXIT
 {
@@ -92,17 +110,18 @@ trap 'rm -f "$RUNTIME_ENV"' EXIT
   printf 'CT_CHANNEL_GRANT=%s\n' "$GRANT"
   printf 'CT_AGENT_SERVICE_HANDLER_CMD=%s\n' "$HANDLER_CMD_IN_CONTAINER"
   printf 'CT_AGENT_SERVICES=%s\n' "$SERVICE"
-  printf 'HOME=/root\n'
+  printf 'HOME=%s\n' "$RUNTIME_HOME"
 } > "$RUNTIME_ENV"
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$CONTAINER_NAME" \
   --restart unless-stopped \
   --network "${DOCKER_NETWORK:-bridge}" \
+  --user "$RUNTIME_UID:$RUNTIME_GID" \
   --env-file "$RUNTIME_ENV" \
   -v "$CLAUDE_REAL_BIN:/usr/local/bin/claude:ro" \
-  -v "$CLAUDE_HOME:/root/.claude:ro" \
-  $([ -f "$CLAUDE_JSON" ] && printf -- '-v %s:/root/.claude.json:ro' "$CLAUDE_JSON") \
+  -v "$CLAUDE_HOME:$RUNTIME_HOME/.claude:ro" \
+  $([ -f "$CLAUDE_JSON" ] && printf -- '-v %s:%s/.claude.json:ro' "$CLAUDE_JSON" "$RUNTIME_HOME") \
   -v "$HANDLER_CMD_HOST:$HANDLER_CMD_IN_CONTAINER:ro" \
   "$IMAGE" \
   ct-agent channel
