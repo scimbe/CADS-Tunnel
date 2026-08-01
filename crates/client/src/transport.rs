@@ -492,7 +492,17 @@ pub async fn client_tunnel_auto(
     payload: &[u8],
     timeout: Duration,
 ) -> Result<(bool, Vec<u8>), BoxError> {
-    let direct = query_direct_endpoint(edge_conn, token).await.ok().flatten();
+    // #283: query_direct_endpoint's read_to_end had no deadline of its own -- a
+    // stalled/malicious Edge that accepts the 'P' query but never answers could
+    // hang here forever, before the direct attempt (which DOES already respect
+    // `timeout`) even starts. A bounded query that fails/times out is treated
+    // the same as "no direct endpoint advertised" (falls through to relay),
+    // matching the existing `.ok().flatten()` fail-soft contract.
+    let direct = tokio::time::timeout(timeout, query_direct_endpoint(edge_conn, token))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
     client_tunnel_p2p_or_relay(edge_conn, token, cap, client_private, payload, direct, timeout).await
 }
 
@@ -517,8 +527,16 @@ pub async fn client_tunnel_p2p_or_relay(
             }
         }
     }
-    // Fallback: PoW-gated rendezvous + Noise tunnel through the Edge relay.
-    let resp = client_tunnel_noise(edge_conn, token, cap, client_private, payload).await?;
+    // Fallback: PoW-gated rendezvous + Noise tunnel through the Edge relay. #283:
+    // this ran with no deadline of its own -- only the direct-connect attempt
+    // above respected `timeout`. A stalled/malicious Edge that accepts the
+    // connection but never sends the challenge (or stalls the Noise handshake)
+    // hung this forever after a failed/absent direct attempt, undercutting the
+    // caller's tunnel-timeout guarantee. Reuses `timeout` (same bound already
+    // applied to the direct attempt) via the existing _timed wrapper
+    // (client_tunnel_noise_tcp_timed's QUIC analog) rather than inventing a
+    // second, separate relay deadline.
+    let resp = client_tunnel_noise_timed(edge_conn, token, cap, client_private, payload, timeout).await?;
     Ok((false, resp))
 }
 
@@ -742,6 +760,99 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "must return near the setup deadline, took {elapsed:?}"
+        );
+        edge.abort();
+    }
+
+    /// #283 regression: client_tunnel_p2p_or_relay's Edge-relay fallback ran
+    /// with no deadline of its own -- only the (skipped here, `direct: None`)
+    /// direct-connect attempt respected `timeout`. Against a stalled edge that
+    /// accepts the connection but never sends the rendezvous challenge, the
+    /// relay fallback must now return a timeout error promptly instead of
+    /// hanging forever.
+    #[tokio::test]
+    async fn p2p_or_relay_fallback_times_out_against_a_stalled_edge() {
+        let token = RoutingToken([11u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let _conn = server.accept().await.unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+
+        let start = Instant::now();
+        let r = client_tunnel_p2p_or_relay(
+            &conn,
+            &token,
+            &cap,
+            &client_kp.private,
+            b"hello",
+            None, // no direct candidate -> straight to the relay fallback
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "must error, not hang, when the edge never relays");
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "error should name the timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return near the deadline, took {elapsed:?}"
+        );
+        edge.abort();
+    }
+
+    /// #283 regression: query_direct_endpoint's read had no deadline of its
+    /// own -- client_tunnel_auto's whole `timeout` budget could be exhausted
+    /// before the direct attempt even started, against an edge that accepts
+    /// the 'P' query but never answers. A timed-out query must fall through to
+    /// the relay path (same as "no direct endpoint advertised"), not hang.
+    #[tokio::test]
+    async fn client_tunnel_auto_falls_through_to_relay_when_the_direct_endpoint_query_stalls() {
+        let token = RoutingToken([12u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        // A stalled edge: accepts the 'P' query's stream but never answers it,
+        // and never answers the relay fallback's rendezvous challenge either --
+        // both stages must be bounded by client_tunnel_auto's overall `timeout`.
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let _stream = conn.accept_bi().await; // accepts the 'P' query's stream, never answers
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+
+        let start = Instant::now();
+        let r = client_tunnel_auto(&conn, &token, &cap, &client_kp.private, b"hello", Duration::from_millis(300))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "must error, not hang, when both the direct query and the relay stall");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return near the deadline, took {elapsed:?} (a stuck direct-endpoint query must not eat the whole budget silently)"
         );
         edge.abort();
     }
