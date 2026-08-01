@@ -1646,7 +1646,12 @@ mod tests {
         // lookup_by_token/lookup_by_host join against mesh_edges, so the owning edge must
         // have heartbeated at least once to be resolvable (mirrors persistent_control_plane_router's
         // boot-time self-heartbeat for the real deployment).
-        mesh_store.heartbeat("primary", "test", 0).unwrap();
+        // #285: the heartbeat must also be recent (within OWNERSHIP_LIVENESS_SECS), not just present.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        mesh_store.heartbeat("primary", "test", now).unwrap();
         let app = portal_api_router(
             KEY,
             ledger,

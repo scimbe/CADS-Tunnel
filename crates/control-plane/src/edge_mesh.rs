@@ -39,6 +39,15 @@ use serde::{Deserialize, Serialize};
 use crate::storage::{open_tuned, sqlite_store_ctors};
 use ct_common::sync::MutexExt;
 
+/// #285: liveness window for [`SqliteEdgeMesh::lookup_by_token`]/[`SqliteEdgeMesh::lookup_by_host`]
+/// -- an edge that hasn't heartbeated within this many seconds is treated as dead for ownership
+/// resolution, even if its `mesh_edges` row hasn't been pruned yet. The edge heartbeats every 30s
+/// (`crates/edge/src/serve.rs`); 4x that tolerates a couple of missed beats from transient network
+/// blips (matching this file's existing "generous, not aggressive" cutoff philosophy — see
+/// [`SqliteEdgeMesh::prune_stale_edges`]'s own doc comment) without treating a briefly-jittery-but-
+/// alive edge as gone.
+const OWNERSHIP_LIVENESS_SECS: i64 = 120;
+
 /// SQLite-backed registry: which edge last heartbeated with which peer
 /// address, and which edge owns which routing token / hostname.
 pub struct SqliteEdgeMesh {
@@ -149,15 +158,19 @@ impl SqliteEdgeMesh {
         Ok(())
     }
 
-    /// Which edge (id, peer_addr) owns `token`, if any.
+    /// Which edge (id, peer_addr) owns `token`, if any. #285: the owning edge must have
+    /// heartbeated within [`OWNERSHIP_LIVENESS_SECS`] -- an edge that died (or was
+    /// decommissioned) without its stale `mesh_edges` row being pruned yet must not keep
+    /// resolving as a live owner, or mesh-relay/promotion traffic black-holes against its
+    /// dead `peer_addr` until someone notices and prunes manually.
     pub fn lookup_by_token(&self, token: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
             .lock_safe()
             .query_row(
                 "SELECT e.id, e.peer_addr FROM mesh_ownership o
                  JOIN mesh_edges e ON e.id = o.edge_id
-                 WHERE o.token = ?1",
-                params![token],
+                 WHERE o.token = ?1 AND e.last_seen >= ?2",
+                params![token, now_secs() - OWNERSHIP_LIVENESS_SECS],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -180,15 +193,16 @@ impl SqliteEdgeMesh {
             .map(|r| r.is_some())
     }
 
-    /// Which edge (id, peer_addr) owns `hostname`, if any.
+    /// Which edge (id, peer_addr) owns `hostname`, if any. #285: same liveness gate as
+    /// [`Self::lookup_by_token`] -- see its doc comment.
     pub fn lookup_by_host(&self, hostname: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.conn
             .lock_safe()
             .query_row(
                 "SELECT e.id, e.peer_addr FROM mesh_ownership o
                  JOIN mesh_edges e ON e.id = o.edge_id
-                 WHERE o.hostname = ?1",
-                params![hostname],
+                 WHERE o.hostname = ?1 AND e.last_seen >= ?2",
+                params![hostname, now_secs() - OWNERSHIP_LIVENESS_SECS],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -426,6 +440,36 @@ mod tests {
 
         assert!(s.lookup_by_token("unknown").unwrap().is_none());
         assert!(s.lookup_by_host("unknown.example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn lookup_by_token_and_host_stop_resolving_a_dead_edges_stale_ownership_row_285() {
+        let s = store();
+        let now = now_secs();
+        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        s.record_ownership("deadbeef", Some("app.example.com"), "edge-1", now).unwrap();
+
+        // Fresh heartbeat -> still resolves normally.
+        assert!(s.lookup_by_token("deadbeef").unwrap().is_some());
+        assert!(s.lookup_by_host("app.example.com").unwrap().is_some());
+
+        // edge-1 dies without its mesh_edges row being pruned: its last heartbeat ages
+        // past OWNERSHIP_LIVENESS_SECS, but mesh_ownership still points at it.
+        s.heartbeat("edge-1", "10.0.0.1:4437", now - OWNERSHIP_LIVENESS_SECS - 1).unwrap();
+
+        assert!(
+            s.lookup_by_token("deadbeef").unwrap().is_none(),
+            "a dead edge's stale ownership row must not keep resolving as a live owner"
+        );
+        assert!(
+            s.lookup_by_host("app.example.com").unwrap().is_none(),
+            "same liveness gate applies to host lookups"
+        );
+
+        // Once edge-1 heartbeats again (comes back, or a replacement reuses its id), the
+        // same ownership row resolves again -- this isn't a permanent black hole.
+        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        assert!(s.lookup_by_token("deadbeef").unwrap().is_some());
     }
 
     #[test]

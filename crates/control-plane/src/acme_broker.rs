@@ -683,7 +683,7 @@ mod tests {
         // admission step immediately offers it a CA (budget is wide open).
         // `lookup_by_host` joins against `mesh_edges`, so the edge itself
         // must have a heartbeat row too, not just the ownership record.
-        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", 0).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", now_secs()).unwrap();
         edge_mesh.record_ownership("tok1", Some("app.example.com"), "edge-1", 0).unwrap();
         sweep_once(&tunnels, &edge_mesh, &None).await.unwrap();
         let a = tunnels.cert_admission_for_hostname("app.example.com").unwrap().unwrap();
@@ -729,7 +729,7 @@ mod tests {
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
-        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", 0).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
 
         sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
@@ -810,7 +810,7 @@ mod tests {
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
-        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", 0).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap(); // Rot -> Gelb
 
@@ -868,7 +868,7 @@ mod tests {
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
-        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", 0).unwrap();
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
 
         sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();

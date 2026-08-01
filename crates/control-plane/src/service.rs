@@ -5797,7 +5797,8 @@ mod tests {
         let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
         // lookup_by_token joins against mesh_edges, so "primary" must have heartbeated at
         // least once to be resolvable (mirrors the real deployment's boot-time self-heartbeat).
-        mesh_store.heartbeat("primary", "test", 0).unwrap();
+        // #285: the heartbeat must also be recent (within OWNERSHIP_LIVENESS_SECS), not just present.
+        mesh_store.heartbeat("primary", "test", now_secs() as i64).unwrap();
         let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary"));
         let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
         let call = |tok: Option<String>| {
