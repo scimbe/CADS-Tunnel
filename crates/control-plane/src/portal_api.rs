@@ -1040,12 +1040,14 @@ struct ClaimState {
     channels: Arc<crate::storage::SqliteChannelStore>,
 }
 
-/// Build the channel-allowlist claim router (#248-follow): `POST
-/// /portal/channels/:channel/claim`, session-cookie authed. Mount alongside
-/// [`portal_api_router`] wherever the channel store is already in scope.
+/// Build the channel-allowlist claim router (#248-follow): a `GET`/`POST` page for
+/// people to self-serve their claim from a browser, plus the pre-existing `POST
+/// .../claim` JSON API for programmatic callers, session-cookie authed either way.
+/// Mount alongside [`portal_api_router`] wherever the channel store is already in scope.
 pub fn channel_claim_router(session_key: &[u8], channels: Arc<crate::storage::SqliteChannelStore>) -> Router {
     Router::new()
-        .route("/portal/channels/:channel/claim", post(claim_channel))
+        .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
+        .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
         .with_state(ClaimState {
             session_key: Arc::from(session_key.to_vec()),
             channels,
@@ -1064,31 +1066,17 @@ struct ClaimResp {
     claimed: bool,
 }
 
-/// `POST /portal/channels/:channel/claim` (#248-follow): the self-service
-/// counterpart to the owner-driven `POST /me/channels/:channel/members` — a portal
-/// user whose **verified** session email is on the channel's allow-list
-/// ([`crate::storage::SqliteChannelStore::allowlist_add`]) can add themselves as a
-/// member directly, no manual out-of-band exchange with the owner needed. Requires:
-/// (1) a valid portal session, (2) that session carrying a *verified* email (an
-/// unverified/absent one — see [`crate::portal::ExchangedIdentity::email_verified`]
-/// — simply can't use this route, matching the owner-driven flow's own trust bar),
-/// (3) the same holder-signed Noise-key attestation `channel_add_member` requires
-/// (#101 SEC101b), and (4) that email actually being allow-listed for this channel.
-async fn claim_channel(
-    State(st): State<ClaimState>,
-    headers: HeaderMap,
-    Path(channel_hex): Path<String>,
-    Json(req): Json<ClaimReq>,
-) -> Result<Json<ClaimResp>, (StatusCode, String)> {
-    let claims = crate::portal::session_claims_for(&st.session_key, &headers)
+/// The outcome of a claim attempt, shared by the JSON API ([`claim_channel`]) and
+/// the HTML form ([`claim_channel`]'s `GET` sibling, [`claim_page`]) so the
+/// verification + allow-list logic lives in exactly one place.
+async fn do_claim(st: &ClaimState, headers: &HeaderMap, channel_hex: &str, req: &ClaimReq) -> Result<(), (StatusCode, String)> {
+    let claims = crate::portal::session_claims_for(&st.session_key, headers)
         .ok_or((StatusCode::UNAUTHORIZED, "log in to the portal first".to_string()))?;
     let email = claims
         .email
         .ok_or((StatusCode::FORBIDDEN, "your session has no verified email — log in again".to_string()))?;
-    let channel = crate::service::hex_decode_32(&channel_hex)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
-    let holder = crate::service::hex_decode_32(&req.holder)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let channel = crate::service::hex_decode_32(channel_hex).ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let holder = crate::service::hex_decode_32(&req.holder).ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
     let noise_pubkey = crate::service::hex_decode_32(&req.noise_pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
     let noise_attestation = crate::service::hex_decode_64(&req.noise_attestation)
@@ -1110,12 +1098,100 @@ async fn claim_channel(
     let claimed = st
         .channels
         .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation)
-        .map_err(|e| internal_error("claim_channel/claim_via_allowlist", e))?;
+        .map_err(|e| internal_error("do_claim/claim_via_allowlist", e))?;
     if claimed {
-        Ok(Json(ClaimResp { claimed: true }))
+        Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, "this email is not allow-listed for this channel".to_string()))
     }
+}
+
+/// `POST /portal/channels/:channel/claim` (#248-follow): the self-service
+/// counterpart to the owner-driven `POST /me/channels/:channel/members` — a portal
+/// user whose **verified** session email is on the channel's allow-list
+/// ([`crate::storage::SqliteChannelStore::allowlist_add`]) can add themselves as a
+/// member directly, no manual out-of-band exchange with the owner needed. Requires:
+/// (1) a valid portal session, (2) that session carrying a *verified* email (an
+/// unverified/absent one — see [`crate::portal::ExchangedIdentity::email_verified`]
+/// — simply can't use this route, matching the owner-driven flow's own trust bar),
+/// (3) the same holder-signed Noise-key attestation `channel_add_member` requires
+/// (#101 SEC101b), and (4) that email actually being allow-listed for this channel.
+/// JSON-only (a `Content-Type: application/json` API for programmatic callers,
+/// e.g. tests / scripted onboarding); [`claim_page`] is the human-facing HTML form.
+async fn claim_channel(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<ClaimReq>,
+) -> Result<Json<ClaimResp>, (StatusCode, String)> {
+    do_claim(&st, &headers, &channel_hex, &req).await?;
+    Ok(Json(ClaimResp { claimed: true }))
+}
+
+/// `GET /portal/channels/:channel/claim` (#248-follow): render the self-serve
+/// claim form; its submission posts (url-encoded, matching every other portal
+/// form) to [`claim_page_submit`] on a distinct path, `.../claim-form`, so the
+/// browser form and the JSON API client above never contend over the same
+/// method+extractor on the same route.
+async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(channel_hex): Path<String>) -> Response {
+    if crate::portal::session_subject_for(&st.session_key, &headers).is_none() {
+        return Redirect::to("/portal").into_response();
+    }
+    Html(claim_html(&channel_hex, None)).into_response()
+}
+
+async fn claim_page_submit(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Form(req): Form<ClaimReq>,
+) -> Response {
+    if crate::portal::session_subject_for(&st.session_key, &headers).is_none() {
+        return Redirect::to("/portal").into_response();
+    }
+    match do_claim(&st, &headers, &channel_hex, &req).await {
+        Ok(()) => Html(claim_html(&channel_hex, Some(Ok(())))).into_response(),
+        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)))).into_response(),
+    }
+}
+
+/// The self-serve claim form (#248-follow): a portal user pastes the three values
+/// [`ct-agent channel member-material`] (or whatever locally produced them) prints,
+/// and the claim runs -- no manual out-of-band exchange with the channel owner.
+fn claim_html(channel_hex: &str, result: Option<Result<(), String>>) -> String {
+    let banner = match &result {
+        Some(Ok(())) => r#"<div class="warn" style="border-color:#238636;background:#0d2818;color:#3fb950">Claimed -- you're now a member of this channel.</div>"#.to_string(),
+        Some(Err(msg)) => format!(r#"<div class="warn">Could not claim: {}</div>"#, escape(msg)),
+        None => String::new(),
+    };
+    let body = format!(
+        r#"<h1>Join a channel</h1>
+<p class="k">Your signed-in e-mail must already be on this channel's allow-list (ask its owner to add
+you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it isn't yet).</p>
+{banner}
+<form method="post" action="/portal/channels/{channel}/claim-form">
+ <label>Channel<input type="text" value="{channel}" disabled></label>
+ <label>Holder public key
+  <input type="text" name="holder" placeholder="64 hex chars" required pattern="[0-9a-fA-F]{{64}}">
+  <span class="help">Your member holder public key.</span></label>
+ <label>Noise public key
+  <input type="text" name="noise_pubkey" placeholder="64 hex chars" required pattern="[0-9a-fA-F]{{64}}">
+  <span class="help">Your member Noise static public key.</span></label>
+ <label>Noise attestation
+  <input type="text" name="noise_attestation" placeholder="128 hex chars" required pattern="[0-9a-fA-F]{{128}}">
+  <span class="help">Your holder key's signature over (channel, holder, noise_pubkey) -- #101.</span></label>
+ <button type="submit">Claim membership</button>
+</form>
+<details>
+ <summary>Where do these come from?</summary>
+ <p class="help">Run <code>ct-agent channel member-material</code> locally (never paste a private key here) --
+ it derives your holder public key and signs the Noise-key attestation from your own holder private key,
+ without sending anything over the network. Paste its three printed values above.</p>
+</details>
+<a class="btn sec" href="/portal">Back to account</a>"#,
+        channel = escape(channel_hex),
+    );
+    page("join channel", &body)
 }
 
 #[cfg(test)]
@@ -2222,5 +2298,79 @@ mod tests {
         let s = post(Some(allowed_cookie), body(&other_holder, &noise, &[0u8; 64])).await.unwrap().status();
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(!channels.is_member(&ch, &other_holder).unwrap());
+    }
+
+    #[tokio::test]
+    async fn claim_page_renders_the_form_when_logged_in_and_claims_via_the_html_form_248() {
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x7au8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
+        let app = channel_claim_router(KEY, channels.clone());
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let ch_hex = hex(&ch.0);
+
+        // Logged out -> bounced to the portal, not the form.
+        let (status, _) = get(&app, &format!("/portal/channels/{ch_hex}/claim"), None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+
+        // Logged in -> the form renders with the channel pre-filled.
+        let (status, html) = get(&app, &format!("/portal/channels/{ch_hex}/claim"), Some("nat-subject")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(&ch_hex), "channel hex is pre-filled into the form");
+        assert!(html.contains("name=\"holder\""));
+        let holder_sk = SigningKey::from_bytes(&[0xc3u8; 32]);
+        let holder_bytes = holder_sk.verifying_key().to_bytes();
+        let noise = [0xd4u8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder_bytes, &noise)).to_bytes();
+        let form = format!(
+            "holder={}&noise_pubkey={}&noise_attestation={}",
+            hex(&holder_bytes),
+            hex(&noise),
+            hex(&attest)
+        );
+
+        // A verified session email NOT on the allow-list -> the page re-renders with an error, no member recorded.
+        let stranger_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "stranger", "stranger@example.com"));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/portal/channels/{ch_hex}/claim-form"))
+                    .header("cookie", stranger_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "re-renders the page (not a raw 403) with the error inline");
+        let body_text = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body_text.contains("Could not claim"));
+        assert!(!channels.is_member(&ch, &holder_bytes).unwrap());
+
+        // The allow-listed verified email succeeds via the HTML form and becomes a real member.
+        let allowed_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "nat-subject", "nat@example.com"));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/portal/channels/{ch_hex}/claim-form"))
+                    .header("cookie", allowed_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_text = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body_text.contains("Claimed"));
+        assert!(channels.is_member(&ch, &holder_bytes).unwrap());
     }
 }
