@@ -2413,6 +2413,14 @@ pub struct StatusState {
     /// (#17). Falls back to the registry count if the scrape fails or is unset.
     edge_metrics_url: Option<String>,
     http: reqwest::Client,
+    /// #328: whether the boot-time OIDC verifier actually came up, surfaced here so
+    /// "the realm's JWKS had no usable RS256 key after retrying -- /me/* disabled"
+    /// is *observable* (an operator/monitor can poll `/status`) instead of only
+    /// ever visible in process logs at the exact moment of boot. `CT_OIDC_ISSUER`
+    /// unset entirely also reports `false` here -- deliberately: from the outside,
+    /// "OIDC not configured" and "OIDC configured but failed to initialize" both
+    /// mean the exact same thing for `/me/*`'s availability.
+    oidc_enabled: bool,
 }
 
 /// Aggregated operator status — health plus metadata counts the operator
@@ -2437,6 +2445,11 @@ pub struct StatusResp {
     pub agents_directory: i64,
     /// Seconds since the control plane started.
     pub uptime_seconds: u64,
+    /// #328: whether `/me/*` is actually mounted and serving right now -- `false`
+    /// covers both "CT_OIDC_ISSUER unset" and "set but the boot-time JWKS fetch
+    /// never got a usable key", since both mean the same thing from here: nothing
+    /// under `/me/*` will authenticate successfully until this reads `true`.
+    pub oidc_enabled: bool,
 }
 
 /// Build the status router (F4.1): `GET /status` returns aggregated counts as
@@ -2448,6 +2461,7 @@ pub fn status_router(
     agent_directory: Arc<SqliteAgentDirectory>,
     pipeline_registry: Arc<SqlitePipelineRegistry>,
     edge_metrics_url: Option<String>,
+    oidc_enabled: bool,
 ) -> Router {
     Router::new().route("/status", get(status_handler)).with_state(StatusState {
         enrollment,
@@ -2458,6 +2472,7 @@ pub fn status_router(
         started: std::time::Instant::now(),
         edge_metrics_url,
         http: reqwest::Client::new(),
+        oidc_enabled,
     })
 }
 
@@ -2471,6 +2486,7 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
         accounts: s.ledger.account_count().unwrap_or(0),
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
         uptime_seconds: s.started.elapsed().as_secs(),
+        oidc_enabled: s.oidc_enabled,
     })
 }
 
@@ -3676,6 +3692,7 @@ pub fn persistent_control_plane_router(
         std::env::var("CT_CP_EDGE_METRICS_URL")
             .ok()
             .filter(|u| !u.is_empty()),
+        oidc.is_some(),
     );
     // Publish the edge CA root (#11): read from the path the edge writes it to,
     // co-located on the central host (CT_CP_EDGE_CERT_PATH, default matches the
@@ -6825,7 +6842,7 @@ mod tests {
             )
             .unwrap();
 
-        let app = status_router(enrollment, registry, ledger, agent_directory, pipeline_registry, None);
+        let app = status_router(enrollment, registry, ledger, agent_directory, pipeline_registry, None, false);
         let resp = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
             .await
@@ -6840,6 +6857,7 @@ mod tests {
         assert_eq!(s.payments_confirmed, 1);
         assert_eq!(s.pipelines_published, 1);
         assert_eq!(s.agents_directory, 1);
+        assert!(!s.oidc_enabled, "328: unconfigured/unavailable OIDC must read false on /status");
     }
 
     #[test]
@@ -6886,6 +6904,7 @@ mod tests {
             Arc::new(SqliteAgentDirectory::open_in_memory().unwrap()),
             Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap()),
             Some(format!("http://{addr}/metrics")),
+            true,
         );
         let resp = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
@@ -6898,6 +6917,7 @@ mod tests {
             s.tunnels, 3,
             "reports the live edge tunnel count, not the empty CP registry"
         );
+        assert!(s.oidc_enabled, "328: a configured/available OIDC verifier must read true on /status");
     }
 
     #[tokio::test]
