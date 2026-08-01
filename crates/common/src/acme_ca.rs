@@ -120,7 +120,25 @@ pub const SSL_COM: CaProfile = CaProfile {
 /// the balance question above is resolved) without a call-site signature
 /// change.
 pub fn active_rotation() -> Vec<&'static CaProfile> {
-    vec![&LETS_ENCRYPT, &ZEROSSL, &GOOGLE_TRUST_SERVICES]
+    // #262 (operator decision, 2026-08-01): ZEROSSL and GOOGLE_TRUST_SERVICES are
+    // deliberately excluded. Both `requires_eab`, and the admission broker discloses the
+    // operator's EAB credentials to every agent assigned to that CA (`ca_response_for` in
+    // `acme_broker.rs`) -- one fixed operator-wide secret shared across every
+    // mutually-untrusted customer on that CA, not per-tenant-scoped. Operator's call: don't
+    // disclose it going forward; new hostnames get only Let's Encrypt (no EAB at all), same
+    // "deliberately excluded, kept defined" treatment `all_known()`'s doc comment already
+    // gives `SSL_COM`. This closes the exposure for every hostname assigned from here on.
+    //
+    // Does NOT retroactively fix already-assigned hostnames: `assigned_ca` is permanent once
+    // offered (`SqliteTunnelStore::offer_claim`/`record_issuance_complete` both refuse to
+    // rewrite it), and several real, currently-live hostnames -- including every demo tunnel
+    // this deployment serves (a2a-demo, auction-demo, flappy-demo, cookbook) -- are already
+    // assigned "zerossl" and need that EAB to keep renewing. Migrating them off ZeroSSL is a
+    // real, separate operation (re-provisioning ~9 hostnames' certs, mindful of Let's
+    // Encrypt's own 50-certs-per-registered-domain-per-7-days limit -- the exact constraint
+    // this multi-CA rotation exists to route around), not something to do as a side effect of
+    // this one-line change. Left for a deliberate follow-up.
+    vec![&LETS_ENCRYPT]
 }
 
 /// Every CA this fleet knows about, including ones currently excluded from
@@ -146,7 +164,22 @@ mod tests {
             assert!(ca.directory_url.starts_with("https://"), "{}: {}", ca.name, ca.directory_url);
             assert!(names.insert(ca.name), "duplicate CA name: {}", ca.name);
         }
-        assert!(rotation.len() >= 3, "the whole point is spreading load across several independent CAs");
+    }
+
+    #[test]
+    fn active_rotation_is_lets_encrypt_only_262() {
+        // #262: ZEROSSL and GOOGLE_TRUST_SERVICES were deliberately pulled from the
+        // assignable pool (operator decision) -- both require an EAB the admission broker
+        // would otherwise disclose to every agent assigned to that CA, one shared secret
+        // across every mutually-untrusted customer. This pins the deliberate shape so a
+        // future re-add is a conscious edit here, not a silent regression back to
+        // disclosing the EAB to new hostnames -- see active_rotation()'s own doc comment
+        // for the full rationale and why already-assigned "zerossl" hostnames aren't
+        // retroactively migrated by this change.
+        let rotation = active_rotation();
+        assert_eq!(rotation.len(), 1);
+        assert_eq!(rotation[0].name, "letsencrypt");
+        assert!(!rotation[0].requires_eab);
     }
 
     #[test]

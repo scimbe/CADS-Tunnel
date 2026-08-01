@@ -327,20 +327,25 @@ fn budget_for(ca_name: &str) -> i64 {
 /// Gelb->Grün for nearly every future admission, not just the one that
 /// happened to surface it.
 fn pick_ca(tunnels: &SqliteTunnelStore, domain: &str, now: i64) -> rusqlite::Result<Option<&'static str>> {
-    pick_ca_with(tunnels, domain, now, eab_for_ca)
+    pick_ca_with(tunnels, domain, now, &ct_common::acme_ca::active_rotation(), eab_for_ca)
 }
 
-/// Testable core of [`pick_ca`] behind an injectable EAB lookup (same
-/// rationale as [`eab_for_ca_with`]).
+/// Testable core of [`pick_ca`] behind an injectable EAB lookup (same rationale as
+/// [`eab_for_ca_with`]) and an injectable `rotation` (#262-follow) -- lets a test exercise
+/// this function's own multi-CA selection/EAB-gating logic against a hypothetical rotation
+/// without needing the real, deliberately Let's-Encrypt-only [`ct_common::acme_ca::active_rotation`]
+/// (#262) to actually contain more than one CA. [`pick_ca`] is the only production caller and
+/// always passes the real rotation.
 fn pick_ca_with(
     tunnels: &SqliteTunnelStore,
     domain: &str,
     now: i64,
+    rotation: &[&'static ct_common::acme_ca::CaProfile],
     eab_lookup: impl Fn(&str) -> (Option<String>, Option<String>),
 ) -> rusqlite::Result<Option<&'static str>> {
     let since = now - BUDGET_WINDOW_SECS;
     let mut best: Option<(&'static str, i64)> = None;
-    for ca in ct_common::acme_ca::active_rotation() {
+    for ca in rotation {
         if ca.requires_eab {
             let (kid, hmac) = eab_lookup(ca.name);
             if kid.is_none() || hmac.is_none() {
@@ -603,8 +608,21 @@ mod tests {
         (Some("kid".to_string()), Some("hmac".to_string()))
     }
 
+    /// #262-follow: a hypothetical multi-CA rotation for testing `pick_ca_with`'s own
+    /// selection/EAB-gating logic in isolation from the real, deliberately
+    /// Let's-Encrypt-only `active_rotation()` (#262) -- exercises the exact same code path
+    /// production would use if a second CA were ever re-added.
+    fn hypothetical_multi_ca_rotation() -> Vec<&'static ct_common::acme_ca::CaProfile> {
+        vec![
+            &ct_common::acme_ca::LETS_ENCRYPT,
+            &ct_common::acme_ca::ZEROSSL,
+            &ct_common::acme_ca::GOOGLE_TRUST_SERVICES,
+        ]
+    }
+
     #[test]
     fn pick_ca_favors_the_least_utilized_ca_and_returns_none_when_all_are_exhausted() {
+        let rotation = hypothetical_multi_ca_rotation();
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
         tunnels.create("alice", "a", Some("a.example.com")).unwrap();
         tunnels.create("alice", "b", Some("b.example.com")).unwrap();
@@ -619,7 +637,7 @@ mod tests {
             tunnels.record_issuance_complete(&host, "example.com", 3).unwrap();
         }
 
-        let picked = pick_ca_with(&tunnels, "example.com", 100, all_eab_configured).unwrap();
+        let picked = pick_ca_with(&tunnels, "example.com", 100, &rotation, all_eab_configured).unwrap();
         assert_ne!(picked, Some("letsencrypt"), "letsencrypt is down to 5 headroom, others have their full budget");
 
         // Exhaust every CA's budget entirely -- no CA should be pickable.
@@ -635,7 +653,7 @@ mod tests {
             }
         }
         assert_eq!(
-            pick_ca_with(&tunnels2, "example.com", 100, all_eab_configured).unwrap(),
+            pick_ca_with(&tunnels2, "example.com", 100, &rotation, all_eab_configured).unwrap(),
             None,
             "every CA exhausted -- nothing pickable"
         );
@@ -648,9 +666,10 @@ mod tests {
         // permanently strand that hostname at Gelb. ZeroSSL's budget (200/7d)
         // dwarfs Let's Encrypt's (40/7d), so with no EAB lookup at all it
         // would otherwise win every single time.
+        let rotation = hypothetical_multi_ca_rotation();
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
         let none_configured = |_: &str| (None, None);
-        let picked = pick_ca_with(&tunnels, "example.com", 100, none_configured).unwrap();
+        let picked = pick_ca_with(&tunnels, "example.com", 100, &rotation, none_configured).unwrap();
         assert_eq!(
             picked,
             Some("letsencrypt"),
@@ -665,7 +684,10 @@ mod tests {
                 (None, None)
             }
         };
-        assert_eq!(pick_ca_with(&tunnels, "example.com", 100, with_zerossl).unwrap(), Some("zerossl"));
+        assert_eq!(
+            pick_ca_with(&tunnels, "example.com", 100, &rotation, with_zerossl).unwrap(),
+            Some("zerossl")
+        );
     }
 
     #[tokio::test]
