@@ -76,10 +76,19 @@ for entry in $ROLES; do
   if [ -f "$pidfile" ]; then
     oldpid="$(cat "$pidfile" 2>/dev/null || true)"
     if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-      log "role=$role stopping stale serve pid=$oldpid"
-      kill "$oldpid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$oldpid" 2>/dev/null || true
+      # #321: kill -0 only proves the PID is alive, not that it's still OUR
+      # serve-role.sh process — once a process dies, the OS can reuse its PID
+      # for anything (a build, an editor, an unrelated service). Verify the
+      # cmdline still names serve-role.sh before signaling it, so a PID-reuse
+      # race can never kill an unrelated process on the operator host.
+      if tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -q 'serve-role\.sh'; then
+        log "role=$role stopping stale serve pid=$oldpid"
+        kill "$oldpid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$oldpid" 2>/dev/null || true
+      else
+        log "role=$role pidfile pid=$oldpid is alive but is no longer serve-role.sh (PID reuse) — not killing, clearing stale pidfile"
+      fi
     fi
   fi
 

@@ -126,11 +126,18 @@ register_body="$(CHANNEL_ID="$CHANNEL_ID" OPERATOR_PUBKEY="$OPERATOR_PUBKEY" pyt
 import json, os
 print(json.dumps({"channel": os.environ["CHANNEL_ID"], "operator_pubkey": os.environ["OPERATOR_PUBKEY"]}))
 ')" || die "failed to build register JSON body"
-HTTP_CODE="$(curl -sS --max-time 15 -o /tmp/provision-link-channel.register.$$ -w '%{http_code}' \
+# #317: mktemp instead of a $$-suffixed predictable /tmp path -- a local
+# attacker on a shared operator host could pre-create a symlink at the
+# predictable path and have curl follow it when writing the response,
+# overwriting (or exposing, via a world-readable symlink target) an
+# unrelated file. mktemp's path is unpredictable and the file already
+# exists with owner-only permissions before curl ever writes to it.
+register_tmp="$(mktemp)" || die "failed to create a temp file for the register response"
+HTTP_CODE="$(curl -sS --max-time 15 -o "$register_tmp" -w '%{http_code}' \
   -X POST "${CT_AGENT_CP_URL%/}/me/channels" \
   -H "Authorization: Bearer $OIDC_TOKEN" -H 'content-type: application/json' \
   -d "$register_body")"
-REGISTER_RESP="$(cat /tmp/provision-link-channel.register.$$ 2>/dev/null)"; rm -f /tmp/provision-link-channel.register.$$
+REGISTER_RESP="$(cat "$register_tmp" 2>/dev/null)"; rm -f "$register_tmp"
 case "$HTTP_CODE" in
   2??) echo "provision-link-channel: channel registered ($HTTP_CODE)" >&2 ;;
   409) echo "provision-link-channel: channel already registered (409) — continuing" >&2 ;;
@@ -144,11 +151,14 @@ add_member() { # Args: <holder_pubkey> <noise_pubkey> <attestation> <label, for 
 import json, os
 print(json.dumps({"holder": os.environ["HOLDER"], "noise_pubkey": os.environ["NOISE"], "noise_attestation": os.environ["ATTEST"]}))
 ')"
-  http_code="$(curl -sS --max-time 15 -o /tmp/provision-link-channel.member.$$ -w '%{http_code}' \
+  # #317: mktemp, not a $$-suffixed predictable path -- see the register call above.
+  local member_tmp
+  member_tmp="$(mktemp)" || die "failed to create a temp file for the member response"
+  http_code="$(curl -sS --max-time 15 -o "$member_tmp" -w '%{http_code}' \
     -X POST "${CT_AGENT_CP_URL%/}/me/channels/${CHANNEL_ID}/members" \
     -H "Authorization: Bearer $OIDC_TOKEN" -H 'content-type: application/json' \
     -d "$body")"
-  resp="$(cat /tmp/provision-link-channel.member.$$ 2>/dev/null)"; rm -f /tmp/provision-link-channel.member.$$
+  resp="$(cat "$member_tmp" 2>/dev/null)"; rm -f "$member_tmp"
   case "$http_code" in
     2??) echo "provision-link-channel: member added ($4, $http_code)" >&2 ;;
     409) echo "provision-link-channel: member already present ($4, 409) — continuing" >&2 ;;

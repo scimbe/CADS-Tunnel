@@ -46,6 +46,18 @@ ok()   { printf "\033[32m  ✓\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m  !\033[0m %s\n" "$*" >&2; }
 die()  { printf "\033[31merror:\033[0m %s\n" "$*" >&2; exit 1; }
 
+# Build the POST /enroll/issue request body SAFELY (#319, mirrors #199's fix in
+# provision-agents.sh — this sibling script was never updated). A real JSON
+# encoder (python's json) escapes the operator-supplied tenant, so a stray `"`
+# or `\` (a fat-finger in a tenant name) can't splice extra/modified fields
+# into the payload — it becomes one string value. Pure (no network).
+build_issue_body() {
+  CT_TENANT="$1" python3 -c '
+import json, os
+print(json.dumps({"tenant": os.environ["CT_TENANT"]}))
+'
+}
+
 usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 [ $# -ge 1 ] || usage 1
 case "$1" in -h|--help) usage 0 ;; esac
@@ -82,7 +94,7 @@ if [ -n "$TENANT" ]; then
   JOIN_TOKEN="$(curl -fsS -X POST "https://$PORTAL_PUBLIC_HOST/enroll/issue" \
     -H 'content-type: application/json' \
     -H "x-ct-admin-token: $ADMIN_TOKEN" \
-    -d "{\"tenant\":\"$TENANT\"}")"
+    -d "$(build_issue_body "$TENANT")")"
   ok "minted"
 fi
 
