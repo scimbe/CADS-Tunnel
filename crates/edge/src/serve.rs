@@ -1570,6 +1570,9 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         // a deliberately separate, later increment — exists).
         if let Ok(cp_url) = std::env::var("CT_EDGE_CP_URL").map(|s| s.trim().to_string()) {
             if !cp_url.is_empty() {
+                // #279: one-time boot warning if the admin token would cross this
+                // connection in cleartext — never blocks (see the fn's own doc).
+                crate::edge_mesh_client::warn_if_insecure_cp_url(&cp_url);
                 let edge_id = std::env::var("CT_EDGE_ID")
                     .ok()
                     .filter(|s| !s.is_empty())
