@@ -1212,7 +1212,11 @@ impl SqliteTunnelStore {
                  issued_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_acme_issuance_log_ca_domain_time
-                 ON acme_issuance_log (ca, domain, issued_at);",
+                 ON acme_issuance_log (ca, domain, issued_at);
+             CREATE TABLE IF NOT EXISTS revoked_tokens (
+                 token      TEXT PRIMARY KEY,
+                 revoked_at INTEGER NOT NULL
+             );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1296,7 +1300,15 @@ impl SqliteTunnelStore {
     /// registration — #27 RB3/RB4), or `None` when the id is unknown or owned by
     /// someone else (no cross-subject deletion). Also clears the tunnel's access
     /// grants (#29) so none are orphaned.
-    pub fn revoke(&self, subject: &str, id: &str) -> rusqlite::Result<Option<String>> {
+    ///
+    /// #327: also records the token in the durable `revoked_tokens` table (same
+    /// transaction). This is what closes #327's gap — the Edge's own in-memory
+    /// revoked set doesn't survive a restart, so without a durable CP-side
+    /// record for it to replay from at boot, a still-reconnecting Agent for an
+    /// already-revoked tunnel would successfully re-register after any Edge
+    /// restart. This table is the CP's half of that fix (see
+    /// [`Self::list_revoked_tokens`]); the Edge's boot-time fetch is the other.
+    pub fn revoke(&self, subject: &str, id: &str, now: u64) -> rusqlite::Result<Option<String>> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
         let token: Option<String> = tx
@@ -1306,15 +1318,33 @@ impl SqliteTunnelStore {
                 |r| r.get(0),
             )
             .optional()?;
-        if token.is_some() {
+        if let Some(tok) = &token {
             tx.execute(
                 "DELETE FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
                 params![id, subject],
             )?;
             tx.execute("DELETE FROM tunnel_grants WHERE tunnel_id = ?1", params![id])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO revoked_tokens (token, revoked_at) VALUES (?1, ?2)",
+                params![tok, now as i64],
+            )?;
         }
         tx.commit()?;
         Ok(token)
+    }
+
+    /// Every routing token ever revoked (#327): the durable record an Edge
+    /// replays at boot so a restart can't silently undo a customer's revoke.
+    /// Unbounded like the Edge's own in-memory set would be, but here that's
+    /// fine — SQLite scales to this far past what an in-memory `HashSet` on a
+    /// resource-capped Edge process should hold, and this table is exactly the
+    /// kind of durable, queryable store the growth concern in #280 was about
+    /// the Edge NOT having.
+    pub fn list_revoked_tokens(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare("SELECT token FROM revoked_tokens")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect()
     }
 
     /// Whether `subject` is the owner of `tunnel_id` (not merely a grantee).
@@ -3256,17 +3286,17 @@ mod tests {
         assert_eq!(store.list_for_subject("bob").unwrap().len(), 1);
 
         // Cross-subject revoke is refused: bob cannot delete alice's tunnel.
-        assert!(store.revoke("bob", &a1.id).unwrap().is_none(), "no cross-subject revoke");
+        assert!(store.revoke("bob", &a1.id, 1_000).unwrap().is_none(), "no cross-subject revoke");
         assert_eq!(store.list_for_subject("alice").unwrap().len(), 2, "alice's tunnel survives");
 
         // Owner revoke removes exactly that tunnel and returns its routing token.
-        assert_eq!(store.revoke("alice", &a1.id).unwrap(), Some(a1.routing_token.clone()));
+        assert_eq!(store.revoke("alice", &a1.id, 1_000).unwrap(), Some(a1.routing_token.clone()));
         let alice = store.list_for_subject("alice").unwrap();
         assert_eq!(alice.len(), 1);
         assert!(alice.iter().all(|t| t.id != a1.id));
 
         // Revoking an unknown id is a no-op false; bob's tunnel is untouched.
-        assert!(store.revoke("alice", "deadbeef").unwrap().is_none());
+        assert!(store.revoke("alice", "deadbeef", 1_000).unwrap().is_none());
         assert_eq!(store.list_for_subject("bob").unwrap(), vec![b1]);
     }
 
@@ -3326,9 +3356,34 @@ mod tests {
         assert!(listed.iter().any(|t| t.routing_token == a.routing_token));
 
         // Revoke returns exactly that token so the caller can act on it.
-        assert_eq!(store.revoke("alice", &a.id).unwrap(), Some(a.routing_token));
+        assert_eq!(store.revoke("alice", &a.id, 1_000).unwrap(), Some(a.routing_token));
         // A second revoke of the same id yields nothing.
-        assert_eq!(store.revoke("alice", &a.id).unwrap(), None);
+        assert_eq!(store.revoke("alice", &a.id, 1_000).unwrap(), None);
+    }
+
+    #[test]
+    fn revoke_durably_records_the_token_for_edge_boot_replay_327() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        assert_eq!(store.list_revoked_tokens().unwrap(), Vec::<String>::new(), "nothing revoked yet");
+
+        let a = store.create("alice", "web", None).unwrap();
+        let b = store.create("alice", "api", None).unwrap();
+        assert_eq!(store.revoke("alice", &a.id, 1_000).unwrap(), Some(a.routing_token.clone()));
+
+        let revoked = store.list_revoked_tokens().unwrap();
+        assert_eq!(revoked, vec![a.routing_token.clone()], "exactly the revoked tunnel's token, durably");
+
+        // A second, distinct revoke accumulates rather than replacing.
+        store.revoke("alice", &b.id, 2_000).unwrap();
+        let mut revoked = store.list_revoked_tokens().unwrap();
+        revoked.sort();
+        let mut expected = vec![a.routing_token, b.routing_token];
+        expected.sort();
+        assert_eq!(revoked, expected, "both revocations persist");
+
+        // A no-op revoke (unknown id) records nothing new.
+        assert!(store.revoke("alice", "deadbeef", 3_000).unwrap().is_none());
+        assert_eq!(store.list_revoked_tokens().unwrap().len(), 2, "a failed revoke records nothing");
     }
 
     #[test]
@@ -3566,7 +3621,7 @@ mod tests {
 
         // Revoking the tunnel clears its grants (no orphans).
         store.grant("alice", &t.id, "bob").unwrap();
-        assert!(store.revoke("alice", &t.id).unwrap().is_some());
+        assert!(store.revoke("alice", &t.id, 1_000).unwrap().is_some());
         assert!(!store.is_authorized("bob", &t.id).unwrap(), "grant gone with the tunnel");
         assert!(!store.is_authorized("alice", &t.id).unwrap(), "owner gone with the tunnel");
     }

@@ -85,6 +85,38 @@ pub async fn rehydrate(cp_url: &str, admin_token: &[u8; 32], edge_id: &str) -> V
         .collect()
 }
 
+#[derive(Deserialize)]
+struct RevokedTokensResp {
+    tokens: Vec<String>,
+}
+
+/// Fetch every routing token the control plane has durably recorded as
+/// revoked (#327), for boot-time replay into the local `revoked` set
+/// (`crate::state::EdgeState`) — without this, an Edge restart silently
+/// forgets every revocation and a still-reconnecting Agent for an
+/// already-revoked tunnel would successfully re-register. Same fail-soft
+/// contract as [`rehydrate`]: any transport/auth/parse failure yields an
+/// empty vec rather than blocking or crashing boot — a fresh/unreachable
+/// registry just means this boot starts with nothing replayed, the same gap
+/// that existed before this feature (not a regression). Malformed individual
+/// token hex strings are skipped, not fatal.
+pub async fn fetch_revoked_tokens(cp_url: &str, admin_token: &[u8; 32]) -> Vec<[u8; 32]> {
+    let client = match reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let url = format!("{}/internal/revoked-tokens", cp_url.trim_end_matches('/'));
+    let resp = match client.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let body: RevokedTokensResp = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    body.tokens.into_iter().filter_map(|t| hex_decode_32(&t)).collect()
+}
+
 /// Announce this edge (`id`, reachable at `peer_addr`) to the control plane's
 /// mesh registry. Fail-soft: a failure is silent (no panic, no log spam on a
 /// tight retry loop) — the next heartbeat tick tries again.

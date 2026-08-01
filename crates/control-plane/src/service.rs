@@ -3772,7 +3772,10 @@ pub fn persistent_control_plane_router(
         .filter(|s| !s.is_empty())
         .and_then(|s| hex_decode_32(&s))
     {
-        app = app.merge(internal_channel_authorize_router(channels.clone(), admin_tok));
+        app = app
+            .merge(internal_channel_authorize_router(channels.clone(), admin_tok))
+            // #327: the Edge's boot-time revoked-tokens fetch.
+            .merge(internal_revoked_tokens_router(tunnels.clone(), admin_tok));
     }
     // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
     // verifier is configured (M26.1). Without one they are simply absent (404).
@@ -3907,6 +3910,49 @@ async fn channel_authorize(
         }
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+/// Shared state for the edge-facing revoked-tokens sync endpoint (#327).
+#[derive(Clone)]
+struct AdminRevokedTokensState {
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
+    admin_token: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct RevokedTokensResp {
+    tokens: Vec<String>,
+}
+
+/// Build the **edge-facing** revoked-tokens sync router (#327): closes the gap where
+/// an Edge's in-memory revoked-token set (`crates/edge/src/state.rs`) doesn't survive
+/// a restart, silently letting a still-reconnecting Agent for an already-revoked
+/// tunnel re-register. The Edge fetches this once at boot (before serving any
+/// connections) and seeds its local set from it — same shared edge↔CP admin token as
+/// every other internal machine endpoint here, and read-only. Mounted only when the
+/// admin token is configured, matching every other internal route's fail-closed
+/// posture.
+///
+/// * `GET /internal/revoked-tokens` + header `x-ct-admin-token` → `200 {tokens: [...]}`;
+///   `401` bad/missing token.
+fn internal_revoked_tokens_router(
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
+    admin_token: [u8; 32],
+) -> Router {
+    Router::new()
+        .route("/internal/revoked-tokens", get(revoked_tokens))
+        .with_state(AdminRevokedTokensState { tunnels, admin_token })
+}
+
+async fn revoked_tokens(
+    State(state): State<AdminRevokedTokensState>,
+    headers: HeaderMap,
+) -> Result<Json<RevokedTokensResp>, StatusCode> {
+    if !admin_token_ok(&headers, &state.admin_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let tokens = state.tunnels.list_revoked_tokens().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(RevokedTokensResp { tokens }))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -6059,6 +6105,40 @@ mod tests {
             post(Some(admin_hex), [0x44u8; 32]).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn internal_revoked_tokens_requires_the_admin_token_and_lists_every_revocation_327() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let a = tunnels.create("alice", "web", None).unwrap();
+        let b = tunnels.create("alice", "api", None).unwrap();
+        tunnels.revoke("alice", &a.id, 1_000).unwrap();
+
+        let app = internal_revoked_tokens_router(tunnels.clone(), admin);
+        let get = |tok: Option<String>| {
+            let mut req = Request::get("/internal/revoked-tokens");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // Wrong / missing token -> 401, before any lookup.
+        assert_eq!(get(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(get(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token -> 200 + exactly the revoked token, not the live one.
+        let r = get(Some(hex_encode(&admin))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let resp: RevokedTokensResp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.tokens, vec![a.routing_token]);
+        assert!(!resp.tokens.contains(&b.routing_token), "the live tunnel's token is never listed");
     }
 
     #[tokio::test]

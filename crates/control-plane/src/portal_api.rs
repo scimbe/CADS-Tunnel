@@ -517,7 +517,11 @@ async fn delete_tunnel(
     // #38 DL2: grab the hostname before revoke so we can clear its DNS afterward.
     let hostname = st.tunnels.tunnel_hostname(&subject, &id).ok().flatten();
     // `revoke` returns the removed tunnel's routing token (owner-scoped).
-    if let Ok(Some(routing_token)) = st.tunnels.revoke(&subject, &id) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(Some(routing_token)) = st.tunnels.revoke(&subject, &id, now) {
         // edge_mesh Phase 0: the tunnel row is gone either way, so its ownership
         // record must not keep claiming an edge still holds this token.
         st.edge_mesh.forget(&routing_token);

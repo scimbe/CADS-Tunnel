@@ -528,6 +528,16 @@ impl<H: Clone> EdgeState<H> {
         self.revoked.lock_safe().contains(token)
     }
 
+    /// Seed the revoked set from the control plane's durable record (#327
+    /// boot-time replay) — unlike [`revoke_token`](Self::revoke_token), this
+    /// never calls [`remove`](Self::remove): at boot nothing is registered
+    /// yet, so there's nothing to tear down, only the future re-registration
+    /// to refuse.
+    pub fn seed_revoked_tokens(&self, tokens: impl IntoIterator<Item = RoutingToken>) {
+        let mut set = self.revoked.lock_safe();
+        set.extend(tokens);
+    }
+
     /// Configure the shared admin secret that authenticates the `'R'` revoke op
     /// (#27 RB3). Set from `CT_EDGE_ADMIN_TOKEN` at startup.
     pub fn set_admin_token(&self, token: [u8; 32]) {
@@ -750,6 +760,29 @@ mod tests {
 
         // A different (unrevoked) token registers normally.
         assert!(state.register_unless_revoked(token(10), 3u32).is_some());
+        assert_eq!(state.active_tunnels(), 1);
+    }
+
+    #[test]
+    fn seed_revoked_tokens_blocks_registration_without_touching_a_live_one_327() {
+        // #327: boot-time replay from the control plane's durable record must
+        // block re-registration of a previously-revoked token, exactly like a
+        // live `revoke_token` call would -- but must never tear down anything,
+        // since at boot there's nothing registered yet to tear down.
+        let state = EdgeState::new();
+        let seeded = token(20);
+        let live = token(21);
+        assert_eq!(state.active_tunnels(), 0, "sanity: nothing registered before seeding");
+
+        state.seed_revoked_tokens(vec![seeded.clone()]);
+        assert!(state.is_revoked(&seeded));
+        assert_eq!(state.active_tunnels(), 0, "seeding never registers or removes anything");
+
+        // The seeded token can't be registered (mirrors a live revoke's effect).
+        assert!(state.register_unless_revoked(seeded, 1u32).is_none());
+        // An unrelated, unrevoked token still registers normally.
+        assert!(state.register_unless_revoked(live.clone(), 2u32).is_some());
+        assert!(!state.is_revoked(&live));
         assert_eq!(state.active_tunnels(), 1);
     }
 

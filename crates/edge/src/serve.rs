@@ -1594,6 +1594,20 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         "ct-edge: rehydrated {n} hostname authorization(s) from {r_cp_url} (edge_id={r_edge_id})"
                     );
                 });
+                // #327: replay the control plane's durable revoked-token record into
+                // this boot's local revoked set — without this, a restart silently
+                // forgets every revocation and a still-reconnecting Agent for an
+                // already-revoked tunnel would successfully re-register. Same
+                // fire-and-forget shape as the rehydration above (accepted trade-off:
+                // a brief boot window before this lands, never a blocked/hung boot).
+                let vstate = state.clone();
+                let v_cp_url = cp_url.clone();
+                tokio::spawn(async move {
+                    let tokens = crate::edge_mesh_client::fetch_revoked_tokens(&v_cp_url, &tok).await;
+                    let n = tokens.len();
+                    vstate.seed_revoked_tokens(tokens.into_iter().map(RoutingToken));
+                    eprintln!("ct-edge: replayed {n} revoked token(s) from {v_cp_url}");
+                });
                 let hstate_cp_url = cp_url.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(30));
