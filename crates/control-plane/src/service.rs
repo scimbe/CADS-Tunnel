@@ -556,6 +556,12 @@ async fn confirm_payment(
 struct BuyReq {
     account: String,
     price: u64,
+    /// #272: optional client-supplied idempotency key (64-hex, like every other token
+    /// in this API). A caller retrying after a lost response passes the SAME key to
+    /// get back the already-minted token instead of being debited again. Absent ->
+    /// unchanged legacy behavior (no idempotency protection), so existing callers
+    /// keep working exactly as before.
+    idempotency_key: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct TokenResp {
@@ -576,19 +582,61 @@ async fn buy_token(
             format!("a routing token costs at least {} credit(s)", crate::billing::TOKEN_PRICE),
         ));
     }
-    // Debit first: only mint the token if the account can pay.
-    store.debit(&AccountId(account), req.price).map_err(|e| {
-        let code = match &e {
-            LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => {
-                StatusCode::PAYMENT_REQUIRED
-            }
-            LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
-            LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        (code, e.to_string())
-    })?;
+    let idempotency_key = match req.idempotency_key.as_deref() {
+        Some(s) => Some(
+            hex_decode_32(s).ok_or((StatusCode::BAD_REQUEST, "malformed idempotency_key".to_string()))?,
+        ),
+        None => None,
+    };
+
+    // #272: a caller retrying after a lost response (crash, timeout, network drop)
+    // would otherwise be debited a second time for a token it already paid for. With
+    // a key, check for a prior issuance FIRST -- if found, hand back the same token,
+    // no new debit.
+    if let Some(key) = &idempotency_key {
+        if let Some(existing) = store
+            .issuance_for_key(key)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        {
+            return Ok(Json(TokenResp { token: hex_encode(&existing) }));
+        }
+    }
+
     let mut token = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+
+    match &idempotency_key {
+        // Debit and durably record the issuance atomically -- a crash between the two
+        // can't happen, so a retry with this same key always finds a consistent state.
+        Some(key) => {
+            store
+                .debit_and_record_issuance(&AccountId(account), req.price, key, &token, now_secs())
+                .map_err(|e| {
+                    let code = match &e {
+                        LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => {
+                            StatusCode::PAYMENT_REQUIRED
+                        }
+                        LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+                        LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                    };
+                    (code, e.to_string())
+                })?;
+        }
+        // No key supplied: unchanged legacy behavior, no idempotency protection.
+        None => {
+            store.debit(&AccountId(account), req.price).map_err(|e| {
+                let code = match &e {
+                    LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => {
+                        StatusCode::PAYMENT_REQUIRED
+                    }
+                    LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+                    LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (code, e.to_string())
+            })?;
+        }
+    }
+
     Ok(Json(TokenResp {
         token: hex_encode(&token),
     }))
@@ -4805,6 +4853,41 @@ mod tests {
             matches!(replay, Err(crate::client::CpError::Status(_))),
             "payment stays confirmed across a service restart"
         );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn buy_token_idempotent_replays_the_same_token_without_a_second_debit_272() {
+        // #272: retrying /billing/issue with the SAME idempotency key (simulating a
+        // caller that never saw the first response) must return the same token and
+        // must NOT debit the account again. ControlPlaneClient has no direct balance
+        // getter, so correctness is proven indirectly: credit exactly 10, spend 3,
+        // "retry" that same purchase, then spend the remaining 7 exactly -- if the
+        // retry had double-debited, only 4 would be left and this last purchase would
+        // be refused.
+        let db = temp_db_path();
+        let cp = ControlPlaneClient::new(spawn_billing(&db).await);
+        let account = cp.open_account().await.unwrap();
+        let payment = cp.create_payment_intent(&account, 10).await.unwrap();
+        cp.confirm_payment(&payment).await.unwrap(); // balance -> 10
+
+        let key = [0x42u8; 32];
+        let first = cp.buy_token_idempotent(&account, 3, &key).await.unwrap();
+
+        // The retry: same key, same price -- as a caller would send after a lost response.
+        let replay = cp.buy_token_idempotent(&account, 3, &key).await.unwrap();
+        assert_eq!(replay.0, first.0, "the retry gets back the SAME token");
+
+        // Exactly the remaining balance -- fails if the retry above secretly re-debited.
+        let key2 = [0x43u8; 32];
+        let second = cp.buy_token_idempotent(&account, 7, &key2).await.unwrap();
+        assert_ne!(second.0, first.0, "a different key mints a different token");
+
+        // Now genuinely broke: even 1 more credit is refused.
+        let key3 = [0x44u8; 32];
+        let broke = cp.buy_token_idempotent(&account, 1, &key3).await;
+        assert!(matches!(broke, Err(crate::client::CpError::Status(_))), "exhausted after exactly one debit per key");
+
         let _ = std::fs::remove_file(&db);
     }
 

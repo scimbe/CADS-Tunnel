@@ -202,10 +202,40 @@ impl ControlPlaneClient {
 
     /// `POST /billing/issue` — buy a routing token, charging `price` credits to
     /// the account. A [`CpError::Status`] (402) means insufficient credit.
+    ///
+    /// No idempotency protection (#272): a lost response after a successful debit means
+    /// the account was charged with no recoverable token, and a caller-initiated retry
+    /// debits again. Prefer [`Self::buy_token_idempotent`] for any caller that might retry.
     pub async fn buy_token(&self, account: &[u8; 32], price: u64) -> CpResult<RoutingToken> {
         let resp = self
             .admin(self.http.post(format!("{}/billing/issue", self.base)))
             .json(&serde_json::json!({ "account": hex_encode(account), "price": price }))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: TokenBody = resp.json().await?;
+        Ok(RoutingToken(hex_decode_32(&body.token).ok_or(CpError::Malformed)?))
+    }
+
+    /// [`Self::buy_token`] with a caller-supplied idempotency key (#272, 64-hex, like every
+    /// other token in this API): retrying this exact call with the SAME key after a lost
+    /// response (crash, timeout, network drop) returns the same already-minted token
+    /// instead of debiting the account a second time. Generate a fresh random key per
+    /// logical purchase attempt (not per HTTP call) and reuse it across retries of that
+    /// same attempt.
+    pub async fn buy_token_idempotent(
+        &self,
+        account: &[u8; 32],
+        price: u64,
+        idempotency_key: &[u8; 32],
+    ) -> CpResult<RoutingToken> {
+        let resp = self
+            .admin(self.http.post(format!("{}/billing/issue", self.base)))
+            .json(&serde_json::json!({
+                "account": hex_encode(account),
+                "price": price,
+                "idempotency_key": hex_encode(idempotency_key),
+            }))
             .send()
             .await?;
         let resp = ok(resp)?;

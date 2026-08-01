@@ -878,6 +878,13 @@ impl SqliteLedger {
              CREATE TABLE IF NOT EXISTS account_subjects (
                  subject TEXT PRIMARY KEY,
                  account BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS token_issuances (
+                 idempotency_key BLOB PRIMARY KEY,
+                 account         BLOB NOT NULL,
+                 token           BLOB NOT NULL,
+                 price           INTEGER NOT NULL,
+                 issued_at       INTEGER NOT NULL
              );",
         )?;
         // #44: `payments.confirmed` was added after the table's first release;
@@ -1006,6 +1013,68 @@ impl SqliteLedger {
             "UPDATE accounts SET balance = ?1 WHERE account = ?2",
             params![new, &id.0[..]],
         )?;
+        Ok(new as u64)
+    }
+
+    /// #272: look up a prior token issuance by its client-supplied idempotency key.
+    /// A caller retrying a `/billing/issue` call after a lost response (crash, timeout,
+    /// network drop) uses this to get back the SAME already-minted token instead of
+    /// [`Self::debit_and_record_issuance`] debiting the account a second time for a
+    /// token that was already paid for.
+    pub fn issuance_for_key(&self, idempotency_key: &[u8]) -> rusqlite::Result<Option<[u8; 32]>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT token FROM token_issuances WHERE idempotency_key = ?1",
+                params![idempotency_key],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map(|opt| {
+                opt.map(|bytes| {
+                    let mut t = [0u8; 32];
+                    t.copy_from_slice(&bytes);
+                    t
+                })
+            })
+    }
+
+    /// #272: debit `amount` from `id` and durably record the minted `token` against
+    /// `idempotency_key` in ONE transaction, so a crash between the two can never
+    /// happen -- the debit and the issuance record either both land or neither does.
+    /// Pairs with [`Self::issuance_for_key`]: a caller checks that first, and only
+    /// calls this when no prior issuance exists for the key.
+    pub fn debit_and_record_issuance(
+        &self,
+        id: &AccountId,
+        amount: u64,
+        idempotency_key: &[u8],
+        token: &[u8; 32],
+        now: u64,
+    ) -> Result<u64, LedgerOpError> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let bal = tx
+            .query_row("SELECT balance FROM accounts WHERE account = ?1", params![&id.0[..]], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let bal_u = bal as u64;
+        if bal_u < amount {
+            return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
+                balance: bal_u,
+                requested: amount,
+            }));
+        }
+        let new = bal - amount as i64;
+        tx.execute("UPDATE accounts SET balance = ?1 WHERE account = ?2", params![new, &id.0[..]])?;
+        tx.execute(
+            "INSERT INTO token_issuances (idempotency_key, account, token, price, issued_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![idempotency_key, &id.0[..], &token[..], amount as i64, now as i64],
+        )?;
+        tx.commit()?;
         Ok(new as u64)
     }
 
@@ -3966,6 +4035,52 @@ mod tests {
             Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: 10, requested: 25 }))
         ));
         assert_eq!(ledger.balance(&acct).unwrap(), 10, "balance intact");
+    }
+
+    #[test]
+    fn debit_and_record_issuance_is_replayed_from_the_idempotency_key_without_a_second_debit_272() {
+        // #272: a caller retrying after a lost response (the debit committed, but the
+        // token never reached them) must get back the SAME token, not be charged again.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 10).unwrap();
+        let key = [0x11u8; 32];
+        let token = [0xAAu8; 32];
+
+        assert_eq!(ledger.issuance_for_key(&key).unwrap(), None, "nothing recorded yet");
+        let bal = ledger.debit_and_record_issuance(&acct, 3, &key, &token, 1_000).unwrap();
+        assert_eq!(bal, 7, "debited once");
+        assert_eq!(ledger.balance(&acct).unwrap(), 7);
+
+        // The "retry": same key looked up first, exactly what the HTTP handler does.
+        assert_eq!(ledger.issuance_for_key(&key).unwrap(), Some(token), "the same token comes back");
+        assert_eq!(ledger.balance(&acct).unwrap(), 7, "looking it up never debits");
+
+        // A genuinely NEW purchase (different key) still debits normally.
+        let key2 = [0x22u8; 32];
+        let token2 = [0xBBu8; 32];
+        ledger.debit_and_record_issuance(&acct, 2, &key2, &token2, 1_001).unwrap();
+        assert_eq!(ledger.balance(&acct).unwrap(), 5, "a different key debits again");
+        assert_eq!(ledger.issuance_for_key(&key2).unwrap(), Some(token2));
+    }
+
+    #[test]
+    fn debit_and_record_issuance_leaves_no_issuance_row_on_insufficient_credit_272() {
+        // The debit and the issuance record are one transaction -- a refused debit must
+        // not leave a dangling issuance row a later retry could incorrectly match.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 1).unwrap();
+        let key = [0x33u8; 32];
+        let token = [0xCCu8; 32];
+
+        let refused = ledger.debit_and_record_issuance(&acct, 5, &key, &token, 2_000);
+        assert!(matches!(
+            refused,
+            Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: 1, requested: 5 }))
+        ));
+        assert_eq!(ledger.balance(&acct).unwrap(), 1, "balance untouched");
+        assert_eq!(ledger.issuance_for_key(&key).unwrap(), None, "no issuance recorded for the refused debit");
     }
 
     #[test]
