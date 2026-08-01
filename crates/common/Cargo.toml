@@ -15,4 +15,7 @@ zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "sync", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+# `test-util` enables tokio's paused clock for the #269 idle-timeout tests
+# (`#[tokio::test(start_paused = true)]`), same purpose as ct-edge's #111 Slowloris
+# timeout test; dev-only, stays out of the production build.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "test-util"] }

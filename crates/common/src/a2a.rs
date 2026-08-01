@@ -15,6 +15,7 @@
 //! fails the AEAD tag and no session forms — only the intended member can complete it.
 
 use std::io;
+use std::time::Duration;
 
 use snow::TransportState;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -264,7 +265,37 @@ pub async fn write_message<W: AsyncWrite + Unpin>(send: &mut W, msg: &[u8]) -> i
 pub async fn serve_request_loop<W, R, H, Fut>(
     send: &mut W,
     recv: &mut R,
+    handle: H,
+) -> io::Result<u64>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    H: FnMut(Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Vec<u8>>,
+{
+    serve_request_loop_with_idle_timeout(send, recv, handle, DEFAULT_IDLE_TIMEOUT).await
+}
+
+/// #269: a peer that completes the Noise_IK handshake and calls [`serve_request_loop`] but
+/// never sends a request (or sends one, then stalls) held `read_frame` forever — the serve
+/// task, and with it the single `--serve` session slot (#200), was pinned indefinitely by an
+/// idle peer with no way to recover short of a process restart. Balanced against real
+/// interactive/tool-calling cadences, which can legitimately go quiet between calls, so this
+/// is generous compared to a transport-level dead-peer detector (contrast the Edge's much
+/// shorter QUIC `max_idle_timeout`, `crates/edge/src/pki.rs` — that catches a genuinely dead
+/// connection; this catches an alive-but-idle one at the application layer, above transport
+/// keepalives that would otherwise mask it).
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// [`serve_request_loop`] with a configurable per-request idle deadline (#269): if no new
+/// request frame arrives within `idle_timeout` of the loop becoming ready to read one, the
+/// session ends with a `TimedOut` error (distinguishable from the peer's own clean close,
+/// which still returns `Ok(served)`) instead of blocking forever.
+pub async fn serve_request_loop_with_idle_timeout<W, R, H, Fut>(
+    send: &mut W,
+    recv: &mut R,
     mut handle: H,
+    idle_timeout: Duration,
 ) -> io::Result<u64>
 where
     W: AsyncWrite + Unpin,
@@ -274,11 +305,17 @@ where
 {
     let mut served = 0u64;
     loop {
-        let request = match read_frame(recv).await {
-            Ok(msg) => msg,
+        let request = match tokio::time::timeout(idle_timeout, read_frame(recv)).await {
+            Ok(Ok(msg)) => msg,
             // The peer closed the stream between requests — a clean, expected end of the session.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(served),
-            Err(e) => return Err(e),
+            Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(served),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("serve_request_loop: idle for {idle_timeout:?} with no new request, closing"),
+                ))
+            }
         };
         let response = handle(request).await;
         // #135 L2.2: guarded write — an oversize response errors the loop rather than truncating the
@@ -475,6 +512,55 @@ mod tests {
         drop(c2s_w);
         let served = server.await.expect("join").expect("loop ends cleanly on peer close");
         assert_eq!(served, 3, "the runner served all three requests before the peer closed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_request_loop_times_out_on_a_peer_that_never_sends_a_request_269() {
+        // #269: a peer that completes the session but never sends a request (the connection
+        // stays open, nothing arrives) must not pin the serve task forever. Paused clock ->
+        // tokio auto-advances virtual time, so this is deterministic and fast despite a real
+        // multi-minute idle_timeout.
+        let (mut _c2s_w, mut c2s_r) = tokio::io::duplex(1 << 16);
+        let (mut s2c_w, _s2c_r) = tokio::io::duplex(1 << 16);
+        let idle_timeout = Duration::from_secs(30);
+
+        let start = tokio::time::Instant::now();
+        let result = serve_request_loop_with_idle_timeout(&mut s2c_w, &mut c2s_r, |req: Vec<u8>| async move { req }, idle_timeout).await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("an idle peer must end the loop with an error, not hang forever");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "distinguishable from a clean close: {err}");
+        assert!(elapsed >= idle_timeout, "must wait out the full idle deadline before giving up, elapsed {elapsed:?}");
+        // Keep _c2s_w alive until here so the read times out rather than seeing an early EOF.
+        drop(_c2s_w);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_request_loop_idle_timeout_resets_after_each_served_request_269() {
+        // #269: the deadline is per-request, not a single overall session cap -- a peer that
+        // sends occasional requests, each within idle_timeout of the last, must be served
+        // indefinitely (a real interactive/tool-calling cadence), only an actually-idle gap
+        // ends the session.
+        let (mut c2s_w, mut c2s_r) = tokio::io::duplex(1 << 16);
+        let (mut s2c_w, mut s2c_r) = tokio::io::duplex(1 << 16);
+        let idle_timeout = Duration::from_secs(10);
+
+        let server = tokio::spawn(async move {
+            serve_request_loop_with_idle_timeout(&mut s2c_w, &mut c2s_r, |req: Vec<u8>| async move { req }, idle_timeout).await
+        });
+
+        // Two requests, each well inside the idle window, spaced further apart than the window
+        // WOULD allow if the deadline didn't reset per request.
+        for msg in [&b"one"[..], b"two"] {
+            tokio::time::sleep(idle_timeout / 2).await;
+            c2s_w.write_all(&frame(msg)).await.expect("send request frame");
+            let resp = read_frame(&mut s2c_r).await.expect("read response frame");
+            assert_eq!(resp, msg, "served despite the cumulative gap exceeding one idle window");
+        }
+
+        drop(c2s_w);
+        let served = server.await.expect("join").expect("loop ends cleanly on peer close, not a timeout");
+        assert_eq!(served, 2, "both requests served -- the per-request deadline reset each time");
     }
 
     #[tokio::test]
