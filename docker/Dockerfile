@@ -63,4 +63,23 @@ COPY --from=builder /build/bin/ct-crew-bridge /usr/local/bin/ct-crew-bridge
 COPY --from=builder /build/bin/ct-cookbook-bridge /usr/local/bin/ct-cookbook-bridge
 COPY docker/netem-entrypoint.sh /usr/local/bin/netem-entrypoint.sh
 RUN chmod +x /usr/local/bin/netem-entrypoint.sh
+# #305: run as non-root by default -- matches the k8s base's runAsNonRoot/
+# runAsUser 65532 posture (docker/deploy/k8s/*.yaml), which this compose-based
+# self-host image previously fell short of despite sharing the same binaries.
+# An RCE in ct-edge/ct-control-plane (e.g. via an unauthenticated endpoint, #87)
+# no longer lands as root in the container. uid/gid 65532 is the same
+# "nobody"-style convention distroless/k8s use; no /etc/passwd entry is needed
+# since nothing here does username lookups.
+#
+# Testbed-only tooling (iproute2/iptables, installed above for tc/netem in
+# hermetic multi-node network-emulation tests, #315) still needs root/
+# NET_ADMIN to actually configure netfilter -- netem-entrypoint.sh already
+# tolerates that gracefully (`tc ... || echo "... failed (need NET_ADMIN)"`)
+# for the (test-only) compose overlays that invoke it; production self-host
+# never does. A test topology that genuinely needs netem to apply (not just
+# degrade gracefully) can override with `user: root` / `cap_add: [NET_ADMIN]`
+# on that specific service -- this default only changes the default, not what's
+# possible to opt back into for testing.
+RUN groupadd -g 65532 ctuser && useradd -u 65532 -g 65532 -M -s /usr/sbin/nologin ctuser
+USER 65532:65532
 CMD ["ct-edge"]

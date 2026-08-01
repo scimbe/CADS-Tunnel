@@ -18,6 +18,12 @@ services:
       dockerfile: docker/Dockerfile
     image: ct-testbed
     command: ["ct-control-plane"]
+    # #305: run as non-root (matches the image's own USER 65532:65532 default,
+    # docker/Dockerfile) -- explicit here too so a future base-image change can't
+    # silently widen this back to root. /data and /shared must be owned by (or
+    # group-writable for) this uid -- see the operator migration note in #305's
+    # closing comment for existing deployments upgrading from a root-owned volume.
+    user: "65532:65532"
     # #312: bounded, so a runaway/leaking co-located service (edge under PoW/relay
     # load, Keycloak) can't OOM-kill this one on a shared single-host deploy -- this
     # host runs with NO swap, so an unbounded container is one bad spike away from
@@ -90,6 +96,11 @@ services:
   edge:
     image: ct-testbed
     command: ["ct-edge"]
+    # #305: see control-plane's own comment above. /shared must be owned by (or
+    # group-writable for) this uid, including the CA signing key file it writes
+    # there on first boot (edge-ca-key.pem, 0600) -- the file permissions
+    # themselves (owner-only) are unaffected by which non-root uid owns them.
+    user: "65532:65532"
     # #312: same rationale as control-plane's own limit above -- edge is the one
     # most likely to actually spike (PoW #202 solving under a flood, relay traffic),
     # so this is both the most important service to bound AND the one that most

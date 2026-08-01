@@ -38,13 +38,20 @@ services:
     env_file:
       - .env
     environment:
-      # Unified :443 front door: ALPN=ct-edge -> relay; Portal SNI -> terminate+proxy
-      # to the control plane; other SNI -> Browser-Plane passthrough.
-      CT_FRONT_DOOR: "0.0.0.0:443"
-      # #66: a redirect-only :80 listener so plain http://<zone>/ 308-bounces to
-      # https instead of connection-refused (a bare-domain / http-default first
-      # visit). Redirect only — no cert, no TLS terminated here.
-      CT_EDGE_HTTP_REDIRECT: "0.0.0.0:80"
+      # Unified front door: ALPN=ct-edge -> relay; Portal SNI -> terminate+proxy
+      # to the control plane; other SNI -> Browser-Plane passthrough. Binds
+      # 8443 (unprivileged) INSIDE the container, not 443 -- #305: the edge now
+      # runs as non-root (uid 65532), which can't bind a port <1024 without
+      # CAP_NET_BIND_SERVICE. Docker's own port-publish mapping below
+      # ("443:8443") does the host:443 -> container:8443 translation at the
+      # network layer, so externally this is unchanged: clients still connect
+      # to :443, same TLS/ALPN behavior, same cert. Nothing outside this
+      # container's own listen address needed to change.
+      CT_FRONT_DOOR: "0.0.0.0:8443"
+      # #66/#305: same port-remap reasoning as CT_FRONT_DOOR above -- 8080
+      # internally, published as the host's :80 via the port mapping below.
+      # Redirect only — no cert, no TLS terminated here.
+      CT_EDGE_HTTP_REDIRECT: "0.0.0.0:8080"
       CT_EDGE_PORTAL_HOST: "${PORTAL_PUBLIC_HOST:?set PORTAL_PUBLIC_HOST=<zone>}"
       CT_CP_PROXY_ADDR: "control-plane:8090"
       CT_EDGE_PORTAL_CERT: "/certs/portal/fullchain.pem"
@@ -65,8 +72,11 @@ services:
       - "${PORTAL_CERT_DIR:?set PORTAL_CERT_DIR=<dir with portal fullchain.pem+privkey.pem>}:/certs/portal:ro"
       - "${WILDCARD_CERT_DIR:?set WILDCARD_CERT_DIR=<dir with wildcard fullchain.pem+privkey.pem>}:/certs/wildcard:ro"
     ports:
-      - "443:443"
-      - "80:80"
+      # #305: host:443/80 -> container:8443/8080 -- see CT_FRONT_DOOR's comment
+      # above. The container-side ports changed; the host-published, externally-
+      # visible ones (443/80) deliberately have not.
+      - "443:8443"
+      - "80:8080"
       # Edge admin API (host-ownership authorize/revoke, #23 BP4b) — unauthenticated
       # by network but token-gated (x-ct-admin-token); loopback-only like the
       # metrics port above, so an operator script on this host (e.g.
