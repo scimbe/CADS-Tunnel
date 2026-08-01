@@ -77,7 +77,7 @@ The authoritative mapping from a hostname to the Edge node currently holding tha
 _Avoid_: Routing table, directory, DNS (it is not DNS)
 
 **Control Plane**:
-The operator's thin coordination service: Agent enrollment, the Tunnel Registry, the Rendezvous endpoint, and billing. It holds no trust material and no payload, and is designed to be self-hostable so customers can survive operator takedown.
+The operator's thin coordination service: Agent enrollment, the Tunnel Registry, the Rendezvous endpoint, and billing. It holds no Agent/CA private keys and never sees payload, and is designed to be self-hostable so customers can survive operator takedown. It is not trust-material-free, though: where configured, it holds the credential-issuer signing key, per-CA ACME EAB credentials, and a DNS-provider token — operator secrets requiring the same protection/rotation as any other (#266).
 _Avoid_: Backend, API, server (too generic); the dashboard is one client of it, not the Control Plane itself
 
 **Termination**:

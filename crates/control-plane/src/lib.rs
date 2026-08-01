@@ -1,6 +1,11 @@
 //! CADS Tunnel Control Plane — thin, self-hostable-ready coordination:
-//! enrollment, Tunnel Registry, Rendezvous, billing. Holds no trust material or
-//! payload. See ADR-0005 (enrollment/identity), ADR-0017 (thin control plane).
+//! enrollment, Tunnel Registry, Rendezvous, billing. Holds no Agent/CA private
+//! keys and never sees payload — but is not trust-material-free (#266): it
+//! holds the credential-issuer signing key ([`credential::CredentialIssuer`],
+//! currently unwired, #260), per-CA EAB credentials ([`acme_broker`]), and any
+//! configured DNS-provider token ([`dns01_challenge`]) — operator secrets that
+//! need the same protection/rotation care as any other. See ADR-0005
+//! (enrollment/identity), ADR-0017 (thin control plane).
 
 pub mod accounts;
 pub mod acme_broker;

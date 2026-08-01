@@ -34,7 +34,7 @@ Primary: **censorship-resistance–motivated users** — people and organisation
 
 - **Agent** (Rust) — customer-run, outbound-only. Custodian of the Origin key; mints Capabilities; runs the ACME/BYO cert path for the future Browser Plane; emits its own telemetry.
 - **Edge** (Rust) — operator-run, public. Coordinates Rendezvous; relays ciphertext only as fallback; routes by Routing Token via a replicated Tunnel Registry. Cannot decrypt.
-- **Control Plane** (thin, self-hostable-ready) — enrollment, Tunnel Registry, Rendezvous endpoint, billing. Holds no trust material or payload ([ADR-0017](adr/0017-thin-self-hostable-control-plane.md)).
+- **Control Plane** (thin, self-hostable-ready) — enrollment, Tunnel Registry, Rendezvous endpoint, billing. Holds no Agent/CA private keys and never sees payload ([ADR-0017](adr/0017-thin-self-hostable-control-plane.md)) — but where configured it does hold the credential-issuer signing key, per-CA ACME EAB credentials, and a DNS-provider token, requiring the same operator-secret protection as any other (#266).
 - **Client** — runs operator software (Mesh Plane, v1). Holds a Capability; pins the Origin Identity.
 
 Language: **Rust** for the data plane ([ADR-0007](adr/0007-rust-data-plane.md)). Transport: **QUIC/UDP-443 with HTTP/2-over-TCP fallback** ([ADR-0004](adr/0004-quic-data-plane-transport.md)).

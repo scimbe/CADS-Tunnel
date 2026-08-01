@@ -3,8 +3,9 @@
 //! An account is addressed only by an opaque, random [`AccountId`] — the control
 //! plane stores no PII, so accounts are pseudonymous. Each account carries a
 //! prepaid credit balance: tunnels are paid for by debiting credits (M15.2), and
-//! credits are topped up out of band by a payment stub (M15.3). In-memory like
-//! the other control-plane services (holds no trust material).
+//! credits are topped up out of band by a payment stub (M15.3). In-memory,
+//! and holds no trust material itself — unlike some other control-plane
+//! services (credential-issuer key, EAB, DNS-provider token; see #266).
 //!
 //! Note on the threat model: pseudonymity + prepaid credit does not by itself
 //! stop a *funded* adversary from opening many accounts (sybil). That economic

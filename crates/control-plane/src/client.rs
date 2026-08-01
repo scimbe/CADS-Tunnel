@@ -4,7 +4,12 @@
 //! [`crate::http`]). This client lets an Agent enroll and register its tunnel,
 //! and a Client resolve a routing token, against a *running* control plane —
 //! the piece that turns the in-memory library into a hosted service (ADR-0017).
-//! Plaintext HTTP only; the control plane holds no trust material or payload.
+//! Plaintext HTTP only; this client's own traffic (enrollment, registry,
+//! rendezvous) carries no payload and no trust material. That's narrower than
+//! "the control plane holds no trust material" — it doesn't hold Agent/CA
+//! private keys, but does hold operator secrets where configured (the
+//! credential-issuer signing key, per-CA EAB credentials, DNS-provider
+//! tokens) on other endpoints this client doesn't call (#266).
 
 use serde::Deserialize;
 
