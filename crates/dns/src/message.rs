@@ -62,22 +62,65 @@ pub fn parse_query(buf: &[u8]) -> Option<Query> {
     })
 }
 
+/// #299: classic DNS-over-UDP payload ceiling (no EDNS0 OPT support here, so no
+/// larger advertised buffer to honor) — a response over this must set TC=1 and
+/// drop trailing answers rather than emit an oversized datagram a resolver that
+/// strictly honors TC never retries over TCP for, or that a plain IP layer
+/// fragments/drops outright.
+const MAX_UDP_RESPONSE_BYTES: usize = 512;
+
 /// Build an authoritative response for `query`, carrying one TXT answer per entry
 /// in `txts` (only for a TXT question; other qtypes get an empty NOERROR). Sets
 /// QR + AA and echoes the question. TXT strings longer than 255 bytes are split
 /// into DNS character-strings per the wire format.
+///
+/// #299: if the full answer set would exceed [`MAX_UDP_RESPONSE_BYTES`], only as
+/// many whole answers as fit are included, TC (truncation) is set, and ancount
+/// reflects the answers actually present — never a partial/corrupt answer record.
 pub fn build_response(query: &Query, txts: &[String]) -> Vec<u8> {
-    let answers: u16 = if query.qtype == TYPE_TXT {
-        txts.len() as u16
+    // Encode each answer RR independently first so truncation can drop whole
+    // answers by byte budget without ever splitting one mid-record.
+    let answer_rrs: Vec<Vec<u8>> = if query.qtype == TYPE_TXT {
+        txts.iter()
+            .map(|txt| {
+                let mut rr = Vec::new();
+                rr.extend_from_slice(&[0xC0, 0x0C]); // name: pointer to the question qname
+                rr.extend_from_slice(&TYPE_TXT.to_be_bytes());
+                rr.extend_from_slice(&CLASS_IN.to_be_bytes());
+                rr.extend_from_slice(&60u32.to_be_bytes()); // TTL
+                let mut rdata = Vec::new();
+                for chunk in txt.as_bytes().chunks(255) {
+                    rdata.push(chunk.len() as u8);
+                    rdata.extend_from_slice(chunk);
+                }
+                rr.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+                rr.extend_from_slice(&rdata);
+                rr
+            })
+            .collect()
     } else {
-        0
+        Vec::new()
     };
+
+    let header_and_question_len = 12 + name_wire_len(&query.name) + 4; // qtype + qclass
+    let mut included = 0usize;
+    let mut budget = MAX_UDP_RESPONSE_BYTES.saturating_sub(header_and_question_len);
+    for rr in &answer_rrs {
+        if rr.len() > budget {
+            break;
+        }
+        budget -= rr.len();
+        included += 1;
+    }
+    let truncated = included < answer_rrs.len();
+
     let mut out = Vec::new();
     out.extend_from_slice(&query.id.to_be_bytes());
-    // flags: QR=1, opcode=0, AA=1, TC=0, RD=0, RA=0, rcode=0 -> 0x8400.
-    out.extend_from_slice(&0x8400u16.to_be_bytes());
+    // flags: QR=1, opcode=0, AA=1, TC=truncated, RD=0, RA=0, rcode=0.
+    let flags: u16 = if truncated { 0x8600 } else { 0x8400 };
+    out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-    out.extend_from_slice(&answers.to_be_bytes()); // ancount
+    out.extend_from_slice(&(included as u16).to_be_bytes()); // ancount: answers actually present
     out.extend_from_slice(&0u16.to_be_bytes()); // nscount
     out.extend_from_slice(&0u16.to_be_bytes()); // arcount
 
@@ -86,23 +129,20 @@ pub fn build_response(query: &Query, txts: &[String]) -> Vec<u8> {
     out.extend_from_slice(&query.qtype.to_be_bytes());
     out.extend_from_slice(&query.qclass.to_be_bytes());
 
-    // Answers: point the RR name back at the question qname (offset 12 = 0xC00C).
-    if query.qtype == TYPE_TXT {
-        for txt in txts {
-            out.extend_from_slice(&[0xC0, 0x0C]);
-            out.extend_from_slice(&TYPE_TXT.to_be_bytes());
-            out.extend_from_slice(&CLASS_IN.to_be_bytes());
-            out.extend_from_slice(&60u32.to_be_bytes()); // TTL
-            let mut rdata = Vec::new();
-            for chunk in txt.as_bytes().chunks(255) {
-                rdata.push(chunk.len() as u8);
-                rdata.extend_from_slice(chunk);
-            }
-            out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-            out.extend_from_slice(&rdata);
-        }
+    for rr in answer_rrs.into_iter().take(included) {
+        out.extend_from_slice(&rr);
     }
     out
+}
+
+/// Wire length of `name` as [`encode_name`] would write it: one length byte + the
+/// label's bytes per dot-separated label, plus the trailing zero-length root label.
+/// `""` (the root/apex) encodes as just the trailing zero byte.
+fn name_wire_len(name: &str) -> usize {
+    if name.is_empty() {
+        return 1;
+    }
+    name.split('.').map(|label| 1 + label.len()).sum::<usize>() + 1
 }
 
 /// Build a DNS query datagram for `name` / `qtype` (RD set, one question).
@@ -238,6 +278,38 @@ mod tests {
             resp.windows(2).any(|w| w == [0xC0, 0x0C]),
             "answer name compresses to the question"
         );
+    }
+
+    #[test]
+    fn build_response_sets_tc_and_drops_trailing_answers_when_the_full_set_exceeds_512_bytes_299() {
+        // #299: many/large TXT answers must not produce an oversized UDP datagram with
+        // TC=0 -- resolvers that strictly honor TC never retry over TCP for one, and a
+        // plain IP layer can fragment/drop it outright, both breaking DNS-01 validation.
+        let q = parse_query(&query_bytes(0x1234, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        // Twenty ~200-byte TXT values -- the full set is far over 512 bytes.
+        let txts: Vec<String> = (0..20).map(|i| format!("{i:03}-{}", "x".repeat(200))).collect();
+        let resp = build_response(&q, &txts);
+
+        assert!(resp.len() <= MAX_UDP_RESPONSE_BYTES, "response fits the UDP ceiling: {} bytes", resp.len());
+        assert_eq!(resp[2] & 0x02, 0x02, "TC bit set");
+        let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+        assert!((ancount as usize) < txts.len(), "fewer answers than requested were included");
+        assert!(ancount > 0, "at least the small early answers still fit and are included");
+
+        // Every included answer is a complete, well-formed record -- parse_txt_answers
+        // recovers exactly `ancount` values with no panic/garbage from a split record.
+        let parsed = parse_txt_answers(&resp);
+        assert_eq!(parsed.len(), ancount as usize, "no partially-written answer snuck in");
+    }
+
+    #[test]
+    fn build_response_does_not_truncate_when_the_answer_set_fits_299() {
+        // The common case (a handful of small TXT values, the actual ACME DNS-01 shape)
+        // must be completely unaffected by the truncation logic.
+        let q = parse_query(&query_bytes(1, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let resp = build_response(&q, &["a-normal-challenge-token".to_string()]);
+        assert_eq!(resp[2] & 0x02, 0, "TC bit NOT set");
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "the one answer is present");
     }
 
     #[test]

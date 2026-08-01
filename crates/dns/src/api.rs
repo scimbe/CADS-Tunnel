@@ -55,6 +55,12 @@ fn authorized(st: &ApiState, headers: &HeaderMap) -> bool {
     }
 }
 
+/// #299: a real ACME DNS-01 key authorization digest (base64url SHA-256) is exactly
+/// 43 bytes; this is a generous ceiling above any realistic challenge value, chosen
+/// so a stored TXT record can never itself be the reason [`crate::message::build_response`]
+/// has to truncate an otherwise-small answer set.
+const MAX_TXT_VALUE_BYTES: usize = 256;
+
 /// `PUT /txt/:name` — body is the TXT value; replaces any existing value.
 async fn put_txt(
     State(st): State<ApiState>,
@@ -68,6 +74,9 @@ async fn put_txt(
     let value = body.trim();
     if name.is_empty() || value.is_empty() {
         return StatusCode::BAD_REQUEST;
+    }
+    if value.len() > MAX_TXT_VALUE_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE;
     }
     st.store.set_txt(&name, value);
     StatusCode::OK
@@ -115,6 +124,28 @@ mod tests {
         let del = Request::delete(format!("/txt/{name}")).body(Body::empty()).unwrap();
         assert_eq!(send(&app, del).await, StatusCode::OK);
         assert!(store.txt(name).is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_rejects_a_txt_value_over_the_size_cap_299() {
+        // #299: a real ACME key authorization digest is 43 bytes -- a value wildly
+        // beyond that (this is deliberately >> a UDP-safe DNS answer) must never reach
+        // the store, which is what let a single oversized record force build_response
+        // to emit a multi-KiB, un-truncated UDP datagram.
+        let store = Arc::new(AcmeDnsStore::new());
+        let app = api_router(store.clone(), None);
+        let name = "_acme-challenge.host.test";
+
+        let huge = "x".repeat(MAX_TXT_VALUE_BYTES + 1);
+        let put = Request::put(format!("/txt/{name}")).body(Body::from(huge)).unwrap();
+        assert_eq!(send(&app, put).await, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(store.txt(name).is_empty(), "the oversized value was never stored");
+
+        // Exactly at the cap is still accepted.
+        let at_cap = "y".repeat(MAX_TXT_VALUE_BYTES);
+        let put = Request::put(format!("/txt/{name}")).body(Body::from(at_cap.clone())).unwrap();
+        assert_eq!(send(&app, put).await, StatusCode::OK);
+        assert_eq!(store.txt(name), vec![at_cap]);
     }
 
     #[tokio::test]
