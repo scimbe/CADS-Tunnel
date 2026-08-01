@@ -734,6 +734,7 @@ pub async fn serve_front_door(
     wildcard_acceptor: Option<&tokio_rustls::TlsAcceptor>,
     mesh_relay: Option<&MeshRelayConfig>,
     relay_gate: Option<&crate::relay_gate::RelayGateContext>,
+    browser_tunnel_cap: Option<&ConnectionCap>,
 ) -> Result<(), BoxError> {
     // #121 Phase B1: the member's reflexive (post-NAT) source, captured from the accepted TCP
     // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
@@ -784,6 +785,18 @@ pub async fn serve_front_door(
             }
         }
         crate::sni::FrontDoorRoute::BrowserTunnel(host) => {
+            // #254: this arm is reached with an attacker-controlled SNI hostname and no
+            // per-token/PoW gate of its own -- admit against its own sub-cap, separate
+            // from the shared front-door `conn_cap` already held for this connection, so
+            // a flood here sheds without touching the budget Portal/auth/channel traffic
+            // depend on. Held for the rest of this arm's lifetime (relay or passthrough).
+            let _browser_tunnel_permit = match browser_tunnel_cap {
+                Some(cap) => Some(
+                    cap.try_admit()
+                        .ok_or("front door: BrowserTunnel connection cap reached — shedding (#254)")?,
+                ),
+                None => None,
+            };
             let joined = Prepend {
                 pre: hello,
                 pos: 0,
@@ -1552,6 +1565,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         eprintln!("ct-edge: max {n} concurrent connections (CT_EDGE_MAX_CONNECTIONS, #86/#95)");
         ConnectionCap::new(n as usize)
     });
+    // #254: a SEPARATE, smaller cap just for the BrowserTunnel/SNI-passthrough arm
+    // (`serve_sni_passthrough`/`serve_gelb_terminated`) -- it's reached with an
+    // attacker-controlled SNI hostname and no per-token/PoW gate of its own, so without
+    // this it can consume the entire shared `conn_cap` budget and starve Portal/auth/
+    // channel traffic, which all share that one cap too. This doesn't stop an attacker
+    // from exhausting the BrowserTunnel arm's OWN sub-budget -- it stops that from
+    // cascading into starving every other arm, same shed-cheaply posture as `conn_cap`.
+    // Half of `DEFAULT_MAX_CONNECTIONS` by default: generous for legitimate multi-tenant
+    // browser-tunnel traffic while always leaving the other half free for everything else.
+    let browser_tunnel_cap = resolve_flood_limit(
+        std::env::var("CT_EDGE_MAX_BROWSER_TUNNEL_CONNECTIONS").ok().as_deref(),
+        DEFAULT_MAX_CONNECTIONS / 2,
+    )
+    .map(|n| {
+        eprintln!("ct-edge: max {n} concurrent BrowserTunnel connections (CT_EDGE_MAX_BROWSER_TUNNEL_CONNECTIONS, #254)");
+        ConnectionCap::new(n as usize)
+    });
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
@@ -1693,10 +1723,40 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
                 Ok(bl) => {
                     let bstate = state.clone();
+                    // #254: this listener previously admitted every accepted connection
+                    // unconditionally -- unlike every other public accept loop in this file,
+                    // it had NO cap at all. Apply both the shared `conn_cap` (consistent with
+                    // the QUIC/TCP-fallback/:443 loops sharing one budget) and the
+                    // BrowserTunnel-specific `browser_tunnel_cap` (#254), same shed-cheaply
+                    // posture as everywhere else.
+                    let conn_cap_bl = conn_cap.clone();
+                    let browser_tunnel_cap_bl = browser_tunnel_cap.clone();
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = bl.accept().await {
+                            let permit = match &conn_cap_bl {
+                                Some(cap) => match cap.try_admit() {
+                                    Some(p) => Some(p),
+                                    None => {
+                                        drop(tcp);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+                            let sub_permit = match &browser_tunnel_cap_bl {
+                                Some(cap) => match cap.try_admit() {
+                                    Some(p) => Some(p),
+                                    None => {
+                                        drop(tcp);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
                             let state = bstate.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
+                                let _sub_permit = sub_permit;
                                 let _ = serve_sni_passthrough(tcp, &state).await;
                             });
                         }
@@ -1884,6 +1944,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // grant / membership gates run. Was missing here — the cap was cloned to
                     // the TCP-fallback and QUIC loops but never to this one.
                     let conn_cap_fd = conn_cap.clone();
+                    let browser_tunnel_cap_fd = browser_tunnel_cap.clone();
                     tokio::spawn(async move {
                         while let Ok((tcp, _)) = fl.accept().await {
                             let permit = match &conn_cap_fd {
@@ -1905,6 +1966,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let wildcard_tls = wildcard_tls.clone();
                             let mesh_relay_config = mesh_relay_config.clone();
                             let relay_gate_ctx = relay_gate_ctx.clone();
+                            let browser_tunnel_cap = browser_tunnel_cap_fd.clone();
                             tokio::spawn(async move {
                                 let _permit = permit; // held for the connection's lifetime
                                 let mut nonce = [0u8; 16];
@@ -1925,6 +1987,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     wildcard_tls.as_ref(),
                                     mesh_relay_config.as_ref(),
                                     relay_gate_ctx.as_ref(),
+                                    browser_tunnel_cap.as_ref(),
                                 )
                                 .await
                                 {
@@ -3461,7 +3524,7 @@ mod tests {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
             serve_front_door(
-                tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None, None,
+                tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None, None, None,
             )
             .await
         });
@@ -3653,7 +3716,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None)
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None)
                 .await
         });
 
@@ -3674,6 +3737,54 @@ mod tests {
         // serve_front_door returns (the upstream already closed after the echo).
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
+    async fn front_door_sheds_a_browser_tunnel_connection_once_its_own_sub_cap_is_full_254() {
+        // #254: the BrowserTunnel arm must admit against its own sub-cap, separate
+        // from the shared front-door `conn_cap` -- proven here by holding the sub-cap's
+        // only permit BEFORE the connection arrives and confirming serve_front_door
+        // refuses it (instead of proceeding to serve_sni_passthrough's route lookup,
+        // which would fail differently -- with "no such host", not a cap error).
+        use tokio::io::AsyncWriteExt;
+        crate::transport::install_crypto_provider();
+
+        let hello = crate::sni::synth_client_hello(Some("unrouted.test"), &[]);
+        let state = Arc::new(EdgeState::<Connection>::new()); // nothing registered
+
+        let certified = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let proxies: std::collections::HashMap<String, ProxyTarget> = std::collections::HashMap::new();
+
+        let cap = ConnectionCap::new(1);
+        let _held = cap.try_admit().unwrap(); // the sub-cap's only permit is already taken
+
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, Some(&cap)).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        client.write_all(&hello).await.unwrap();
+        client.flush().await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task)
+            .await
+            .expect("serve_front_door returns promptly, it never blocks waiting on the cap")
+            .unwrap();
+        let err = result.expect_err("an over-sub-cap BrowserTunnel connection is shed, not served");
+        assert!(err.to_string().contains("254"), "shed for the expected reason, got: {err}");
     }
 
     #[test]
@@ -3789,7 +3900,7 @@ mod tests {
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
             serve_front_door(
-                tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None,
+                tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None,
             )
             .await
         });
@@ -3878,7 +3989,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None)
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None, None)
                 .await
         });
 
@@ -4017,7 +4128,7 @@ mod tests {
                         std::collections::HashMap::new();
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
-                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None,
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None,
                     )
                     .await;
                 });
