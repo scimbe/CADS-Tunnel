@@ -99,6 +99,30 @@ pub struct EdgeState<H> {
     /// Revoked routing tokens (#27 RB3): a token here is torn down and refuses
     /// re-registration, so a customer's "revoke" actually stops the tunnel even
     /// though the agent keeps reconnecting.
+    ///
+    /// #280: this set has no eviction, and deliberately so. A `RoutingToken` is
+    /// an opaque 32 bytes with no embedded expiry (`ct_common::RoutingToken`) --
+    /// the CP hands out a token once and it's expected to keep working until the
+    /// customer explicitly revokes it, so nothing else independently invalidates
+    /// a revoked token. A TTL or size-capped eviction here would therefore be a
+    /// **security regression**, not just a robustness trade-off: aging out a
+    /// revocation record would let that same token become valid again on a
+    /// later reconnect attempt, silently undoing the customer's revoke. Growth
+    /// is bounded only by process lifetime (one 32-byte entry per ever-revoked
+    /// token).
+    ///
+    /// A restart IS a full reclamation of this set (and, today, the ONLY one) --
+    /// but that is a pre-existing, separate gap from what #280 covers, not a
+    /// mitigation of it: `POST /admin/revoke/:token` (`admin.rs`) is a one-time
+    /// push at the moment of revocation, and nothing replays the CP's
+    /// currently-revoked tokens to the Edge at boot (checked: no such call
+    /// anywhere in this crate). So a restarted Edge starts with an *empty*
+    /// revoked set, and a still-reconnecting Agent for an already-revoked
+    /// tunnel would successfully re-register until the customer revokes again
+    /// -- which they have no reason to, believing it's already done. Filed
+    /// separately (deserves its own fix: a boot-time sync endpoint or
+    /// replay-on-connect from the CP), since building that is a real feature
+    /// addition, not the same bounded scope as this unbounded-growth finding.
     revoked: Mutex<HashSet<RoutingToken>>,
     /// Shared admin secret authenticating the control plane's `'R'` revoke op
     /// (#27 RB3). `None` = revocation disabled (no `CT_EDGE_ADMIN_TOKEN`).
