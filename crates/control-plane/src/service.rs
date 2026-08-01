@@ -3371,6 +3371,18 @@ pub struct NetworkInfoResp {
     /// The Agent-Fabric channel relay port (`CT_EDGE_CHANNEL_RELAY_LISTEN`) — what
     /// `CT_CHANNEL_RELAY` must point at.
     pub channel_relay_port: u16,
+    /// #330: the unified `:443` front door (`CT_EDGE_BROWSER_LISTEN`) a relay-only
+    /// (NAT'd) channel member should point `CT_CHANNEL_RELAY_GATE` at — the relay-gate is
+    /// ALPN-demuxed onto this SAME listener as Browser-Plane/Portal traffic, not a
+    /// separate port, so there is deliberately no distinct `channel_relay_gate_port`
+    /// field. This value is the EXTERNAL convention (default `443`); a member co-located
+    /// on the plane's own Docker network must use the edge container's real bound port
+    /// instead (e.g. `edge:8443`, not `edge:443` — a host-level Docker port-publish like
+    /// `"443:8443"` only translates traffic entering from OUTSIDE Docker, see
+    /// `compose.frontdoor.yml`'s own comment on this exact trap, first hit live in
+    /// `#248`). `CT_CHANNEL_RELAY_GATE_CERT` is the same CA root every other `/pki/ca`
+    /// consumer already fetches — no separate cert endpoint needed.
+    pub channel_relay_gate_port: u16,
 }
 
 impl NetworkInfoResp {
@@ -3391,6 +3403,7 @@ impl NetworkInfoResp {
             mesh_edge_port: port("CT_CP_MESH_EDGE_PORT", 4433),
             channel_broker_port: port("CT_CP_CHANNEL_BROKER_PORT", 4435),
             channel_relay_port: port("CT_CP_CHANNEL_RELAY_PORT", 4436),
+            channel_relay_gate_port: port("CT_CP_CHANNEL_RELAY_GATE_PORT", 443),
         }
     }
 }
@@ -3418,11 +3431,13 @@ mod network_info_tests {
 
     #[test]
     fn network_info_defaults_match_the_selfhost_compose_ports() {
-        // No env configured -> the same 4433/4435/4436 docker/deploy/compose.selfhost.yml uses.
+        // No env configured -> the same 4433/4435/4436 docker/deploy/compose.selfhost.yml uses,
+        // plus 443 for the relay-gate's shared front door (#330).
         let info = NetworkInfoResp::from_lookup(|_| None);
         assert_eq!(info.mesh_edge_port, 4433);
         assert_eq!(info.channel_broker_port, 4435);
         assert_eq!(info.channel_relay_port, 4436);
+        assert_eq!(info.channel_relay_gate_port, 443);
     }
 
     #[test]
@@ -3430,12 +3445,14 @@ mod network_info_tests {
         let env = |k: &str| match k {
             "CT_CP_MESH_EDGE_PORT" => Some("5000".to_string()),
             "CT_CP_CHANNEL_BROKER_PORT" => Some("not-a-port".to_string()), // falls back to default
+            "CT_CP_CHANNEL_RELAY_GATE_PORT" => Some("8443".to_string()),
             _ => None,
         };
         let info = NetworkInfoResp::from_lookup(env);
         assert_eq!(info.mesh_edge_port, 5000, "explicit override honored");
         assert_eq!(info.channel_broker_port, 4435, "unparseable value falls back to default, not 0/panic");
         assert_eq!(info.channel_relay_port, 4436, "unset falls back to default");
+        assert_eq!(info.channel_relay_gate_port, 8443, "explicit override honored (e.g. a Docker-co-located deployment)");
     }
 
     #[tokio::test]
@@ -3455,6 +3472,7 @@ mod network_info_tests {
         assert_eq!(info.mesh_edge_port, 4433);
         assert_eq!(info.channel_broker_port, 4435);
         assert_eq!(info.channel_relay_port, 4436);
+        assert_eq!(info.channel_relay_gate_port, 443);
     }
 }
 
