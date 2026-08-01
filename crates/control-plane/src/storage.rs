@@ -219,6 +219,14 @@ impl SqliteEnrollment {
     /// [`IssueBatchError::Conflict`] instead of silently replaying the original set
     /// (the stored `tenant` and the recorded token count — `blob.len() / 32` — are the
     /// authoritative operation identity, so no extra column is needed).
+    /// #289: the mint loop and the `batch_issuance` idempotency record now run
+    /// in one transaction -- previously separate auto-committed statements, so
+    /// a crash after minting but before the idem record committed left `count`
+    /// live, durable, valid join tokens with no record of the operation. A
+    /// retry with the same key then found nothing and minted a SECOND full
+    /// set -- exactly the duplicate-identity outcome this idempotency key
+    /// exists to prevent. Now either both land or neither does, so a retry
+    /// after a crash always replays cleanly instead of re-minting.
     pub fn issue_join_tokens_idempotent(
         &self,
         tenant: &TenantId,
@@ -226,11 +234,12 @@ impl SqliteEnrollment {
         idempotency_key: &str,
         now: u64,
     ) -> Result<Vec<JoinToken>, IssueBatchError> {
-        let conn = self.conn.lock_safe();
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
         // Replay: return the previously-minted set for this key — but only if the retry
         // names the same operation. We fetch the stored `tenant` alongside the tokens so
         // a key reused with mismatched params fails loudly rather than mis-provisioning.
-        let existing: Option<(String, Vec<u8>)> = conn
+        let existing: Option<(String, Vec<u8>)> = tx
             .query_row(
                 "SELECT tenant, tokens FROM batch_issuance WHERE idem_key = ?1",
                 params![idempotency_key],
@@ -252,31 +261,41 @@ impl SqliteEnrollment {
         for _ in 0..count {
             let mut bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut bytes);
-            conn.execute(
+            tx.execute(
                 "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
                 params![&bytes[..], tenant.0],
             )?;
             blob.extend_from_slice(&bytes);
             tokens.push(JoinToken(bytes));
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO batch_issuance (idem_key, tenant, tokens, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![idempotency_key, tenant.0, blob, now as i64],
         )?;
+        tx.commit()?;
         Ok(tokens)
     }
 
     /// Redeem a join token, binding `agent`'s public key to the token's tenant.
     /// Single-use: a second redemption of the same token is rejected, and the
     /// consumption is persisted so it survives a restart.
+    ///
+    /// #288: the consume (`UPDATE redeemed`) and the bind (`INSERT
+    /// agent_bindings`) run in one transaction -- previously two separate
+    /// auto-committed statements, so a crash between them left the token
+    /// flagged redeemed with no binding row: a retry got `TokenAlreadyUsed`
+    /// but the agent had no enrolled identity, permanently locked out without
+    /// operator intervention. `confirm_payment` already wraps its own
+    /// two-table update this way; this matches that precedent.
     pub fn redeem(
         &self,
         token: &JoinToken,
         agent: &AgentId,
         pubkey: AgentPublicKey,
     ) -> Result<TenantId, RedeemError> {
-        let conn = self.conn.lock_safe();
-        let row: Option<(String, i64)> = conn
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let row: Option<(String, i64)> = tx
             .query_row(
                 "SELECT tenant, redeemed FROM join_tokens WHERE token = ?1",
                 params![&token.0[..]],
@@ -287,14 +306,15 @@ impl SqliteEnrollment {
         if redeemed != 0 {
             return Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed));
         }
-        conn.execute(
+        tx.execute(
             "UPDATE join_tokens SET redeemed = 1 WHERE token = ?1",
             params![&token.0[..]],
         )?;
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO agent_bindings (agent, tenant, pubkey) VALUES (?1, ?2, ?3)",
             params![agent.0, tenant, &pubkey[..]],
         )?;
+        tx.commit()?;
         Ok(TenantId(tenant))
     }
 
