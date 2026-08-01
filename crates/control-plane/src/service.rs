@@ -3951,32 +3951,42 @@ async fn channel_authorize(
     }
     let channel = hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST)?;
     let holder = hex_decode_32(&req.holder).ok_or(StatusCode::BAD_REQUEST)?;
-    match state
-        .channels
-        .authorize_holder(&ChannelId(channel), &holder)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        Some(op) => {
-            // Also hand back the member's attested Noise key (if registered) so the
-            // broker can deliver it to the paired peer (#72 AF4 / #100).
-            let noise = state
-                .channels
-                .member_noise_key(&ChannelId(channel), &holder)
-                .ok()
-                .flatten()
-                .map(|n| hex_encode(&n));
-            let attestation = state
-                .channels
-                .member_noise_attestation(&ChannelId(channel), &holder)
-                .ok()
-                .flatten()
-                .map(|a| hex_encode(&a));
-            Ok(Json(AuthorizeResp {
-                operator_pubkey: hex_encode(&op),
-                noise_pubkey: noise,
-                noise_attestation: attestation,
-            }))
-        }
+    // #231 root-cause candidate (2026-08-01): the three SqliteChannelStore lookups below
+    // are plain synchronous `fn`s over a `Mutex<rusqlite::Connection>` -- calling them
+    // directly here blocks whichever tokio worker thread is running this handler for the
+    // full duration of the lock wait + DB I/O. This host runs the control-plane at
+    // `cpus: 1.0` while tokio's default runtime still spawns one worker thread per HOST
+    // core (4 here) -- under ANY concurrent request load those threads share a single CPU's
+    // worth of CFS quota, so a handful of blocking calls landing close together can queue
+    // for real, multi-second time even though each individual query is trivial. This is
+    // exactly the edge broker's `authorize()` call this issue already bounds at 10s
+    // (`DEFAULT_AUTHORIZE_TIMEOUT`, channel_authorize.rs) -- a queueing delay approaching
+    // that bound is indistinguishable from a genuinely slow CP from the edge's side, and
+    // is a very plausible source of the intermittent "channel join admission exchange
+    // stalled (#140)" pattern this issue tracks. `spawn_blocking` moves the lock wait +
+    // query execution onto tokio's dedicated blocking-thread pool, so a slow/contended
+    // lookup here no longer starves the same small pool of async worker threads every
+    // other request (including unrelated ones) depends on.
+    let channels = state.channels.clone();
+    let lookup = tokio::task::spawn_blocking(move || {
+        let cid = ChannelId(channel);
+        let op = channels.authorize_holder(&cid, &holder)?;
+        let Some(op) = op else { return Ok(None) };
+        // Also hand back the member's attested Noise key (if registered) so the
+        // broker can deliver it to the paired peer (#72 AF4 / #100).
+        let noise = channels.member_noise_key(&cid, &holder).ok().flatten();
+        let attestation = channels.member_noise_attestation(&cid, &holder).ok().flatten();
+        Ok::<_, rusqlite::Error>(Some((op, noise, attestation)))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match lookup {
+        Some((op, noise, attestation)) => Ok(Json(AuthorizeResp {
+            operator_pubkey: hex_encode(&op),
+            noise_pubkey: noise.map(|n| hex_encode(&n)),
+            noise_attestation: attestation.map(|a| hex_encode(&a)),
+        })),
         None => Err(StatusCode::NOT_FOUND),
     }
 }

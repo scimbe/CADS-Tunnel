@@ -264,14 +264,32 @@ where
     // request + possession round-trip is then bounded a second time inside
     // `read_channel_join_on_stream`, so each phase has its own guard.
     //
-    let (send, recv) = match tokio::time::timeout(join_timeout, conn.accept_bi()).await {
+    // #231 root-cause (2026-08-01): this used to share the FULL `join_timeout` with the
+    // read phase below, stacking to up to 2x join_timeout (30s at the real 15s constant)
+    // of total server-side tolerance for one admission -- while the CLIENT's own total
+    // budget (ADMISSION_EXCHANGE_TIMEOUT, ct-agent's channel.rs) is a single 15s window
+    // covering the whole round trip. A perfectly healthy admission whose CP `authorize`
+    // call takes several seconds (well within ITS OWN 10s bound, and well within the read
+    // phase's own 15s bound) could already have exceeded what the client was still
+    // waiting for -- the server hadn't "failed", the client had just already given up,
+    // live-reproduced as the intermittent "channel join admission exchange stalled
+    // (#140)" pattern this issue tracks. `accept_bi` itself should be near-instant for a
+    // well-behaved peer (its own bi-stream open, right after completing the QUIC
+    // handshake) -- it is NOT a network round-trip to an external control-plane like the
+    // read phase is, so it doesn't need anywhere near the same budget. Capped at 5s (or
+    // `join_timeout` itself when a caller configures something shorter, e.g. this file's
+    // own fast unit tests) rather than a separate hardcoded constant, so the #105
+    // slow/hostile-client protection this timeout exists for is unchanged in spirit, just
+    // no longer wastefully large for this specific phase.
+    let accept_bi_timeout = join_timeout.min(std::time::Duration::from_secs(5));
+    let (send, recv) = match tokio::time::timeout(accept_bi_timeout, conn.accept_bi()).await {
         // #128: tag the bi-stream-open phase — a peer that completes the QUIC handshake but
         // closes before opening its stream surfaces here, not at handshake.
         Ok(streams) => streams.map_err(|e| format!("[quic-bistream] {e}"))?,
         Err(_) => {
             // A peer that completes the QUIC handshake but never opens a bi-stream within the
             // timeout (#105 stalled connection): log the problem, don't wedge the loop.
-            eprintln!("ct-edge: channel-join NO [bi-timeout] peer={observed}: no bi-stream within {join_timeout:?}");
+            eprintln!("ct-edge: channel-join NO [bi-timeout] peer={observed}: no bi-stream within {accept_bi_timeout:?}");
             return Err(
                 "channel join not submitted within the timeout — dropping stalled connection (#105)"
                     .into(),
