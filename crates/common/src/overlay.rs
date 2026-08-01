@@ -182,7 +182,17 @@ pub fn add_shortcuts(
             di[d] = 0;
         }
         for &(a, b) in &chosen {
-            let c = cost[&(a, b)];
+            // #274: `chosen` seeds from `base.links`, a caller-supplied plan that
+            // isn't guaranteed to be built from THIS function's own `links` slice
+            // -- a base-link pair with no matching entry in `cost` must never
+            // panic a public fn on untrusted/inconsistent input (this ran inside
+            // the control-plane's own request path). Treat an unknown cost as
+            // `inf`: Floyd-Warshall still runs correctly, it just can't use that
+            // pair's real (unknown) weight to discover a cheaper shortcut through
+            // it -- a safe, non-panicking degradation, not a correctness bug for
+            // any caller whose `base` actually IS derived from `links` (the only
+            // supported use today), where every pair already has a cost.
+            let c = cost.get(&(a, b)).copied().unwrap_or(inf);
             dist[a][b] = dist[a][b].min(c);
             dist[b][a] = dist[b][a].min(c);
         }
@@ -577,6 +587,24 @@ mod tests {
         // Only candidate not chosen would be... none improving (no a-c candidate exists).
         let out = add_shortcuts(&ns, &links, base.clone(), 5);
         assert_eq!(out, base, "no improving candidate -> unchanged");
+    }
+
+    #[test]
+    fn add_shortcuts_never_panics_on_a_base_link_absent_from_the_links_slice_274() {
+        // #274: `base` is a caller-supplied OverlayPlan, not guaranteed to have been
+        // built from the SAME `links` slice passed alongside it -- a base link with no
+        // matching cost entry must degrade gracefully (treated as an unknown/infinite
+        // cost), never panic this public fn on inconsistent input.
+        let ns = nodes(&["a", "b", "c"]);
+        let base = OverlayPlan {
+            links: vec![("a".to_string(), "b".to_string())], // NOT present in `links` below
+            total_cost: 999,
+            connected: true,
+        };
+        let links = vec![WeightedLink::new("b", "c", 1)]; // unrelated candidate set
+        let out = add_shortcuts(&ns, &links, base.clone(), 3); // must not panic
+        // The inconsistent base link is preserved as-is (never removed); no crash.
+        assert!(out.links.contains(&("a".to_string(), "b".to_string())));
     }
 
     #[test]

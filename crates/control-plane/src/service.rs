@@ -807,6 +807,10 @@ async fn network_put(
     Json(network): Json<ct_common::policy::Network>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let owner = subject_of(&state.verifier, &headers)?;
+    // #275: reject a duplicate-agent-id declaration here, at the REST boundary --
+    // before it's ever stored and silently produces a partitioned overlay plan or
+    // a wrong explain() resolution with no diagnostic pointing at the real cause.
+    network.validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     state
         .networks
         .put(&owner, &id, &network)
@@ -5104,6 +5108,47 @@ mod tests {
         let body = to_bytes(plan.into_body(), 1 << 16).await.unwrap();
         let resp: NetworkPlanResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp.desired, vec![Pair::new("dev-1", "ops-1")], "dev<->ops is the one permitted channel");
+    }
+
+    #[tokio::test]
+    async fn network_put_rejects_a_duplicate_agent_id_275() {
+        // #275: a duplicate agent id must be a clear 400 at the REST boundary, never
+        // silently stored and discovered later as a partitioned overlay plan.
+        use axum::body::Body;
+        use axum::http::Request;
+        use ct_common::policy::{Agent, Network, Policy};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let networks = Arc::new(SqliteNetworkStore::open_in_memory().unwrap());
+        let app = authed_network_router(networks, verifier);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let dup_net = Network {
+            agents: vec![
+                Agent::new("worker", "dev", "internal"),
+                Agent::new("worker", "dev", "internal"), // typo'd duplicate id
+            ],
+            policy: Policy::default(),
+        };
+        let resp = app
+            .oneshot(
+                Request::put("/me/networks/corp")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&dup_net).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "duplicate agent id -> 400, not silently stored");
     }
 
     #[tokio::test]

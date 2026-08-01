@@ -222,6 +222,25 @@ pub struct Network {
 }
 
 impl Network {
+    /// #275: reject duplicate agent ids before this `Network` is ever used. Without
+    /// this, `min_latency_overlay`'s id->index map silently collapses two agents
+    /// with the same id to one index -- the other becomes an unreachable overlay
+    /// component with no error (`plan.connected` just reports `false`), and
+    /// `explain(id, ...)` silently resolves to whichever duplicate happens to be
+    /// first, both with zero diagnostic pointing at the actual cause (a typo'd
+    /// duplicate id). Called at the REST deserialization boundary
+    /// (`PUT /me/networks/:id`) so a malformed declaration is a clear 400, not a
+    /// silently-partitioned overlay discovered later.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::with_capacity(self.agents.len());
+        for a in &self.agents {
+            if !seen.insert(a.id.as_str()) {
+                return Err(format!("duplicate agent id: {:?}", a.id));
+            }
+        }
+        Ok(())
+    }
+
     /// Explain whether agents `a_id` and `b_id` may establish a channel under this
     /// network's policy — the **`net.explain(a, b) → allowed? why`** decision (#102 MCP /
     /// broker-enforce): resolve both ids to members, then
@@ -406,6 +425,28 @@ mod tests {
         assert!(!desired.contains(&Pair::new("dev-1", "fin-i")));
         assert!(!desired.contains(&Pair::new("fin-i", "fin-s")));
         assert_eq!(desired.len(), 3, "exactly the three mutually-permitted pairs");
+    }
+
+    #[test]
+    fn network_validate_rejects_duplicate_agent_ids_275() {
+        let dup = Network {
+            agents: vec![
+                Agent::new("worker", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+                Agent::new("worker", "dev", "internal"), // typo'd duplicate id
+            ],
+            policy: company_policy(),
+        };
+        let err = dup.validate().expect_err("duplicate agent id must be rejected");
+        assert!(err.contains("worker"), "error names the duplicate id: {err}");
+
+        let unique = Network {
+            agents: vec![Agent::new("dev-1", "dev", "internal"), Agent::new("ops-1", "ops", "internal")],
+            policy: company_policy(),
+        };
+        assert!(unique.validate().is_ok(), "no duplicates -> valid");
+
+        assert!(Network::default().validate().is_ok(), "no agents at all -> trivially valid");
     }
 
     #[test]
