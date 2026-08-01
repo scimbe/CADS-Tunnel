@@ -1653,14 +1653,22 @@ impl SqliteTunnelStore {
     /// the CA the ledger entry was recorded against, or `None` if this
     /// hostname somehow had no `assigned_ca` (defensive; should not happen
     /// for a hostname that reached `gelb`+`offered`).
+    /// #293: the status flip and the ledger insert run in one transaction --
+    /// previously two separate auto-committed statements, so a crash between
+    /// them left a hostname permanently `gruen` with no matching
+    /// `acme_issuance_log` row. That silently undercounted the CA's real
+    /// usage in [`Self::ca_budget_usage`], letting the admission sweep
+    /// over-issue against that CA's actual rate limit. Now either both land
+    /// or neither does.
     pub fn record_issuance_complete(
         &self,
         hostname: &str,
         domain: &str,
         now: i64,
     ) -> rusqlite::Result<Option<String>> {
-        let conn = self.conn.lock_safe();
-        let ca: Option<String> = conn
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let ca: Option<String> = tx
             .query_row(
                 "SELECT assigned_ca FROM subject_tunnels WHERE hostname = ?1",
                 params![hostname],
@@ -1668,18 +1676,19 @@ impl SqliteTunnelStore {
             )
             .optional()?
             .flatten();
-        conn.execute(
+        tx.execute(
             "UPDATE subject_tunnels
              SET status = 'gruen', claim_state = 'none', claim_offered_at = NULL, claim_deadline = NULL
              WHERE hostname = ?1",
             params![hostname],
         )?;
         if let Some(ca) = &ca {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO acme_issuance_log (ca, domain, hostname, issued_at) VALUES (?1, ?2, ?3, ?4)",
                 params![ca, domain, hostname, now],
             )?;
         }
+        tx.commit()?;
         Ok(ca)
     }
 
