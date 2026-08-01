@@ -237,6 +237,35 @@ impl<H: Clone> EdgeState<H> {
         }
     }
 
+    /// De-authorize `host` (#281) — the counterpart `authorize_host` never had.
+    /// A no-op (not an error) if authorization was never required or `host`
+    /// wasn't authorized. Callers: [`revoke_token`](Self::revoke_token) (a
+    /// fully revoked token must not keep authorizing any of its hosts) and,
+    /// once the control plane grows a per-hostname (as opposed to per-tunnel)
+    /// revoke, that call path too.
+    pub fn unauthorize_host(&self, host: &str) {
+        if let Some(key) = ct_common::normalize_hostname(host) {
+            if let Some(map) = self.host_auth.lock_safe().as_mut() {
+                map.remove(&key);
+            }
+        }
+    }
+
+    /// Remove every `host_auth` entry currently authorizing `token` (#281):
+    /// unlike [`clear_hosts_for`](Self::clear_hosts_for) (the active routing
+    /// table, cleared on both a transient agent-drop and a real revoke),
+    /// this is deliberately called ONLY from [`revoke_token`](Self::revoke_token)
+    /// -- an ordinary disconnect-then-reconnect must keep its CP-granted
+    /// authorization, but a token the control plane has actually revoked must
+    /// never keep re-authorizing a hostname bind on a later reconnect attempt,
+    /// and the entry must not linger in memory for the rest of the process's
+    /// life either.
+    fn clear_host_auth_for(&self, token: &RoutingToken) {
+        if let Some(map) = self.host_auth.lock_safe().as_mut() {
+            map.retain(|_, t| t != token);
+        }
+    }
+
     /// Whether binding `host` to `token` is permitted (#23 BP4b): always true
     /// when authorization is not required; otherwise only for the authorized
     /// (hostname, token) pair.
@@ -521,6 +550,11 @@ impl<H: Clone> EdgeState<H> {
     pub fn revoke_token(&self, token: &RoutingToken) {
         self.revoked.lock_safe().insert(token.clone());
         self.remove(token); // also clears the token's hostname routes (#23 BP4a)
+        // #281: also drop any host_auth grant(s) for this token, so a revoked
+        // token can never re-authorize a hostname bind on a later reconnect --
+        // clear_hosts_for (inside remove()) only wipes the *active* routing
+        // table, not the separate, otherwise-permanent authorization grant.
+        self.clear_host_auth_for(token);
     }
 
     /// Whether `token` has been revoked (#27 RB3).
@@ -665,6 +699,47 @@ mod tests {
         let mut dump = state.dump_host_auth().unwrap();
         dump.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(dump, vec![("a.test".to_string(), token(1)), ("b.test".to_string(), token(2))]);
+    }
+
+    #[test]
+    fn unauthorize_host_drops_exactly_that_entry_281() {
+        let state = EdgeState::<u32>::new();
+        state.require_host_auth();
+        state.authorize_host("a.test", token(1));
+        state.authorize_host("b.test", token(2));
+
+        state.unauthorize_host("a.test");
+        assert!(!state.host_bind_allowed("a.test", &token(1)), "de-authorized host no longer binds");
+        assert!(state.host_bind_allowed("b.test", &token(2)), "the other authorization is untouched");
+
+        // A no-op on an unknown host, or when authorization was never required.
+        state.unauthorize_host("never-authorized.test");
+        let fresh = EdgeState::<u32>::new();
+        fresh.unauthorize_host("x.test"); // must not panic
+    }
+
+    #[test]
+    fn revoke_token_drops_its_host_auth_grants_so_a_later_reconnect_cant_rebind_281() {
+        // #281: authorize_host's grant otherwise persisted forever -- a customer
+        // revoking their tunnel at the control plane must also stop a
+        // still-reconnecting Agent from re-binding a hostname it was
+        // previously (but no longer) authorized for.
+        let state = EdgeState::<u32>::new();
+        state.require_host_auth();
+        state.authorize_host("app.example.com", token(1));
+        state.authorize_host("other.example.com", token(2));
+        assert!(state.host_bind_allowed("app.example.com", &token(1)));
+
+        state.revoke_token(&token(1));
+
+        assert!(
+            !state.host_bind_allowed("app.example.com", &token(1)),
+            "the revoked token's host authorization is gone, not just its live registration"
+        );
+        assert!(
+            state.host_bind_allowed("other.example.com", &token(2)),
+            "an unrelated token's authorization survives"
+        );
     }
 
     #[test]
