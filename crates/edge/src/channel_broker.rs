@@ -334,11 +334,18 @@ where
         tag: &str,
         context: &str,
         reason: BoxError,
+        peer: std::net::SocketAddr,
     ) -> BoxError {
+        // #248-follow: `observed` (the real remote address, QUIC or TCP) was already in
+        // scope everywhere this is called from -- just never included in the log line, so
+        // an operator watching a repeated refusal (e.g. a stale/leaked client retrying a
+        // channel-join for a since-deleted channel/holder forever) had no way to tell WHO
+        // was doing it, only that it was happening. Every other tagged refusal below now
+        // passes its own `observed` through.
         if context.is_empty() {
-            eprintln!("ct-edge: channel-join NO [{tag}]: {reason}");
+            eprintln!("ct-edge: channel-join NO [{tag}] peer={peer}: {reason}");
         } else {
-            eprintln!("ct-edge: channel-join NO [{tag}] {context}: {reason}");
+            eprintln!("ct-edge: channel-join NO [{tag}] peer={peer} {context}: {reason}");
         }
         let _ = send.write_all(b"NO").await;
         let _ = send.shutdown().await;
@@ -359,7 +366,7 @@ where
         .map_err(|e| { eprintln!("ct-edge: channel-join NO [io-len]: {e}"); e })?;
     let len = u16::from_be_bytes(len_buf) as usize;
     if len == 0 || len > 1024 {
-        return Err(refuse(&mut send, "len-oob", "", "channel join request length out of range".into()).await);
+        return Err(refuse(&mut send, "len-oob", "", "channel join request length out of range".into(), observed).await);
     }
     let mut bytes = vec![0u8; len];
     recv.read_exact(&mut bytes)
@@ -369,7 +376,7 @@ where
     let req = match ChannelJoinRequest::decode(&bytes) {
         Ok(r) => r,
         Err(_) => {
-            return Err(refuse(&mut send, "malformed", "", "malformed channel join request".into()).await);
+            return Err(refuse(&mut send, "malformed", "", "malformed channel join request".into(), observed).await);
         }
     };
     // The public grant fields that identify a live refusal to the operator: the channel
@@ -391,6 +398,7 @@ where
             "endpoint",
             &format!("endpoint={}", req.endpoint),
             "unsafe advertised endpoint".into(),
+            observed,
         )
         .await);
     }
@@ -400,11 +408,11 @@ where
         match authorize(req.grant.grant.channel, req.grant.grant.holder).await {
             Some(t) => t,
             None => {
-                return Err(refuse(&mut send, "not-member", &grant_ctx, "unknown channel or holder not a member".into()).await);
+                return Err(refuse(&mut send, "not-member", &grant_ctx, "unknown channel or holder not a member".into(), observed).await);
             }
         };
     if let Err(e) = verify(&operator, &req.grant, now) {
-        return Err(refuse(&mut send, "grant-verify", &grant_ctx, format!("channel grant rejected: {e}").into()).await);
+        return Err(refuse(&mut send, "grant-verify", &grant_ctx, format!("channel grant rejected: {e}").into(), observed).await);
     }
     // #81 gap 1: a signed grant is bearer bytes until the presenter proves it holds
     // the `holder` private key. The edge picks a fresh single-use challenge; the
@@ -420,7 +428,7 @@ where
     if recv.read_exact(&mut sig).await.is_err()
         || !verify_holder_possession(&req.grant.grant.holder, &challenge, &sig)
     {
-        return Err(refuse(&mut send, "possession", &grant_ctx, "holder possession proof failed".into()).await);
+        return Err(refuse(&mut send, "possession", &grant_ctx, "holder possession proof failed".into(), observed).await);
     }
     Ok((send, recv, req, operator, member_noise, member_attest, observed))
     };
