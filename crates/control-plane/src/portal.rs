@@ -1181,13 +1181,18 @@ mod tests {
         assert!(fd.contains("CT_CP_PROXY_ADDR"), "Portal upstream (control plane) set");
         assert!(fd.contains("CT_EDGE_PORTAL_CERT"), "Portal TLS cert wired (FD4-a)");
         assert!(fd.contains("/certs/portal"), "Portal cert dir mounted");
-        assert!(fd.contains(r#""443:443""#), "the :443 port is published");
+        // #305: the container binds unprivileged 8443/8080 internally (non-root,
+        // uid 65532, can't bind <1024) -- Docker's own port-publish mapping does the
+        // host:443/80 -> container:8443/8080 translation, so what must hold externally
+        // is that the HOST side of the mapping is still 443/80, not that the container
+        // side is too.
+        assert!(fd.contains(r#""443:8443""#), "the host's :443 is published (mapped to the container's unprivileged 8443)");
         // env_file on the edge, so the above are overridable from .env (the gap #60 hit).
         assert!(fd.contains("env_file"), "edge reads .env for the front-door vars");
         // #66: the :80 -> :443 redirect must also be wired (env var + published port),
         // else plain http://<zone>/ is connection-refused. Same gap class as #60.
         assert!(fd.contains("CT_EDGE_HTTP_REDIRECT"), "the :80->:443 redirect listener is enabled");
-        assert!(fd.contains(r#""80:80""#), "the :80 port is published for the redirect");
+        assert!(fd.contains(r#""80:8080""#), "the host's :80 is published (mapped to the container's unprivileged 8080, #305)");
         // #68: the customer install one-liner's public base URL must be wired from
         // the front door's Portal host — else it defaults to https://localhost.
         let base_line = fd

@@ -1057,7 +1057,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/logout">Sign out</a></nav>
+<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/logout">Sign out</a></nav>
 {body}
 </div>
 <script>
@@ -1121,12 +1121,83 @@ struct ClaimState {
 /// Mount alongside [`portal_api_router`] wherever the channel store is already in scope.
 pub fn channel_claim_router(session_key: &[u8], channels: Arc<crate::storage::SqliteChannelStore>) -> Router {
     Router::new()
+        .route("/portal/channels", get(channels_page))
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
         .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
         .with_state(ClaimState {
             session_key: Arc::from(session_key.to_vec()),
             channels,
         })
+}
+
+/// `GET /portal/channels` (self-service discoverability, 2026-08-01): the account
+/// page's "Your Channels" view -- every channel the logged-in session's own
+/// **verified** email has been allow-listed for
+/// ([`crate::storage::SqliteChannelStore::channels_for_email`]), with claim status
+/// and a direct link to [`claim_page`] for anything still pending. Closes the gap
+/// that kept forcing a manual, out-of-band hand-off of a raw channel id (chat,
+/// email, whatever) just so an allow-listed person could find out *what* to claim
+/// -- now discoverable purely from being logged in. Self-scoped by construction:
+/// the query is keyed on the session's own email, never a caller-supplied one, so
+/// there is no way to view another subject's invitations from this route.
+async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let Some(email) = claims.email else {
+        return Html(page(
+            "your channels",
+            r#"<h1>Your channels</h1><p class="help">Your session has no verified e-mail, so channel
+invitations (which are matched by e-mail) can't be shown. Log in again with an identity
+provider that verifies e-mail.</p>"#,
+        ))
+        .into_response();
+    };
+    let entries = match st.channels.channels_for_email(&email) {
+        Ok(v) => v,
+        Err(e) => return internal_error("channels_page/channels_for_email", e).into_response(),
+    };
+    Html(channels_html(&entries)).into_response()
+}
+
+/// Render the "Your Channels" list: each row is a channel id (the only stable,
+/// non-secret identifier a channel has in this schema -- there's no separate
+/// human name) plus a status badge, and a Claim link for anything pending.
+fn channels_html(entries: &[(ct_common::channel::ChannelId, Option<u64>)]) -> String {
+    let rows = if entries.is_empty() {
+        r#"<p class="help">No channel invitations yet. A channel owner adds your e-mail to their
+allow-list (<code>ct-agent channel allowlist add &lt;your-email&gt;</code> or the owner's own
+portal), and it appears here automatically -- nothing to request.</p>"#
+            .to_string()
+    } else {
+        entries
+            .iter()
+            .map(|(channel, claimed_at)| {
+                let channel_hex = escape(&hex(&channel.0));
+                let status = match claimed_at {
+                    Some(_) => r#" <span class="tier" style="color:#3fb950">Claimed</span>"#.to_string(),
+                    None => r#" <span class="tier" style="color:#f0c674">Pending</span>"#.to_string(),
+                };
+                let action = if claimed_at.is_none() {
+                    format!(r#"<a class="btn sec" href="/portal/channels/{channel_hex}/claim">Claim</a>"#)
+                } else {
+                    String::new()
+                };
+                format!(
+                    r#"<div class="row"><span class="v"><code>{channel_hex}</code>{status}</span><span>{action}</span></div>"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let body = format!(
+        r#"<h1>Your channels</h1>
+<p class="help">Channels your e-mail has been invited to (matched against your verified
+sign-in e-mail) -- claim a pending one to add yourself as a member, no manual
+exchange with the owner needed.</p>
+{rows}"#
+    );
+    page("your channels", &body)
 }
 
 #[derive(Deserialize)]
@@ -1170,9 +1241,13 @@ async fn do_claim(st: &ClaimState, headers: &HeaderMap, channel_hex: &str, req: 
             "noise_attestation does not verify against the holder key".to_string(),
         ));
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let claimed = st
         .channels
-        .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation)
+        .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation, now)
         .map_err(|e| internal_error("do_claim/claim_via_allowlist", e))?;
     if claimed {
         Ok(())
@@ -2559,5 +2634,75 @@ mod tests {
         let body_text = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert!(body_text.contains("Claimed"));
         assert!(channels.is_member(&ch, &holder_bytes).unwrap());
+    }
+
+    #[tokio::test]
+    async fn channels_page_lists_only_the_sessions_own_invitations_with_claim_status() {
+        // Self-service discoverability (2026-08-01): GET /portal/channels is the
+        // account page's "Your Channels" view -- must show only the logged-in
+        // session's own (verified-email-matched) invitations, with correct
+        // pending/claimed status, and never another subject's.
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::ChannelId;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch_pending = ChannelId([0x91u8; 32]);
+        let ch_claimed = ChannelId([0x92u8; 32]);
+        let ch_other_user = ChannelId([0x93u8; 32]);
+        let op = [0x22u8; 32];
+        assert!(channels.register_channel(&ch_pending, &op, "owner").unwrap());
+        assert!(channels.register_channel(&ch_claimed, &op, "owner").unwrap());
+        assert!(channels.register_channel(&ch_other_user, &op, "owner").unwrap());
+        assert!(channels.allowlist_add(&ch_pending, "owner", "nat@example.com", 1_000).unwrap());
+        assert!(channels.allowlist_add(&ch_claimed, "owner", "nat@example.com", 1_100).unwrap());
+        assert!(channels.allowlist_add(&ch_other_user, "owner", "someone-else@example.com", 1_200).unwrap());
+        assert!(channels
+            .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000)
+            .unwrap());
+
+        let app = channel_claim_router(KEY, channels.clone());
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        // Logged out -> bounced, not a raw 401/500.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/portal/channels").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // Logged in as nat -> sees exactly her two invitations, correct status each,
+        // and never the other user's channel (no cross-subject leakage).
+        let nat_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "nat-subject", "nat@example.com"));
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/portal/channels").header("cookie", nat_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains(&hex(&ch_pending.0)), "pending channel listed");
+        assert!(body.contains(&hex(&ch_claimed.0)), "claimed channel listed");
+        assert!(!body.contains(&hex(&ch_other_user.0)), "another user's invitation never shown");
+        assert!(body.contains("Pending"), "pending status shown");
+        assert!(body.contains("Claimed"), "claimed status shown");
+        // The pending channel gets a Claim link; a claimed one shouldn't repeat it.
+        assert!(body.contains(&format!("/portal/channels/{}/claim", hex(&ch_pending.0))));
+
+        // A different verified email with no invitations -> empty state, not an error.
+        let stranger_cookie = format!(
+            "ct_portal_session={}",
+            sign_session_with_email_for_test(KEY, "stranger-subject", "stranger@example.com")
+        );
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/portal/channels").header("cookie", stranger_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("No channel invitations yet"));
     }
 }

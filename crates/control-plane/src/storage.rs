@@ -1968,6 +1968,14 @@ impl SqliteChannelStore {
                  PRIMARY KEY (channel, email)
              );",
         )?;
+        // Self-service discoverability follow-up (2026-08-01): an allow-listed
+        // person previously had no way to find out *which* channel they'd been
+        // granted access to short of being told the raw channel id out of band --
+        // the exact gap that kept surfacing as a manual, repeated chat hand-off
+        // for real participants. Recording when a claim actually landed lets
+        // `channels_for_email` report status (pending / claimed) without needing
+        // to guess a not-yet-known holder key. Additive, nullable -- #44 pattern.
+        ensure_column(&conn, "channel_allowlist", "claimed_at", "INTEGER")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -2336,6 +2344,10 @@ impl SqliteChannelStore {
     /// Idempotent, same as `add_member`: re-claiming refreshes the recorded Noise
     /// key. The allow-list check and the insert happen under the same lock, so a
     /// concurrent `allowlist_remove` can't race a claim into landing anyway.
+    ///
+    /// Also stamps `channel_allowlist.claimed_at` for this `(channel, email)` pair
+    /// (`now`), so [`channels_for_email`](Self::channels_for_email) can report
+    /// claim status without needing to already know the claimant's holder key.
     pub fn claim_via_allowlist(
         &self,
         channel: &ChannelId,
@@ -2343,6 +2355,7 @@ impl SqliteChannelStore {
         holder: &[u8; 32],
         noise_pubkey: &[u8; 32],
         noise_attestation: &[u8; 64],
+        now: u64,
     ) -> rusqlite::Result<bool> {
         let conn = self.conn.lock_safe();
         let allowed: bool = conn
@@ -2361,7 +2374,42 @@ impl SqliteChannelStore {
              VALUES (?1, ?2, ?3, ?4)",
             params![&channel.0[..], &holder[..], &noise_pubkey[..], &noise_attestation[..]],
         )?;
+        conn.execute(
+            "UPDATE channel_allowlist SET claimed_at = ?3 WHERE channel = ?1 AND email = ?2",
+            params![&channel.0[..], email.to_ascii_lowercase(), now as i64],
+        )?;
         Ok(true)
+    }
+
+    /// Self-service discoverability (2026-08-01): every channel `email`
+    /// (case-insensitive) is allow-listed for, most-recently-added first, with
+    /// whether they've already claimed membership. This is the query behind the
+    /// portal account page's "Your Channels" section — a logged-in, verified-
+    /// email user's own view of what they've been invited to, with no need to be
+    /// told a raw channel id out of band first. Deliberately **not** owner-scoped
+    /// (same posture as [`allowlist_contains`](Self::allowlist_contains)/
+    /// [`claim_via_allowlist`](Self::claim_via_allowlist) — the caller here is the
+    /// invitee, not the owner) and deliberately scoped to exactly the caller's own
+    /// verified email — never call this with an email the session doesn't own.
+    pub fn channels_for_email(&self, email: &str) -> rusqlite::Result<Vec<(ChannelId, Option<u64>)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT channel, claimed_at FROM channel_allowlist WHERE email = ?1 ORDER BY added_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![email.to_ascii_lowercase()], |r| {
+                let channel: Vec<u8> = r.get(0)?;
+                let claimed_at: Option<i64> = r.get(1)?;
+                Ok((channel, claimed_at))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(channel, claimed_at)| {
+                let channel: [u8; 32] = channel.try_into().ok()?;
+                Some((ChannelId(channel), claimed_at.map(|v| v as u64)))
+            })
+            .collect())
     }
 }
 
@@ -4291,11 +4339,11 @@ mod tests {
         assert!(!s.allowlist_contains(&ch, "someone-else@example.com").unwrap());
 
         // An email NOT on the allow-list can't claim.
-        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest).unwrap());
+        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest, 3_000).unwrap());
         assert!(!s.is_member(&ch, &holder).unwrap());
 
         // The allow-listed email claims successfully (owner never involved in this call).
-        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest).unwrap());
+        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest, 3_000).unwrap());
         assert!(s.is_member(&ch, &holder).unwrap());
 
         // Owner removes the email; a FUTURE claim by a new holder is refused, but the
@@ -4306,11 +4354,49 @@ mod tests {
         assert_eq!(s.allowlist_list(&ch, "alice").unwrap(), Some(vec![]));
         assert!(s.is_member(&ch, &holder).unwrap(), "de-listing doesn't revoke an existing member");
         let another_holder = [0x99u8; 32];
-        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest).unwrap());
+        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest, 4_000).unwrap());
 
         // An unknown channel's allow-list is always empty -> claim always false.
         let unknown = ChannelId([0xAB; 32]);
-        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest).unwrap());
+        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest, 4_000).unwrap());
+    }
+
+    #[test]
+    fn channels_for_email_reports_claim_status_and_stays_self_scoped() {
+        // Self-service discoverability (2026-08-01): the query behind the portal
+        // account page's "Your Channels" section. An allow-listed-but-not-yet-
+        // claimed entry shows claimed_at = None; a claim stamps it; a different
+        // email (or channel) is never conflated with this one.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch_a = ChannelId([0x11; 32]);
+        let ch_b = ChannelId([0x22; 32]);
+        let op = [0x55u8; 32];
+        let holder = [0x66u8; 32];
+        let noise = [0x77u8; 32];
+        let attest = [0x88u8; 64];
+        assert!(s.register_channel(&ch_a, &op, "alice").unwrap());
+        assert!(s.register_channel(&ch_b, &op, "alice").unwrap());
+
+        // Nothing yet -> empty.
+        assert_eq!(s.channels_for_email("nat@example.com").unwrap(), vec![]);
+
+        // Allow-listed on both channels, claimed on neither yet.
+        assert!(s.allowlist_add(&ch_a, "alice", "nat@example.com", 1_000).unwrap());
+        assert!(s.allowlist_add(&ch_b, "alice", "Nat@Example.com", 1_100).unwrap());
+        let listed = s.channels_for_email("NAT@EXAMPLE.COM").unwrap();
+        assert_eq!(listed.len(), 2, "case-insensitive lookup, both channels");
+        assert!(listed.iter().all(|(_, claimed_at)| claimed_at.is_none()));
+
+        // Claim on ch_a only -> that one shows claimed_at, ch_b still pending.
+        assert!(s.claim_via_allowlist(&ch_a, "nat@example.com", &holder, &noise, &attest, 5_000).unwrap());
+        let listed = s.channels_for_email("nat@example.com").unwrap();
+        let a_status = listed.iter().find(|(c, _)| *c == ch_a).unwrap().1;
+        let b_status = listed.iter().find(|(c, _)| *c == ch_b).unwrap().1;
+        assert_eq!(a_status, Some(5_000), "ch_a claim stamped");
+        assert_eq!(b_status, None, "ch_b still pending");
+
+        // A different email sees nothing -- self-scoped, no cross-user leakage.
+        assert_eq!(s.channels_for_email("someone-else@example.com").unwrap(), vec![]);
     }
 
     #[test]
