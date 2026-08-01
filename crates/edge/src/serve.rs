@@ -699,6 +699,16 @@ const CHANNEL_PARK_TTL_SECS: u64 = 30;
 /// the pure parsers in [`crate::sni`] stay timeout-free so their unit tests are unaffected.
 const CLIENT_HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// #258: bound on the TLS handshake and admission exchange (role byte, per-role
+/// fixed-size reads/writes like the token, hostname, or 40-byte PoW solution) on the
+/// TCP-fallback path -- the same slow-drip concern [`CLIENT_HELLO_READ_TIMEOUT`]
+/// addresses for the :443 front door, which that timeout does NOT cover (this is a
+/// separate listener). Applies only to the bounded admission prefix of
+/// [`serve_tcp_connection`]'s TLS handshake and each role arm; the long-lived phase
+/// after admission (`park_tcp_agent`, relay, `wait_for_tcp_agent`) is deliberately left
+/// unbounded, same as everywhere else in this file.
+const TCP_FALLBACK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read the raw front-door ClientHello under [`CLIENT_HELLO_READ_TIMEOUT`] (#111): the
 /// timeout-bounded seam wrapping the panic-free parser [`crate::sni::read_client_hello_bytes`]
 /// so a client that stalls mid-record is dropped (freeing its #119 cap permit) instead of
@@ -1145,11 +1155,18 @@ where
     stream.read_exact(&mut role).await?;
     match role[0] {
         b'A' => {
-            let mut token_buf = [0u8; 32];
-            stream.read_exact(&mut token_buf).await?;
-            let token = RoutingToken(token_buf);
-            stream.write_all(b"OK").await?;
-            stream.flush().await?;
+            // #258: bound the admission exchange (not the park/relay that follows --
+            // that's deliberately unbounded, same as everywhere else in this file).
+            let token = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+                let mut token_buf = [0u8; 32];
+                stream.read_exact(&mut token_buf).await?;
+                let token = RoutingToken(token_buf);
+                stream.write_all(b"OK").await?;
+                stream.flush().await?;
+                Ok::<_, BoxError>(token)
+            })
+            .await
+            .map_err(|_| "tcp-fallback: role 'A' admission timed out")??;
             // Park and await a Client, then relay this agent stream to it.
             match state.park_tcp_agent(token).await {
                 Ok(mut client) => {
@@ -1174,26 +1191,34 @@ where
             // hostname in ONE message — the TLS-TCP fallback has a single stream,
             // so it can't carry a separate 'H' bind like the QUIC path. Wire:
             // `'B' | token(32) | host_len(2 BE) | host`.
-            let mut token_buf = [0u8; 32];
-            stream.read_exact(&mut token_buf).await?;
-            let token = RoutingToken(token_buf);
-            let mut hl = [0u8; 2];
-            stream.read_exact(&mut hl).await?;
-            let hlen = u16::from_be_bytes(hl) as usize;
-            if hlen == 0 || hlen > 253 {
-                return Err("invalid Browser-Plane hostname length".into());
-            }
-            let mut host = vec![0u8; hlen];
-            stream.read_exact(&mut host).await?;
-            let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
-            // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
-            if !state.host_bind_allowed(host, &token) || !state.register_host(host, token.clone()) {
-                stream.write_all(b"NO").await?;
+            // #258: bound the admission exchange, same as arm 'A'. `None` means
+            // admission was refused inline (NO already sent) -- just return.
+            let admitted = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+                let mut token_buf = [0u8; 32];
+                stream.read_exact(&mut token_buf).await?;
+                let token = RoutingToken(token_buf);
+                let mut hl = [0u8; 2];
+                stream.read_exact(&mut hl).await?;
+                let hlen = u16::from_be_bytes(hl) as usize;
+                if hlen == 0 || hlen > 253 {
+                    return Err("invalid Browser-Plane hostname length".into());
+                }
+                let mut host = vec![0u8; hlen];
+                stream.read_exact(&mut host).await?;
+                let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?.to_string();
+                // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
+                if !state.host_bind_allowed(&host, &token) || !state.register_host(&host, token.clone()) {
+                    stream.write_all(b"NO").await?;
+                    stream.flush().await?;
+                    return Ok::<_, BoxError>(None);
+                }
+                stream.write_all(b"OK").await?;
                 stream.flush().await?;
-                return Ok(());
-            }
-            stream.write_all(b"OK").await?;
-            stream.flush().await?;
+                Ok(Some(token))
+            })
+            .await
+            .map_err(|_| "tcp-fallback: role 'B' admission timed out")??;
+            let Some(token) = admitted else { return Ok(()) };
             match state.park_tcp_agent(token).await {
                 Ok(mut client) => {
                     relay(&mut stream, &mut client).await?;
@@ -1209,20 +1234,27 @@ where
             }
         }
         b'C' => {
-            let mut chal = [0u8; 17];
-            chal[..16].copy_from_slice(&challenge.nonce);
-            chal[16] = challenge.difficulty;
-            stream.write_all(&chal).await?;
-            stream.flush().await?;
+            // #258: bound the challenge/PoW admission exchange; the deliver/relay
+            // dispatch below is left unbounded (park/relay-wait, same as elsewhere).
+            let token = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+                let mut chal = [0u8; 17];
+                chal[..16].copy_from_slice(&challenge.nonce);
+                chal[16] = challenge.difficulty;
+                stream.write_all(&chal).await?;
+                stream.flush().await?;
 
-            let mut req = [0u8; 40];
-            stream.read_exact(&mut req).await?;
-            let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
+                let mut req = [0u8; 40];
+                stream.read_exact(&mut req).await?;
+                let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
-            // #86 (ADR-0018): per-token rendezvous rate limit (same as the QUIC path).
-            if !state.rendezvous_allowed(&token, rendezvous_window()) {
-                return Err("rendezvous rate limit exceeded".into());
-            }
+                // #86 (ADR-0018): per-token rendezvous rate limit (same as the QUIC path).
+                if !state.rendezvous_allowed(&token, rendezvous_window()) {
+                    return Err("rendezvous rate limit exceeded".into());
+                }
+                Ok::<_, BoxError>(token)
+            })
+            .await
+            .map_err(|_| "tcp-fallback: role 'C' admission timed out")??;
 
             // Prefer a parked TCP-fallback agent; else relay to a QUIC agent.
             match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
@@ -1258,30 +1290,39 @@ where
             // the one constant-time admin-token check every other privileged
             // edge operation already goes through, so only a genuine peer edge
             // (or the operator) can reach this role, never a Client or Agent.
-            let mut admin_token = [0u8; 32];
-            stream.read_exact(&mut admin_token).await?;
-            let mut hl = [0u8; 2];
-            stream.read_exact(&mut hl).await?;
-            let hlen = u16::from_be_bytes(hl) as usize;
-            if hlen == 0 || hlen > 253 {
-                return Err("invalid mesh-relay hostname length".into());
-            }
-            let mut host = vec![0u8; hlen];
-            stream.read_exact(&mut host).await?;
-            let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?;
+            // #258: bound the admin-token/hostname admission exchange, same as the
+            // other roles -- the reads here happen BEFORE admin_revoke_ok is even
+            // checked, so an unauthenticated dripper can still hold the cap permit
+            // through this phase.
+            let token = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+                let mut admin_token = [0u8; 32];
+                stream.read_exact(&mut admin_token).await?;
+                let mut hl = [0u8; 2];
+                stream.read_exact(&mut hl).await?;
+                let hlen = u16::from_be_bytes(hl) as usize;
+                if hlen == 0 || hlen > 253 {
+                    return Err("invalid mesh-relay hostname length".into());
+                }
+                let mut host = vec![0u8; hlen];
+                stream.read_exact(&mut host).await?;
+                let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?.to_string();
 
-            if !state.admin_revoke_ok(&admin_token) {
-                stream.write_all(b"NO").await?;
+                if !state.admin_revoke_ok(&admin_token) {
+                    stream.write_all(b"NO").await?;
+                    stream.flush().await?;
+                    return Err("mesh-relay auth rejected".into());
+                }
+                let Some(token) = state.route_host(&host) else {
+                    stream.write_all(b"NO").await?;
+                    stream.flush().await?;
+                    return Err(format!("mesh-relay: no local route for '{host}'").into());
+                };
+                stream.write_all(b"OK").await?;
                 stream.flush().await?;
-                return Err("mesh-relay auth rejected".into());
-            }
-            let Some(token) = state.route_host(host) else {
-                stream.write_all(b"NO").await?;
-                stream.flush().await?;
-                return Err(format!("mesh-relay: no local route for '{host}'").into());
-            };
-            stream.write_all(b"OK").await?;
-            stream.flush().await?;
+                Ok::<_, BoxError>(token)
+            })
+            .await
+            .map_err(|_| "tcp-fallback: role 'M' admission timed out")??;
 
             match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
@@ -1962,12 +2003,16 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
             let state = state_tcp.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the connection's lifetime
-                if let Ok(tls) = acceptor.accept(tcp).await {
-                    let mut nonce = [0u8; 16];
-                    rand::rngs::OsRng.fill_bytes(&mut nonce);
-                    let challenge = Challenge { nonce, difficulty };
-                    let _ = serve_tcp_connection(tls, &state, &challenge).await;
-                }
+                // #258: bound the handshake too, not just the admission reads inside
+                // serve_tcp_connection -- a slow-drip TLS handshake holds the cap
+                // permit exactly the same way a slow admission read does.
+                let Ok(Ok(tls)) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, acceptor.accept(tcp)).await else {
+                    return;
+                };
+                let mut nonce = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut nonce);
+                let challenge = Challenge { nonce, difficulty };
+                let _ = serve_tcp_connection(tls, &state, &challenge).await;
             });
         }
     });
@@ -2431,6 +2476,40 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         let _ = server_task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_admission_times_out_on_a_stalled_role_a_registration_258() {
+        // #258: a client that completes the TLS handshake, sends the 'A' role byte,
+        // then stalls forever (never sends its 32-byte token) must not hold the
+        // ConnectionCap permit indefinitely -- the admission read needs its own
+        // deadline, same discipline as #111's ClientHello timeout for the :443 path.
+        // Paused clock -> tokio auto-advances virtual time, so this is deterministic
+        // and fast despite the real 10s TCP_FALLBACK_ADMISSION_TIMEOUT.
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        let (edge_side, mut attacker_side) = tokio::io::duplex(64);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let server_task = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let res = serve_tcp_connection(edge_side, &state, &challenge).await;
+            (res, start.elapsed())
+        });
+
+        // Send only the role byte, then stall -- never send the token.
+        attacker_side.write_all(b"A").await.unwrap();
+        attacker_side.flush().await.unwrap();
+
+        let (res, elapsed) = server_task.await.unwrap();
+        assert!(res.is_err(), "a stalled 'A' registration must be dropped, got Ok");
+        assert!(
+            elapsed >= TCP_FALLBACK_ADMISSION_TIMEOUT,
+            "must wait for the admission timeout before dropping, elapsed {elapsed:?}"
+        );
+        // Keep the stalling attacker end alive until after the read resolves, so the
+        // read times out rather than seeing an EOF (same discipline as the front-door
+        // ClientHello timeout test above).
+        drop(attacker_side);
     }
 
     #[tokio::test]
