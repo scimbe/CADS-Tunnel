@@ -81,6 +81,18 @@ impl SqliteEdgeMesh {
         Ok(())
     }
 
+    /// Delete `mesh_edges` rows that haven't heartbeated since `since` (#290
+    /// housekeeping); returns the count removed. A permanently decommissioned
+    /// edge's row otherwise lives forever — `live_edges`/`assign_edge` already
+    /// filter it out of the *active* pool by `last_seen`, but it still bloats
+    /// the table and every future full scan. Safe to call periodically with a
+    /// generous cutoff (comfortably past any real edge's longest expected
+    /// downtime, e.g. a redeploy window) — an edge that heartbeats again after
+    /// being pruned just re-inserts on its next call, same as a brand-new one.
+    pub fn prune_stale_edges(&self, since: i64) -> rusqlite::Result<usize> {
+        self.conn.lock_safe().execute("DELETE FROM mesh_edges WHERE last_seen < ?1", params![since])
+    }
+
     /// Edges that have heartbeated at or after `since` (a Unix-seconds
     /// cutoff) — the pool [`assign_edge`] balances across.
     fn live_edges(&self, since: i64) -> rusqlite::Result<Vec<String>> {
@@ -376,6 +388,27 @@ mod tests {
         let now = now_secs();
         s.heartbeat("edge-1", "10.0.0.1:4437", now - 600).unwrap(); // stale
         assert_eq!(s.assign_edge("edge-1", now - 60).unwrap(), "edge-1", "falls back to default, not the stale edge");
+    }
+
+    #[test]
+    fn prune_stale_edges_removes_only_rows_older_than_the_cutoff_290() {
+        let s = store();
+        let now = now_secs();
+        s.heartbeat("edge-live", "10.0.0.1:4437", now).unwrap();
+        s.heartbeat("edge-decommissioned", "10.0.0.2:4437", now - 1_000).unwrap();
+
+        assert_eq!(s.prune_stale_edges(now - 500).unwrap(), 1, "exactly the decommissioned row is pruned");
+        assert_eq!(s.live_edges(now - 60).unwrap(), vec!["edge-live".to_string()], "the live edge survives");
+
+        // A pruned edge that heartbeats again just re-inserts, same as brand-new.
+        s.heartbeat("edge-decommissioned", "10.0.0.2:4438", now).unwrap();
+        assert_eq!(
+            s.live_edges(now - 60).unwrap(),
+            vec!["edge-decommissioned".to_string(), "edge-live".to_string()]
+        );
+
+        // A second prune with the same cutoff finds nothing new to remove.
+        assert_eq!(s.prune_stale_edges(now - 500).unwrap(), 0);
     }
 
     #[test]
