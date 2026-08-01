@@ -17,7 +17,7 @@ use ct_client::ladder::{
 };
 use ct_client::transport::{
     client_forward, client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed,
-    dial_edge, dial_rung, load_cert, udp_selftest, EdgeConn, DEFAULT_STREAM_SETUP_DEADLINE,
+    dial_edge_timed, dial_rung, load_cert, udp_selftest, EdgeConn, DEFAULT_STREAM_SETUP_DEADLINE,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
@@ -100,7 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // UDP mode: send one datagram through the tunnel to a UDP Origin and verify
     // the echo (the Agent must run with CT_AGENT_ORIGIN_PROTO=udp).
     if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("udp") {
-        let conn = dial_edge(edge_addr, edge_cert).await?;
+        // #284: udp mode also dials the Edge directly, bypassing dial_rung's
+        // per-rung timeout -- a blackholed/stalled Edge IP hung this forever.
+        let conn = dial_edge_timed(edge_addr, edge_cert, Duration::from_secs(3)).await?;
         let echo = udp_selftest(
             &conn,
             &cap.token,
@@ -128,7 +130,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("p2p") {
         let mut result = (false, Vec::new());
         for attempt in 0..5u32 {
-            let conn = dial_edge(edge_addr, edge_cert.clone()).await?;
+            // #284: p2p mode dials the Edge directly, bypassing dial_rung's
+            // per-rung timeout (the Ladder machinery is forward-mode-only) --
+            // a blackholed/stalled Edge IP hung this indefinitely and the
+            // 5-attempt retry loop below never advanced. Bound it to the same
+            // 3s budget the tunnel attempt right below already uses.
+            let conn = dial_edge_timed(edge_addr, edge_cert.clone(), Duration::from_secs(3)).await?;
             let (used_direct, resp) = client_tunnel_auto(
                 &conn,
                 &cap.token,

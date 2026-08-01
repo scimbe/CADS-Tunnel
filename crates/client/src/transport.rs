@@ -59,6 +59,22 @@ pub async fn dial_edge(
     Ok(conn)
 }
 
+/// [`dial_edge`] bounded by `timeout` (#284). The p2p/udp client modes dial the
+/// Edge directly (unlike single-tunnel/forward modes, which route through
+/// `dial_rung`'s own per-rung timeout via the Ladder) -- a blackholed or
+/// stalled Edge IP hung the bare call forever, and p2p mode's 5-attempt retry
+/// loop never advanced past attempt 1.
+pub async fn dial_edge_timed(
+    edge: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+    timeout: Duration,
+) -> Result<Connection, BoxError> {
+    match tokio::time::timeout(timeout, dial_edge(edge, edge_cert)).await {
+        Ok(r) => r,
+        Err(_) => Err(tunnel_timeout_error(timeout)),
+    }
+}
+
 /// After rendezvous, open a data stream to the Edge and exchange `input` for the
 /// tunnel's response. In the daemon, `input`/output are the Client's local
 /// socket; the Edge relays the stream to the Agent → Origin.
@@ -855,6 +871,36 @@ mod tests {
             "must return near the deadline, took {elapsed:?} (a stuck direct-endpoint query must not eat the whole budget silently)"
         );
         edge.abort();
+    }
+
+    /// #284 regression: `dial_edge` itself has no deadline (only `dial_rung`,
+    /// forward-mode-only, wraps it). p2p/udp client modes dial the Edge
+    /// directly -- against a blackholed/stalled Edge IP (here: a bound UDP
+    /// port nothing ever `accept()`s on, so the QUIC handshake never
+    /// completes) the bare call hangs until QUIC's own internal handshake
+    /// timeout. `dial_edge_timed` must return promptly instead.
+    #[tokio::test]
+    async fn dial_edge_timed_returns_promptly_against_a_handshake_that_never_completes() {
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        // Deliberately never call server.accept() -- the port is bound (so the
+        // client's handshake packets are received by the OS, not rejected
+        // outright) but nothing ever processes them, exactly like a
+        // stalled/blackholed Edge.
+
+        let start = Instant::now();
+        let r = dial_edge_timed(addr, cert, Duration::from_millis(300)).await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "must error, not hang, when the handshake never completes");
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "error should name the timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return near the deadline, took {elapsed:?}"
+        );
     }
 
     // #21 WC4: cover client_tunnel_noise_tcp_timed (the TLS-over-TCP timed
