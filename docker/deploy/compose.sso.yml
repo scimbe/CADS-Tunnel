@@ -42,6 +42,26 @@
 #                         exchange, so they never drift — no more copying a
 #                         Keycloak-minted secret by hand after each recreate.
 
+# #307 (found live, 2026-08-01 -- this exact failure mode already hit the running
+# deployment once this session: a `docker compose up` that only named other services
+# ended up recreating Keycloak too because its own compose config had changed,
+# silently wiping every registered account): Keycloak's data directory
+# (/opt/keycloak/data, where its embedded H2 database file lives even in --import-realm
+# / start-dev mode) was never on a persistent volume -- it lived in the container's
+# writable layer, so ANY recreate (image update, host reboot, an unrelated compose
+# change that happens to touch keycloak's own block) silently wiped every registered
+# user, session, and IdP link. `keycloak_data` below fixes exactly that: the H2 file
+# now survives a recreate. Keycloak's own realm-import strategy (IGNORE_EXISTING, the
+# default) means `--import-realm` is a no-op once the realm already exists in the
+# persisted data -- so this is safe to combine with the always-present
+# ct-demo-realm.json mount: first boot imports the declarative baseline (client
+# secrets, IdP config), every boot after that preserves the real accumulated user data.
+#
+# Deliberately NOT switching `start-dev` -> `start` (production mode) in the same
+# change -- that needs its own careful pass (KC_HOSTNAME/KC_PROXY/HTTPS-termination
+# expectations differ in production mode and could break the currently-working login
+# flow) and isn't the data-loss risk this issue is actually about. Filed as the
+# remaining, smaller half of #307 rather than bundled into a risky same-night change.
 name: ct-selfhost
 
 services:
@@ -103,6 +123,9 @@ services:
       KC_GITLAB_CLIENT_ID: "${KC_GITLAB_CLIENT_ID:-}"
       KC_GITLAB_CLIENT_SECRET: "${KC_GITLAB_CLIENT_SECRET:-}"
     volumes:
+      # #307: persist Keycloak's own data dir (its H2 DB file lives here) across
+      # recreates -- see the header comment above for why this matters.
+      - keycloak_data:/opt/keycloak/data
       - ./keycloak/ct-demo-realm.json:/opt/keycloak/data/import/ct-demo-realm.json:ro
       # Custom login theme (ct-bunsenbrenner): real Terms-and-Conditions text (EN/DE,
       # linking the live Nutzungsbedingungen/Datenschutz/Impressum pages) instead of
@@ -157,3 +180,7 @@ services:
     depends_on:
       keycloak:
         condition: service_healthy
+
+volumes:
+  # #307: Keycloak's data dir (H2 DB file) -- see the header comment above.
+  keycloak_data:
