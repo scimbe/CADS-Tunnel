@@ -75,6 +75,22 @@ services:
       # #305: host:443/80 -> container:8443/8080 -- see CT_FRONT_DOOR's comment
       # above. The container-side ports changed; the host-published, externally-
       # visible ones (443/80) deliberately have not.
+      #
+      # #248 TRAP for downstream integrators: this "443:8443" mapping is a
+      # HOST-level Docker port-publish. It only translates traffic entering
+      # from OUTSIDE Docker (the real internet, or the host's own loopback) --
+      # it does NOT create a listener reachable at <this-container's-ip>:443
+      # for another container on the SAME compose network. A sibling service
+      # (an agent, a bridge, anything reaching the edge's front door from
+      # inside Docker) MUST connect to :8443 directly, not :443, or it gets an
+      # instant OS-level "Connection refused" with no indication why. Bit
+      # CADS-a2a-demo for real: its bridge's relay-gate DCUtR dial used
+      # "edge:443" and failed 100% of the time until fixed to "edge:8443" --
+      # see that repo's run-demo.sh for the full incident writeup. Only
+      # affects a container-internal client of CT_CHANNEL_FRONT_DOOR /
+      # CT_CHANNEL_RELAY_GATE specifically; every other agent in this
+      # ecosystem talks to the edge on :4433 (a real bound port, no host-only
+      # publish, unaffected).
       - "443:8443"
       - "80:8080"
       # Edge admin API (host-ownership authorize/revoke, #23 BP4b) — unauthenticated
