@@ -34,6 +34,10 @@ struct Dns01State {
     /// queue, whenever they like, consuming the operator's shared per-CA
     /// rate-limit budget unpaced.
     tunnels: Arc<SqliteTunnelStore>,
+    /// #301: coalesces concurrent [`publish`] calls for the same record/value into
+    /// one shared deSEC convergence poll instead of each independently hammering
+    /// all 12 unicast nodes.
+    convergence: Arc<ct_dns::convergence::ConvergenceCoalescer>,
 }
 
 /// Build the DNS-01 challenge router. `None` when no DNS-01 backend is
@@ -48,7 +52,12 @@ pub fn dns01_challenge_router(
         Some(provider) => Router::new()
             .route("/agent/dns01-challenge", post(publish))
             .route("/agent/dns01-challenge/clear", post(clear))
-            .with_state(Dns01State { edge_mesh, provider: Arc::new(provider), tunnels }),
+            .with_state(Dns01State {
+                edge_mesh,
+                provider: Arc::new(provider),
+                tunnels,
+                convergence: Arc::new(ct_dns::convergence::ConvergenceCoalescer::new()),
+            }),
         None => Router::new(),
     }
 }
@@ -135,8 +144,16 @@ async fn publish(
     // UDP/53 blocked entirely, unlike doing this client-side) and so a 200
     // response means what it says: this is actually live.
     if let Dns01Provider::Desec(client) = state.provider.as_ref() {
-        use ct_dns::convergence::{wait_for_convergence, Convergence, DEFAULT_TIMEOUT, DESEC_NODES};
-        match wait_for_convergence(DESEC_NODES, client.domain(), &record_name, &req.value, DEFAULT_TIMEOUT).await {
+        use ct_dns::convergence::{Convergence, DEFAULT_TIMEOUT, DESEC_NODES};
+        // #301: coalesced by (zone, record, value) -- a burst of concurrent publishes
+        // for the exact same record+value share one poll instead of each hammering
+        // all 12 deSEC nodes independently.
+        let key = format!("{}/{}/{}", client.domain(), record_name, req.value);
+        match state
+            .convergence
+            .wait_for_convergence(&key, DESEC_NODES, client.domain(), &record_name, &req.value, DEFAULT_TIMEOUT)
+            .await
+        {
             Convergence::Converged { .. } => {}
             // We could not reach any node ourselves -- a fact about the
             // control plane's own network, not about deSEC. The write did

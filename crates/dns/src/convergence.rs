@@ -72,7 +72,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Outcome of waiting for a record to reach every node.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Convergence {
     /// Every node that answered is serving the expected value.
     Converged { nodes: usize, took: Duration },
@@ -165,6 +165,103 @@ pub async fn wait_for_convergence(
     }
 }
 
+/// #301: coalesce concurrent [`wait_for_convergence`] calls for the same
+/// `(zone, name, expected)` into ONE shared poll cycle. Without this, a burst of N
+/// simultaneous issuances for the same record (e.g. a retried publish, or several
+/// tenants renewing around the same time) each independently poll all 12 deSEC
+/// nodes every 5s for up to 300s -- N-fold amplification of query traffic against
+/// deSEC's unicast nodes, risking exactly the rate-limiting/IO-blocking the
+/// convergence probe itself depends on not hitting.
+///
+/// A caller that is first for a key becomes the poller and drives the real
+/// [`wait_for_convergence`] call; every concurrent caller for the SAME key
+/// subscribes to that one poll's result instead of starting its own. The map entry
+/// is removed once the poll finishes, so a later call for the same key (e.g. a
+/// genuinely new challenge value after renewal) starts a fresh poll rather than
+/// replaying a stale result.
+pub struct ConvergenceCoalescer {
+    inflight: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<Convergence>>>>,
+}
+
+impl Default for ConvergenceCoalescer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConvergenceCoalescer {
+    pub fn new() -> Self {
+        Self { inflight: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// [`wait_for_convergence`], coalesced by `key` (the caller picks it -- typically
+    /// something that uniquely identifies `(zone, name, expected)`, e.g.
+    /// `format!("{zone}/{name}/{expected}")`, so two different desired values for the
+    /// same record name are never accidentally coalesced together).
+    pub async fn wait_for_convergence(
+        &self,
+        key: &str,
+        nodes: &[&str],
+        zone: &str,
+        name: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> Convergence {
+        self.coalesce(key, || wait_for_convergence(nodes, zone, name, expected, timeout)).await
+    }
+
+    /// Core coalescing logic (#301), independent of what "poll" actually does --
+    /// injectable so a test can prove the dedup behavior itself (a concurrent
+    /// same-key burst runs the poll exactly once) without touching real DNS.
+    async fn coalesce<F, Fut>(&self, key: &str, poll: F) -> Convergence
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Convergence>,
+    {
+        // Atomically check-and-claim under one lock acquisition: whoever inserts the
+        // map entry is the poller, everyone else observed an existing entry and
+        // subscribes -- no window where two concurrent callers both think they're
+        // first.
+        let existing_or_new_rx = {
+            let mut map = self.inflight.lock().expect("convergence coalescer mutex poisoned");
+            match map.get(key) {
+                Some(rx) => Err(rx.clone()),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    map.insert(key.to_string(), rx);
+                    Ok(tx)
+                }
+            }
+        };
+
+        match existing_or_new_rx {
+            Ok(tx) => {
+                // This caller is the poller.
+                let result = poll().await;
+                let _ = tx.send(Some(result.clone()));
+                self.inflight.lock().expect("convergence coalescer mutex poisoned").remove(key);
+                result
+            }
+            Err(mut rx) => {
+                // A subscriber: wait for the poller's result. `watch` always retains
+                // its most recent value, so even if the poller already finished
+                // between our lock release above and getting here, `rx.borrow()`
+                // sees it immediately without an extra wakeup.
+                loop {
+                    if let Some(result) = rx.borrow_and_update().clone() {
+                        return result;
+                    }
+                    if rx.changed().await.is_err() {
+                        // The poller's sender dropped without ever sending (a panic
+                        // mid-poll) -- fail safe as unreachable rather than hang.
+                        return Convergence::NoNodesReachable;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Resolve each node hostname to every address it has (typically one IPv4 and
 /// one IPv6), skipping any node that no longer resolves at all so a stale
 /// entry cannot block issuance.
@@ -234,6 +331,7 @@ async fn soa_reachable(server: std::net::IpAddr, zone: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn the_node_list_covers_both_anycast_clouds_and_several_continents() {
@@ -268,5 +366,86 @@ mod tests {
         let outcome =
             wait_for_convergence(&[], "example.invalid", "_acme-challenge.example.invalid", "v", Duration::from_millis(50)).await;
         assert_eq!(outcome, Convergence::NoNodesReachable);
+    }
+
+    #[tokio::test]
+    async fn coalescer_runs_the_poll_exactly_once_for_a_concurrent_same_key_burst_301() {
+        // #301: N concurrent callers for the SAME key must share ONE poll, not each
+        // run their own -- the whole point, and not observable through real DNS
+        // timing (concurrent polls would overlap in wall-clock time either way), so
+        // prove it directly against an injected poll that counts its own invocations.
+        // Only ONE of the 8 concurrent callers ever becomes the poller (the other 7
+        // are subscribers that never touch the closure at all), so the closure holds
+        // itself open briefly with a short sleep -- long enough for all 8 spawned
+        // tasks to reach the coalescer and register as poller-or-subscriber before
+        // the single poll resolves, without any explicit cross-task coordination.
+        let coalescer = Arc::new(ConvergenceCoalescer::new());
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let coalescer = coalescer.clone();
+            let poll_count = poll_count.clone();
+            handles.push(tokio::spawn(async move {
+                coalescer
+                    .coalesce("zone/name/expected", || async move {
+                        poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                    })
+                    .await
+            }));
+        }
+
+        for h in handles {
+            let result = h.await.unwrap();
+            assert_eq!(result, Convergence::Converged { nodes: 12, took: Duration::from_millis(1) });
+        }
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one poll served all 8 callers");
+    }
+
+    #[tokio::test]
+    async fn coalescer_runs_independent_polls_for_different_keys_301() {
+        // Different keys must NOT be coalesced together -- each gets its own poll.
+        let coalescer = ConvergenceCoalescer::new();
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let a = coalescer.coalesce("zone/a/expected", || {
+            let poll_count = poll_count.clone();
+            async move {
+                poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Convergence::NoNodesReachable
+            }
+        });
+        let b = coalescer.coalesce("zone/b/expected", || {
+            let poll_count = poll_count.clone();
+            async move {
+                poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Convergence::NoNodesReachable
+            }
+        });
+        let (ra, rb) = tokio::join!(a, b);
+        assert_eq!((ra, rb), (Convergence::NoNodesReachable, Convergence::NoNodesReachable));
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 2, "two distinct keys, two independent polls");
+    }
+
+    #[tokio::test]
+    async fn coalescer_starts_a_fresh_poll_after_the_prior_one_for_the_same_key_finished_301() {
+        // A finished poll's map entry must be cleaned up -- a LATER call for the same
+        // key (e.g. a genuinely new challenge value after renewal) must run its own
+        // fresh poll, not replay a stale cached result forever.
+        let coalescer = ConvergenceCoalescer::new();
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let poll_count = poll_count.clone();
+            coalescer
+                .coalesce("zone/name/expected", || async move {
+                    poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Convergence::NoNodesReachable
+                })
+                .await;
+        }
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 3, "three sequential calls, three fresh polls");
     }
 }
