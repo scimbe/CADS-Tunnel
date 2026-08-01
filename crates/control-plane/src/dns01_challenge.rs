@@ -73,11 +73,24 @@ fn dns01_record_name(hostname: &str) -> String {
 }
 
 async fn authorize(state: &Dns01State, token: &str, hostname: &str) -> Result<(), (StatusCode, String)> {
-    let owns = state
+    // #286: `mesh_ownership` is best-effort bookkeeping (`EdgeMeshHandle::forget`
+    // swallows a DELETE failure on revoke), so a stale row there must never be
+    // sufficient on its own; also require the DURABLE `subject_tunnels` record to
+    // currently agree this token owns this hostname. A revoked tunnel's row is gone
+    // (transactional delete, #327), so this closes the gap regardless of whether the
+    // best-effort mesh_ownership cleanup succeeded -- otherwise a former agent could
+    // still obtain a real certificate for a hostname its customer no longer controls.
+    let mesh_owns = state
         .edge_mesh
         .token_owns_hostname(token, hostname)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if owns {
+    let durable_owns = state
+        .tunnels
+        .routing_token_for_hostname(hostname)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .as_deref()
+        == Some(token);
+    if mesh_owns && durable_owns {
         Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, "this token is not the recorded owner of this hostname".to_string()))
@@ -164,6 +177,7 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use crate::storage::SubjectTunnel;
     use ct_dns::store::AcmeDnsStore;
     use tower::ServiceExt;
 
@@ -177,22 +191,28 @@ mod tests {
 
     /// Create a tunnel row for `hostname` and admit it straight to `gruen` --
     /// the shortest path to "the admission broker says yes" for tests whose
-    /// point is ownership authorization, not admission status itself.
-    fn admit(tunnels: &SqliteTunnelStore, hostname: &str) {
-        tunnels.create("subject", hostname, Some(hostname)).unwrap();
+    /// point is ownership authorization, not admission status itself. Returns
+    /// the full tunnel record (#286: `authorize` now also requires the
+    /// durable routing token to match, not just mesh_ownership's record; some
+    /// tests also need `.id` to revoke it).
+    fn admit(tunnels: &SqliteTunnelStore, hostname: &str) -> SubjectTunnel {
+        let t = tunnels.create("subject", hostname, Some(hostname)).unwrap();
         tunnels.enter_gelb_queue(hostname, 0).unwrap();
         tunnels.offer_claim(hostname, "letsencrypt", 0, 1).unwrap();
         tunnels.record_issuance_complete(hostname, "example.com", 0).unwrap();
+        t
     }
 
     #[tokio::test]
     async fn publish_and_clear_require_the_owning_token_and_touch_only_that_hostname() {
         let edge_mesh = store();
-        edge_mesh.record_ownership("deadbeef", Some("app.example.com"), "edge-1", 0).unwrap();
-        edge_mesh.record_ownership("cafef00d", Some("other.example.com"), "edge-1", 0).unwrap();
         let tunnels = tunnels();
-        admit(&tunnels, "app.example.com");
-        admit(&tunnels, "other.example.com");
+        let app_tunnel = admit(&tunnels, "app.example.com");
+        let other_tunnel = admit(&tunnels, "other.example.com");
+        let app_token = app_tunnel.routing_token.clone();
+        let other_token = other_tunnel.routing_token.clone();
+        edge_mesh.record_ownership(&app_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        edge_mesh.record_ownership(&other_token, Some("other.example.com"), "edge-1", 0).unwrap();
         let dns_store = Arc::new(AcmeDnsStore::new());
         let app = dns01_challenge_router(
             edge_mesh,
@@ -212,7 +232,7 @@ mod tests {
         // The owning token publishes successfully.
         let resp = post(
             "/agent/dns01-challenge",
-            serde_json::json!({"token": "deadbeef", "hostname": "app.example.com", "value": "tok-123"}),
+            serde_json::json!({"token": app_token, "hostname": "app.example.com", "value": "tok-123"}),
         )
         .await
         .unwrap();
@@ -222,7 +242,7 @@ mod tests {
         // A DIFFERENT owned hostname's token cannot touch this one.
         let resp = post(
             "/agent/dns01-challenge",
-            serde_json::json!({"token": "cafef00d", "hostname": "app.example.com", "value": "evil"}),
+            serde_json::json!({"token": other_token, "hostname": "app.example.com", "value": "evil"}),
         )
         .await
         .unwrap();
@@ -245,12 +265,44 @@ mod tests {
         // The owning token clears its own record.
         let resp = post(
             "/agent/dns01-challenge/clear",
-            serde_json::json!({"token": "deadbeef", "hostname": "app.example.com"}),
+            serde_json::json!({"token": app_token, "hostname": "app.example.com"}),
         )
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(dns_store.txt("_acme-challenge.app.example.com").is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_is_refused_once_mesh_ownership_is_stale_relative_to_the_durable_tunnel_286() {
+        // #286: mesh_ownership is best-effort (a revoke's forget() can fail and
+        // leave a stale row). Proves the actual bug this closes for the DNS-01
+        // publish endpoint specifically: a stale mesh_ownership row alone must
+        // never be enough to publish a real ACME challenge record -- the
+        // durable subject_tunnels record has to agree too.
+        let edge_mesh = store();
+        let tunnels = tunnels();
+        let t = admit(&tunnels, "app.example.com");
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        // Revoke at the durable layer without touching mesh_ownership.
+        tunnels.revoke("subject", &t.id, 1_000).unwrap();
+
+        let dns_store = Arc::new(AcmeDnsStore::new());
+        let app = dns01_challenge_router(edge_mesh, tunnels, Some(Dns01Provider::SelfHosted(dns_store.clone())));
+        let resp = app
+            .oneshot(
+                Request::post("/agent/dns01-challenge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"token": t.routing_token, "hostname": "app.example.com", "value": "v"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "revoked at the durable layer -> refused despite the stale mesh row");
+        assert!(dns_store.txt("_acme-challenge.app.example.com").is_empty(), "no challenge record ever published");
     }
 
     #[tokio::test]
@@ -279,9 +331,9 @@ mod tests {
         // NOT be enough once the broker exists; the hostname must actually be
         // in an admitted window (or already gruen).
         let edge_mesh = store();
-        edge_mesh.record_ownership("deadbeef", Some("app.example.com"), "edge-1", 0).unwrap();
         let tunnels = tunnels();
-        tunnels.create("subject", "app.example.com", Some("app.example.com")).unwrap();
+        let t = tunnels.create("subject", "app.example.com", Some("app.example.com")).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         // Deliberately left `rot` -- never entered the Gelb queue, never offered.
         let dns_store = Arc::new(AcmeDnsStore::new());
         let app =
@@ -292,7 +344,7 @@ mod tests {
                 Request::post("/agent/dns01-challenge")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"token": "deadbeef", "hostname": "app.example.com", "value": "v"})
+                        serde_json::json!({"token": t.routing_token, "hostname": "app.example.com", "value": "v"})
                             .to_string(),
                     ))
                     .unwrap(),

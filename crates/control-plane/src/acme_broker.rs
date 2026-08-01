@@ -132,11 +132,23 @@ async fn push_channel_tier(
 }
 
 async fn authorize(state: &AcmeBrokerState, token: &str, hostname: &str) -> Result<(), (StatusCode, String)> {
-    let owns = state
+    // #286: `mesh_ownership` is best-effort bookkeeping (`EdgeMeshHandle::forget`
+    // swallows a DELETE failure on revoke — see its own doc comment), so a stale row
+    // there must never be sufficient on its own; also require the DURABLE
+    // `subject_tunnels` record to currently agree this token owns this hostname. A
+    // revoked tunnel's row is gone (transactional delete, #327), so this closes the
+    // gap regardless of whether the best-effort mesh_ownership cleanup succeeded.
+    let mesh_owns = state
         .edge_mesh
         .token_owns_hostname(token, hostname)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if owns {
+    let durable_owns = state
+        .tunnels
+        .routing_token_for_hostname(hostname)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .as_deref()
+        == Some(token);
+    if mesh_owns && durable_owns {
         Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, "this token is not the recorded owner of this hostname".to_string()))
@@ -433,15 +445,12 @@ mod tests {
     #[tokio::test]
     async fn admission_requires_the_owning_token_and_reports_rot_by_default() {
         let (edge_mesh, tunnels) = stores();
-        tunnels.create("alice", "web", Some("app.example.com")).unwrap();
-        edge_mesh.record_ownership("deadbeef", Some("app.example.com"), "edge-1", 0).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         let app = acme_broker_router(edge_mesh, tunnels, None);
+        let path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
 
-        let resp = app
-            .clone()
-            .oneshot(Request::get("/agent/acme-admission/deadbeef/app.example.com").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app.clone().oneshot(Request::get(&path).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: AdmissionResponse = serde_json::from_slice(&body).unwrap();
@@ -458,19 +467,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admission_is_refused_once_mesh_ownership_is_stale_relative_to_the_durable_tunnel_286() {
+        // #286: `mesh_ownership` is best-effort (a revoke's forget() can fail and
+        // leave a stale row). Proves the actual bug this closes: even when
+        // mesh_ownership still (incorrectly) claims a token owns a hostname, the
+        // durable subject_tunnels record must ALSO agree, or admission is refused.
+        let (edge_mesh, tunnels) = stores();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        // Revoke the tunnel at the durable layer WITHOUT touching mesh_ownership --
+        // simulating exactly the failure mode #286 describes (forget()'s DELETE
+        // silently failed and left the stale row behind).
+        tunnels.revoke("alice", &t.id, 1_000).unwrap();
+        assert!(
+            edge_mesh.token_owns_hostname(&t.routing_token, "app.example.com").unwrap(),
+            "sanity: the stale mesh_ownership row is still there"
+        );
+
+        let app = acme_broker_router(edge_mesh, tunnels, None);
+        let path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
+        let resp = app.oneshot(Request::get(&path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a revoked tunnel must not admit even with a stale mesh_ownership row"
+        );
+    }
+
+    #[tokio::test]
     async fn admission_reports_may_issue_now_only_within_an_open_offer_or_once_gruen() {
         let (edge_mesh, tunnels) = stores();
-        tunnels.create("alice", "web", Some("app.example.com")).unwrap();
-        edge_mesh.record_ownership("deadbeef", Some("app.example.com"), "edge-1", 0).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         tunnels.enter_gelb_queue("app.example.com", 100).unwrap();
+        let admission_path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
+        let issuance_complete_path = format!("/agent/acme-issuance-complete/{}/app.example.com", t.routing_token);
 
         let far_future = now_secs() + 100;
         tunnels.offer_claim("app.example.com", "letsencrypt", 100, far_future).unwrap();
         let app = acme_broker_router(edge_mesh.clone(), tunnels.clone(), None);
-        let resp = app
-            .oneshot(Request::get("/agent/acme-admission/deadbeef/app.example.com").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app.oneshot(Request::get(&admission_path).body(Body::empty()).unwrap()).await.unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: AdmissionResponse = serde_json::from_slice(&body).unwrap();
         assert!(parsed.may_issue_now, "an open, unexpired offer allows issuance");
@@ -481,16 +517,11 @@ mod tests {
         let app = acme_broker_router(edge_mesh, tunnels.clone(), None);
         let resp = app
             .clone()
-            .oneshot(
-                Request::post("/agent/acme-issuance-complete/deadbeef/app.example.com").body(Body::empty()).unwrap(),
-            )
+            .oneshot(Request::post(&issuance_complete_path).body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let resp = app
-            .oneshot(Request::get("/agent/acme-admission/deadbeef/app.example.com").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let resp = app.oneshot(Request::get(&admission_path).body(Body::empty()).unwrap()).await.unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: AdmissionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.status, "gruen");
