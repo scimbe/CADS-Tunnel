@@ -156,7 +156,7 @@ impl PortalOidc {
     /// so a caller reachable at a different portal path still gets a correct link.
     pub(crate) fn account_console_url_with_referrer(&self, portal_origin: &str, redirect_to: &str) -> String {
         format!(
-            "{}/account?referrer={}&referrer_uri={}",
+            "{}/account?referrer={}&referrer_uri={}&kc_locale=en",
             self.issuer(),
             urlencode(&self.client_id),
             urlencode(&format!("{portal_origin}{redirect_to}")),
@@ -1023,7 +1023,8 @@ mod tests {
         assert_eq!(
             url,
             "https://auth.bunsenbrenner.org/realms/ct-demo/account\
-             ?referrer=ct-portal&referrer_uri=https%3A%2F%2Fbunsenbrenner.org%2Fportal%2Faccount"
+             ?referrer=ct-portal&referrer_uri=https%3A%2F%2Fbunsenbrenner.org%2Fportal%2Faccount\
+             &kc_locale=en"
         );
     }
 
