@@ -799,7 +799,7 @@ fn session_cookie(token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax")
 }
 
-fn cleared_session_cookie() -> String {
+pub(crate) fn cleared_session_cookie() -> String {
     format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 

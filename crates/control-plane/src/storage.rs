@@ -737,6 +737,16 @@ impl SqlitePipelineRegistry {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Un-publish `id`, owner-scoped (account-deletion cascade's per-pipeline teardown).
+    /// Returns whether a row was removed.
+    pub fn unpublish(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "DELETE FROM pipelines WHERE id = ?1 AND owner = ?2",
+            params![id, owner],
+        )?;
+        Ok(n > 0)
+    }
 }
 
 /// SQLite-backed tunnel registry (durable equivalent of
@@ -2067,6 +2077,46 @@ impl SqliteChannelStore {
         Ok(raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()))
     }
 
+    /// Every channel `owner` registered, sorted (account-deletion cascade's discovery
+    /// step — the reverse of [`channel_owner`](Self::channel_owner)).
+    pub fn channels_owned_by(&self, owner: &str) -> rusqlite::Result<Vec<ChannelId>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare("SELECT channel FROM channels WHERE owner = ?1 ORDER BY channel")?;
+        let rows = stmt
+            .query_map(params![owner], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok().map(ChannelId))
+            .collect())
+    }
+
+    /// Delete `channel` entirely (owner-scoped): its registration, every member, and
+    /// its allow-list — the account-deletion cascade's per-channel teardown. Returns
+    /// `false` (no-op) if `owner` doesn't own `channel`.
+    pub fn delete_channel(&self, owner: &str, channel: &ChannelId) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let n = conn.execute(
+            "DELETE FROM channels WHERE channel = ?1 AND owner = ?2",
+            params![&channel.0[..], owner],
+        )?;
+        if n > 0 {
+            conn.execute("DELETE FROM channel_members WHERE channel = ?1", params![&channel.0[..]])?;
+            conn.execute("DELETE FROM channel_allowlist WHERE channel = ?1", params![&channel.0[..]])?;
+        }
+        Ok(n > 0)
+    }
+
+    /// Strip `email` from every channel's allow-list, regardless of owner
+    /// (account-deletion cascade: a deleted account's e-mail shouldn't keep sitting
+    /// on other owners' pending-invite lists). Returns rows removed.
+    pub fn remove_allowlist_entries_for_email(&self, email: &str) -> rusqlite::Result<usize> {
+        Ok(self.conn.lock_safe().execute(
+            "DELETE FROM channel_allowlist WHERE email = ?1",
+            params![email.to_ascii_lowercase()],
+        )?)
+    }
+
     /// The subject that owns `channel`, if registered.
     pub fn channel_owner(&self, channel: &ChannelId) -> rusqlite::Result<Option<String>> {
         self.conn
@@ -2797,11 +2847,62 @@ impl SqliteTopologyStore {
     /// Delete `owner`'s topology `id` (owner-scoped); returns whether a row was removed.
     /// A non-owner's delete is a no-op (`false`), so one subject can't drop another's.
     pub fn delete_topology(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
-        let n = self.conn.lock_safe().execute(
+        let conn = self.conn.lock_safe();
+        let n = conn.execute(
             "DELETE FROM topologies WHERE id = ?1 AND owner = ?2",
             params![id, owner],
         )?;
+        if n > 0 {
+            // The topology row is gone -- also drop what only made sense while it
+            // existed (its wiring and its share list), and release any agent still
+            // assigned into it back to "unassigned" rather than leaving it pointed at
+            // a dangling topology id (previously left orphaned -- account-deletion
+            // cascade work surfaced this as a real, if mostly harmless, leak).
+            conn.execute("DELETE FROM topology_edges WHERE topology = ?1", params![id])?;
+            conn.execute("DELETE FROM topology_shares WHERE topology = ?1", params![id])?;
+            conn.execute(
+                "UPDATE topology_agents SET topology = NULL WHERE topology = ?1",
+                params![id],
+            )?;
+        }
         Ok(n > 0)
+    }
+
+    /// Every owned topology, agent, edge and share for `owner`, gone (account-deletion
+    /// cascade). Reuses [`delete_topology`](Self::delete_topology) per id so the same
+    /// cascade rules apply; also drops the owner's now-ownerless
+    /// `topology_agents` rows (agents it registered but never assigned) and strips it
+    /// as a collaborator from anyone else's share list. Returns the number of owned
+    /// topologies removed.
+    pub fn delete_all_owned_by(&self, owner: &str) -> rusqlite::Result<usize> {
+        let ids: Vec<String> = {
+            let conn = self.conn.lock_safe();
+            let mut stmt = conn.prepare("SELECT id FROM topologies WHERE owner = ?1")?;
+            let rows = stmt
+                .query_map(params![owner], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut removed = 0usize;
+        for id in &ids {
+            if self.delete_topology(owner, id)? {
+                removed += 1;
+            }
+        }
+        let conn = self.conn.lock_safe();
+        conn.execute("DELETE FROM topology_agents WHERE owner = ?1", params![owner])?;
+        conn.execute("DELETE FROM topology_shares WHERE added_by = ?1", params![owner])?;
+        Ok(removed)
+    }
+
+    /// Strip `email` as a collaborator from every topology it's been shared into,
+    /// regardless of owner (account-deletion cascade: a deleted account should stop
+    /// showing up in other people's "shared with" lists too). Returns rows removed.
+    pub fn remove_shares_by_email(&self, email: &str) -> rusqlite::Result<usize> {
+        Ok(self.conn.lock_safe().execute(
+            "DELETE FROM topology_shares WHERE email = ?1",
+            params![email.to_ascii_lowercase()],
+        )?)
     }
 
     /// Whether `owner` owns topology `id` (the edit-authorization check).
@@ -3297,6 +3398,11 @@ mod tests {
         };
         assert!(reg.publish("alice", &updated, 300).unwrap(), "owner re-publish");
         assert_eq!(reg.get("flappy").unwrap().unwrap().roles.len(), 1, "owner re-publish updates the spec");
+
+        // Account-deletion cascade: owner-scoped unpublish.
+        assert!(!reg.unpublish("mallory", "flappy").unwrap(), "non-owner unpublish -> no-op");
+        assert!(reg.unpublish("alice", "flappy").unwrap());
+        assert_eq!(reg.get("flappy").unwrap(), None);
     }
 
     #[test]
@@ -3570,6 +3676,51 @@ mod tests {
         assert!(store.topology("corp").unwrap().is_some(), "still there");
         assert!(store.delete_topology("alice", "corp").unwrap(), "owner deletes");
         assert!(store.topology("corp").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_topology_cascades_edges_shares_and_releases_assigned_agents_account_overhaul() {
+        // Account-deletion cascade work surfaced this: `delete_topology` used to
+        // only drop the `topologies` row itself, leaving `topology_edges` /
+        // `topology_shares` orphaned and an assigned agent permanently pointed at
+        // a now-nonexistent topology id. Real cascade required.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "u1").unwrap();
+        store.add_edge("alice", "t1", "a", "b").unwrap();
+        store.share_add("alice", "t1", "carol@example.com", 100).unwrap();
+        store.assign("alice", "agent-x", "t1").unwrap();
+        assert_eq!(store.assignment("agent-x").unwrap().unwrap().topology(), Some("t1"));
+
+        assert!(store.delete_topology("alice", "t1").unwrap());
+
+        assert!(store.edges("t1").unwrap().is_empty(), "edges gone with the topology");
+        assert!(store.shares_for("alice", "t1").unwrap().is_empty(), "shares gone (owner check also fails post-delete, both == empty)");
+        assert!(
+            !store.assignment("agent-x").unwrap().unwrap().is_assigned(),
+            "the agent is released back to unassigned, not left pointed at a dead topology"
+        );
+    }
+
+    #[test]
+    fn delete_all_owned_by_and_remove_shares_by_email_drive_the_account_deletion_cascade() {
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "u1").unwrap();
+        store.create_topology("alice", "t2", "u2").unwrap();
+        store.create_topology("dave", "dt", "u3").unwrap();
+        store.share_add("dave", "dt", "alice@example.com", 100).unwrap();
+        store.share_add("alice", "t1", "carol@example.com", 100).unwrap();
+
+        let removed = store.delete_all_owned_by("alice").unwrap();
+        assert_eq!(removed, 2, "both of alice's topologies removed");
+        assert!(store.list_topologies("alice").unwrap().is_empty());
+        assert!(store.topology("dt").unwrap().is_some(), "dave's topology is untouched");
+
+        // alice is still listed as a collaborator on dave's topology until the
+        // email-scoped cleanup runs (the account-deletion route's second step).
+        assert!(store.is_shared_with("dt", "alice@example.com").unwrap());
+        let stripped = store.remove_shares_by_email("alice@example.com").unwrap();
+        assert_eq!(stripped, 1);
+        assert!(!store.is_shared_with("dt", "alice@example.com").unwrap());
     }
 
     #[test]
@@ -4607,6 +4758,36 @@ mod tests {
         // Owner may re-key their own channel (agent rotates its operator key).
         assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
         assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+    }
+
+    #[test]
+    fn channels_owned_by_and_delete_channel_and_remove_allowlist_entries_for_email_drive_account_deletion() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let mine = ChannelId([0x11; 32]);
+        let other = ChannelId([0x22; 32]);
+        let op = [0x22u8; 32];
+        let holder = [0x33u8; 32];
+        assert!(s.register_channel(&mine, &op, "alice").unwrap());
+        assert!(s.register_channel(&other, &op, "bob").unwrap());
+        s.add_member(&mine, "alice", &holder, &[0u8; 32], &[0u8; 64]).unwrap();
+        s.allowlist_add(&mine, "alice", "carol@example.com", 100).unwrap();
+        s.allowlist_add(&other, "bob", "alice@example.com", 100).unwrap();
+
+        assert_eq!(s.channels_owned_by("alice").unwrap(), vec![mine]);
+
+        assert!(!s.delete_channel("mallory", &mine).unwrap(), "non-owner delete -> no-op");
+        assert!(s.delete_channel("alice", &mine).unwrap());
+        assert_eq!(s.channel_owner(&mine).unwrap(), None, "channel gone");
+        assert!(!s.is_member(&mine, &holder).unwrap(), "members gone with it");
+        assert_eq!(s.allowlist_list(&mine, "alice").unwrap(), None, "channel unknown post-delete");
+
+        // bob's channel is untouched by alice's deletion, but her e-mail is still
+        // sitting on its allow-list until the email-scoped cleanup runs.
+        assert!(s.allowlist_contains(&other, "alice@example.com").unwrap());
+        let stripped = s.remove_allowlist_entries_for_email("alice@example.com").unwrap();
+        assert_eq!(stripped, 1);
+        assert!(!s.allowlist_contains(&other, "alice@example.com").unwrap());
+        assert_eq!(s.channel_owner(&other).unwrap(), Some("bob".to_string()), "bob's channel itself is untouched");
     }
 
     #[test]
