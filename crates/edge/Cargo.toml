@@ -15,7 +15,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 socket2 = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["zeroize"] }
+zeroize = "1"
 # PEM cert/key parsing via the maintained rustls-pki-types (replaces the
 # unmaintained rustls-pemfile, RUSTSEC-2025-0134 / #80 SEC80b). Already in the tree
 # via rustls; the `pem` feature enables the PemObject decoders used in transport.rs.
