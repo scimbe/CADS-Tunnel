@@ -67,6 +67,16 @@ struct PortalState {
     /// `Some(domains)` = admit only subjects whose id_token email is under one of
     /// these lowercase domains.
     allowed_domains: Option<Arc<[String]>>,
+    /// Whether the session's email must carry the IdP's `email_verified: true`
+    /// claim to be usable for the self-service channel-allowlist claim flow
+    /// (`CT_PORTAL_REQUIRE_VERIFIED_EMAIL`). Off by default: this realm has no
+    /// real email-confirmation mechanism wired up yet (no verification email is
+    /// ever sent), so requiring `email_verified` today just permanently locks
+    /// every self-registered user out of claiming an allow-listed channel, not a
+    /// real security gate. Flip to `true` once a genuine confirmation flow
+    /// exists — the check itself (`verified_email` below) is unchanged, only
+    /// which claim it's allowed to trust.
+    require_verified_email: bool,
 }
 
 /// OIDC login configuration for the Authorization Code flow (#25). Built from
@@ -209,11 +219,29 @@ impl PortalOidc {
 
 /// Build the customer portal router (#25 PP1): `GET /portal` (shell) and
 /// `GET /portal/login` (SSO Authorization Code redirect). The email-domain
-/// access-list (#43) is read from `CT_PORTAL_ALLOWED_EMAIL_DOMAINS` here.
+/// access-list (#43) is read from `CT_PORTAL_ALLOWED_EMAIL_DOMAINS` here, and
+/// whether the channel-allowlist self-service claim flow requires an
+/// `email_verified` id_token claim from `CT_PORTAL_REQUIRE_VERIFIED_EMAIL`
+/// (see [`PortalState::require_verified_email`]'s doc comment — off by
+/// default until a real email-confirmation mechanism exists).
 pub fn portal_router(oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
     let exchange = default_exchanger(oidc.clone());
     let allowed_domains = parse_allowed_domains(std::env::var("CT_PORTAL_ALLOWED_EMAIL_DOMAINS").ok());
-    portal_router_with(oidc, session_key, exchange, allowed_domains)
+    let require_verified_email = is_truthy_env("CT_PORTAL_REQUIRE_VERIFIED_EMAIL");
+    portal_router_with(oidc, session_key, exchange, allowed_domains, require_verified_email)
+}
+
+/// Any non-empty value other than `"0"`/`"false"` (case-insensitive) counts as
+/// truthy — matches this project's other opt-in-flag env vars
+/// (`CT_EDGE_REQUIRE_HOST_AUTH` etc.).
+fn is_truthy_env(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false"
+        })
+        .unwrap_or(false)
 }
 
 /// Parse `CT_PORTAL_ALLOWED_EMAIL_DOMAINS` (comma-separated) into a lowercase
@@ -251,12 +279,14 @@ fn portal_router_with(
     session_key: &[u8],
     exchange: Exchanger,
     allowed_domains: Option<Arc<[String]>>,
+    require_verified_email: bool,
 ) -> Router {
     let state = PortalState {
         oidc,
         session_key: Arc::from(session_key.to_vec()),
         exchange,
         allowed_domains,
+        require_verified_email,
     };
     Router::new()
         .route("/portal", get(portal_home))
@@ -477,11 +507,21 @@ async fn portal_callback(
                 }
             }
             let subject = identity.subject;
-            // #248-follow: only a *verified* email rides along in the session — an
-            // unverified or absent one means the allow-list claim route simply won't
-            // find a usable email later (falls back to the owner-driven flow), never
-            // a spoofable one.
-            let verified_email = identity.email_verified.then_some(identity.email).flatten();
+            // #248-follow, relaxed by CT_PORTAL_REQUIRE_VERIFIED_EMAIL (default off,
+            // see PortalState::require_verified_email's doc comment): only a
+            // *verified* email is supposed to ride along in the session, so an
+            // unverified/absent one means the allow-list claim route can't find a
+            // usable email later. But with no real email-confirmation mechanism
+            // wired up in this realm, `email_verified` is never actually true for a
+            // self-registered user — enforcing it today just permanently locks
+            // everyone out of the self-service claim flow, not a real security
+            // control. Until a genuine confirmation flow exists, trust whatever
+            // email the IdP asserts regardless of its `email_verified` claim.
+            let verified_email = if st.require_verified_email {
+                identity.email_verified.then_some(identity.email).flatten()
+            } else {
+                identity.email
+            };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -925,6 +965,21 @@ mod tests {
                     subject: subject.to_string(),
                     email: Some(email.to_string()),
                     email_verified: true,
+                })
+            })
+        })
+    }
+
+    /// An injected exchanger returning a fixed subject + an **unverified** email
+    /// (`email_verified: false`) — this realm's actual current shape, since no
+    /// email-confirmation flow sends the IdP a verification step.
+    fn stub_exchanger_unverified_email(subject: &'static str, email: &'static str) -> Exchanger {
+        Arc::new(move |_code| {
+            Box::pin(async move {
+                Ok(ExchangedIdentity {
+                    subject: subject.to_string(),
+                    email: Some(email.to_string()),
+                    email_verified: false,
                 })
             })
         })
@@ -1471,7 +1526,7 @@ mod tests {
     #[tokio::test]
     async fn callback_exchanges_the_code_and_mints_a_session() {
         // #25 PP4: valid state -> exchange -> session cookie -> redirect to home.
-        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger("kc-user-9"), None);
+        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger("kc-user-9"), None, false);
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
@@ -1513,7 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_reports_bad_gateway_when_exchange_fails() {
-        let app = portal_router_with(Some(cfg()), TEST_KEY, failing_exchanger(), None);
+        let app = portal_router_with(Some(cfg()), TEST_KEY, failing_exchanger(), None, false);
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
@@ -1628,6 +1683,7 @@ mod tests {
             TEST_KEY,
             stub_exchanger_email("kc-user-9", "dev@becke.biz"),
             allow,
+            false,
         );
         let resp = app
             .oneshot(
@@ -1655,7 +1711,7 @@ mod tests {
         // #248-follow: `stub_exchanger_email` returns `email_verified: true`, so the
         // minted session's claims carry the email too, not just the subject — the
         // allow-list claim route reads exactly this.
-        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger_email("kc-user-9", "dev@becke.biz"), None);
+        let app = portal_router_with(Some(cfg()), TEST_KEY, stub_exchanger_email("kc-user-9", "dev@becke.biz"), None, false);
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
@@ -1682,6 +1738,90 @@ mod tests {
         assert_eq!(claims.email.as_deref(), Some("dev@becke.biz"));
     }
 
+    /// The switch this fix adds: with no real email-confirmation mechanism wired
+    /// up, `email_verified` is never true for a self-registered user, so requiring
+    /// it (the pre-fix behavior) permanently locked everyone out of the
+    /// self-service channel-allowlist claim flow. Default (`require_verified_email:
+    /// false`) must still carry the email into the session despite
+    /// `email_verified: false`.
+    #[tokio::test]
+    async fn unverified_email_still_rides_along_when_the_verified_requirement_is_off() {
+        let app = portal_router_with(
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger_unverified_email("kc-user-9", "dev@becke.biz"),
+            None,
+            false, // require_verified_email: off (the new default)
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with("ct_portal_session=") && !c.contains("ct_portal_session=;"))
+            .expect("session cookie set");
+        let token = session.strip_prefix("ct_portal_session=").and_then(|s| s.split(';').next()).unwrap();
+        let claims = session_claims_for(TEST_KEY, &HeaderMap::from_iter([(
+            COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={token}")).unwrap(),
+        )]))
+        .expect("valid session");
+        assert_eq!(
+            claims.email.as_deref(),
+            Some("dev@becke.biz"),
+            "an unverified email still rides along when the strict requirement is off"
+        );
+    }
+
+    /// The flip side: once an operator turns `CT_PORTAL_REQUIRE_VERIFIED_EMAIL`
+    /// on (a real confirmation flow exists), the original strict behavior must
+    /// still hold -- an unverified email must NOT ride along.
+    #[tokio::test]
+    async fn unverified_email_is_dropped_when_the_verified_requirement_is_on() {
+        let app = portal_router_with(
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger_unverified_email("kc-user-9", "dev@becke.biz"),
+            None,
+            true, // require_verified_email: on
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/portal/callback?code=abc&state=s1")
+                    .header("cookie", "ct_portal_state=s1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with("ct_portal_session=") && !c.contains("ct_portal_session=;"))
+            .expect("session cookie set");
+        let token = session.strip_prefix("ct_portal_session=").and_then(|s| s.split(';').next()).unwrap();
+        let claims = session_claims_for(TEST_KEY, &HeaderMap::from_iter([(
+            COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={token}")).unwrap(),
+        )]))
+        .expect("valid session");
+        assert_eq!(
+            claims.email, None,
+            "an unverified email must NOT ride along once the strict requirement is on"
+        );
+    }
+
     #[tokio::test]
     async fn callback_gate_rejects_disallowed_domain_without_a_session() {
         // #43: a non-allowed-domain subject is 403'd with the access-list page and
@@ -1692,6 +1832,7 @@ mod tests {
             TEST_KEY,
             stub_exchanger_email("kc-user-x", "mallory@evil.test"),
             allow,
+            false,
         );
         let resp = app
             .oneshot(
@@ -1730,6 +1871,7 @@ mod tests {
             TEST_KEY,
             stub_exchanger_email("kc-user-z", "anyone@wherever.test"),
             None,
+            false,
         );
         let resp = app
             .oneshot(
