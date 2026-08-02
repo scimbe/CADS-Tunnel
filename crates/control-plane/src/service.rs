@@ -1972,6 +1972,23 @@ label.sp{color:var(--muted);font-size:.82rem;display:flex;align-items:center;gap
 .sharee{font:500 .8rem ui-monospace,monospace;background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:.25rem .5rem;display:inline-flex;align-items:center;gap:.35rem}
 .sharee .unshare{background:none;border:0;color:var(--muted);cursor:pointer;font-size:.9rem;padding:0;line-height:1}
 .sharee .unshare:hover{color:var(--accent2)}
+body:not([data-uimode="flexible"]) .flex-only{display:none}
+.modebtn{font:600 .78rem system-ui,sans-serif;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:.3rem .2rem;display:inline-flex;overflow:hidden}
+.modebtn button{border:0;background:none;color:var(--muted);padding:.15rem .6rem;border-radius:999px;cursor:pointer;font:inherit}
+.modebtn button.on{background:var(--accent);color:#fff}
+.cmds{border-top:1px solid var(--line);background:var(--panel);padding:.9rem 1.1rem 1.2rem;max-height:38vh;overflow-y:auto}
+.cmds[hidden]{display:none}
+.cmds h2{font-size:.85rem;margin:0 0 .3rem;color:var(--ink)}
+.cmds .lede{color:var(--muted);font-size:.8rem;margin:0 0 .8rem}
+.cmds .hostrow{display:flex;align-items:center;gap:.5rem;margin-bottom:.9rem;font-size:.8rem;color:var(--muted)}
+.cmds .hostrow input{font:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.3rem .5rem;color:var(--ink);width:14rem}
+.cmd-block{margin:0 0 1rem}
+.cmd-block h3{font-size:.78rem;font-weight:650;color:var(--muted);margin:0 0 .35rem;text-transform:uppercase;letter-spacing:.02em}
+.cmd-block pre{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:.6rem .7rem;overflow-x:auto;position:relative}
+.cmd-block code{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);white-space:pre}
+.cmd-block .copy{position:absolute;top:.4rem;right:.4rem;font:600 .68rem system-ui,sans-serif;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:.2rem .5rem;cursor:pointer;color:var(--muted)}
+.cmd-block .copy:hover{color:var(--ink)}
+.cmd-empty{color:var(--muted);font-size:.8rem;font-style:italic}
 "#;
 
 /// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
@@ -2042,6 +2059,80 @@ const EDITOR_JS: &str = r#"
  function unshare(email,el){fetch('/me/topologies/'+encodeURIComponent(tid)+'/share/'+encodeURIComponent(email)+'/remove',{method:'POST'}).then(function(r){if(r.ok){if(el&&el.remove)el.remove();say('unshared '+email);}else{say('unshare failed ('+r.status+')');}}).catch(function(){say('unshare failed');});}
  if(sharesEl){sharesEl.querySelectorAll('.unshare').forEach(function(btn){btn.addEventListener('click',function(){unshare(btn.getAttribute('data-email'),btn.closest('.sharee'));});});}
  if(shareBtn&&shareEmail){shareBtn.addEventListener('click',function(){var email=shareEmail.value.trim();if(!email){say('enter an email address');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/share',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:email})}).then(function(r){if(r.ok){addShareRow(email);shareEmail.value='';say('shared with '+email);}else{say('share failed ('+r.status+')');}}).catch(function(){say('share failed');});});}
+
+ // Easy/Flexible presentation toggle (#ux-overhaul): purely a client-side view
+ // preference, persisted in localStorage -- the real graph/API underneath is
+ // identical either way. Easy hides the overlay-mode/suggest planning tools and
+ // keeps the "how do I bring this to life?" commands panel open by default;
+ // Flexible shows the full toolbar with the panel collapsed.
+ var easyBtn=document.getElementById('modeeasy'),flexBtn=document.getElementById('modeflex');
+ var cmds=document.getElementById('cmds');
+ function setUiMode(m){
+  document.body.setAttribute('data-uimode',m);
+  if(easyBtn)easyBtn.classList.toggle('on',m==='easy');
+  if(flexBtn)flexBtn.classList.toggle('on',m==='flexible');
+  try{localStorage.setItem('ct-topology-uimode',m);}catch(_){}
+  if(cmds)cmds.hidden=(m!=='easy');
+ }
+ if(easyBtn)easyBtn.addEventListener('click',function(){setUiMode('easy');});
+ if(flexBtn)flexBtn.addEventListener('click',function(){setUiMode('flexible');});
+ var storedMode='easy';
+ try{storedMode=localStorage.getItem('ct-topology-uimode')||'easy';}catch(_){}
+ setUiMode(storedMode);
+
+ // "How do I bring this to life?" -- real, copy-paste ct-agent one-liners for
+ // what's actually drawn on the canvas right now: one per super-peer node, one
+ // pair per edge (derive + grant, using the edge's REAL two holder-key node ids
+ // -- a topology node id already IS the agent's holder key, #107-enforce). Ports
+ // come from this deployment's own /network-info (real values); the host is a
+ // best-effort default (this page's own hostname) the visitor can correct --
+ // never asserted as fact, since the edge can genuinely be a different host.
+ var hostIn=document.getElementById('cmdhost');
+ function esc2(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+ function block(title,body){return '<div class="cmd-block"><h3>'+esc2(title)+'</h3><pre><code>'+esc2(body)+'</code></pre><button type="button" class="copy">Copy</button></div>';}
+ var netInfo=null;
+ function renderCmds(){
+  if(!cmds)return;
+  var host=(hostIn&&hostIn.value.trim())||location.hostname;
+  var brokerPort=netInfo?netInfo.channel_broker_port:4435;
+  var out='';
+  out+='<div class="cmd-block"><h3>New agent identity</h3><p class="lede" style="margin:.1rem 0 .5rem">Run once per machine you\'re adding to this topology, then paste the printed <code>holder_pubkey</code> into "agent id" above.</p><pre><code>ct-agent channel init</code></pre><button type="button" class="copy" data-copy="ct-agent channel init">Copy</button></div>';
+  var sps=[];svg.querySelectorAll('.node.superpeer').forEach(function(g){sps.push(g.getAttribute('data-node'));});
+  if(sps.length){
+   sps.forEach(function(id){
+    var cmd='CT_CHANNEL_SUPER_PEER_LISTEN=0.0.0.0:9443 \\\nCT_CHANNEL_SUPER_PEER_UPSTREAM='+host+':'+brokerPort+' \\\nct-agent channel super-peer';
+    out+=block('Run super-peer '+id.slice(0,12)+'…',cmd);
+   });
+  }
+  var seen={};
+  svg.querySelectorAll('.edge').forEach(function(ed){
+   var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b'),key=a+'|'+b;
+   if(seen[key])return;seen[key]=true;
+   var cmd='# on '+a.slice(0,12)+'\\u2026 (repeat with roles swapped on the other side)\nCT_CHANNEL_OPERATOR_PUBKEY=<operator pubkey> \\\nCT_CHANNEL_BRIDGE_HOLDER='+b+' \\\nCT_CHANNEL_HOLDER_KEY=<'+a.slice(0,12)+'\\u2026\\'s own holder private key> \\\nCT_CHANNEL_NOISE_PUBKEY=<'+a.slice(0,12)+'\\u2026\\'s own noise public key> \\\nct-agent channel member-material';
+   out+=block('Wire '+a.slice(0,10)+'… ↔ '+b.slice(0,10)+'…',cmd);
+  });
+  if(!sps.length && !Object.keys(seen).length){
+   out+='<p class="cmd-empty">Add an agent or draw a connection to see the real commands for it here.</p>';
+  }
+  out+='<p class="lede" style="margin-top:.8rem">Full walkthroughs on docs.bunsenbrenner.org: <strong>/how-to/join-a-channel</strong>, <strong>/how-to/run-a-super-peer</strong>, <strong>/how-to/tunnel-plus-channel</strong>.</p>';
+  cmds.innerHTML='<h2>How do I bring this to life?</h2><p class="lede">Real commands for what\'s on the canvas right now &mdash; run them on the actual machines, not here.</p><div class="hostrow"><label for="cmdhost">edge host</label><input id="cmdhost" value="'+esc2(host)+'"/></div>'+out;
+  var hi=document.getElementById('cmdhost');
+  if(hi)hi.addEventListener('input',renderCmds);
+  cmds.querySelectorAll('.copy').forEach(function(btn){
+   btn.addEventListener('click',function(){
+    var pre=btn.previousElementSibling;var text=pre?pre.textContent:'';
+    var done=function(){var o=btn.textContent;btn.textContent='Copied';setTimeout(function(){btn.textContent=o;},1400);};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}
+   });
+  });
+ }
+ fetch('/network-info').then(function(r){return r.ok?r.json():null;}).then(function(j){netInfo=j;renderCmds();}).catch(function(){renderCmds();});
+ var cmdsBtn=document.getElementById('cmdstoggle');
+ if(cmdsBtn&&cmds){cmdsBtn.addEventListener('click',function(){cmds.hidden=!cmds.hidden;});}
+ // Re-render the commands panel whenever the graph actually changes (new agent,
+ // new/removed edge) so it never drifts from what's really on the canvas.
+ var _origAddEdgeEl=addEdgeEl;addEdgeEl=function(a,b){_origAddEdgeEl(a,b);renderCmds();};
+ var _origRemoveEdge=removeEdge;removeEdge=function(ed){_origRemoveEdge(ed);renderCmds();};
 })();
 "#;
 
@@ -2202,16 +2293,21 @@ fn render_topology_editor(
          <span class=\"chip\">net:{uuid}</span>\
          <span class=\"chip\" id=\"agentcount\">{na} agents</span><span class=\"chip\" id=\"edgecount\">{ne} links</span>\
          <span class=\"hint\">drag nodes to arrange</span>\
-         <label>overlay <select id=\"mode\"{mode_dis}>{mode_options}</select></label>\
+         <div class=\"modebtn\" role=\"group\" aria-label=\"editor complexity\">\
+         <button type=\"button\" id=\"modeeasy\">Easy</button><button type=\"button\" id=\"modeflex\">Flexible</button></div>\
+         <label class=\"flex-only\">overlay <select id=\"mode\"{mode_dis}>{mode_options}</select></label>\
          <button id=\"link\" aria-pressed=\"false\">Connect</button>\
-         <input id=\"agent\" placeholder=\"agent id\" aria-label=\"agent id to add\"/>\
+         <input id=\"agent\" placeholder=\"agent id (paste holder_pubkey)\" aria-label=\"agent id to add\"/>\
          <label class=\"sp\"><input type=\"checkbox\" id=\"agentkind\"/> super-peer</label>\
          <button id=\"addagent\">Add</button>\
-         <button id=\"suggest\" class=\"primary\">Suggest overlay</button>\
+         <button id=\"suggest\" class=\"primary flex-only\">Suggest overlay</button>\
+         <button id=\"cmdstoggle\">Commands</button>\
          <span id=\"msg\"></span></header>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
          preserveAspectRatio=\"xMidYMid meet\" role=\"application\" aria-label=\"topology node graph\">\
-         {content}</svg></div>{share_section}<script>{js}</script></body></html>",
+         {content}</svg></div>{share_section}\
+         <div class=\"cmds\" id=\"cmds\" hidden></div>\
+         <script>{js}</script></body></html>",
         uuid = esc(&t.net_uuid),
         tid = esc(&t.id),
         na = agents.len(),
@@ -6493,6 +6589,35 @@ mod tests {
         // An empty topology still yields a valid page with an empty-state hint (no panic).
         let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[]);
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
+    }
+
+    #[test]
+    fn topology_editor_has_an_easy_flexible_toggle_and_a_commands_panel_ux_overhaul() {
+        // UX overhaul: "as easy as hell, then as flexible as hell" -- a client-side
+        // presentation toggle (same underlying graph/API either way) plus a
+        // generated-one-liners panel for what's actually on the canvas. Still fully
+        // self-contained/CSP-safe (covered by the sibling test above); this pins the
+        // new elements exist and stay wired to the same real endpoints.
+        let t = crate::topology::Topology {
+            id: "t1".into(),
+            owner: "alice".into(),
+            net_uuid: "uuid-xyz".into(),
+        };
+        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "super-peer".to_string())];
+        let edges = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
+        let html = render_topology_editor(&t, &agents, &edges, "baseline", true, &[]);
+
+        assert!(html.contains("id=\"modeeasy\"") && html.contains("id=\"modeflex\""), "easy/flexible toggle present");
+        assert!(html.contains("id=\"cmdstoggle\"") && html.contains("id=\"cmds\""), "commands panel present");
+        assert!(html.contains("class=\"flex-only\""), "advanced-only controls (overlay mode, suggest) are marked for the easy-mode CSS to hide");
+        assert!(html.contains("ct-agent channel init"), "the identity one-liner is embedded in the client-side renderer");
+        assert!(html.contains("CT_CHANNEL_SUPER_PEER_UPSTREAM") && html.contains("CT_CHANNEL_SUPER_PEER_LISTEN"), "the super-peer one-liner template is embedded");
+        assert!(html.contains("CT_CHANNEL_BRIDGE_HOLDER") && html.contains("member-material"), "the connect one-liner template is embedded");
+        // Still fully self-contained -- the new panel's guidance text names the docs
+        // site but never links out (CSP-safe stays CSP-safe).
+        for external in ["http://", "https://", "<link", "src=\"", "@import"] {
+            assert!(!html.contains(external), "commands panel stays CSP-safe: no {external:?}");
+        }
     }
 
     #[test]
