@@ -550,7 +550,9 @@ dependencies = [
  "ct-common",
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "js-sys",
  "rand 0.8.7",
+ "snow",
  "wasm-bindgen",
 ]
 

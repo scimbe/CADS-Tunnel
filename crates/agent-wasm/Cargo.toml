@@ -14,6 +14,13 @@ ct-common = { path = "../common" }
 wasm-bindgen = "0.2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+# Same version ct-common itself pins -- needed as a direct dependency (not just
+# transitive) so this crate can name snow::HandshakeState/TransportState in its
+# own NoiseHandshake/NoiseTransport wrapper types below.
+snow = "0.9"
+# Object/Reflect, to hand decoded signal messages back to JS as a plain object
+# (decode_signal_message) rather than a bespoke wasm-bindgen class per variant.
+js-sys = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

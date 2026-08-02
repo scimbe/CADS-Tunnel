@@ -132,9 +132,346 @@ pub fn frame_message(msg: &[u8]) -> Vec<u8> {
     ct_common::noise::frame(msg)
 }
 
+/// Noise message max size (RFC-fixed at 65535 -- the same buffer size
+/// `ct_common::noise`'s own tests use, and what its 2-byte length prefix can
+/// address). One fixed-size scratch buffer per call, sized for the worst case.
+const NOISE_MAX_MESSAGE: usize = 65535;
+
+// The pure, testable core behind NoiseHandshake/NoiseTransport below -- plain
+// `Result<_, String>` (not JsError) for the same native-test reason as
+// from_hex/hex32 above: constructing a JsError panics on a non-wasm target.
+fn ik_initiator(local_private: &[u8; 32], remote_public: &[u8; 32]) -> Result<snow::HandshakeState, String> {
+    ct_common::noise::client_handshake(local_private, remote_public).map_err(|e| e.to_string())
+}
+fn ik_responder(local_private: &[u8; 32]) -> Result<snow::HandshakeState, String> {
+    ct_common::noise::origin_handshake(local_private).map_err(|e| e.to_string())
+}
+
+/// A Noise_IK handshake in progress -- the browser side of the SAME
+/// authenticated key exchange a native channel member performs
+/// (`ct_common::noise::client_handshake`/`origin_handshake`, the exact
+/// primitives `ct-agent`'s own channel session uses under the hood). Exposes
+/// `snow`'s own synchronous `write_message`/`read_message` step-by-step, since
+/// a browser has no Rust-owned socket for an async driver to run against --
+/// JavaScript owns the actual WebSocket and feeds bytes through this state
+/// machine explicitly, one handshake message at a time.
+///
+/// Once `is_finished()` is true, call `into_transport()` (consumes this
+/// handshake) to get the encrypted [`NoiseTransport`] session -- attempting
+/// application messages before that point is a programmer error the caller
+/// should never trigger, not a normal runtime condition, so it's an `Err`
+/// rather than something silently tolerated.
+#[wasm_bindgen]
+pub struct NoiseHandshake {
+    inner: Option<snow::HandshakeState>,
+}
+
+#[wasm_bindgen]
+impl NoiseHandshake {
+    /// The initiator side (mirrors `CT_CHANNEL_ROLE=initiate`): pins the
+    /// peer's Noise public key up front, matching Noise_IK's "I know who I'm
+    /// talking to" property for the initiator.
+    #[wasm_bindgen(js_name = newInitiator)]
+    pub fn new_initiator(local_noise_private_hex: &str, remote_noise_public_hex: &str) -> Result<NoiseHandshake, JsError> {
+        let local = hex32(local_noise_private_hex).map_err(|e| JsError::new(&e))?;
+        let remote = hex32(remote_noise_public_hex).map_err(|e| JsError::new(&e))?;
+        let hs = ik_initiator(&local, &remote).map_err(|e| JsError::new(&e))?;
+        Ok(NoiseHandshake { inner: Some(hs) })
+    }
+
+    /// The responder side (mirrors `CT_CHANNEL_ROLE=accept`): learns the
+    /// peer's identity FROM the first handshake message (Noise_IK's own
+    /// property), so it needs only its own private key up front.
+    #[wasm_bindgen(js_name = newResponder)]
+    pub fn new_responder(local_noise_private_hex: &str) -> Result<NoiseHandshake, JsError> {
+        let local = hex32(local_noise_private_hex).map_err(|e| JsError::new(&e))?;
+        let hs = ik_responder(&local).map_err(|e| JsError::new(&e))?;
+        Ok(NoiseHandshake { inner: Some(hs) })
+    }
+
+    /// Produce the next handshake message to send to the peer (payload is
+    /// almost always empty for the two Noise_IK handshake messages -- kept as
+    /// a parameter since the protocol allows piggybacking early data).
+    #[wasm_bindgen(js_name = writeMessage)]
+    pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, JsError> {
+        let hs = self.inner.as_mut().ok_or_else(|| JsError::new("handshake already consumed by into_transport()"))?;
+        let mut buf = [0u8; NOISE_MAX_MESSAGE];
+        let n = hs.write_message(payload, &mut buf).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(buf[..n].to_vec())
+    }
+
+    /// Consume a handshake message received from the peer.
+    #[wasm_bindgen(js_name = readMessage)]
+    pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>, JsError> {
+        let hs = self.inner.as_mut().ok_or_else(|| JsError::new("handshake already consumed by into_transport()"))?;
+        let mut buf = [0u8; NOISE_MAX_MESSAGE];
+        let n = hs.read_message(msg, &mut buf).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(buf[..n].to_vec())
+    }
+
+    #[wasm_bindgen(js_name = isFinished)]
+    pub fn is_finished(&self) -> Result<bool, JsError> {
+        let hs = self.inner.as_ref().ok_or_else(|| JsError::new("handshake already consumed by into_transport()"))?;
+        Ok(hs.is_handshake_finished())
+    }
+
+    /// Transition to the encrypted transport session once `is_finished()` is
+    /// true -- consumes this handshake, matching `snow`'s own one-way
+    /// state transition (a finished handshake can't be "used" for more
+    /// handshake messages afterward, only for real traffic).
+    #[wasm_bindgen(js_name = intoTransport)]
+    pub fn into_transport(&mut self) -> Result<NoiseTransport, JsError> {
+        let hs = self.inner.take().ok_or_else(|| JsError::new("handshake already consumed by into_transport()"))?;
+        let t = hs.into_transport_mode().map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(NoiseTransport { inner: t })
+    }
+}
+
+/// An established, encrypted Noise_IK session -- the browser side of a real
+/// channel's application-data traffic (SDP offers/answers, ICE candidates,
+/// and eventually media, once WebRTC signaling is layered on top of this).
+#[wasm_bindgen]
+pub struct NoiseTransport {
+    inner: snow::TransportState,
+}
+
+#[wasm_bindgen]
+impl NoiseTransport {
+    #[wasm_bindgen]
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, JsError> {
+        let mut buf = [0u8; NOISE_MAX_MESSAGE];
+        let n = self.inner.write_message(plaintext, &mut buf).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(buf[..n].to_vec())
+    }
+
+    #[wasm_bindgen]
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, JsError> {
+        let mut buf = [0u8; NOISE_MAX_MESSAGE];
+        let n = self.inner.read_message(ciphertext, &mut buf).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(buf[..n].to_vec())
+    }
+}
+
+/// WebRTC signaling messages -- what actually rides over a [`NoiseTransport`]
+/// session (encrypt the encoded bytes below, send over the WebSocket channel;
+/// decrypt the peer's bytes, decode back into one of these). This is
+/// deliberately a thin, self-delimiting wire format for the standard WebRTC
+/// offer/answer/trickle-ICE dance -- it carries the SDP/candidate text
+/// verbatim (browsers generate/consume that themselves via
+/// `RTCPeerConnection`; this crate never parses SDP), it just gets it
+/// authentically and confidentially to the peer over the SAME Agent-Fabric
+/// channel session identity/admission already secures, instead of needing a
+/// separate signaling server (the usual extra moving part in a WebRTC app).
+///
+/// Wire form: `type(1) | ...fields`, each string field length-prefixed
+/// (`u16` BE for SDP text, `u8` for the shorter ICE `sdpMid`) so multiple
+/// fields concatenate unambiguously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignalMessage {
+    Offer { sdp: String },
+    Answer { sdp: String },
+    /// `sdp_mline_index` is `u16::MAX` standing in for "absent" (`None`) --
+    /// WebRTC's own `RTCIceCandidateInit.sdpMLineIndex` is optional and a real
+    /// index never reaches anywhere close to that value.
+    IceCandidate { candidate: String, sdp_mid: Option<String>, sdp_mline_index: Option<u16> },
+    /// An explicit "hanging up" signal -- lets the peer tear down its
+    /// `RTCPeerConnection` promptly instead of waiting on an ICE-failure
+    /// timeout when the other side just closes the underlying channel.
+    Bye,
+}
+
+const SIGNAL_TYPE_OFFER: u8 = 1;
+const SIGNAL_TYPE_ANSWER: u8 = 2;
+const SIGNAL_TYPE_ICE: u8 = 3;
+const SIGNAL_TYPE_BYE: u8 = 4;
+const SIGNAL_NO_MLINE_INDEX: u16 = u16::MAX;
+
+impl SignalMessage {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            SignalMessage::Offer { sdp } => {
+                out.push(SIGNAL_TYPE_OFFER);
+                push_u16_str(&mut out, sdp);
+            }
+            SignalMessage::Answer { sdp } => {
+                out.push(SIGNAL_TYPE_ANSWER);
+                push_u16_str(&mut out, sdp);
+            }
+            SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index } => {
+                out.push(SIGNAL_TYPE_ICE);
+                push_u16_str(&mut out, candidate);
+                push_u8_str(&mut out, sdp_mid.as_deref().unwrap_or(""));
+                out.extend_from_slice(&sdp_mline_index.unwrap_or(SIGNAL_NO_MLINE_INDEX).to_be_bytes());
+            }
+            SignalMessage::Bye => out.push(SIGNAL_TYPE_BYE),
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let mut cur = bytes;
+        let kind = take_u8(&mut cur)?;
+        match kind {
+            SIGNAL_TYPE_OFFER => Ok(SignalMessage::Offer { sdp: take_u16_str(&mut cur)? }),
+            SIGNAL_TYPE_ANSWER => Ok(SignalMessage::Answer { sdp: take_u16_str(&mut cur)? }),
+            SIGNAL_TYPE_ICE => {
+                let candidate = take_u16_str(&mut cur)?;
+                let mid = take_u8_str(&mut cur)?;
+                let mline = u16::from_be_bytes(take_n(&mut cur, 2)?.try_into().unwrap());
+                Ok(SignalMessage::IceCandidate {
+                    candidate,
+                    sdp_mid: (!mid.is_empty()).then_some(mid),
+                    sdp_mline_index: (mline != SIGNAL_NO_MLINE_INDEX).then_some(mline),
+                })
+            }
+            SIGNAL_TYPE_BYE => Ok(SignalMessage::Bye),
+            other => Err(format!("unknown signal message type {other}")),
+        }
+    }
+}
+
+fn push_u16_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+fn push_u8_str(out: &mut Vec<u8>, s: &str) {
+    out.push(s.len() as u8);
+    out.extend_from_slice(s.as_bytes());
+}
+fn take_n<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
+    if cur.len() < n {
+        return Err("truncated signal message".to_string());
+    }
+    let (head, tail) = cur.split_at(n);
+    *cur = tail;
+    Ok(head)
+}
+fn take_u8(cur: &mut &[u8]) -> Result<u8, String> {
+    Ok(take_n(cur, 1)?[0])
+}
+fn take_u16_str(cur: &mut &[u8]) -> Result<String, String> {
+    let len = u16::from_be_bytes(take_n(cur, 2)?.try_into().unwrap()) as usize;
+    String::from_utf8(take_n(cur, len)?.to_vec()).map_err(|_| "signal message field is not valid UTF-8".to_string())
+}
+fn take_u8_str(cur: &mut &[u8]) -> Result<String, String> {
+    let len = take_u8(cur)? as usize;
+    String::from_utf8(take_n(cur, len)?.to_vec()).map_err(|_| "signal message field is not valid UTF-8".to_string())
+}
+
+/// Encode a WebRTC SDP offer for sending -- encrypt the returned bytes with
+/// [`NoiseTransport::encrypt`] before putting them on the wire.
+#[wasm_bindgen(js_name = encodeSignalOffer)]
+pub fn encode_signal_offer(sdp: &str) -> Vec<u8> {
+    SignalMessage::Offer { sdp: sdp.to_string() }.encode()
+}
+
+/// Encode a WebRTC SDP answer for sending.
+#[wasm_bindgen(js_name = encodeSignalAnswer)]
+pub fn encode_signal_answer(sdp: &str) -> Vec<u8> {
+    SignalMessage::Answer { sdp: sdp.to_string() }.encode()
+}
+
+/// Encode a trickle-ICE candidate for sending. `sdp_mid`/`sdp_mline_index`
+/// mirror `RTCIceCandidateInit`'s own optional fields -- pass an empty string
+/// / `undefined` (JS) for "absent", matching a candidate gathered before the
+/// remote description is set.
+#[wasm_bindgen(js_name = encodeSignalIceCandidate)]
+pub fn encode_signal_ice_candidate(candidate: &str, sdp_mid: Option<String>, sdp_mline_index: Option<u16>) -> Vec<u8> {
+    SignalMessage::IceCandidate { candidate: candidate.to_string(), sdp_mid, sdp_mline_index }.encode()
+}
+
+/// Encode the "hanging up" signal.
+#[wasm_bindgen(js_name = encodeSignalBye)]
+pub fn encode_signal_bye() -> Vec<u8> {
+    SignalMessage::Bye.encode()
+}
+
+/// Decode a signal message received from the peer (after [`NoiseTransport::decrypt`])
+/// into a plain JS object: `{kind: "offer"|"answer"|"ice-candidate"|"bye", sdp?,
+/// candidate?, sdpMid?, sdpMlineIndex?}` -- shaped to drop straight into
+/// `RTCPeerConnection.setRemoteDescription`/`.addIceCandidate` with minimal
+/// glue on the JS side.
+#[wasm_bindgen(js_name = decodeSignalMessage)]
+pub fn decode_signal_message(bytes: &[u8]) -> Result<JsValue, JsError> {
+    let msg = SignalMessage::decode(bytes).map_err(|e| JsError::new(&e))?;
+    let obj = js_sys::Object::new();
+    let set = |key: &str, val: JsValue| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(key), &val);
+    };
+    match msg {
+        SignalMessage::Offer { sdp } => {
+            set("kind", JsValue::from_str("offer"));
+            set("sdp", JsValue::from_str(&sdp));
+        }
+        SignalMessage::Answer { sdp } => {
+            set("kind", JsValue::from_str("answer"));
+            set("sdp", JsValue::from_str(&sdp));
+        }
+        SignalMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index } => {
+            set("kind", JsValue::from_str("ice-candidate"));
+            set("candidate", JsValue::from_str(&candidate));
+            set("sdpMid", sdp_mid.map(|s| JsValue::from_str(&s)).unwrap_or(JsValue::UNDEFINED));
+            set("sdpMlineIndex", sdp_mline_index.map(JsValue::from).unwrap_or(JsValue::UNDEFINED));
+        }
+        SignalMessage::Bye => set("kind", JsValue::from_str("bye")),
+    }
+    Ok(obj.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_message_offer_answer_bye_round_trip() {
+        for msg in [
+            SignalMessage::Offer { sdp: "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n".to_string() },
+            SignalMessage::Answer { sdp: "v=0\r\no=- 3 4 IN IP4 127.0.0.1\r\n".to_string() },
+            SignalMessage::Bye,
+        ] {
+            let encoded = msg.encode();
+            let decoded = SignalMessage::decode(&encoded).unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn signal_message_ice_candidate_round_trips_with_and_without_optional_fields() {
+        let full = SignalMessage::IceCandidate {
+            candidate: "candidate:1 1 UDP 2130706431 192.0.2.1 54321 typ host".to_string(),
+            sdp_mid: Some("audio".to_string()),
+            sdp_mline_index: Some(0),
+        };
+        assert_eq!(SignalMessage::decode(&full.encode()).unwrap(), full);
+
+        // Both optional fields absent (a candidate gathered before the remote
+        // description sets mid/mline-index) -- proves None isn't confused with
+        // Some(0)/Some("") on the wire.
+        let bare = SignalMessage::IceCandidate {
+            candidate: "candidate:2 1 UDP 2130706431 192.0.2.2 54322 typ host".to_string(),
+            sdp_mid: None,
+            sdp_mline_index: None,
+        };
+        assert_eq!(SignalMessage::decode(&bare.encode()).unwrap(), bare);
+
+        // mline_index genuinely 0 (a real, valid index) must NOT decode as absent.
+        let mline_zero = SignalMessage::IceCandidate {
+            candidate: "candidate:3 1 UDP 2130706431 192.0.2.3 54323 typ host".to_string(),
+            sdp_mid: None,
+            sdp_mline_index: Some(0),
+        };
+        let decoded = SignalMessage::decode(&mline_zero.encode()).unwrap();
+        assert_eq!(decoded, mline_zero);
+        assert_ne!(decoded, bare, "Some(0) must stay distinguishable from None");
+    }
+
+    #[test]
+    fn signal_message_decode_rejects_truncated_and_unknown_bytes() {
+        assert!(SignalMessage::decode(&[]).is_err(), "empty input");
+        assert!(SignalMessage::decode(&[SIGNAL_TYPE_OFFER]).is_err(), "offer with no length-prefixed sdp");
+        assert!(SignalMessage::decode(&[0xEE]).is_err(), "unknown message type");
+    }
 
     #[test]
     fn channel_id_for_link_matches_the_native_computation_and_is_order_independent() {
@@ -166,5 +503,40 @@ mod tests {
         let n = generate_noise_identity();
         assert_eq!(n.public_hex().len(), 64);
         assert_eq!(n.private_hex().len(), 64);
+    }
+
+    #[test]
+    fn noise_ik_handshake_and_transport_round_trip_via_the_pure_helpers() {
+        // The native-testable core behind NoiseHandshake/NoiseTransport (plain
+        // snow types, no JsError) -- proves the SAME two-message Noise_IK flow
+        // ct_common::noise's own frozen `noise_ik_handshake_establishes_e2e`
+        // test exercises natively, now driven through ik_initiator/ik_responder
+        // exactly as the wasm-bindgen wrapper above will drive it.
+        let origin = ct_common::noise::generate_static_keypair();
+        let client = ct_common::noise::generate_static_keypair();
+
+        let mut ini = ik_initiator(&client.private, &origin.public).unwrap();
+        let mut resp = ik_responder(&origin.private).unwrap();
+
+        let mut buf = [0u8; NOISE_MAX_MESSAGE];
+        let mut scratch = [0u8; NOISE_MAX_MESSAGE];
+        let n = ini.write_message(&[], &mut buf).unwrap();
+        resp.read_message(&buf[..n], &mut scratch).unwrap();
+        let n = resp.write_message(&[], &mut buf).unwrap();
+        ini.read_message(&buf[..n], &mut scratch).unwrap();
+
+        assert!(ini.is_handshake_finished());
+        assert!(resp.is_handshake_finished());
+
+        let mut ini_t = ini.into_transport_mode().unwrap();
+        let mut resp_t = resp.into_transport_mode().unwrap();
+
+        let n = ini_t.write_message(b"sdp-offer: v=0...", &mut buf).unwrap();
+        let m = resp_t.read_message(&buf[..n], &mut scratch).unwrap();
+        assert_eq!(&scratch[..m], b"sdp-offer: v=0...");
+
+        let n = resp_t.write_message(b"sdp-answer: v=0...", &mut buf).unwrap();
+        let m = ini_t.read_message(&buf[..n], &mut scratch).unwrap();
+        assert_eq!(&scratch[..m], b"sdp-answer: v=0...");
     }
 }
