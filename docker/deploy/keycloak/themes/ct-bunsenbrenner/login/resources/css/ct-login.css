@@ -30,6 +30,16 @@ body,
   color: var(--ct-text);
   font-weight: 600;
   letter-spacing: .01em;
+  text-transform: none;
+  font-size: 1.5rem;
+}
+
+/* The footer strip (social-provider section, now disabled) used to fill this
+   bar; with only "Register" left it should read as a quiet footer link, not
+   a leftover grey slab. */
+#kc-registration-container {
+  background: transparent;
+  padding: .75rem 0 0;
 }
 
 .card-pf {
