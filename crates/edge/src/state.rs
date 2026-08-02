@@ -30,6 +30,7 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct ConnectionCap {
     sem: Arc<Semaphore>,
+    shed: Arc<AtomicU64>,
 }
 
 impl ConnectionCap {
@@ -37,6 +38,7 @@ impl ConnectionCap {
     pub fn new(max: usize) -> Self {
         Self {
             sem: Arc::new(Semaphore::new(max)),
+            shed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -50,6 +52,19 @@ impl ConnectionCap {
     /// Currently free slots (for tests / metrics).
     pub fn available(&self) -> usize {
         self.sem.available_permits()
+    }
+
+    /// Record one shed connection (the cap was full when a caller tried to admit)
+    /// and return the running total. A cap-exhaustion shed previously left NO trace
+    /// anywhere in the edge's own logs — from the caller's own TCP accept loop it's
+    /// indistinguishable from any other closed socket, so an operator chasing a
+    /// client-reported "TLS handshake EOF right after connect" symptom had no way to
+    /// confirm or rule out "the cap is full" from the edge side at all. Callers log
+    /// this occasionally (not every shed — that would defeat the whole point of
+    /// shedding cheaply under a real flood); this just makes the running total
+    /// available to do so.
+    pub fn note_shed(&self) -> u64 {
+        self.shed.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 
