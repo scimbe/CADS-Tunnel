@@ -16,6 +16,7 @@ pub mod serve;
 pub mod sni;
 pub mod state;
 pub mod transport;
+pub mod ws_channel;
 
 /// Stable crate identifier, used by the P0.1 smoke test.
 pub const CRATE_NAME: &str = "ct-edge";
