@@ -1022,8 +1022,8 @@ pub(crate) fn page(title: &str, body: &str) -> String {
       display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:3rem 1rem}}
  .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;max-width:640px;width:100%}}
  h1{{font-size:1.3rem;margin:.1rem 0 1rem}} h2{{font-size:1rem;color:#8b949e;margin:1.4rem 0 .6rem}}
- .row{{display:flex;justify-content:space-between;padding:.5rem 0;border-bottom:1px solid #21262d}}
- .k{{color:#8b949e}} .v{{word-break:break-all}}
+ .row{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.25rem 1rem;padding:.5rem 0;border-bottom:1px solid #21262d}}
+ .k{{color:#8b949e;flex-shrink:0}} .v{{word-break:break-all;min-width:0}}
  nav a{{color:#58a6ff;text-decoration:none;margin-right:1rem;font-size:.9rem}} nav{{margin-bottom:1.2rem}}
  a.btn,button{{background:#238636;color:#fff;border:0;border-radius:8px;padding:.5rem 1rem;
       font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}}
@@ -1057,7 +1057,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/logout">Sign out</a></nav>
+<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/logout">Sign out</a></nav>
 {body}
 </div>
 <script>
@@ -1128,6 +1128,76 @@ pub fn channel_claim_router(session_key: &[u8], channels: Arc<crate::storage::Sq
             session_key: Arc::from(session_key.to_vec()),
             channels,
         })
+}
+
+/// Shared state for the Topology Editor's portal discoverability shell (#237-follow):
+/// just the session key, so this can gate access without needing the topology store
+/// directly -- the actual listing/creation happens client-side against the already
+/// session-cookie-authed `/me/topologies*` API (`subject_of_topology`, service.rs),
+/// keeping topology data access in exactly one place.
+#[derive(Clone)]
+struct TopologyPortalState {
+    session_key: Arc<[u8]>,
+}
+
+/// Build the Topology Editor's portal-discoverability router (#237-follow): before this,
+/// the Topology Editor (`GET /me/topologies/:id/editor`, a real draggable SVG node-graph
+/// editor, #107-ui) existed and worked, but nothing in the portal a real logged-in user
+/// browses ever linked to it, and it required a bearer token no portal session carries --
+/// from an actual user's perspective it was simply "not there." `/portal/topologies` is a
+/// thin, session-gated shell; the listing and "create new" action are plain client-side
+/// `fetch()` calls against `/me/topologies` (now dual-auth: portal session cookie OR
+/// bearer token, see `subject_of_topology`), which the browser's ambient session cookie
+/// satisfies with zero extra plumbing.
+pub fn topology_portal_router(session_key: &[u8]) -> Router {
+    Router::new()
+        .route("/portal/topologies", get(topologies_page))
+        .with_state(TopologyPortalState { session_key: Arc::from(session_key.to_vec()) })
+}
+
+async fn topologies_page(State(st): State<TopologyPortalState>, headers: HeaderMap) -> Response {
+    if crate::portal::session_claims_for(&st.session_key, &headers).is_none() {
+        return Redirect::to("/portal").into_response();
+    }
+    Html(topologies_html()).into_response()
+}
+
+/// A static shell: `#list` and the "New topology" button are filled/wired entirely by the
+/// inline script below via `fetch()` against `/me/topologies*` -- no server-side topology
+/// read here, matching [`TopologyPortalState`]'s doc comment.
+fn topologies_html() -> String {
+    let body = r#"<h1>Your topologies</h1>
+<p class="help">Compose overlay networks by assigning agents and wiring links in the
+<strong>Topology Editor</strong> -- a draggable node graph. A topology authorizes real
+channel admission only once bound to an operator key (see the editor's own hint for that
+step).</p>
+<button id="newtopo" class="btn">New topology</button>
+<span id="msg" class="help"></span>
+<div id="list" class="help">Loading…</div>
+<script>
+(function(){
+ var list=document.getElementById('list'),msg=document.getElementById('msg');
+ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+ function say(t){if(msg)msg.textContent=t;}
+ function render(items){
+  if(!items.length){list.innerHTML='<p class="help">No topologies yet -- create one to start composing an overlay.</p>';return;}
+  list.innerHTML=items.map(function(t){
+   return '<div class="row"><span class="v"><code>'+esc(t.id)+'</code></span>'
+        + '<span><a class="btn sec" href="/me/topologies/'+encodeURIComponent(t.id)+'/editor">Open editor</a></span></div>';
+  }).join('');
+ }
+ fetch('/me/topologies').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+  .then(render).catch(function(s){list.textContent='';say('could not load topologies ('+s+')');});
+ var btn=document.getElementById('newtopo');
+ if(btn){btn.addEventListener('click',function(){
+  say('creating…');
+  fetch('/me/topologies',{method:'POST'}).then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+   .then(function(t){location.href='/me/topologies/'+encodeURIComponent(t.id)+'/editor';})
+   .catch(function(s){say('create failed ('+s+')');});
+ });}
+})();
+</script>"#;
+    page("your topologies", body)
 }
 
 /// `GET /portal/channels` (self-service discoverability, 2026-08-01): the account
@@ -2704,5 +2774,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert!(body.contains("No channel invitations yet"));
+    }
+
+    #[tokio::test]
+    async fn topologies_page_bounces_when_logged_out_and_renders_the_shell_when_logged_in_237() {
+        // #237-follow: /portal/topologies is the portal-discoverability shell for the
+        // Topology Editor -- gated on the session cookie exactly like every other portal
+        // page, and (unlike a bare 401/500) bounces a logged-out visitor to /portal.
+        use crate::portal::sign_session_for_test;
+
+        let app = topology_portal_router(KEY);
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/portal/topologies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "logged out -> bounced, not a raw error");
+        assert_eq!(resp.headers().get("location").unwrap(), "/portal");
+
+        let cookie = format!("ct_portal_session={}", sign_session_for_test(KEY, "alice"));
+        let resp = app
+            .oneshot(Request::get("/portal/topologies").header("cookie", cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("Your topologies"));
+        // The shell drives everything via fetch() against the already dual-authed
+        // /me/topologies* API -- proves it targets that endpoint, not a dead/placeholder one.
+        assert!(body.contains("/me/topologies"));
+        assert!(body.contains("New topology"));
     }
 }
