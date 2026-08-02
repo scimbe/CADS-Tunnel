@@ -280,6 +280,126 @@ provider's signed webhook confirms the payment.</p>
     Html(page("buy credits", &body)).into_response()
 }
 
+/// Shared state for the account-deletion cascade (Keycloak/account overhaul): every
+/// store that holds data keyed by a portal subject. Before this, `account_html`'s
+/// "manage your account" section punted entirely to Keycloak's own Account Console
+/// -- correct for identity concerns (password, sessions, the Keycloak login itself)
+/// but Keycloak has no idea CADS-Tunnel's own tunnels/channels/topologies/networks/
+/// pipelines exist, so a Keycloak-side account deletion would silently leave every
+/// bit of a customer's CADS-Tunnel data behind. Kept as its own small state/router
+/// (matching `ClaimState`/`TopologyPortalState`'s pattern) rather than widening
+/// `ApiState`, so this doesn't have to thread five more stores through every
+/// existing `portal_api_router` call site.
+#[derive(Clone)]
+struct AccountDeleteState {
+    session_key: Arc<[u8]>,
+    tunnels: Arc<SqliteTunnelStore>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+    networks: Arc<crate::storage::SqliteNetworkStore>,
+    pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+}
+
+/// Build the account-deletion router: `POST /portal/account/delete`, session-cookie
+/// authed, cascading across every store this crate keeps that's keyed by a portal
+/// subject. Mount alongside `portal_api_router` wherever those stores are already
+/// in scope.
+pub fn account_delete_router(
+    session_key: &[u8],
+    tunnels: Arc<SqliteTunnelStore>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+    networks: Arc<crate::storage::SqliteNetworkStore>,
+    pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+) -> Router {
+    Router::new()
+        .route("/portal/account/delete", post(delete_account))
+        .with_state(AccountDeleteState {
+            session_key: Arc::from(session_key.to_vec()),
+            tunnels,
+            channels,
+            topologies,
+            networks,
+            pipelines,
+        })
+}
+
+#[derive(Deserialize, Default)]
+struct DeleteAccountForm {
+    #[serde(default)]
+    confirm: String,
+}
+
+/// `POST /portal/account/delete`: irreversibly delete every CADS-Tunnel resource the
+/// caller's account owns -- tunnels (revoked), channels (deleted, with members and
+/// allow-list), topologies (deleted, with their agents/edges/share-list), declarative
+/// networks, and published pipelines -- then strips the caller's e-mail out of anyone
+/// else's channel allow-list / topology share-list so a deleted account stops showing
+/// up in other people's "shared with" views. Requires the literal confirmation text
+/// `DELETE` in the form body (a lightweight guard against an accidental submit; the
+/// real "are you sure" friction lives in the account page's own JS confirm). Does
+/// **not** touch the Keycloak account itself -- the account page's own copy tells the
+/// caller to also use the linked Account Console for that, matching the existing
+/// division of concerns (identity vs. this crate's own data).
+async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap, Form(form): Form<DeleteAccountForm>) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    if form.confirm.trim() != "DELETE" {
+        return (StatusCode::BAD_REQUEST, "type DELETE to confirm account deletion").into_response();
+    }
+    let subject = claims.subject.as_str();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Ok(owned) = st.tunnels.list_for_subject(subject) {
+        for t in owned {
+            let _ = st.tunnels.revoke(subject, &t.id, now);
+        }
+    }
+
+    if let Ok(owned) = st.channels.channels_owned_by(subject) {
+        for c in owned {
+            let _ = st.channels.delete_channel(subject, &c);
+        }
+    }
+
+    let _ = st.topologies.delete_all_owned_by(subject);
+
+    if let Ok(owned) = st.networks.list(subject) {
+        for id in owned {
+            let _ = st.networks.delete(subject, &id);
+        }
+    }
+
+    if let Ok(all) = st.pipelines.list() {
+        for (id, owner) in all {
+            if owner == subject {
+                let _ = st.pipelines.unpublish(subject, &id);
+            }
+        }
+    }
+
+    if let Some(email) = claims.email.as_deref() {
+        let _ = st.channels.remove_allowlist_entries_for_email(email);
+        let _ = st.topologies.remove_shares_by_email(email);
+    }
+
+    let body = r#"<h1 class="deleted-check">Your account data has been deleted</h1>
+<p class="help">Every tunnel, channel, topology, network and pipeline this account owned is gone,
+along with your e-mail on anyone else's allow-list or share list. Your sign-in itself is
+managed by Keycloak, not this page -- use <strong>Open Account Console</strong> from the account
+page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
+<a class="btn" href="/portal/logout">Sign out</a>"#;
+    let mut resp = Html(page("account deleted", body)).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie()) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    resp
+}
+
 /// A new tunnel from the (defense-in-depth; not linked from the UI in the
 /// Standard tier — see [`tunnels_page`]) create form.
 #[derive(Deserialize)]
@@ -1020,15 +1140,30 @@ pub(crate) fn page(title: &str, body: &str) -> String {
 <style>
  body{{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
       display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:3rem 1rem}}
- .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;max-width:640px;width:100%}}
+ .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;max-width:640px;width:100%;
+      animation:cardIn .32s ease-out}}
+ @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
+ @keyframes checkIn{{0%{{opacity:0;transform:scale(.85)}}60%{{opacity:1;transform:scale(1.03)}}100%{{transform:scale(1)}}}}
  h1{{font-size:1.3rem;margin:.1rem 0 1rem}} h2{{font-size:1rem;color:#8b949e;margin:1.4rem 0 .6rem}}
- .row{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.25rem 1rem;padding:.5rem 0;border-bottom:1px solid #21262d}}
+ .row{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.25rem 1rem;padding:.5rem 0;border-bottom:1px solid #21262d;
+      transition:background .15s ease}}
+ .row:hover{{background:#1c222b}}
  .k{{color:#8b949e;flex-shrink:0}} .v{{word-break:break-all;min-width:0}}
- nav a{{color:#58a6ff;text-decoration:none;margin-right:1rem;font-size:.9rem}} nav{{margin-bottom:1.2rem}}
+ nav a{{color:#58a6ff;text-decoration:none;margin-right:1rem;font-size:.9rem;transition:color .15s ease}}
+ nav a:hover{{color:#79c0ff}} nav{{margin-bottom:1.2rem}}
  a.btn,button{{background:#238636;color:#fff;border:0;border-radius:8px;padding:.5rem 1rem;
-      font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}}
+      font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;
+      transition:background .15s ease,transform .08s ease,opacity .15s ease}}
+ a.btn:hover,button:hover{{background:#2ea043}} a.btn:active,button:active{{transform:scale(.96)}}
  a.btn.sec,button.sec{{background:#21262d;border:1px solid #30363d;color:#e6edf3;font-weight:500}}
- input,select{{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:.5rem;font:inherit}}
+ a.btn.sec:hover,button.sec:hover{{background:#30363d}}
+ a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
+ a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
+ .deleted-check{{animation:checkIn .45s ease-out}}
+ @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
+ input,select{{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:.5rem;font:inherit;
+      transition:border-color .15s ease}}
+ input:focus,select:focus{{outline:none;border-color:#58a6ff}}
  code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.15rem .4rem}}
  form.inline{{display:inline}}
  label{{display:block;margin:.85rem 0;font-size:.9rem}}
@@ -1073,18 +1208,28 @@ pub(crate) fn page(title: &str, body: &str) -> String {
 }
 
 fn account_html(subject: &str, account_hex: &str, balance: u64, account_console_url: Option<&str>) -> String {
-    // Password change, active-session review, and self-service account
-    // deletion all live in Keycloak's own Account Console -- not reimplemented
-    // here. Omitted (not a dead link) when OIDC isn't configured.
+    // Password change, active sessions, and 2FA (TOTP) live in Keycloak's own
+    // Account Console -- correct, since those are identity concerns Keycloak
+    // already handles well; not reimplemented here. Account deletion is split the
+    // same way: this page's own "Danger zone" removes every CADS-Tunnel-side
+    // resource the account owns (tunnels/channels/topologies/networks/pipelines --
+    // Keycloak has no idea any of that exists), while the Account Console link
+    // remains how a caller removes the Keycloak login itself. Omitted (not a dead
+    // link) when OIDC isn't configured.
     let manage_section = match account_console_url {
         Some(url) => format!(
-            r#"<h2>Manage your account</h2>
-<p class="help">Change your password, review active sessions, or delete your account entirely --
-all handled by your identity provider, not by CADS-Tunnel itself.</p>
+            r#"<h2>Manage your sign-in</h2>
+<p class="help">Change your password, set up two-factor authentication, or review active
+sessions -- all handled by your identity provider, not by CADS-Tunnel itself.</p>
 <a class="btn sec" href="{url}" target="_blank" rel="noopener">Open Account Console &rarr;</a>"#,
             url = escape(url)
         ),
         None => String::new(),
+    };
+    let danger_kc_note = if account_console_url.is_some() {
+        " Your Keycloak sign-in itself is untouched; use Account Console above if you also want to remove that."
+    } else {
+        ""
     };
     let body = format!(
         r#"<h1>Your account</h1>
@@ -1096,11 +1241,29 @@ all handled by your identity provider, not by CADS-Tunnel itself.</p>
  <input type="number" name="credits" min="1" value="100" required>
  <button type="submit">Create payment intent</button>
 </form>
-{manage_section}"#,
+{manage_section}
+<h2>Danger zone</h2>
+<p class="help">Permanently deletes every tunnel, channel, topology (including ones shared with
+you), declarative network and published pipeline this account owns -- credits are forfeited, and
+this cannot be undone.{danger_kc_note}</p>
+<form method="post" action="/portal/account/delete" id="deleteAccountForm" onsubmit="return confirmDelete(event)">
+ <label>Type <code>DELETE</code> to confirm
+  <input type="text" name="confirm" id="confirmDelete" autocomplete="off" placeholder="DELETE" required>
+ </label>
+ <button type="submit" class="danger">Delete account and all data</button>
+</form>
+<script>
+ function confirmDelete(ev){{
+  var v = document.getElementById('confirmDelete').value.trim();
+  if(v !== 'DELETE'){{ ev.preventDefault(); return false; }}
+  return window.confirm('This permanently deletes all CADS-Tunnel data for this account. Continue?');
+ }}
+</script>"#,
         subject = escape(subject),
         account = escape(account_hex),
         balance = balance,
         manage_section = manage_section,
+        danger_kc_note = danger_kc_note,
     );
     page("your account", &body)
 }
@@ -1604,8 +1767,14 @@ mod tests {
             html.contains(r#"href="https://auth.example/realms/ct-demo/account""#),
             "links to the real account console URL"
         );
-        assert!(html.contains("delete your account") || html.contains("Delete your account"),
-            "explains that deletion is available via the account console");
+        assert!(
+            html.contains("two-factor authentication"),
+            "explains password/2FA/session management is available via the account console"
+        );
+        assert!(
+            html.contains("Danger zone") && html.contains("/portal/account/delete"),
+            "offers CADS-Tunnel's own self-service account-data deletion, not just a link out"
+        );
     }
 
     #[tokio::test]
@@ -1641,6 +1810,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn delete_account_requires_a_session_and_the_literal_confirm_text() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
+        let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
+        let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
+        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines);
+
+        // No session -> bounced, nothing happens.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        // Wrong confirm text -> rejected.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("cookie", session_header("kc-alice"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_account_cascades_every_owned_resource_and_strips_cross_account_grants() {
+        // Account-deletion cascade (Keycloak/account overhaul): before this,
+        // `account_html`'s "manage your account" section punted deletion entirely
+        // to Keycloak's Account Console, which has no idea CADS-Tunnel's own
+        // tunnels/channels/topologies/networks/pipelines exist. This proves the
+        // real self-service teardown, including cleaning the deleted account's
+        // e-mail off OTHER people's allow-lists / share-lists.
+        use ct_common::channel::ChannelId;
+        use ct_common::policy::{Agent, Levels, Network, Policy};
+        use ct_common::pipeline::{PipelineSpec, SelectionPolicy};
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
+        let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
+        let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
+
+        // Alice's own stuff.
+        tunnels.create("kc-alice", "my-tunnel", None).unwrap();
+        let alice_chan = ChannelId([0xA1; 32]);
+        channels.register_channel(&alice_chan, &[0x01; 32], "kc-alice").unwrap();
+        channels.allowlist_add(&alice_chan, "kc-alice", "friend@example.com", 1).unwrap();
+        topologies.create_topology("kc-alice", "alice-topo", "u-alice").unwrap();
+        topologies.share_add("kc-alice", "alice-topo", "friend@example.com", 1).unwrap();
+        let net = Network { agents: vec![Agent::new("a1", "dev", "internal")], policy: Policy { levels: Levels::new(["public", "internal"]), rules: vec![], mac_flow_control: false } };
+        networks.put("kc-alice", "alice-net", &net).unwrap();
+        pipelines
+            .publish("kc-alice", &PipelineSpec { id: "alice-pipeline".into(), roles: vec![], operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor }, 1)
+            .unwrap();
+
+        // Bob owns a separate channel and topology, and has shared/allow-listed
+        // alice's e-mail into them -- these must survive Bob's ownership intact,
+        // just with alice's e-mail stripped out.
+        let bob_chan = ChannelId([0xB0; 32]);
+        channels.register_channel(&bob_chan, &[0x02; 32], "kc-bob").unwrap();
+        channels.allowlist_add(&bob_chan, "kc-bob", "alice@example.com", 1).unwrap();
+        topologies.create_topology("kc-bob", "bob-topo", "u-bob").unwrap();
+        topologies.share_add("kc-bob", "bob-topo", "alice@example.com", 1).unwrap();
+
+        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone());
+        let session = format!(
+            "ct_portal_session={}",
+            crate::portal::sign_session_with_email_for_test(KEY, "kc-alice", "alice@example.com")
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("cookie", session)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("set-cookie").is_some(), "session cookie cleared");
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("account data has been deleted"));
+
+        // Alice's own resources are gone.
+        assert!(tunnels.list_for_subject("kc-alice").unwrap().is_empty());
+        assert_eq!(channels.channel_owner(&alice_chan).unwrap(), None);
+        assert!(topologies.list_topologies("kc-alice").unwrap().is_empty());
+        assert_eq!(networks.get("kc-alice", "alice-net").unwrap(), None);
+        assert_eq!(pipelines.get("alice-pipeline").unwrap(), None);
+
+        // Bob's resources survive, but alice's e-mail is gone from both grant lists.
+        assert_eq!(channels.channel_owner(&bob_chan).unwrap(), Some("kc-bob".to_string()));
+        assert!(!channels.allowlist_contains(&bob_chan, "alice@example.com").unwrap());
+        assert!(topologies.topology("bob-topo").unwrap().is_some());
+        assert!(!topologies.is_shared_with("bob-topo", "alice@example.com").unwrap());
     }
 
     async fn get(app: &Router, path: &str, subject: Option<&str>) -> (StatusCode, String) {

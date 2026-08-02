@@ -614,6 +614,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "zeroize",
 ]
 
 [[package]]
@@ -2852,6 +2853,7 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
+ "zeroize",
 ]
 
 [[package]]

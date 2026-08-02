@@ -4283,6 +4283,18 @@ pub fn persistent_control_plane_router(
                 oidc.clone(),
                 AUTHED_ISSUES_PER_WINDOW,
             ))
+            // Keycloak/account overhaul: "delete my account and all data" cascades
+            // across every store keyed by a portal subject -- see
+            // `account_delete_router`'s doc comment for why this stays a separate
+            // small router rather than widening `ApiState`.
+            .merge(crate::portal_api::account_delete_router(
+                session_key,
+                tunnels.clone(),
+                channels.clone(),
+                topologies.clone(),
+                networks.clone(),
+                pipeline_registry.clone(),
+            ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
