@@ -916,6 +916,11 @@ pub struct AuthedTopologyState {
     /// [`subject_of_topology`]'s doc comment for why accepting either is not a
     /// scope-widening.
     session_key: Arc<[u8]>,
+    /// #107-complex: the channel store, so an edge's explicit channel association
+    /// (`topology_edge_channel`) can validate the caller actually owns or is a member of
+    /// the channel it's attaching — "account related channels or shared to account
+    /// channels", never an arbitrary id with no relationship to the caller.
+    channels: Arc<SqliteChannelStore>,
 }
 
 /// Build the **authenticated** Topology Editor router (#107-rest): compose an overlay by
@@ -933,9 +938,11 @@ pub fn authed_topology_router(
     topologies: Arc<SqliteTopologyStore>,
     verifier: OidcVerifierHandle,
     session_key: Arc<[u8]>,
+    channels: Arc<SqliteChannelStore>,
 ) -> Router {
     Router::new()
         .route("/me/topologies", post(topology_create).get(topology_list))
+        .route("/me/topologies/shared", get(topology_shared_list))
         .route("/me/topologies/:id", get(topology_view))
         .route("/me/topologies/:id/mode", axum::routing::put(topology_set_mode))
         .route("/me/topologies/:id/operator", axum::routing::put(topology_set_operator))
@@ -943,7 +950,10 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
         .route("/me/topologies/:id/edges", post(topology_add_edge).delete(topology_remove_edge))
-        .with_state(AuthedTopologyState { topologies, verifier, session_key })
+        .route("/me/topologies/:id/edges/channel", axum::routing::put(topology_edge_channel))
+        .route("/me/topologies/:id/share", post(topology_share_add))
+        .route("/me/topologies/:id/share/:email/remove", post(topology_share_remove))
+        .with_state(AuthedTopologyState { topologies, verifier, session_key, channels })
 }
 
 /// State for the searchable agent directory (#144 ②): the store + the shared
@@ -1304,15 +1314,31 @@ async fn topology_list(
     Ok(Json(list))
 }
 
+/// An edge plus its optional explicitly-attached channel (#107-complex link info) — the
+/// derived `channel_id_for_link(a, b)` always applies regardless; `channel` is only ever an
+/// explicit, informational override/association a collaborator attached.
+#[derive(Debug, Serialize, Deserialize)]
+struct EdgeView {
+    a: String,
+    b: String,
+    /// 64-hex channel id, if one has been explicitly attached to this edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct TopologyView {
     id: String,
     net_uuid: String,
-    agents: Vec<String>,
-    edges: Vec<(String, String)>,
+    /// `(agent id, kind)` — kind is `"peer"` or `"super-peer"` (#107-complex).
+    agents: Vec<(String, String)>,
+    edges: Vec<EdgeView>,
     /// The overlay mode (#107-ui-mode): `baseline` (direct) vs `smart-route`/`shortcut`
     /// (complex-adaptive). Legacy/absent rows read back as `baseline`.
     overlay_mode: String,
+    /// Whether the CALLER owns this topology (vs. viewing it as a share, #107-complex) —
+    /// lets a client distinguish "my topology" from "shared with me" without a second call.
+    owner: String,
 }
 
 /// Resolve `id` as a topology owned by `owner`, or a `404` (owner isolation — a topology
@@ -1331,21 +1357,53 @@ fn owned_topology(
     Ok(t)
 }
 
+/// Resolve `id` as a topology `subject` may **view** (#107-complex): owned by them, OR
+/// shared with their verified session e-mail. A topology that's neither is a `404` (owner/
+/// share isolation — never a `403`, matching `owned_topology`'s existing idiom).
+fn viewable_topology(
+    state: &AuthedTopologyState,
+    subject: &str,
+    subject_email: Option<&str>,
+    id: &str,
+) -> Result<crate::topology::Topology, (StatusCode, String)> {
+    let t = state
+        .topologies
+        .topology(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "no such topology".to_string()))?;
+    if t.owner == subject {
+        return Ok(t);
+    }
+    if let Some(email) = subject_email {
+        if state
+            .topologies
+            .is_shared_with(&t.id, email)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        {
+            return Ok(t);
+        }
+    }
+    Err((StatusCode::NOT_FOUND, "no such topology".to_string()))
+}
+
 async fn topology_view(
     State(state): State<AuthedTopologyState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<TopologyView>, (StatusCode, String)> {
-    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
-    let t = owned_topology(&state, &owner, &id)?;
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    let t = viewable_topology(&state, &subject, email.as_deref(), &id)?;
     let agents = state
         .topologies
-        .agents_in(&t.id)
+        .agents_with_kind(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let edges = state
         .topologies
-        .edges(&t.id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .edges_with_channel(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|(a, b, channel)| EdgeView { a, b, channel: channel.map(|c| hex_encode(&c)) })
+        .collect();
     let overlay_mode = state
         .topologies
         .overlay_mode(&t.id)
@@ -1353,7 +1411,7 @@ async fn topology_view(
         .unwrap_or(ct_common::overlay::RoutingApproach::Baseline)
         .as_str()
         .to_string();
-    Ok(Json(TopologyView { id: t.id, net_uuid: t.net_uuid, agents, edges, overlay_mode }))
+    Ok(Json(TopologyView { id: t.id, net_uuid: t.net_uuid, agents, edges, overlay_mode, owner: t.owner }))
 }
 
 /// `PUT /me/topologies/:id/mode` — set the topology's **overlay mode** (#107-ui-mode):
@@ -1392,22 +1450,30 @@ async fn topology_editor(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
-    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
-    let t = owned_topology(&state, &owner, &id)?;
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    let t = viewable_topology(&state, &subject, email.as_deref(), &id)?;
+    let is_owner = t.owner == subject;
     let agents = state
         .topologies
-        .agents_in(&t.id)
+        .agents_with_kind(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let edges = state
         .topologies
-        .edges(&t.id)
+        .edges_with_channel(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mode = state
         .topologies
         .overlay_mode(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .unwrap_or(ct_common::overlay::RoutingApproach::Baseline);
-    Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges, mode.as_str())))
+    // #107-complex: the share list is only ever fetched (and rendered) for the owner --
+    // shares_for is itself owner-scoped, so a non-owner viewer gets an empty Vec here
+    // regardless, matching render_topology_editor's own is_owner-gated section.
+    let shares = state
+        .topologies
+        .shares_for(&t.owner, &t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges, mode.as_str(), is_owner, &shares)))
 }
 
 /// A caller-supplied candidate link + its measured latency cost, the input to the overlay
@@ -1506,6 +1572,12 @@ async fn topology_suggest(
 #[derive(Deserialize)]
 struct AssignReq {
     agent: String,
+    /// #107-complex: the agent's node kind -- `"peer"` (default when absent) or
+    /// `"super-peer"`. Applied via `set_agent_kind` immediately after a successful assign,
+    /// so it's scoped to the SAME "caller owns this agent" authority `assign` already
+    /// enforces (never the topology's own owner/collaborator authority).
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn topology_assign(
@@ -1514,10 +1586,12 @@ async fn topology_assign(
     Path(id): Path<String>,
     Json(req): Json<AssignReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
-    // The caller must own the topology it is assigning into.
-    owned_topology(&state, &owner, &id)?;
-    state.topologies.assign(&owner, &req.agent, &id).map_err(|e| {
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    // #107-complex: the caller must own the topology OR be a collaborator it's shared with
+    // (view access is the prerequisite for wiring in an agent at all); viewable_topology
+    // 404s otherwise, same owner/share isolation idiom as everywhere else in this router.
+    viewable_topology(&state, &subject, email.as_deref(), &id)?;
+    state.topologies.assign(&subject, &req.agent, &id).map_err(|e| {
         use crate::topology::AssignError;
         let code = match e {
             crate::storage::TopologyError::Assign(AssignError::AlreadyAssigned { .. }) => StatusCode::CONFLICT,
@@ -1527,6 +1601,12 @@ async fn topology_assign(
         };
         (code, e.to_string())
     })?;
+    if let Some(kind) = req.kind.as_deref().filter(|k| !k.is_empty()) {
+        state
+            .topologies
+            .set_agent_kind(&subject, &req.agent, kind)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -1542,39 +1622,173 @@ async fn topology_add_edge(
     Path(id): Path<String>,
     Json(req): Json<EdgeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    // #107-complex: owner OR shared collaborator may wire an edge.
     let added = state
         .topologies
-        .add_edge(&owner, &id, &req.a, &req.b)
+        .add_edge_collab(&subject, email.as_deref(), &id, &req.a, &req.b)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // false → the caller doesn't own the topology, a self-loop, or a duplicate edge.
+    // false → the caller can't edit the topology, a self-loop, or a duplicate edge.
     if added {
         Ok(StatusCode::OK)
     } else {
-        Err((StatusCode::CONFLICT, "edge not added (not owner, self-loop, or duplicate)".to_string()))
+        Err((StatusCode::CONFLICT, "edge not added (no edit access, self-loop, or duplicate)".to_string()))
     }
 }
 
-/// Remove an undirected edge `a—b` from the caller's topology (#107-ui-compose) — the
-/// owner-scoped inverse of [`topology_add_edge`], backing the editor's "unlink" gesture.
-/// `404` when the edge isn't the owner's to remove (a non-owner topology OR no such edge —
-/// deliberately indistinguishable, so a non-owner learns nothing about the topology's shape).
+/// Remove an undirected edge `a—b` from a topology the caller may edit (#107-ui-compose,
+/// #107-complex) — the owner-or-collaborator inverse of [`topology_add_edge`], backing the
+/// editor's "unlink" gesture. `404` when the edge isn't the caller's to remove (no edit
+/// access OR no such edge — deliberately indistinguishable, so a caller without access
+/// learns nothing about the topology's shape).
 async fn topology_remove_edge(
     State(state): State<AuthedTopologyState>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<EdgeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
     let removed = state
         .topologies
-        .remove_edge(&owner, &id, &req.a, &req.b)
+        .remove_edge_collab(&subject, email.as_deref(), &id, &req.a, &req.b)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if removed {
         Ok(StatusCode::OK)
     } else {
-        Err((StatusCode::NOT_FOUND, "edge not removed (not owner or no such edge)".to_string()))
+        Err((StatusCode::NOT_FOUND, "edge not removed (no edit access or no such edge)".to_string()))
     }
+}
+
+#[derive(Deserialize)]
+struct EdgeChannelReq {
+    a: String,
+    b: String,
+    /// 64-hex channel id to attach, or `None`/absent to clear.
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+/// `PUT /me/topologies/:id/edges/channel {a, b, channel}` (#107-complex link info): attach
+/// (or, with `channel: null`/absent, clear) an edge's explicitly-associated channel. Owner
+/// or shared collaborator, like the edge wiring endpoints. Validates `channel` (when
+/// present) is 64-hex AND a channel the caller either owns or is a member of — "account
+/// related channels or shared to account channels", never an arbitrary channel id the
+/// caller has no relationship to at all.
+async fn topology_edge_channel(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<EdgeChannelReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    let channel_id = match req.channel.as_deref().filter(|c| !c.is_empty()) {
+        Some(hex) => {
+            let raw = hex_decode_32(hex).ok_or((StatusCode::BAD_REQUEST, "channel must be 64 hex chars".to_string()))?;
+            let cid = ct_common::channel::ChannelId(raw);
+            let is_owner = state
+                .channels
+                .channel_owner(&cid)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .is_some_and(|o| o == subject);
+            // "related to the account" for a non-owner means allow-listed by e-mail
+            // (channels_for_email) -- channel membership itself is keyed by a holder
+            // ed25519 pubkey, not by this portal session's subject string, so there is
+            // no direct "is this subject a member" query to make here; the allow-list
+            // is the actual account-level relationship this codebase tracks.
+            let is_related = match &email {
+                Some(e) => state
+                    .channels
+                    .channels_for_email(e)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                    .iter()
+                    .any(|(c, _)| *c == cid),
+                None => false,
+            };
+            if !is_owner && !is_related {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "not a channel this account owns or has been allow-listed on".to_string(),
+                ));
+            }
+            Some(raw)
+        }
+        None => None,
+    };
+    let ok = state
+        .topologies
+        .set_edge_channel(&subject, email.as_deref(), &id, &req.a, &req.b, channel_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "edge not updated (no edit access or no such edge)".to_string()))
+    }
+}
+
+#[derive(Deserialize)]
+struct ShareReq {
+    email: String,
+}
+
+/// `POST /me/topologies/:id/share {email}` (#107-complex) — owner-only: share this
+/// topology with another Keycloak account's e-mail. Idempotent.
+async fn topology_share_add(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<ShareReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let ok = state
+        .topologies
+        .share_add(&owner, &id, &req.email, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such topology".to_string()))
+    }
+}
+
+/// `POST /me/topologies/:id/share/:email/remove` (#107-complex) — owner-only, de-lists an
+/// e-mail. `404` indistinguishably whether the topology isn't the caller's or the e-mail
+/// was never on the share list.
+async fn topology_share_remove(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path((id, email)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let removed = state
+        .topologies
+        .share_remove(&owner, &id, &email)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if removed {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "not shared with that email, or not the owner".to_string()))
+    }
+}
+
+/// `GET /me/topologies/shared` (#107-complex) — the topologies-shared-with-me portal view's
+/// data source, mirroring `channels_for_email`: keyed on the CALLER's own verified e-mail,
+/// never a caller-supplied one, so there's no way to enumerate another account's shares.
+/// Empty (not an error) when the caller's session has no verified email — a bearer-token
+/// caller included, since only a real portal login ever carries one.
+async fn topology_shared_list(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TopologySummary>>, (StatusCode, String)> {
+    let (_subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    let list = match email {
+        Some(email) => state
+            .topologies
+            .topologies_shared_with_email(&email)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        None => Vec::new(),
+    };
+    Ok(Json(list.into_iter().map(|t| TopologySummary { id: t.id, net_uuid: t.net_uuid }).collect()))
 }
 
 #[derive(Deserialize)]
@@ -1748,6 +1962,16 @@ svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var
 .bar button.active{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 .node.linking .card{stroke:var(--accent);stroke-width:2px}
 svg[data-linkmode="1"] .edge{cursor:pointer;stroke-width:5px}
+.edge{cursor:pointer}
+.node.superpeer .card{stroke:var(--accent2);stroke-width:2px}
+.node.superpeer .accent{fill:var(--accent2)}
+.badge{fill:var(--accent2)}.badge-t{fill:#fff;font:700 9px ui-monospace,monospace;pointer-events:none}
+label.sp{color:var(--muted);font-size:.82rem;display:flex;align-items:center;gap:.3rem;margin-left:0}
+.panel{border-top:1px solid var(--line);background:var(--panel);padding:.7rem 1.1rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.panel h2{font-size:.82rem;color:var(--muted);margin:0;font-weight:600}
+.sharee{font:500 .8rem ui-monospace,monospace;background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:.25rem .5rem;display:inline-flex;align-items:center;gap:.35rem}
+.sharee .unshare{background:none;border:0;color:var(--muted);cursor:pointer;font-size:.9rem;padding:0;line-height:1}
+.sharee .unshare:hover{color:var(--accent2)}
 "#;
 
 /// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
@@ -1761,7 +1985,7 @@ const EDITOR_JS: &str = r#"
  function pt(e){var m=svg.getScreenCTM().inverse(),p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;return p.matrixTransform(m);}
  function centers(){var m={};svg.querySelectorAll('.node').forEach(function(n){m[n.getAttribute('data-node')]=[+n.getAttribute('data-cx'),+n.getAttribute('data-cy')];});return m;}
  function redraw(){var c=centers();svg.querySelectorAll('.edge').forEach(function(ed){var a=c[ed.getAttribute('data-a')],b=c[ed.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2;ed.setAttribute('d','M '+a[0]+' '+a[1]+' C '+mx+' '+a[1]+', '+mx+' '+b[1]+', '+b[0]+' '+b[1]);});}
- svg.addEventListener('pointerdown',function(e){if(svg.getAttribute('data-linkmode')==='1'){var ed=e.target.closest('.edge');if(ed){removeEdge(ed);return;}}var g=e.target.closest('.node');if(!g)return;if(svg.getAttribute('data-linkmode')==='1'){linkPick(g);return;}sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
+ svg.addEventListener('pointerdown',function(e){if(svg.getAttribute('data-linkmode')==='1'){var ed=e.target.closest('.edge');if(ed){removeEdge(ed);return;}}else{var ed2=e.target.closest('.edge');if(ed2){editLinkInfo(ed2);return;}}var g=e.target.closest('.node');if(!g)return;if(svg.getAttribute('data-linkmode')==='1'){linkPick(g);return;}sel=g;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
  svg.addEventListener('pointermove',function(e){if(!sel)return;var p=pt(e),x=p.x-dx,y=p.y-dy;sel.setAttribute('data-cx',x);sel.setAttribute('data-cy',y);sel.setAttribute('transform','translate('+x+','+y+')');redraw();});
  svg.addEventListener('pointerup',function(){sel=null;});
  redraw();
@@ -1796,7 +2020,28 @@ const EDITOR_JS: &str = r#"
  // #107-ui-compose: add-agent — assign an existing agent into this topology, then re-render
  // (the server lays out the new node with correct geometry). Exclusive-membership 409 is surfaced.
  var addBtn=document.getElementById('addagent'),agIn=document.getElementById('agent');
- if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a})}).then(function(r){if(r.ok){say('added '+a);location.reload();}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
+ var kindIn=document.getElementById('agentkind');
+ if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}var kind=(kindIn&&kindIn.checked)?'super-peer':'peer';fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a,kind:kind})}).then(function(r){if(r.ok){say('added '+a);location.reload();}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
+ // #107-complex: click an edge OUTSIDE connect-mode to view/attach its explicit channel
+ // (link info) -- the derived channel always applies regardless; this is purely the
+ // optional, explicit association a collaborator can attach for their own bookkeeping.
+ function editLinkInfo(ed){
+  var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b'),cur=ed.getAttribute('data-channel')||'';
+  var msgLine=cur?('current channel: '+cur):'no channel explicitly attached (edge still authorizes its derived channel)';
+  var next=window.prompt('Link '+a+' — '+b+'\n'+msgLine+'\n\nEnter a 64-hex channel id to attach, or leave blank to clear:',cur);
+  if(next===null)return;
+  next=next.trim();
+  if(next&&!/^[0-9a-fA-F]{64}$/.test(next)){say('channel id must be 64 hex chars');return;}
+  fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges/channel',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b,channel:next?next:null})})
+   .then(function(r){if(r.ok){ed.setAttribute('data-channel',next);say(next?'channel attached':'channel cleared');}else{say('link-info update failed ('+r.status+')');}})
+   .catch(function(){say('link-info update failed');});
+ }
+ // #107-complex: owner-only share management.
+ var shareBtn=document.getElementById('shareBtn'),shareEmail=document.getElementById('shareEmail'),sharesEl=document.getElementById('shares');
+ function addShareRow(email){if(!sharesEl)return;var s=document.createElement('span');s.className='sharee';s.textContent=email+' ';var btn=document.createElement('button');btn.className='unshare';btn.setAttribute('data-email',email);btn.setAttribute('aria-label','stop sharing with '+email);btn.textContent='×';btn.addEventListener('click',function(){unshare(email,s);});s.appendChild(btn);sharesEl.appendChild(s);}
+ function unshare(email,el){fetch('/me/topologies/'+encodeURIComponent(tid)+'/share/'+encodeURIComponent(email)+'/remove',{method:'POST'}).then(function(r){if(r.ok){if(el&&el.remove)el.remove();say('unshared '+email);}else{say('unshare failed ('+r.status+')');}}).catch(function(){say('unshare failed');});}
+ if(sharesEl){sharesEl.querySelectorAll('.unshare').forEach(function(btn){btn.addEventListener('click',function(){unshare(btn.getAttribute('data-email'),btn.closest('.sharee'));});});}
+ if(shareBtn&&shareEmail){shareBtn.addEventListener('click',function(){var email=shareEmail.value.trim();if(!email){say('enter an email address');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/share',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:email})}).then(function(r){if(r.ok){addShareRow(email);shareEmail.value='';say('shared with '+email);}else{say('share failed ('+r.status+')');}}).catch(function(){say('share failed');});});}
 })();
 "#;
 
@@ -1813,9 +2058,11 @@ const EDITOR_JS: &str = r#"
 /// topology's current [`overlay mode`](topology_set_mode) token, pre-selected in the toggle.
 fn render_topology_editor(
     t: &crate::topology::Topology,
-    agents: &[String],
-    edges: &[(String, String)],
+    agents: &[(String, String)],
+    edges: &[(String, String, Option<[u8; 32]>)],
     mode: &str,
+    is_owner: bool,
+    shares: &[String],
 ) -> String {
     use std::f64::consts::PI;
     let esc = crate::portal::escape;
@@ -1831,7 +2078,7 @@ fn render_topology_editor(
     let pos: std::collections::HashMap<&str, (f64, f64)> = agents
         .iter()
         .enumerate()
-        .map(|(i, a)| {
+        .map(|(i, (a, _))| {
             if n == 1 {
                 (a.as_str(), (CX, CY))
             } else {
@@ -1854,35 +2101,51 @@ fn render_topology_editor(
              no agents yet — assign one to start composing</text>"
         )
     } else {
-        // Edges first (drawn under the nodes), each a bezier between node centres.
+        // Edges first (drawn under the nodes), each a bezier between node centres. #107-complex:
+        // data-channel carries the explicitly-attached channel id (hex), if any -- the click
+        // handler reads it to show/edit link info without a extra round-trip.
         let edge_svg: String = edges
             .iter()
-            .filter_map(|(a, b)| {
+            .filter_map(|(a, b, channel)| {
                 let (&(x1, y1), &(x2, y2)) = (pos.get(a.as_str())?, pos.get(b.as_str())?);
                 let mx = (x1 + x2) / 2.0;
+                let ch = channel.map(|c| hex_encode(&c)).unwrap_or_default();
                 Some(format!(
-                    "<path class=\"edge\" data-a=\"{a}\" data-b=\"{b}\" \
+                    "<path class=\"edge\" data-a=\"{a}\" data-b=\"{b}\" data-channel=\"{ch}\" \
                      d=\"M {x1:.1} {y1:.1} C {mx:.1} {y1:.1}, {mx:.1} {y2:.1}, {x2:.1} {y2:.1}\"/>",
                     a = esc(a),
                     b = esc(b),
+                    ch = esc(&ch),
                 ))
             })
             .collect();
+        // #107-complex: a super-peer node gets a distinct class (`node superpeer`, styled in
+        // EDITOR_CSS) and a small "SP" badge instead of the plain accent bar -- a peer routing
+        // through it is a visually distinguishable graph shape, not just a same-looking agent.
         let node_svg: String = agents
             .iter()
-            .map(|a| {
+            .map(|(a, kind)| {
                 let (x, y) = pos[a.as_str()];
                 // Truncate long ids for the card face (raw, then escape).
                 let raw: String = a.chars().take(16).collect();
                 let label = if a.chars().count() > 16 { format!("{raw}…") } else { raw };
+                let is_sp = kind == "super-peer";
+                let cls = if is_sp { "node superpeer" } else { "node" };
+                let badge = if is_sp {
+                    "<rect class=\"badge\" x=\"32\" y=\"-34\" width=\"28\" height=\"16\" rx=\"8\" ry=\"8\"/>\
+                     <text class=\"badge-t\" x=\"46\" y=\"-22\" text-anchor=\"middle\">SP</text>"
+                } else {
+                    ""
+                };
                 format!(
-                    "<g class=\"node\" data-node=\"{id}\" data-cx=\"{x:.1}\" data-cy=\"{y:.1}\" \
+                    "<g class=\"{cls}\" data-node=\"{id}\" data-kind=\"{kind}\" data-cx=\"{x:.1}\" data-cy=\"{y:.1}\" \
                      transform=\"translate({x:.1},{y:.1})\" tabindex=\"0\" role=\"listitem\" aria-label=\"agent {id}\">\
                      <rect class=\"card\" x=\"-60\" y=\"-22\" width=\"120\" height=\"44\" rx=\"12\" ry=\"12\" filter=\"url(#nsh)\"/>\
                      <rect class=\"accent\" x=\"-60\" y=\"-22\" width=\"120\" height=\"4\" rx=\"2\"/>\
                      <circle class=\"handle\" cx=\"60\" cy=\"0\" r=\"4\"/>\
-                     <text class=\"label\" x=\"0\" y=\"5\" text-anchor=\"middle\">{label}</text></g>",
+                     <text class=\"label\" x=\"0\" y=\"5\" text-anchor=\"middle\">{label}</text>{badge}</g>",
                     id = esc(a),
+                    kind = esc(kind),
                     label = esc(&label),
                 )
             })
@@ -1907,27 +2170,53 @@ fn render_topology_editor(
         opt("random-mesh", "Random mesh"),
     );
 
+    // #107-complex: owner-only share management -- a subject viewing via a share never sees
+    // (or can reach) another collaborator's e-mail or the share-management controls.
+    let share_section = if is_owner {
+        let rows: String = shares
+            .iter()
+            .map(|e| {
+                format!(
+                    "<span class=\"sharee\">{email} <button class=\"unshare\" data-email=\"{email}\" \
+                     aria-label=\"stop sharing with {email}\">&times;</button></span>",
+                    email = esc(e)
+                )
+            })
+            .collect();
+        format!(
+            "<div class=\"panel\"><h2>Shared with</h2>\
+             <div id=\"shares\">{rows}</div>\
+             <input id=\"shareEmail\" type=\"email\" placeholder=\"email address\" aria-label=\"share with email\"/>\
+             <button id=\"shareBtn\">Share</button></div>"
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Topology Editor — {uuid}</title><style>{css}</style></head><body data-tid=\"{tid}\">\
+         <title>Topology Editor — {uuid}</title><style>{css}</style></head>\
+         <body data-tid=\"{tid}\" data-owner=\"{is_owner}\">\
          <header class=\"bar\"><span class=\"title\">Topology Editor</span>\
          <span class=\"chip\">net:{uuid}</span>\
-         <span class=\"chip\">{na} agents</span><span class=\"chip\">{ne} links</span>\
+         <span class=\"chip\" id=\"agentcount\">{na} agents</span><span class=\"chip\" id=\"edgecount\">{ne} links</span>\
          <span class=\"hint\">drag nodes to arrange</span>\
-         <label>overlay <select id=\"mode\">{mode_options}</select></label>\
+         <label>overlay <select id=\"mode\"{mode_dis}>{mode_options}</select></label>\
          <button id=\"link\" aria-pressed=\"false\">Connect</button>\
          <input id=\"agent\" placeholder=\"agent id\" aria-label=\"agent id to add\"/>\
+         <label class=\"sp\"><input type=\"checkbox\" id=\"agentkind\"/> super-peer</label>\
          <button id=\"addagent\">Add</button>\
          <button id=\"suggest\" class=\"primary\">Suggest overlay</button>\
          <span id=\"msg\"></span></header>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
          preserveAspectRatio=\"xMidYMid meet\" role=\"application\" aria-label=\"topology node graph\">\
-         {content}</svg></div><script>{js}</script></body></html>",
+         {content}</svg></div>{share_section}<script>{js}</script></body></html>",
         uuid = esc(&t.net_uuid),
         tid = esc(&t.id),
         na = agents.len(),
         ne = edges.len(),
+        mode_dis = if is_owner { "" } else { " disabled" },
         css = EDITOR_CSS,
         js = EDITOR_JS,
     )
@@ -2374,6 +2663,22 @@ fn subject_of_topology(
         return Ok(claims.subject);
     }
     subject_of(verifier, headers)
+}
+
+/// Like [`subject_of_topology`], but also returns the caller's verified e-mail when resolved
+/// via the portal session cookie (#107-complex share checks need it). A bearer-token caller
+/// has no email available here — `None` — so shared-topology access is only reachable via a
+/// real portal login today, which is the only path that ever carries a verified email to
+/// begin with.
+fn topology_actor_of(
+    session_key: &[u8],
+    verifier: &OidcVerifierHandle,
+    headers: &HeaderMap,
+) -> Result<(String, Option<String>), (StatusCode, String)> {
+    if let Some(claims) = crate::portal::session_claims_for(session_key, headers) {
+        return Ok((claims.subject, claims.email));
+    }
+    subject_of(verifier, headers).map(|s| (s, None))
 }
 
 /// Extract + verify the bearer token, returning the authenticated subject.
@@ -3979,7 +4284,7 @@ pub fn persistent_control_plane_router(
                 AUTHED_ISSUES_PER_WINDOW,
             ))
             .merge(authed_network_router(networks, oidc.clone()))
-            .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key)))
+            .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc.clone()))
@@ -5511,7 +5816,13 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
-        let app = authed_topology_router(topologies, OidcVerifierHandle::new(Some(verifier)), Arc::from(b"test-session-key".as_slice()));
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let app = authed_topology_router(
+            topologies,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            channels,
+        );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -5562,8 +5873,11 @@ mod tests {
         assert_eq!(view.status(), StatusCode::OK);
         let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
         let v: TopologyView = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v.agents, vec!["agent-1", "agent-2"]);
-        assert_eq!(v.edges, vec![("agent-1".to_string(), "agent-2".to_string())]);
+        assert_eq!(v.agents, vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())]);
+        assert_eq!(v.edges.len(), 1);
+        assert_eq!(v.edges[0].a, "agent-1");
+        assert_eq!(v.edges[0].b, "agent-2");
+        assert_eq!(v.edges[0].channel, None);
         // #107-ui-mode: a fresh topology defaults to the direct overlay mode.
         assert_eq!(v.overlay_mode, "baseline", "default overlay mode is direct");
 
@@ -5627,11 +5941,10 @@ mod tests {
         );
         let view = send("GET", format!("/me/topologies/{tid}"), Some(&alice), String::new()).await.unwrap();
         let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<TopologyView>(&body).unwrap().edges,
-            vec![("agent-1".to_string(), "agent-2".to_string())],
-            "the edge survives a non-owner delete"
-        );
+        let survived = serde_json::from_slice::<TopologyView>(&body).unwrap().edges;
+        assert_eq!(survived.len(), 1, "the edge survives a non-owner delete");
+        assert_eq!(survived[0].a, "agent-1");
+        assert_eq!(survived[0].b, "agent-2");
         assert_eq!(
             send("DELETE", format!("/me/topologies/{tid}/edges"), Some(&alice), r#"{"a":"agent-2","b":"agent-1"}"#.into())
                 .await.unwrap().status(),
@@ -5746,7 +6059,13 @@ mod tests {
         let session_key = b"test-session-key".as_slice();
         let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
-        let app = authed_topology_router(topologies, OidcVerifierHandle::new(Some(verifier)), Arc::from(session_key));
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let app = authed_topology_router(
+            topologies,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            channels,
+        );
 
         let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
         let send = |method: &str, path: String, body: String| {
@@ -5812,6 +6131,261 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn topology_sharing_lets_a_collaborator_view_and_wire_their_own_agents_but_not_govern_107_complex() {
+        // #107-complex: a topology defaults to owner-only (no share rows at all). Sharing is
+        // strictly additive: the shared subject can VIEW and wire in THEIR OWN agents/edges
+        // (the collaborative use case topology.rs's own original module doc anticipated --
+        // "their own, or ones shared to them") but never owner-only governance (delete,
+        // operator-bind, managing the share list itself).
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let app = authed_topology_router(
+            topologies,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            channels,
+        );
+        let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_with_email_for_test(session_key, "alice", "alice@example.test"));
+        let bob_cookie = format!("ct_portal_session={}", crate::portal::sign_session_with_email_for_test(session_key, "bob", "bob@example.test"));
+        let stranger_cookie = format!("ct_portal_session={}", crate::portal::sign_session_with_email_for_test(session_key, "stranger", "stranger@example.test"));
+        let send = |method: &str, path: String, cookie: &str, body: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        let created = send("POST", "/me/topologies".into(), &alice_cookie, String::new()).await.unwrap();
+        let body = to_bytes(created.into_body(), 1 << 16).await.unwrap();
+        let tid = serde_json::from_slice::<TopologyCreatedResp>(&body).unwrap().id;
+
+        // Before sharing: bob can't even see it.
+        assert_eq!(
+            send("GET", format!("/me/topologies/{tid}"), &bob_cookie, String::new()).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "not shared yet -> invisible to bob, indistinguishable from nonexistent"
+        );
+        // And bob can't share it with himself (owner-only governance).
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/share"), &bob_cookie, r#"{"email":"bob@example.test"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "only the owner may manage the share list"
+        );
+
+        // Alice shares with bob's email.
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/share"), &alice_cookie, r#"{"email":"bob@example.test"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Now bob can view it...
+        assert_eq!(
+            send("GET", format!("/me/topologies/{tid}"), &bob_cookie, String::new()).await.unwrap().status(),
+            StatusCode::OK,
+            "shared -> visible to bob"
+        );
+        // ...and it shows up in bob's "shared with me" listing, by email -- not a stranger's.
+        let shared_resp = send("GET", "/me/topologies/shared".into(), &bob_cookie, String::new()).await.unwrap();
+        let shared_body = to_bytes(shared_resp.into_body(), 1 << 16).await.unwrap();
+        let shared: Vec<TopologySummary> = serde_json::from_slice(&shared_body).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].id, tid);
+        let stranger_shared = send("GET", "/me/topologies/shared".into(), &stranger_cookie, String::new()).await.unwrap();
+        let stranger_body = to_bytes(stranger_shared.into_body(), 1 << 16).await.unwrap();
+        assert!(serde_json::from_slice::<Vec<TopologySummary>>(&stranger_body).unwrap().is_empty(), "a stranger has nothing shared");
+
+        // Bob wires in HIS OWN agent, marked as a super-peer.
+        assert_eq!(
+            send(
+                "POST",
+                format!("/me/topologies/{tid}/agents"),
+                &bob_cookie,
+                r#"{"agent":"bob-relay","kind":"super-peer"}"#.into()
+            )
+            .await.unwrap().status(),
+            StatusCode::OK,
+            "bob may assign his OWN agent into alice's shared topology"
+        );
+        // Bob cannot wire in an agent he doesn't own (alice's, first-touched by her below).
+        send("POST", format!("/me/topologies/{tid}/agents"), &alice_cookie, r#"{"agent":"alice-peer"}"#.into())
+            .await
+            .unwrap();
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/agents"), &bob_cookie, r#"{"agent":"alice-peer"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "bob still can't touch an agent alice already owns -- collaboration widens WHO can edit the topology, never agent ownership"
+        );
+
+        // Bob wires an edge between the two (topology-edit access, not agent ownership, gates this).
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/edges"), &bob_cookie, r#"{"a":"bob-relay","b":"alice-peer"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK,
+            "bob may wire an edge in a topology shared with him"
+        );
+
+        // The view shows bob-relay as a super-peer.
+        let view = send("GET", format!("/me/topologies/{tid}"), &alice_cookie, String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        let v: TopologyView = serde_json::from_slice(&body).unwrap();
+        assert!(v.agents.contains(&("bob-relay".to_string(), "super-peer".to_string())), "bob-relay recorded as a super-peer");
+        assert!(v.agents.contains(&("alice-peer".to_string(), "peer".to_string())), "alice-peer stays a plain peer");
+
+        // Bob still can't govern: no operator-bind, can't delete the share list.
+        assert_eq!(
+            send("PUT", format!("/me/topologies/{tid}/mode"), &bob_cookie, r#"{"mode":"smart-route"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a collaborator can't retune the topology's overlay mode either (owner-only governance)"
+        );
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/share/{}/remove", "bob@example.test"), &bob_cookie, String::new())
+                .await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a collaborator can't manage the share list, not even to remove their own access"
+        );
+
+        // Alice de-lists bob; he loses access immediately.
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/share/{}/remove", "bob@example.test"), &alice_cookie, String::new())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send("GET", format!("/me/topologies/{tid}"), &bob_cookie, String::new()).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "de-listed -> access revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn topology_edge_channel_association_requires_a_real_owned_or_member_channel_107_complex() {
+        // #107-complex link info: attaching a channel to an edge must be a real channel the
+        // caller owns or is a member of ("account related channels or shared to account
+        // channels") -- never an arbitrary id with no relationship to the caller. Clearing
+        // (channel: null) always works once attached.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ct_common::channel::ChannelId;
+        use tower::ServiceExt;
+
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+
+        // A real channel alice owns.
+        let owned = ChannelId([0xa1u8; 32]);
+        assert!(channels.register_channel(&owned, &[0x11u8; 32], "alice").unwrap());
+        // A real channel someone else owns, but alice's e-mail is allow-listed on
+        // (invited, #248-follow's channel_allowlist -- the actual account-level
+        // relationship this codebase tracks; channel *membership* is keyed by a
+        // holder ed25519 pubkey, not by a portal session's subject string, so there
+        // is no separate "is this subject a member" concept to test here).
+        let member_of = ChannelId([0xb2u8; 32]);
+        assert!(channels.register_channel(&member_of, &[0x22u8; 32], "carol").unwrap());
+        assert!(channels.allowlist_add(&member_of, "carol", "alice@example.test", 1_000).unwrap());
+        // A real channel alice has no relationship to at all.
+        let unrelated = ChannelId([0xc3u8; 32]);
+        assert!(channels.register_channel(&unrelated, &[0x44u8; 32], "carol").unwrap());
+
+        let app = authed_topology_router(
+            topologies,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            channels,
+        );
+        let alice_cookie = format!(
+            "ct_portal_session={}",
+            crate::portal::sign_session_with_email_for_test(session_key, "alice", "alice@example.test")
+        );
+        let send = |method: &str, path: String, body: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("content-type", "application/json")
+                    .header("cookie", alice_cookie.clone())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        let created = send("POST", "/me/topologies".into(), String::new()).await.unwrap();
+        let body = to_bytes(created.into_body(), 1 << 16).await.unwrap();
+        let tid = serde_json::from_slice::<TopologyCreatedResp>(&body).unwrap().id;
+        send("POST", format!("/me/topologies/{tid}/agents"), r#"{"agent":"a"}"#.into()).await.unwrap();
+        send("POST", format!("/me/topologies/{tid}/agents"), r#"{"agent":"b"}"#.into()).await.unwrap();
+        send("POST", format!("/me/topologies/{tid}/edges"), r#"{"a":"a","b":"b"}"#.into()).await.unwrap();
+
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        // An unrelated channel is refused.
+        assert_eq!(
+            send(
+                "PUT",
+                format!("/me/topologies/{tid}/edges/channel"),
+                format!(r#"{{"a":"a","b":"b","channel":"{}"}}"#, hex(&unrelated.0))
+            )
+            .await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "not owned or a member of -> refused"
+        );
+
+        // A channel alice OWNS is accepted.
+        assert_eq!(
+            send(
+                "PUT",
+                format!("/me/topologies/{tid}/edges/channel"),
+                format!(r#"{{"a":"a","b":"b","channel":"{}"}}"#, hex(&owned.0))
+            )
+            .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let view = send("GET", format!("/me/topologies/{tid}"), String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        let v: TopologyView = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.edges[0].channel.as_deref(), Some(hex(&owned.0).as_str()));
+
+        // A channel alice is only a MEMBER of (not the owner) is also accepted.
+        assert_eq!(
+            send(
+                "PUT",
+                format!("/me/topologies/{tid}/edges/channel"),
+                format!(r#"{{"a":"a","b":"b","channel":"{}"}}"#, hex(&member_of.0))
+            )
+            .await.unwrap().status(),
+            StatusCode::OK,
+            "a channel the caller's e-mail is allow-listed (not owner) on is also \"account related\""
+        );
+
+        // Clearing works.
+        assert_eq!(
+            send("PUT", format!("/me/topologies/{tid}/edges/channel"), r#"{"a":"a","b":"b","channel":null}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let view = send("GET", format!("/me/topologies/{tid}"), String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        let v: TopologyView = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v.edges[0].channel, None, "cleared");
+    }
+
     #[test]
     fn topology_svg_diagram_has_a_node_per_agent_and_a_line_per_edge() {
         // #107 "live diagram": the status page renders an inline SVG node-graph.
@@ -5844,14 +6418,18 @@ mod tests {
             owner: "alice".into(),
             net_uuid: "uuid-xyz".into(),
         };
-        let agents = vec!["agent-1".to_string(), "agent-2".to_string(), "agent-3".to_string()];
+        let agents = vec![
+            ("agent-1".to_string(), "peer".to_string()),
+            ("agent-2".to_string(), "peer".to_string()),
+            ("agent-3".to_string(), "peer".to_string()),
+        ];
         // A complex (non-direct) wiring: a triangle among three agents.
         let edges = vec![
-            ("agent-1".to_string(), "agent-2".to_string()),
-            ("agent-2".to_string(), "agent-3".to_string()),
-            ("agent-1".to_string(), "agent-3".to_string()),
+            ("agent-1".to_string(), "agent-2".to_string(), None),
+            ("agent-2".to_string(), "agent-3".to_string(), None),
+            ("agent-1".to_string(), "agent-3".to_string(), None),
         ];
-        let html = render_topology_editor(&t, &agents, &edges, "smart-route");
+        let html = render_topology_editor(&t, &agents, &edges, "smart-route", true, &[]);
 
         // A complete, self-contained HTML document.
         assert!(html.starts_with("<!doctype html>") && html.contains("</html>"), "full HTML doc");
@@ -5874,13 +6452,13 @@ mod tests {
         assert!(html.contains("/mode") && html.contains("/suggest"), "wired to the owner endpoints");
 
         // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
-        let evil = vec!["<script>alert(1)</script>".to_string()];
-        let evil_html = render_topology_editor(&t, &evil, &[], "baseline");
+        let evil = vec![("<script>alert(1)</script>".to_string(), "peer".to_string())];
+        let evil_html = render_topology_editor(&t, &evil, &[], "baseline", true, &[]);
         assert!(!evil_html.contains("<script>alert(1)"), "hostile agent id is escaped");
         assert!(evil_html.contains("&lt;script&gt;alert(1)"), "escaped form is present");
 
         // An empty topology still yields a valid page with an empty-state hint (no panic).
-        let empty = render_topology_editor(&t, &[], &[], "baseline");
+        let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[]);
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
     }
 
@@ -5897,8 +6475,8 @@ mod tests {
             owner: "alice".into(),
             net_uuid: "uuid-xyz".into(),
         };
-        let agents = vec!["agent-1".to_string(), "agent-2".to_string()];
-        let html = render_topology_editor(&t, &agents, &[], "baseline");
+        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[]);
 
         // The Connect tool is present and starts un-armed (a11y state exposed).
         assert!(html.contains("id=\"link\"") && html.contains("aria-pressed=\"false\""), "Connect tool present, un-armed");
