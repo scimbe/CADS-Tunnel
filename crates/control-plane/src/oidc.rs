@@ -109,6 +109,65 @@ impl OidcVerifier {
     }
 }
 
+/// A hot-swappable holder for the `/me/*` OIDC verifier (#328). Two problems this
+/// closes together:
+///
+/// - **Self-healing**: before this, a boot-time JWKS fetch failure (a transient
+///   Keycloak/network blip) disabled `/me/*` for the process's *entire remaining
+///   lifetime* — nothing short of an operator noticing and restarting the process
+///   brought it back. Recurred live twice in one session. A background task can
+///   now keep retrying after boot and [`Self::set`] the verifier the moment a
+///   fetch finally succeeds, with zero restart.
+/// - **Observability**: the `/me/*` routers used to be conditionally *mounted*
+///   at boot depending on verifier availability, so an unavailable verifier meant
+///   an indistinguishable `404` (route not found) rather than an honest `503`
+///   (route exists, temporarily can't authenticate you). Routers now mount
+///   unconditionally against a handle and check readiness per-request.
+///
+/// `Clone` is cheap (one `Arc`) — every authenticated router/state holds its own
+/// clone of the same underlying cell, so [`Self::set`] from the background
+/// refresh task is visible to every route immediately.
+#[derive(Clone)]
+pub struct OidcVerifierHandle(std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<OidcVerifier>>>>);
+
+impl OidcVerifierHandle {
+    pub fn new(initial: Option<std::sync::Arc<OidcVerifier>>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(initial)))
+    }
+
+    /// A handle with no verifier yet — the state every `/me/*` route was
+    /// permanently stuck in before #328 when the boot-time fetch failed;
+    /// now just the starting state a background retry can heal from.
+    pub fn empty() -> Self {
+        Self::new(None)
+    }
+
+    /// Install a freshly-fetched verifier, replacing whatever (if anything) was
+    /// there before. Called once by the boot sequence on success, and again by
+    /// the background retry task the first time a delayed fetch succeeds.
+    pub fn set(&self, verifier: std::sync::Arc<OidcVerifier>) {
+        let mut guard = self.0.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(verifier);
+    }
+
+    /// The current verifier, if one has been installed yet.
+    pub fn get(&self) -> Option<std::sync::Arc<OidcVerifier>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether a verifier is currently installed — what `/status`'s
+    /// `oidc_enabled` field reports live (#328).
+    pub fn is_ready(&self) -> bool {
+        self.get().is_some()
+    }
+}
+
+impl From<Option<std::sync::Arc<OidcVerifier>>> for OidcVerifierHandle {
+    fn from(initial: Option<std::sync::Arc<OidcVerifier>>) -> Self {
+        Self::new(initial)
+    }
+}
+
 /// The JWKS (signing-key) endpoint of a Keycloak realm whose issuer is `issuer`
 /// (#42 KC2): `<issuer>/protocol/openid-connect/certs`. A trailing slash on the
 /// issuer is tolerated so it composes with `CT_OIDC_ISSUER` either way.
@@ -230,6 +289,30 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    #[test]
+    fn oidc_verifier_handle_starts_empty_and_becomes_ready_once_set() {
+        let handle = OidcVerifierHandle::empty();
+        assert!(!handle.is_ready(), "no verifier installed yet");
+        assert!(handle.get().is_none());
+
+        let v = std::sync::Arc::new(OidcVerifier::from_hs_secret(SECRET, ISSUER));
+        handle.set(v);
+        assert!(handle.is_ready(), "#328: set() must flip readiness for a background self-heal to be observable");
+        assert!(handle.get().is_some());
+    }
+
+    #[test]
+    fn oidc_verifier_handle_clones_share_the_same_underlying_cell() {
+        let handle = OidcVerifierHandle::empty();
+        let clone = handle.clone();
+        assert!(!clone.is_ready());
+
+        // A route's own clone (taken at router-construction time) must observe a
+        // later set() from the background retry task -- that's the whole point.
+        handle.set(std::sync::Arc::new(OidcVerifier::from_hs_secret(SECRET, ISSUER)));
+        assert!(clone.is_ready(), "#328: a pre-existing clone must see a later set() through the shared cell");
     }
 
     fn make_token(secret: &[u8], sub: &str, iss: &str, exp: u64) -> String {

@@ -19,7 +19,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use ct_control_plane::oidc::{verifier_from_jwks_with_retry, OidcVerifier};
+use ct_control_plane::oidc::{verifier_from_jwks, verifier_from_jwks_with_retry, OidcVerifier, OidcVerifierHandle};
 use ct_control_plane::service::persistent_control_plane_router;
 
 /// Fetch a realm JWKS document over HTTP(S) for the startup verifier (#42 KC2-c).
@@ -52,6 +52,14 @@ async fn fetch_jwks(url: String) -> Option<serde_json::Value> {
     resp.json::<serde_json::Value>().await.ok()
 }
 
+/// #82 SEC82b: apply the opt-in bearer-token audience requirement, if configured.
+fn apply_access_aud(v: OidcVerifier, access_aud: Option<&str>) -> Arc<OidcVerifier> {
+    match access_aud {
+        Some(aud) => Arc::new(v.require_audience(aud)),
+        None => Arc::new(v),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen: SocketAddr = std::env::var("CT_CONTROL_PLANE_LISTEN")
@@ -79,6 +87,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // from its JWKS (<issuer>/protocol/openid-connect/certs) at startup, no manual
     // key export. CT_OIDC_PUBKEY_PATH remains an explicit offline override (the
     // realm's RSA public key in PEM), taking precedence when set.
+    // #328: track the issuer separately so a JWKS-path failure (the only retryable
+    // case — a bad/missing CT_OIDC_PUBKEY_PATH aborts boot outright via `?` above,
+    // and an unset CT_OIDC_ISSUER has nothing to retry) can be picked up by a
+    // background self-heal task below, instead of permanently disabling `/me/*`
+    // for the rest of this process's life. Recurred live twice in one session
+    // before this fix (a transient Keycloak/network blip at exactly boot time).
+    let mut retry_issuer: Option<String> = None;
     let oidc = match std::env::var("CT_OIDC_ISSUER") {
         Ok(issuer) if !issuer.is_empty() => match std::env::var("CT_OIDC_PUBKEY_PATH") {
             Ok(path) if !path.is_empty() => {
@@ -106,8 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 None => {
                     eprintln!(
-                        "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key after retrying — /me/* disabled"
+                        "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key after retrying — /me/* disabled; retrying in the background (#328)"
                     );
+                    retry_issuer = Some(issuer);
                     None
                 }
             },
@@ -120,13 +136,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // #82 SEC82b: opt-in bearer-token audience enforcement for /me/*. Keycloak
     // access-token audiences vary by client, so this stays off unless the operator
     // supplies their realm's field-checked access-token `aud` via CT_OIDC_ACCESS_AUD.
-    let oidc = oidc.map(|v| match std::env::var("CT_OIDC_ACCESS_AUD") {
-        Ok(aud) if !aud.is_empty() => {
-            eprintln!("ct-control-plane: /me/* access-token audience enforced (aud={aud})");
-            Arc::new(v.require_audience(&aud))
-        }
-        _ => Arc::new(v),
-    });
+    // Read once and reused by both the boot-time verifier below and #328's
+    // background retry task, so a self-healed verifier enforces the exact same
+    // audience requirement a boot-time success would have.
+    let access_aud = std::env::var("CT_OIDC_ACCESS_AUD").ok().filter(|s| !s.is_empty());
+    if let Some(aud) = &access_aud {
+        eprintln!("ct-control-plane: /me/* access-token audience enforced (aud={aud})");
+    }
+    let oidc_handle = OidcVerifierHandle::new(oidc.map(|v| apply_access_aud(v, access_aud.as_deref())));
+
+    // #328: self-heal a failed boot-time JWKS fetch instead of leaving /me/*
+    // permanently disabled. Long, fixed-cadence retries (not the boot path's short
+    // backoff) so a genuinely down/misconfigured realm isn't hammered, while a
+    // transient blip that outlasts the ~15.5s boot window still recovers within a
+    // couple of minutes -- no operator noticing and restarting the process needed.
+    // `/status`'s `oidc_enabled` field (already shipped) reflects this handle live,
+    // so recovery is observable the moment it happens, not just in process logs.
+    if let Some(issuer) = retry_issuer {
+        let handle = oidc_handle.clone();
+        let access_aud = access_aud.clone();
+        tokio::spawn(async move {
+            let mut delay = std::time::Duration::from_secs(30);
+            const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+            loop {
+                tokio::time::sleep(delay).await;
+                match verifier_from_jwks(&issuer, fetch_jwks).await {
+                    Some(v) => {
+                        eprintln!(
+                            "ct-control-plane: OIDC self-healed (issuer={issuer}, key=JWKS) — /me/* now available (#328)"
+                        );
+                        handle.set(apply_access_aud(v, access_aud.as_deref()));
+                        return;
+                    }
+                    None => {
+                        eprintln!(
+                            "ct-control-plane: OIDC background retry failed (issuer={issuer}) — retrying in {}s (#328)",
+                            delay.as_secs()
+                        );
+                        delay = std::cmp::min(delay * 2, MAX_DELAY);
+                    }
+                }
+            }
+        });
+    }
 
     // #68: the customer-facing install one-liner (/portal/tunnels/{id}/install)
     // embeds this base URL. If it's unset it silently falls back to
@@ -158,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let app = persistent_control_plane_router(&db, &webhook_secret, &session_key, oidc)?;
+    let app = persistent_control_plane_router(&db, &webhook_secret, &session_key, oidc_handle)?;
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("ct-control-plane: listening on {listen}, db={db}");
