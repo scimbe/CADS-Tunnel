@@ -2002,9 +2002,9 @@ body:not([data-uimode="flexible"]) .flex-only{display:none}
 .drawer-body p.lede{color:var(--muted);font-size:.82rem;margin:0 0 .9rem}
 .drawer-body label{display:block;font-size:.78rem;color:var(--muted);margin:0 0 .3rem}
 .drawer-body input{font:inherit;font-size:.82rem;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.4rem .55rem;color:var(--ink);width:100%;box-sizing:border-box}
-.cmd-block{margin:0 0 1rem}
+.cmd-block{margin:0 0 1rem;position:relative}
 .cmd-block h3{font-size:.72rem;font-weight:650;color:var(--muted);margin:0 0 .35rem;text-transform:uppercase;letter-spacing:.03em}
-.cmd-block pre{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:.6rem .7rem;overflow-x:auto;position:relative}
+.cmd-block pre{margin:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:.6rem .7rem;overflow-x:auto}
 .cmd-block code{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);white-space:pre}
 .cmd-block .copy{position:absolute;top:.4rem;right:.4rem;font:600 .68rem system-ui,sans-serif;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:.2rem .5rem;cursor:pointer;color:var(--muted)}
 .cmd-block .copy:hover{color:var(--ink)}
