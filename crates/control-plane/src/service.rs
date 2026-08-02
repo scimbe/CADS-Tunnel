@@ -2108,7 +2108,8 @@ const EDITOR_JS: &str = r#"
   svg.querySelectorAll('.edge').forEach(function(ed){
    var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b'),key=a+'|'+b;
    if(seen[key])return;seen[key]=true;
-   var cmd='# on '+a.slice(0,12)+'\\u2026 (repeat with roles swapped on the other side)\nCT_CHANNEL_OPERATOR_PUBKEY=<operator pubkey> \\\nCT_CHANNEL_BRIDGE_HOLDER='+b+' \\\nCT_CHANNEL_HOLDER_KEY=<'+a.slice(0,12)+'\\u2026\\'s own holder private key> \\\nCT_CHANNEL_NOISE_PUBKEY=<'+a.slice(0,12)+'\\u2026\\'s own noise public key> \\\nct-agent channel member-material';
+   var shortA=a.slice(0,12)+'...';
+   var cmd='# run on '+shortA+' (repeat with roles swapped on the other machine)\nCT_CHANNEL_OPERATOR_PUBKEY=<operator pubkey> \\\nCT_CHANNEL_BRIDGE_HOLDER='+b+' \\\nCT_CHANNEL_HOLDER_KEY=<'+shortA+' own holder private key, from its own channel init> \\\nCT_CHANNEL_NOISE_PUBKEY=<'+shortA+' own noise public key, from its own channel init> \\\nct-agent channel member-material';
    out+=block('Wire '+a.slice(0,10)+'… ↔ '+b.slice(0,10)+'…',cmd);
   });
   if(!sps.length && !Object.keys(seen).length){
