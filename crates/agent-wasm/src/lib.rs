@@ -419,6 +419,59 @@ pub fn decode_signal_message(bytes: &[u8]) -> Result<JsValue, JsError> {
     Ok(obj.into())
 }
 
+// The pure, testable core behind holder_sign/build_channel_join_request below --
+// plain `Result<_, String>` for the same native-test reason as from_hex/hex32/
+// ik_initiator above.
+fn holder_sign_inner(holder_private_hex: &str, message: &[u8]) -> Result<Vec<u8>, String> {
+    use ed25519_dalek::Signer;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&hex32(holder_private_hex)?);
+    Ok(sk.sign(message).to_bytes().to_vec())
+}
+
+fn build_channel_join_request_inner(grant_hex: &str, endpoint: &str) -> Result<Vec<u8>, String> {
+    let grant_bytes = from_hex(grant_hex)?;
+    let grant = ct_common::channel::SignedChannelGrant::decode(&grant_bytes).map_err(|e| e.to_string())?;
+    let req = ct_common::channel::ChannelJoinRequest { grant, endpoint: endpoint.to_string() };
+    Ok(req.encode())
+}
+
+/// Sign a byte string (the edge's 32-byte single-use possession challenge, in
+/// practice -- see [`build_channel_join_request`]'s doc for the full join
+/// sequence) with a holder's ed25519 private key. The signature this returns
+/// is sent RAW on the wire (no length prefix, no [`frame_message`] framing --
+/// `read_channel_join_on_stream` reads exactly 64 bytes) as the direct
+/// response to that challenge.
+#[wasm_bindgen(js_name = holderSign)]
+pub fn holder_sign(holder_private_hex: &str, message: &[u8]) -> Result<Vec<u8>, JsError> {
+    holder_sign_inner(holder_private_hex, message).map_err(|e| JsError::new(&e))
+}
+
+/// Build the exact bytes a browser member sends to join a channel, from a
+/// pre-minted, hex-encoded [`ct_common::channel::SignedChannelGrant`] (a
+/// browser peer cannot mint its own grant -- that needs the channel
+/// operator's private key -- so a demo/app backend hands each peer its own
+/// grant hex out of band) and the endpoint this member advertises (use
+/// [`CHANNEL_ENDPOINT_RELAY_ONLY`]'s literal, `"relay-only"`, for a
+/// browser member -- it has no dialable address of its own).
+///
+/// The full join sequence over the WebSocket, mirroring
+/// `channel_broker::read_channel_join_on_stream` exactly:
+/// 1. send `frame_message(build_channel_join_request(grant, "relay-only"))`
+///    as one WebSocket binary message (the length prefix is already inside
+///    those framed bytes -- message boundaries don't need to line up)
+/// 2. read the next 32 bytes that arrive -- a `b"NO"` (2 bytes) means
+///    refused; otherwise it's a 32-byte single-use possession challenge
+/// 3. send `holderSign(holderPrivateHex, challenge)` (64 raw bytes, no
+///    framing) as the next WebSocket binary message
+/// 4. from here on the socket is a raw relay splice: nothing further
+///    arrives until a channel partner also joins (a solo member parks in
+///    silence), then a rich `"OK <peer...>\n"` ack line arrives on both
+///    sides simultaneously and the Noise handshake begins immediately after
+#[wasm_bindgen(js_name = buildChannelJoinRequest)]
+pub fn build_channel_join_request(grant_hex: &str, endpoint: &str) -> Result<Vec<u8>, JsError> {
+    build_channel_join_request_inner(grant_hex, endpoint).map_err(|e| JsError::new(&e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +591,85 @@ mod tests {
         let n = resp_t.write_message(b"sdp-answer: v=0...", &mut buf).unwrap();
         let m = ini_t.read_message(&buf[..n], &mut scratch).unwrap();
         assert_eq!(&scratch[..m], b"sdp-answer: v=0...");
+    }
+
+    // A real, minted, operator-signed grant -- exactly the object a demo backend
+    // would hand a browser peer as hex, built with ct_common's own real types
+    // (not a hand-rolled fixture) so these tests exercise the identical wire
+    // format `channel_broker::read_channel_join_on_stream` decodes.
+    fn signed_test_grant(operator_sk: &ed25519_dalek::SigningKey, holder: [u8; 32]) -> ct_common::channel::SignedChannelGrant {
+        use ct_common::channel::{ChannelGrant, ChannelId, Direction, Rights, SignedChannelGrant};
+        use ed25519_dalek::Signer;
+        let grant = ChannelGrant {
+            channel: ChannelId([0x77u8; 32]),
+            holder,
+            direction: Direction::Both,
+            rights: Rights::ReadWrite,
+            delegable: false,
+            expires_at: 9_999_999_999,
+        };
+        let signature = operator_sk.sign(&grant.signing_bytes()).to_bytes();
+        SignedChannelGrant { grant, signature }
+    }
+
+    #[test]
+    fn build_channel_join_request_produces_bytes_the_real_ct_common_decoder_accepts_and_verifies() {
+        use ct_common::channel::{verify, ChannelJoinRequest, CHANNEL_ENDPOINT_RELAY_ONLY};
+        use ed25519_dalek::SigningKey;
+
+        let operator_sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let holder = generate_holder_identity();
+        let holder_pub = hex32(&holder.public_hex()).unwrap();
+        let signed = signed_test_grant(&operator_sk, holder_pub);
+        let grant_hex = to_hex(&signed.encode());
+
+        let req_bytes = build_channel_join_request(&grant_hex, CHANNEL_ENDPOINT_RELAY_ONLY).unwrap();
+
+        // Decoded exactly as the edge decodes it (channel_broker.rs reads a
+        // u16 BE length prefix, then this many bytes, then calls this decode).
+        let decoded = ChannelJoinRequest::decode(&req_bytes).unwrap();
+        assert_eq!(decoded.grant, signed);
+        assert_eq!(decoded.endpoint, CHANNEL_ENDPOINT_RELAY_ONLY);
+        assert!(decoded.is_relay_only());
+        assert!(verify(&operator_sk.verifying_key().to_bytes(), &decoded.grant, 0).is_ok());
+
+        // frame_message wraps it exactly the way it goes on the wire (a u16 BE
+        // length prefix that read_channel_join_on_stream's `len_buf` reads).
+        let framed = frame_message(&req_bytes);
+        let len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
+        assert_eq!(len, req_bytes.len());
+        assert_eq!(&framed[2..], req_bytes.as_slice());
+    }
+
+    #[test]
+    fn build_channel_join_request_rejects_a_malformed_grant_hex() {
+        assert!(build_channel_join_request_inner("not-hex", "relay-only").is_err());
+        assert!(build_channel_join_request_inner("aa", "relay-only").is_err(), "too short to be a real grant");
+    }
+
+    #[test]
+    fn holder_sign_produces_a_signature_the_real_ct_common_possession_check_accepts() {
+        use ct_common::channel::verify_holder_possession;
+        let holder = generate_holder_identity();
+        let holder_pub = hex32(&holder.public_hex()).unwrap();
+        let challenge = [0x5cu8; 32]; // stands in for the edge's fresh random challenge
+
+        let sig_bytes = holder_sign(&holder.private_hex(), &challenge).unwrap();
+        let sig: [u8; 64] = sig_bytes.try_into().unwrap();
+        assert!(verify_holder_possession(&holder_pub, &challenge, &sig));
+
+        // A signature over the wrong challenge (or by the wrong key) must fail --
+        // this is the exact anti-replay property #81 relies on.
+        let other_challenge = [0x5du8; 32];
+        assert!(!verify_holder_possession(&holder_pub, &other_challenge, &sig));
+        let other_holder = generate_holder_identity();
+        let other_pub = hex32(&other_holder.public_hex()).unwrap();
+        assert!(!verify_holder_possession(&other_pub, &challenge, &sig));
+    }
+
+    #[test]
+    fn holder_sign_rejects_a_malformed_private_key_hex() {
+        assert!(holder_sign_inner("nothex", b"msg").is_err());
+        assert!(holder_sign_inner("aa", b"msg").is_err(), "too short to be 32 bytes");
     }
 }
