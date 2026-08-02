@@ -35,7 +35,7 @@ use ct_common::sync::MutexExt;
 ///
 /// `table`/`column`/`decl` are compile-time constants (never user input), so the
 /// `format!` interpolation carries no injection surface.
-fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+pub(crate) fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
     let present = {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let cols: Vec<String> = stmt

@@ -3681,7 +3681,7 @@ pub fn persistent_control_plane_router(
         // record_ownership written below/at the two hook points would be silently
         // unresolvable via lookup. "local" is a placeholder peer_addr; a real edge-side
         // heartbeat will overwrite it with its actual reachable address once that lands.
-        if let Err(e) = edge_mesh_store.heartbeat(&local_edge_id, "local", now) {
+        if let Err(e) = edge_mesh_store.heartbeat(&local_edge_id, "local", None, now) {
             eprintln!("ct-cp: edge_mesh self-heartbeat failed: {e}");
         }
     }
@@ -5965,7 +5965,7 @@ mod tests {
         // lookup_by_token joins against mesh_edges, so "primary" must have heartbeated at
         // least once to be resolvable (mirrors the real deployment's boot-time self-heartbeat).
         // #285: the heartbeat must also be recent (within OWNERSHIP_LIVENESS_SECS), not just present.
-        mesh_store.heartbeat("primary", "test", now_secs() as i64).unwrap();
+        mesh_store.heartbeat("primary", "test", None, now_secs() as i64).unwrap();
         let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary"));
         let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
         let call = |tok: Option<String>| {

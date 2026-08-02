@@ -1889,7 +1889,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        mesh_store.heartbeat("primary", "test", now).unwrap();
+        mesh_store.heartbeat("primary", "test", None, now).unwrap();
         let app = portal_api_router(
             KEY,
             ledger,
