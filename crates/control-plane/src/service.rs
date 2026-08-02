@@ -4198,7 +4198,11 @@ pub fn persistent_control_plane_router(
         .merge(network_info_router())
         .merge({
             let oidc_cfg = crate::portal::PortalOidc::from_env();
-            let account_console_url = oidc_cfg.as_ref().map(|c| c.account_console_url());
+            let portal_base_url =
+                std::env::var("CT_PORTAL_BASE_URL").unwrap_or_else(|_| "https://localhost".to_string());
+            let account_console_url = oidc_cfg
+                .as_ref()
+                .map(|c| c.account_console_url_with_referrer(&portal_base_url, "/portal/account"));
             crate::portal::portal_router(oidc_cfg, session_key).merge(
                 crate::portal_api::portal_api_router(
                     session_key,

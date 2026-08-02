@@ -1,0 +1,93 @@
+/* bunsenbrenner.org login skin -- CSS-only reskin of the stock login-pf theme.
+   Same palette as the portal (crates/control-plane/src/portal_api.rs `page()`)
+   and the account console (../account/resources/css/ct-account.css), so the
+   sign-in -> account journey reads as one product instead of three. No DOM/id
+   changes -- #username/#password/#kc-login are untouched. */
+
+:root {
+  --ct-bg: #0e1116;
+  --ct-surface: #161b22;
+  --ct-border: #30363d;
+  --ct-text: #e6edf3;
+  --ct-muted: #8b949e;
+  --ct-accent: #58a6ff;
+  --ct-accent-hover: #79c0ff;
+}
+
+html,
+body,
+.login-pf,
+.login-pf body {
+  background: var(--ct-bg) !important;
+  color: var(--ct-text);
+}
+
+.login-pf-page {
+  background: var(--ct-bg) !important;
+}
+
+#kc-header-wrapper {
+  color: var(--ct-text);
+  font-weight: 600;
+  letter-spacing: .01em;
+}
+
+.card-pf {
+  background: var(--ct-surface) !important;
+  border: 1px solid var(--ct-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .35);
+  animation: ctCardIn .32s ease-out;
+}
+
+@keyframes ctCardIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+label,
+#kc-content-wrapper,
+#kc-form-options,
+#kc-registration-container {
+  color: var(--ct-text);
+}
+
+.pf-c-form-control,
+input.pf-c-form-control {
+  background: var(--ct-bg) !important;
+  border: 1px solid var(--ct-border) !important;
+  color: var(--ct-text) !important;
+  transition: border-color .15s ease;
+}
+.pf-c-form-control:focus {
+  border-color: var(--ct-accent) !important;
+  box-shadow: 0 0 0 1px var(--ct-accent) !important;
+}
+
+a {
+  color: var(--ct-accent);
+}
+a:hover {
+  color: var(--ct-accent-hover);
+}
+
+.pf-c-button.pf-m-primary {
+  background-color: var(--ct-accent) !important;
+  border-color: var(--ct-accent) !important;
+  transition: background-color .15s ease, transform .08s ease;
+}
+.pf-c-button.pf-m-primary:hover {
+  background-color: var(--ct-accent-hover) !important;
+}
+.pf-c-button.pf-m-primary:active {
+  transform: scale(.97);
+}
+
+.alert,
+.pf-c-alert {
+  border-radius: 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

@@ -1,0 +1,110 @@
+/* bunsenbrenner.org account console skin -- reuses the exact palette the portal's
+   own pages (crates/control-plane/src/portal_api.rs `page()`) already use, so
+   moving between the portal and "Manage your sign-in" reads as one product. */
+
+:root,
+.pf-v5-t-dark {
+  --ct-bg: #0e1116;
+  --ct-surface: #161b22;
+  --ct-border: #30363d;
+  --ct-text: #e6edf3;
+  --ct-muted: #8b949e;
+  --ct-accent: #58a6ff;
+  --ct-accent-hover: #79c0ff;
+
+  --pf-v5-global--BackgroundColor--100: var(--ct-bg);
+  --pf-v5-global--BackgroundColor--dark-100: var(--ct-bg);
+  --pf-v5-global--BackgroundColor--light-100: var(--ct-surface);
+  --pf-v5-global--BackgroundColor--light-200: var(--ct-surface);
+  --pf-v5-global--Color--100: var(--ct-text);
+  --pf-v5-global--Color--light-100: var(--ct-text);
+  --pf-v5-global--Color--200: var(--ct-muted);
+  --pf-v5-global--Color--light-200: var(--ct-muted);
+  --pf-v5-global--BorderColor--100: var(--ct-border);
+  --pf-v5-global--BorderColor--light-100: var(--ct-border);
+  --pf-v5-global--primary-color--100: var(--ct-accent);
+  --pf-v5-global--primary-color--dark-100: var(--ct-accent);
+  --pf-v5-global--primary-color--light-100: var(--ct-accent);
+  --pf-v5-global--link--Color: var(--ct-accent);
+  --pf-v5-global--link--Color--dark: var(--ct-accent);
+  --pf-v5-global--link--Color--hover: var(--ct-accent-hover);
+  --pf-v5-global--active-color--100: var(--ct-accent);
+}
+
+html,
+body,
+#app,
+.pf-v5-c-page {
+  background-color: var(--ct-bg) !important;
+  color: var(--ct-text);
+}
+
+.pf-v5-c-masthead {
+  background-color: var(--ct-surface) !important;
+  border-bottom: 1px solid var(--ct-border);
+}
+
+.pf-v5-c-page__sidebar,
+.pf-v5-c-page__sidebar-body {
+  background-color: var(--ct-surface) !important;
+  border-right: 1px solid var(--ct-border);
+}
+
+.pf-v5-c-page__main-section,
+.pf-v5-c-card,
+.pf-v5-c-form-control,
+.pf-v5-c-text-input-group__text-input {
+  background-color: var(--ct-surface) !important;
+  color: var(--ct-text);
+}
+
+.pf-v5-c-form-control,
+.pf-v5-c-text-input-group__text-input,
+input.pf-v5-c-form-control {
+  border-color: var(--ct-border) !important;
+}
+
+.pf-v5-c-nav__link {
+  color: var(--ct-text);
+  transition: background-color .15s ease, color .15s ease;
+}
+.pf-v5-c-nav__link:hover {
+  background-color: rgba(88, 166, 255, .1);
+  color: var(--ct-accent-hover);
+}
+.pf-v5-c-nav__link.pf-m-current {
+  color: var(--ct-accent);
+  border-left: 3px solid var(--ct-accent);
+}
+
+.pf-v5-c-button.pf-m-primary {
+  background-color: var(--ct-accent);
+  transition: background-color .15s ease, transform .08s ease;
+}
+.pf-v5-c-button.pf-m-primary:hover {
+  background-color: var(--ct-accent-hover);
+}
+.pf-v5-c-button.pf-m-primary:active {
+  transform: scale(.97);
+}
+
+/* The masthead brand mark (logo.svg + "Back to bunsenbrenner.org" referrer
+   link, when present) -- give it room and a hover cue since it's now a real
+   navigation affordance, not decoration. */
+img[alt="logo"] {
+  height: 26px;
+  width: auto;
+}
+[data-testid="page-header"] a:has(img[alt="logo"]) {
+  transition: opacity .15s ease;
+}
+[data-testid="page-header"] a:has(img[alt="logo"]):hover {
+  opacity: .85;
+}
+[data-testid="referrer-link"] {
+  color: var(--ct-accent) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}

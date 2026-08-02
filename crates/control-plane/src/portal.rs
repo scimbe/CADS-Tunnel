@@ -145,11 +145,22 @@ impl PortalOidc {
     }
 
     /// Keycloak's own Account Console for this realm -- where a customer can
-    /// change their password, review active sessions, and (once the realm's
-    /// `delete_account` required action is enabled) delete their own account,
-    /// without CADS-Tunnel reimplementing any of that itself.
-    pub(crate) fn account_console_url(&self) -> String {
-        format!("{}/account", self.issuer())
+    /// change their password, review active sessions, and set up 2FA, without
+    /// CADS-Tunnel reimplementing any of that itself. Carries `referrer`/
+    /// `referrer_uri` (Keycloak's own account-console feature, not something
+    /// this crate invented) so the console renders a real "Back to bunsenbrenner"
+    /// link -- `referrer` must be a client with `referrer_uri` among its
+    /// registered redirect URIs (`ct-portal`'s now include `/portal/account`) or
+    /// Keycloak silently drops both params. `redirect_to` is the exact page to
+    /// return to, e.g. `/portal/account` -- kept a parameter (not hardcoded)
+    /// so a caller reachable at a different portal path still gets a correct link.
+    pub(crate) fn account_console_url_with_referrer(&self, portal_origin: &str, redirect_to: &str) -> String {
+        format!(
+            "{}/account?referrer={}&referrer_uri={}",
+            self.issuer(),
+            urlencode(&self.client_id),
+            urlencode(&format!("{portal_origin}{redirect_to}")),
+        )
     }
 
     /// Build the Authorization Code redirect URL, carrying a CSRF `state`. `idp_hint`
@@ -991,6 +1002,29 @@ mod tests {
 
         assert!(result.is_err(), "a hanging IdP errors, it does not hang the login path");
         assert!(elapsed < Duration::from_secs(2), "failed fast in {elapsed:?}, not forever");
+    }
+
+    #[test]
+    fn account_console_url_carries_a_valid_referrer_back_to_the_portal() {
+        // Keycloak/account overhaul follow-up: "missing a back to bunsenbrenner
+        // account link" -- Keycloak's account console (keycloak.v3) renders a
+        // real "Back to <app>" link only when `referrer`/`referrer_uri` are
+        // present AND `referrer_uri` matches one of `referrer`'s own registered
+        // redirect URIs; this proves the URL this crate builds actually carries
+        // both, correctly encoded.
+        let cfg = PortalOidc::from_lookup(|k| match k {
+            "CT_OIDC_CLIENT_ID" => Some("ct-portal".into()),
+            "CT_OIDC_REDIRECT_URI" => Some("https://bunsenbrenner.org/portal/callback".into()),
+            "CT_OIDC_ISSUER" => Some("https://auth.bunsenbrenner.org/realms/ct-demo".into()),
+            _ => None,
+        })
+        .unwrap();
+        let url = cfg.account_console_url_with_referrer("https://bunsenbrenner.org", "/portal/account");
+        assert_eq!(
+            url,
+            "https://auth.bunsenbrenner.org/realms/ct-demo/account\
+             ?referrer=ct-portal&referrer_uri=https%3A%2F%2Fbunsenbrenner.org%2Fportal%2Faccount"
+        );
     }
 
     const TEST_KEY: &[u8] = b"portal-test-session-key";
