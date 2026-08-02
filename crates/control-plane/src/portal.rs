@@ -411,8 +411,59 @@ fn identity_from_verified_id_token(
     Ok(ExchangedIdentity { subject, email, email_verified })
 }
 
-async fn portal_home() -> Html<&'static str> {
-    Html(PORTAL_HTML)
+async fn portal_home() -> Html<String> {
+    Html(portal_home_html(std::env::var("CT_PORTAL_SOCIAL_PROVIDERS").ok().as_deref()))
+}
+
+/// Render the logged-out portal shell, with the social-login buttons gated on
+/// `CT_PORTAL_SOCIAL_PROVIDERS` (comma-separated: `google`, `github` — matches
+/// [`known_idp_hint`]'s allowlist). Default (unset/empty) shows **none** of them.
+///
+/// Found live, 2026-08-02: both "Continue with Google" and "Continue with GitHub" led
+/// to a raw 502 — Keycloak's `google`/`github` identity-provider entries in the
+/// `ct-demo` realm are registered and enabled, but their `config` has no `clientId`/
+/// `clientSecret` at all (never actually set up with real OAuth app credentials), so
+/// Keycloak's own `createAuthorizationUrl` throws building the redirect
+/// ("IllegalArgumentException: Value is null") before the button ever does anything
+/// useful. These buttons were unconditionally shown regardless, so EVERY visitor who
+/// clicked either one hit a dead end. Since fixing this for real means an operator
+/// registering actual OAuth apps with Google/GitHub and supplying real credentials —
+/// not something fixable in code — the safe fix is to stop advertising a broken path:
+/// hide a provider's button until its real credentials are configured and
+/// `CT_PORTAL_SOCIAL_PROVIDERS` says so explicitly. "Continue with email" (proven live,
+/// fully functional) always renders regardless.
+fn portal_home_html(enabled_raw: Option<&str>) -> String {
+    let enabled: std::collections::HashSet<&str> = enabled_raw
+        .map(|s| s.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    let mut providers = String::new();
+    if enabled.contains("google") {
+        providers.push_str(
+            r#"<a class="provider" href="/portal/login?kc_idp_hint=google">
+   <svg viewBox="0 0 18 18"><path fill='#4285F4' d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84c-.21 1.13-.84 2.09-1.8 2.73v2.27h2.92c1.7-1.57 2.68-3.87 2.68-6.64z"/><path fill='#34A853' d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.27c-.81.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33C2.44 15.98 5.48 18 9 18z"/><path fill='#FBBC05' d="M3.97 10.7c-.18-.54-.28-1.11-.28-1.7s.1-1.16.28-1.7V4.97H.96A8.99 8.99 0 0 0 0 9c0 1.45.35 2.83.96 4.03l3.01-2.33z"/><path fill='#EA4335' d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.59-2.59C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.97l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>
+   Continue with Google
+  </a>
+  "#,
+        );
+    }
+    if enabled.contains("github") {
+        providers.push_str(
+            r#"<a class="provider" href="/portal/login?kc_idp_hint=github">
+   <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+   Continue with GitHub
+  </a>"#,
+        );
+    }
+    // The "or" divider only makes sense between at least one social button and the
+    // email path -- omit it (and the now-empty providers wrapper) when none are enabled,
+    // so a default deployment shows a clean single "Continue with email" card, not an
+    // empty box + a dangling divider.
+    let providers_block = if providers.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"providers\">\n  {providers}\n </div>\n\n <div class=\"divider\">or</div>\n\n")
+    };
+    format!("{PORTAL_HTML_HEAD}{providers_block}{PORTAL_HTML_TAIL}")
 }
 
 /// `kc_idp_hint` from the portal shell's "Continue with Google/GitHub" buttons.
@@ -861,10 +912,12 @@ fn urlencode(s: &str) -> String {
 
 /// The customer portal shell (logged-out state): a self-contained, CSP-safe HTML
 /// page offering real "Continue with Google/GitHub" buttons (via Keycloak's
-/// `kc_idp_hint`, #portal-idp-hint) plus a direct email/password path -- one
-/// click straight into the right flow instead of a single generic "Sign in with
-/// SSO" button that just forwarded to another chooser screen.
-const PORTAL_HTML: &str = r#"<!doctype html>
+/// `kc_idp_hint`, #portal-idp-hint), each shown only when actually enabled+configured
+/// (`CT_PORTAL_SOCIAL_PROVIDERS`, see [`portal_home_html`]), plus a direct email/
+/// password path that always works -- one click straight into the right flow instead
+/// of a single generic "Sign in with SSO" button that just forwarded to another
+/// chooser screen.
+const PORTAL_HTML_HEAD: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bunsenbrenner.org — sign in or create an account</title>
@@ -896,20 +949,9 @@ const PORTAL_HTML: &str = r#"<!doctype html>
  <h1>&#128293; Sign in or create an account</h1>
  <div class="sub">One account for your tunnels, pipelines, and agents.</div>
 
- <div class="providers">
-  <a class="provider" href="/portal/login?kc_idp_hint=google">
-   <svg viewBox="0 0 18 18"><path fill='#4285F4' d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84c-.21 1.13-.84 2.09-1.8 2.73v2.27h2.92c1.7-1.57 2.68-3.87 2.68-6.64z"/><path fill='#34A853' d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.92-2.27c-.81.54-1.84.86-3.04.86-2.34 0-4.32-1.58-5.03-3.71H.96v2.33C2.44 15.98 5.48 18 9 18z"/><path fill='#FBBC05' d="M3.97 10.7c-.18-.54-.28-1.11-.28-1.7s.1-1.16.28-1.7V4.97H.96A8.99 8.99 0 0 0 0 9c0 1.45.35 2.83.96 4.03l3.01-2.33z"/><path fill='#EA4335' d="M9 3.58c1.32 0 2.51.45 3.44 1.35l2.59-2.59C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.97l3.01 2.33C4.68 5.16 6.66 3.58 9 3.58z"/></svg>
-   Continue with Google
-  </a>
-  <a class="provider" href="/portal/login?kc_idp_hint=github">
-   <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-   Continue with GitHub
-  </a>
- </div>
+ "#;
 
- <div class="divider">or</div>
-
- <a class="btn-email" href="/portal/login">Continue with email</a>
+const PORTAL_HTML_TAIL: &str = r#"<a class="btn-email" href="/portal/login">Continue with email</a>
 
  <div class="foot">Provider-blind tunnels — the operator never sees your payload.</div>
 </div>
@@ -1311,15 +1353,40 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("Continue with email"), "direct email/password login CTA present");
         assert!(html.contains(r#"href="/portal/login""#), "the email path links to the plain login route");
-        assert!(
-            html.contains(r#"href="/portal/login?kc_idp_hint=google""#),
-            "the Google button hints Keycloak straight to that provider"
-        );
-        assert!(
-            html.contains(r#"href="/portal/login?kc_idp_hint=github""#),
-            "the GitHub button hints Keycloak straight to that provider"
-        );
         assert!(!html.contains("http://") && !html.contains("https://cdn"), "self-contained, no external assets");
+    }
+
+    #[test]
+    fn portal_home_hides_social_buttons_by_default_but_shows_them_once_configured() {
+        // Found live, 2026-08-02: "Continue with Google"/"Continue with GitHub" were
+        // ALWAYS shown, but Keycloak's google/github identity providers in the live
+        // ct-demo realm had no real clientId/clientSecret configured at all (the
+        // compose-level KC_GOOGLE_CLIENT_ID/etc. env vars default to empty and were
+        // never actually set) -- every visitor who clicked either button hit a raw
+        // 502 ("Could not create authentication request"). Default (no
+        // CT_PORTAL_SOCIAL_PROVIDERS) must show NEITHER button, only the always-
+        // working email path -- and the "or" divider must not dangle with nothing
+        // above it. Setting the env var re-enables exactly the named provider(s),
+        // for once an operator actually configures real OAuth credentials.
+        let default_html = portal_home_html(None);
+        assert!(!default_html.contains("kc_idp_hint=google"), "no Google button by default");
+        assert!(!default_html.contains("kc_idp_hint=github"), "no GitHub button by default");
+        assert!(!default_html.contains("class=\"divider\""), "no dangling 'or' divider with nothing above it");
+        assert!(default_html.contains("Continue with email"), "the always-working path still renders");
+
+        let google_only = portal_home_html(Some("google"));
+        assert!(google_only.contains(r#"href="/portal/login?kc_idp_hint=google""#), "Google shown once enabled");
+        assert!(!google_only.contains("kc_idp_hint=github"), "GitHub still hidden, not enabled");
+        assert!(google_only.contains("class=\"divider\""), "divider present once at least one provider shows");
+
+        let both = portal_home_html(Some(" google , github "));
+        assert!(both.contains("kc_idp_hint=google") && both.contains("kc_idp_hint=github"), "both enabled (whitespace-tolerant)");
+
+        // An empty string is treated the same as unset (matches this project's other
+        // opt-in-flag env var conventions).
+        assert!(!portal_home_html(Some("")).contains("kc_idp_hint"));
+        // An unrecognized token is silently ignored, not rendered as a broken button.
+        assert!(!portal_home_html(Some("facebook")).contains("kc_idp_hint"));
     }
 
     #[tokio::test]
