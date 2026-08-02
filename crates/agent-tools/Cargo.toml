@@ -18,6 +18,10 @@ axum = "0.7"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync"] }
 tokio-stream = "0.1"
+# ct-video-call-grant only: local operator-key signing, the same versions
+# ct-common/ct-edge/ct-control-plane already pin.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 
 [features]
 # See ct-agent's own `nat-lab` feature doc comment -- required to build `natlab`.
@@ -53,3 +57,7 @@ path = "src/bin/udp_echo.rs"
 name = "natlab"
 path = "src/bin/natlab.rs"
 required-features = ["nat-lab"]
+
+[[bin]]
+name = "ct-video-call-grant"
+path = "src/bin/video_call_grant.rs"
