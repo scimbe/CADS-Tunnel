@@ -1937,7 +1937,7 @@ const EDITOR_CSS: &str = r#"
 @media (prefers-color-scheme:dark){:root{--bg:#0e1116;--panel:#161b22;--ink:#e6edf3;--muted:#8b949e;--line:#30363d;--accent:#3fb950;--accent2:#58a6ff;--edge:#484f58;--node:#1c2128;--nodeln:#30363d}}
 *{box-sizing:border-box}html,body{height:100%}
 body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);display:flex;flex-direction:column}
-header.bar{display:flex;align-items:center;gap:.9rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
+header.bar{display:flex;align-items:center;flex-wrap:wrap;gap:.9rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
 .title{font-size:1rem;font-weight:650;letter-spacing:-.01em}
 .chip{font:500 .78rem/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:.32rem .62rem}
 .hint{color:var(--muted);font-size:.82rem}
@@ -1958,7 +1958,7 @@ svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var
 .bar input{font:inherit;font-size:.82rem;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.35rem .6rem;width:8.5rem}
 .bar button.primary{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 .bar button.primary:hover{filter:brightness(1.06)}
-#msg{color:var(--muted);font-size:.8rem;min-width:6rem}
+#msg{color:var(--muted);font-size:.8rem;min-width:0;max-width:16rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar button.active{background:var(--accent);color:#fff;border-color:transparent;font-weight:600}
 .node.linking .card{stroke:var(--accent);stroke-width:2px}
 svg[data-linkmode="1"] .edge{cursor:pointer;stroke-width:5px}
@@ -2027,18 +2027,19 @@ const EDITOR_JS: &str = r#"
  // overlay link; it POSTs the existing owner `…/edges` endpoint and the edge appears live.
  var src=null;
  function xesc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+ function shortId(s){s=String(s);return s.length>14?s.slice(0,10)+'…':s;}
  function clearSrc(){if(src){src.classList.remove('linking');src=null;}}
  function edgeExists(a,b){var f=false;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=true;});return f;}
  function addEdgeEl(a,b){var first=svg.querySelector('.node');if(!first)return;first.insertAdjacentHTML('beforebegin','<path data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"/>');var np=first.previousElementSibling;if(np)np.setAttribute('class','edge');redraw();}
- function linkPick(g){var id=g.getAttribute('data-node');if(!src){src=g;g.classList.add('linking');say('connect: pick the target agent');return;}var a=src.getAttribute('data-node');clearSrc();if(a===id){say('connect: pick two different agents');return;}if(edgeExists(a,id)){say('already linked');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:id})}).then(function(r){if(r.ok){addEdgeEl(a,id);say('linked '+a+' — '+id);}else{say('link failed ('+r.status+')');}}).catch(function(){say('link failed');});}
- function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();say('unlinked '+a+' — '+b);}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
+ function linkPick(g){var id=g.getAttribute('data-node');if(!src){src=g;g.classList.add('linking');say('connect: pick the target agent');return;}var a=src.getAttribute('data-node');clearSrc();if(a===id){say('connect: pick two different agents');return;}if(edgeExists(a,id)){say('already linked');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:id})}).then(function(r){if(r.ok){addEdgeEl(a,id);say('linked '+shortId(a)+' — '+shortId(id));}else{say('link failed ('+r.status+')');}}).catch(function(){say('link failed');});}
+ function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();say('unlinked '+shortId(a)+' — '+shortId(b));}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
  var linkBtn=document.getElementById('link');
  if(linkBtn){linkBtn.addEventListener('click',function(){var on=svg.getAttribute('data-linkmode')!=='1';svg.setAttribute('data-linkmode',on?'1':'');linkBtn.setAttribute('aria-pressed',on?'true':'false');linkBtn.classList.toggle('active',on);if(!on)clearSrc();say(on?'connect: click two agents to link, or a link to remove':'');});}
  // #107-ui-compose: add-agent — assign an existing agent into this topology, then re-render
  // (the server lays out the new node with correct geometry). Exclusive-membership 409 is surfaced.
  var addBtn=document.getElementById('addagent'),agIn=document.getElementById('agent');
  var kindIn=document.getElementById('agentkind');
- if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}var kind=(kindIn&&kindIn.checked)?'super-peer':'peer';fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a,kind:kind})}).then(function(r){if(r.ok){say('added '+a);location.reload();}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
+ if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}var kind=(kindIn&&kindIn.checked)?'super-peer':'peer';fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a,kind:kind})}).then(function(r){if(r.ok){say('added '+shortId(a));location.reload();}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
  // #107-complex: click an edge OUTSIDE connect-mode to view/attach its explicit channel
  // (link info) -- the derived channel always applies regardless; this is purely the
  // optional, explicit association a collaborator can attach for their own bookkeeping.
