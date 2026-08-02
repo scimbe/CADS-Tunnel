@@ -2593,6 +2593,20 @@ impl SqliteTopologyStore {
                  a        TEXT NOT NULL,
                  b        TEXT NOT NULL,
                  PRIMARY KEY (topology, a, b)
+             );
+             -- #107-complex: a topology is shared with another Keycloak account by e-mail
+             -- (mirrors channel_allowlist's shape/semantics) -- the default stays owner-only
+             -- (no rows here), sharing is a strictly additive grant. A shared subject may view
+             -- the topology and wire in their OWN agents/edges (collaborative composition, the
+             -- use case topology.rs's original module doc already anticipated: 'their own, or
+             -- ones shared to them') but never the owner-only governance actions (delete,
+             -- operator-bind, manage the share list itself).
+             CREATE TABLE IF NOT EXISTS topology_shares (
+                 topology  TEXT NOT NULL,
+                 email     TEXT NOT NULL,
+                 added_by  TEXT NOT NULL,
+                 added_at  INTEGER NOT NULL,
+                 PRIMARY KEY (topology, email)
              );",
         )?;
         // #107-ui-mode: the per-topology overlay mode (a RoutingApproach token) the owner
@@ -2606,6 +2620,22 @@ impl SqliteTopologyStore {
         // and self-host DBs upgrade in place. Self-contained on the topology so enforcement needs no
         // fragile cross-store join to discover whose operator authority governs the overlay.
         ensure_column(&conn, "topologies", "operator_pubkey", "BLOB")?;
+        // #107-complex: an agent's node KIND in the topology graph -- 'peer' (default, a
+        // regular channel member) or 'super-peer' (a byte-transparent UDP relay other LAN
+        // members route through, ct-agent's `channel super-peer` subcommand). Purely a
+        // rendering/informational hint at this layer -- the graph's actual admission
+        // semantics (authorized_channels/topology_authorizes) are unchanged by it; a
+        // super-peer node is still just an agent id in the edge graph. Additive (#44).
+        ensure_column(&conn, "topology_agents", "kind", "TEXT NOT NULL DEFAULT 'peer'")?;
+        // #107-complex: an edge may explicitly name a REAL, separately-registered channel
+        // (from SqliteChannelStore) it carries, instead of only ever relying on the
+        // implicit, derived channel_id_for_link(a, b). Nullable + additive (#44): most
+        // edges never set this, and derivation is unaffected either way -- this is purely
+        // link-info display + an explicit association a collaborator can attach, not a new
+        // authorization path (authorized_channels/topology_authorizes still only ever
+        // consult the derived id, so an explicit channel_id here cannot be used to smuggle
+        // admission for a channel the drawn edge doesn't actually imply).
+        ensure_column(&conn, "topology_edges", "channel_id", "BLOB")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -2922,11 +2952,37 @@ impl SqliteTopologyStore {
     }
 
     fn persist(conn: &Connection, agent: &str, a: &crate::topology::AgentAssignment) -> rusqlite::Result<()> {
+        // #107-complex: ON CONFLICT DO UPDATE (not a blind INSERT OR REPLACE) so a
+        // previously-set `kind` (super-peer, set via `set_agent_kind`) survives every later
+        // assign/revoke cycle -- REPLACE would silently reset it to the column default on
+        // the agent's next reassignment.
         conn.execute(
-            "INSERT OR REPLACE INTO topology_agents (agent, owner, topology) VALUES (?1, ?2, ?3)",
+            "INSERT INTO topology_agents (agent, owner, topology, kind) VALUES (?1, ?2, ?3, 'peer')
+             ON CONFLICT(agent) DO UPDATE SET owner = excluded.owner, topology = excluded.topology",
             params![agent, a.owner(), a.topology()],
         )?;
         Ok(())
+    }
+
+    /// Set `agent`'s node **kind** in the topology graph (#107-complex): `"peer"` (default)
+    /// or `"super-peer"`. Scoped to the agent's own registered owner (`by`) -- the same
+    /// authority that controls its assignment -- so a topology collaborator can mark their
+    /// OWN agent as a super-peer, never someone else's. `false` (no-op) if `agent` has never
+    /// been touched (no row to update) or `by` isn't its owner. Rejects an unrecognized kind
+    /// token outright (`Err`), same "never store garbage" posture as `RoutingApproach::parse`.
+    pub fn set_agent_kind(&self, by: &str, agent: &str, kind: &str) -> Result<bool, String> {
+        if kind != "peer" && kind != "super-peer" {
+            return Err(format!("unrecognized agent kind {kind:?} (expected \"peer\" or \"super-peer\")"));
+        }
+        let n = self
+            .conn
+            .lock_safe()
+            .execute(
+                "UPDATE topology_agents SET kind = ?3 WHERE agent = ?1 AND owner = ?2",
+                params![agent, by, kind],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
     }
 
     /// The current assignment for `agent`, if it has ever been touched.
@@ -2966,6 +3022,223 @@ impl SqliteTopologyStore {
             .query_map(params![topology], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(agents)
+    }
+
+    /// Like [`agents_in`](Self::agents_in), but pairs each agent with its node **kind**
+    /// (`"peer"`/`"super-peer"`, #107-complex) — what the editor's richer node rendering
+    /// needs; `agents_in` stays as-is for the (kind-indifferent) optimizer/authorization
+    /// call sites.
+    pub fn agents_with_kind(&self, topology: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn
+            .prepare("SELECT agent, kind FROM topology_agents WHERE topology = ?1 ORDER BY agent")?;
+        let agents = stmt
+            .query_map(params![topology], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(agents)
+    }
+
+    /// Like [`edges`](Self::edges), but includes each edge's explicitly-attached **channel
+    /// id**, if any (#107-complex link info). `None` means the edge relies purely on the
+    /// implicit, derived `channel_id_for_link` (the common case).
+    pub fn edges_with_channel(&self, topology: &str) -> rusqlite::Result<Vec<(String, String, Option<[u8; 32]>)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT a, b, channel_id FROM topology_edges WHERE topology = ?1 ORDER BY a, b",
+        )?;
+        let edges = stmt
+            .query_map(params![topology], |r| {
+                let a: String = r.get(0)?;
+                let b: String = r.get(1)?;
+                let raw: Option<Vec<u8>> = r.get(2)?;
+                Ok((a, b, raw))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(edges
+            .into_iter()
+            .map(|(a, b, raw)| {
+                let channel_id = raw.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+                (a, b, channel_id)
+            })
+            .collect())
+    }
+
+    /// Whether `subject` may perform a **collaborative edit** (assign an agent, wire/unwire
+    /// an edge, attach a channel to an edge) on `topology` (#107-complex): the topology's
+    /// owner, OR a subject whose verified session e-mail is on the topology's share list.
+    /// Owner-only governance actions (delete, operator-bind, managing the share list itself)
+    /// deliberately do NOT use this — they stay `owns_topology`-only.
+    fn can_collaborate(conn: &Connection, subject: &str, subject_email: Option<&str>, topology: &str) -> rusqlite::Result<bool> {
+        if Self::owns_topology(conn, subject, topology)? {
+            return Ok(true);
+        }
+        let Some(email) = subject_email else { return Ok(false) };
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM topology_shares WHERE topology = ?1 AND email = ?2",
+                params![topology, email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Wire an edge on behalf of a topology **owner or collaborator** (#107-complex) — like
+    /// [`add_edge`](Self::add_edge), but the access check is `can_collaborate` (owner OR
+    /// shared-by-email) instead of owner-only, and the two endpoints' assignment-into-THIS-
+    /// topology is not otherwise re-verified here (matches `add_edge`'s existing contract:
+    /// it wires whatever ids are given, real enforcement of "does this edge authorize a real
+    /// channel" lives entirely in `authorized_channels`/`topology_authorizes`).
+    pub fn add_edge_collab(
+        &self,
+        subject: &str,
+        subject_email: Option<&str>,
+        topology: &str,
+        a: &str,
+        b: &str,
+    ) -> rusqlite::Result<bool> {
+        if a == b {
+            return Ok(false);
+        }
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let conn = self.conn.lock_safe();
+        if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "INSERT OR IGNORE INTO topology_edges (topology, a, b) VALUES (?1, ?2, ?3)",
+            params![topology, a, b],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Remove an edge on behalf of a topology **owner or collaborator** (#107-complex) — the
+    /// `add_edge_collab` counterpart to [`remove_edge`](Self::remove_edge).
+    pub fn remove_edge_collab(
+        &self,
+        subject: &str,
+        subject_email: Option<&str>,
+        topology: &str,
+        a: &str,
+        b: &str,
+    ) -> rusqlite::Result<bool> {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let conn = self.conn.lock_safe();
+        if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "DELETE FROM topology_edges WHERE topology = ?1 AND a = ?2 AND b = ?3",
+            params![topology, a, b],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Attach (`Some`) or clear (`None`) an edge's explicit **channel id** (#107-complex link
+    /// info) — owner-or-collaborator scoped like `add_edge_collab`. Does not validate that
+    /// `channel_id` is a real, existing channel or that the caller owns/is a member of it —
+    /// that validation belongs to the HTTP layer (service.rs), which has `SqliteChannelStore`
+    /// in scope; this method's job is purely "is the caller allowed to edit this topology's
+    /// edges." Purely informational either way (see the `channel_id` column's own doc
+    /// comment) — never a new authorization path.
+    pub fn set_edge_channel(
+        &self,
+        subject: &str,
+        subject_email: Option<&str>,
+        topology: &str,
+        a: &str,
+        b: &str,
+        channel_id: Option<[u8; 32]>,
+    ) -> rusqlite::Result<bool> {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let conn = self.conn.lock_safe();
+        if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "UPDATE topology_edges SET channel_id = ?4 WHERE topology = ?1 AND a = ?2 AND b = ?3",
+            params![topology, a, b, channel_id.map(|c| c.to_vec())],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether `topology` is shared with `email` (#107-complex) — the raw existence check a
+    /// non-owner subject's OWN view-access check needs; unlike `shares_for` this is NOT
+    /// owner-scoped (the caller here is the invitee checking their own access, not the
+    /// owner browsing their share list).
+    pub fn is_shared_with(&self, topology: &str, email: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM topology_shares WHERE topology = ?1 AND email = ?2",
+                params![topology, email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Share `topology` with `email` (#107-complex) — owner-scoped, idempotent, case-
+    /// insensitive e-mail (matches `channel_allowlist`'s convention). `false` (no-op) if the
+    /// caller doesn't own `topology`.
+    pub fn share_add(&self, owner: &str, topology: &str, email: &str, now: i64) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        if !Self::owns_topology(&conn, owner, topology)? {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO topology_shares (topology, email, added_by, added_at) VALUES (?1, ?2, ?3, ?4)",
+            params![topology, email.to_ascii_lowercase(), owner, now],
+        )?;
+        Ok(true)
+    }
+
+    /// De-list `email` from `topology`'s share list (#107-complex) — owner-scoped. Returns
+    /// whether a row was actually removed.
+    pub fn share_remove(&self, owner: &str, topology: &str, email: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        if !Self::owns_topology(&conn, owner, topology)? {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "DELETE FROM topology_shares WHERE topology = ?1 AND email = ?2",
+            params![topology, email.to_ascii_lowercase()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The e-mails `topology` is currently shared with (#107-complex) — owner-scoped
+    /// (empty for a non-owner, never another owner's share list).
+    pub fn shares_for(&self, owner: &str, topology: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock_safe();
+        if !Self::owns_topology(&conn, owner, topology)? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT email FROM topology_shares WHERE topology = ?1 ORDER BY email",
+        )?;
+        let emails = stmt
+            .query_map(params![topology], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(emails)
+    }
+
+    /// Every topology shared with `email` (#107-complex) — deliberately NOT owner-scoped
+    /// (keyed on the INVITEE's own verified e-mail), the "topologies shared with me" portal
+    /// view's data source, mirroring `SqliteChannelStore::channels_for_email`.
+    pub fn topologies_shared_with_email(&self, email: &str) -> rusqlite::Result<Vec<crate::topology::Topology>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.owner, t.net_uuid FROM topologies t
+             JOIN topology_shares s ON s.topology = t.id
+             WHERE s.email = ?1 ORDER BY t.id",
+        )?;
+        let rows = stmt
+            .query_map(params![email.to_ascii_lowercase()], |r| {
+                Ok(Self::row_to_topology(r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 }
 

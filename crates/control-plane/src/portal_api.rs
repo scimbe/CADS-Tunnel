@@ -1170,24 +1170,31 @@ fn topologies_html() -> String {
 <p class="help">Compose overlay networks by assigning agents and wiring links in the
 <strong>Topology Editor</strong> -- a draggable node graph. A topology authorizes real
 channel admission only once bound to an operator key (see the editor's own hint for that
-step).</p>
+step). Share a topology (from inside its editor) with another Keycloak account's e-mail
+to compose it together -- they wire in their own agents, never yours.</p>
 <button id="newtopo" class="btn">New topology</button>
 <span id="msg" class="help"></span>
+<h2>Owned by you</h2>
 <div id="list" class="help">Loading…</div>
+<h2>Shared with you</h2>
+<div id="sharedlist" class="help">Loading…</div>
 <script>
 (function(){
- var list=document.getElementById('list'),msg=document.getElementById('msg');
+ var list=document.getElementById('list'),shared=document.getElementById('sharedlist'),msg=document.getElementById('msg');
  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
  function say(t){if(msg)msg.textContent=t;}
- function render(items){
-  if(!items.length){list.innerHTML='<p class="help">No topologies yet -- create one to start composing an overlay.</p>';return;}
-  list.innerHTML=items.map(function(t){
+ function rows(items){
+  return items.map(function(t){
    return '<div class="row"><span class="v"><code>'+esc(t.id)+'</code></span>'
         + '<span><a class="btn sec" href="/me/topologies/'+encodeURIComponent(t.id)+'/editor">Open editor</a></span></div>';
   }).join('');
  }
  fetch('/me/topologies').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
-  .then(render).catch(function(s){list.textContent='';say('could not load topologies ('+s+')');});
+  .then(function(items){list.innerHTML=items.length?rows(items):'<p class="help">No topologies yet -- create one to start composing an overlay.</p>';})
+  .catch(function(s){list.textContent='';say('could not load topologies ('+s+')');});
+ fetch('/me/topologies/shared').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+  .then(function(items){shared.innerHTML=items.length?rows(items):'<p class="help">Nothing shared with you yet -- ask the owner to share by your account\'s e-mail.</p>';})
+  .catch(function(s){shared.textContent='';say('could not load shared topologies ('+s+')');});
  var btn=document.getElementById('newtopo');
  if(btn){btn.addEventListener('click',function(){
   say('creating…');
@@ -2805,5 +2812,8 @@ mod tests {
         // /me/topologies* API -- proves it targets that endpoint, not a dead/placeholder one.
         assert!(body.contains("/me/topologies"));
         assert!(body.contains("New topology"));
+        // #107-complex: both "owned" and "shared with me" sections are present.
+        assert!(body.contains("/me/topologies/shared"), "fetches the shared-with-me listing too");
+        assert!(body.contains("Shared with you"));
     }
 }
