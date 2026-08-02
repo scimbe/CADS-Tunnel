@@ -12,7 +12,17 @@ ed25519-dalek = "2"
 snow = "0.9"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["io-util", "sync", "macros", "time"] }
+
+# WASM-in-browser spike (video conferencing): ct-common has no direct getrandom
+# dependency, but ed25519-dalek/rand/snow pull it in transitively for key
+# generation and Noise nonces. getrandom's wasm32-unknown-unknown backend is
+# opt-in (it must call into the browser's crypto.getRandomValues() via
+# wasm-bindgen, not a syscall) -- enabling the "js" feature here, scoped to the
+# wasm32 target only, activates that backend without touching native builds at
+# all (this line is inert -- zero effect -- for every non-wasm32 target).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 # `test-util` enables tokio's paused clock for the #269 idle-timeout tests
