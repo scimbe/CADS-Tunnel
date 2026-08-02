@@ -1102,6 +1102,25 @@ pub async fn serve_connection(
             send.finish()?;
             Ok(None)
         }
+        b'W' => {
+            // Reflexive-address echo (STUN-like, "whoami"): no token, no admission
+            // check, no state mutation. quinn already knows the caller's real UDP
+            // source address for THIS connection (`conn.remote_address()`) — this
+            // just tells the caller what it is, so a DCUtR-punching channel member
+            // can seed its candidate pool with a GENUINE UDP-observed reflexive
+            // address instead of blindly reusing one observed over a different
+            // transport (the :443 relay-gate's TCP admission), which a NAT maps to
+            // a different external port and made the QUIC direct-dial upgrade
+            // consistently fail (#248/#238). Safe unauthenticated: it reveals only
+            // the caller's own already-known public address and offers no proxy/
+            // relay capability to abuse, unlike an open relay.
+            let addr = conn.remote_address().to_string();
+            let ab = addr.as_bytes();
+            send.write_all(&[ab.len() as u8]).await?;
+            send.write_all(ab).await?;
+            send.finish()?;
+            Ok(None)
+        }
         b'R' => {
             // #27 RB3: authenticated revoke — `'R' | admin_token(32) | routing_token(32)`.
             // The control plane calls this when a customer revokes a tunnel; the
@@ -2447,6 +2466,49 @@ mod tests {
         // Keep the stalling client end alive until after the read resolves, so the read
         // times out rather than seeing an EOF.
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn whoami_echoes_the_callers_real_quic_observed_address() {
+        // #248/#238: 'W' is the stateless reflexive-address echo a DCUtR-punching
+        // channel member queries to learn its GENUINE UDP-observed address,
+        // instead of blindly reusing one observed over the :443 TCP relay-gate
+        // admission (a different NAT mapping). No token, no admission gate --
+        // proves the response matches the connection's own real remote_address(),
+        // and that it works with no prior 'A'/'C' handshake on this connection.
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let state_srv = state.clone();
+        let server_task = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let result = serve_connection(&conn, &state_srv, &challenge).await;
+            assert!(result.is_ok(), "'W' is not an 'A' registration -> Ok(None)");
+            // Wait for the client to finish reading + close, rather than dropping
+            // `conn` (and tearing down the QUIC connection) the instant this
+            // function returns -- the response bytes are already on the wire, but
+            // an immediate drop can race the client's read of them.
+            conn.closed().await;
+        });
+
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"W").await.unwrap();
+        send.finish().unwrap();
+        let mut len = [0u8; 1];
+        recv.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; len[0] as usize];
+        recv.read_exact(&mut buf).await.unwrap();
+        let reported: std::net::SocketAddr = std::str::from_utf8(&buf).unwrap().parse().unwrap();
+
+        // The server observed the client connecting from 127.0.0.1:<ephemeral port> --
+        // the exact loopback-address family this in-process test actually dials from.
+        assert_eq!(reported.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        conn.close(0u32.into(), b"done");
+        let _ = server_task.await;
     }
 
     #[tokio::test]
