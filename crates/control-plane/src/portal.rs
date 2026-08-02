@@ -199,7 +199,7 @@ impl PortalOidc {
             .map(|h| format!("&login_hint={}", urlencode(h)))
             .unwrap_or_default();
         format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}{}{}",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}{}{}&ui_locales=en",
             base,
             urlencode(&self.client_id),
             urlencode(&self.redirect_uri),

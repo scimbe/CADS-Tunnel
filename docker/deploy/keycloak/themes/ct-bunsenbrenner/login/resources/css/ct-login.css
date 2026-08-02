@@ -34,12 +34,20 @@ body,
   font-size: 1.5rem;
 }
 
-/* The footer strip (social-provider section, now disabled) used to fill this
-   bar; with only "Register" left it should read as a quiet footer link, not
-   a leftover grey slab. */
+/* The actual light-grey slab is #kc-info-wrapper (not -container, which was
+   already transparent) -- base login.css leaves it a plain light background
+   meant for a white card, so on our dark card "Neuer Nutzer?"/"noAccount" sat
+   at near-zero contrast. Recolor the wrapper and its text explicitly. */
+#kc-info-wrapper,
 #kc-registration-container {
-  background: transparent;
-  padding: .75rem 0 0;
+  background: var(--ct-surface) !important;
+  border-top: 1px solid var(--ct-border);
+  padding: .9rem 0;
+}
+#kc-info,
+.login-pf-signup,
+.login-pf-page .login-pf-signup {
+  color: var(--ct-muted) !important;
 }
 
 .card-pf {

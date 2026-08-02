@@ -3134,10 +3134,14 @@ const LANDING_HTML: &str = r#"<!doctype html>
     <div class="eyebrow">Self-hosted &middot; end-to-end encrypted</div>
     <h1>Better homemade ideas.</h1>
     <p class="lede">
-     Run it on whatever you already have — a laptop, a Raspberry Pi, a spare VM, your own AI agent — and
-     it's live at a real, encrypted HTTPS address. No open ports to configure. No public IP to buy. One
-     device is enough to start; combine several later when one idea needs more than one pair of hands.
-     Nobody, including us, sees what's actually flowing through the connection.
+     But bunsenbrenner.org is far more than just a tunnel. It's the foundation for your decentralized
+     projects. One device is enough to start. Later, you effortlessly combine several machines once an
+     idea grows and demands more computing power.
+    </p>
+    <p class="lede">
+     Whether you're connecting distributed edge-computing nodes, orchestrating autonomous AI agents, or
+     wiring together protected microservices: you keep absolute control. Thanks to strict end-to-end
+     encryption, absolutely nobody sees what's flowing through the connection — not even us.
     </p>
 
     <form class="join" action="/portal/login" method="get">
@@ -3175,10 +3179,13 @@ const LANDING_HTML: &str = r#"<!doctype html>
      </div>
     </div>
     <div class="trust-strip">
-     <span><span class="dot"></span>Open source — audit the code yourself</span>
+     <span><span class="dot"></span>Open source (for private use) — audit the code yourself</span>
      <span><span class="dot"></span>Zero-knowledge transport</span>
      <span><span class="dot"></span>No credit card required</span>
      <span><span class="dot"></span>First tunnel live in minutes</span>
+     <span><span class="dot"></span>DSGVO</span>
+     <span><span class="dot"></span>European Service</span>
+     <span><span class="dot"></span>Focus on Standards</span>
     </div>
    </div>
   </div>
@@ -3279,7 +3286,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    runs on it. We provide secure (end-to-end encrypted) transport <em>to</em> your exposed service —
    not protection <em>of</em> the device it runs on. Keeping your own machine and code secure —
    including not introducing exploitable weaknesses through how you implement it — is your responsibility; see
-   <a href="/nutzungsbedingungen">Nutzungsbedingungen</a> §3–§5. We recommend running your service in an
+   <a href="/terms-of-use">Terms of Use</a> §3–§5. We recommend running your service in an
    isolated, containerized environment (Docker, a VM, or a Kubernetes pod) rather than directly on your
    host — that way a bug in your own code can't reach past the sandbox onto the rest of your machine.
   </div>
@@ -3433,7 +3440,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 <footer class="site-footer">
  <div class="footer-inner">
   <div class="foot">Operator view — structural health and metadata only; the payload is end-to-end encrypted and never visible here.</div>
-  <div class="legal-links"><a href="/impressum">Impressum</a><a href="/datenschutz">Datenschutzerklärung</a><a href="/nutzungsbedingungen">Nutzungsbedingungen</a></div>
+  <div class="legal-links"><a href="/legal-notice">Legal Notice</a><a href="/privacy-policy">Privacy Policy</a><a href="/terms-of-use">Terms of Use</a></div>
   <div class="copyright">&copy; Bunsenbrenner.org — Martin Becke</div>
  </div>
 </footer>
@@ -3660,7 +3667,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 </script>
 <div class="cookie-notice" id="cookie-notice">
  <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
- analytics, no marketing cookies. See the <a href="/datenschutz">Datenschutzerklärung</a>.</span>
+ analytics, no marketing cookies. See the <a href="/privacy-policy">Privacy Policy</a>.</span>
  <button onclick="document.getElementById('cookie-notice').classList.remove('show');localStorage.setItem('ct-cookie-notice-seen','1')">Got it</button>
 </div>
 <script>
@@ -3690,6 +3697,13 @@ const DATENSCHUTZ_HTML: &str = include_str!("../../../docs/legal/datenschutz.htm
 /// own workflow-pipelines/services as its own; each user is solely responsible for (and indemnifies
 /// the operator against third-party claims arising from) their own service run through the platform.
 const NUTZUNGSBEDINGUNGEN_HTML: &str = include_str!("../../../docs/legal/nutzungsbedingungen.html");
+
+/// English courtesy translations of the three legal pages above (the site itself is English-first;
+/// German remains the legally binding version for each, per its own translation notice). Kept as
+/// separate files rather than templated from the German source so each stays independently reviewable.
+const LEGAL_NOTICE_HTML: &str = include_str!("../../../docs/legal/legal-notice.html");
+const PRIVACY_POLICY_HTML: &str = include_str!("../../../docs/legal/privacy-policy.html");
+const TERMS_OF_USE_HTML: &str = include_str!("../../../docs/legal/terms-of-use.html");
 
 /// The downloadable "hello world" starter template (register → download → adapt with Claude Code →
 /// publish), zipped so a human onboarding on the landing page gets it with one click instead of
@@ -3744,6 +3758,9 @@ pub fn landing_router() -> Router {
             "/nutzungsbedingungen",
             get(|| async { axum::response::Html(NUTZUNGSBEDINGUNGEN_HTML) }),
         )
+        .route("/legal-notice", get(|| async { axum::response::Html(LEGAL_NOTICE_HTML) }))
+        .route("/privacy-policy", get(|| async { axum::response::Html(PRIVACY_POLICY_HTML) }))
+        .route("/terms-of-use", get(|| async { axum::response::Html(TERMS_OF_USE_HTML) }))
 }
 
 /// This deployment's actual mesh/channel-broker/channel-relay ports (#214 follow-up: generic
@@ -7768,12 +7785,15 @@ mod tests {
             doc.contains("AI-agent onboarding") && doc.contains("Register yourself as a discoverable agent"),
             "/llms.txt serves the onboarding doc"
         );
-        // The footer links to the three legal pages, and each actually serves (not a dead link).
+        // The footer links to the three (English) legal pages, and each actually serves
+        // (not a dead link). The German originals stay reachable at their own URLs too
+        // (checked in legal_pages_serve_real_operator_facts_not_placeholders below) but
+        // are no longer what the footer itself links to -- the site is English-first.
         assert!(
-            html.contains(r#"href="/impressum""#)
-                && html.contains(r#"href="/datenschutz""#)
-                && html.contains(r#"href="/nutzungsbedingungen""#),
-            "footer links to the legal pages"
+            html.contains(r#"href="/legal-notice""#)
+                && html.contains(r#"href="/privacy-policy""#)
+                && html.contains(r#"href="/terms-of-use""#),
+            "footer links to the English legal pages"
         );
         // The accounts stat is no longer shown on the landing page (operator request).
         assert!(!html.contains(r#"id="accounts""#), "accounts counter removed from the landing page");
@@ -7791,6 +7811,12 @@ mod tests {
             ("/impressum", vec!["Martin Becke", "Mettinger", "Neuenkirchen", "§ 19 UStG"]),
             ("/datenschutz", vec!["DSGVO", "TTDSG", "Cookies"]),
             ("/nutzungsbedingungen", vec!["Freistellung", "Nutzerdienst", "§§ 7", "TMG"]),
+            // English courtesy translations (the site is English-first) -- each still names
+            // real operator facts / statute citations, not placeholder prose, and each points
+            // back at its own German original as the legally binding version.
+            ("/legal-notice", vec!["Martin Becke", "Mettinger", "Neuenkirchen", "§ 19 UStG", "courtesy translation", "/impressum"]),
+            ("/privacy-policy", vec!["GDPR", "TTDSG", "Cookies", "courtesy translation", "/datenschutz"]),
+            ("/terms-of-use", vec!["Indemnification", "user service", "Art. 9", "TMG", "courtesy translation", "/nutzungsbedingungen"]),
             (
                 // The human "get started" onboarding now lives inline on the landing page itself.
                 // #237 redesign: the entry point is an email-first join form (login_hint into the

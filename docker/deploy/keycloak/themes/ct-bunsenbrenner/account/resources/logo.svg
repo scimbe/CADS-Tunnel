@@ -1,11 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 32" height="32" role="img" aria-label="bunsenbrenner.org">
-  <defs>
-    <linearGradient id="ctFlame" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#1f6feb"/>
-      <stop offset="1" stop-color="#79c0ff"/>
-    </linearGradient>
-  </defs>
-  <path fill="url(#ctFlame)" d="M16 2c3.4 4.6 5.2 8 5.2 11.2 0 2.9-1.8 4.8-3.6 4.8-1.4 0-2.4-1-2.4-2.3 0-1 .6-1.7 1.3-2.5-1.9.4-3.3 2.2-3.3 4.4 0 2.8 2.3 5.1 5.1 5.1 3.6 0 6.7-2.9 6.7-7.4C25 10.4 21.6 5.4 16 2z"/>
-  <path fill="#58a6ff" opacity=".55" d="M13.6 9.6c1.6 2.3 2.4 4 2.4 5.5 0 1.6-1 2.6-2.1 2.6-.9 0-1.5-.6-1.5-1.4 0-.6.3-1 .8-1.5-1.1.2-1.9 1.2-1.9 2.4 0 1.6 1.3 2.9 2.9 2.9 2 0 3.7-1.6 3.7-4.1 0-2.4-1.7-4.9-4.3-6.4z"/>
-  <text x="34" y="22" font-family="Segoe UI, system-ui, sans-serif" font-size="15" font-weight="600" letter-spacing=".2" fill="#e6edf3">bunsenbrenner<tspan fill="#58a6ff">.org</tspan></text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 172 32" height="32" role="img" aria-label="Bunsenbrenner.org">
+  <!-- Matches the portal's own .brand mark exactly: a soft amber dot (--accent:#d98a4f,
+       glow rgba(217,138,79,.22)) + bold serif "Bunsenbrenner" (--text:#eef1f7) + muted
+       ".org" (--muted:#8a93ad), see service.rs .brand/.flame/.tld. -->
+  <circle cx="10" cy="16" r="4.5" fill="#d98a4f"/>
+  <circle cx="10" cy="16" r="7.5" fill="none" stroke="#d98a4f" stroke-opacity=".22" stroke-width="6"/>
+  <text x="26" y="21" font-family="ui-serif, Georgia, 'Iowan Old Style', 'Palatino Linotype', serif" font-size="17" font-weight="700" letter-spacing="-.2" fill="#eef1f7">Bunsenbrenner<tspan fill="#8a93ad" font-weight="400"> .org</tspan></text>
 </svg>
