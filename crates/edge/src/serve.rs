@@ -2245,6 +2245,38 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         }
     }
 
+    // Video-conferencing feature: a browser has no raw UDP/QUIC and no TLS-ALPN
+    // control of its own, so it can't reach either broker above. This is the
+    // browser-reachable entry point instead -- a plain WebSocket listener bridging
+    // into the identical channel_broker admission/pairing/relay core (see
+    // ws_channel.rs's module doc for the full design). Opt-in, same convention as
+    // the brokers above: only when the listen addr + CP URL + admin token are set.
+    if let (Some(ws_listen), Some(cp_url), Some(admin_tok)) = (
+        std::env::var("CT_EDGE_WS_CHANNEL_LISTEN").ok().filter(|s| !s.is_empty()),
+        std::env::var("CT_EDGE_CP_URL").ok().filter(|s| !s.is_empty()),
+        std::env::var("CT_EDGE_ADMIN_TOKEN")
+            .ok()
+            .and_then(|s| parse_admin_token_hex(&s)),
+    ) {
+        match ws_listen.parse::<std::net::SocketAddr>() {
+            Ok(ws_addr) => {
+                let resolver: std::sync::Arc<dyn ChannelMemberResolver> = std::sync::Arc::new(
+                    crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok),
+                );
+                eprintln!(
+                    "ct-edge: browser (WebSocket) Agent-Fabric channel listener on {ws_addr} \
+                     (authorize via {cp_url})"
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = crate::ws_channel::serve_ws_channel(ws_addr, resolver).await {
+                        eprintln!("ct-edge: ws-channel listener on {ws_addr} ended: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("ct-edge: invalid CT_EDGE_WS_CHANNEL_LISTEN '{ws_listen}': {e}"),
+        }
+    }
+
     // QUIC accept loop (primary).
     while let Some(incoming) = endpoint.accept().await {
         // #86 SEC86b: when a connection cap is configured and full, shed this

@@ -22,7 +22,12 @@ zeroize = "1"
 # via rustls; the `pem` feature enables the PemObject decoders used in transport.rs.
 rustls-pki-types = { version = "1", features = ["std", "alloc"] }
 rand = "0.8"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+# Bridges axum's WebSocket (a Stream+Sink of framed Messages) into a plain
+# AsyncRead+AsyncWrite byte stream for the browser channel-join listener
+# (ws_channel.rs), so it can feed the same channel_broker core every other
+# transport uses.
+futures-util = "0.3"
 # #81 SEC81c-c c-ii: the edge queries the control plane's channel-authorize endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,3 +41,8 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 ed25519-dalek = "2"
 serde_json = "1"
+# ws_channel.rs's end-to-end test: real WebSocket clients (not the axum handler side --
+# tokio-tungstenite's own client, driving a real TCP connection against a real bound
+# listener) proving two browser-shaped members actually admit, pair, and relay through
+# the new listener, not just that the server-side plumbing compiles.
+tokio-tungstenite = "0.24"
