@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/agent-tools",
+    "crates/agent-wasm",
     "crates/edge",
     "crates/control-plane",
     "crates/client",
