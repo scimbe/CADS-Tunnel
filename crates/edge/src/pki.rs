@@ -16,6 +16,7 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use zeroize::Zeroize;
 
 use crate::transport::install_crypto_provider;
 
@@ -54,6 +55,19 @@ fn edge_server_transport() -> Result<Arc<quinn::TransportConfig>, BoxError> {
 pub struct Ca {
     cert: rcgen::Certificate,
     key: KeyPair,
+}
+
+/// #278: without this, `key`'s serialized DER (the root-of-trust private key,
+/// valid across restarts since it's persisted to disk) sits in freed-but-not-
+/// cleared heap after `Ca` is dropped -- recoverable from a core dump, a
+/// same-UID `/proc/<pid>/mem` read, or swap, until the memory happens to be
+/// reallocated and overwritten. `rcgen`'s `zeroize` feature (already a
+/// workspace dependency via `ct-common`) makes `KeyPair::zeroize()` clear that
+/// buffer; nothing does so automatically on drop, so `Ca` must call it itself.
+impl Drop for Ca {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 /// Write `bytes` to `path`, restricting the file to owner read/write (0600) on
