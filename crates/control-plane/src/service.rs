@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::{AccountId, LedgerError};
 use crate::enrollment::{EnrollError, JoinToken};
+use crate::oidc::OidcVerifierHandle;
+#[cfg(test)]
 use crate::oidc::OidcVerifier;
 use crate::payment::{PaymentError, PaymentId};
 use crate::payment_provider::WebhookVerifier;
@@ -743,7 +745,7 @@ const ISSUE_WINDOW_SECS: u64 = 60;
 #[derive(Clone)]
 pub struct AuthedState {
     ledger: Arc<SqliteLedger>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
     /// Caps `/me/issue` requests per authenticated subject per fixed window, so
     /// a single account cannot exhaust the control plane with issuance calls.
     issue_limiter: Arc<Mutex<KeyedRateLimiter<String>>>,
@@ -759,7 +761,7 @@ pub struct AuthedState {
 ///   the per-subject rate limit of `max_issues_per_window` per fixed window)
 pub fn authed_billing_router(
     ledger: Arc<SqliteLedger>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
     max_issues_per_window: u32,
 ) -> Router {
     Router::new()
@@ -779,7 +781,7 @@ pub fn authed_billing_router(
 #[derive(Clone)]
 pub struct AuthedChannelState {
     channels: Arc<SqliteChannelStore>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 }
 
 /// Build the **authenticated** Agent-Fabric channel-registry router (#81 SEC81c-b):
@@ -799,7 +801,7 @@ pub struct AuthedChannelState {
 /// * `POST /me/channels/:channel/allowlist/:email/remove` → de-list an email (owner-scoped)
 pub fn authed_channel_router(
     channels: Arc<SqliteChannelStore>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 ) -> Router {
     Router::new()
         .route("/me/channels", post(channel_register))
@@ -825,7 +827,7 @@ pub fn authed_channel_router(
 #[derive(Clone)]
 pub struct AuthedNetworkState {
     networks: Arc<SqliteNetworkStore>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 }
 
 /// Build the **authenticated** declarative-network router (#102-rest): the REST surface
@@ -840,7 +842,7 @@ pub struct AuthedNetworkState {
 ///   compiles to ([`Network::desired_channels`]) — what the controller would establish.
 pub fn authed_network_router(
     networks: Arc<SqliteNetworkStore>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 ) -> Router {
     Router::new()
         .route("/me/networks/:id", put(network_put).get(network_get))
@@ -907,7 +909,7 @@ async fn network_plan(
 #[derive(Clone)]
 pub struct AuthedTopologyState {
     topologies: Arc<SqliteTopologyStore>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 }
 
 /// Build the **authenticated** Topology Editor router (#107-rest): compose an overlay by
@@ -923,7 +925,7 @@ pub struct AuthedTopologyState {
 /// * `POST /me/topologies/:id/edges` `{a, b}` → wire an undirected edge
 pub fn authed_topology_router(
     topologies: Arc<SqliteTopologyStore>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 ) -> Router {
     Router::new()
         .route("/me/topologies", post(topology_create).get(topology_list))
@@ -1114,7 +1116,7 @@ async fn pipeline_get(
 #[derive(Clone)]
 struct AuthedPipelineState {
     registry: Arc<SqlitePipelineRegistry>,
-    verifier: Arc<OidcVerifier>,
+    verifier: OidcVerifierHandle,
 }
 
 /// `POST /me/pipelines` `{spec}` → publish (owner = verified subject); `403` if the id
@@ -1131,7 +1133,7 @@ struct AuthedPipelineState {
 /// same way `/me/channels` did: owner = the caller's verified OIDC subject, no shared
 /// secret required. The admin-gated `/registry/pipelines` stays mounted unchanged for
 /// operator/back-compat use (e.g. scripted publishes without an interactive login).
-pub fn authed_pipeline_router(registry: Arc<SqlitePipelineRegistry>, verifier: Arc<OidcVerifier>) -> Router {
+pub fn authed_pipeline_router(registry: Arc<SqlitePipelineRegistry>, verifier: OidcVerifierHandle) -> Router {
     Router::new()
         .route("/me/pipelines", post(me_pipeline_publish))
         .with_state(AuthedPipelineState { registry, verifier })
@@ -2312,13 +2314,25 @@ async fn channel_invite_redeem(
     }
 }
 
-/// Extract + verify the `Authorization: Bearer` token against `verifier`,
-/// returning the authenticated subject. Shared by every self-scoped endpoint so
-/// the acting identity always comes from a verified token, never the request body.
+/// Extract + verify the `Authorization: Bearer` token against `handle`'s current
+/// verifier, returning the authenticated subject. Shared by every self-scoped
+/// endpoint so the acting identity always comes from a verified token, never the
+/// request body.
+///
+/// #328: `/me/*` routers are always mounted now (no more boot-time
+/// present-or-absent decision), so "no verifier installed yet" is a real,
+/// distinct state from "bad/missing token" -- surfaced as `503` (retry later,
+/// the background refresh may still bring it up) rather than `401` (this
+/// specific request's credentials are the problem) or the old, indistinguishable
+/// `404` (route not found at all).
 fn subject_of(
-    verifier: &OidcVerifier,
+    handle: &OidcVerifierHandle,
     headers: &HeaderMap,
 ) -> Result<String, (StatusCode, String)> {
+    let verifier = handle.get().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "OIDC verifier not yet available -- a background refresh is retrying; check /status's oidc_enabled (#328)".to_string(),
+    ))?;
     let token = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -2456,14 +2470,13 @@ pub struct StatusState {
     /// (#17). Falls back to the registry count if the scrape fails or is unset.
     edge_metrics_url: Option<String>,
     http: reqwest::Client,
-    /// #328: whether the boot-time OIDC verifier actually came up, surfaced here so
-    /// "the realm's JWKS had no usable RS256 key after retrying -- /me/* disabled"
-    /// is *observable* (an operator/monitor can poll `/status`) instead of only
-    /// ever visible in process logs at the exact moment of boot. `CT_OIDC_ISSUER`
-    /// unset entirely also reports `false` here -- deliberately: from the outside,
-    /// "OIDC not configured" and "OIDC configured but failed to initialize" both
-    /// mean the exact same thing for `/me/*`'s availability.
-    oidc_enabled: bool,
+    /// #328: a live handle, not a boot-time snapshot -- `oidc.is_ready()` reflects
+    /// the CURRENT state, so a background refresh task healing a failed boot-time
+    /// fetch becomes visible on `/status` within one poll, no restart needed.
+    /// `CT_OIDC_ISSUER` unset entirely also reads not-ready here -- deliberately:
+    /// from the outside, "OIDC not configured" and "OIDC configured but not
+    /// available yet" both mean the exact same thing for `/me/*`'s availability.
+    oidc: OidcVerifierHandle,
 }
 
 /// Aggregated operator status — health plus metadata counts the operator
@@ -2504,7 +2517,7 @@ pub fn status_router(
     agent_directory: Arc<SqliteAgentDirectory>,
     pipeline_registry: Arc<SqlitePipelineRegistry>,
     edge_metrics_url: Option<String>,
-    oidc_enabled: bool,
+    oidc: OidcVerifierHandle,
 ) -> Router {
     Router::new().route("/status", get(status_handler)).with_state(StatusState {
         enrollment,
@@ -2515,7 +2528,7 @@ pub fn status_router(
         started: std::time::Instant::now(),
         edge_metrics_url,
         http: reqwest::Client::new(),
-        oidc_enabled,
+        oidc,
     })
 }
 
@@ -2529,7 +2542,7 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
         accounts: s.ledger.account_count().unwrap_or(0),
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
         uptime_seconds: s.started.elapsed().as_secs(),
-        oidc_enabled: s.oidc_enabled,
+        oidc_enabled: s.oidc.is_ready(),
     })
 }
 
@@ -3632,8 +3645,13 @@ pub fn persistent_control_plane_router(
     db_path: &str,
     webhook_secret: &[u8],
     session_key: &[u8],
-    oidc: Option<Arc<OidcVerifier>>,
+    oidc: OidcVerifierHandle,
 ) -> rusqlite::Result<Router> {
+    // #328: `/me/*` used to be conditionally *mounted* based on whether `oidc` was
+    // `Some` at this exact call -- a boot-time-only decision. It's now always a
+    // handle, mounted unconditionally below; readiness is a per-request check
+    // against the handle instead, which is what lets a background refresh task
+    // (main.rs) heal a failed boot without a restart.
     let enrollment = Arc::new(SqliteEnrollment::open(db_path)?);
     let registry = Arc::new(SqliteRegistry::open(db_path)?);
     let ledger = Arc::new(SqliteLedger::open(db_path)?);
@@ -3753,7 +3771,7 @@ pub fn persistent_control_plane_router(
         std::env::var("CT_CP_EDGE_METRICS_URL")
             .ok()
             .filter(|u| !u.is_empty()),
-        oidc.is_some(),
+        oidc.clone(),
     );
     // Publish the edge CA root (#11): read from the path the edge writes it to,
     // co-located on the central host (CT_CP_EDGE_CERT_PATH, default matches the
@@ -3907,9 +3925,14 @@ pub fn persistent_control_plane_router(
             // #327: the Edge's boot-time revoked-tokens fetch.
             .merge(internal_revoked_tokens_router(tunnels.clone(), admin_tok));
     }
-    // Authenticated per-subject endpoints (`/me/*`) — mounted only when an OIDC
-    // verifier is configured (M26.1). Without one they are simply absent (404).
-    if let Some(oidc) = oidc {
+    // Authenticated per-subject endpoints (`/me/*`) (M26.1). #328: always mounted
+    // now, regardless of whether a verifier is installed yet -- each handler
+    // checks `oidc`'s current readiness per-request via `subject_of`, returning
+    // `503` (not `404`) while unready. This is what lets a background refresh
+    // task in main.rs heal a failed boot-time JWKS fetch without a restart: the
+    // SAME `OidcVerifierHandle` clone captured here keeps observing later
+    // `set()` calls for this process's entire lifetime.
+    {
         // #102-rest: the declarative-network REST surface (owner = verified subject).
         let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
         app = app
@@ -5010,7 +5033,7 @@ mod tests {
         // E2E restart test legitimately drives them (open_account / buy_token) to prove billing
         // persists across a restart, so mount the OPEN (ungated) writers here against the SAME db —
         // test-only, and no route conflict since the production router mounts none without a token.
-        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", None)
+        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", OidcVerifierHandle::empty())
             .unwrap()
             .merge(billing_writers_gated(std::sync::Arc::new(SqliteLedger::open(db_path).unwrap()), None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5058,7 +5081,8 @@ mod tests {
 
         let db = temp_db_path();
         let oidc = Some(Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct")));
-        let app = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", oidc).unwrap();
+        let app =
+            persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::from(oidc)).unwrap();
         let resp = app
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
@@ -5069,7 +5093,7 @@ mod tests {
 
         // Without an OIDC verifier the public search is STILL mounted (#161): it is a public,
         // machine-facing surface, not part of the authed `/me/*` set that OIDC gates.
-        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", None).unwrap();
+        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let still = no_oidc
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
@@ -5144,7 +5168,7 @@ mod tests {
         let account = ledger.account_for_subject("user-1").unwrap();
         ledger.credit(&account, 5).unwrap();
 
-        let app = authed_billing_router(ledger.clone(), verifier, 100);
+        let app = authed_billing_router(ledger.clone(), OidcVerifierHandle::new(Some(verifier)), 100);
 
         // No token -> 401.
         let resp = app
@@ -5190,6 +5214,99 @@ mod tests {
         );
     }
 
+    /// #328: before this fix, an unavailable OIDC verifier meant the `/me/*`
+    /// routers were never mounted at all -- an unavailable-vs-nonexistent route
+    /// was indistinguishable, both surfacing as `404`. Routers are now always
+    /// mounted against a handle; a request while the verifier isn't installed
+    /// yet must get a clear `503`, and a later `set()` (what the background
+    /// self-heal task does) must make the SAME already-built router start
+    /// authenticating requests with zero rebuild/reconnect.
+    #[tokio::test]
+    async fn authed_router_returns_503_while_unready_then_self_heals_once_the_handle_is_set() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let account = ledger.account_for_subject("user-1").unwrap();
+        ledger.credit(&account, 5).unwrap();
+
+        let handle = OidcVerifierHandle::empty();
+        assert!(!handle.is_ready());
+        let app = authed_billing_router(ledger.clone(), handle.clone(), 100);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "user-1", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        // Even a genuinely valid-looking bearer token can't be checked yet -- 503, not
+        // 401 (401 would wrongly imply "this specific token is bad") and not 404 (the
+        // route DOES exist, mounted unconditionally now).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/me/issue")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"price":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "verifier not installed yet -> 503, not 404/401");
+
+        // The background self-heal task's only action: set() on the SAME handle the
+        // already-built router closed over.
+        handle.set(Arc::new(OidcVerifier::from_hs_secret(secret, issuer)));
+        assert!(handle.is_ready());
+
+        let resp = app
+            .oneshot(
+                Request::post("/me/issue")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"price":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "#328: the same router self-heals once the handle is set, no restart/rebuild");
+    }
+
+    /// #328: `/status`'s `oidc_enabled` must track the handle live, not a
+    /// boot-time snapshot -- otherwise the whole point of self-healing (an
+    /// operator/monitor observing recovery without restarting the process) is
+    /// lost even though the routes themselves did recover.
+    #[tokio::test]
+    async fn status_oidc_enabled_reflects_the_live_handle_not_a_boot_time_snapshot() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let registry = Arc::new(SqliteRegistry::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let agent_directory = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+        let handle = OidcVerifierHandle::empty();
+
+        let app = status_router(enrollment, registry, ledger, agent_directory, pipeline_registry, None, handle.clone());
+
+        let get_oidc_enabled = |app: Router| async {
+            let resp = app.oneshot(Request::get("/status").body(Body::empty()).unwrap()).await.unwrap();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<StatusResp>(&body).unwrap().oidc_enabled
+        };
+        assert!(!get_oidc_enabled(app.clone()).await, "not ready yet");
+
+        handle.set(Arc::new(OidcVerifier::from_hs_secret(b"s", "https://kc/realms/ct")));
+        assert!(get_oidc_enabled(app).await, "#328: reflects the self-heal live, without rebuilding the router");
+    }
+
     #[tokio::test]
     async fn authed_network_api_is_owner_scoped_and_plans_from_the_policy() {
         // #102-rest: PUT/GET /me/networks/:id is subject-scoped; /plan returns the
@@ -5205,7 +5322,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let networks = Arc::new(SqliteNetworkStore::open_in_memory().unwrap());
-        let app = authed_network_router(networks, verifier);
+        let app = authed_network_router(networks, OidcVerifierHandle::new(Some(verifier)));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -5317,7 +5434,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let networks = Arc::new(SqliteNetworkStore::open_in_memory().unwrap());
-        let app = authed_network_router(networks, verifier);
+        let app = authed_network_router(networks, OidcVerifierHandle::new(Some(verifier)));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
@@ -5357,7 +5474,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
-        let app = authed_topology_router(topologies, verifier);
+        let app = authed_topology_router(topologies, OidcVerifierHandle::new(Some(verifier)));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -5887,7 +6004,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let reg = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = authed_pipeline_router(reg.clone(), verifier);
+        let app = authed_pipeline_router(reg.clone(), OidcVerifierHandle::new(Some(verifier)));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -6014,7 +6131,7 @@ mod tests {
         let acct = ledger.account_for_subject("user-1").unwrap();
         ledger.credit(&acct, 2).unwrap();
         // Cap issuance at 2 per window for each subject.
-        let app = authed_billing_router(ledger, verifier, 2);
+        let app = authed_billing_router(ledger, OidcVerifierHandle::new(Some(verifier)), 2);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6071,7 +6188,7 @@ mod tests {
         let acct = ledger.account_for_subject("payer").unwrap();
         ledger.credit(&acct, 5).unwrap();
         let probe = ledger.clone();
-        let app = authed_billing_router(ledger, verifier, 100);
+        let app = authed_billing_router(ledger, OidcVerifierHandle::new(Some(verifier)), 100);
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let claims = serde_json::json!({ "sub": "payer", "iss": issuer, "exp": now + 3600 });
@@ -6121,7 +6238,7 @@ mod tests {
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let probe = channels.clone();
-        let app = authed_channel_router(channels, verifier);
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -6272,7 +6389,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = authed_channel_router(channels, verifier);
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -6606,7 +6723,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let app =
-            persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", Some(oidc)).unwrap();
+            persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc))).unwrap();
 
         // Without a bearer token the mounted endpoint rejects with 401 (not 404).
         let resp = app
@@ -6653,7 +6770,7 @@ mod tests {
         let secret = b"realm-secret";
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", Some(oidc)).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc))).unwrap();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6687,21 +6804,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_router_omits_authed_endpoints_without_oidc() {
+    async fn production_router_serves_authed_endpoints_as_503_without_oidc() {
+        // #328: /me/* used to not be mounted at all without a boot-time OIDC verifier
+        // (404 -- indistinguishable from a route that plain doesn't exist). It's now
+        // always mounted, so an unconfigured/unavailable verifier reads 503 (the
+        // route exists, but can't authenticate you right now) -- and, unlike a 404,
+        // it can recover to 401/200 without a restart the moment a background retry
+        // (or, in this constructed test, an explicit `set()`) installs a verifier.
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
 
-        // With no OIDC verifier configured, /me/* is not mounted at all -> 404.
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let handle = OidcVerifierHandle::empty();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", handle.clone()).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/me/account").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authed endpoints are mounted but unavailable when OIDC is unconfigured"
+        );
+
+        handle.set(Arc::new(OidcVerifier::from_hs_secret(b"s", "https://kc/realms/ct")));
         let resp = app
             .oneshot(Request::get("/me/account").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::NOT_FOUND,
-            "authed endpoints absent when OIDC is unconfigured"
+            StatusCode::UNAUTHORIZED,
+            "#328: the same already-built production router recovers to normal auth behavior once the handle is set"
         );
     }
 
@@ -6717,7 +6852,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"the-webhook-secret", b"the-session-key", None).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"the-webhook-secret", b"the-session-key", OidcVerifierHandle::empty()).unwrap();
 
         // A cookie forged with the webhook secret (what an attacker who only
         // learned THAT secret could produce) is rejected -> bounced to /portal.
@@ -6757,7 +6892,7 @@ mod tests {
         // The unified production router must not expose the M18 stub endpoint —
         // credits come only from the signed webhook (proven crediting-side by
         // unified_control_plane_survives_restart).
-        let app = persistent_control_plane_router(":memory:", b"whsec_prod", b"test-session-key", None).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_prod", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp = app
             .oneshot(
                 Request::post("/payment/confirm")
@@ -6781,7 +6916,7 @@ mod tests {
         use tower::ServiceExt;
 
         // The full production router serves the landing page at `/`.
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp = app
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
@@ -6827,7 +6962,7 @@ mod tests {
         // #194: fail closed — with no CT_CP_EDGE_ADMIN_TOKEN set (unset in the test env → admin_token
         // = None), the unauthenticated client-supplied-account billing writer must NOT be served;
         // /billing/issue is absent (404), not an open account-debit endpoint.
-        let app_b = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let app_b = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp_b = app_b
             .oneshot(
                 Request::post("/billing/issue")
@@ -6867,7 +7002,7 @@ mod tests {
             "links to the project's Buy Me a Coffee page"
         );
         // /publish still redirects (old links / bookmarks keep working) to the merged section.
-        let app_pub = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let app_pub = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp_pub = app_pub.oneshot(Request::get("/publish").body(Body::empty()).unwrap()).await.unwrap();
         assert!(resp_pub.status().is_redirection(), "/publish redirects, got {}", resp_pub.status());
         assert_eq!(
@@ -6876,7 +7011,7 @@ mod tests {
             "/publish redirects into the merged landing-page section"
         );
         // The starter template is a real, downloadable zip (not a 404, not HTML).
-        let app_zip = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let app_zip = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp_zip = app_zip
             .oneshot(Request::get("/downloads/hello-world-pipeline.zip").body(Body::empty()).unwrap())
             .await
@@ -6898,7 +7033,7 @@ mod tests {
         let zip_bytes = to_bytes(resp_zip.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&zip_bytes[..2], b"PK", "serves a real zip archive (PK magic bytes)");
         // The read-it-yourself template guide actually serves (not a dead link).
-        let app_guide = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let app_guide = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp_guide = app_guide
             .oneshot(Request::get("/template-guide").body(Body::empty()).unwrap())
             .await
@@ -6910,7 +7045,7 @@ mod tests {
             guide_html.contains("pipeline-spec.json") && guide_html.contains(".env"),
             "the template guide explains the file structure and the .env identity file"
         );
-        let app2 = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+        let app2 = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
         let ct2 = resp2.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -6961,7 +7096,7 @@ mod tests {
                 ],
             ),
         ] {
-            let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", None).unwrap();
+            let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
             let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{path} should serve");
             let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -7050,7 +7185,15 @@ mod tests {
             )
             .unwrap();
 
-        let app = status_router(enrollment, registry, ledger, agent_directory, pipeline_registry, None, false);
+        let app = status_router(
+            enrollment,
+            registry,
+            ledger,
+            agent_directory,
+            pipeline_registry,
+            None,
+            OidcVerifierHandle::empty(),
+        );
         let resp = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
             .await
@@ -7112,7 +7255,7 @@ mod tests {
             Arc::new(SqliteAgentDirectory::open_in_memory().unwrap()),
             Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap()),
             Some(format!("http://{addr}/metrics")),
-            true,
+            OidcVerifierHandle::from(Some(Arc::new(OidcVerifier::from_hs_secret(b"s", "https://kc/realms/ct")))),
         );
         let resp = app
             .oneshot(Request::get("/status").body(Body::empty()).unwrap())
@@ -7134,7 +7277,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"whsec_health", b"test-session-key", None).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_health", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
 
         let health = app
             .clone()

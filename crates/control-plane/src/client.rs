@@ -561,7 +561,7 @@ mod tests {
     /// token as a Status(401).
     #[tokio::test]
     async fn client_registers_a_channel_against_the_authed_service() {
-        use crate::oidc::OidcVerifier;
+        use crate::oidc::{OidcVerifier, OidcVerifierHandle};
         use crate::service::authed_channel_router;
         use crate::storage::SqliteChannelStore;
         use ct_common::channel::ChannelId;
@@ -573,7 +573,7 @@ mod tests {
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let probe = channels.clone();
-        let app = authed_channel_router(channels, verifier);
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
