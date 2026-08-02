@@ -1970,6 +1970,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 Some(cap) => match cap.try_admit() {
                                     Some(p) => Some(p),
                                     None => {
+                                        // #119's shed path previously left no trace anywhere in
+                                        // the edge's own logs -- indistinguishable, from here,
+                                        // from any other closed socket. A client sees this as a
+                                        // bare TCP-connect-then-EOF with no TLS bytes exchanged
+                                        // at all (the ClientHello it sends lands on an already-
+                                        // dropped socket), which is otherwise easy to misdiagnose
+                                        // as a TLS-layer bug rather than "the cap is full". Log
+                                        // occasionally (powers of two, then every 1000) so a
+                                        // sustained shed streak is visible without spamming
+                                        // stdout under a real flood -- the shed itself stays as
+                                        // cheap as before, this is just a counter + rare eprintln.
+                                        let total = cap.note_shed();
+                                        if total.is_power_of_two() || total % 1000 == 0 {
+                                            eprintln!(
+                                                "ct-edge: :443 front door shedding — CT_EDGE_MAX_CONNECTIONS cap full, {total} connection(s) shed since start"
+                                            );
+                                        }
                                         drop(tcp); // shed: over the cap, close cheaply
                                         continue;
                                     }
