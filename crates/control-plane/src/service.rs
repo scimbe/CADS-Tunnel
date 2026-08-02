@@ -910,6 +910,12 @@ async fn network_plan(
 pub struct AuthedTopologyState {
     topologies: Arc<SqliteTopologyStore>,
     verifier: OidcVerifierHandle,
+    /// #237-follow: the portal session-cookie signing key, so the Topology Editor's own
+    /// client-side JS (which authenticates via the ambient portal session cookie, not a
+    /// bearer token it has no way to hold) can actually drive these endpoints. See
+    /// [`subject_of_topology`]'s doc comment for why accepting either is not a
+    /// scope-widening.
+    session_key: Arc<[u8]>,
 }
 
 /// Build the **authenticated** Topology Editor router (#107-rest): compose an overlay by
@@ -926,6 +932,7 @@ pub struct AuthedTopologyState {
 pub fn authed_topology_router(
     topologies: Arc<SqliteTopologyStore>,
     verifier: OidcVerifierHandle,
+    session_key: Arc<[u8]>,
 ) -> Router {
     Router::new()
         .route("/me/topologies", post(topology_create).get(topology_list))
@@ -936,7 +943,7 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
         .route("/me/topologies/:id/edges", post(topology_add_edge).delete(topology_remove_edge))
-        .with_state(AuthedTopologyState { topologies, verifier })
+        .with_state(AuthedTopologyState { topologies, verifier, session_key })
 }
 
 /// State for the searchable agent directory (#144 ②): the store + the shared
@@ -1260,7 +1267,7 @@ async fn topology_create(
     State(state): State<AuthedTopologyState>,
     headers: HeaderMap,
 ) -> Result<Json<TopologyCreatedResp>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     // Generate a unique (id, net_uuid); retry the negligible collision a few times.
     for _ in 0..4 {
         let id = gen_hex_id();
@@ -1286,7 +1293,7 @@ async fn topology_list(
     State(state): State<AuthedTopologyState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<TopologySummary>>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let list = state
         .topologies
         .list_topologies(&owner)
@@ -1329,7 +1336,7 @@ async fn topology_view(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<TopologyView>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let t = owned_topology(&state, &owner, &id)?;
     let agents = state
         .topologies
@@ -1359,7 +1366,7 @@ async fn topology_set_mode(
     Path(id): Path<String>,
     Json(req): Json<ModeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let mode = ct_common::overlay::RoutingApproach::parse(&req.mode)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     // Owner isolation: a topology the subject doesn't own is a 404 (never a 403).
@@ -1385,7 +1392,7 @@ async fn topology_editor(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let t = owned_topology(&state, &owner, &id)?;
     let agents = state
         .topologies
@@ -1451,7 +1458,7 @@ async fn topology_suggest(
     Json(req): Json<SuggestReq>,
 ) -> Result<Json<SuggestResp>, (StatusCode, String)> {
     use ct_common::overlay::RoutingApproach;
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let t = owned_topology(&state, &owner, &id)?;
     let mode = state
         .topologies
@@ -1507,7 +1514,7 @@ async fn topology_assign(
     Path(id): Path<String>,
     Json(req): Json<AssignReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     // The caller must own the topology it is assigning into.
     owned_topology(&state, &owner, &id)?;
     state.topologies.assign(&owner, &req.agent, &id).map_err(|e| {
@@ -1535,7 +1542,7 @@ async fn topology_add_edge(
     Path(id): Path<String>,
     Json(req): Json<EdgeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let added = state
         .topologies
         .add_edge(&owner, &id, &req.a, &req.b)
@@ -1558,7 +1565,7 @@ async fn topology_remove_edge(
     Path(id): Path<String>,
     Json(req): Json<EdgeReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let removed = state
         .topologies
         .remove_edge(&owner, &id, &req.a, &req.b)
@@ -1596,7 +1603,7 @@ async fn topology_set_operator(
     Path(id): Path<String>,
     Json(req): Json<OperatorBindReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
     let operator_pubkey = hex_decode_32(&req.operator_pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "operator_pubkey must be 64 hex chars".to_string()))?;
     let proof = hex_decode_64(&req.proof)
@@ -2341,6 +2348,32 @@ fn subject_of(
     verifier
         .subject(token)
         .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))
+}
+
+/// #237-follow: resolve the acting subject for the Topology Editor's owner-scoped
+/// endpoints from EITHER a valid portal session cookie OR a valid OIDC bearer token,
+/// whichever is present -- tried in that order. The editor page's own client-side JS
+/// (`EDITOR_JS`'s `fetch()` calls for mode/suggest/agents/edges) authenticates the only
+/// way a browser page can: via the ambient session cookie the portal login flow already
+/// set, not a bearer token it has no way to hold. Before this, `GET .../editor` alone
+/// required a header no real portal session ever carries, and even manually supplying one
+/// wouldn't have helped: the page's own fetch() calls send cookies, never an Authorization
+/// header, so the editor was fully unreachable/inert for an actual logged-in user.
+///
+/// This is not a scope-widening: both paths resolve to the exact same "subject" identity
+/// concept the topology store's ownership model already keys every operation on, and the
+/// portal session cookie is itself minted only after a real OIDC login (`portal_callback`)
+/// -- accepting it here is accepting the SAME verified identity via its second, browser-
+/// native delivery mechanism, not a weaker check.
+fn subject_of_topology(
+    session_key: &[u8],
+    verifier: &OidcVerifierHandle,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(claims) = crate::portal::session_claims_for(session_key, headers) {
+        return Ok(claims.subject);
+    }
+    subject_of(verifier, headers)
 }
 
 /// Extract + verify the bearer token, returning the authenticated subject.
@@ -3893,6 +3926,10 @@ pub fn persistent_control_plane_router(
             // same session key as the portal login above, so a claim just works right
             // after a portal login with no separate auth step.
             .merge(crate::portal_api::channel_claim_router(session_key, channels.clone()))
+            // #237-follow: the Topology Editor's portal discoverability shell — same
+            // session key, so the editor (already dual-auth via subject_of_topology)
+            // is reachable and linked from the portal nav, not just a bare URL.
+            .merge(crate::portal_api::topology_portal_router(session_key))
         })
         .merge(pki)
         // /install.sh + /install.ps1 now just redirect to ct-agent's own setup
@@ -3942,7 +3979,7 @@ pub fn persistent_control_plane_router(
                 AUTHED_ISSUES_PER_WINDOW,
             ))
             .merge(authed_network_router(networks, oidc.clone()))
-            .merge(authed_topology_router(topologies.clone(), oidc.clone()))
+            .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key)))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc.clone()))
@@ -5474,7 +5511,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
-        let app = authed_topology_router(topologies, OidcVerifierHandle::new(Some(verifier)));
+        let app = authed_topology_router(topologies, OidcVerifierHandle::new(Some(verifier)), Arc::from(b"test-session-key".as_slice()));
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -5691,6 +5728,88 @@ mod tests {
         let list = send("GET", "/me/topologies".into(), Some(&mallory), String::new()).await.unwrap();
         let body = to_bytes(list.into_body(), 1 << 16).await.unwrap();
         assert_eq!(serde_json::from_slice::<Vec<TopologySummary>>(&body).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn authed_topology_router_also_accepts_a_portal_session_cookie_with_no_bearer_token_237() {
+        // #237-follow: the Topology Editor's own client-side JS (EDITOR_JS) authenticates via
+        // the ambient portal session cookie a real browser carries -- it never has a bearer
+        // token to attach. Before this fix, GET/POST/PUT to every one of these routes
+        // required Authorization: Bearer, which a real portal session never sends, making the
+        // editor fully unreachable/inert for an actual logged-in user. This proves the whole
+        // create -> assign -> edge -> view -> editor -> mode flow works via ONLY a session
+        // cookie, no bearer token anywhere in the request.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let app = authed_topology_router(topologies, OidcVerifierHandle::new(Some(verifier)), Arc::from(session_key));
+
+        let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
+        let send = |method: &str, path: String, body: String| {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(&path)
+                        .header("content-type", "application/json")
+                        .header("cookie", alice_cookie.clone())
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+        };
+
+        // No cookie AND no bearer -> still refused (the fallback bearer path's own 401).
+        let bare = app
+            .clone()
+            .oneshot(Request::post("/me/topologies").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED, "neither a session cookie nor a bearer token -> refused");
+
+        let created = send("POST", "/me/topologies".into(), String::new()).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK, "session-cookie-only create succeeds");
+        let body = to_bytes(created.into_body(), 1 << 16).await.unwrap();
+        let created: TopologyCreatedResp = serde_json::from_slice(&body).unwrap();
+        let tid = created.id;
+
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/agents"), r#"{"agent":"agent-a"}"#.into()).await.unwrap().status(),
+            StatusCode::OK,
+            "session-cookie-only assign succeeds"
+        );
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/agents"), r#"{"agent":"agent-b"}"#.into()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send("POST", format!("/me/topologies/{tid}/edges"), r#"{"a":"agent-a","b":"agent-b"}"#.into())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "session-cookie-only edge wiring succeeds"
+        );
+
+        let view = send("GET", format!("/me/topologies/{tid}"), String::new()).await.unwrap();
+        assert_eq!(view.status(), StatusCode::OK);
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        let view: TopologyView = serde_json::from_slice(&body).unwrap();
+        assert_eq!(view.agents.len(), 2);
+        assert_eq!(view.edges.len(), 1);
+
+        // The actual editor PAGE itself -- what a real browser navigates to -- also renders
+        // via the session cookie alone.
+        let editor = send("GET", format!("/me/topologies/{tid}/editor"), String::new()).await.unwrap();
+        assert_eq!(editor.status(), StatusCode::OK, "the editor page itself is reachable via the session cookie");
+        let editor_body = to_bytes(editor.into_body(), 1 << 16).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&editor_body).contains("Topology Editor"),
+            "renders the real editor page, not an error"
+        );
     }
 
     #[test]
