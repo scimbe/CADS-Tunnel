@@ -44,11 +44,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
           target/release/quic_echo target/release/direct_bench \
           target/release/ct-crew-bridge target/release/ct-cookbook-bridge /build/bin/
 
-FROM debian:bookworm-slim AS runtime
-# iproute2 for tc/netem inside the node containers; ca-certificates is harmless.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+# Shared non-root setup both runtime stages below apply identically -- kept as one
+# place so the uid/gid convention (#305) can never drift between them.
+FROM debian:bookworm-slim AS runtime-base
+RUN groupadd -g 65532 ctuser && useradd -u 65532 -g 65532 -M -s /usr/sbin/nologin ctuser
 COPY --from=builder /build/bin/ct-edge /usr/local/bin/ct-edge
 COPY --from=builder /build/bin/ct-client /usr/local/bin/ct-client
 COPY --from=builder /build/bin/ct-control-plane /usr/local/bin/ct-control-plane
@@ -61,6 +60,30 @@ COPY --from=builder /build/bin/direct_bench /usr/local/bin/direct_bench
 COPY --from=builder /build/bin/ct-crew-bridge /usr/local/bin/ct-crew-bridge
 # #201 cookbook-demo crew: the HTTP bridge for /cookbook/build.
 COPY --from=builder /build/bin/ct-cookbook-bridge /usr/local/bin/ct-cookbook-bridge
+
+# #315: the real production/self-host image -- ca-certificates + curl only, no
+# iproute2/iptables. Not the default target (see `runtime` below, which stays the
+# default so every existing testbed compose file keeps working unchanged) --
+# `docker/deploy/compose.selfhost.yml` opts into this explicitly via `target:
+# production`. #305's non-root posture applies equally here.
+FROM runtime-base AS production
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+USER 65532:65532
+CMD ["ct-edge"]
+
+# The default target (must stay LAST in this file -- `docker build`/`docker compose
+# build` with no `--target`/`target:` picks whichever stage is textually last).
+# Every existing testbed/netem compose file (docker-compose.baseline.yml,
+# docker-compose.tcp.yml, docker-compose.yml) builds without specifying a target and
+# genuinely needs `tc`/`iptables` for network-emulation tests -- this stage is
+# unchanged from before #315 so none of them need to change.
+FROM runtime-base AS runtime
+# iproute2 for tc/netem inside the node containers; ca-certificates is harmless.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
 COPY docker/netem-entrypoint.sh /usr/local/bin/netem-entrypoint.sh
 RUN chmod +x /usr/local/bin/netem-entrypoint.sh
 # #305: run as non-root by default -- matches the k8s base's runAsNonRoot/
@@ -76,10 +99,10 @@ RUN chmod +x /usr/local/bin/netem-entrypoint.sh
 # NET_ADMIN to actually configure netfilter -- netem-entrypoint.sh already
 # tolerates that gracefully (`tc ... || echo "... failed (need NET_ADMIN)"`)
 # for the (test-only) compose overlays that invoke it; production self-host
-# never does. A test topology that genuinely needs netem to apply (not just
-# degrade gracefully) can override with `user: root` / `cap_add: [NET_ADMIN]`
-# on that specific service -- this default only changes the default, not what's
-# possible to opt back into for testing.
-RUN groupadd -g 65532 ctuser && useradd -u 65532 -g 65532 -M -s /usr/sbin/nologin ctuser
+# never does (it now uses the `production` target above, which never ships these
+# binaries at all -- #315). A test topology that genuinely needs netem to apply
+# (not just degrade gracefully) can override with `user: root` /
+# `cap_add: [NET_ADMIN]` on that specific service -- this default only changes the
+# default, not what's possible to opt back into for testing.
 USER 65532:65532
 CMD ["ct-edge"]

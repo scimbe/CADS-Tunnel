@@ -16,6 +16,12 @@ services:
     build:
       context: ../..
       dockerfile: docker/Dockerfile
+      # #315: the slim self-host runtime -- no iproute2/iptables in the image at
+      # all (unlike the default `runtime` target, which every testbed/netem
+      # compose file still needs and keeps getting unchanged). edge below shares
+      # this same built image/tag, so it gets the slim target too without its own
+      # build block.
+      target: production
     image: ct-testbed
     command: ["ct-control-plane"]
     # #305: run as non-root (matches the image's own USER 65532:65532 default,
