@@ -1944,7 +1944,7 @@ header.bar{display:flex;align-items:center;flex-wrap:wrap;gap:.9rem;padding:.7re
 .stage{flex:1;min-height:0}
 svg.canvas{width:100%;height:100%;display:block;touch-action:none;background:var(--bg)}
 .dot{fill:var(--line);opacity:.55}
-.edge{fill:none;stroke:var(--edge);stroke-width:2;stroke-linecap:round;opacity:.9}
+.edge{fill:none;stroke:var(--edge);stroke-width:3;stroke-linecap:round;opacity:.9}
 .node{cursor:grab}.node:active{cursor:grabbing}
 .node .card{fill:var(--node);stroke:var(--nodeln);stroke-width:1}
 .node:hover .card,.node:focus .card{stroke:var(--accent2)}
