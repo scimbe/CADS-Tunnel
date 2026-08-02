@@ -36,8 +36,64 @@ use axum::{Json, Router};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::{open_tuned, sqlite_store_ctors};
+use crate::storage::{ensure_column, open_tuned, sqlite_store_ctors};
 use ct_common::sync::MutexExt;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+/// #287: the domain-separated preimage an edge signs to prove it controls the identity
+/// key bound to `id` — see [`SqliteEdgeMesh::heartbeat`]'s doc comment for the full TOFU
+/// design this closes a real spoofing gap with. Binds `id` AND `peer_addr` (not just `id`)
+/// so a captured signature over one `peer_addr` can't be replayed to claim a different one
+/// for the same, legitimately-owned `id`.
+pub fn edge_heartbeat_signing_bytes(id: &str, peer_addr: &str) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"ct-edge-mesh-heartbeat-v1";
+    let mut m = Vec::with_capacity(DOMAIN.len() + 8 + id.len() + peer_addr.len());
+    m.extend_from_slice(DOMAIN);
+    m.extend_from_slice(&(id.len() as u64).to_le_bytes());
+    m.extend_from_slice(id.as_bytes());
+    m.extend_from_slice(peer_addr.as_bytes());
+    m
+}
+
+/// Verify `sig` is `pubkey`'s ed25519 signature over
+/// [`edge_heartbeat_signing_bytes`]`(id, peer_addr)`. `false` on a malformed pubkey, not a
+/// panic — a garbage 32 bytes must never be treated as "verification succeeded."
+fn verify_heartbeat_proof(pubkey: &[u8; 32], sig: &[u8; 64], id: &str, peer_addr: &str) -> bool {
+    match VerifyingKey::from_bytes(pubkey) {
+        Ok(vk) => vk.verify(&edge_heartbeat_signing_bytes(id, peer_addr), &Signature::from_bytes(sig)).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
+    if s.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
 
 /// #285: liveness window for [`SqliteEdgeMesh::lookup_by_token`]/[`SqliteEdgeMesh::lookup_by_host`]
 /// -- an edge that hasn't heartbeated within this many seconds is treated as dead for ownership
@@ -73,21 +129,80 @@ impl SqliteEdgeMesh {
              CREATE INDEX IF NOT EXISTS idx_mesh_ownership_hostname
                  ON mesh_ownership (hostname);",
         )?;
+        // #287: additive (#44 pattern) — a pre-existing self-host DB gains this column on
+        // upgrade. NULL means "no identity key bound yet" (a legacy or not-yet-upgraded
+        // edge), preserving today's exact behavior for anyone not yet presenting a key.
+        ensure_column(&conn, "mesh_edges", "pubkey", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// An edge announces itself: `id` reachable at `peer_addr` (the address a
-    /// *peer* edge would use for mesh-relay, not the public listener).
-    /// Upserts so repeated heartbeats just bump `last_seen`.
-    pub fn heartbeat(&self, id: &str, peer_addr: &str, now: i64) -> rusqlite::Result<()> {
-        self.conn.lock_safe().execute(
-            "INSERT INTO mesh_edges (id, peer_addr, last_seen) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET peer_addr = excluded.peer_addr, last_seen = excluded.last_seen",
-            params![id, peer_addr, now],
+    /// An edge announces itself: `id` reachable at `peer_addr` (the address a *peer* edge
+    /// would use for mesh-relay, not the public listener) — with an OPTIONAL identity
+    /// `proof`: the edge's ed25519 public key + its signature over
+    /// [`edge_heartbeat_signing_bytes`]`(id, peer_addr)`, proving it controls the private
+    /// half.
+    ///
+    /// **#287: closes a real spoofing gap.** Before this, `id` was a bare client-supplied
+    /// string authorized only by the shared admin token every edge holds — any edge (or
+    /// anything else holding that token) could heartbeat with `id = "edge-1"` (a different,
+    /// real edge's id) and silently clobber its `peer_addr`, redirecting mesh-relay traffic
+    /// intended for that edge to the attacker instead.
+    ///
+    /// **Trust-on-first-use, per `id`**: the FIRST heartbeat for a given `id` that presents
+    /// a valid `proof` binds that pubkey to `id` (`Ok(true)`, recorded). Every SUBSEQUENT
+    /// heartbeat for that `id` — whether or not the proof is presented — is checked against
+    /// the bound key: a missing proof, a different pubkey, or a signature that doesn't
+    /// verify are all rejected (`Ok(false)`, `peer_addr`/`last_seen` left untouched) rather
+    /// than silently upserted. An `id` with NO bound key yet (never presented a proof, the
+    /// legacy/today's-only path) keeps behaving exactly as before this fix — accepted
+    /// unconditionally — so a single-edge or not-yet-upgraded deployment is unaffected;
+    /// this only closes the gap for an id that has actually claimed a key.
+    pub fn heartbeat(
+        &self,
+        id: &str,
+        peer_addr: &str,
+        proof: Option<(&[u8; 32], &[u8; 64])>,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let existing_pubkey: Option<String> = conn
+            .query_row("SELECT pubkey FROM mesh_edges WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let proof_pubkey_hex = proof.map(|(pk, _)| hex_encode(pk));
+
+        if let Some(bound_hex) = &existing_pubkey {
+            // A key is already bound to this id: every heartbeat must present a proof
+            // verifying under THAT SAME key. Anything else is a rejected impersonation
+            // attempt (or a downgrade attempt), not a silent overwrite.
+            let verifies = match (proof, proof_pubkey_hex.as_deref()) {
+                (Some((pk, sig)), Some(presented_hex)) if presented_hex == bound_hex => {
+                    verify_heartbeat_proof(pk, sig, id, peer_addr)
+                }
+                _ => false,
+            };
+            if !verifies {
+                return Ok(false);
+            }
+        } else if let Some((pk, sig)) = proof {
+            // No key bound yet: a presented proof must at least verify against ITSELF
+            // before we trust-on-first-use bind it — a malformed/garbage signature must
+            // never get recorded as this id's now-permanent identity.
+            if !verify_heartbeat_proof(pk, sig, id, peer_addr) {
+                return Ok(false);
+            }
+        }
+        // Either no key was ever bound and none is presented now (legacy path, unchanged
+        // behavior), or the presented proof verified against the bound/about-to-be-bound key.
+        conn.execute(
+            "INSERT INTO mesh_edges (id, peer_addr, last_seen, pubkey) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET peer_addr = excluded.peer_addr, last_seen = excluded.last_seen,
+                 pubkey = COALESCE(mesh_edges.pubkey, excluded.pubkey)",
+            params![id, peer_addr, now, proof_pubkey_hex],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Delete `mesh_edges` rows that haven't heartbeated since `since` (#290
@@ -273,6 +388,16 @@ impl EdgeMeshHandle {
 struct HeartbeatBody {
     id: String,
     peer_addr: String,
+    /// #287: this edge's ed25519 public identity key (64-hex), optional for backward
+    /// compatibility with a not-yet-upgraded edge. Present together with `signature` or
+    /// not at all — one without the other is treated as no proof presented.
+    #[serde(default)]
+    pubkey: Option<String>,
+    /// #287: this edge's signature (128-hex) over
+    /// `edge_heartbeat_signing_bytes(id, peer_addr)`, proving possession of `pubkey`'s
+    /// private half.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -312,10 +437,31 @@ async fn heartbeat(
     Json(body): Json<HeartbeatBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     crate::service::require_admin(&headers, &st.admin_token, "edge heartbeat requires the admin token")?;
-    st.store
-        .heartbeat(&body.id, &body.peer_addr, now_secs())
+    // #287: a pubkey/signature present but not valid 64/128-hex is a malformed proof, not
+    // "no proof" -- reject outright rather than silently treating it as an unkeyed
+    // heartbeat (which would let a malformed-on-purpose request bypass a bound key's check
+    // by masquerading as a legacy no-proof caller).
+    let proof = match (body.pubkey.as_deref(), body.signature.as_deref()) {
+        (Some(pk_hex), Some(sig_hex)) => {
+            let pk = hex_decode_32(pk_hex).ok_or((StatusCode::BAD_REQUEST, "pubkey must be 64 hex chars".to_string()))?;
+            let sig = hex_decode_64(sig_hex).ok_or((StatusCode::BAD_REQUEST, "signature must be 128 hex chars".to_string()))?;
+            Some((pk, sig))
+        }
+        (None, None) => None,
+        _ => return Err((StatusCode::BAD_REQUEST, "pubkey and signature must be presented together".to_string())),
+    };
+    let accepted = st
+        .store
+        .heartbeat(&body.id, &body.peer_addr, proof.as_ref().map(|(pk, sig)| (pk, sig)), now_secs())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(StatusCode::OK)
+    if accepted {
+        Ok(StatusCode::OK)
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "heartbeat rejected: this id has a bound identity key and the presented proof did not verify against it (#287)".to_string(),
+        ))
+    }
 }
 
 async fn lookup(
@@ -371,7 +517,18 @@ mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use ed25519_dalek::{Signer, SigningKey};
     use tower::ServiceExt;
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn sign_heartbeat(sk: &SigningKey, id: &str, peer_addr: &str) -> (String, String) {
+        let pk_hex = hex_encode(sk.verifying_key().as_bytes());
+        let sig = sk.sign(&edge_heartbeat_signing_bytes(id, peer_addr));
+        (pk_hex, hex_encode(&sig.to_bytes()))
+    }
 
     fn store() -> Arc<SqliteEdgeMesh> {
         Arc::new(SqliteEdgeMesh::open_in_memory().unwrap())
@@ -387,8 +544,8 @@ mod tests {
     fn assign_edge_balances_across_live_edges_by_current_load() {
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
-        s.heartbeat("edge-2", "10.0.0.2:4437", now).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
+        s.heartbeat("edge-2", "10.0.0.2:4437", None, now).unwrap();
         // edge-1 already has 3 tunnels, edge-2 has 0 -> new ones go to edge-2.
         for i in 0..3 {
             s.record_ownership(&format!("tok{i}"), None, "edge-1", now).unwrap();
@@ -400,22 +557,146 @@ mod tests {
     fn assign_edge_ignores_stale_edges() {
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-1", "10.0.0.1:4437", now - 600).unwrap(); // stale
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now - 600).unwrap(); // stale
         assert_eq!(s.assign_edge("edge-1", now - 60).unwrap(), "edge-1", "falls back to default, not the stale edge");
+    }
+
+    // #287: TOFU identity binding on SqliteEdgeMesh::heartbeat.
+
+    #[test]
+    fn unkeyed_heartbeats_remain_unaffected_for_backward_compatibility() {
+        let s = store();
+        let now = now_secs();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap(), "no proof presented, no key ever bound -> accepted");
+        assert!(s.heartbeat("edge-1", "10.0.0.2:4437", None, now + 1).unwrap(), "still unbound -> a later unkeyed heartbeat can move the peer_addr");
+    }
+
+    #[test]
+    fn first_keyed_heartbeat_binds_the_key_for_that_id() {
+        let s = store();
+        let now = now_secs();
+        let sk = signing_key(1);
+        let (pk_hex, sig_hex) = sign_heartbeat(&sk, "edge-1", "10.0.0.1:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", Some((&pk, &sig)), now).unwrap(), "first proof for this id binds the key");
+    }
+
+    #[test]
+    fn subsequent_heartbeat_with_the_bound_key_is_accepted_and_updates_peer_addr() {
+        let s = store();
+        let now = now_secs();
+        let sk = signing_key(2);
+        let (pk_hex, sig_hex) = sign_heartbeat(&sk, "edge-1", "10.0.0.1:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", Some((&pk, &sig)), now).unwrap());
+
+        let (pk_hex2, sig_hex2) = sign_heartbeat(&sk, "edge-1", "10.0.0.9:4437");
+        let pk2 = hex_decode_32(&pk_hex2).unwrap();
+        let sig2 = hex_decode_64(&sig_hex2).unwrap();
+        assert!(
+            s.heartbeat("edge-1", "10.0.0.9:4437", Some((&pk2, &sig2)), now + 1).unwrap(),
+            "same bound key, new peer_addr -> accepted (legit edge moved/restarted)"
+        );
+        assert_eq!(s.live_edges(now).unwrap(), vec!["edge-1".to_string()]);
+    }
+
+    #[test]
+    fn heartbeat_with_a_different_key_is_rejected_once_a_key_is_bound() {
+        let s = store();
+        let now = now_secs();
+        let legit = signing_key(3);
+        let (pk_hex, sig_hex) = sign_heartbeat(&legit, "edge-1", "10.0.0.1:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", Some((&pk, &sig)), now).unwrap());
+
+        // A rogue holder of the shared admin token, but NOT edge-1's private key, tries to
+        // redirect edge-1's traffic to an attacker-controlled peer_addr (#287's exact scenario).
+        let rogue = signing_key(4);
+        let (rogue_pk_hex, rogue_sig_hex) = sign_heartbeat(&rogue, "edge-1", "6.6.6.6:4437");
+        let rogue_pk = hex_decode_32(&rogue_pk_hex).unwrap();
+        let rogue_sig = hex_decode_64(&rogue_sig_hex).unwrap();
+        assert!(
+            !s.heartbeat("edge-1", "6.6.6.6:4437", Some((&rogue_pk, &rogue_sig)), now + 1).unwrap(),
+            "different key than the one bound to edge-1 -> rejected"
+        );
+        assert_eq!(
+            s.live_edges(now).unwrap(),
+            vec!["edge-1".to_string()],
+            "sanity: edge-1 row still present"
+        );
+    }
+
+    #[test]
+    fn heartbeat_with_no_proof_is_rejected_once_a_key_is_bound() {
+        let s = store();
+        let now = now_secs();
+        let sk = signing_key(5);
+        let (pk_hex, sig_hex) = sign_heartbeat(&sk, "edge-1", "10.0.0.1:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", Some((&pk, &sig)), now).unwrap());
+
+        assert!(
+            !s.heartbeat("edge-1", "6.6.6.6:4437", None, now + 1).unwrap(),
+            "once a key is bound, an unkeyed heartbeat for the same id is rejected, not treated as legacy"
+        );
+    }
+
+    #[test]
+    fn heartbeat_with_a_signature_over_the_wrong_peer_addr_is_rejected() {
+        let s = store();
+        let now = now_secs();
+        let sk = signing_key(6);
+        let (pk_hex, sig_hex) = sign_heartbeat(&sk, "edge-1", "10.0.0.1:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", Some((&pk, &sig)), now).unwrap());
+
+        // Same bound key, but the signature was over a different peer_addr than the one now
+        // presented -- a captured signature must not be replayable to claim a new address.
+        let stale_sig_over_new_addr = sig; // signed "10.0.0.1:4437", replayed against "9.9.9.9:4437"
+        assert!(
+            !s.heartbeat("edge-1", "9.9.9.9:4437", Some((&pk, &stale_sig_over_new_addr)), now + 1).unwrap(),
+            "signature doesn't cover the presented peer_addr -> rejected"
+        );
+    }
+
+    #[test]
+    fn distinct_ids_bind_independent_keys() {
+        let s = store();
+        let now = now_secs();
+        let sk1 = signing_key(7);
+        let sk2 = signing_key(8);
+        let (pk1, sig1) = sign_heartbeat(&sk1, "edge-1", "10.0.0.1:4437");
+        let (pk2, sig2) = sign_heartbeat(&sk2, "edge-2", "10.0.0.2:4437");
+        assert!(s
+            .heartbeat("edge-1", "10.0.0.1:4437", Some((&hex_decode_32(&pk1).unwrap(), &hex_decode_64(&sig1).unwrap())), now)
+            .unwrap());
+        assert!(s
+            .heartbeat("edge-2", "10.0.0.2:4437", Some((&hex_decode_32(&pk2).unwrap(), &hex_decode_64(&sig2).unwrap())), now)
+            .unwrap());
+
+        // edge-2's key must not authorize heartbeats for edge-1.
+        assert!(!s
+            .heartbeat("edge-1", "6.6.6.6:4437", Some((&hex_decode_32(&pk2).unwrap(), &hex_decode_64(&sig2).unwrap())), now + 1)
+            .unwrap());
     }
 
     #[test]
     fn prune_stale_edges_removes_only_rows_older_than_the_cutoff_290() {
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-live", "10.0.0.1:4437", now).unwrap();
-        s.heartbeat("edge-decommissioned", "10.0.0.2:4437", now - 1_000).unwrap();
+        s.heartbeat("edge-live", "10.0.0.1:4437", None, now).unwrap();
+        s.heartbeat("edge-decommissioned", "10.0.0.2:4437", None, now - 1_000).unwrap();
 
         assert_eq!(s.prune_stale_edges(now - 500).unwrap(), 1, "exactly the decommissioned row is pruned");
         assert_eq!(s.live_edges(now - 60).unwrap(), vec!["edge-live".to_string()], "the live edge survives");
 
         // A pruned edge that heartbeats again just re-inserts, same as brand-new.
-        s.heartbeat("edge-decommissioned", "10.0.0.2:4438", now).unwrap();
+        s.heartbeat("edge-decommissioned", "10.0.0.2:4438", None, now).unwrap();
         assert_eq!(
             s.live_edges(now - 60).unwrap(),
             vec!["edge-decommissioned".to_string(), "edge-live".to_string()]
@@ -429,7 +710,7 @@ mod tests {
     fn record_and_lookup_ownership_by_token_and_host() {
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
         s.record_ownership("deadbeef", Some("app.example.com"), "edge-1", now).unwrap();
 
         let by_token = s.lookup_by_token("deadbeef").unwrap().expect("found by token");
@@ -446,7 +727,7 @@ mod tests {
     fn lookup_by_token_and_host_stop_resolving_a_dead_edges_stale_ownership_row_285() {
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
         s.record_ownership("deadbeef", Some("app.example.com"), "edge-1", now).unwrap();
 
         // Fresh heartbeat -> still resolves normally.
@@ -455,7 +736,7 @@ mod tests {
 
         // edge-1 dies without its mesh_edges row being pruned: its last heartbeat ages
         // past OWNERSHIP_LIVENESS_SECS, but mesh_ownership still points at it.
-        s.heartbeat("edge-1", "10.0.0.1:4437", now - OWNERSHIP_LIVENESS_SECS - 1).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now - OWNERSHIP_LIVENESS_SECS - 1).unwrap();
 
         assert!(
             s.lookup_by_token("deadbeef").unwrap().is_none(),
@@ -468,7 +749,7 @@ mod tests {
 
         // Once edge-1 heartbeats again (comes back, or a replacement reuses its id), the
         // same ownership row resolves again -- this isn't a permanent black hole.
-        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
         assert!(s.lookup_by_token("deadbeef").unwrap().is_some());
     }
 
@@ -491,8 +772,8 @@ mod tests {
         // its row rather than erroring or duplicating.
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
-        s.heartbeat("edge-2", "10.0.0.2:4437", now).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
+        s.heartbeat("edge-2", "10.0.0.2:4437", None, now).unwrap();
         s.record_ownership("tok", Some("app.example.com"), "edge-1", now).unwrap();
         s.record_ownership("tok", Some("app.example.com"), "edge-2", now + 1).unwrap();
         let (edge_id, peer_addr) = s.lookup_by_token("tok").unwrap().unwrap();
@@ -525,7 +806,7 @@ mod tests {
     fn remove_ownership_drops_the_row_and_is_a_no_op_on_an_unknown_token() {
         let s = store();
         let now = now_secs();
-        s.heartbeat("edge-1", "10.0.0.1:4437", now).unwrap();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
         s.record_ownership("tok", Some("app.example.com"), "edge-1", now).unwrap();
         assert!(s.lookup_by_token("tok").unwrap().is_some());
         s.remove_ownership("tok").unwrap();
@@ -536,7 +817,7 @@ mod tests {
     #[test]
     fn edge_mesh_handle_records_under_its_configured_local_edge_id_and_forgets_on_revoke() {
         let s = store();
-        s.heartbeat("primary", "10.0.0.1:4437", now_secs()).unwrap();
+        s.heartbeat("primary", "10.0.0.1:4437", None, now_secs()).unwrap();
         let handle = EdgeMeshHandle::new(s.clone(), Arc::from("primary"));
 
         handle.record("tok-a", Some("a.example.com"));
@@ -599,10 +880,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_endpoint_blocks_a_spoofed_peer_addr_redirect_once_a_key_is_bound() {
+        let (app, store) = test_router(Some([7u8; 32]));
+        let legit = signing_key(9);
+        let (pk_hex, sig_hex) = sign_heartbeat(&legit, "edge-1", "10.0.0.1:4437");
+
+        let bind = app
+            .clone()
+            .oneshot(
+                Request::post("/internal/edges/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("x-ct-admin-token", hex32(&[7u8; 32]))
+                    .body(Body::from(format!(
+                        r#"{{"id":"edge-1","peer_addr":"10.0.0.1:4437","pubkey":"{pk_hex}","signature":"{sig_hex}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bind.status(), StatusCode::OK, "first proof binds edge-1's key");
+
+        // A rogue caller holds the shared admin token but not edge-1's private key, and tries
+        // to redirect edge-1's mesh-relay traffic to an attacker-controlled address (#287).
+        let rogue = app
+            .oneshot(
+                Request::post("/internal/edges/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("x-ct-admin-token", hex32(&[7u8; 32]))
+                    .body(Body::from(r#"{"id":"edge-1","peer_addr":"6.6.6.6:4437"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rogue.status(), StatusCode::FORBIDDEN, "unkeyed heartbeat rejected once edge-1's key is bound");
+        assert_eq!(
+            store.live_edges(now_secs() - 5).unwrap(),
+            vec!["edge-1".to_string()],
+            "sanity: edge-1's row is still present; the rejected heartbeat never reached the UPDATE"
+        );
+    }
+
+    #[tokio::test]
     async fn lookup_endpoint_returns_404_for_an_unknown_token_and_200_for_a_known_one() {
         let (app, store) = test_router(None);
         store.record_ownership("deadbeef", None, "edge-1", now_secs()).unwrap();
-        store.heartbeat("edge-1", "10.0.0.1:4437", now_secs()).unwrap();
+        store.heartbeat("edge-1", "10.0.0.1:4437", None, now_secs()).unwrap();
 
         let resp = app
             .clone()
