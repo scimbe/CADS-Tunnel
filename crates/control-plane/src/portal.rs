@@ -732,14 +732,24 @@ pub(crate) fn sign_session_with_email_for_test(key: &[u8], subject: &str, email:
     sign_session_with_email(key, subject, Some(email), now + SESSION_TTL_SECS)
 }
 
-/// The session cookie: HttpOnly, Secure, SameSite=Lax, scoped to `/portal`.
+/// The session cookie: HttpOnly, Secure, SameSite=Lax.
+///
+/// #237-follow: scoped to `Path=/` (was `/portal`) so the browser actually attaches it to
+/// the Topology Editor's `/me/topologies*` requests too -- `subject_of_topology` (service.rs)
+/// checks this cookie for exactly that purpose, but a `Path=/portal`-scoped cookie is simply
+/// never sent on a request to `/me/...` at all (that's the browser's own cookie-scoping
+/// behavior, independent of any server-side auth logic) -- confirmed live: the editor page
+/// loaded fine via the cookie, but its own `fetch('/me/topologies')` calls 401'd because the
+/// cookie header was silently absent from those specific requests. Widening scope doesn't
+/// weaken anything: it's still HttpOnly + Secure + SameSite=Lax, and only `/me/*` topology
+/// handlers even look at it (every other `/me/*` router stays bearer-token-only).
 /// Set by the callback once a session is minted.
 fn session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; Path=/portal; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax")
+    format!("{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax")
 }
 
 fn cleared_session_cookie() -> String {
-    format!("{SESSION_COOKIE}=; Path=/portal; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+    format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -2037,8 +2047,11 @@ mod tests {
     fn session_cookie_carries_the_hardening_flags() {
         let c = session_cookie("tok123");
         assert!(c.starts_with("ct_portal_session=tok123;"));
-        for flag in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/portal"] {
+        for flag in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
             assert!(c.contains(flag), "cookie sets {flag}");
         }
+        // #237-follow: Path=/ specifically (not just any Path=... substring match), so the
+        // browser actually attaches this cookie to /me/topologies* requests too.
+        assert!(c.contains("Path=/;"), "scoped to the whole site, not just /portal");
     }
 }
