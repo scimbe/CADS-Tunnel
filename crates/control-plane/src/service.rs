@@ -3903,7 +3903,7 @@ pub fn persistent_control_plane_router(
         .and_then(|s| hex_decode_32(&s))
     {
         app = app
-            .merge(internal_channel_authorize_router(channels.clone(), admin_tok))
+            .merge(internal_channel_authorize_router(channels.clone(), topologies.clone(), admin_tok))
             // #327: the Edge's boot-time revoked-tokens fetch.
             .merge(internal_revoked_tokens_router(tunnels.clone(), admin_tok));
     }
@@ -3949,6 +3949,14 @@ pub fn persistent_control_plane_router(
 #[derive(Clone)]
 pub struct AdminChannelState {
     channels: Arc<SqliteChannelStore>,
+    // #235/#107-enforce (ii-b), the live-wiring the Topology Editor's own docs page names as
+    // its remaining "does not currently change how your agents actually connect" gap: consulted
+    // ADDITIVELY alongside `channels` below (never restrictively) -- an existing, unrelated
+    // channel is completely unaffected whether or not its operator happens to also have a bound
+    // topology elsewhere. `topology_authorizes` (already real, tested, and doc-commented "the
+    // gate consults it additively alongside channel-members") was simply never called by
+    // anything live before this.
+    topologies: Arc<SqliteTopologyStore>,
     admin_token: [u8; 32],
 }
 
@@ -3968,12 +3976,14 @@ fn ct_token_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 ///   → `200 {operator_pubkey}` iff member; `401` bad/missing token; `404` non-member.
 fn internal_channel_authorize_router(
     channels: Arc<SqliteChannelStore>,
+    topologies: Arc<SqliteTopologyStore>,
     admin_token: [u8; 32],
 ) -> Router {
     Router::new()
         .route("/internal/channel/authorize", post(channel_authorize))
         .with_state(AdminChannelState {
             channels,
+            topologies,
             admin_token,
         })
 }
@@ -4029,12 +4039,23 @@ async fn channel_authorize(
     // lookup here no longer starves the same small pool of async worker threads every
     // other request (including unrelated ones) depends on.
     let channels = state.channels.clone();
+    let topologies = state.topologies.clone();
     let lookup = tokio::task::spawn_blocking(move || {
         let cid = ChannelId(channel);
         let op = channels.authorize_holder(&cid, &holder)?;
+        let op = match op {
+            Some(op) => Some(op),
+            // #235/#107-enforce (ii-b): a declared topology edge is an ADDITIVE second path
+            // to authorization, consulted only when the channel-membership registry has no
+            // match -- a bound topology never removes an existing channel's authorization,
+            // it only ever ADDS one for a channel its own drawn edges name.
+            None => topologies.topology_authorizes(&cid, &holder)?,
+        };
         let Some(op) = op else { return Ok(None) };
         // Also hand back the member's attested Noise key (if registered) so the
-        // broker can deliver it to the paired peer (#72 AF4 / #100).
+        // broker can deliver it to the paired peer (#72 AF4 / #100). A topology-only
+        // authorization (no channel-store registration at all) simply has neither --
+        // AuthorizeResp already treats both as optional.
         let noise = channels.member_noise_key(&cid, &holder).ok().flatten();
         let attestation = channels.member_noise_attestation(&cid, &holder).ok().flatten();
         Ok::<_, rusqlite::Error>(Some((op, noise, attestation)))
@@ -6346,7 +6367,8 @@ mod tests {
         assert!(channels.register_channel(&ch, &op, "alice").unwrap());
         assert!(channels.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
 
-        let app = internal_channel_authorize_router(channels, admin);
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let app = internal_channel_authorize_router(channels, topologies, admin);
         let admin_hex = hex_encode(&admin);
         let wrong_hex = hex_encode(&[0u8; 32]);
         let ch_hex = hex_encode(&ch.0);
@@ -6380,6 +6402,63 @@ mod tests {
             post(Some(admin_hex), [0x44u8; 32]).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn internal_channel_authorize_additively_consults_a_bound_topologys_declared_edges() {
+        // #235/#107-enforce (ii-b): a declared topology edge is a SECOND, ADDITIVE path to
+        // channel authorization -- neither replaces nor restricts the existing
+        // channel-membership path. Exercises both halves: a topology-only holder (never
+        // registered in the channel store at all) gets authorized purely from a declared
+        // edge, and a genuinely unrelated channel/holder pair with NO topology involvement
+        // is completely unaffected by topologies existing elsewhere in the same store.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let admin = [0x7au8; 32];
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+
+        // A topology owner binds a real operator key (genuine proof-of-possession) and draws
+        // one edge between two holder-key node ids -- no channel-store registration at all.
+        let op_key = SigningKey::from_bytes(&[0x11u8; 32]);
+        let op_pub = op_key.verifying_key().to_bytes();
+        let holder_a = [0x22u8; 32];
+        let holder_b = [0x33u8; 32];
+        let tid = "t1";
+        assert!(topologies.create_topology("owner1", tid, "net1").unwrap());
+        topologies.assign("owner1", &hex_encode(&holder_a), tid).unwrap();
+        topologies.assign("owner1", &hex_encode(&holder_b), tid).unwrap();
+        assert!(topologies.add_edge("owner1", tid, &hex_encode(&holder_a), &hex_encode(&holder_b)).unwrap());
+        let proof = op_key.sign(&ct_common::channel::topology_operator_binding_bytes(tid, &op_pub)).to_bytes();
+        assert!(topologies.set_operator("owner1", tid, &op_pub, &proof).unwrap());
+        let topo_channel = ct_common::channel::channel_id_for_link(&op_pub, &holder_a, &holder_b);
+
+        let app = internal_channel_authorize_router(channels, topologies, admin);
+        let admin_hex = hex_encode(&admin);
+        let post = |channel: &ct_common::channel::ChannelId, holder: [u8; 32]| {
+            let req = Request::post("/internal/channel/authorize")
+                .header("content-type", "application/json")
+                .header("x-ct-admin-token", admin_hex.clone());
+            let body = format!(r#"{{"channel":"{}","holder":"{}"}}"#, hex_encode(&channel.0), hex_encode(&holder));
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+
+        // The topology-declared edge authorizes holder_a on the derived channel -- purely
+        // from the drawn edge, with no channel-store registration whatsoever.
+        let r = post(&topo_channel, holder_a).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "topology edge authorizes a never-registered holder");
+        let bytes = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let resp: AuthorizeResp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(resp.operator_pubkey, hex_encode(&op_pub));
+        assert_eq!(resp.noise_pubkey, None, "no channel-store registration -> no noise key to hand back");
+
+        // A genuinely unrelated (channel, holder) pair -- no edge names it -- is still a
+        // clean 404, unaffected by the topology store having OTHER real topologies in it.
+        let unrelated: ct_common::channel::ChannelId = ct_common::channel::ChannelId([0x99u8; 32]);
+        assert_eq!(post(&unrelated, [0x44u8; 32]).await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
