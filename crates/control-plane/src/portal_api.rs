@@ -346,7 +346,14 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
         return Redirect::to("/portal").into_response();
     };
     if form.confirm.trim() != "DELETE" {
-        return (StatusCode::BAD_REQUEST, "type DELETE to confirm account deletion").into_response();
+        // Belt-and-suspenders: the form's own `pattern="DELETE"` + submit-time
+        // `window.confirm()` (account_html) mean a real browser never reaches this,
+        // but a crafted/JS-disabled request shouldn't dead-end on a bare text
+        // response either -- send it back to a real page with a way out.
+        let body = r#"<h1>Confirmation text didn't match</h1>
+<p class="help">Type <code>DELETE</code> exactly to confirm account deletion.</p>
+<a class="btn sec" href="/portal/account">Back to account</a>"#;
+        return (StatusCode::BAD_REQUEST, Html(page("account deletion", body))).into_response();
     }
     let subject = claims.subject.as_str();
     let now = std::time::SystemTime::now()
@@ -1246,18 +1253,16 @@ sessions -- all handled by your identity provider, not by CADS-Tunnel itself.</p
 <p class="help">Permanently deletes every tunnel, channel, topology (including ones shared with
 you), declarative network and published pipeline this account owns -- credits are forfeited, and
 this cannot be undone.{danger_kc_note}</p>
-<form method="post" action="/portal/account/delete" id="deleteAccountForm" onsubmit="return confirmDelete(event)">
+<form method="post" action="/portal/account/delete" id="deleteAccountForm">
  <label>Type <code>DELETE</code> to confirm
-  <input type="text" name="confirm" id="confirmDelete" autocomplete="off" placeholder="DELETE" required>
+  <input type="text" name="confirm" id="confirmDelete" autocomplete="off" placeholder="DELETE" required pattern="DELETE" title="Type DELETE exactly, in capitals">
  </label>
  <button type="submit" class="danger">Delete account and all data</button>
 </form>
 <script>
- function confirmDelete(ev){{
-  var v = document.getElementById('confirmDelete').value.trim();
-  if(v !== 'DELETE'){{ ev.preventDefault(); return false; }}
-  return window.confirm('This permanently deletes all CADS-Tunnel data for this account. Continue?');
- }}
+ document.getElementById('deleteAccountForm').addEventListener('submit', function(ev){{
+  if(!window.confirm('This permanently deletes all CADS-Tunnel data for this account. Continue?')){{ ev.preventDefault(); }}
+ }});
 </script>"#,
         subject = escape(subject),
         account = escape(account_hex),
