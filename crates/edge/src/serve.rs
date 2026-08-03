@@ -1607,6 +1607,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         eprintln!("ct-edge: max {n} concurrent BrowserTunnel connections (CT_EDGE_MAX_BROWSER_TUNNEL_CONNECTIONS, #254)");
         ConnectionCap::new(n as usize)
     });
+    // Video-conferencing feature: every OTHER public listener sheds cheaply under a
+    // ConnectionCap once its own budget is exhausted -- ws_channel.rs's browser
+    // listener had none at all, an unbounded-concurrent-WS-upgrade gap (each admitted
+    // connection does real work: an ed25519 signature verification, a CP authorize
+    // round-trip). Computed here (not down where the listener itself is set up) so
+    // it's available to the metrics endpoint below too, whether or not the listener
+    // itself ends up enabled (a separate opt-in, CT_EDGE_WS_CHANNEL_LISTEN). Same
+    // opt-out convention; default matches BrowserTunnel's own reasoning (half the
+    // general cap -- public/attacker-reachable before any grant is verified).
+    let ws_channel_cap = resolve_flood_limit(
+        std::env::var("CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS").ok().as_deref(),
+        DEFAULT_MAX_CONNECTIONS / 2,
+    )
+    .map(|n| {
+        eprintln!("ct-edge: max {n} concurrent ws-channel connections (CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS)");
+        ConnectionCap::new(n as usize)
+    });
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
@@ -1727,8 +1744,9 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         match addr.parse::<SocketAddr>() {
             Ok(listen) => {
                 let mstate = state.clone();
+                let mws_channel_cap = ws_channel_cap.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::observe::serve_metrics(listen, mstate).await {
+                    if let Err(e) = crate::observe::serve_metrics(listen, mstate, mws_channel_cap).await {
                         eprintln!("ct-edge: metrics endpoint on {listen} exited: {e}");
                     }
                 });
@@ -2297,27 +2315,14 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     spawn_front_door_pairer_reaper(p.clone(), Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3), unix_now);
                     p
                 });
-                // #XXX: every OTHER public listener (QUIC, TCP-fallback, the `:443` front
-                // door, BrowserTunnel) sheds cheaply under a `ConnectionCap` once its own
-                // budget is exhausted -- this listener had none at all, an unbounded-
-                // concurrent-WS-upgrade gap (each admitted connection does real work: an
-                // ed25519 signature verification, a CP authorize round-trip). Same opt-out
-                // convention as the others (unset -> a safe default; CT_EDGE_MAX_WS_CHANNEL_
-                // CONNECTIONS=0/off disables it). Default matches BrowserTunnel's own
-                // reasoning: half of the general cap, since this is public/attacker-reachable
-                // before any grant is verified, same as that arm.
-                let ws_channel_cap = resolve_flood_limit(
-                    std::env::var("CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS").ok().as_deref(),
-                    DEFAULT_MAX_CONNECTIONS / 2,
-                )
-                .map(|n| {
-                    eprintln!("ct-edge: max {n} concurrent ws-channel connections (CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS)");
-                    ConnectionCap::new(n as usize)
-                });
+                // ws_channel_cap was resolved earlier (alongside conn_cap/browser_tunnel_cap)
+                // so it's also available to the metrics endpoint above whether or not this
+                // listener ends up enabled.
                 eprintln!(
                     "ct-edge: browser (WebSocket) Agent-Fabric channel listener on {ws_addr} \
                      (authorize via {cp_url}, cross-transport pairing with the :443 front door)"
                 );
+                let ws_channel_cap = ws_channel_cap.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
                         crate::ws_channel::serve_ws_channel_with_pairer(ws_addr, resolver, pairer, ws_channel_cap).await
