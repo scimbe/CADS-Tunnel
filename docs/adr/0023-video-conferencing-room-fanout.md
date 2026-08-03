@@ -65,7 +65,9 @@ CADS-Tunnel's own extraction commit), not in this repository.
   labeled as such, or (b) a peer-relay topology (one participant's browser forwards
   ciphertext to others it can reach, still never decrypting anyone else's leg) — neither is
   in scope now.
-- **No further core (`ct-edge`/`ct_common`/`ct-agent-wasm`) changes are required** to
-  support a room feature at the demo layer; the multi-channel concurrency this needs was
-  already exercised (single specific verification of the general property added by this
-  ADR) rather than newly built.
+- **No further core (`ct-edge`/`ct_common`) changes are required** to support a room
+  feature at the demo layer; the multi-channel concurrency this needs was already
+  exercised (single specific verification of the general property added by this ADR)
+  rather than newly built. (`ct-agent-wasm` itself has since moved to
+  [scimbe/ct-agent](https://github.com/scimbe/ct-agent)'s `wasm/` — it's `ct-agent` for
+  the browser, not CADS-Tunnel platform code; see that repo's workspace restructure.)
