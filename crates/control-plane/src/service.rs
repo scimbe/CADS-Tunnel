@@ -793,7 +793,11 @@ pub struct AuthedChannelState {
 ///
 /// * `POST /me/channels` `{channel, operator_pubkey}` → register (owner = subject); `403` if
 ///   the channel is already owned by another subject
+/// * `GET /me/channels` → list the caller's own registered channels (video-conferencing
+///   feature follow-up -- registration was write-only before this)
 /// * `POST /me/channels/:channel/members` `{holder}` → add a member (owner-scoped)
+/// * `GET /me/channels/:channel/members` → list a channel's members (owner-scoped;
+///   same follow-up -- membership was write-only before this)
 /// * `POST /me/channels/:channel/members/:holder/remove` → remove a member (revocation)
 /// * `POST /me/channels/:channel/allowlist` `{email}` → allow-list an email for
 ///   self-service claiming (#248-follow, owner-scoped)
@@ -804,8 +808,11 @@ pub fn authed_channel_router(
     verifier: OidcVerifierHandle,
 ) -> Router {
     Router::new()
-        .route("/me/channels", post(channel_register))
-        .route("/me/channels/:channel/members", post(channel_add_member))
+        .route("/me/channels", post(channel_register).get(channel_list))
+        .route(
+            "/me/channels/:channel/members",
+            post(channel_add_member).get(channel_members_list),
+        )
         .route(
             "/me/channels/:channel/members/:holder/remove",
             post(channel_remove_member),
@@ -2445,6 +2452,74 @@ async fn channel_register(
         Ok(StatusCode::OK)
     } else {
         Err((StatusCode::FORBIDDEN, "channel owned by another subject".to_string()))
+    }
+}
+
+#[derive(Serialize)]
+struct ChannelListResp {
+    channels: Vec<String>,
+}
+
+/// `GET /me/channels`: every channel the caller owns (hex ids), sorted -- the
+/// missing counterpart to `POST /me/channels` (register): before this there was
+/// no way to list what you'd already registered short of remembering the channel
+/// ids yourself. Owner-scoped by construction (`channels_owned_by` only ever
+/// returns the verified subject's own channels).
+async fn channel_list(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+) -> Result<Json<ChannelListResp>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channels = state
+        .channels
+        .channels_owned_by(&owner)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|c| hex_encode(&c.0))
+        .collect();
+    Ok(Json(ChannelListResp { channels }))
+}
+
+#[derive(Serialize)]
+struct ChannelMemberView {
+    holder: String,
+    noise_pubkey: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ChannelMembersResp {
+    members: Vec<ChannelMemberView>,
+}
+
+/// `GET /me/channels/:channel/members`: every member of `channel` (owner-scoped --
+/// `members_of` itself enforces this, returning `None` -> a 403 for a non-owner
+/// rather than leaking membership of a channel you don't own via an empty-list
+/// response indistinguishable from "no members yet"). The other missing
+/// counterpart to `POST .../members` (add): registering members was previously
+/// write-only.
+async fn channel_members_list(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+) -> Result<Json<ChannelMembersResp>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let members = state
+        .channels
+        .members_of(&ChannelId(channel), &owner)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match members {
+        Some(members) => Ok(Json(ChannelMembersResp {
+            members: members
+                .into_iter()
+                .map(|(holder, noise)| ChannelMemberView {
+                    holder: hex_encode(&holder),
+                    noise_pubkey: noise.map(|n| hex_encode(&n)),
+                })
+                .collect(),
+        })),
+        None => Err((StatusCode::FORBIDDEN, "not the channel owner".to_string())),
     }
 }
 
@@ -7409,6 +7484,106 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["emails"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn channel_list_and_members_list_routes_are_owner_scoped() {
+        // Video-conferencing feature follow-up: GET /me/channels and
+        // GET /me/channels/:channel/members were missing entirely -- registration
+        // and membership were write-only. Same owner-scoping convention as the
+        // allowlist GET route above (403 for a non-owner, never a membership leak).
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let get = |path: String, bearer: Option<String>| {
+            let mut req = Request::get(&path);
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let json_body = |resp: Response| async move {
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        // Two channels, both owned by alice -- a two-person video call's own pairwise
+        // channel plus a second one, so GET /me/channels proves it lists ALL of the
+        // caller's own channels, not just the most recent.
+        let ch1 = "e5".repeat(32);
+        let ch2 = "f6".repeat(32);
+        let op = "17".repeat(32);
+        for ch in [&ch1, &ch2] {
+            assert_eq!(
+                post("/me/channels".into(), Some(alice.clone()), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#))
+                    .await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+
+        // GET /me/channels: unauthenticated -> 401; alice sees exactly her 2 channels
+        // (order-independent); mallory (no channels of her own) sees an empty list,
+        // not alice's -- proving this is genuinely owner-scoped, not global.
+        assert_eq!(get("/me/channels".into(), None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let body = json_body(get("/me/channels".into(), Some(alice.clone())).await.unwrap()).await;
+        let mut listed: Vec<String> = body["channels"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        listed.sort();
+        let mut expected = vec![ch1.clone(), ch2.clone()];
+        expected.sort();
+        assert_eq!(listed, expected, "alice sees exactly her own 2 channels");
+        let body = json_body(get("/me/channels".into(), Some(mallory.clone())).await.unwrap()).await;
+        assert_eq!(body["channels"], serde_json::json!([]), "mallory has none of her own -- not alice's");
+
+        // Add a real member (with a real attestation) to ch1, then list it.
+        let holder_sk = SigningKey::from_bytes(&[0x5eu8; 32]);
+        let hbytes = holder_sk.verifying_key().to_bytes();
+        let holder = hex_encode(&hbytes);
+        let nk = hex_encode(&[0x6fu8; 32]);
+        let chan1 = ChannelId(hex_decode_32(&ch1).unwrap());
+        let att = hex_encode(&holder_sk.sign(&ct_common::channel::member_noise_attest_bytes(&chan1, &hbytes, &[0x6fu8; 32])).to_bytes());
+        assert_eq!(
+            post(format!("/me/channels/{ch1}/members"), Some(alice.clone()), format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}","noise_attestation":"{att}"}}"#))
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // GET /me/channels/:channel/members: non-owner -> 403 (not an empty list --
+        // no distinguishable-from-"no members yet" leak); owner sees the real member,
+        // including its pinned Noise key; the OTHER channel (ch2, no members added)
+        // correctly lists empty, not ch1's member.
+        assert_eq!(get(format!("/me/channels/{ch1}/members"), Some(mallory)).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let body = json_body(get(format!("/me/channels/{ch1}/members"), Some(alice.clone())).await.unwrap()).await;
+        assert_eq!(
+            body["members"],
+            serde_json::json!([{"holder": holder, "noise_pubkey": nk}]),
+            "alice sees ch1's real member with its pinned Noise key"
+        );
+        let body = json_body(get(format!("/me/channels/{ch2}/members"), Some(alice)).await.unwrap()).await;
+        assert_eq!(body["members"], serde_json::json!([]), "ch2 has no members -- not ch1's");
     }
 
     #[tokio::test]
