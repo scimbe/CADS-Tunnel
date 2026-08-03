@@ -782,6 +782,10 @@ pub fn authed_billing_router(
 pub struct AuthedChannelState {
     channels: Arc<SqliteChannelStore>,
     verifier: OidcVerifierHandle,
+    /// #214: the portal session-cookie signing key, so a portal-session-authenticated
+    /// caller (no raw bearer token, by BFF design) can drive these endpoints too --
+    /// see [`subject_of_channel`]'s doc comment.
+    session_key: Arc<[u8]>,
 }
 
 /// Build the **authenticated** Agent-Fabric channel-registry router (#81 SEC81c-b):
@@ -812,6 +816,7 @@ pub struct AuthedChannelState {
 pub fn authed_channel_router(
     channels: Arc<SqliteChannelStore>,
     verifier: OidcVerifierHandle,
+    session_key: Arc<[u8]>,
 ) -> Router {
     Router::new()
         .route("/me/channels", post(channel_register).get(channel_list))
@@ -833,7 +838,7 @@ pub fn authed_channel_router(
             "/me/channels/:channel/allowlist/:email/remove",
             post(channel_allowlist_remove),
         )
-        .with_state(AuthedChannelState { channels, verifier })
+        .with_state(AuthedChannelState { channels, verifier, session_key })
 }
 
 /// Shared state for the authenticated declarative **network** API (#102-rest): the
@@ -2535,7 +2540,7 @@ async fn channel_register(
     headers: HeaderMap,
     Json(req): Json<ChannelRegisterReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&req.channel)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let operator = hex_decode_32(&req.operator_pubkey)
@@ -2567,7 +2572,7 @@ async fn channel_list(
     State(state): State<AuthedChannelState>,
     headers: HeaderMap,
 ) -> Result<Json<ChannelListResp>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channels = state
         .channels
         .channels_owned_by(&owner)
@@ -2600,7 +2605,7 @@ async fn channel_members_list(
     headers: HeaderMap,
     Path(channel_hex): Path<String>,
 ) -> Result<Json<ChannelMembersResp>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let members = state
@@ -2639,7 +2644,7 @@ async fn channel_add_member(
     Path(channel_hex): Path<String>,
     Json(req): Json<MemberReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let holder = hex_decode_32(&req.holder)
@@ -2679,7 +2684,7 @@ async fn channel_remove_member(
     headers: HeaderMap,
     Path((channel_hex, holder_hex)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let holder = hex_decode_32(&holder_hex)
@@ -2708,7 +2713,7 @@ async fn channel_delete(
     headers: HeaderMap,
     Path(channel_hex): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let ok = state
@@ -2770,7 +2775,7 @@ async fn room_create(
     headers: HeaderMap,
     Json(req): Json<RoomCreateReq>,
 ) -> Result<Json<RoomCreateResp>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let operator = hex_decode_32(&req.operator_pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "malformed operator_pubkey".to_string()))?;
     if req.holders.len() < 2 {
@@ -2852,7 +2857,7 @@ async fn channel_allowlist_add(
     Path(channel_hex): Path<String>,
     Json(req): Json<AllowlistEmailReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     if !plausible_email(&req.email) {
@@ -2877,7 +2882,7 @@ async fn channel_allowlist_list(
     headers: HeaderMap,
     Path(channel_hex): Path<String>,
 ) -> Result<Json<AllowlistResp>, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let emails = state
@@ -2899,7 +2904,7 @@ async fn channel_allowlist_remove(
     headers: HeaderMap,
     Path((channel_hex, email)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let owner = subject_of(&state.verifier, &headers)?;
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
     let channel = hex_decode_32(&channel_hex)
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     // axum's `Path` extractor percent-decodes each segment already — `email` here is
@@ -3149,6 +3154,26 @@ fn topology_actor_of(
         return Ok((claims.subject, claims.email));
     }
     subject_of(verifier, headers).map(|s| (s, None))
+}
+
+/// #214: same dual-auth precedent as [`subject_of_topology`] -- a portal-session-
+/// authenticated caller (the correct BFF pattern: the raw OIDC bearer token stays
+/// server-side, never reaches the browser) had no path into the Agent-Fabric
+/// channel-registry endpoints, which accepted only a raw `Authorization: Bearer`
+/// header. Reported as a genuine capability gap blocking self-service video/chat
+/// channel registration from a portal-session-only caller. Not a scope-widening
+/// for the same reason `subject_of_topology` isn't: both paths resolve to the
+/// same verified subject, and the session cookie is itself minted only after a
+/// real OIDC login.
+fn subject_of_channel(
+    session_key: &[u8],
+    verifier: &OidcVerifierHandle,
+    headers: &HeaderMap,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(claims) = crate::portal::session_claims_for(session_key, headers) {
+        return Ok(claims.subject);
+    }
+    subject_of(verifier, headers)
 }
 
 /// Extract + verify the bearer token, returning the authenticated subject.
@@ -4831,7 +4856,7 @@ pub fn persistent_control_plane_router(
             .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
-            .merge(authed_channel_router(channels, oidc.clone()))
+            .merge(authed_channel_router(channels, oidc.clone(), Arc::from(session_key)))
             // Self-service pipeline publish (owner = verified subject) — see
             // `authed_pipeline_router`'s doc comment for why this exists alongside
             // the admin-gated `/registry/pipelines`.
@@ -7569,7 +7594,11 @@ mod tests {
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let probe = channels.clone();
-        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+        );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -7707,6 +7736,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authed_channel_router_also_accepts_a_portal_session_cookie_with_no_bearer_token_214() {
+        // #214: same dual-auth precedent already proven for topologies
+        // (`authed_topology_router_also_accepts_a_portal_session_cookie_with_no_bearer_token_237`)
+        // -- a portal-session-authenticated caller (no raw bearer token, by BFF design: the
+        // token stays server-side) can now register a channel and list its own channels
+        // through ONLY a session cookie, no bearer token anywhere in the request.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)), Arc::from(session_key));
+
+        let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
+        let ch = "c3".repeat(32);
+        let op = "d4".repeat(32);
+
+        // No cookie AND no bearer -> still refused (the fallback bearer path's own 401).
+        let bare = app
+            .clone()
+            .oneshot(Request::get("/me/channels").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED, "neither a session cookie nor a bearer token -> refused");
+
+        // Session cookie alone registers the channel.
+        let register = app
+            .clone()
+            .oneshot(
+                Request::post("/me/channels")
+                    .header("content-type", "application/json")
+                    .header("cookie", alice_cookie.clone())
+                    .body(Body::from(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::OK, "session cookie alone registers a channel");
+
+        // Session cookie alone lists it back, owned by "alice".
+        let list = app
+            .clone()
+            .oneshot(
+                Request::get("/me/channels")
+                    .header("cookie", alice_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = to_bytes(list.into_body(), 1 << 16).await.unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            listed["channels"][0].as_str().unwrap(),
+            ch,
+            "the session-cookie-registered channel shows up in the session-cookie-authenticated list"
+        );
+    }
+
+    #[tokio::test]
     async fn channel_allowlist_routes_are_owner_scoped_248() {
         // #248-follow: the allow-list management routes share `authed_channel_router`'s
         // owner-scoping with the member routes tested above.
@@ -7720,7 +7812,11 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+        );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -7815,7 +7911,11 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+        );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -7920,7 +8020,11 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+        );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
@@ -8012,7 +8116,11 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+        );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
