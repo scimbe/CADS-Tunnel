@@ -13,7 +13,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -795,6 +795,9 @@ pub struct AuthedChannelState {
 ///   the channel is already owned by another subject
 /// * `GET /me/channels` → list the caller's own registered channels (video-conferencing
 ///   feature follow-up -- registration was write-only before this)
+/// * `DELETE /me/channels/:channel` → fully deregister a channel (its registration,
+///   members, and allow-list) once a call ends -- owner-scoped, previously only
+///   reachable via the whole-account-deletion cascade
 /// * `POST /me/channels/:channel/members` `{holder}` → add a member (owner-scoped)
 /// * `GET /me/channels/:channel/members` → list a channel's members (owner-scoped;
 ///   same follow-up -- membership was write-only before this)
@@ -809,6 +812,7 @@ pub fn authed_channel_router(
 ) -> Router {
     Router::new()
         .route("/me/channels", post(channel_register).get(channel_list))
+        .route("/me/channels/:channel", delete(channel_delete))
         .route(
             "/me/channels/:channel/members",
             post(channel_add_member).get(channel_members_list),
@@ -2672,6 +2676,33 @@ async fn channel_remove_member(
     let ok = state
         .channels
         .remove_member(&ChannelId(channel), &owner, &holder)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
+    }
+}
+
+/// `DELETE /me/channels/:channel` (video-conferencing feature follow-up): fully
+/// deregister a channel the caller owns -- its registration, every member, and its
+/// allow-list. Was previously only reachable as a side effect of deleting the whole
+/// account ([`SqliteChannelStore::delete_channel`] already existed and is unit-
+/// tested for that cascade); this exposes the same primitive as its own owner-scoped
+/// action, so a video call's channel can be cleaned up once the call ends without
+/// deleting the account. Owner-scoped like every other channel-mutating route here:
+/// a non-owner (or non-existent channel) gets `403`, never a membership/existence leak.
+async fn channel_delete(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let ok = state
+        .channels
+        .delete_channel(&owner, &ChannelId(channel))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if ok {
         Ok(StatusCode::OK)
@@ -7711,6 +7742,101 @@ mod tests {
         );
         let body = json_body(get(format!("/me/channels/{ch2}/members"), Some(alice)).await.unwrap()).await;
         assert_eq!(body["members"], serde_json::json!([]), "ch2 has no members -- not ch1's");
+    }
+
+    #[tokio::test]
+    async fn channel_delete_route_is_owner_scoped_and_fully_deregisters() {
+        // Video-conferencing feature follow-up: a channel's registration had no
+        // deletion route at all -- only reachable as a side effect of deleting the
+        // whole account (SqliteChannelStore::delete_channel, unit-tested for that
+        // cascade but never exposed as its own action). Once a video call ends,
+        // an owner needs to clean up that ONE channel without deleting their
+        // account. Same owner-scoping convention as every other channel-mutating
+        // route: unauthenticated -> 401, non-owner -> 403 (not silently ignored,
+        // not a 404 that would leak non-existence either), and the delete is real
+        // -- fully gone from GET /me/channels afterward, members gone too.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let get = |path: String, bearer: Option<String>| {
+            let mut req = Request::get(&path);
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let del = |path: String, bearer: Option<String>| {
+            let mut req = Request::delete(&path);
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let json_body = |resp: Response| async move {
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let ch = "9a".repeat(32);
+        let op = "3c".repeat(32);
+        assert_eq!(
+            post("/me/channels".into(), Some(alice.clone()), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op}"}}"#))
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let holder_sk = SigningKey::from_bytes(&[0x5eu8; 32]);
+        let hbytes = holder_sk.verifying_key().to_bytes();
+        let holder = hex_encode(&hbytes);
+        let nk = hex_encode(&[0x6fu8; 32]);
+        let chan = ChannelId(hex_decode_32(&ch).unwrap());
+        let att = hex_encode(&holder_sk.sign(&ct_common::channel::member_noise_attest_bytes(&chan, &hbytes, &[0x6fu8; 32])).to_bytes());
+        assert_eq!(
+            post(format!("/me/channels/{ch}/members"), Some(alice.clone()), format!(r#"{{"holder":"{holder}","noise_pubkey":"{nk}","noise_attestation":"{att}"}}"#))
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // Unauthenticated -> 401; non-owner -> 403, channel untouched afterward.
+        assert_eq!(del(format!("/me/channels/{ch}"), None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(del(format!("/me/channels/{ch}"), Some(mallory)).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let body = json_body(get("/me/channels".into(), Some(alice.clone())).await.unwrap()).await;
+        assert_eq!(body["channels"], serde_json::json!([ch]), "mallory's failed delete left alice's channel intact");
+
+        // Owner deletes it for real: 200, then gone from the list, and its members
+        // route now 403s (matches "no such channel you own" -- same shape as a
+        // channel that never existed, not a distinguishable "deleted" state).
+        assert_eq!(del(format!("/me/channels/{ch}"), Some(alice.clone())).await.unwrap().status(), StatusCode::OK);
+        let body = json_body(get("/me/channels".into(), Some(alice.clone())).await.unwrap()).await;
+        assert_eq!(body["channels"], serde_json::json!([]), "fully deregistered -- gone from the list");
+        assert_eq!(get(format!("/me/channels/{ch}/members"), Some(alice.clone())).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // Deleting an already-deleted (now nonexistent) channel is the same 403, not
+        // a crash or a 200 no-op that would suggest it still existed.
+        assert_eq!(del(format!("/me/channels/{ch}"), Some(alice)).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
