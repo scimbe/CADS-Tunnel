@@ -199,6 +199,21 @@ pub struct EdgeState<H> {
     /// semantics -- restarting the Edge is the only reset, same as every
     /// other in-memory counter here).
     tunnel_bytes: Mutex<HashMap<RoutingToken, (u64, u64)>>,
+    /// #282 follow-up: `agents`/`candidates`/`direct`/`hosts` are four
+    /// independent mutexes with no shared critical section of their own, which
+    /// left a narrow but real TOCTOU window between [`remove_registration`]'s
+    /// teardown and a concurrent [`register_with_candidate`]/[`register_host`]
+    /// for the same token (#282's original fix only narrowed this window with
+    /// a re-check; the closing comment on #282 flagged a combined lock as the
+    /// honest follow-up if the residual window ever proved to matter -- CI
+    /// started reproducing it reliably under real thread contention, so it
+    /// did). Every mutation entry point that touches more than one of those
+    /// four maps for the *same* registration lifecycle now holds this lock for
+    /// its entire critical section, so a teardown and a concurrent
+    /// (re-)registration can never interleave -- coarser than per-token, but
+    /// registration/teardown/host-bind are connection-setup-time operations,
+    /// not the data-relay hot path, so global serialization here is cheap.
+    registration_lock: Mutex<()>,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -221,6 +236,7 @@ impl<H: Clone> EdgeState<H> {
             relay_bytes: Counter::default(),
             failovers: Counter::default(),
             tunnel_bytes: Mutex::new(HashMap::new()),
+            registration_lock: Mutex::new(()),
         }
     }
 
@@ -234,6 +250,10 @@ impl<H: Clone> EdgeState<H> {
         let Some(key) = ct_common::normalize_hostname(host) else {
             return false; // reject malformed hostnames (#23 BP4b-d)
         };
+        // #282: held across the whole bind so a concurrent remove_registration
+        // teardown for this token can't observe "not yet bound" and wipe this
+        // bind out from under it a moment later -- see registration_lock's doc.
+        let _guard = self.registration_lock.lock_safe();
         let mut hosts = self.hosts.lock_safe();
         match hosts.get(&key) {
             Some(existing) if *existing != token => false,
@@ -246,6 +266,8 @@ impl<H: Clone> EdgeState<H> {
 
     /// Remove every hostname bound to `token` — called when its last agent drops
     /// or it is revoked, so no stale host->token route lingers (#23 BP4a).
+    /// Callers already hold `registration_lock` (see [`remove_registration`]/
+    /// [`remove`]) -- this does not re-acquire it.
     fn clear_hosts_for(&self, token: &RoutingToken) {
         self.hosts.lock_safe().retain(|_, v| v != token);
     }
@@ -513,6 +535,15 @@ impl<H: Clone> EdgeState<H> {
     /// [`remove_registration`](Self::remove_registration)) when its connection
     /// drops, without disturbing the other Agents serving the token.
     pub fn register(&self, token: RoutingToken, handle: H) -> u64 {
+        let _guard = self.registration_lock.lock_safe();
+        self.register_locked(token, handle)
+    }
+
+    /// Shared by [`register`](Self::register) and
+    /// [`register_with_candidate`](Self::register_with_candidate) -- assumes
+    /// `registration_lock` is already held by the caller (it is NOT reentrant,
+    /// so this must never call back into `register`).
+    fn register_locked(&self, token: RoutingToken, handle: H) -> u64 {
         let id = self.next_reg.fetch_add(1, Ordering::Relaxed);
         self.agents
             .lock_safe()
@@ -527,21 +558,19 @@ impl<H: Clone> EdgeState<H> {
     /// the reflexive address a Client will hole-punch toward (M11.1). Returns the
     /// registration id (see [`register`](Self::register)).
     ///
-    /// #282: `register` (the `agents` insert) runs FIRST, `candidates` second —
-    /// the reverse of this function's original order. This half of the #282
-    /// mitigation matters together with [`remove_registration`](Self::remove_registration)'s
-    /// own re-check: with `agents` populated before `candidates`, a concurrent
-    /// `remove_registration` that re-checks `agents` right before wiping
-    /// `candidates` reliably observes this registration and backs off, instead
-    /// of a residual empty-`agents`-but-about-to-insert-`candidates` window
-    /// letting the teardown race ahead of it.
+    /// #282: the whole function now holds `registration_lock` (see its doc),
+    /// which fully closes the original race this comment used to only narrow --
+    /// a concurrent `remove_registration` for the same token cannot interleave
+    /// with this at all anymore, so the `agents`-before-`candidates` insert
+    /// order documented here is now belt-and-suspenders, not the only guard.
     pub fn register_with_candidate(
         &self,
         token: RoutingToken,
         handle: H,
         candidate: SocketAddr,
     ) -> u64 {
-        let id = self.register(token.clone(), handle);
+        let _guard = self.registration_lock.lock_safe();
+        let id = self.register_locked(token.clone(), handle);
         self.candidates.lock_safe().insert(token, candidate);
         id
     }
@@ -604,21 +633,15 @@ impl<H: Clone> EdgeState<H> {
     /// The token's candidate/direct entries are cleared only when the **last**
     /// Agent for the token is gone.
     ///
-    /// #282: `agents`, `candidates`, `direct` and `hosts` are four independent
-    /// mutexes (no combined lock), so this can't be made fully atomic against a
-    /// *concurrent* `register_with_candidate` for the same token without a
-    /// larger lock-architecture change. What this DOES close: the original code
-    /// dropped the `agents` lock and then unconditionally wiped
-    /// candidates/direct/hosts — if a redundant Agent's `register_with_candidate`
-    /// landed in that window, its brand-new candidate/hostname route was wiped
-    /// out from under it, live in `agents` but unreachable until it happened to
-    /// re-advertise. Re-checking `agents` right before the wipe (combined with
-    /// `register_with_candidate` now populating `agents` before `candidates`,
-    /// so a racing registration is visible here) collapses that into a
-    /// sub-lock-acquisition window — not zero, but the practical difference
-    /// between "any register during the whole cleanup" and "a register landing
-    /// in the few instructions between two specific lock calls".
+    /// #282 follow-up: this now holds `registration_lock` for its entire body
+    /// (see that field's doc), so a concurrent `register_with_candidate`/
+    /// `register_host` for this token cannot interleave with the check-then-wipe
+    /// below at all -- not narrowed, closed. The original per-map re-check this
+    /// comment used to describe is gone: with the coarse lock held throughout,
+    /// `agents` cannot change between the emptiness check and the wipe, so
+    /// re-reading it added nothing once the lock spans both.
     pub fn remove_registration(&self, token: &RoutingToken, id: u64) {
+        let _guard = self.registration_lock.lock_safe();
         let mut agents = self.agents.lock_safe();
         let Some(v) = agents.get_mut(token) else { return };
         v.retain(|(rid, _)| *rid != id);
@@ -627,11 +650,6 @@ impl<H: Clone> EdgeState<H> {
         }
         agents.remove(token);
         drop(agents);
-        // Re-check: a concurrent register_with_candidate may have already
-        // repopulated `agents` for this token in the gap above.
-        if self.agents.lock_safe().contains_key(token) {
-            return;
-        }
         self.candidates.lock_safe().remove(token);
         self.direct.lock_safe().remove(token);
         // The tunnel is gone — drop its hostname routes too (#23 BP4a).
@@ -640,7 +658,10 @@ impl<H: Clone> EdgeState<H> {
 
     /// Remove **all** Agent tunnels (and candidate + direct + tcp) for `token` —
     /// a full teardown, regardless of how many redundant Agents serve it.
+    /// Holds `registration_lock` for the same #282 reason as
+    /// [`remove_registration`](Self::remove_registration).
     pub fn remove(&self, token: &RoutingToken) {
+        let _guard = self.registration_lock.lock_safe();
         self.agents.lock_safe().remove(token);
         self.candidates.lock_safe().remove(token);
         self.direct.lock_safe().remove(token);
