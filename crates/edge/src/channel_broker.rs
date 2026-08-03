@@ -833,6 +833,37 @@ async fn quic_ack_member(
     Ok(())
 }
 
+/// A type-erased channel duplex: box any transport's concrete stream (the `:443`
+/// front door's TLS-over-TCP stream, a browser's WebSocket byte stream, ...) into
+/// this so members that arrive over DIFFERENT transports but hold the same channel
+/// can still be offered to and correlated by ONE shared [`ChannelPairer`]
+/// (cross-transport pairing: a native `:443`/QUIC member and a browser member of the
+/// same channel now pair with EACH OTHER, not only with another member of their own
+/// transport). [`finish_relay_pair_over_streams`] is already generic over two
+/// independent stream types, so relay-splicing a boxed browser stream with a boxed
+/// front-door stream needs no change there at all — only the shared admission/pairing
+/// state needed one common type, which is exactly what this is.
+pub trait AsyncDuplex: AsyncRead + AsyncWrite + Send {}
+impl<T: AsyncRead + AsyncWrite + Send> AsyncDuplex for T {}
+pub type BoxedChannelStream = std::pin::Pin<Box<dyn AsyncDuplex>>;
+
+/// The shared cross-transport channel pairer type every transport opts into (the
+/// `:443` front door, the browser WebSocket listener, ...): one `Arc` constructed
+/// once at edge startup ([`crate::serve::run_edge`]) and cloned into each transport's
+/// context, so members that arrive over different transports but hold the same
+/// channel still correlate through the same map.
+pub type SharedChannelPairer =
+    std::sync::Arc<std::sync::Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>>>;
+
+/// A fresh, empty [`SharedChannelPairer`] — callers still own spawning their own
+/// reaper against it (the interval/`now_fn` choice is caller-specific; see
+/// `serve.rs`'s `spawn_front_door_pairer_reaper`), this just gives every call site
+/// the same one-line way to construct the shared type instead of spelling out the
+/// nested `Arc<Mutex<ChannelPairer<...>>>` each time.
+pub fn new_shared_channel_pairer() -> SharedChannelPairer {
+    std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new()))
+}
+
 /// A channel member admitted over a **generic byte stream** (not a `quinn::Connection`)
 /// — e.g. a `:443` TLS-over-TCP front-door member whose network blocks the channel
 /// UDP/TCP ports (#106). Unlike [`AdmittedMember`] it carries no `quinn::Connection`:
@@ -2186,6 +2217,118 @@ mod tests {
 
         assert_eq!(src_task.await.expect("src"), 0x22, "source got the sink's byte via the paired relay");
         assert_eq!(snk_task.await.expect("snk"), 0x11, "sink got the source's byte via the paired relay");
+    }
+
+    /// A trivial newtype around `tokio::io::DuplexStream` -- a distinct Rust TYPE (not
+    /// just a different value) standing in for "a different transport's concrete
+    /// stream" in the cross-transport pairing test below, so boxing genuinely erases
+    /// two DIFFERENT types into [`BoxedChannelStream`], not just two instances of one.
+    struct OtherTransportStream(tokio::io::DuplexStream);
+
+    impl AsyncRead for OtherTransportStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for OtherTransportStream {
+        fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn boxed_channel_stream_pairs_two_different_concrete_stream_types_cross_transport() {
+        // Cross-transport pairing (video-conferencing feature follow-up): the whole
+        // point of BoxedChannelStream/SharedChannelPairer is that a `:443` front-door
+        // member's TLS stream and a browser's WsByteStream -- two genuinely DIFFERENT
+        // concrete types -- can be admitted onto the SAME shared pairer and pair with
+        // EACH OTHER. Proves the type-erasure mechanism itself with two different
+        // concrete stream types (a plain DuplexStream and a distinct newtype wrapping
+        // one), independent of either transport's own admission wiring (those stay
+        // covered by ws_channel.rs's and serve.rs's own tests).
+        let pk = operator_pubkey();
+        let channel = [0x9Bu8; 32];
+        let src = holder_sk(0xc1);
+        let snk = holder_sk(0xd2);
+        let req_src = ChannelJoinRequest {
+            grant: grant_h(channel, &src, Direction::Initiate, 1_000),
+            endpoint: "relay-only".to_string(),
+        };
+        let req_snk = ChannelJoinRequest {
+            grant: grant_h(channel, &snk, Direction::Accept, 1_000),
+            endpoint: "relay-only".to_string(),
+        };
+
+        let (c1, s1) = tokio::io::duplex(4096);
+        let (c2, s2) = tokio::io::duplex(4096);
+        let s2 = OtherTransportStream(s2); // a genuinely different concrete type than s1
+
+        let src_task = tokio::spawn(async move {
+            let mut c = c1;
+            let rb = req_src.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&src.sign(&ch).to_bytes()).await.expect("sig");
+            let ack = read_relay_ack_line(&mut c).await;
+            assert!(ack.starts_with(b"OK"), "got {:?}", String::from_utf8_lossy(&ack));
+            c.write_all(&[0x33]).await.expect("send");
+            let mut g = [0u8; 1];
+            c.read_exact(&mut g).await.expect("recv");
+            let _ = c.shutdown().await;
+            g[0]
+        });
+        let snk_task = tokio::spawn(async move {
+            let mut c = c2;
+            let rb = req_snk.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&snk.sign(&ch).to_bytes()).await.expect("sig");
+            let ack = read_relay_ack_line(&mut c).await;
+            assert!(ack.starts_with(b"OK"), "got {:?}", String::from_utf8_lossy(&ack));
+            c.write_all(&[0x44]).await.expect("send");
+            let mut g = [0u8; 1];
+            c.read_exact(&mut g).await.expect("recv");
+            let _ = c.shutdown().await;
+            g[0]
+        });
+
+        let pairer: SharedChannelPairer = new_shared_channel_pairer();
+        let authorize = move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs1: std::net::SocketAddr = "203.0.113.1:8001".parse().unwrap();
+        let obs2: std::net::SocketAddr = "203.0.113.2:8002".parse().unwrap();
+
+        let boxed1: BoxedChannelStream = Box::pin(s1);
+        let r1 = admit_and_pair_on_stream(boxed1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+            .await
+            .expect("admit 1 (transport A: a plain DuplexStream)");
+        assert!(r1.is_none(), "first holder parks");
+        assert_eq!(pairer.lock().unwrap().len(), 1);
+
+        let boxed2: BoxedChannelStream = Box::pin(s2);
+        let r2 = admit_and_pair_on_stream(boxed2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+            .await
+            .expect("admit 2 (transport B: a DIFFERENT concrete stream type)");
+        let (a, b) = r2.expect("second holder pairs with the parked first, across the type boundary");
+        assert!(pairer.lock().unwrap().is_empty());
+
+        finish_relay_pair_over_streams(a, b, 500).await.expect("relay spliced two different stream types");
+
+        assert_eq!(src_task.await.expect("src"), 0x44, "the transport-A member got transport-B's byte");
+        assert_eq!(snk_task.await.expect("snk"), 0x33, "the transport-B member got transport-A's byte");
     }
 
     #[tokio::test]

@@ -10,15 +10,15 @@
 //! member can't use the QUIC broker or the `:443` ALPN-demuxed front door at all --
 //! this is a plain HTTP(S)-Upgrade WebSocket on its own listener instead.
 //!
-//! Scope of this increment: browser members (the [`crate::channel_broker::AdmittedStreamMember`]s
-//! this listener produces) pair with **other browser members** via their own
-//! [`crate::channel_broker::ChannelPairer`] -- NOT yet unified with the `:443` front door's
-//! separate pairer (that pairer is generic over a *different* concrete stream type,
-//! [`FrontDoorChannelStream`] in `serve.rs`, and `ChannelPairer<T>` is not type-erased, so
-//! sharing one pairer across both transports needs both call sites to agree on a common
-//! boxed `Pin<Box<dyn AsyncRead + AsyncWrite + Unpin + Send>>` stream type -- a real, but
-//! separate, follow-up that touches the already-tested front-door path and so is
-//! deliberately not bundled into this addition). Browser-to-browser channel admission,
+//! Cross-transport pairing: in production ([`crate::serve::run_edge`]) this listener's
+//! [`WsChannelState`] joins the SAME [`crate::channel_broker::SharedChannelPairer`] the
+//! `:443` front door's `ChannelFrontDoor` uses, via [`crate::channel_broker::BoxedChannelStream`]
+//! (a type-erased duplex both transports box their concrete stream into) -- so a browser
+//! member and a `:443`/QUIC member of the same channel correlate through one pairer and can
+//! pair with EACH OTHER, not only with another member of their own transport.
+//! [`WsChannelState::standalone`] (used by this module's own tests, and available to any
+//! caller that only ever runs this one listener) builds its own pairer instead, unchanged
+//! from this listener's original browser-to-browser-only scope. Browser channel admission,
 //! authorization, and encrypted relay all go through the identical, already-tested
 //! [`crate::channel_broker`] core either way.
 
@@ -151,21 +151,20 @@ impl AsyncWrite for WsByteStream {
     }
 }
 
-/// The concrete stream type this listener's [`crate::channel_broker::ChannelPairer`] is
-/// keyed on -- named once, mirroring [`FrontDoorChannelStream`] in `serve.rs`.
+/// The concrete stream type this listener produces before it's boxed into
+/// [`crate::channel_broker::BoxedChannelStream`] for the shared pairer.
 pub type WsChannelStream = WsByteStream;
 
-type WsPairer = std::sync::Mutex<
-    crate::channel_broker::ChannelPairer<crate::channel_broker::AdmittedStreamMember<WsChannelStream>>,
->;
-
-/// Shared state for the browser channel-join route: the long-lived pairer (so two
-/// independently-arriving browser members of the same channel correlate, exactly like
-/// the `:443` front door's `ChannelFrontDoor::pairer`) and the CP-backed membership
-/// resolver. Cloned cheaply (both fields are `Arc`s) into each connection's task.
+/// Shared state for the browser channel-join route: the long-lived pairer -- by
+/// default shared with the `:443` front door's own channel broker (cross-transport
+/// pairing: a browser member and a `:443`/QUIC member of the same channel correlate
+/// through the SAME pairer and can pair with each other, not only with another member
+/// of their own transport; see [`crate::channel_broker::SharedChannelPairer`]) -- and
+/// the CP-backed membership resolver. Cloned cheaply (both fields are `Arc`s) into
+/// each connection's task.
 #[derive(Clone)]
 pub struct WsChannelState {
-    pairer: Arc<WsPairer>,
+    pairer: crate::channel_broker::SharedChannelPairer,
     resolver: Arc<dyn ChannelMemberResolver>,
 }
 
@@ -178,8 +177,20 @@ const WS_CHANNEL_PARK_TTL_SECS: u64 = 120;
 const WS_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl WsChannelState {
-    pub fn new(resolver: Arc<dyn ChannelMemberResolver>) -> Self {
-        let pairer: Arc<WsPairer> = Arc::new(std::sync::Mutex::new(crate::channel_broker::ChannelPairer::new()));
+    /// Build around an EXTERNALLY shared pairer (cross-transport pairing) -- the
+    /// caller (`serve.rs`'s `run_edge`) owns constructing the pairer + spawning its
+    /// reaper once and shares it with every transport that opts into channel
+    /// brokering.
+    pub fn new(resolver: Arc<dyn ChannelMemberResolver>, pairer: crate::channel_broker::SharedChannelPairer) -> Self {
+        Self { pairer, resolver }
+    }
+
+    /// Like [`Self::new`], but builds its OWN standalone pairer + reaper -- for
+    /// callers (tests, or a deployment that only ever runs this one listener) that
+    /// don't need cross-transport pairing with the `:443` front door. This is what
+    /// `new` did unconditionally before cross-transport pairing existed.
+    pub fn standalone(resolver: Arc<dyn ChannelMemberResolver>) -> Self {
+        let pairer = crate::channel_broker::new_shared_channel_pairer();
         // Mirrors serve.rs's `spawn_front_door_pairer_reaper` exactly: draining and
         // dropping is enough -- there's no explicit shutdown to do, `AdmittedStreamMember`'s
         // `stream` field has no public accessor from outside channel_broker.rs, and
@@ -202,7 +213,7 @@ impl WsChannelState {
                 }
             }
         });
-        Self { pairer, resolver }
+        Self::new(resolver, pairer)
     }
 }
 
@@ -219,7 +230,10 @@ async fn ws_upgrade_handler(ws: WebSocketUpgrade, State(state): State<WsChannelS
 }
 
 async fn handle_ws_channel_join(socket: WebSocket, state: WsChannelState) {
-    let stream = WsByteStream::new(socket);
+    // Boxed into the shared cross-transport stream type so this browser member
+    // correlates through the SAME pairer a `:443`/QUIC member offers itself to --
+    // either can now be the partner.
+    let stream: crate::channel_broker::BoxedChannelStream = Box::pin(WsByteStream::new(socket));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -257,14 +271,31 @@ async fn handle_ws_channel_join(socket: WebSocket, state: WsChannelState) {
     }
 }
 
-/// Serve the browser channel-join listener on `listen` (plain HTTP -- put a TLS-terminating
-/// reverse proxy or the edge's own TLS listener in front in production; kept plain here so
-/// this can be exercised directly in tests/dev without a certificate).
+/// Serve the browser channel-join listener on `listen` with its OWN standalone pairer
+/// (no cross-transport pairing with the `:443` front door) -- plain HTTP, put a
+/// TLS-terminating reverse proxy or the edge's own TLS listener in front in
+/// production; kept plain here so this can be exercised directly in tests/dev without
+/// a certificate.
 pub async fn serve_ws_channel(
     listen: std::net::SocketAddr,
     resolver: Arc<dyn ChannelMemberResolver>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = WsChannelState::new(resolver);
+    let state = WsChannelState::standalone(resolver);
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    axum::serve(listener, ws_channel_router(state)).await?;
+    Ok(())
+}
+
+/// Like [`serve_ws_channel`], but joins the shared cross-transport `pairer` (the
+/// `:443` front door's own channel broker uses the same one) instead of building a
+/// standalone one -- what `run_edge` wires up in production so a browser member and a
+/// `:443`/QUIC member of the same channel correlate and can pair with each other.
+pub async fn serve_ws_channel_with_pairer(
+    listen: std::net::SocketAddr,
+    resolver: Arc<dyn ChannelMemberResolver>,
+    pairer: crate::channel_broker::SharedChannelPairer,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let state = WsChannelState::new(resolver, pairer);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, ws_channel_router(state)).await?;
     Ok(())
@@ -377,7 +408,7 @@ mod tests {
             channel,
             holders: vec![alice_holder, bob_holder],
         });
-        let state = WsChannelState::new(resolver);
+        let state = WsChannelState::standalone(resolver);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -464,7 +495,7 @@ mod tests {
         let solo_holder = solo.verifying_key().to_bytes();
 
         let resolver = Arc::new(FixedResolver { operator_pubkey, channel, holders: vec![solo_holder] });
-        let state = WsChannelState::new(resolver);
+        let state = WsChannelState::standalone(resolver);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

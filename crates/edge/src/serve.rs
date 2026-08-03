@@ -575,13 +575,7 @@ type FrontDoorChannelStream = tokio_rustls::server::TlsStream<Prepend<tokio::net
 /// arm returns a clear error), so every non-channel front-door caller/test is unaffected.
 #[derive(Clone)]
 pub struct ChannelFrontDoor {
-    pairer: Arc<
-        std::sync::Mutex<
-            crate::channel_broker::ChannelPairer<
-                crate::channel_broker::AdmittedStreamMember<FrontDoorChannelStream>,
-            >,
-        >,
-    >,
+    pairer: crate::channel_broker::SharedChannelPairer,
     resolver: Arc<dyn ChannelMemberResolver>,
     /// The DEDICATED TLS acceptor the ChannelBroker arm terminates with (#118): a
     /// CA-issued leaf whose `ServerConfig` advertises the `ct-edge-channel` ALPN, so the
@@ -608,27 +602,35 @@ impl ChannelFrontDoor {
     /// caller gets it for free with no risk of forgetting to wire it up per front-door
     /// instance. Ticks at a fraction of the park TTL so an expired member is reaped promptly,
     /// not up to a full TTL late.
+    /// Build around an EXTERNALLY shared pairer (cross-transport pairing): the caller
+    /// ([`run_edge`]) constructs the pairer + spawns its reaper ONCE and shares it with
+    /// every transport that opts into channel brokering, so a browser member
+    /// (`ws_channel.rs`) and a `:443`/QUIC member of the same channel correlate through
+    /// the SAME pairer and can pair with each other.
     pub fn new(
         resolver: Arc<dyn ChannelMemberResolver>,
         acceptor: tokio_rustls::TlsAcceptor,
+        pairer: crate::channel_broker::SharedChannelPairer,
     ) -> Self {
-        let pairer: Arc<
-            std::sync::Mutex<
-                crate::channel_broker::ChannelPairer<
-                    crate::channel_broker::AdmittedStreamMember<FrontDoorChannelStream>,
-                >,
-            >,
-        > = Arc::new(std::sync::Mutex::new(crate::channel_broker::ChannelPairer::new()));
-        spawn_front_door_pairer_reaper(
-            pairer.clone(),
-            Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
-            unix_now,
-        );
         Self {
             pairer,
             resolver,
             acceptor,
         }
+    }
+
+    /// Like [`Self::new`], but builds its OWN standalone pairer + reaper instead of
+    /// taking a shared one — for tests/callers that don't need cross-transport pairing.
+    /// This is what `new` did unconditionally before cross-transport pairing existed.
+    #[cfg(test)]
+    pub fn standalone(resolver: Arc<dyn ChannelMemberResolver>, acceptor: tokio_rustls::TlsAcceptor) -> Self {
+        let pairer = crate::channel_broker::new_shared_channel_pairer();
+        spawn_front_door_pairer_reaper(
+            pairer.clone(),
+            Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
+            unix_now,
+        );
+        Self::new(resolver, acceptor, pairer)
     }
 }
 
@@ -866,7 +868,7 @@ pub async fn serve_front_door(
             // #127: a TLS-handshake failure at the dedicated channel-ALPN acceptor happens
             // BEFORE admission, so #124/#125's per-checkpoint logs never run — tag it so a
             // silent `Refused` (e.g. #103's) surfaces under `grep 'channel-join NO'`.
-            let tls = ctx
+            let tls: FrontDoorChannelStream = ctx
                 .acceptor
                 .accept(joined)
                 .await
@@ -882,8 +884,12 @@ pub async fn serve_front_door(
                 let resolver = resolver.clone();
                 async move { resolver.resolve_member(c, h).await }
             };
+            // Boxed into the shared cross-transport stream type (#XXX) so this `:443`
+            // member correlates through the SAME pairer a browser member
+            // (ws_channel.rs) offers itself to -- either can now be the partner.
+            let boxed: crate::channel_broker::BoxedChannelStream = Box::pin(tls);
             let paired = crate::channel_broker::admit_and_pair_on_stream(
-                tls,
+                boxed,
                 observed,
                 now,
                 CHANNEL_JOIN_TIMEOUT,
@@ -1793,6 +1799,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // the Portal, or a Browser-Plane tunnel (serve_front_door). Off unless
     // CT_FRONT_DOOR is set; additive, so direct :8090/:4433 keep working. This is
     // the single port agents/clients/browsers on :443-only networks reach.
+    // Cross-transport pairing (#XXX): populated below (inside the CT_FRONT_DOOR arm,
+    // where the `:443` channel broker's pairer is actually constructed) whenever
+    // channel brokering is enabled; the browser WebSocket listener further down
+    // (unconditional on CT_FRONT_DOOR -- it can run standalone) picks it up if
+    // present, so a `:443`/QUIC member and a browser member of the same channel
+    // correlate through one pairer and can pair with each other.
+    let mut shared_channel_pairer: Option<crate::channel_broker::SharedChannelPairer> = None;
     if let Ok(addr) = std::env::var("CT_FRONT_DOOR") {
         match addr.parse::<SocketAddr>() {
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
@@ -1875,6 +1888,8 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // members correlate through one pairer; hand a cloned-Arc context to each
                     // connection. Unset -> None (the ChannelBroker arm refuses with a clear
                     // "not configured" error). Mirrors the QUIC broker's opt-in style.
+                    // `shared_channel_pairer` (declared at the top of `run_edge`) is assigned
+                    // inside the match arm below, once channel brokering is confirmed enabled.
                     let channel_fd: Option<ChannelFrontDoor> = match (
                         std::env::var("CT_EDGE_CP_URL").ok().filter(|s| !s.is_empty()),
                         std::env::var("CT_EDGE_ADMIN_TOKEN")
@@ -1897,9 +1912,17 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 "ct-edge: front-door :443 channel broker active \
                                  (authorize via {cp_url}, #106; ct-edge-channel ALPN #118)"
                             );
+                            let pairer = crate::channel_broker::new_shared_channel_pairer();
+                            spawn_front_door_pairer_reaper(
+                                pairer.clone(),
+                                Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
+                                unix_now,
+                            );
+                            shared_channel_pairer = Some(pairer.clone());
                             Some(ChannelFrontDoor::new(
                                 std::sync::Arc::new(authorizer),
                                 channel_acceptor,
+                                pairer,
                             ))
                         }
                         _ => None,
@@ -2263,12 +2286,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let resolver: std::sync::Arc<dyn ChannelMemberResolver> = std::sync::Arc::new(
                     crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok),
                 );
+                // Cross-transport pairing (#XXX): reuse the SAME pairer the `:443` front
+                // door's channel broker uses (constructed above whenever CP_URL+ADMIN_TOKEN
+                // are set, which this branch already requires too) so a browser member and a
+                // `:443`/QUIC member of the same channel correlate and can pair with each
+                // other. Falls back to a standalone pairer only in the defensive case where
+                // this branch somehow runs without the front-door one having constructed it.
+                let pairer = shared_channel_pairer.clone().unwrap_or_else(|| {
+                    let p = crate::channel_broker::new_shared_channel_pairer();
+                    spawn_front_door_pairer_reaper(p.clone(), Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3), unix_now);
+                    p
+                });
                 eprintln!(
                     "ct-edge: browser (WebSocket) Agent-Fabric channel listener on {ws_addr} \
-                     (authorize via {cp_url})"
+                     (authorize via {cp_url}, cross-transport pairing with the :443 front door)"
                 );
                 tokio::spawn(async move {
-                    if let Err(e) = crate::ws_channel::serve_ws_channel(ws_addr, resolver).await {
+                    if let Err(e) = crate::ws_channel::serve_ws_channel_with_pairer(ws_addr, resolver, pairer).await {
                         eprintln!("ct-edge: ws-channel listener on {ws_addr} ended: {e}");
                     }
                 });
@@ -4220,7 +4254,7 @@ mod tests {
         // the two independently-arriving members correlate by ChannelId (cloning shares
         // the same Arc pairer + resolver + dedicated channel acceptor).
         let ctx =
-            ChannelFrontDoor::new(Arc::new(MockResolver { operator, channel }), channel_acceptor);
+            ChannelFrontDoor::standalone(Arc::new(MockResolver { operator, channel }), channel_acceptor);
 
         let state = Arc::new(EdgeState::<Connection>::new());
         let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
