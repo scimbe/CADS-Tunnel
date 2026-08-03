@@ -31,6 +31,7 @@ use std::time::Duration;
 pub struct ConnectionCap {
     sem: Arc<Semaphore>,
     shed: Arc<AtomicU64>,
+    max: usize,
 }
 
 impl ConnectionCap {
@@ -39,7 +40,25 @@ impl ConnectionCap {
         Self {
             sem: Arc::new(Semaphore::new(max)),
             shed: Arc::new(AtomicU64::new(0)),
+            max,
         }
+    }
+
+    /// The configured capacity this cap was built with (for metrics -- `available()`
+    /// alone can't tell a caller how many of that budget are currently in use).
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Connections currently in use (`max` minus free slots).
+    pub fn in_use(&self) -> usize {
+        self.max.saturating_sub(self.available())
+    }
+
+    /// Total sheds recorded so far (read-only -- unlike [`Self::note_shed`], which
+    /// also increments the counter).
+    pub fn shed_total(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
     }
 
     /// Try to admit one connection: `Some(permit)` when below the cap (hold it for
