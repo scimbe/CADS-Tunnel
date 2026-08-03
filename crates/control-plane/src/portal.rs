@@ -676,12 +676,19 @@ const ACCESS_DENIED_HTML: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CADS-Tunnel — access not permitted</title>
 <style>
- body{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
+ :root{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
       display:flex;min-height:100vh;align-items:center;justify-content:center}
- .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;max-width:480px}
- h1{font-size:1.3rem;margin:.2rem 0 1rem} p{color:#8b949e;font-size:.95rem;line-height:1.5}
- a.btn{display:inline-block;margin-top:1.4rem;background:#21262d;color:#e6edf3;text-decoration:none;
-       padding:.55rem 1.1rem;border-radius:8px;border:1px solid #30363d} a.btn:hover{background:#30363d}
+ .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px;
+       animation:cardIn .32s ease-out}
+ @keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+ h1{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}
+ p{color:var(--muted);font-size:.95rem;line-height:1.5}
+ a.btn{display:inline-block;margin-top:1.4rem;background:var(--accent);color:var(--accent-ink);text-decoration:none;
+       padding:.55rem 1.1rem;border-radius:8px;border:0;font-weight:600;transition:background .15s ease,transform .08s ease}
+ a.btn:hover{background:#e39a63} a.btn:active{transform:scale(.96)}
+ @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
 </style></head><body>
 <div class="card">
  <h1>You're not on the access list</h1>
@@ -875,17 +882,29 @@ fn home_html(subject: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CADS-Tunnel — your account</title>
 <style>
- body{{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-hover:#e39a63;--accent-ink:#20130a;--accent2:#5fb8ab;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
       display:flex;min-height:100vh;align-items:center;justify-content:center}}
- .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2.5rem;max-width:480px}}
- h1{{font-size:1.3rem;margin:.2rem 0 1rem}} .sub{{color:#8b949e;font-size:.9rem;word-break:break-all}}
- a.btn{{display:inline-block;margin-top:1.4rem;background:#21262d;color:#e6edf3;text-decoration:none;
-       padding:.55rem 1.1rem;border-radius:8px;border:1px solid #30363d}} a.btn:hover{{background:#30363d}}
- a.pri{{background:#238636;border-color:#238636;color:#fff;margin-right:.6rem}} a.pri:hover{{background:#2ea043}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px;
+       animation:cardIn .32s ease-out}}
+ @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
+ @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.45rem;margin:.2rem 0 .5rem}}
+ .sub{{color:var(--muted);font-size:.9rem;word-break:break-all;display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem}}
+ .sub i{{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent2);
+        animation:pulse 1.6s ease-in-out infinite;flex-shrink:0}}
+ a.btn{{display:inline-block;margin-top:1.4rem;background:#21262d;color:var(--text);text-decoration:none;
+       padding:.55rem 1.1rem;border-radius:8px;border:1px solid var(--border);transition:background .15s ease,transform .08s ease}}
+ a.btn:hover{{background:#30363d}} a.btn:active{{transform:scale(.96)}}
+ a.pri{{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);margin-right:.6rem;font-weight:600}}
+ a.pri:hover{{background:var(--accent-hover)}}
+ @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
 </style></head><body>
 <div class="card">
  <h1>Signed in</h1>
- <div class="sub">Subject: {subject}</div>
+ <div class="sub"><i></i>Subject: {subject}</div>
  <a class="btn pri" href="/portal/tunnels">Manage tunnels &rarr;</a>
  <a class="btn" href="/portal/logout">Sign out</a>
 </div>
@@ -964,37 +983,49 @@ const PORTAL_HTML_HEAD: &str = r#"<!doctype html>
     and .../account/resources/css/ct-account.css exactly (no shared build step
     across the Rust binary and the Keycloak theme, so these four copies are
     kept in sync by hand -- diff them if this page ever looks "bolted together"
-    against the others again). */
+    against the others again). Pulled from the landing page's own actual brand
+    (bunsenbrenner.org: warm orange primary, teal secondary, serif display type) --
+    not invented here, and not the generic GitHub-dark blue/green this page used
+    before. */
  :root{--bg:#0e1116;--panel:#161b22;--border:#30363d;--border2:#3d4551;--text:#e6edf3;--muted:#8b949e;
-       --accent:#58a6ff;--accent-hover:#79c0ff;--primary:#238636;--primary-hover:#2ea043}
+       --accent2:#5fb8ab;--accent2-hover:#7cc9bd;--primary:#d98a4f;--primary-hover:#e39a63;--primary-ink:#20130a;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}
  *{box-sizing:border-box}
  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);
       color:var(--text);display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}
  .card{background:linear-gradient(180deg,#1c2128,var(--panel));border:1px solid var(--border);border-radius:14px;
        padding:2.3rem 2.1rem;max-width:400px;width:100%;animation:cardIn .32s ease-out}
  @keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
- .back{display:inline-block;margin-bottom:1.2rem;color:var(--accent);font-size:.85rem;text-decoration:none;
+ @keyframes flameGlow{0%,100%{filter:drop-shadow(0 0 2px rgba(217,138,79,.15))}50%{filter:drop-shadow(0 0 7px rgba(217,138,79,.55))}}
+ @keyframes itemIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+ .back{display:inline-block;margin-bottom:1.2rem;color:var(--accent2);font-size:.85rem;text-decoration:none;
        transition:color .15s ease}
- .back:hover{color:var(--accent-hover)}
- h1{font-size:1.35rem;margin:.2rem 0 .35rem} .sub{color:var(--muted);font-size:.9rem;margin-bottom:1.6rem}
+ .back:hover{color:var(--accent2-hover)}
+ h1{font-family:var(--serif);font-weight:600;font-size:1.5rem;margin:.2rem 0 .4rem;letter-spacing:-.01em}
+ h1 .flame{display:inline-block;animation:flameGlow 2.4s ease-in-out infinite}
+ .sub{color:var(--muted);font-size:.9rem;margin-bottom:1.6rem}
  .providers{display:flex;flex-direction:column;gap:.65rem;margin-bottom:1.2rem}
  a.provider{display:flex;align-items:center;gap:.7rem;background:#0d1117;border:1px solid var(--border);
    border-radius:9px;padding:.7rem 1rem;color:var(--text);text-decoration:none;font-weight:600;font-size:.92rem;
-   transition:border-color .15s ease,background .15s ease}
- a.provider:hover{border-color:var(--border2);background:#1c2128}
+   transition:border-color .15s ease,background .15s ease,transform .08s ease;
+   animation:itemIn .3s ease-out backwards}
+ a.provider:nth-of-type(1){animation-delay:60ms} a.provider:nth-of-type(2){animation-delay:100ms}
+ a.provider:nth-of-type(3){animation-delay:140ms}
+ a.provider:hover{border-color:var(--border2);background:#1c2128;transform:translateY(-1px)}
  a.provider svg{width:1.1rem;height:1.1rem;flex-shrink:0}
  .divider{display:flex;align-items:center;gap:.7rem;color:var(--muted);font-size:.74rem;text-transform:uppercase;
    letter-spacing:.05em;margin:.9rem 0}
  .divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--border)}
- a.btn-email{display:block;text-align:center;background:var(--primary);color:#fff;text-decoration:none;padding:.7rem 1.4rem;
-       border-radius:9px;font-weight:600;transition:background .15s ease,transform .08s ease}
+ a.btn-email{display:block;text-align:center;background:var(--primary);color:var(--primary-ink);text-decoration:none;padding:.7rem 1.4rem;
+       border-radius:9px;font-weight:600;transition:background .15s ease,transform .08s ease;
+       animation:itemIn .3s ease-out backwards;animation-delay:180ms}
  a.btn-email:hover{background:var(--primary-hover)} a.btn-email:active{transform:scale(.97)}
  .foot{color:var(--muted);font-size:.8rem;margin-top:1.6rem;text-align:center}
  @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
 </style></head><body>
 <div class="card">
  <a class="back" href="/">&larr; bunsenbrenner.org</a>
- <h1>&#128293; Sign in or create an account</h1>
+ <h1><span class="flame">&#128293;</span> Sign in or create an account</h1>
  <div class="sub">One account for your tunnels, pipelines, and agents.</div>
 
  "#;

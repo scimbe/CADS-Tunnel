@@ -1118,8 +1118,8 @@ fn tunnels_html(
             // -- absent (edge unreachable, or CT_CP_EDGE_ADMIN_URL not configured)
             // renders nothing rather than a misleading "offline"/"0 B".
             let status_badge = match status {
-                Some(s) if s.connected => r#" <span class="tier" style="color:#3fb950">🟢 Connected</span>"#.to_string(),
-                Some(_) => r#" <span class="tier" style="color:#8b949e">⚪ Not connected</span>"#.to_string(),
+                Some(s) if s.connected => r#" <span class="tier"><i class="status-dot live"></i>Connected</span>"#.to_string(),
+                Some(_) => r#" <span class="tier"><i class="status-dot off"></i>Not connected</span>"#.to_string(),
                 None => String::new(),
             };
             let bytes_line = match status {
@@ -1200,6 +1200,14 @@ fn redact_routing_tokens(s: &str) -> String {
 
 /// Shared page chrome: dark card layout, a title and body. `body` is trusted
 /// (built from escaped parts by the caller).
+///
+/// Brand tokens match the landing page (bunsenbrenner.org's own hero/nav) --
+/// see docs/design/tokens.md. #337's own pass unified this page, the Keycloak
+/// login form, and the account console to EACH OTHER, but never cross-checked
+/// against the landing page's actual established identity (warm orange
+/// `--accent`, teal `--accent2`, serif headings, the pulsing live-dot motif) --
+/// so the "unified" result was still just generic dark-mode blue/green,
+/// disconnected from the one surface with a real brand. Fixed here.
 pub(crate) fn page(title: &str, body: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -1207,33 +1215,61 @@ pub(crate) fn page(title: &str, body: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CADS-Tunnel — {title}</title>
 <style>
- body{{font-family:system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-hover:#e39a63;--accent-ink:#20130a;
+       --accent2:#5fb8ab;--accent2-hover:#7cc9bd;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
       display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:3rem 1rem}}
- .card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;max-width:640px;width:100%;
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:640px;width:100%;
       animation:cardIn .32s ease-out}}
  @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
  @keyframes checkIn{{0%{{opacity:0;transform:scale(.85)}}60%{{opacity:1;transform:scale(1.03)}}100%{{transform:scale(1)}}}}
- h1{{font-size:1.3rem;margin:.1rem 0 1rem}} h2{{font-size:1rem;color:#8b949e;margin:1.4rem 0 .6rem}}
+ @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+ h1,h2{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
+ h1{{font-size:1.55rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.05rem;color:var(--muted);margin:1.5rem 0 .6rem}}
  .row{{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.25rem 1rem;padding:.5rem 0;border-bottom:1px solid #21262d;
-      transition:background .15s ease}}
+      transition:background .15s ease;animation:rowIn .28s ease-out backwards}}
  .row:hover{{background:#1c222b}}
- .k{{color:#8b949e;flex-shrink:0}} .v{{word-break:break-all;min-width:0}}
- nav a{{color:#58a6ff;text-decoration:none;margin-right:1rem;font-size:.9rem;transition:color .15s ease}}
- nav a:hover{{color:#79c0ff}} nav{{margin-bottom:1.2rem}}
- a.btn,button{{background:#238636;color:#fff;border:0;border-radius:8px;padding:.5rem 1rem;
-      font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;
-      transition:background .15s ease,transform .08s ease,opacity .15s ease}}
- a.btn:hover,button:hover{{background:#2ea043}} a.btn:active,button:active{{transform:scale(.96)}}
- a.btn.sec,button.sec{{background:#21262d;border:1px solid #30363d;color:#e6edf3;font-weight:500}}
+ @keyframes rowIn{{from{{opacity:0;transform:translateX(-4px)}}to{{opacity:1;transform:translateX(0)}}}}
+ /* A light stagger across the first several rows reads as a deliberate reveal
+    rather than the whole list popping in at once -- capped so a long tunnel
+    list doesn't end with a visibly-delayed tail. */
+ .row:nth-child(1){{animation-delay:0ms}} .row:nth-child(2){{animation-delay:30ms}}
+ .row:nth-child(3){{animation-delay:60ms}} .row:nth-child(4){{animation-delay:90ms}}
+ .row:nth-child(n+5){{animation-delay:120ms}}
+ .k{{color:var(--muted);flex-shrink:0}} .v{{word-break:break-all;min-width:0}}
+ nav a{{color:var(--accent2);text-decoration:none;margin-right:1rem;font-size:.9rem;transition:color .15s ease}}
+ nav a:hover{{color:var(--accent2-hover)}} nav{{margin-bottom:1.2rem}}
+ a.btn,button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;padding:.5rem 1rem;
+      font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;position:relative;overflow:hidden;
+      transition:background .15s ease,transform .08s ease,opacity .15s ease,box-shadow .2s ease}}
+ a.btn:hover,button:hover{{background:var(--accent-hover)}} a.btn:active,button:active{{transform:scale(.96)}}
+ a.btn:focus-visible,button:focus-visible{{outline:none;box-shadow:0 0 0 3px rgba(217,138,79,.35)}}
+ /* A quick diagonal shine sweep on the primary CTA only -- one small, tasteful
+    flourish rather than motion everywhere; skipped entirely for .sec/.danger
+    so secondary actions stay visually quiet. */
+ a.btn::before,button::before{{content:"";position:absolute;inset:0;
+      background:linear-gradient(115deg,transparent 20%,rgba(255,255,255,.35) 45%,transparent 70%);
+      transform:translateX(-120%);transition:transform .5s ease}}
+ a.btn:hover::before,button:hover::before{{transform:translateX(120%)}}
+ a.btn.sec::before,button.sec::before,a.btn.danger::before,button.danger::before{{display:none}}
+ a.btn.sec,button.sec{{background:#21262d;border:1px solid var(--border);color:var(--text);font-weight:500}}
  a.btn.sec:hover,button.sec:hover{{background:#30363d}}
  a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
  a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
  .deleted-check{{animation:checkIn .45s ease-out}}
+ /* The connection-status indicator (was a raw 🟢/⚪ emoji before this pass) --
+    same pulsing-dot motif the landing page uses for its own "live" markers. A
+    dead/idle tunnel doesn't pulse (no activity to signal); a live one does. */
+ .status-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:.45rem;vertical-align:middle}}
+ .status-dot.live{{background:var(--accent2);animation:pulse 1.6s ease-in-out infinite}}
+ .status-dot.off{{background:var(--muted)}}
  @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
- input,select{{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:.5rem;font:inherit;
+ input,select{{background:#0d1117;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:.5rem;font:inherit;
       transition:border-color .15s ease}}
- input:focus,select:focus{{outline:none;border-color:#58a6ff}}
- code{{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:.15rem .4rem}}
+ input:focus,select:focus{{outline:none;border-color:var(--accent2)}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.15rem .4rem}}
  form.inline{{display:inline}}
  label{{display:block;margin:.85rem 0;font-size:.9rem}}
  label input{{display:block;margin-top:.3rem;width:100%;max-width:360px}}

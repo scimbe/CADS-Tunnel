@@ -2,7 +2,10 @@
    own pages (crates/control-plane/src/portal_api.rs `page()`) already use, so
    moving between the portal, sign-in, and "Manage your sign-in" reads as one
    product. See docs/design/tokens.md for the canonical values this file (and
-   the other three sign-in-journey surfaces) each hardcode their own copy of. */
+   the other three sign-in-journey surfaces) each hardcode their own copy of.
+   Palette is the landing page's own real brand: warm orange primary, teal
+   secondary, serif display type -- not the generic GitHub-dark blue/green
+   this theme shipped with before. */
 
 :root,
 .pf-v5-t-dark {
@@ -11,15 +14,16 @@
   --ct-border: #30363d;
   --ct-text: #e6edf3;
   --ct-muted: #8b949e;
-  /* --ct-accent (blue) is nav/links/focus only; --ct-primary (green) is the
-     actual primary-action button color, matching every other primary CTA in
-     the sign-in journey (portal pre-login "Continue with email", the login
-     form's submit, the dashboard's `.btn`) -- was blue here before, the one
-     real color inconsistency in an otherwise-matching palette. */
-  --ct-accent: #58a6ff;
-  --ct-accent-hover: #79c0ff;
-  --ct-primary: #238636;
-  --ct-primary-hover: #2ea043;
+  --ct-serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  /* --ct-accent (teal) is nav/links/focus only; --ct-primary (orange, dark
+     ink text) is the actual primary-action button color, matching every
+     other primary CTA in the sign-in journey (portal pre-login "Continue
+     with email", the login form's submit, the dashboard's `.btn`). */
+  --ct-accent: #5fb8ab;
+  --ct-accent-hover: #7cc9bd;
+  --ct-primary: #d98a4f;
+  --ct-primary-hover: #e39a63;
+  --ct-primary-ink: #20130a;
 
   --pf-v5-global--BackgroundColor--100: var(--ct-bg);
   --pf-v5-global--BackgroundColor--dark-100: var(--ct-bg);
@@ -38,6 +42,12 @@
   --pf-v5-global--link--Color--dark: var(--ct-accent);
   --pf-v5-global--link--Color--hover: var(--ct-accent-hover);
   --pf-v5-global--active-color--100: var(--ct-accent);
+}
+
+.pf-v5-c-page__main-section h1,
+.pf-v5-c-page__main-section h2,
+.pf-v5-c-title {
+  font-family: var(--ct-serif);
 }
 
 html,
@@ -78,7 +88,7 @@ input.pf-v5-c-form-control {
   transition: background-color .15s ease, color .15s ease;
 }
 .pf-v5-c-nav__link:hover {
-  background-color: rgba(88, 166, 255, .1);
+  background-color: rgba(95, 184, 171, .1);
   color: var(--ct-accent-hover);
 }
 .pf-v5-c-nav__link.pf-m-current {
@@ -88,13 +98,28 @@ input.pf-v5-c-form-control {
 
 .pf-v5-c-button.pf-m-primary {
   background-color: var(--ct-primary);
+  color: var(--ct-primary-ink);
+  font-weight: 600;
   transition: background-color .15s ease, transform .08s ease;
+  position: relative;
+  overflow: hidden;
 }
 .pf-v5-c-button.pf-m-primary:hover {
   background-color: var(--ct-primary-hover);
 }
 .pf-v5-c-button.pf-m-primary:active {
   transform: scale(.97);
+}
+.pf-v5-c-button.pf-m-primary::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, transparent 20%, rgba(255, 255, 255, .35) 45%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform .5s ease;
+}
+.pf-v5-c-button.pf-m-primary:hover::before {
+  transform: translateX(120%);
 }
 
 /* Entrance motion -- this console previously had zero page-load animation,

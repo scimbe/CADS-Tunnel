@@ -5,7 +5,10 @@
    journey reads as one product instead of four. No DOM/id changes --
    #username/#password/#kc-login are untouched. See docs/design/tokens.md for
    the canonical values -- these four files each hardcode their own copy (no
-   shared build step across the Rust binary and this static Keycloak theme). */
+   shared build step across the Rust binary and this static Keycloak theme).
+   Palette is the landing page's own real brand (bunsenbrenner.org's hero/nav):
+   warm orange primary, teal secondary, serif display type -- replacing the
+   generic GitHub-dark blue/green this theme shipped with before. */
 
 :root {
   --ct-bg: #0e1116;
@@ -13,16 +16,21 @@
   --ct-border: #30363d;
   --ct-text: #e6edf3;
   --ct-muted: #8b949e;
-  /* --ct-accent (blue) is for links/focus only; the primary CTA button below
-     uses --ct-primary (green) -- the same two-accent split the portal
-     dashboard already used correctly (`page()`'s nav links vs. its `.btn`).
-     Previously this button was blue, the one real color inconsistency between
-     "the primary action on this page" and every other primary action across
-     the other three surfaces. */
-  --ct-accent: #58a6ff;
-  --ct-accent-hover: #79c0ff;
-  --ct-primary: #238636;
-  --ct-primary-hover: #2ea043;
+  --ct-serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  /* --ct-accent (teal) is for links/focus only; the primary CTA button below
+     uses --ct-primary (orange, with dark ink text -- matches the landing
+     page's own button convention) -- the same two-accent split the portal
+     dashboard already uses (`page()`'s nav links vs. its `.btn`). */
+  --ct-accent: #5fb8ab;
+  --ct-accent-hover: #7cc9bd;
+  --ct-primary: #d98a4f;
+  --ct-primary-hover: #e39a63;
+  --ct-primary-ink: #20130a;
+}
+
+#kc-header-wrapper,
+h1, h2, #kc-page-title {
+  font-family: var(--ct-serif);
 }
 
 html,
@@ -103,13 +111,31 @@ a:hover {
 .pf-c-button.pf-m-primary {
   background-color: var(--ct-primary) !important;
   border-color: var(--ct-primary) !important;
+  color: var(--ct-primary-ink) !important;
+  font-weight: 600;
   transition: background-color .15s ease, transform .08s ease;
+  position: relative;
+  overflow: hidden;
 }
 .pf-c-button.pf-m-primary:hover {
   background-color: var(--ct-primary-hover) !important;
 }
 .pf-c-button.pf-m-primary:active {
   transform: scale(.97);
+}
+/* Same small shine-sweep flourish as the portal's own primary CTA
+   (crates/control-plane/src/portal_api.rs `page()`) -- one deliberate touch of
+   motion on the single most important click on this page. */
+.pf-c-button.pf-m-primary::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, transparent 20%, rgba(255, 255, 255, .35) 45%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform .5s ease;
+}
+.pf-c-button.pf-m-primary:hover::before {
+  transform: translateX(120%);
 }
 
 .alert,
