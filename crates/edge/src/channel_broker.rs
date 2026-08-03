@@ -2331,6 +2331,140 @@ mod tests {
         assert_eq!(snk_task.await.expect("snk"), 0x33, "the transport-B member got transport-A's byte");
     }
 
+    /// One member's full admission handshake over an in-memory duplex, ending with
+    /// one application byte exchanged post-pairing -- the shared body every member
+    /// task in the room test below runs, parameterized by its own stream/request/
+    /// key/send-byte so that test stays readable as "which participant, which pair,
+    /// which byte" instead of repeating the handshake six times inline.
+    async fn room_member_roundtrip(
+        mut stream: tokio::io::DuplexStream,
+        req: ChannelJoinRequest,
+        holder_sk: SigningKey,
+        send_byte: u8,
+    ) -> u8 {
+        let rb = req.encode();
+        stream.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+        stream.write_all(&rb).await.expect("req");
+        let mut ch = [0u8; 32];
+        stream.read_exact(&mut ch).await.expect("challenge");
+        stream.write_all(&holder_sk.sign(&ch).to_bytes()).await.expect("sig");
+        let ack = read_relay_ack_line(&mut stream).await;
+        assert!(ack.starts_with(b"OK"), "got {:?}", String::from_utf8_lossy(&ack));
+        stream.write_all(&[send_byte]).await.expect("send");
+        let mut g = [0u8; 1];
+        stream.read_exact(&mut g).await.expect("recv");
+        let _ = stream.shutdown().await;
+        g[0]
+    }
+
+    #[tokio::test]
+    async fn a_three_person_room_pairs_its_three_pairwise_channels_concurrently_without_cross_talk() {
+        // ADR-0023 (video-conferencing multicast/room fan-out): a room is full mesh --
+        // C(N,2) independent PAIRWISE channels through ONE shared pairer, never a
+        // server-side fan-out. For 3 participants (Alice, Bob, Carol) that's 3
+        // pairwise channels (A-B, B-C, A-C). This proves the concrete claim ADR-0023
+        // rests on: all 3 channels' admissions INTERLEAVED (not grouped by channel --
+        // A-B's first member, then B-C's first, then A-C's first, THEN each channel's
+        // second member, closing them in a different order again) still correlate
+        // and pair EXACTLY the right two holders per channel, with each pair's relay
+        // traffic staying isolated from the other two pairs -- through the exact
+        // SharedChannelPairer type both ws_channel.rs (browser) and the `:443` front
+        // door (native) already use in production, so this is a direct proof a real
+        // room, mixing transports, would behave correctly.
+        let pk = operator_pubkey();
+        let chan_ab = [0xABu8; 32];
+        let chan_bc = [0xBCu8; 32];
+        let chan_ac = [0xACu8; 32];
+        let alice = holder_sk(0xA1);
+        let bob = holder_sk(0xB2);
+        let carol = holder_sk(0xC3);
+
+        let req = |channel: [u8; 32], holder: &SigningKey| ChannelJoinRequest {
+            grant: grant_h(channel, holder, Direction::Both, 1_000),
+            endpoint: "relay-only".to_string(),
+        };
+
+        let (c_ab_a, s_ab_a) = tokio::io::duplex(4096); // Alice's leg of A-B
+        let (c_ab_b, s_ab_b) = tokio::io::duplex(4096); // Bob's leg of A-B
+        let (c_bc_b, s_bc_b) = tokio::io::duplex(4096); // Bob's leg of B-C
+        let (c_bc_c, s_bc_c) = tokio::io::duplex(4096); // Carol's leg of B-C
+        let (c_ac_a, s_ac_a) = tokio::io::duplex(4096); // Alice's leg of A-C
+        let (c_ac_c, s_ac_c) = tokio::io::duplex(4096); // Carol's leg of A-C
+
+        let t_ab_a = tokio::spawn(room_member_roundtrip(c_ab_a, req(chan_ab, &alice), alice.clone(), 0xA0));
+        let t_ab_b = tokio::spawn(room_member_roundtrip(c_ab_b, req(chan_ab, &bob), bob.clone(), 0xB0));
+        let t_bc_b = tokio::spawn(room_member_roundtrip(c_bc_b, req(chan_bc, &bob), bob.clone(), 0xB1));
+        let t_bc_c = tokio::spawn(room_member_roundtrip(c_bc_c, req(chan_bc, &carol), carol.clone(), 0xC1));
+        let t_ac_a = tokio::spawn(room_member_roundtrip(c_ac_a, req(chan_ac, &alice), alice.clone(), 0xA2));
+        let t_ac_c = tokio::spawn(room_member_roundtrip(c_ac_c, req(chan_ac, &carol), carol.clone(), 0xC2));
+
+        let pairer: SharedChannelPairer = new_shared_channel_pairer();
+        let authorize = move |c: ChannelId, _h: [u8; 32]| async move {
+            (c.0 == chan_ab || c.0 == chan_bc || c.0 == chan_ac).then_some((pk, None, None))
+        };
+        let obs: std::net::SocketAddr = "203.0.113.9:9001".parse().unwrap();
+
+        // Admit all 6 members CONCURRENTLY, deliberately interleaved across the three
+        // channels (not grouped) -- each admit_and_pair_on_stream call is its own
+        // task, so the real ordering is whatever the executor happens to schedule,
+        // exactly like 3 browser tabs' WebSocket connections racing in on a real edge.
+        async fn admit(
+            stream: tokio::io::DuplexStream,
+            obs: std::net::SocketAddr,
+            authorize: impl Fn(ChannelId, [u8; 32]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send>>
+                + Send
+                + Sync
+                + 'static,
+            pairer: SharedChannelPairer,
+        ) -> Option<(AdmittedStreamMember<BoxedChannelStream>, AdmittedStreamMember<BoxedChannelStream>)> {
+            let boxed: BoxedChannelStream = Box::pin(stream);
+            admit_and_pair_on_stream(boxed, obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+                .await
+                .expect("admission")
+        }
+        // A boxed, cloneable authorize closure so each spawned admit task can own one.
+        let authorize_dyn = move |c: ChannelId, h: [u8; 32]| -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send>> {
+            Box::pin(authorize(c, h))
+        };
+        let a_ab_a = { let p = pairer.clone(); let f = authorize_dyn.clone(); tokio::spawn(async move { admit(s_ab_a, obs, f, p).await }) };
+        let a_bc_b = { let p = pairer.clone(); let f = authorize_dyn.clone(); tokio::spawn(async move { admit(s_bc_b, obs, f, p).await }) };
+        let a_ac_a = { let p = pairer.clone(); let f = authorize_dyn.clone(); tokio::spawn(async move { admit(s_ac_a, obs, f, p).await }) };
+        // Give the three first-arrivals above a moment to park before the seconds
+        // arrive, so this genuinely exercises "3 different lone waiters parked at
+        // once" (not just a race that happens to resolve either way).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(pairer.lock().unwrap().len(), 3, "all three channels' first arrivals are parked simultaneously");
+
+        let a_ab_b = { let p = pairer.clone(); let f = authorize_dyn.clone(); tokio::spawn(async move { admit(s_ab_b, obs, f, p).await }) };
+        let a_ac_c = { let p = pairer.clone(); let f = authorize_dyn.clone(); tokio::spawn(async move { admit(s_ac_c, obs, f, p).await }) };
+        let a_bc_c = { let p = pairer.clone(); let f = authorize_dyn.clone(); tokio::spawn(async move { admit(s_bc_c, obs, f, p).await }) };
+
+        let (r_ab_a, r_bc_b, r_ac_a, r_ab_b, r_ac_c, r_bc_c) =
+            tokio::join!(a_ab_a, a_bc_b, a_ac_a, a_ab_b, a_ac_c, a_bc_c);
+        assert!(pairer.lock().unwrap().is_empty(), "every parked member found its own pair, none left waiting");
+
+        // Exactly one of each pair's two admit calls carries the real Some((a, b));
+        // the other necessarily returned None (it was the one that parked).
+        let pair_ab = r_ab_a.unwrap().or(r_ab_b.unwrap()).expect("A-B paired");
+        let pair_bc = r_bc_b.unwrap().or(r_bc_c.unwrap()).expect("B-C paired");
+        let pair_ac = r_ac_a.unwrap().or(r_ac_c.unwrap()).expect("A-C paired");
+
+        tokio::join!(
+            async { finish_relay_pair_over_streams(pair_ab.0, pair_ab.1, 500).await.expect("A-B relay") },
+            async { finish_relay_pair_over_streams(pair_bc.0, pair_bc.1, 500).await.expect("B-C relay") },
+            async { finish_relay_pair_over_streams(pair_ac.0, pair_ac.1, 500).await.expect("A-C relay") },
+        );
+
+        // Each side got EXACTLY its own pairwise partner's byte -- never a byte from
+        // either of the other two pairs (the concrete proof there is no cross-talk).
+        assert_eq!(t_ab_a.await.unwrap(), 0xB0, "Alice's A-B leg got Bob's A-B byte");
+        assert_eq!(t_ab_b.await.unwrap(), 0xA0, "Bob's A-B leg got Alice's A-B byte");
+        assert_eq!(t_bc_b.await.unwrap(), 0xC1, "Bob's B-C leg got Carol's B-C byte");
+        assert_eq!(t_bc_c.await.unwrap(), 0xB1, "Carol's B-C leg got Bob's B-C byte");
+        assert_eq!(t_ac_a.await.unwrap(), 0xC2, "Alice's A-C leg got Carol's A-C byte");
+        assert_eq!(t_ac_c.await.unwrap(), 0xA2, "Carol's A-C leg got Alice's A-C byte");
+    }
+
     #[tokio::test]
     async fn read_join_on_connection_times_out_a_stalled_connection() {
         // #105: a client that completes the QUIC handshake but never opens a bi-stream
