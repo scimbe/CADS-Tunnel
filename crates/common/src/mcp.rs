@@ -402,14 +402,24 @@ pub fn register_auction_tools(
 }
 
 /// The stable slug naming a service's MCP tool (`service/<slug>`) — kept next to the registration so
-/// the tool name is one place, not derived from the serde rename.
-fn service_slug(service: crate::channel::ServiceType) -> &'static str {
+/// the tool name is one place, not derived from the serde rename. [`crate::channel::ServiceType::Custom`]
+/// (#382 follow-up) has no fixed slug, so its name is slugified (lowercased, non-alphanumeric ->
+/// `_`) into a valid tool-name segment instead. `pub` so a downstream role-filler (e.g. ct-agent's
+/// own `CT_AGENT_SERVICE_HANDLER_CMD` wiring) can derive the SAME slug for its own bookkeeping
+/// (e.g. a `CT_SERVICE_TYPE` env var) instead of maintaining a second, driftable copy of this match.
+pub fn service_slug(service: &crate::channel::ServiceType) -> std::borrow::Cow<'static, str> {
     use crate::channel::ServiceType::*;
     match service {
-        CodeGeneration => "code_generation",
-        SecurityReview => "security_review",
-        SafetyCheck => "safety_check",
-        TextGeneration => "text_generation",
+        CodeGeneration => "code_generation".into(),
+        SecurityReview => "security_review".into(),
+        SafetyCheck => "safety_check".into(),
+        TextGeneration => "text_generation".into(),
+        Custom(name) => name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+            .into(),
     }
 }
 
@@ -436,8 +446,8 @@ pub fn register_service_tools(
     handler: impl Fn(crate::channel::ServiceType, &str) -> Result<String, String> + Send + Sync + 'static,
 ) {
     let handler = std::sync::Arc::new(handler);
-    for &service in services {
-        let slug = service_slug(service);
+    for service in services.iter().cloned() {
+        let slug = service_slug(&service);
         let h = std::sync::Arc::clone(&handler);
         reg.register(
             format!("service/{slug}"),
@@ -455,7 +465,10 @@ pub fn register_service_tools(
                         MAX_SERVICE_INPUT_BYTES
                     ));
                 }
-                let output = h(service, input)?;
+                // ServiceType (#382 follow-up: gained a Custom(String) variant, so it's Clone but
+                // no longer Copy) -- this closure is called once per request, so clone the
+                // captured value in rather than moving it out on the first call only.
+                let output = h(service.clone(), input)?;
                 Ok(json!({ "output": output }))
             },
         );

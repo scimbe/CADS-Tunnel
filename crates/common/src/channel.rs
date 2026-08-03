@@ -1538,7 +1538,7 @@ impl CapacityKind {
 /// An offer with an **empty** `services` list is undeclared/generic (the opt-out — a generic offer
 /// stays valid); a provider that opts in advertises exactly the task types it serves (and registers
 /// one MCP tool per service — that tool-per-service wiring is the follow slice).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ServiceType {
     /// Generate code to a specification.
     CodeGeneration,
@@ -1548,16 +1548,34 @@ pub enum ServiceType {
     SafetyCheck,
     /// General text completion — the closest to a raw chat endpoint, so declaring it is explicit.
     TextGeneration,
+    /// An open-ended, pipeline-designer-declared service that doesn't fit the four fixed variants
+    /// above (#382 follow-up: generalizing `RequiredRole`/`convene()` beyond flappy/cookbook's
+    /// closed catalog for non-demo workflow pipelines — e.g. `"StaticAnalysis"`,
+    /// `"AndroidInstrumentedTest"`, `"CodeReview"`). Free-form, but matching is still an EXACT
+    /// string match between a [`crate::pipeline::RequiredRole::service`] and an offering agent's
+    /// [`CapacityOffer::services`] entry — same discipline every fixed variant already requires,
+    /// just without a core-crate code change per new pipeline-stage type. This is intentionally
+    /// still opt-in/schema-typed (the string names a task-TYPE, not a free-form instruction) —
+    /// #149-A.1's own abuse-mitigation rationale for a closed catalog applies just as much to an
+    /// open one: an agent still exposes exactly `service/<slug>` per declared entry, never a
+    /// generic completion proxy.
+    Custom(String),
 }
 
 impl ServiceType {
-    /// The one byte representing this service in the signing preimage (stable across serde renames).
-    fn tag(self) -> u8 {
+    /// The one byte representing this service KIND in the signing preimage (stable across serde
+    /// renames) -- for [`ServiceType::Custom`], this alone is NOT injective (every custom name
+    /// shares tag `4`); [`CapacityOffer::signing_bytes`] additionally length-prefixes the name
+    /// itself right after this byte for that variant, restoring injectivity. The four fixed
+    /// variants are byte-identical to before this existed -- no signature computed against them
+    /// changes.
+    fn tag(&self) -> u8 {
         match self {
             ServiceType::CodeGeneration => 0,
             ServiceType::SecurityReview => 1,
             ServiceType::SafetyCheck => 2,
             ServiceType::TextGeneration => 3,
+            ServiceType::Custom(_) => 4,
         }
     }
 }
@@ -1607,7 +1625,12 @@ impl CapacityOffer {
     /// Domain-separated, **canonical injective** preimage: `domain ‖ holder ‖ kind(u8) ‖ ⟨models⟩ ‖
     /// units_available(LE) ‖ min_price(LE) ‖ ⟨currency_id⟩ ‖ issued_at(LE) ‖ expires_at(LE) ‖
     /// ⟨services⟩`, every variable-length field length-prefixed (u32 LE count/byte-len) so no two
-    /// distinct offers share a preimage. `services` (#149-A.1) is appended as `count(u32 LE) ‖ ⟨tag⟩`.
+    /// distinct offers share a preimage. `services` (#149-A.1) is appended as `count(u32 LE) ‖
+    /// ⟨tag(u8) ‖ (Custom only: var_bytes(name))⟩` per entry — the four fixed variants are
+    /// byte-identical to before [`ServiceType::Custom`] existed (a lone tag byte, nothing after);
+    /// `Custom`'s tag byte (4) is shared by every custom name, so its own name is length-prefixed
+    /// right after to restore injectivity (two different custom names can never share a preimage,
+    /// same guarantee this whole preimage already gives every other field, #382 follow-up).
     #[allow(clippy::too_many_arguments)]
     pub fn signing_bytes(
         holder_pubkey: &[u8; 32],
@@ -1638,6 +1661,9 @@ impl CapacityOffer {
             .u32(services.len() as u32);
         for service in services {
             p = p.tag(service.tag());
+            if let ServiceType::Custom(name) = service {
+                p = p.var_bytes(name.as_bytes());
+            }
         }
         p.finish()
     }
@@ -2172,8 +2198,10 @@ pub struct CapacityBid {
 impl CapacityBid {
     /// Domain-separated, canonical injective preimage: `domain ‖ bidder ‖ kind(u8) ‖ ⟨model⟩ ‖
     /// units(LE) ‖ total_price(LE) ‖ issued_at(LE) ‖ expires_at(LE) ‖ terms_ack ‖ service`, `model`
-    /// length-prefixed. `terms_ack` (#149-A.5) and `service` (#149-A.1, `0` = none, else `1 ‖ tag`) are
-    /// appended so both are covered by the signature.
+    /// length-prefixed. `terms_ack` (#149-A.5) and `service` (#149-A.1, `0` = none, else `1 ‖ tag`,
+    /// with a [`ServiceType::Custom`] name length-prefixed right after its tag byte — same
+    /// injectivity fix as [`CapacityOffer::signing_bytes`], #382 follow-up) are appended so both
+    /// are covered by the signature.
     #[allow(clippy::too_many_arguments)]
     pub fn signing_bytes(
         bidder: &[u8; 32],
@@ -2197,8 +2225,14 @@ impl CapacityBid {
             .u64(issued_at)
             .u64(expires_at)
             .fixed(terms_ack);
-        match service {
-            Some(s) => p.tag(1).tag(s.tag()).finish(),
+        match &service {
+            Some(s) => {
+                let p = p.tag(1).tag(s.tag());
+                match s {
+                    ServiceType::Custom(name) => p.var_bytes(name.as_bytes()).finish(),
+                    _ => p.finish(),
+                }
+            }
             None => p.tag(0).finish(),
         }
     }
@@ -2220,7 +2254,7 @@ impl CapacityBid {
                         self.issued_at,
                         self.expires_at,
                         &self.terms_ack,
-                        self.service,
+                        self.service.clone(),
                     ),
                     &Signature::from_bytes(&self.signature),
                 )
@@ -2279,7 +2313,7 @@ impl CapacityBid {
         let bidder = signing_key.verifying_key().to_bytes();
         let signature = signing_key
             .sign(&Self::signing_bytes(
-                &bidder, kind, &model, units, total_price, issued_at, expires_at, &terms_ack, service,
+                &bidder, kind, &model, units, total_price, issued_at, expires_at, &terms_ack, service.clone(),
             ))
             .to_bytes();
         CapacityBid { bidder, kind, model, units, total_price, issued_at, expires_at, terms_ack, service, signature }
@@ -2359,8 +2393,8 @@ pub fn match_offer(offer: &CapacityOffer, bid: &CapacityBid, now: UnixSeconds) -
     // service. A bid with no service (`None`) is unconstrained (matches as before); a service-specific
     // bid against a generic (undeclared) or non-matching offer does NOT clear — the schema-typed
     // catalog is enforced at match time, not merely advertised.
-    if let Some(service) = bid.service {
-        if !offer.services.contains(&service) {
+    if let Some(service) = &bid.service {
+        if !offer.services.contains(service) {
             return None;
         }
     }
@@ -2897,6 +2931,50 @@ mod tests {
             CapacityBid::signing_bytes(&h, CapacityKind::CloudApiQuota, "m", 5, 500, 7, 9, &ta, None),
             e_none, "CapacityBid (None service) preimage drifted"
         );
+    }
+
+    #[test]
+    fn service_type_custom_preimage_stays_injective_and_the_four_fixed_variants_are_unchanged() {
+        // #382 follow-up: ServiceType gained Custom(String). Two things must both hold or the
+        // signing preimage's own "canonical injective" guarantee (the doc comment on every
+        // signing_bytes fn in this file) is broken:
+        // 1. The four PRE-EXISTING variants' encoding is byte-identical to before Custom existed
+        //    (a lone tag byte, nothing appended) -- no already-issued signature's verification
+        //    changes.
+        // 2. Two DIFFERENT Custom names never share a preimage (tag 4 alone is NOT injective --
+        //    the name itself must be length-prefixed right after it), the same guarantee every
+        //    other variable-length field in this preimage already has.
+        let h = [0x9au8; 32];
+
+        // (1) Fixed variants: exactly one byte per service, unchanged.
+        let fixed = CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &[], 1, 1, "c", 0, 10, &[ServiceType::CodeGeneration]);
+        assert_eq!(fixed.last(), Some(&0u8), "CodeGeneration's tag byte, nothing appended after it");
+        let empty = CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &[], 1, 1, "c", 0, 10, &[]);
+        assert_eq!(fixed.len(), empty.len() + 1, "a fixed variant appends EXACTLY one byte (its tag) to the services section");
+
+        // (2) Custom: two DIFFERENT names must never collide, even though both share tag 4.
+        let custom_a = CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &[], 1, 1, "c", 0, 10, &[ServiceType::Custom("StaticAnalysis".into())]);
+        let custom_b = CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &[], 1, 1, "c", 0, 10, &[ServiceType::Custom("AndroidInstrumentedTest".into())]);
+        assert_ne!(custom_a, custom_b, "two different Custom service names must not share a preimage");
+        assert!(custom_a.len() > empty.len() + 1, "a Custom variant appends its tag AND its length-prefixed name, more than a fixed variant's single byte");
+
+        // Boundary case: "ab"+"c" must not collide with "a"+"bc" for two Custom names in
+        // sequence -- the classic var-length-concatenation collision this whole preimage
+        // discipline exists to prevent, now exercised for the new variable-length variant too.
+        let boundary_1 = CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &[], 1, 1, "c", 0, 10, &[ServiceType::Custom("ab".into()), ServiceType::Custom("c".into())]);
+        let boundary_2 = CapacityOffer::signing_bytes(&h, CapacityKind::CloudApiQuota, &[], 1, 1, "c", 0, 10, &[ServiceType::Custom("a".into()), ServiceType::Custom("bc".into())]);
+        assert_ne!(boundary_1, boundary_2, "Custom names are length-prefixed, not just concatenated");
+
+        // A real signature over a Custom-service offer verifies correctly end to end.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x5eu8; 32]);
+        let offer = CapacityOffer::sign_new_with_services(
+            &sk, CapacityKind::CloudApiQuota, vec!["m".into()], 5, 10, "c".into(), 0, 1000,
+            vec![ServiceType::Custom("StaticAnalysis".into())],
+        );
+        assert!(offer.is_valid(50), "a real Custom-service offer signs and verifies correctly");
+        let mut tampered = offer.clone();
+        tampered.services = vec![ServiceType::Custom("SomethingElse".into())];
+        assert!(!tampered.is_valid(50), "swapping the Custom name after signing invalidates the signature");
     }
 
     #[test]
