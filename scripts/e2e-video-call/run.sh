@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Real end-to-end proof of the video-conferencing feature's channel-join + Noise +
-# WebRTC-signaling pipeline (see crates/agent-wasm/src/lib.rs, crates/edge/src/
-# ws_channel.rs). The browser-facing demo page that consumes these primitives now
-# lives in the separate scimbe/CADS-webconference-demo repo (a demo, not core
-# platform code); this script is CADS-Tunnel's own core regression test and stays
-# fully self-contained -- setup.js mints its own test grants locally (see its own
-# header comment) rather than depending on that repo's tooling.
+# WebRTC-signaling pipeline (see crates/edge/src/ws_channel.rs, and
+# scimbe/ct-agent's wasm/ -- ct-agent-wasm moved there as a sibling of the native
+# ct-agent binary, one shared ct-common version for both; it's ct-agent for the
+# browser, not CADS-Tunnel platform code, same reasoning that already moved the
+# demo page itself to scimbe/CADS-webconference-demo). This script is CADS-Tunnel's
+# own core regression test for ws_channel.rs/channel_broker.rs and stays fully
+# self-contained -- setup.js mints its own test grants locally (see its own header
+# comment) rather than depending on either external repo's own tooling; it only
+# clones ct-agent to get ct-agent-wasm's SOURCE (built here, not vendored).
 #
 # Two independent "browser peers" (Alice, Bob), each driving their OWN instance of
 # the actual compiled ct-agent-wasm module and a real WebSocket connection, join
@@ -34,31 +37,47 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Which scimbe/ct-agent commit to build ct-agent-wasm from -- the workspace
+# restructure that moved ct-agent-wasm in as a sibling of the native binary
+# (before this, ct-agent had no wasm/ member at all). Bump deliberately.
+CT_AGENT_REF="${CT_AGENT_REF:-b03f2ef}"
+
 docker run --rm -m 3g --cpus 2 \
   -v "$REPO_ROOT":/work -w /work \
   -v ct-tunnel-target:/work/target \
+  -v ct-e2e-video-call-agent-src:/agent-src \
+  -v ct-e2e-video-call-agent-target:/agent-target \
   -v ct-build-cargo-registry:/usr/local/cargo/registry \
   -v ct-build-rustup:/usr/local/rustup \
   -v ct-wasm-bindgen-cli:/usr/local/cargo/bin-wbg \
+  -e CT_AGENT_REF="$CT_AGENT_REF" \
   rust:1-slim bash -eu -o pipefail -c '
 set -euo pipefail
 export PATH=/usr/local/cargo/bin-wbg/bin:$PATH
+export CARGO_TARGET_DIR=/agent-target
 SCRIPTS=/work/scripts/e2e-video-call
 
 apt-get update -qq >/dev/null
-apt-get install -y -qq nodejs >/dev/null
+apt-get install -y -qq nodejs git >/dev/null
 
 echo "== building ct-edge =="
-cargo build -p ct-edge
+(cd /work && CARGO_TARGET_DIR=/work/target cargo build -p ct-edge)
+
+echo "== fetching scimbe/ct-agent@$CT_AGENT_REF (for ct-agent-wasm) =="
+if [ ! -d /agent-src/.git ]; then
+  git clone https://github.com/scimbe/ct-agent /agent-src
+fi
+git -C /agent-src fetch origin
+git -C /agent-src checkout "$CT_AGENT_REF"
 
 echo "== building ct-agent-wasm (wasm32) + JS glue =="
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1
-cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown
+(cd /agent-src && cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown)
 if ! command -v wasm-bindgen >/dev/null; then
   cargo install wasm-bindgen-cli --version 0.2.126 --root /usr/local/cargo/bin-wbg
 fi
 mkdir -p /tmp/e2e-pkg
-wasm-bindgen --target nodejs --out-dir /tmp/e2e-pkg target/wasm32-unknown-unknown/release/ct_agent_wasm.wasm
+wasm-bindgen --target nodejs --out-dir /tmp/e2e-pkg /agent-target/wasm32-unknown-unknown/release/ct_agent_wasm.wasm
 
 echo "== generating identities + minting grants =="
 WASM_PKG_DIR=/tmp/e2e-pkg node "$SCRIPTS/setup.js"
