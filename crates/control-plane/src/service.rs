@@ -3630,11 +3630,6 @@ const LANDING_HTML: &str = r#"<!doctype html>
     <div class="eyebrow">Self-hosted &middot; end-to-end encrypted</div>
     <h1>Better homemade ideas.</h1>
     <p class="lede">
-     But bunsenbrenner.org is far more than just a tunnel. It's the foundation for your decentralized
-     projects. One device is enough to start. Later, you effortlessly combine several machines once an
-     idea grows and demands more computing power.
-    </p>
-    <p class="lede">
      Whether you're connecting distributed edge-computing nodes, orchestrating autonomous AI agents, or
      wiring together protected microservices: you keep absolute control. Thanks to strict end-to-end
      encryption, absolutely nobody sees what's flowing through the connection — not even us.
