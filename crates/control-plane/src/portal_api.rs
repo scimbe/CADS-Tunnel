@@ -1014,11 +1014,15 @@ fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String
         // to reassure) -- it must appear ONLY in the Gelb warning, so a customer
         // (or a test) scanning for that exact phrase gets an unambiguous signal
         // of which tier they are actually in.
-        "gruen" => r#"<div class="tier tier-gruen">🟢 Grün &mdash; eigenes, vollständig eigenständiges
+        // Grün is the settled, final state -- its dot is solid, not pulsing (nothing
+        // left in flux). Rot/Gelb are both transitional (still being set up, or
+        // time-limited), so their dot pulses -- same "pulse means still in motion"
+        // rule as the connection-status dot in `page()`.
+        "gruen" => r#"<div class="tier tier-gruen"><i class="tier-dot"></i>Grün &mdash; eigenes, vollständig eigenständiges
  Zertifikat aktiv.</div>"#
             .to_string(),
         "rot" => {
-            r#"<div class="tier tier-rot">🔴 Rot &mdash; Ihre Subdomain wird gerade eingerichtet.</div>"#
+            r#"<div class="tier tier-rot"><i class="tier-dot pulse"></i>Rot &mdash; Ihre Subdomain wird gerade eingerichtet.</div>"#
                 .to_string()
         }
         _ /* gelb */ => {
@@ -1040,11 +1044,11 @@ fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String
                         None => String::new(),
                     };
                     format!(
-                        r#"<div class="tier tier-gelb">🟡 Gelb &mdash; Sie sind an der Reihe{deadline_note}.</div>{disclosure}"#
+                        r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; Sie sind an der Reihe{deadline_note}.</div>{disclosure}"#
                     )
                 }
                 "lapsed" => format!(
-                    r#"<div class="tier tier-gelb">🟡 Gelb &mdash; die Frist ist abgelaufen.</div>{disclosure}
+                    r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; die Frist ist abgelaufen.</div>{disclosure}
 <form class="inline" method="post" action="/portal/tunnels/{id}/reclaim-cert-slot">
  <button class="sec" type="submit">Erneut anfragen</button></form>"#
                 ),
@@ -1054,7 +1058,7 @@ fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String
                         None => String::new(),
                     };
                     format!(
-                        r#"<div class="tier tier-gelb">🟡 Gelb &mdash; bereits erreichbar{position_note}.</div>{disclosure}"#
+                        r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; bereits erreichbar{position_note}.</div>{disclosure}"#
                     )
                 }
             }
@@ -1279,6 +1283,8 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  ol.steps li{{margin:.35rem 0}} ol.steps strong{{color:#e6edf3}}
  .warn{{background:#3d1e00;border:1px solid #7d4e00;color:#f0c674;border-radius:8px;padding:.7rem .9rem;margin:1rem 0;font-size:.88rem;line-height:1.6}}
  .tier{{font-size:.85rem;margin:.2rem 0 .1rem}} .tier-rot{{color:#f85149}} .tier-gelb{{color:#f0c674}} .tier-gruen{{color:#3fb950}}
+ .tier-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:.45rem;vertical-align:middle}}
+ .tier-dot.pulse{{animation:pulse 1.6s ease-in-out infinite}}
  .warn code{{background:#2a1500;border-color:#7d4e00}} h2.muted{{color:#6e7681}}
  .btn.disabled,button:disabled,input:disabled{{opacity:.45;cursor:not-allowed;pointer-events:none}}
  .code-block{{margin:.6rem 0 1rem;border:1px solid #30363d;border-radius:8px;overflow:hidden;background:#0d1117}}
