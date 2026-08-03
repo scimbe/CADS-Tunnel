@@ -104,6 +104,7 @@ fn gate_router_with(
         .route("/gate/check", get(gate_check))
         .route("/gate/start", get(gate_start))
         .route("/gate/callback", get(gate_callback))
+        .route("/gate/logout", get(gate_logout))
         .with_state(state)
 }
 
@@ -385,6 +386,48 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
     }
 }
 
+#[derive(Deserialize)]
+struct LogoutQuery {
+    host: Option<String>,
+    #[serde(rename = "return")]
+    return_path: Option<String>,
+}
+
+/// `GET /gate/logout`: clears the `ct_gate_session` cookie -- the piece that
+/// was entirely missing before (#214-follow): `ct_gate_session` is HttpOnly by
+/// design (same reasoning as the portal's own session cookie), so no
+/// client-side JS on a gated page could ever clear it, and there was no
+/// server route to do it either. Logs the visitor out of **every** gated
+/// hostname at once (the cookie is shared across the whole `Domain=` zone by
+/// design -- see `gate_session_cookie`), matching how a single Keycloak SSO
+/// identity backs every gate session. Does **not** end the underlying
+/// Keycloak SSO session (unlike `/portal/logout`'s RP-Initiated Logout) --
+/// deliberately scoped to just this gate, since the same `ct-portal` Keycloak
+/// client also backs the portal login, and ending that SSO session here would
+/// silently log the visitor out of the portal too, a much bigger blast radius
+/// than "log out of this one gated demo" implies.
+async fn gate_logout(State(st): State<GateState>, Query(q): Query<LogoutQuery>) -> Response {
+    let Some(domain) = &st.cookie_domain else {
+        return gate_unconfigured();
+    };
+    let target = match q.host {
+        Some(host) => {
+            let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
+            format!("https://{host}{return_path}")
+        }
+        // No specific hostname given -- land on the control plane's own
+        // public host (the same one /gate/start's redirects resolve to),
+        // never a bare, hardcoded domain.
+        None => match st.oidc.as_ref().and_then(|cfg| gate_public_host(&cfg.redirect_uri)) {
+            Some(h) => format!("https://{h}/"),
+            None => return gate_unconfigured(),
+        },
+    };
+    let mut resp = Redirect::to(&target).into_response();
+    set_cookie(&mut resp, &cleared_gate_session_cookie(domain));
+    resp
+}
+
 fn access_denied_html(host: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -456,6 +499,13 @@ fn gate_session_cookie(token: &str, domain: &str) -> String {
         "{GATE_SESSION_COOKIE}={token}; Domain={domain}; Path=/; Max-Age={GATE_SESSION_TTL_SECS}; \
          HttpOnly; Secure; SameSite=Lax"
     )
+}
+
+/// The same cookie with an immediate expiry -- `Domain=`/`Path=` MUST match
+/// [`gate_session_cookie`] exactly, or the browser treats this as a
+/// *different* cookie and the original one survives untouched (#214-follow).
+fn cleared_gate_session_cookie(domain: &str) -> String {
+    format!("{GATE_SESSION_COOKIE}=; Domain={domain}; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
 fn now_secs() -> u64 {
@@ -854,5 +904,63 @@ mod tests {
             .get_all("set-cookie")
             .iter()
             .any(|c| c.to_str().unwrap().starts_with(&format!("{GATE_SESSION_COOKIE}="))));
+    }
+
+    #[tokio::test]
+    async fn gate_logout_clears_the_session_cookie_and_redirects_back_to_the_gated_host() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/gate/logout?host=demo.bunsenbrenner.org&return=/room/1")
+                    .header("cookie", format!("{GATE_SESSION_COOKIE}=some-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "https://demo.bunsenbrenner.org/room/1");
+        let cleared = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .find(|c| c.starts_with(&format!("{GATE_SESSION_COOKIE}=")))
+            .expect("clears the gate session cookie");
+        assert!(cleared.contains("Max-Age=0"), "actually expires it, not just overwrites: {cleared}");
+        assert!(cleared.contains("Domain=.bunsenbrenner.org"), "same Domain= as the cookie that was set, or the browser won't clear it: {cleared}");
+
+        // After logout, a fresh /gate/check for the same host is refused again --
+        // proves this isn't just a redirect theater, the session is genuinely gone.
+        let recheck = app
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                    .header("cookie", "ct_gate_session=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(recheck.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gate_logout_without_a_host_falls_back_to_the_control_planes_own_public_host() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+        let resp = app
+            .oneshot(Request::get("/gate/logout").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "https://bunsenbrenner.org/");
     }
 }
