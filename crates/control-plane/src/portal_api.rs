@@ -1101,7 +1101,7 @@ fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) ->
             .map(|email| {
                 let email = escape(email);
                 format!(
-                    r#"<li>{email} <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist/{email}/remove">
+                    r#"<li>{email} <form class="inline fade-out-submit" method="post" action="/portal/tunnels/{id}/login-allowlist/{email}/remove">
  <button class="sec" type="submit">Remove</button></form></li>"#
                 )
             })
@@ -1152,17 +1152,29 @@ fn tunnels_html(
             // grantee can still install an agent for it. Sharing itself is a
             // planned paid-tier feature — shown so owners know it exists, but
             // disabled (Standard tier ships one tunnel, not shared access).
+            //
+            // Share used to be a bare <span class="btn sec disabled">: the
+            // page's own CSS only ever styles `a.btn`/`button` (never a plain
+            // `.btn` class alone), so it rendered with none of Install/Revoke's
+            // padding, background, or border -- three actions meant to read as
+            // one button group instead looked visibly misaligned. A real
+            // disabled <button> picks up the page's existing `button:disabled`
+            // rule for free and needs no new CSS.
             let owner_actions = if *owned {
                 format!(
-                    r#" <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
- <span class="btn sec disabled" title="Sharing tunnels is a planned paid-tier feature">Share</span>
- <form class="inline" method="post" action="/portal/tunnels/{id}/delete">
-  <button class="sec" type="submit">Revoke</button></form>"#
+                    r#"<div class="actions">
+ <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <button type="button" class="btn sec" disabled title="Sharing tunnels is a planned paid-tier feature">Share</button>
+ <form class="inline fade-out-submit" method="post" action="/portal/tunnels/{id}/delete">
+  <button class="btn danger" type="submit">Revoke</button></form>
+</div>"#
                 )
             } else {
                 format!(
-                    r#" <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
- <span class="k">(shared with you)</span>"#
+                    r#"<div class="actions">
+ <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
+ <span class="k">(shared with you)</span>
+</div>"#
                 )
             };
             let tier = admission.as_ref().map(|a| cert_tier_html(&id, a)).unwrap_or_default();
@@ -1190,8 +1202,10 @@ fn tunnels_html(
                 String::new()
             };
             format!(
-                r#"<div class="row"><span class="v">{name}{host}{status_badge}</span><span>{owner_actions}
-</span></div>{bytes_line}{tier}{login_gate}"#,
+                r#"<div class="tunnel-card">
+<div class="row"><span class="v">{name}{host}{status_badge}</span></div>
+{owner_actions}{bytes_line}{tier}{login_gate}
+</div>"#,
                 name = escape(&t.name),
             )
         })
@@ -1324,6 +1338,30 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  .status-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:.45rem;vertical-align:middle}}
  .status-dot.live{{background:var(--accent2);animation:pulse 1.6s ease-in-out infinite}}
  .status-dot.off{{background:var(--muted)}}
+ /* Each tunnel is its own self-contained card, not just another row in one
+    long flat list -- previously every tunnel's rows (including its OWN
+    access list, when "Require login" is on) ran together with nothing but a
+    faint row divider between them, which read as one shared list across all
+    tunnels rather than each tunnel owning its own (it never was shared --
+    login_allowlist_list is already scoped per tunnel id -- the bug was purely
+    that the boundary between tunnels wasn't visible). */
+ .tunnel-card{{border:1px solid var(--border);border-radius:10px;padding:.2rem 1rem;margin:0 0 1rem;
+      background:#131820;max-height:640px;animation:cardIn .3s ease-out backwards;
+      transition:opacity .2s ease,transform .2s ease,max-height .25s ease,margin .25s ease,padding .25s ease}}
+ .tunnel-card:nth-of-type(1){{animation-delay:0ms}} .tunnel-card:nth-of-type(2){{animation-delay:50ms}}
+ .tunnel-card:nth-of-type(3){{animation-delay:100ms}} .tunnel-card:nth-of-type(n+4){{animation-delay:150ms}}
+ .tunnel-card .row:last-child{{border-bottom:0}}
+ .tunnel-card .actions{{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;padding:.6rem 0}}
+ /* Progressive enhancement: a form with this class fades/collapses its
+    ancestor .tunnel-card or <li> out before letting the (unmodified) POST
+    proceed -- see the script at the bottom of `page()`. Without JS the form
+    just submits immediately, same as before. */
+ .leaving{{opacity:0!important;transform:translateX(8px) scale(.98)!important;max-height:0!important;
+      padding-top:0!important;padding-bottom:0!important;margin:0!important;overflow:hidden;pointer-events:none}}
+ .login-allowlist li{{animation:rowIn .22s ease-out backwards;max-height:60px;
+      transition:opacity .2s ease,transform .2s ease,max-height .2s ease,padding .2s ease,margin .2s ease}}
+ .login-allowlist li:nth-child(1){{animation-delay:0ms}} .login-allowlist li:nth-child(2){{animation-delay:25ms}}
+ .login-allowlist li:nth-child(n+3){{animation-delay:50ms}}
  @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
  input,select{{background:#0d1117;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:.5rem;font:inherit;
       transition:border-color .15s ease}}
@@ -1368,6 +1406,25 @@ pub(crate) fn page(title: &str, body: &str) -> String {
   const done = () => {{ const orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(()=>{{ btn.textContent = orig; }}, 1600); }};
   if(navigator.clipboard && navigator.clipboard.writeText){{ navigator.clipboard.writeText(text).then(done).catch(()=>{{}}); }}
  }}
+ // Progressive enhancement for any `form.fade-out-submit` (tunnel Revoke,
+ // login-allowlist Remove): fade/collapse the enclosing .tunnel-card or <li>
+ // out before letting the real (unmodified) POST proceed, instead of the row
+ // just vanishing on the next full-page reload. Without JS, or with reduced
+ // motion requested, the form submits immediately -- nothing here is load-bearing.
+ document.addEventListener('submit', function(ev){{
+  var form = ev.target;
+  if(!form.classList || !form.classList.contains('fade-out-submit')){{ return; }}
+  if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){{ return; }}
+  // Most-specific ancestor first: a login-allowlist Remove form sits inside a
+  // <li> that is itself inside the tunnel's own .tunnel-card -- closest('li')
+  // must win so removing one email only fades that one list item, not the
+  // whole tunnel card it happens to live inside.
+  var target = form.closest('li') || form.closest('.tunnel-card') || form;
+  if(target.classList.contains('leaving')){{ return; }}
+  ev.preventDefault();
+  target.classList.add('leaving');
+  setTimeout(function(){{ form.submit(); }}, 220);
+ }});
 </script>
 </body></html>"#
     )
