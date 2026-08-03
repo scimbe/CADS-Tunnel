@@ -1973,6 +1973,8 @@ svg[data-linkmode="1"] .edge{cursor:pointer;stroke-width:5px}
 .node.superpeer .card{stroke:var(--accent2);stroke-width:2px}
 .node.superpeer .accent{fill:var(--accent2)}
 .badge{fill:var(--accent2)}.badge-t{fill:#fff;font:700 9px ui-monospace,monospace;pointer-events:none}
+.live-dot circle{fill:var(--accent);opacity:.94}
+.live-dot text{fill:#fff;font:700 9px ui-monospace,monospace;text-anchor:middle;dominant-baseline:central;pointer-events:none}
 label.sp{color:var(--muted);font-size:.82rem;display:flex;align-items:center;gap:.3rem;margin-left:0}
 .panel{border-top:1px solid var(--line);background:var(--panel);padding:.7rem 1.1rem;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
 .panel h2{font-size:.82rem;color:var(--muted);margin:0;font-weight:600}
@@ -2027,14 +2029,17 @@ body:not([data-uimode="flexible"]) .flex-only{display:none}
 /// The Topology-Editor behaviour (#107-ui) — CSP-safe inline JS, no external assets.
 /// Pointer-drag any node; connected edges re-route live. Progressive enhancement: the
 /// server already emits correct node/edge geometry, so the graph renders identically with
-/// JS disabled — this only adds interactivity.
+/// JS disabled — this only adds interactivity. Also carries the video-conferencing
+/// feature's "Sync my channels" action (imports the caller's own `GET /me/channels`
+/// registrations as live-wired edges) and a polled live-member-count dot on any edge
+/// with an attached channel (#276-video-call).
 const EDITOR_JS: &str = r#"
 (function(){
  var svg=document.getElementById('cv');if(!svg)return;
  var sel=null,dx=0,dy=0,moved=false,downX=0,downY=0;
  function pt(e){var m=svg.getScreenCTM().inverse(),p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;return p.matrixTransform(m);}
  function centers(){var m={};svg.querySelectorAll('.node').forEach(function(n){m[n.getAttribute('data-node')]=[+n.getAttribute('data-cx'),+n.getAttribute('data-cy')];});return m;}
- function redraw(){var c=centers();svg.querySelectorAll('.edge').forEach(function(ed){var a=c[ed.getAttribute('data-a')],b=c[ed.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2;ed.setAttribute('d','M '+a[0]+' '+a[1]+' C '+mx+' '+a[1]+', '+mx+' '+b[1]+', '+b[0]+' '+b[1]);});}
+ function redraw(){var c=centers();svg.querySelectorAll('.edge').forEach(function(ed){var a=c[ed.getAttribute('data-a')],b=c[ed.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2;ed.setAttribute('d','M '+a[0]+' '+a[1]+' C '+mx+' '+a[1]+', '+mx+' '+b[1]+', '+b[0]+' '+b[1]);});positionLiveDots();}
  svg.addEventListener('pointerdown',function(e){if(svg.getAttribute('data-linkmode')==='1'){var ed=e.target.closest('.edge');if(ed){removeEdge(ed);return;}}else{var ed2=e.target.closest('.edge');if(ed2){openEdgeDrawer(ed2);return;}}var g=e.target.closest('.node');if(!g)return;if(svg.getAttribute('data-linkmode')==='1'){linkPick(g);return;}sel=g;moved=false;downX=e.clientX;downY=e.clientY;var p=pt(e);dx=p.x-(+g.getAttribute('data-cx'));dy=p.y-(+g.getAttribute('data-cy'));try{g.setPointerCapture(e.pointerId);}catch(_){}});
  svg.addEventListener('pointermove',function(e){if(!sel)return;if(!moved&&(Math.abs(e.clientX-downX)>4||Math.abs(e.clientY-downY)>4))moved=true;var p=pt(e),x=p.x-dx,y=p.y-dy;sel.setAttribute('data-cx',x);sel.setAttribute('data-cy',y);sel.setAttribute('transform','translate('+x+','+y+')');redraw();});
  svg.addEventListener('pointerup',function(){if(sel&&!moved&&svg.getAttribute('data-linkmode')!=='1'){openNodeDrawer(sel);}sel=null;});
@@ -2065,7 +2070,81 @@ const EDITOR_JS: &str = r#"
  function edgeExists(a,b){var f=false;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=true;});return f;}
  function addEdgeEl(a,b){var first=svg.querySelector('.node');if(!first)return;first.insertAdjacentHTML('beforebegin','<path data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"/>');var np=first.previousElementSibling;if(np)np.setAttribute('class','edge');redraw();}
  function linkPick(g){var id=g.getAttribute('data-node');if(!src){src=g;g.classList.add('linking');say('connect: pick the target agent');return;}var a=src.getAttribute('data-node');clearSrc();if(a===id){say('connect: pick two different agents');return;}if(edgeExists(a,id)){say('already linked');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:id})}).then(function(r){if(r.ok){addEdgeEl(a,id);say('linked '+shortId(a)+' — '+shortId(id));}else{say('link failed ('+r.status+')');}}).catch(function(){say('link failed');});}
- function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();say('unlinked '+shortId(a)+' — '+shortId(b));}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
+ function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();var dot=liveDotFor(a,b);if(dot)dot.remove();say('unlinked '+shortId(a)+' — '+shortId(b));}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
+ function findEdgeEl(a,b){var f=null;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=ed;});return f;}
+ // Video-conferencing feature (#276-video-call, the browser-originated channel case):
+ // a channel a browser ct-agent registered via POST /me/channels is otherwise invisible
+ // here -- the caller has to know the two holder ids and manually paste/link/attach them.
+ // "Sync my channels" closes that loop using the GET routes above: list the caller's own
+ // channels, and for each 2-party one not already attached to an edge, ensure both holder
+ // ids exist as nodes (adding + reloading exactly like the existing add-agent flow does --
+ // a brand-new agent needs the server's own layout pass) then wire + attach the edge live.
+ function findNodeIds(){var s={};svg.querySelectorAll('.node').forEach(function(n){s[n.getAttribute('data-node')]=1;});return s;}
+ function edgeChannelSet(){var m={};svg.querySelectorAll('.edge').forEach(function(ed){var c=ed.getAttribute('data-channel');if(c)m[c]=1;});return m;}
+ function ensureAgent(id){return fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:id,kind:'peer'})}).then(function(r){return r.ok||r.status===409;}).catch(function(){return false;});}
+ function syncChannels(){
+  say('syncing channels…');
+  fetch('/me/channels').then(function(r){return r.ok?r.json():Promise.reject(r.status);}).then(function(p){
+   var attached=edgeChannelSet();
+   var todo=(p.channels||[]).filter(function(c){return !attached[c];});
+   if(!todo.length){say('no new channels to sync');return;}
+   Promise.all(todo.map(function(ch){
+    return fetch('/me/channels/'+encodeURIComponent(ch)+'/members').then(function(r){return r.ok?r.json():null;}).then(function(mp){
+     if(!mp)return null;
+     var members=(mp.members||[]).map(function(m){return m.holder;});
+     return members.length===2?{ch:ch,a:members[0],b:members[1]}:null;
+    }).catch(function(){return null;});
+   })).then(function(results){
+    var pairs=results.filter(function(x){return x;});
+    if(!pairs.length){say('no 2-party channels to sync yet');return;}
+    var have=findNodeIds(),missing=[];
+    pairs.forEach(function(p){[p.a,p.b].forEach(function(id){if(!have[id]&&missing.indexOf(id)<0)missing.push(id);});});
+    if(missing.length){
+     Promise.all(missing.map(ensureAgent)).then(function(){say('added '+missing.length+' agent(s) from your channels — syncing links…');location.reload();});
+     return;
+    }
+    var linked=0;
+    function attachNext(i){
+     if(i>=pairs.length){say(linked?('synced '+linked+' channel link(s)'):'channels already synced');renderGuide();return;}
+     var p=pairs[i];
+     var doEdge=edgeExists(p.a,p.b)?Promise.resolve(true):fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:p.a,b:p.b})}).then(function(r){return r.ok||r.status===409;}).catch(function(){return false;});
+     doEdge.then(function(ok){
+      if(!ok){attachNext(i+1);return;}
+      if(!edgeExists(p.a,p.b))addEdgeEl(p.a,p.b);
+      fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges/channel',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({a:p.a,b:p.b,channel:p.ch})}).then(function(r){
+       if(r.ok){linked++;var ed=findEdgeEl(p.a,p.b);if(ed)ed.setAttribute('data-channel',p.ch);}
+       attachNext(i+1);
+      }).catch(function(){attachNext(i+1);});
+     });
+    }
+    attachNext(0);
+   });
+  }).catch(function(s){say('sync failed ('+s+')');});
+ }
+ var syncBtn=document.getElementById('syncchan');
+ if(syncBtn)syncBtn.addEventListener('click',syncChannels);
+ // Live status: for every edge with an attached channel, a small dot at its midpoint
+ // showing the channel's real current member count -- polled (not pushed, this editor
+ // has no server-side event stream), so "dynamic" here means "refreshes on its own every
+ // few seconds", not real-time-to-the-millisecond. Purely additive to the existing
+ // drag/redraw geometry -- positionLiveDots() piggybacks on the same redraw() pass.
+ function liveDotFor(a,b){var f=null;svg.querySelectorAll('.live-dot').forEach(function(g){var x=g.getAttribute('data-a'),y=g.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=g;});return f;}
+ function ensureLiveDot(a,b){var g=liveDotFor(a,b);if(g)return g;var first=svg.querySelector('.node');if(!first)return null;first.insertAdjacentHTML('beforebegin','<g class="live-dot" data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"><circle r="9"/><text></text></g>');return first.previousElementSibling;}
+ function positionLiveDots(){var c=centers();svg.querySelectorAll('.live-dot').forEach(function(g){var a=c[g.getAttribute('data-a')],b=c[g.getAttribute('data-b')];if(!a||!b)return;var mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;g.setAttribute('transform','translate('+mx+','+my+')');});}
+ function pollChannelStatus(){
+  var chans={};
+  svg.querySelectorAll('.edge').forEach(function(ed){var c=ed.getAttribute('data-channel'),a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');if(c)chans[c]=[a,b];});
+  Object.keys(chans).forEach(function(ch){
+   fetch('/me/channels/'+encodeURIComponent(ch)+'/members').then(function(r){return r.ok?r.json():null;}).then(function(mp){
+    if(!mp)return;
+    var ab=chans[ch],g=ensureLiveDot(ab[0],ab[1]);
+    if(!g)return;
+    var t=g.querySelector('text');if(t)t.textContent=(mp.members||[]).length;
+    positionLiveDots();
+   }).catch(function(){});
+  });
+ }
+ if(tid){pollChannelStatus();setInterval(pollChannelStatus,6000);}
  var linkBtn=document.getElementById('link');
  if(linkBtn){linkBtn.addEventListener('click',function(){var on=svg.getAttribute('data-linkmode')!=='1';svg.setAttribute('data-linkmode',on?'1':'');linkBtn.setAttribute('aria-pressed',on?'true':'false');linkBtn.classList.toggle('active',on);if(!on)clearSrc();say(on?'connect: click two agents to link, or a link to remove':'');});}
  // #107-ui-compose: add-agent — assign an existing agent into this topology, then re-render
@@ -2224,9 +2303,12 @@ const EDITOR_JS: &str = r#"
 /// "Suggest overlay", the "Connect" click-to-compose tool (#107-ui-compose — toggle it,
 /// click two agents to draw a link, or click a link to remove it, via the owner
 /// `POST`/`DELETE …/edges` endpoints), and an add-agent input (`POST …/agents`, re-rendering
-/// so the server lays out the new node). Agent ids are HTML-escaped
-/// (XSS-safe). An empty topology yields a valid page with an empty-state hint. `mode` is the
-/// topology's current [`overlay mode`](topology_set_mode) token, pre-selected in the toggle.
+/// so the server lays out the new node), and a "Sync my channels" button (#276-video-call
+/// — imports the caller's own `GET /me/channels` registrations as live edges, with a
+/// polled member-count dot on any edge carrying an attached channel). Agent ids are
+/// HTML-escaped (XSS-safe). An empty topology yields a valid page with an empty-state
+/// hint. `mode` is the topology's current [`overlay mode`](topology_set_mode) token,
+/// pre-selected in the toggle.
 fn render_topology_editor(
     t: &crate::topology::Topology,
     agents: &[(String, String)],
@@ -2380,6 +2462,7 @@ fn render_topology_editor(
          <input id=\"agent\" placeholder=\"agent id (paste holder_pubkey)\" aria-label=\"agent id to add\"/>\
          <label class=\"sp\"><input type=\"checkbox\" id=\"agentkind\"/> super-peer</label>\
          <button id=\"addagent\">Add</button>\
+         <button id=\"syncchan\" class=\"primary\">Sync my channels</button>\
          <button id=\"suggest\" class=\"primary flex-only\">Suggest overlay</button>\
          <span id=\"msg\"></span></header>\
          <div class=\"guide\" id=\"guide\" role=\"button\" tabindex=\"0\" aria-label=\"current step -- click for details\"></div>\
@@ -6817,6 +6900,50 @@ mod tests {
         // namespace URL in particular must be absent).
         for external in ["http://", "https://", "<link", "src=\"", "@import"] {
             assert!(!html.contains(external), "compose editor stays CSP-safe: no {external:?}");
+        }
+    }
+
+    #[test]
+    fn topology_editor_offers_a_sync_my_channels_action_with_a_polled_live_status_dot() {
+        // #276-video-call: a browser-originated video-call channel (registered via
+        // POST /me/channels, wired to the caller via the new GET /me/channels[/…/members]
+        // routes) is otherwise invisible in the Editor -- the caller would have to know and
+        // manually paste both holder ids. "Sync my channels" imports it as a live edge; a
+        // polled dot on any channel-carrying edge shows its real current member count. Like
+        // the sibling compose test above, the interactive fetch sequencing can't be click-
+        // simulated here, so this pins the real endpoints/functions are embedded in the
+        // shipped JS (browser verification covers the interactive part).
+        let t = crate::topology::Topology {
+            id: "t1".into(),
+            owner: "alice".into(),
+            net_uuid: "uuid-xyz".into(),
+        };
+        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[]);
+
+        // The action itself: a button wired to a real sync routine, not a stub.
+        assert!(html.contains("id=\"syncchan\""), "Sync my channels button present");
+        assert!(html.contains("function syncChannels"), "sync routine present");
+        assert!(html.contains("getElementById('syncchan')") && html.contains("addEventListener('click',syncChannels)"), "button wired to the routine");
+        // It lists the caller's own channels, then each 2-party channel's real members --
+        // both new GET routes this increment's control-plane half added.
+        assert!(html.contains("fetch('/me/channels')"), "lists the caller's own registered channels");
+        assert!(html.contains("'/me/channels/'+encodeURIComponent(ch)+'/members'"), "reads each channel's real members");
+        // Missing agents are added (server lays out the new node) before any edge is wired --
+        // same `/agents` endpoint and reload-after-add convention as manual add-agent.
+        assert!(html.contains("function ensureAgent") && html.contains("+'/agents'"), "new members are added as real agent nodes via the owner agents endpoint");
+        // The edge + its channel attachment are wired via the SAME owner endpoints the
+        // manual Connect tool and edge-drawer use -- no new/parallel API surface.
+        assert!(html.contains("+'/edges'") && html.contains("method:'POST'"), "wires the pairwise edge via the owner edges endpoint");
+        assert!(html.contains("+'/edges/channel'") && html.contains("method:'PUT'"), "attaches the channel via the owner edges/channel endpoint");
+        // Live status: a polled dot (not a one-time render) on any edge carrying a channel.
+        assert!(html.contains("function pollChannelStatus"), "live-status poll present");
+        assert!(html.contains("setInterval(pollChannelStatus"), "polls periodically, not once");
+        assert!(html.contains("function positionLiveDots") && html.contains("class=\"live-dot\""), "live dot repositions with the graph and has real styling");
+        assert!(html.contains("insertAdjacentHTML"), "live dot created without a namespace literal, same CSP-safe idiom as edges");
+        // Still fully self-contained -- the sync/poll JS must not smuggle in any external asset.
+        for external in ["http://", "https://", "<link", "src=\"", "@import"] {
+            assert!(!html.contains(external), "sync/poll stays CSP-safe: no {external:?}");
         }
     }
 
