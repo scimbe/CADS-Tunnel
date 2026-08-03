@@ -566,7 +566,12 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     .as_deref()
                     .and_then(|h| st.tunnels.cert_admission_for_hostname(h).ok().flatten());
                 let status = edge_tunnel_status(&st, &t.routing_token).await;
-                rows.push((t, owned, admission, status));
+                // #382-follow (Browser-Plane login gate): owner-scoped, so a shared
+                // (not-owned) row simply gets the off/empty defaults -- matching the
+                // existing owner-only convention for Revoke/Share above.
+                let require_login = st.tunnels.require_login(&subject, &t.id).ok().flatten().unwrap_or(false);
+                let login_allowlist = st.tunnels.login_allowlist_list(&subject, &t.id).ok().flatten().unwrap_or_default();
+                rows.push((t, owned, admission, status, require_login, login_allowlist));
             }
             Html(tunnels_html(&rows)).into_response()
         }
@@ -1083,17 +1088,60 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Browser-Plane login gate section (#382-follow): a checkbox to require a
+/// Keycloak login (checked against this tunnel's own email allow-list) before
+/// its public content is served, and -- while enabled -- the allow-list itself
+/// with add/remove forms. Owner-scoped by construction: only called for owned
+/// rows (see `tunnels_html`).
+fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) -> String {
+    let checked = if require_login { " checked" } else { "" };
+    let allowlist_section = if require_login {
+        let items = login_allowlist
+            .iter()
+            .map(|email| {
+                let email = escape(email);
+                format!(
+                    r#"<li>{email} <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist/{email}/remove">
+ <button class="sec" type="submit">Remove</button></form></li>"#
+                )
+            })
+            .collect::<String>();
+        let empty_note = if login_allowlist.is_empty() {
+            r#"<p class="k">No one is allowed in yet -- add an email below.</p>"#
+        } else {
+            ""
+        };
+        format!(
+            r#"<div class="row"><ul class="login-allowlist">{items}</ul>{empty_note}
+<form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist">
+ <input type="email" name="email" placeholder="invite@example.com" required>
+ <button class="sec" type="submit">Add to access list</button>
+</form></div>"#
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="row"><form class="inline" method="post" action="/portal/tunnels/{id}/require-login">
+ <label><input type="checkbox" name="enabled" value="1"{checked}> Require login to access this tunnel</label>
+ <button class="sec" type="submit">Update</button>
+</form></div>{allowlist_section}"#
+    )
+}
+
 fn tunnels_html(
     tunnels: &[(
         crate::storage::SubjectTunnel,
         bool,
         Option<crate::storage::CertAdmission>,
         Option<EdgeTunnelStatus>,
+        bool,
+        Vec<String>,
     )],
 ) -> String {
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status)| {
+        .map(|(t, owned, admission, status, require_login, login_allowlist)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -1134,9 +1182,16 @@ fn tunnels_html(
                 ),
                 _ => String::new(),
             };
+            // Browser-Plane login gate (#382-follow): owner-only, and only shown for
+            // a tunnel that actually has public content to protect (a hostname).
+            let login_gate = if *owned && t.hostname.is_some() {
+                login_gate_html(&id, *require_login, login_allowlist)
+            } else {
+                String::new()
+            };
             format!(
                 r#"<div class="row"><span class="v">{name}{host}{status_badge}</span><span>{owner_actions}
-</span></div>{bytes_line}{tier}"#,
+</span></div>{bytes_line}{tier}{login_gate}"#,
                 name = escape(&t.name),
             )
         })
@@ -1425,6 +1480,134 @@ pub fn topology_portal_router(session_key: &[u8]) -> Router {
     Router::new()
         .route("/portal/topologies", get(topologies_page))
         .with_state(TopologyPortalState { session_key: Arc::from(session_key.to_vec()) })
+}
+
+/// Shared state for the Browser-Plane login-gate's owner-scoped management
+/// routes (#382-follow): toggle the gate + manage its email allow-list. Kept
+/// separate from `ApiState` (not folded into `portal_api_router`) so this
+/// genuinely new, still-settling feature doesn't widen that struct (and its
+/// many existing test call sites) for what is otherwise an independent concern
+/// -- same rationale as `ClaimState`/`TopologyPortalState` above.
+#[derive(Clone)]
+struct LoginGateState {
+    session_key: Arc<[u8]>,
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
+    /// `None` disables Keycloak account auto-provisioning: the allow-list entry
+    /// is still recorded, but the invitee needs an already-existing Keycloak
+    /// account to actually sign in (matches this crate's "off unless configured"
+    /// convention -- see `EdgeAdmin`/`DnsAutopilot` above for the same shape).
+    kc_admin: Option<crate::keycloak_admin::KeycloakAdminConfig>,
+}
+
+/// Build the Browser-Plane login-gate's owner-scoped management router
+/// (#382-follow): `POST /portal/tunnels/:id/require-login` (toggle),
+/// `POST /portal/tunnels/:id/login-allowlist` (add + auto-provision),
+/// `POST /portal/tunnels/:id/login-allowlist/:email/remove`. Mount alongside
+/// `portal_api_router` wherever the tunnel store is already in scope -- the
+/// actual gate (`GET /gate/*`) lives in `crate::gate`, fronting each demo's own
+/// Caddy via `forward_auth`; this router is only the owner-facing settings UI.
+pub fn login_gate_portal_router(
+    session_key: &[u8],
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
+    kc_admin: Option<crate::keycloak_admin::KeycloakAdminConfig>,
+) -> Router {
+    Router::new()
+        .route("/portal/tunnels/:id/require-login", post(set_require_login_route))
+        .route("/portal/tunnels/:id/login-allowlist", post(login_allowlist_add_route))
+        .route("/portal/tunnels/:id/login-allowlist/:email/remove", post(login_allowlist_remove_route))
+        .with_state(LoginGateState {
+            session_key: Arc::from(session_key.to_vec()),
+            tunnels,
+            kc_admin,
+        })
+}
+
+#[derive(Deserialize)]
+struct RequireLoginForm {
+    /// Present (any value) when the portal checkbox was checked; absent when
+    /// unchecked -- standard HTML checkbox-form semantics, not a boolean field.
+    enabled: Option<String>,
+}
+
+async fn set_require_login_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<RequireLoginForm>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.set_require_login(&subject, &id, form.enabled.is_some()) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
+        Err(e) => internal_error("set_require_login", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AllowlistEmailForm {
+    email: String,
+}
+
+async fn login_allowlist_add_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<AllowlistEmailForm>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let email = form.email.trim();
+    if email.is_empty() {
+        return (StatusCode::BAD_REQUEST, "email required".to_string()).into_response();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match st.tunnels.login_allowlist_add(&subject, &id, email, now) {
+        Ok(true) => {
+            // Best-effort account provisioning (#382-follow): never blocks the
+            // allow-list add itself, matching `authorize_hostname`'s own
+            // "side effect, logged not surfaced" convention above. This realm has
+            // no outbound-email mechanism (see `portal.rs`'s
+            // `require_verified_email` doc comment for the same gap), so a fresh
+            // account's one-time temporary password is only ever logged
+            // server-side -- the operator relays it to the invitee out of band.
+            if let Some(kc) = &st.kc_admin {
+                let client = reqwest::Client::new();
+                match crate::keycloak_admin::ensure_user(&client, kc, email).await {
+                    Ok(result) if !result.already_existed => eprintln!(
+                        "ct-cp: provisioned a new Keycloak account for {email} (tunnel {id}) -- \
+                         one-time temporary password, relay to them out of band: {}",
+                        result.temporary_password.unwrap_or_default()
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("ct-cp: Keycloak account provisioning for {email} failed: {e}"),
+                }
+            }
+            Redirect::to("/portal/tunnels").into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel or no hostname assigned yet".to_string()).into_response(),
+        Err(e) => internal_error("login_allowlist_add", e).into_response(),
+    }
+}
+
+async fn login_allowlist_remove_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path((id, email)): Path<(String, String)>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.login_allowlist_remove(&subject, &id, &email) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
+        Err(e) => internal_error("login_allowlist_remove", e).into_response(),
+    }
 }
 
 async fn topologies_page(State(st): State<TopologyPortalState>, headers: HeaderMap) -> Response {

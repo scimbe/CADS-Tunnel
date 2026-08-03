@@ -133,14 +133,14 @@ impl PortalOidc {
 
     /// The realm issuer (an id_token's `iss`), derived from the token endpoint by
     /// stripping Keycloak's `/protocol/openid-connect/token` suffix (#82).
-    fn issuer(&self) -> &str {
+    pub(crate) fn issuer(&self) -> &str {
         self.token_url
             .strip_suffix("/protocol/openid-connect/token")
             .unwrap_or(&self.token_url)
     }
 
     /// The realm JWKS (signing-key) endpoint used to verify the id_token (#82).
-    fn jwks_url(&self) -> String {
+    pub(crate) fn jwks_url(&self) -> String {
         crate::oidc::jwks_uri_for(self.issuer())
     }
 
@@ -179,7 +179,7 @@ impl PortalOidc {
     /// straight on "create an account", not on a login screen with the register
     /// link buried. `/portal`'s own "Sign in" links keep going through the
     /// ordinary `/auth` login form via `false`.
-    fn authorize_redirect(
+    pub(crate) fn authorize_redirect(
         &self,
         state: &str,
         idp_hint: Option<&str>,
@@ -206,6 +206,23 @@ impl PortalOidc {
             urlencode(state),
             hint_param,
             login_hint_param,
+        )
+    }
+
+    /// Like [`authorize_redirect`](Self::authorize_redirect), but for a caller
+    /// with its own separately-registered `redirect_uri` instead of `self`'s
+    /// (#382-follow: the Browser-Plane login gate has its own callback,
+    /// `/gate/callback`, distinct from the portal's `/portal/callback` -- the
+    /// authorize request's `redirect_uri` must exactly match whichever one the
+    /// later token exchange will send). No idp/login hint or register-mode
+    /// support -- the gate flow doesn't need either.
+    pub(crate) fn authorize_redirect_to(&self, state: &str, redirect_uri: &str) -> String {
+        format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}&ui_locales=en",
+            self.authorize_url,
+            urlencode(&self.client_id),
+            urlencode(redirect_uri),
+            urlencode(state),
         )
     }
 
@@ -331,7 +348,7 @@ fn oidc_http_client_with(timeout: std::time::Duration) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-fn oidc_http_client() -> reqwest::Client {
+pub(crate) fn oidc_http_client() -> reqwest::Client {
     oidc_http_client_with(OIDC_HTTP_TIMEOUT)
 }
 
@@ -386,7 +403,7 @@ fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
 /// the audience (an id_token's `aud` IS the client that requested it) and expiry
 /// are all checked, so a tampered token endpoint response cannot inject a subject.
 /// Kept standalone so it is unit-tested directly against a JWKS.
-fn identity_from_verified_id_token(
+pub(crate) fn identity_from_verified_id_token(
     jwt: &str,
     jwks: &serde_json::Value,
     issuer: &str,

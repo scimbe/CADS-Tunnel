@@ -47,7 +47,9 @@
       "fullScopeAllowed": true,
       "redirectUris": [
         "${PORTAL_PUBLIC_URL}/portal/callback",
-        "http://localhost:8090/portal/callback"
+        "${PORTAL_PUBLIC_URL}/gate/callback",
+        "http://localhost:8090/portal/callback",
+        "http://localhost:8090/gate/callback"
       ],
       "webOrigins": [
         "+"

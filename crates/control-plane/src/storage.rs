@@ -1338,6 +1338,10 @@ impl SqliteTunnelStore {
         // (or is believed to confirm) the channel_tier=gelb=false revert push --
         // see record_issuance_complete / pending_revert_hostnames / clear_pending_revert.
         ensure_column(&conn, "subject_tunnels", "pending_revert", "INTEGER NOT NULL DEFAULT 0")?;
+        // Browser-Plane login gate (#382-follow): off by default for every existing
+        // tunnel on upgrade -- enabling it is always an explicit owner action
+        // (`set_require_login`), never silently turned on by this migration.
+        ensure_column(&conn, "subject_tunnels", "require_login", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -1361,6 +1365,17 @@ impl SqliteTunnelStore {
              CREATE TABLE IF NOT EXISTS revoked_tokens (
                  token      TEXT PRIMARY KEY,
                  revoked_at INTEGER NOT NULL
+             );
+             -- Browser-Plane login gate (#382-follow): same shape as channel_allowlist,
+             -- but hostname-keyed -- the gate-check endpoint (GET /gate/check) only ever
+             -- knows the visitor's target hostname (from Caddy's forward_auth), never a
+             -- tunnel id or its owner.
+             CREATE TABLE IF NOT EXISTS tunnel_login_allowlist (
+                 hostname  TEXT NOT NULL,
+                 email     TEXT NOT NULL,
+                 added_by  TEXT NOT NULL,
+                 added_at  INTEGER NOT NULL,
+                 PRIMARY KEY (hostname, email)
              );",
         )?;
         Ok(Self {
@@ -1525,6 +1540,134 @@ impl SqliteTunnelStore {
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    /// Enable/disable the Browser-Plane login gate for a tunnel the caller owns
+    /// (#382-follow). `false` if the id is unknown or owned by someone else.
+    pub fn set_require_login(&self, subject: &str, tunnel_id: &str, enabled: bool) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "UPDATE subject_tunnels SET require_login = ?1 WHERE id = ?2 AND subject = ?3",
+            params![enabled as i64, tunnel_id, subject],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether a tunnel the caller owns currently has the login gate enabled, or
+    /// `None` if the id is unknown or owned by someone else. Owner-scoped, for
+    /// rendering the portal checkbox's current state.
+    pub fn require_login(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<bool>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT require_login FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.map(|n| n != 0))
+    }
+
+    /// Whether the login gate is enabled for `hostname` (#382-follow). Unscoped
+    /// by design: [`GET /gate/check`] only ever knows the visitor's target
+    /// hostname (from Caddy's `forward_auth`), never a tunnel id or its owner --
+    /// this is the one lookup the gate-check path needs, mirroring
+    /// [`routing_token_for_hostname`](Self::routing_token_for_hostname)'s same
+    /// hostname-only shape.
+    pub fn require_login_for_hostname(&self, hostname: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT require_login FROM subject_tunnels WHERE hostname = ?1",
+                params![hostname],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|n| n != 0)
+            .unwrap_or(false))
+    }
+
+    /// Add `email` to the login gate's allow-list for a tunnel the caller owns
+    /// (#382-follow), keyed by the tunnel's current hostname. `false` if the id
+    /// is unknown, owned by someone else, or has no hostname yet.
+    pub fn login_allowlist_add(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+        email: &str,
+        now: u64,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let hostname: Option<String> = conn
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(hostname) = hostname else { return Ok(false) };
+        conn.execute(
+            "INSERT OR REPLACE INTO tunnel_login_allowlist (hostname, email, added_by, added_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![hostname, email.to_ascii_lowercase(), subject, now as i64],
+        )?;
+        Ok(true)
+    }
+
+    /// Remove `email` from a tunnel's login-gate allow-list (#382-follow),
+    /// owner-scoped like [`login_allowlist_add`](Self::login_allowlist_add).
+    pub fn login_allowlist_remove(&self, subject: &str, tunnel_id: &str, email: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let hostname: Option<String> = conn
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(hostname) = hostname else { return Ok(false) };
+        conn.execute(
+            "DELETE FROM tunnel_login_allowlist WHERE hostname = ?1 AND email = ?2",
+            params![hostname, email.to_ascii_lowercase()],
+        )?;
+        Ok(true)
+    }
+
+    /// List a tunnel's login-gate allow-listed emails (#382-follow), owner-scoped:
+    /// `None` if the id is unknown, owned by someone else, or has no hostname yet.
+    pub fn login_allowlist_list(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<Vec<String>>> {
+        let conn = self.conn.lock_safe();
+        let hostname: Option<String> = conn
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(hostname) = hostname else { return Ok(None) };
+        let mut stmt =
+            conn.prepare("SELECT email FROM tunnel_login_allowlist WHERE hostname = ?1 ORDER BY added_at ASC")?;
+        let rows = stmt.query_map(params![hostname], |r| r.get::<_, String>(0))?;
+        Ok(Some(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+
+    /// Whether `email` is allow-listed for `hostname`'s login gate (#382-follow).
+    /// Unscoped like [`require_login_for_hostname`](Self::require_login_for_hostname)
+    /// -- the one check `GET /portal/callback` needs after a successful gate login.
+    pub fn email_allowed_for_hostname(&self, hostname: &str, email: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM tunnel_login_allowlist WHERE hostname = ?1 AND email = ?2",
+                params![hostname, email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// The routing token of a tunnel `subject` is **authorized** to use — as its

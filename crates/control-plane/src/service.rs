@@ -4756,7 +4756,9 @@ pub fn persistent_control_plane_router(
             let account_console_url = oidc_cfg
                 .as_ref()
                 .map(|c| c.account_console_url_with_referrer(&portal_base_url, "/portal/account"));
-            crate::portal::portal_router(oidc_cfg, session_key).merge(
+            crate::portal::portal_router(oidc_cfg.clone(), session_key)
+                .merge(crate::gate::gate_router(tunnels.clone(), oidc_cfg, session_key))
+                .merge(
                 crate::portal_api::portal_api_router(
                     session_key,
                     ledger.clone(),
@@ -4792,6 +4794,14 @@ pub fn persistent_control_plane_router(
             // session key, so the editor (already dual-auth via subject_of_topology)
             // is reachable and linked from the portal nav, not just a bare URL.
             .merge(crate::portal_api::topology_portal_router(session_key))
+            // #382-follow: the Browser-Plane login gate's owner-facing settings
+            // (toggle + email allow-list) -- the gate itself is `crate::gate`,
+            // merged above alongside the portal login.
+            .merge(crate::portal_api::login_gate_portal_router(
+                session_key,
+                tunnels.clone(),
+                crate::keycloak_admin::KeycloakAdminConfig::from_env(),
+            ))
         })
         .merge(pki)
         // /install.sh + /install.ps1 now just redirect to ct-agent's own setup
