@@ -146,6 +146,7 @@ pub fn portal_api_router(
         .route("/portal/tunnels/:id/grants", get(grants_page).post(add_grant))
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
         .route("/admin/provision-tunnel", post(admin_provision_tunnel))
+        .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
         .with_state(state)
 }
 
@@ -170,13 +171,14 @@ struct ProvisionTunnelResp {
 /// is a real `subject_tunnels` row that participates in the Rot/Gelb/Grün
 /// admission broker exactly like any other -- the recipient can run
 /// `ct-agent certificate` against it like any Standard-tier customer.
-async fn admin_provision_tunnel(
-    State(st): State<ApiState>,
-    headers: HeaderMap,
-    Json(req): Json<ProvisionTunnelReq>,
-) -> Response {
-    let Some(expected) = st.admin_token else {
-        return StatusCode::NOT_FOUND.into_response();
+/// The one `x-ct-admin-token` check every `/admin/*` route in this file needs:
+/// `404` when no admin token is configured at all (the route doesn't exist),
+/// `401` on a missing/malformed/wrong header, constant-time comparison against
+/// the real token either way. Factored out so `admin_set_max_tunnels` doesn't
+/// duplicate [`admin_provision_tunnel`]'s own copy of this.
+fn admin_authed(headers: &HeaderMap, admin_token: Option<[u8; 32]>) -> Result<(), StatusCode> {
+    let Some(expected) = admin_token else {
+        return Err(StatusCode::NOT_FOUND);
     };
     let authed = headers
         .get("x-ct-admin-token")
@@ -192,8 +194,20 @@ async fn admin_provision_tunnel(
             Some(out)
         })
         .is_some_and(|got| got.iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0);
-    if !authed {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if authed {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn admin_provision_tunnel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ProvisionTunnelReq>,
+) -> Response {
+    if let Err(code) = admin_authed(&headers, st.admin_token) {
+        return code.into_response();
     }
     let Some(hostname) = ct_common::normalize_hostname(&req.hostname) else {
         return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
@@ -208,6 +222,41 @@ async fn admin_provision_tunnel(
     };
     authorize_hostname(&st, &tunnel).await;
     Json(ProvisionTunnelResp { routing_token: tunnel.routing_token.clone(), hostname }).into_response()
+}
+
+#[derive(Deserialize)]
+struct SetMaxTunnelsReq {
+    max: u32,
+}
+
+/// `POST /admin/accounts/:subject/max-tunnels {max}` (operator-only, #214):
+/// raise (or lower) how many tunnels ONE SPECIFIC account may own at once,
+/// above the Standard tier's default of 1 -- unlocks self-service creation of
+/// additional subdomains (`POST /portal/tunnels`, the same customer-facing
+/// route every Standard-tier account already uses) for a trusted account
+/// instead of the operator running [`admin_provision_tunnel`] by hand for
+/// every additional hostname that account wants. `:subject` is the OIDC
+/// subject, resolved the exact same way every other self-service action here
+/// resolves an account ([`crate::storage::SqliteLedger::account_for_subject`]),
+/// so this always targets exactly the account that subject's own portal login
+/// reaches -- never any other account.
+async fn admin_set_max_tunnels(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetMaxTunnelsReq>,
+) -> Response {
+    if let Err(code) = admin_authed(&headers, st.admin_token) {
+        return code.into_response();
+    }
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_set_max_tunnels/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_max_tunnels(&account, req.max) {
+        return internal_error("admin_set_max_tunnels/set", e).into_response();
+    }
+    StatusCode::OK.into_response()
 }
 
 /// Resolve the caller's account from the session, or an early response
@@ -635,16 +684,29 @@ async fn create_tunnel(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
     }
-    match st.tunnels.list_authorized_for_subject(&subject) {
-        Ok(rows) if rows.iter().any(|(_, owned)| *owned) => {
-            return (
-                StatusCode::FORBIDDEN,
-                "the Standard tier includes one tunnel per account; additional tunnels are a planned paid-tier feature",
-            )
-                .into_response();
-        }
-        Ok(_) => {}
+    // #214: the Standard tier's default is 1 tunnel per account, but an
+    // operator can raise this for a SPECIFIC account (SqliteLedger::
+    // set_max_tunnels, via POST /admin/accounts/:subject/max-tunnels) to
+    // unlock self-service creation of additional subdomains -- so the gate
+    // compares against that account's own limit, not a hardcoded "ever own
+    // one at all".
+    let owned_count = match st.tunnels.list_authorized_for_subject(&subject) {
+        Ok(rows) => rows.iter().filter(|(_, owned)| *owned).count() as u32,
         Err(e) => return internal_error("create_tunnel/list(owns_one)", e).into_response(),
+    };
+    let max = match st.ledger.account_for_subject(&subject) {
+        Ok(account) => match st.ledger.max_tunnels(&account) {
+            Ok(m) => m,
+            Err(e) => return internal_error("create_tunnel/max_tunnels", e).into_response(),
+        },
+        Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
+    };
+    if owned_count >= max {
+        return (
+            StatusCode::FORBIDDEN,
+            "the Standard tier includes one tunnel per account; additional tunnels are a planned paid-tier feature (or ask the operator to raise your account's limit)",
+        )
+            .into_response();
     }
     let hostname = st
         .dns
@@ -2478,6 +2540,75 @@ mod tests {
         let created = &tunnels.list_for_subject("flappy-demo-maintainer").unwrap()[0];
         assert_eq!(created.hostname.as_deref(), Some("flappy-demo.bunsenbrenner.org"));
         assert_eq!(created.routing_token, routing_token);
+    }
+
+    #[tokio::test]
+    async fn admin_set_max_tunnels_unlocks_self_service_creation_for_one_specific_account() {
+        // #214: remote asked to self-service-create MORE than the Standard
+        // tier's one tunnel, for their own specific account, rather than the
+        // operator running admin_provision_tunnel by hand for every additional
+        // hostname. Proves: default stays 1 for everyone (existing behavior
+        // unchanged), the admin route is gated the same way
+        // admin_provision_tunnel already is, raising the limit targets ONLY
+        // the named subject's account (a sibling account's own limit is
+        // untouched), and the raised account can then really create a second
+        // tunnel via the SAME customer-facing POST /portal/tunnels route
+        // every Standard-tier account already uses -- no new/parallel
+        // creation path.
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x88u8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
+            Some(secret),
+        );
+
+        let remote = "remote-maintainer";
+        let sibling = "someone-else";
+
+        // First tunnel: succeeds for anyone (default limit 1, 0 owned so far).
+        assert_eq!(post_form(&app, "/portal/tunnels", remote, "name=first").await, StatusCode::SEE_OTHER);
+        // Second tunnel for the SAME account, still at the default limit: refused.
+        assert_eq!(post_form(&app, "/portal/tunnels", remote, "name=second").await, StatusCode::FORBIDDEN);
+
+        let set_max = |subject: &str, max: u32, token_header: Option<String>| {
+            let app = app.clone();
+            let mut req = Request::post(format!("/admin/accounts/{subject}/max-tunnels")).header("content-type", "application/json");
+            if let Some(t) = token_header {
+                req = req.header("x-ct-admin-token", t);
+            }
+            let req = req.body(Body::from(format!(r#"{{"max":{max}}}"#))).unwrap();
+            async move { app.oneshot(req).await.unwrap() }
+        };
+
+        // Gated the same way admin_provision_tunnel already is.
+        assert_eq!(set_max(remote, 3, None).await.status(), StatusCode::UNAUTHORIZED, "no token -> refused");
+        assert_eq!(set_max(remote, 3, Some(hex(&[0x11u8; 32]))).await.status(), StatusCode::UNAUTHORIZED, "wrong token -> refused");
+        assert_eq!(set_max(remote, 3, Some(hex(&secret))).await.status(), StatusCode::OK);
+
+        // Now the SAME account's second attempt succeeds (0->1 already owned,
+        // 1 < 3), and a third also succeeds (2 < 3).
+        assert_eq!(post_form(&app, "/portal/tunnels", remote, "name=second").await, StatusCode::SEE_OTHER, "raised limit unlocks a second tunnel");
+        assert_eq!(post_form(&app, "/portal/tunnels", remote, "name=third").await, StatusCode::SEE_OTHER, "and a third, still under the raised limit of 3");
+        assert_eq!(post_form(&app, "/portal/tunnels", remote, "name=fourth").await, StatusCode::FORBIDDEN, "the 4th hits the raised limit itself");
+
+        // A sibling account's OWN limit is untouched -- still refused at 1.
+        assert_eq!(post_form(&app, "/portal/tunnels", sibling, "name=first").await, StatusCode::SEE_OTHER);
+        assert_eq!(post_form(&app, "/portal/tunnels", sibling, "name=second").await, StatusCode::FORBIDDEN, "sibling account was never raised");
+
+        assert_eq!(tunnels.list_for_subject(remote).unwrap().len(), 3, "remote really owns 3 real tunnel rows, not just 3 successful responses");
     }
 
     #[tokio::test]

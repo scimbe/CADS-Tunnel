@@ -900,9 +900,43 @@ impl SqliteLedger {
         // #44: `payments.confirmed` was added after the table's first release;
         // ensure it exists on a pre-existing DB so a top-up write doesn't 500.
         ensure_column(&conn, "payments", "confirmed", "INTEGER NOT NULL DEFAULT 0")?;
+        // Multi-tunnel entitlement follow-up (#214): every account defaults to the
+        // Standard tier's own tunnel (1) -- an operator can raise this for a
+        // SPECIFIC account (set_max_tunnels) to unlock self-service creation of
+        // additional subdomains, instead of running admin_provision_tunnel by hand
+        // for every one. DEFAULT 1 keeps every existing account's behavior
+        // unchanged on a pre-existing DB.
+        ensure_column(&conn, "accounts", "max_tunnels", "INTEGER NOT NULL DEFAULT 1")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// The most tunnels `account` may own at once (default 1, the Standard
+    /// tier) -- what [`Self::set_max_tunnels`] raises for a specific account.
+    pub fn max_tunnels(&self, account: &AccountId) -> rusqlite::Result<u32> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT max_tunnels FROM accounts WHERE account = ?1",
+                params![&account.0[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(1).max(0) as u32)
+    }
+
+    /// Raise (or lower) the tunnel-creation limit for one SPECIFIC account
+    /// (#214) -- an operator-only action; `create_tunnel`'s own gate is the
+    /// only thing that reads this. No-op (not an error) if `account` doesn't
+    /// exist yet (a subject that has never logged in has no account row to
+    /// update -- [`Self::account_for_subject`] creates one on first login).
+    pub fn set_max_tunnels(&self, account: &AccountId, max: u32) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "UPDATE accounts SET max_tunnels = ?1 WHERE account = ?2",
+            params![max, &account.0[..]],
+        )?;
+        Ok(())
     }
 
     fn balance_of(conn: &Connection, id: &AccountId) -> rusqlite::Result<Option<i64>> {
@@ -4750,6 +4784,23 @@ mod tests {
         // The bound account is a real, usable account.
         ledger.credit(&a1, 10).unwrap();
         assert_eq!(ledger.balance(&a1).unwrap(), 10);
+    }
+
+    #[test]
+    fn max_tunnels_defaults_to_one_and_is_raised_per_account_only() {
+        // #214 multi-tunnel entitlement: every account starts at the Standard
+        // tier's default of 1 (unchanged behavior for everyone who never gets
+        // raised); raising it targets ONLY the specified account -- a sibling
+        // account's own limit is untouched.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let a1 = ledger.account_for_subject("remote-maintainer").unwrap();
+        let a2 = ledger.account_for_subject("someone-else").unwrap();
+        assert_eq!(ledger.max_tunnels(&a1).unwrap(), 1, "default is 1, the Standard tier");
+        assert_eq!(ledger.max_tunnels(&a2).unwrap(), 1);
+
+        ledger.set_max_tunnels(&a1, 5).unwrap();
+        assert_eq!(ledger.max_tunnels(&a1).unwrap(), 5, "raised for the specified account");
+        assert_eq!(ledger.max_tunnels(&a2).unwrap(), 1, "a different account's limit is untouched");
     }
 
     #[test]
