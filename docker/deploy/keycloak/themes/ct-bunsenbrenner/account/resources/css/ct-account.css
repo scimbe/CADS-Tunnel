@@ -77,6 +77,23 @@ body,
   color: var(--ct-text);
 }
 
+/* Personal Info (js/apps/account-ui's Page.tsx, verified against Keycloak
+   25.0's actual source) renders its content directly inside a bare
+   `.pf-v5-c-page__main-section`, not a `.pf-v5-c-card` -- so on that page
+   specifically, none of this file's card border/radius/shadow/hover rules
+   below ever applied, and the section just sat flush against the page
+   background with zero depth or separation. Give the section itself the
+   same panel treatment so every account page reads as "considered", not
+   just the ones that happen to use Card. */
+.pf-v5-c-page__main-section {
+  border: 1px solid var(--ct-border);
+  border-radius: 12px;
+  margin: 0 0 1rem;
+}
+.pf-v5-c-page__main-section:first-of-type {
+  margin-top: 1rem;
+}
+
 .pf-v5-c-form-control,
 .pf-v5-c-text-input-group__text-input,
 input.pf-v5-c-form-control {
@@ -91,9 +108,19 @@ input.pf-v5-c-form-control {
   background-color: rgba(95, 184, 171, .1);
   color: var(--ct-accent-hover);
 }
-.pf-v5-c-nav__link.pf-m-current {
-  color: var(--ct-accent);
-  border-left: 3px solid var(--ct-accent);
+/* !important + box-shadow (not border-left, which would fight the layout of
+   PatternFly's own ::after indicator bar) because .pf-v5-c-nav__link.pf-m-current
+   is PatternFly's OWN component CSS at the same specificity -- verified against
+   the real compiled nav.css (@patternfly/patternfly 5.3.1, the version Keycloak
+   25.0's account-ui actually ships): it sets `color`/`background-color` directly,
+   not via a variable this theme can simply redirect, so without !important
+   whichever stylesheet the SPA's own bundle loads later in the document just
+   wins the cascade tie and this rule silently does nothing. */
+.pf-v5-c-nav__link.pf-m-current,
+.pf-v5-c-nav__link.pf-m-current:hover {
+  color: var(--ct-accent) !important;
+  background-color: rgba(95, 184, 171, .12) !important;
+  box-shadow: inset 3px 0 0 var(--ct-accent);
 }
 
 .pf-v5-c-button.pf-m-primary {
@@ -132,8 +159,15 @@ input.pf-v5-c-form-control {
   to   { opacity: 1; transform: translateY(0); }
 }
 .pf-v5-c-page__main-section {
-  animation: ctAccountIn .32s ease-out;
+  animation: ctAccountIn .32s ease-out backwards;
 }
+/* Sibling main-sections (e.g. Personal Info's title section + content
+   section, each a bare `.pf-v5-c-page__main-section` with no Card) stagger
+   against each other the same way Card children do below -- otherwise every
+   section on a Card-less page fades in at once with zero sense of sequence. */
+.pf-v5-c-page__main-section:nth-of-type(1) { animation-delay: 0ms; }
+.pf-v5-c-page__main-section:nth-of-type(2) { animation-delay: 40ms; }
+.pf-v5-c-page__main-section:nth-of-type(n+3) { animation-delay: 80ms; }
 /* A light stagger across the section's direct cards reads as a deliberate
    reveal rather than everything popping in at once -- capped at a handful of
    steps so a long settings list doesn't end with a visibly-delayed tail. */
@@ -155,14 +189,19 @@ input.pf-v5-c-form-control {
 /* The masthead brand mark (logo.svg + "Back to bunsenbrenner.org" referrer
    link, when present) -- give it room and a hover cue since it's now a real
    navigation affordance, not decoration. */
-img[alt="logo"] {
+/* Case-insensitive ([alt="logo" i]): Header.tsx sets alt={t("logo")} -- a
+   TRANSLATED string, not the literal word "logo". English happens to render
+   lowercase "logo", but German (messages_de) renders "Logo" (capital), which
+   this selector silently failed to match before -- verified against the real
+   Header.tsx source (js/apps/account-ui/src/root/Header.tsx, Keycloak 25.0). */
+img[alt="logo" i] {
   height: 26px;
   width: auto;
 }
-[data-testid="page-header"] a:has(img[alt="logo"]) {
+[data-testid="page-header"] a:has(img[alt="logo" i]) {
   transition: opacity .15s ease;
 }
-[data-testid="page-header"] a:has(img[alt="logo"]):hover {
+[data-testid="page-header"] a:has(img[alt="logo" i]):hover {
   opacity: .85;
 }
 [data-testid="referrer-link"] {
