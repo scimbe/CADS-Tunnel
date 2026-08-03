@@ -438,6 +438,45 @@ fn build_front_door_cert(
     }
 }
 
+/// Optional native TLS termination for the browser WS channel listener
+/// (`CT_EDGE_WS_CHANNEL_CERT`/`_KEY`). Unlike [`build_front_door_cert`]'s front-door
+/// hosts, an ABSENT cert here is a normal, expected configuration -- plain `ws://`,
+/// e.g. behind a reverse proxy that already terminates TLS (the deployed
+/// CADS-webconference-demo's Caddy front does exactly this) or local dev with no TLS
+/// at all -- so this stays silent rather than warning about an "outage" the way
+/// `build_front_door_cert` does. A PARTIALLY set or configured-but-unusable pair
+/// still warns loudly; that IS a real misconfiguration, same as the front-door case.
+fn build_ws_channel_cert() -> Option<tokio_rustls::TlsAcceptor> {
+    let cert_env = "CT_EDGE_WS_CHANNEL_CERT";
+    let key_env = "CT_EDGE_WS_CHANNEL_KEY";
+    let cert = std::env::var(cert_env).ok();
+    let key = std::env::var(key_env).ok();
+    let present = |v: &Option<String>| v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    match (present(&cert), present(&key)) {
+        (false, false) => None,
+        (true, true) => match crate::transport::build_portal_acceptor(cert.as_deref().unwrap(), key.as_deref().unwrap()) {
+            Ok(a) => {
+                eprintln!("ct-edge: ws-channel listener terminates TLS natively (wss://, {cert_env})");
+                Some(a)
+            }
+            Err(e) => {
+                eprintln!(
+                    "ct-edge: WARNING — {cert_env}/{key_env} configured but UNUSABLE ({e}); \
+                     ws-channel listener stays plain ws://"
+                );
+                None
+            }
+        },
+        _ => {
+            eprintln!(
+                "ct-edge: WARNING — only one of {cert_env}/{key_env} is set; ws-channel \
+                 listener stays plain ws:// (set both, or neither)"
+            );
+            None
+        }
+    }
+}
+
 /// Serve one plaintext HTTP/1.x request on `:80` with a `308 Permanent Redirect`
 /// to the HTTPS URL for the same Host + path — so a browser typing
 /// `http://<host>/…` is bounced to `https://<host>/…` on the unified `:443`
@@ -2323,9 +2362,16 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                      (authorize via {cp_url}, cross-transport pairing with the :443 front door)"
                 );
                 let ws_channel_cap = ws_channel_cap.clone();
+                let ws_channel_tls = build_ws_channel_cert();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::ws_channel::serve_ws_channel_with_pairer(ws_addr, resolver, pairer, ws_channel_cap).await
+                    if let Err(e) = crate::ws_channel::serve_ws_channel_with_pairer(
+                        ws_addr,
+                        resolver,
+                        pairer,
+                        ws_channel_cap,
+                        ws_channel_tls,
+                    )
+                    .await
                     {
                         eprintln!("ct-edge: ws-channel listener on {ws_addr} ended: {e}");
                     }

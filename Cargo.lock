@@ -607,6 +607,8 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "quinn",
  "rand 0.8.7",
  "rcgen",
