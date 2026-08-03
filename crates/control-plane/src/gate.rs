@@ -41,7 +41,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
-use crate::portal::{identity_from_verified_id_token, oidc_http_client, ExchangedIdentity, PortalOidc};
+use crate::portal::{identity_from_verified_id_token, oidc_http_client, urlencode, ExchangedIdentity, PortalOidc};
 use crate::storage::SqliteTunnelStore;
 
 const GATE_STATE_COOKIE: &str = "ct_gate_state";
@@ -222,8 +222,18 @@ const GATE_EMAIL_HEADER: &str = "x-gate-email";
 /// setting), not in Caddy's own config -- so: `200` immediately when the host
 /// doesn't have the gate enabled at all; `200` (with the verified email in
 /// `X-Gate-Email`) when it does AND a valid, unexpired `ct_gate_session` cookie
-/// for exactly that host is present; `401` otherwise (Caddy turns a `401` here
-/// into the login redirect via its own `handle_errors`).
+/// for exactly that host is present.
+///
+/// Otherwise a `302` straight to `/gate/start` -- **not** a bare `401` for
+/// Caddy's `handle_errors` to convert. Confirmed against Caddy's own docs:
+/// `forward_auth` copies a non-2xx auth-backend response straight to the
+/// client verbatim, it never reaches `handle_errors` at all ("this response
+/// should typically involve a redirect to the login page... of the
+/// authentication gateway" -- i.e. issuing the redirect is *this handler's*
+/// job, not Caddy's). An earlier version of this handler returned a bare
+/// `401` and relied on `handle_errors`, which never actually fired -- caught
+/// live testing the first real gated demo (devsystem-demo.bunsenbrenner.org,
+/// #382), not from re-reading the docs first.
 async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Query<CheckQuery>) -> Response {
     let Some(host) = headers
         .get("x-forwarded-host")
@@ -239,15 +249,46 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
     let now = now_secs();
-    match cookie_value(&headers, GATE_SESSION_COOKIE).and_then(|t| verify_gate_session(&st.session_key, &t, now)) {
-        Some(claims) if claims.host == host => match HeaderValue::from_str(&claims.email) {
-            Ok(v) => (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response(),
-            // A malformed/non-ASCII email can't ride in a header value -- fail
-            // closed (no identity to report is worse than none at all here).
-            Err(_) => StatusCode::UNAUTHORIZED.into_response(),
-        },
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    if let Some(claims) =
+        cookie_value(&headers, GATE_SESSION_COOKIE).and_then(|t| verify_gate_session(&st.session_key, &t, now))
+    {
+        if claims.host == host {
+            if let Ok(v) = HeaderValue::from_str(&claims.email) {
+                return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
+            }
+            // A malformed/non-ASCII email can't ride in a header value -- fall
+            // through to the redirect below (no identity to report is worse
+            // than none at all here).
+        }
     }
+    let Some(cfg) = &st.oidc else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(gate_host) = gate_public_host(&cfg.redirect_uri) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // Caddy's forward_auth sets X-Forwarded-Uri to the ORIGINAL request path
+    // the visitor wanted -- so the round trip through Keycloak lands them back
+    // where they meant to go, not always the site root.
+    let return_path = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or("/");
+    let location = format!(
+        "https://{gate_host}/gate/start?host={}&return={}",
+        urlencode(&host),
+        urlencode(return_path)
+    );
+    (StatusCode::FOUND, [(axum::http::header::LOCATION, location)]).into_response()
+}
+
+/// The control plane's own public host, e.g. `bunsenbrenner.org` from
+/// `https://bunsenbrenner.org/portal/callback` -- where `/gate/start` (and
+/// this whole gate router) actually lives, as opposed to whichever gated
+/// hostname `gate_check` was just asked about.
+fn gate_public_host(portal_redirect_uri: &str) -> Option<&str> {
+    portal_redirect_uri.strip_prefix("https://").or_else(|| portal_redirect_uri.strip_prefix("http://"))?.split('/').next()
 }
 
 #[derive(Deserialize)]
@@ -567,20 +608,28 @@ mod tests {
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
 
-        // No cookie at all -> 401.
+        // No cookie at all -> 302 straight to /gate/start (NOT a bare 401 --
+        // forward_auth copies our response to the client verbatim, so this
+        // handler must issue the redirect itself; Caddy's handle_errors never
+        // sees a forward_auth non-2xx at all).
         let bare = app
             .clone()
             .oneshot(
                 Request::get("/gate/check")
                     .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                    .header("x-forwarded-uri", "/room/1")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(bare.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(bare.status(), StatusCode::FOUND);
+        let location = bare.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.starts_with("https://bunsenbrenner.org/gate/start?"), "got {location}");
+        assert!(location.contains("host=demo.bunsenbrenner.org"));
+        assert!(location.contains("return=%2Froom%2F1"), "carries the original path so the round trip lands back where the visitor meant to go: {location}");
 
-        // A valid session for a DIFFERENT host -> still 401 (no cross-tunnel replay).
+        // A valid session for a DIFFERENT host -> still redirected (no cross-tunnel replay).
         let now = now_secs();
         let wrong_host_token = sign_gate_session(TEST_KEY, "other.bunsenbrenner.org", "alice@example.com", now + 3600);
         let wrong = app
@@ -594,7 +643,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "a session minted for a different host is refused");
+        assert_eq!(wrong.status(), StatusCode::FOUND, "a session minted for a different host is refused");
 
         // A valid session for the RIGHT host -> 200, with the verified email
         // available to Caddy's forward_auth via X-Gate-Email.

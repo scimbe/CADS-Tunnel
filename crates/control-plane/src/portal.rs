@@ -971,7 +971,7 @@ fn random_state() -> String {
 
 /// Percent-encode a query-parameter value (encode everything but the RFC 3986
 /// unreserved set), so `redirect_uri` (with `:` and `/`) survives intact.
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
