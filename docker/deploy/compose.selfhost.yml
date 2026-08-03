@@ -43,6 +43,17 @@ services:
     cpus: 1.0
     environment:
       CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
+      # #214: without this, the portal-session HMAC key falls back to a fresh
+      # random one on EVERY restart (main.rs's own documented behavior) --
+      # not just this repo's own portal sessions, but the Browser-Plane login
+      # gate's ct_gate_session cookies too (gate.rs shares the same key).
+      # Every redeploy silently logs everyone out and drops every gated
+      # tunnel's active sessions. Optional (a base-only deployment with no
+      # SSO configured never mints a session to begin with, so an unset
+      # value there is harmless) -- but any deployment that DOES run
+      # compose.sso.yml should set a real one in .env: 64 random hex chars,
+      # e.g. `openssl rand -hex 32`.
+      CT_PORTAL_SESSION_KEY: "${CT_PORTAL_SESSION_KEY:-}"
       CT_CONTROL_PLANE_DB: "/data/control-plane.db"
       # Where the control plane reads the edge CA root to publish at /pki/ca
       # (#11). The edge writes it into the shared volume (CT_EDGE_CERT_OUT below);
