@@ -141,6 +141,16 @@ services:
       # to any confirmed-open port pair via .env alone, no compose/code edit needed.
       CT_EDGE_CHANNEL_LISTEN: "0.0.0.0:${EDGE_CHANNEL_PORT:-4435}"
       CT_EDGE_CHANNEL_RELAY_LISTEN: "0.0.0.0:${EDGE_CHANNEL_RELAY_PORT:-4436}"
+      # Video-conferencing feature: the browser-reachable Agent-Fabric channel entry
+      # point (ws_channel.rs) -- a browser has no raw UDP/QUIC or TLS-ALPN control of
+      # its own, so it can't reach either broker above; this is a plain WebSocket
+      # listener bridging into the identical admission/pairing/relay core (now
+      # cross-transport-paired with the two brokers above via SharedChannelPairer).
+      # Same opt-in convention (activates only when CP_URL + ADMIN_TOKEN are also
+      # set, which this deployment already has). Plain ws:// here -- a TLS-
+      # terminating front (Caddy or the edge's own TLS) in front of it, for a real
+      # browser page to reach it as wss://, is a separate follow-up.
+      CT_EDGE_WS_CHANNEL_LISTEN: "0.0.0.0:${EDGE_WS_CHANNEL_PORT:-4437}"
     volumes:
       - shared:/shared
     ports:
@@ -157,6 +167,10 @@ services:
       # door (#106, ALPN=ct-edge-channel).
       - "${EDGE_CHANNEL_RELAY_PORT:-4436}:${EDGE_CHANNEL_RELAY_PORT:-4436}/udp"
       - "${EDGE_CHANNEL_RELAY_PORT:-4436}:${EDGE_CHANNEL_RELAY_PORT:-4436}/tcp"
+      # Video-conferencing feature: the browser-reachable WebSocket channel listener
+      # (ws_channel.rs, admission-gated same as the ports above -- a signed grant +
+      # possession proof is required, so this is safe to publish on all interfaces).
+      - "${EDGE_WS_CHANNEL_PORT:-4437}:${EDGE_WS_CHANNEL_PORT:-4437}/tcp"
       # Operator-facing metrics scrape endpoint (#19), bound to LOOPBACK (#85) — it's
       # unauthenticated, so it must not be published on a public interface; scrape it
       # from 127.0.0.1 (or internally via the docker network at edge:9600). Override

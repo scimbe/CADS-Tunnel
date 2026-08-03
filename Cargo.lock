@@ -537,8 +537,6 @@ dependencies = [
  "axum",
  "ct-agent",
  "ct-common",
- "ed25519-dalek",
- "rand 0.8.7",
  "serde_json",
  "tokio",
  "tokio-stream",
