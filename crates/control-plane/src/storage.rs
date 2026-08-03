@@ -2161,6 +2161,52 @@ impl SqliteChannelStore {
         Ok(true)
     }
 
+    /// Every member of `channel`, owner-scoped (only `owner` -- the channel's real
+    /// owner -- can list its members; anyone else gets an empty list, same
+    /// ownership-check shape as [`Self::add_member`]) -- `(holder, noise_pubkey)`,
+    /// sorted by holder so the result is stable. The video-conferencing feature's
+    /// missing piece: `/me/channels` itself (registration, membership) had no GET
+    /// route at all before this -- an operator could register a channel + add
+    /// members but never list what they'd already registered.
+    pub fn members_of(&self, channel: &ChannelId, owner: &str) -> rusqlite::Result<Option<Vec<([u8; 32], Option<[u8; 32]>)>>> {
+        let conn = self.conn.lock_safe();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            // `None` (not an empty `Some(vec![])`), matching `allowlist_list`'s own
+            // convention: a non-owner gets a clear 403 at the HTTP layer, not a 200
+            // with an empty list that reads the same as "no members yet" -- no
+            // membership-existence leak either way, but a distinguishable, honest
+            // response instead of two different truths looking identical.
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT holder, noise_pubkey FROM channel_members WHERE channel = ?1 ORDER BY holder",
+        )?;
+        let rows = stmt
+            .query_map(params![&channel.0[..]], |r| {
+                let holder: Vec<u8> = r.get(0)?;
+                let noise: Option<Vec<u8>> = r.get(1)?;
+                Ok((holder, noise))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(
+            rows.into_iter()
+                .filter_map(|(h, n)| {
+                    let holder = <[u8; 32]>::try_from(h.as_slice()).ok()?;
+                    let noise = n.and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+                    Some((holder, noise))
+                })
+                .collect(),
+        ))
+    }
+
     /// Record a cross-user invitation redemption as **consumed** (#72 AF3 / #108),
     /// keyed by the invitation's 64-byte operator signature (unique per invitation — a
     /// replay carries the identical bytes). Returns `true` the **first** time an
