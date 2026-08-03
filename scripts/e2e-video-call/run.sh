@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Real end-to-end proof of the video-conferencing feature's channel-join + Noise +
 # WebRTC-signaling pipeline (see crates/agent-wasm/src/lib.rs, crates/edge/src/
-# ws_channel.rs, crates/agent-tools/src/bin/video_call_grant.rs).
+# ws_channel.rs). The browser-facing demo page that consumes these primitives now
+# lives in the separate scimbe/CADS-webconference-demo repo (a demo, not core
+# platform code); this script is CADS-Tunnel's own core regression test and stays
+# fully self-contained -- setup.js mints its own test grants locally (see its own
+# header comment) rather than depending on that repo's tooling.
 #
 # Two independent "browser peers" (Alice, Bob), each driving their OWN instance of
 # the actual compiled ct-agent-wasm module and a real WebSocket connection, join
@@ -16,8 +20,8 @@
 # members for real needs a live OIDC session against the control plane, which is
 # a separate, credentialed step tested in ct-control-plane's own suite). Every
 # other component -- the edge binary, the WASM module, the WebSocket transport,
-# the Noise handshake, the signaling protocol, the grant-minting CLI -- is the
-# genuine, unmodified article.
+# the Noise handshake, the signaling protocol -- is the genuine, unmodified
+# article.
 #
 # This is fully hermetic: builds everything itself in a throwaway container, runs
 # entirely on loopback, and needs no live host or credentials.
@@ -44,8 +48,8 @@ SCRIPTS=/work/scripts/e2e-video-call
 apt-get update -qq >/dev/null
 apt-get install -y -qq nodejs >/dev/null
 
-echo "== building ct-edge + ct-video-call-grant =="
-cargo build -p ct-edge -p ct-agent-tools --bin ct-video-call-grant
+echo "== building ct-edge =="
+cargo build -p ct-edge
 
 echo "== building ct-agent-wasm (wasm32) + JS glue =="
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1
@@ -56,9 +60,8 @@ fi
 mkdir -p /tmp/e2e-pkg
 wasm-bindgen --target nodejs --out-dir /tmp/e2e-pkg target/wasm32-unknown-unknown/release/ct_agent_wasm.wasm
 
-echo "== generating identities + minting grants (real ct-video-call-grant) =="
-WASM_PKG_DIR=/tmp/e2e-pkg GRANT_BIN=/work/target/debug/ct-video-call-grant \
-  node "$SCRIPTS/setup.js"
+echo "== generating identities + minting grants =="
+WASM_PKG_DIR=/tmp/e2e-pkg node "$SCRIPTS/setup.js"
 # shellcheck source=/dev/null
 source /tmp/e2e-env.sh
 
