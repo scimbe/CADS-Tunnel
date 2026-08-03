@@ -48,6 +48,15 @@ use crate::serve::ChannelMemberResolver;
 /// opaque byte stream (which every `crate::channel_broker`/`ct_common::noise` caller
 /// already does -- Noise messages are self-delimiting via `noise::frame`/`take_frame`'s
 /// own length prefix), the two framings never need to line up.
+/// How often an idle (no application bytes flowing) channel connection gets a
+/// server-sent WebSocket Ping (#XXX): once two members are paired and their Noise/
+/// signaling session is established, real call traffic is sparse (occasional SDP/
+/// ICE messages, not a steady stream) -- exactly the shape of connection an
+/// idle-timeout reverse proxy or load balancer in front of this listener is most
+/// likely to drop. Conservative relative to common default idle-WebSocket timeouts
+/// (many sit around 60s) so a Ping goes out well before any such timeout could fire.
+const WS_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct WsByteStream {
     inner: WebSocket,
     read_buf: std::collections::VecDeque<u8>,
@@ -58,16 +67,51 @@ pub struct WsByteStream {
     /// the *same* `buf`) resumes at `poll_flush` instead of calling `start_send`
     /// again and queuing the same bytes twice.
     pending_write_len: Option<usize>,
+    /// Fires every [`WS_KEEPALIVE_INTERVAL`]; `poll_read` checks it on every call
+    /// (which registers this task's waker against the timer even on a call that
+    /// finds nothing to read, so a purely idle connection still gets polled again
+    /// when the timer fires -- `poll_next` alone only wakes on a real inbound
+    /// message/state change, never on the mere passage of time).
+    keepalive: tokio::time::Interval,
 }
 
 impl WsByteStream {
     pub fn new(inner: WebSocket) -> Self {
-        Self { inner, read_buf: std::collections::VecDeque::new(), eof: false, pending_write_len: None }
+        Self::new_with_keepalive(inner, WS_KEEPALIVE_INTERVAL)
+    }
+
+    /// Like [`Self::new`], but with an explicit keepalive interval -- exposed so a
+    /// test can use a short interval instead of waiting out the real 30s constant.
+    fn new_with_keepalive(inner: WebSocket, keepalive_interval: Duration) -> Self {
+        let mut keepalive = tokio::time::interval(keepalive_interval);
+        // The first tick fires immediately (tokio::time::interval's own default) --
+        // not useful here (a fresh connection is never "idle" yet) and would send a
+        // pointless Ping before the first real byte. Consume it now so the first
+        // REAL tick is a full interval away.
+        keepalive.reset();
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self { inner, read_buf: std::collections::VecDeque::new(), eof: false, pending_write_len: None, keepalive }
     }
 }
 
 impl AsyncRead for WsByteStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        // Best-effort periodic Ping to keep idle-timeout infra from dropping a
+        // long-lived but signaling-sparse call session -- see WS_KEEPALIVE_INTERVAL's
+        // doc comment. Skipped (not lost -- the interval just fires again on its own
+        // schedule) if a data write is already in flight, so this never interleaves
+        // a second `start_send` before `poll_write`'s own pending flush completes
+        // (the WebSocket Sink requires strictly sequenced poll_ready/start_send/
+        // poll_flush, never two starts in flight at once).
+        {
+            let this = self.as_mut().get_mut();
+            if this.keepalive.poll_tick(cx).is_ready() && this.pending_write_len.is_none() {
+                if let Poll::Ready(Ok(())) = Pin::new(&mut this.inner).poll_ready(cx) {
+                    let _ = Pin::new(&mut this.inner).start_send(Message::Ping(Vec::new()));
+                    let _ = Pin::new(&mut this.inner).poll_flush(cx);
+                }
+            }
+        }
         loop {
             if !self.read_buf.is_empty() {
                 let n = buf.remaining().min(self.read_buf.len());
@@ -522,5 +566,46 @@ mod tests {
         // received a "NO" (or closed) well within this window.
         let quiet = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
         assert!(quiet.is_err(), "a parked solo member gets silence, not a refusal or an ack: {quiet:?}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_ws_byte_stream_sends_periodic_keepalive_pings() {
+        // #XXX: once paired, a real call's signaling traffic is sparse -- a
+        // WsByteStream sitting idle (no application bytes to relay) must still keep
+        // sending WS Pings so an idle-timeout reverse proxy/load balancer in front of
+        // this listener doesn't drop the connection mid-call. Proves the mechanism
+        // directly against a real WebSocket (tokio-tungstenite, real TCP): a server
+        // task holds a WsByteStream open with NOTHING to read or write (mirroring a
+        // real relay's read side blocked waiting for the next byte) and a real client
+        // observes an actual `Ping` frame arrive within a bounded window, using a
+        // short test-only interval instead of the real 30s constant.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        async fn ws_upgrade_test_handler(ws: WebSocketUpgrade) -> Response {
+            ws.on_upgrade(|socket| async move {
+                let mut stream = WsByteStream::new_with_keepalive(socket, Duration::from_millis(100));
+                // Drive poll_read forever (nothing will ever actually arrive) -- the
+                // exact same "blocked waiting for the next byte" shape a real
+                // relay's read side has on an idle connection, which is precisely
+                // when the keepalive needs to keep firing.
+                let mut buf = [0u8; 1];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            })
+        }
+        let app = Router::new().route("/ws/idle", get(ws_upgrade_test_handler));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/idle")).await.expect("ws connect");
+
+        // Send nothing at all; just wait for the server's own unprompted Ping.
+        let msg = tokio::time::timeout(Duration::from_millis(500), ws.next())
+            .await
+            .expect("a Ping should arrive well within 5x the 100ms test interval")
+            .expect("stream item")
+            .expect("no ws error");
+        assert!(matches!(msg, WsMessage::Ping(_)), "expected a Ping frame, got {msg:?}");
     }
 }
