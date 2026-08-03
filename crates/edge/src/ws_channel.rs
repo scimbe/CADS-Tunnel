@@ -362,22 +362,79 @@ pub async fn serve_ws_channel(
     Ok(())
 }
 
+/// Serve `router` on `inner`, optionally TLS-wrapping each accepted connection first
+/// (`tls: None` = plain `ws://`, `Some(acceptor)` = native `wss://` termination).
+/// axum 0.7's `axum::serve` only accepts a concrete [`tokio::net::TcpListener`] --
+/// the generic `Listener` trait that would let a custom listener TLS-wrap per
+/// connection arrived in axum 0.8, which this workspace doesn't use (its route-param
+/// syntax change, `:id` -> `{id}`, is a much larger, unrelated migration across every
+/// router in this crate). So this drives the connection at the hyper 1.x level
+/// directly -- the same low-level approach axum's own examples use for exactly this
+/// case. `.with_upgrades()` is required for the WebSocket `Connection: Upgrade`
+/// handshake this listener exists for.
+async fn serve_with_optional_tls(
+    inner: tokio::net::TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    router: Router,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let (stream, addr) = match inner.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                // A transient per-connection accept error must not take down the
+                // whole listener -- log and keep serving.
+                eprintln!("ct-edge: ws-channel accept error: {e}");
+                continue;
+            }
+        };
+        let router = router.clone();
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            let service = hyper_util::service::TowerToHyperService::new(router);
+            let result = match tls {
+                None => {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    hyper::server::conn::http1::Builder::new().serve_connection(io, service).with_upgrades().await
+                }
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        hyper::server::conn::http1::Builder::new().serve_connection(io, service).with_upgrades().await
+                    }
+                    Err(e) => {
+                        // One failed TLS handshake (e.g. a plain-HTTP probe hitting a
+                        // wss:// port) must not kill the listener -- log and drop just
+                        // this connection.
+                        eprintln!("ct-edge: ws-channel TLS handshake failed from {addr}: {e}");
+                        return;
+                    }
+                },
+            };
+            if let Err(e) = result {
+                eprintln!("ct-edge: ws-channel connection from {addr} ended: {e}");
+            }
+        });
+    }
+}
+
 /// Like [`serve_ws_channel`], but joins the shared cross-transport `pairer` (the
 /// `:443` front door's own channel broker uses the same one) instead of building a
-/// standalone one, and applies the given connection `cap` (`None` = unbounded) --
-/// what `run_edge` wires up in production so a browser member and a `:443`/QUIC
-/// member of the same channel correlate and can pair with each other, with the same
-/// flood protection every other public listener has.
+/// standalone one, applies the given connection `cap` (`None` = unbounded), and
+/// optionally terminates TLS natively via `tls` (`None` = plain `ws://`, unchanged
+/// default behavior) -- what `run_edge` wires up in production so a browser member
+/// and a `:443`/QUIC member of the same channel correlate and can pair with each
+/// other, with the same flood protection and TLS-termination option every other
+/// public listener has.
 pub async fn serve_ws_channel_with_pairer(
     listen: std::net::SocketAddr,
     resolver: Arc<dyn ChannelMemberResolver>,
     pairer: crate::channel_broker::SharedChannelPairer,
     cap: Option<crate::state::ConnectionCap>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = WsChannelState::new(resolver, pairer, cap);
-    let listener = tokio::net::TcpListener::bind(listen).await?;
-    axum::serve(listener, ws_channel_router(state)).await?;
-    Ok(())
+    let inner = tokio::net::TcpListener::bind(listen).await?;
+    serve_with_optional_tls(inner, tls, ws_channel_router(state)).await
 }
 
 #[cfg(test)]
@@ -429,8 +486,8 @@ mod tests {
     /// mirror of `WsByteStream::poll_read`'s own concatenate-and-serve behavior, so the
     /// test doesn't have to assume anything about how the server chunks its writes
     /// across WS message boundaries.
-    async fn ws_read_exact(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    async fn ws_read_exact<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
         buf: &mut Vec<u8>,
         n: usize,
     ) -> Vec<u8> {
@@ -448,7 +505,7 @@ mod tests {
     /// Like [`ws_read_exact`], but reads until (and consumes) a `\n` byte -- for the
     /// text member-ack line `write_member_ack` sends after admission, before the raw
     /// relay payload begins.
-    async fn ws_read_line(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, buf: &mut Vec<u8>) -> String {
+    async fn ws_read_line<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(ws: &mut tokio_tungstenite::WebSocketStream<S>, buf: &mut Vec<u8>) -> String {
         loop {
             if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -554,6 +611,90 @@ mod tests {
         bob_ws.send(WsMessage::Binary(reply.to_vec())).await.expect("bob sends");
         let received_reply = ws_read_exact(&mut alice_ws, &mut alice_buf, reply.len()).await;
         assert_eq!(received_reply, reply, "alice received bob's reply, byte for byte");
+    }
+
+    #[tokio::test]
+    async fn wss_terminates_tls_natively_and_relays_exactly_like_plain_ws() {
+        // CT_EDGE_WS_CHANNEL_CERT/_KEY (production): the SAME channel-join/relay
+        // pipeline as the plain-ws test above, reached over a REAL TLS handshake
+        // (tokio-rustls, a real cert, a real client trusting it) instead of
+        // plaintext -- proves MaybeTlsListener's wrapping changes only the transport
+        // underneath, none of the join/relay behavior. Brings this listener to the
+        // same native-TLS-termination parity every other public edge listener
+        // (portal/auth/wildcard) already has.
+        let (unused_listener, acceptor, cert) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        drop(unused_listener); // only the acceptor + cert are needed; ws_channel binds its own port below
+
+        let operator = SigningKey::from_bytes(&[0x64u8; 32]);
+        let operator_pubkey = operator.verifying_key().to_bytes();
+        let channel = ChannelId([0x88u8; 32]);
+        let alice = SigningKey::from_bytes(&[0xA2u8; 32]);
+        let bob = SigningKey::from_bytes(&[0xB3u8; 32]);
+        let alice_holder = alice.verifying_key().to_bytes();
+        let bob_holder = bob.verifying_key().to_bytes();
+
+        let resolver = Arc::new(FixedResolver {
+            operator_pubkey,
+            channel,
+            holders: vec![alice_holder, bob_holder],
+        });
+        let pairer = crate::channel_broker::new_shared_channel_pairer();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe); // free the port for serve_ws_channel_with_pairer to bind for real
+        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor)));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        async fn join_tls(
+            addr: std::net::SocketAddr,
+            cert: rustls::pki_types::CertificateDer<'static>,
+            channel: ChannelId,
+            holder_key: &SigningKey,
+            direction: Direction,
+            operator_sk: &SigningKey,
+        ) -> (tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, Vec<u8>, String) {
+            let tls_stream = crate::transport::tcp_tls_connect(addr, cert).await.expect("tls connect");
+            let (mut ws, _resp) = tokio_tungstenite::client_async("wss://localhost/ws/channel", tls_stream)
+                .await
+                .expect("ws handshake over tls");
+            let holder = holder_key.verifying_key().to_bytes();
+            let grant = signed_grant(operator_sk, channel, holder, direction);
+            let req = ChannelJoinRequest { grant, endpoint: CHANNEL_ENDPOINT_RELAY_ONLY.to_string() };
+            let req_bytes = req.encode();
+            let mut out = Vec::with_capacity(2 + req_bytes.len());
+            out.extend_from_slice(&(req_bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(&req_bytes);
+            ws.send(WsMessage::Binary(out)).await.expect("send join request");
+
+            let mut buf = Vec::new();
+            let challenge = ws_read_exact(&mut ws, &mut buf, 32).await;
+            let sig = holder_key.sign(&challenge).to_bytes();
+            ws.send(WsMessage::Binary(sig.to_vec())).await.expect("send possession sig");
+
+            let member_ack_line = ws_read_line(&mut ws, &mut buf).await;
+            (ws, buf, member_ack_line)
+        }
+
+        let (alice_res, bob_res) = tokio::join!(
+            join_tls(addr, cert.clone(), channel, &alice, Direction::Initiate, &operator),
+            join_tls(addr, cert.clone(), channel, &bob, Direction::Accept, &operator),
+        );
+        let (mut alice_ws, mut alice_buf, alice_member_ack) = alice_res;
+        let (mut bob_ws, mut bob_buf, bob_member_ack) = bob_res;
+
+        assert!(alice_member_ack.starts_with(&format!("OK {CHANNEL_ENDPOINT_RELAY_ONLY}")), "alice's ack: {alice_member_ack}");
+        assert!(bob_member_ack.starts_with(&format!("OK {CHANNEL_ENDPOINT_RELAY_ONLY}")), "bob's ack: {bob_member_ack}");
+
+        let payload = b"hello from alice, over a REAL TLS-terminated websocket";
+        alice_ws.send(WsMessage::Binary(payload.to_vec())).await.expect("alice sends");
+        let received = ws_read_exact(&mut bob_ws, &mut bob_buf, payload.len()).await;
+        assert_eq!(received, payload, "bob received exactly what alice sent, byte for byte, over TLS");
+
+        let reply = b"and hello back from bob, over TLS too";
+        bob_ws.send(WsMessage::Binary(reply.to_vec())).await.expect("bob sends");
+        let received_reply = ws_read_exact(&mut alice_ws, &mut alice_buf, reply.len()).await;
+        assert_eq!(received_reply, reply, "alice received bob's reply, byte for byte, over TLS");
     }
 
     #[tokio::test]
