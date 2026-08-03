@@ -422,8 +422,33 @@ fn identity_from_verified_id_token(
     Ok(ExchangedIdentity { subject, email, email_verified })
 }
 
-async fn portal_home() -> Html<String> {
-    Html(portal_home_html(std::env::var("CT_PORTAL_SOCIAL_PROVIDERS").ok().as_deref()))
+/// `/portal`: the site's own entry point (#337-follow). When OIDC is configured
+/// (the normal production case), this skips the separate pre-login card entirely
+/// and redirects straight into the real Keycloak login form -- the SAME redirect
+/// [`portal_login`] builds, just reached without an extra click through an
+/// intermediate screen first. Two template systems (this Rust-rendered card, then
+/// Keycloak's own login theme) presenting themselves as one step read as "bolted
+/// together" (flagged in PR #337's design pass, confirmed live by the operator
+/// looking at the actual deployed site) -- collapsing the hop removes both the
+/// extra click and the jarring handoff. When OIDC is NOT configured (local/dev/
+/// self-host without SSO wired up yet), this still renders the old pre-login card
+/// -- it's a genuinely working entry point in that case (its own "Continue with
+/// email" hits `/portal/login`, which reports [`sso_unconfigured`] the same way),
+/// whereas redirecting straight into a login flow that doesn't exist would leave
+/// the site's own landing page showing nothing at all.
+async fn portal_home(State(st): State<PortalState>) -> Response {
+    match st.oidc {
+        Some(cfg) => {
+            // Same CSRF-state-cookie dance portal_login already does -- this and
+            // portal_login now reach an identical result; /portal/login stays as
+            // its own route for any existing bookmarked/linked-to URLs.
+            let state = random_state();
+            let mut resp = Redirect::to(&cfg.authorize_redirect(&state, None, None, false)).into_response();
+            set_cookie(&mut resp, &state_cookie(&state));
+            resp
+        }
+        None => Html(portal_home_html(std::env::var("CT_PORTAL_SOCIAL_PROVIDERS").ok().as_deref())).into_response(),
+    }
 }
 
 /// Render the logged-out portal shell, with the social-login buttons gated on
@@ -1389,6 +1414,31 @@ mod tests {
         assert!(html.contains("Continue with email"), "direct email/password login CTA present");
         assert!(html.contains(r#"href="/portal/login""#), "the email path links to the plain login route");
         assert!(!html.contains("http://") && !html.contains("https://cdn"), "self-contained, no external assets");
+    }
+
+    #[tokio::test]
+    async fn portal_home_skips_straight_to_keycloak_when_oidc_is_configured() {
+        // #337-follow: the operator looked at the deployed site and asked why the
+        // pre-login card is still a separate screen before the real Keycloak login
+        // form -- exactly the "two template systems for one step" PR #337 itself
+        // flagged. With OIDC configured (every real deployment), /portal now
+        // redirects straight into Keycloak -- same destination/CSRF-cookie
+        // machinery login_redirects_to_the_authorize_endpoint already proves for
+        // /portal/login, just reached without the extra hop.
+        let app = portal_router(Some(cfg()), TEST_KEY);
+        let resp = app
+            .oneshot(Request::get("/portal").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "no intermediate card -- straight to the redirect");
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(loc.starts_with("https://kc.example/realms/ct/protocol/openid-connect/auth?"), "goes to the real Keycloak login form: {loc}");
+        assert!(loc.contains("response_type=code") && loc.contains("client_id=ct-portal"), "a genuine authorize request: {loc}");
+        // The same CSRF state-cookie pairing /portal/login uses -- proven working
+        // by login_binds_state_in_an_httponly_cookie_matching_the_redirect below;
+        // this just confirms /portal ALSO sets one, not a redirect with no cookie.
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(set_cookie.contains("HttpOnly"), "CSRF state cookie is HttpOnly: {set_cookie}");
     }
 
     #[test]
