@@ -933,15 +933,25 @@ const PORTAL_HTML_HEAD: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bunsenbrenner.org — sign in or create an account</title>
 <style>
- :root{--bg:#0b0e13;--panel:#161b22;--border:#30363d;--border2:#3d4551;--text:#e6edf3;--muted:#8b949e}
+ /* Design tokens shared across the whole sign-in -> account journey -- see
+    docs/design/tokens.md. Must match crates/control-plane/src/portal_api.rs
+    `page()`, docker/deploy/keycloak/themes/ct-bunsenbrenner/login/resources/css/ct-login.css,
+    and .../account/resources/css/ct-account.css exactly (no shared build step
+    across the Rust binary and the Keycloak theme, so these four copies are
+    kept in sync by hand -- diff them if this page ever looks "bolted together"
+    against the others again). */
+ :root{--bg:#0e1116;--panel:#161b22;--border:#30363d;--border2:#3d4551;--text:#e6edf3;--muted:#8b949e;
+       --accent:#58a6ff;--accent-hover:#79c0ff;--primary:#238636;--primary-hover:#2ea043}
  *{box-sizing:border-box}
  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);
       color:var(--text);display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1.5rem}
  .card{background:linear-gradient(180deg,#1c2128,var(--panel));border:1px solid var(--border);border-radius:14px;
-       padding:2.3rem 2.1rem;max-width:400px;width:100%}
- .back{display:inline-block;margin-bottom:1.2rem;color:var(--muted);font-size:.85rem;text-decoration:none}
- .back:hover{color:#c9d1d9}
- h1{font-size:1.35rem;margin:.2rem 0 .35rem} .sub{color:#8b949e;font-size:.9rem;margin-bottom:1.6rem}
+       padding:2.3rem 2.1rem;max-width:400px;width:100%;animation:cardIn .32s ease-out}
+ @keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+ .back{display:inline-block;margin-bottom:1.2rem;color:var(--accent);font-size:.85rem;text-decoration:none;
+       transition:color .15s ease}
+ .back:hover{color:var(--accent-hover)}
+ h1{font-size:1.35rem;margin:.2rem 0 .35rem} .sub{color:var(--muted);font-size:.9rem;margin-bottom:1.6rem}
  .providers{display:flex;flex-direction:column;gap:.65rem;margin-bottom:1.2rem}
  a.provider{display:flex;align-items:center;gap:.7rem;background:#0d1117;border:1px solid var(--border);
    border-radius:9px;padding:.7rem 1rem;color:var(--text);text-decoration:none;font-weight:600;font-size:.92rem;
@@ -951,9 +961,11 @@ const PORTAL_HTML_HEAD: &str = r#"<!doctype html>
  .divider{display:flex;align-items:center;gap:.7rem;color:var(--muted);font-size:.74rem;text-transform:uppercase;
    letter-spacing:.05em;margin:.9rem 0}
  .divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--border)}
- a.btn-email{display:block;text-align:center;background:#238636;color:#fff;text-decoration:none;padding:.7rem 1.4rem;
-       border-radius:9px;font-weight:600} a.btn-email:hover{background:#2ea043}
+ a.btn-email{display:block;text-align:center;background:var(--primary);color:#fff;text-decoration:none;padding:.7rem 1.4rem;
+       border-radius:9px;font-weight:600;transition:background .15s ease,transform .08s ease}
+ a.btn-email:hover{background:var(--primary-hover)} a.btn-email:active{transform:scale(.97)}
  .foot{color:var(--muted);font-size:.8rem;margin-top:1.6rem;text-align:center}
+ @media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
 </style></head><body>
 <div class="card">
  <a class="back" href="/">&larr; bunsenbrenner.org</a>
