@@ -1506,7 +1506,7 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 8192;
 /// explicit `0` / `off` / `false` / `none` disables the control. An unparseable value
 /// falls back to `default` rather than silently disabling protection (fail-safe — a
 /// typo never opens the flood gate). Returns `None` only for an explicit opt-out.
-fn resolve_flood_limit(raw: Option<&str>, default: u32) -> Option<u32> {
+pub(crate) fn resolve_flood_limit(raw: Option<&str>, default: u32) -> Option<u32> {
     match raw.map(str::trim) {
         None => Some(default),
         Some(v)
@@ -2297,12 +2297,31 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     spawn_front_door_pairer_reaper(p.clone(), Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3), unix_now);
                     p
                 });
+                // #XXX: every OTHER public listener (QUIC, TCP-fallback, the `:443` front
+                // door, BrowserTunnel) sheds cheaply under a `ConnectionCap` once its own
+                // budget is exhausted -- this listener had none at all, an unbounded-
+                // concurrent-WS-upgrade gap (each admitted connection does real work: an
+                // ed25519 signature verification, a CP authorize round-trip). Same opt-out
+                // convention as the others (unset -> a safe default; CT_EDGE_MAX_WS_CHANNEL_
+                // CONNECTIONS=0/off disables it). Default matches BrowserTunnel's own
+                // reasoning: half of the general cap, since this is public/attacker-reachable
+                // before any grant is verified, same as that arm.
+                let ws_channel_cap = resolve_flood_limit(
+                    std::env::var("CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS").ok().as_deref(),
+                    DEFAULT_MAX_CONNECTIONS / 2,
+                )
+                .map(|n| {
+                    eprintln!("ct-edge: max {n} concurrent ws-channel connections (CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS)");
+                    ConnectionCap::new(n as usize)
+                });
                 eprintln!(
                     "ct-edge: browser (WebSocket) Agent-Fabric channel listener on {ws_addr} \
                      (authorize via {cp_url}, cross-transport pairing with the :443 front door)"
                 );
                 tokio::spawn(async move {
-                    if let Err(e) = crate::ws_channel::serve_ws_channel_with_pairer(ws_addr, resolver, pairer).await {
+                    if let Err(e) =
+                        crate::ws_channel::serve_ws_channel_with_pairer(ws_addr, resolver, pairer, ws_channel_cap).await
+                    {
                         eprintln!("ct-edge: ws-channel listener on {ws_addr} ended: {e}");
                     }
                 });

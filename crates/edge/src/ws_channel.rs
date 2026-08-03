@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures_util::{Sink, Stream};
@@ -210,6 +210,11 @@ pub type WsChannelStream = WsByteStream;
 pub struct WsChannelState {
     pairer: crate::channel_broker::SharedChannelPairer,
     resolver: Arc<dyn ChannelMemberResolver>,
+    /// Concurrency cap (#XXX), matching every other public listener's `ConnectionCap`
+    /// (QUIC, TCP-fallback, the `:443` front door, BrowserTunnel) -- `None` means
+    /// unbounded (the default for [`Self::standalone`]/tests; production always sets
+    /// one, see `serve.rs`'s `CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS`).
+    cap: Option<crate::state::ConnectionCap>,
 }
 
 /// How long a browser member's join stays parked waiting for its channel partner
@@ -221,18 +226,24 @@ const WS_CHANNEL_PARK_TTL_SECS: u64 = 120;
 const WS_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl WsChannelState {
-    /// Build around an EXTERNALLY shared pairer (cross-transport pairing) -- the
-    /// caller (`serve.rs`'s `run_edge`) owns constructing the pairer + spawning its
-    /// reaper once and shares it with every transport that opts into channel
-    /// brokering.
-    pub fn new(resolver: Arc<dyn ChannelMemberResolver>, pairer: crate::channel_broker::SharedChannelPairer) -> Self {
-        Self { pairer, resolver }
+    /// Build around an EXTERNALLY shared pairer (cross-transport pairing) and an
+    /// optional connection cap -- the caller (`serve.rs`'s `run_edge`) owns
+    /// constructing the pairer + spawning its reaper once and shares it with every
+    /// transport that opts into channel brokering, and owns resolving the cap from
+    /// `CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS`.
+    pub fn new(
+        resolver: Arc<dyn ChannelMemberResolver>,
+        pairer: crate::channel_broker::SharedChannelPairer,
+        cap: Option<crate::state::ConnectionCap>,
+    ) -> Self {
+        Self { pairer, resolver, cap }
     }
 
-    /// Like [`Self::new`], but builds its OWN standalone pairer + reaper -- for
-    /// callers (tests, or a deployment that only ever runs this one listener) that
-    /// don't need cross-transport pairing with the `:443` front door. This is what
-    /// `new` did unconditionally before cross-transport pairing existed.
+    /// Like [`Self::new`], but builds its OWN standalone pairer + reaper and has NO
+    /// connection cap (unbounded) -- for callers (tests, or a deployment that only
+    /// ever runs this one listener) that don't need cross-transport pairing with the
+    /// `:443` front door or flood protection. This is what `new` did unconditionally
+    /// before cross-transport pairing/the connection cap existed.
     pub fn standalone(resolver: Arc<dyn ChannelMemberResolver>) -> Self {
         let pairer = crate::channel_broker::new_shared_channel_pairer();
         // Mirrors serve.rs's `spawn_front_door_pairer_reaper` exactly: draining and
@@ -257,7 +268,7 @@ impl WsChannelState {
                 }
             }
         });
-        Self::new(resolver, pairer)
+        Self::new(resolver, pairer, None)
     }
 }
 
@@ -270,7 +281,28 @@ pub fn ws_channel_router(state: WsChannelState) -> Router {
 }
 
 async fn ws_upgrade_handler(ws: WebSocketUpgrade, State(state): State<WsChannelState>) -> Response {
-    ws.on_upgrade(move |socket| handle_ws_channel_join(socket, state))
+    // Shed BEFORE upgrading (cheaper than admitting then dropping mid-handshake),
+    // same posture as every other public listener's `ConnectionCap` -- see
+    // WsChannelState::cap's doc comment.
+    let permit = match &state.cap {
+        Some(cap) => match cap.try_admit() {
+            Some(p) => Some(p),
+            None => {
+                let total = cap.note_shed();
+                if total.is_power_of_two() || total % 1000 == 0 {
+                    eprintln!(
+                        "ct-edge: ws-channel shedding — CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS cap full, {total} connection(s) shed since start"
+                    );
+                }
+                return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "too many concurrent connections").into_response();
+            }
+        },
+        None => None,
+    };
+    ws.on_upgrade(move |socket| async move {
+        let _permit = permit; // held for the connection's lifetime, released on drop
+        handle_ws_channel_join(socket, state).await
+    })
 }
 
 async fn handle_ws_channel_join(socket: WebSocket, state: WsChannelState) {
@@ -332,14 +364,17 @@ pub async fn serve_ws_channel(
 
 /// Like [`serve_ws_channel`], but joins the shared cross-transport `pairer` (the
 /// `:443` front door's own channel broker uses the same one) instead of building a
-/// standalone one -- what `run_edge` wires up in production so a browser member and a
-/// `:443`/QUIC member of the same channel correlate and can pair with each other.
+/// standalone one, and applies the given connection `cap` (`None` = unbounded) --
+/// what `run_edge` wires up in production so a browser member and a `:443`/QUIC
+/// member of the same channel correlate and can pair with each other, with the same
+/// flood protection every other public listener has.
 pub async fn serve_ws_channel_with_pairer(
     listen: std::net::SocketAddr,
     resolver: Arc<dyn ChannelMemberResolver>,
     pairer: crate::channel_broker::SharedChannelPairer,
+    cap: Option<crate::state::ConnectionCap>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = WsChannelState::new(resolver, pairer);
+    let state = WsChannelState::new(resolver, pairer, cap);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     axum::serve(listener, ws_channel_router(state)).await?;
     Ok(())
@@ -607,5 +642,34 @@ mod tests {
             .expect("stream item")
             .expect("no ws error");
         assert!(matches!(msg, WsMessage::Ping(_)), "expected a Ping frame, got {msg:?}");
+    }
+
+    #[tokio::test]
+    async fn a_full_connection_cap_sheds_the_ws_upgrade_before_admission() {
+        // #XXX: every OTHER public listener sheds cheaply under a ConnectionCap once
+        // full; this listener had none at all until now. Proves the mechanism
+        // directly: a cap of 1, a first real WebSocket connection that holds its slot
+        // (never closes), and a second real connection that must be REJECTED AT THE
+        // WS UPGRADE ITSELF (never reaches 101 Switching Protocols) -- cheaper than
+        // admitting then dropping mid-handshake, same posture as every other cap.
+        let resolver = Arc::new(FixedResolver { operator_pubkey: [0u8; 32], channel: ChannelId([0u8; 32]), holders: vec![] });
+        let cap = crate::state::ConnectionCap::new(1);
+        let state = WsChannelState::new(resolver, crate::channel_broker::new_shared_channel_pairer(), Some(cap));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, ws_channel_router(state)).await;
+        });
+        let url = format!("ws://{addr}/ws/channel");
+
+        // First connection: admitted, takes the cap's only slot. Held open (not
+        // dropped) for the rest of the test so the slot stays occupied.
+        let (first_ws, _resp) = tokio_tungstenite::connect_async(&url).await.expect("first connection admitted");
+
+        // Second connection: the cap is full -- the upgrade itself must be refused.
+        let second = tokio_tungstenite::connect_async(&url).await;
+        assert!(second.is_err(), "a full cap must refuse the WS upgrade, not just admit-then-drop: {second:?}");
+
+        drop(first_ws);
     }
 }
