@@ -2139,9 +2139,16 @@ const EDITOR_JS: &str = r#"
   var chans={};
   svg.querySelectorAll('.edge').forEach(function(ed){var c=ed.getAttribute('data-channel'),a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');if(c)chans[c]=[a,b];});
   Object.keys(chans).forEach(function(ch){
+   var ab=chans[ch];
    fetch('/me/channels/'+encodeURIComponent(ch)+'/members').then(function(r){return r.ok?r.json():null;}).then(function(mp){
-    if(!mp)return;
-    var ab=chans[ch],g=ensureLiveDot(ab[0],ab[1]);
+    if(!mp){
+     // The channel is gone (DELETE /me/channels/:channel, #276-video-call) or no
+     // longer this caller's -- clear any existing dot rather than leaving a
+     // stale "N connected" showing a call that isn't there anymore.
+     var stale=liveDotFor(ab[0],ab[1]);if(stale)stale.remove();
+     return;
+    }
+    var g=ensureLiveDot(ab[0],ab[1]);
     if(!g)return;
     var t=g.querySelector('text');if(t)t.textContent=(mp.members||[]).length;
     positionLiveDots();
@@ -6970,6 +6977,10 @@ mod tests {
         // Live status: a polled dot (not a one-time render) on any edge carrying a channel.
         assert!(html.contains("function pollChannelStatus"), "live-status poll present");
         assert!(html.contains("setInterval(pollChannelStatus"), "polls periodically, not once");
+        // A channel can now be deleted (DELETE /me/channels/:channel) once a call
+        // ends -- the poll must clear its dot on that, not leave a stale
+        // "N connected" showing a call that isn't there anymore.
+        assert!(html.contains("var stale=liveDotFor(ab[0],ab[1]);if(stale)stale.remove();"), "stale live dot is cleared when the channel becomes inaccessible");
         assert!(html.contains("function positionLiveDots") && html.contains("class=\"live-dot\""), "live dot repositions with the graph and has real styling");
         assert!(html.contains("insertAdjacentHTML"), "live dot created without a namespace literal, same CSP-safe idiom as edges");
         // Still fully self-contained -- the sync/poll JS must not smuggle in any external asset.
