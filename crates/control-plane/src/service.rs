@@ -806,6 +806,9 @@ pub struct AuthedChannelState {
 ///   self-service claiming (#248-follow, owner-scoped)
 /// * `GET /me/channels/:channel/allowlist` → list allow-listed emails (owner-scoped)
 /// * `POST /me/channels/:channel/allowlist/:email/remove` → de-list an email (owner-scoped)
+/// * `POST /me/rooms` `{operator_pubkey, holders}` → register every pairwise channel
+///   a full-mesh room of `holders` needs in one call (multicast/room fan-out
+///   follow-up, owner-scoped, idempotent/additive)
 pub fn authed_channel_router(
     channels: Arc<SqliteChannelStore>,
     verifier: OidcVerifierHandle,
@@ -813,6 +816,7 @@ pub fn authed_channel_router(
     Router::new()
         .route("/me/channels", post(channel_register).get(channel_list))
         .route("/me/channels/:channel", delete(channel_delete))
+        .route("/me/rooms", post(room_create))
         .route(
             "/me/channels/:channel/members",
             post(channel_add_member).get(channel_members_list),
@@ -2716,6 +2720,104 @@ async fn channel_delete(
     } else {
         Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
     }
+}
+
+/// A room supports at most this many holders (`C(12,2)` = 66 pairwise channels) --
+/// generous above ADR-0023's own framing ("a handful of participants... closer to a
+/// team call than a webinar"), just a sanity backstop against one request asking for
+/// an enormous number of channels (`C(50,2)` = 1225) that isn't the intended use case.
+const MAX_ROOM_HOLDERS: usize = 12;
+
+#[derive(Deserialize)]
+struct RoomCreateReq {
+    operator_pubkey: String,
+    holders: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RoomChannelView {
+    a: String,
+    b: String,
+    channel: String,
+}
+
+#[derive(Serialize)]
+struct RoomCreateResp {
+    channels: Vec<RoomChannelView>,
+}
+
+/// `POST /me/rooms` (#276-video-call, multicast/room fan-out follow-up): register
+/// every pairwise channel a full-mesh room of `holders` needs in ONE call, instead of
+/// an operator manually deriving and registering `C(N,2)` channels by hand.
+/// ADR-0023 already established rooms are full mesh over independent pairwise
+/// channels (no new broker/relay primitive needed) -- this is the missing
+/// REGISTRATION-layer convenience: each pair's channel id is
+/// [`ct_common::channel::channel_id_for_link`] (the same order-independent,
+/// collision-resistant per-pair derivation the edge's topology-authorized-channel
+/// folding already relies on), registered exactly like an individual
+/// `POST /me/channels` call. Idempotent and additive: calling again with an
+/// overlapping (or superset) holder list re-registers existing pairs harmlessly
+/// (`register_channel` is itself idempotent for the same owner) and only adds the
+/// new ones -- the natural way to grow a room ("a fourth person joins the call")
+/// without tearing anything down first. If any derived pair is already owned by a
+/// DIFFERENT subject, the whole request is rejected with `409` (never partially
+/// hands a room to one owner when another already owns a piece of it) --
+/// already-registered pairs from earlier in the same request stay registered
+/// (idempotent registration, not a transaction), so retrying after resolving the
+/// conflict picks up cleanly rather than redoing completed work.
+async fn room_create(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Json(req): Json<RoomCreateReq>,
+) -> Result<Json<RoomCreateResp>, (StatusCode, String)> {
+    let owner = subject_of(&state.verifier, &headers)?;
+    let operator = hex_decode_32(&req.operator_pubkey)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed operator_pubkey".to_string()))?;
+    if req.holders.len() < 2 {
+        return Err((StatusCode::BAD_REQUEST, "a room needs at least 2 holders".to_string()));
+    }
+    if req.holders.len() > MAX_ROOM_HOLDERS {
+        return Err((StatusCode::BAD_REQUEST, format!("a room supports at most {MAX_ROOM_HOLDERS} holders")));
+    }
+    let holders: Vec<[u8; 32]> = req
+        .holders
+        .iter()
+        .map(|h| hex_decode_32(h).ok_or((StatusCode::BAD_REQUEST, format!("malformed holder: {h}"))))
+        .collect::<Result<_, _>>()?;
+    // A self-pair (the same holder listed twice) would derive a channel with
+    // itself -- meaningless for a video call, reject before deriving anything.
+    let mut seen = std::collections::HashSet::new();
+    for h in &holders {
+        if !seen.insert(*h) {
+            return Err((StatusCode::BAD_REQUEST, "duplicate holder in room".to_string()));
+        }
+    }
+    let mut channels = Vec::with_capacity(holders.len() * (holders.len() - 1) / 2);
+    for i in 0..holders.len() {
+        for j in (i + 1)..holders.len() {
+            let channel = ct_common::channel::channel_id_for_link(&operator, &holders[i], &holders[j]);
+            let ok = state
+                .channels
+                .register_channel(&channel, &operator, &owner)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if !ok {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "the channel for pair {}/{} is already owned by another subject",
+                        hex_encode(&holders[i]),
+                        hex_encode(&holders[j])
+                    ),
+                ));
+            }
+            channels.push(RoomChannelView {
+                a: hex_encode(&holders[i]),
+                b: hex_encode(&holders[j]),
+                channel: hex_encode(&channel.0),
+            });
+        }
+    }
+    Ok(Json(RoomCreateResp { channels }))
 }
 
 /// Loose email-syntax sanity check (#248-follow) — this is NOT verification (that's
@@ -7848,6 +7950,144 @@ mod tests {
         // Deleting an already-deleted (now nonexistent) channel is the same 403, not
         // a crash or a 200 no-op that would suggest it still existed.
         assert_eq!(del(format!("/me/channels/{ch}"), Some(alice)).await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn room_create_registers_every_pairwise_channel_a_full_mesh_room_needs() {
+        // Multicast/room fan-out follow-up (#276-video-call, ADR-0023): a room of N
+        // holders needs C(N,2) pairwise channels registered -- this proves the ONE
+        // POST /me/rooms call does exactly that, matches the REAL
+        // ct_common::channel::channel_id_for_link derivation (not a reimplementation
+        // that could silently drift from what the edge itself derives), is
+        // idempotent/additive for growing a room, and stays owner-scoped like every
+        // other channel-mutating route.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let bob = jwt_for("bob");
+        let post = |path: String, bearer: Option<String>, body: String| {
+            let mut req = Request::post(&path).header("content-type", "application/json");
+            if let Some(b) = &bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        let json_body = |resp: Response| async move {
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+
+        let op = "42".repeat(32);
+        let op_bytes = hex_decode_32(&op).unwrap();
+        let h1 = "11".repeat(32);
+        let h2 = "22".repeat(32);
+        let h3 = "33".repeat(32);
+        let h1_bytes = hex_decode_32(&h1).unwrap();
+        let h2_bytes = hex_decode_32(&h2).unwrap();
+        let h3_bytes = hex_decode_32(&h3).unwrap();
+
+        // Unauthenticated -> 401.
+        assert_eq!(
+            post("/me/rooms".into(), None, format!(r#"{{"operator_pubkey":"{op}","holders":["{h1}","{h2}"]}}"#))
+                .await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // A 3-person room -> exactly the 3 real channel ids channel_id_for_link
+        // itself derives, not a stand-in/reimplementation.
+        let resp = post(
+            "/me/rooms".into(),
+            Some(alice.clone()),
+            format!(r#"{{"operator_pubkey":"{op}","holders":["{h1}","{h2}","{h3}"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let got: Vec<String> = body["channels"].as_array().unwrap().iter().map(|c| c["channel"].as_str().unwrap().to_string()).collect();
+        let mut got_sorted = got.clone();
+        got_sorted.sort();
+        let expect_12 = hex_encode(&ct_common::channel::channel_id_for_link(&op_bytes, &h1_bytes, &h2_bytes).0);
+        let expect_13 = hex_encode(&ct_common::channel::channel_id_for_link(&op_bytes, &h1_bytes, &h3_bytes).0);
+        let expect_23 = hex_encode(&ct_common::channel::channel_id_for_link(&op_bytes, &h2_bytes, &h3_bytes).0);
+        let mut expected_sorted = vec![expect_12.clone(), expect_13, expect_23];
+        expected_sorted.sort();
+        assert_eq!(got_sorted, expected_sorted, "exactly the 3 real per-pair channel ids for a 3-person room");
+
+        // Every one of those channels is genuinely registered -- listable via
+        // GET /me/channels, not just returned in the response body.
+        let listed = json_body(
+            app.clone()
+                .oneshot(Request::get("/me/channels").header("authorization", format!("Bearer {alice}")).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let mut listed_channels: Vec<String> = listed["channels"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+        listed_channels.sort();
+        assert_eq!(listed_channels, expected_sorted, "all 3 room channels are really registered, not just echoed back");
+
+        // Idempotent/additive: re-POSTing with a 4th holder added re-registers the
+        // same 3 pairs harmlessly and adds exactly the 3 NEW pairs with the newcomer
+        // -- "a fourth person joins the call" without tearing anything down.
+        let h4 = "44".repeat(32);
+        let resp = post(
+            "/me/rooms".into(),
+            Some(alice.clone()),
+            format!(r#"{{"operator_pubkey":"{op}","holders":["{h1}","{h2}","{h3}","{h4}"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["channels"].as_array().unwrap().len(), 6, "C(4,2) = 6 pairwise channels for the grown room");
+        assert!(body["channels"].as_array().unwrap().iter().any(|c| c["channel"] == expect_12), "the original pair's channel id is unchanged, not re-derived differently");
+
+        // Malformed/invalid requests: too few holders, a duplicate holder.
+        assert_eq!(
+            post("/me/rooms".into(), Some(alice.clone()), format!(r#"{{"operator_pubkey":"{op}","holders":["{h1}"]}}"#)).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "a room needs at least 2 holders"
+        );
+        assert_eq!(
+            post("/me/rooms".into(), Some(alice.clone()), format!(r#"{{"operator_pubkey":"{op}","holders":["{h1}","{h1}"]}}"#)).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "a duplicate holder is rejected, not silently deduplicated"
+        );
+
+        // Conflict: bob registers a room using h1+a fresh holder FIRST under a
+        // DIFFERENT operator_pubkey (so it derives a different, bob-owned channel
+        // id for that pair) -- then alice's OWN attempt to register a room that
+        // happens to collide with an already-registered-by-someone-else channel id
+        // is rejected outright (409), not partially handed to alice.
+        let h5 = "55".repeat(32);
+        let bob_op = "7b".repeat(32);
+        assert_eq!(
+            post("/me/rooms".into(), Some(bob), format!(r#"{{"operator_pubkey":"{bob_op}","holders":["{h1}","{h5}"]}}"#)).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // alice now asks for a room using the SAME operator_pubkey + holder pair bob
+        // just registered under -- same derivation, same channel id, different owner.
+        assert_eq!(
+            post("/me/rooms".into(), Some(alice), format!(r#"{{"operator_pubkey":"{bob_op}","holders":["{h1}","{h5}"]}}"#)).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "a pair whose derived channel is already owned by someone else is rejected, not silently taken over"
+        );
     }
 
     #[tokio::test]
