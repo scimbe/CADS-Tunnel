@@ -1,6 +1,8 @@
 /* bunsenbrenner.org account console skin -- reuses the exact palette the portal's
    own pages (crates/control-plane/src/portal_api.rs `page()`) already use, so
-   moving between the portal and "Manage your sign-in" reads as one product. */
+   moving between the portal, sign-in, and "Manage your sign-in" reads as one
+   product. See docs/design/tokens.md for the canonical values this file (and
+   the other three sign-in-journey surfaces) each hardcode their own copy of. */
 
 :root,
 .pf-v5-t-dark {
@@ -9,8 +11,15 @@
   --ct-border: #30363d;
   --ct-text: #e6edf3;
   --ct-muted: #8b949e;
+  /* --ct-accent (blue) is nav/links/focus only; --ct-primary (green) is the
+     actual primary-action button color, matching every other primary CTA in
+     the sign-in journey (portal pre-login "Continue with email", the login
+     form's submit, the dashboard's `.btn`) -- was blue here before, the one
+     real color inconsistency in an otherwise-matching palette. */
   --ct-accent: #58a6ff;
   --ct-accent-hover: #79c0ff;
+  --ct-primary: #238636;
+  --ct-primary-hover: #2ea043;
 
   --pf-v5-global--BackgroundColor--100: var(--ct-bg);
   --pf-v5-global--BackgroundColor--dark-100: var(--ct-bg);
@@ -78,14 +87,44 @@ input.pf-v5-c-form-control {
 }
 
 .pf-v5-c-button.pf-m-primary {
-  background-color: var(--ct-accent);
+  background-color: var(--ct-primary);
   transition: background-color .15s ease, transform .08s ease;
 }
 .pf-v5-c-button.pf-m-primary:hover {
-  background-color: var(--ct-accent-hover);
+  background-color: var(--ct-primary-hover);
 }
 .pf-v5-c-button.pf-m-primary:active {
   transform: scale(.97);
+}
+
+/* Entrance motion -- this console previously had zero page-load animation,
+   the least of the four sign-in-journey surfaces despite being the one users
+   spend the most time in. Matches the fade+slide-up timing/easing every other
+   surface already uses (portal.rs cardIn, ct-login.css ctCardIn) so it reads
+   as the same product, not a fourth, separately-behaving screen. */
+@keyframes ctAccountIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.pf-v5-c-page__main-section {
+  animation: ctAccountIn .32s ease-out;
+}
+/* A light stagger across the section's direct cards reads as a deliberate
+   reveal rather than everything popping in at once -- capped at a handful of
+   steps so a long settings list doesn't end with a visibly-delayed tail. */
+.pf-v5-c-page__main-section > .pf-v5-c-card:nth-child(1) { animation-delay: 0ms; }
+.pf-v5-c-page__main-section > .pf-v5-c-card:nth-child(2) { animation-delay: 40ms; }
+.pf-v5-c-page__main-section > .pf-v5-c-card:nth-child(3) { animation-delay: 80ms; }
+.pf-v5-c-page__main-section > .pf-v5-c-card:nth-child(n+4) { animation-delay: 120ms; }
+.pf-v5-c-page__main-section > .pf-v5-c-card {
+  animation: ctAccountIn .32s ease-out backwards;
+}
+.pf-v5-c-card {
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.pf-v5-c-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, .25);
 }
 
 /* The masthead brand mark (logo.svg + "Back to bunsenbrenner.org" referrer
@@ -106,5 +145,5 @@ img[alt="logo"] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; }
+  * { transition: none !important; animation: none !important; }
 }
