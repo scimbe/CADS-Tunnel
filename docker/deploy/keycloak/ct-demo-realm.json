@@ -121,6 +121,7 @@
     }
   ],
   "loginTheme": "ct-bunsenbrenner",
+  "accountTheme": "ct-bunsenbrenner",
   "internationalizationEnabled": true,
   "supportedLocales": [
     "en",
