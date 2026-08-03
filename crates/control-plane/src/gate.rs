@@ -208,33 +208,45 @@ struct CheckQuery {
     host: Option<String>,
 }
 
+/// The verified-email response header `GET /gate/check` sets on a `200` when a
+/// real gate session backs it (never on the "not gated at all" `200` -- there's
+/// no identity to report there). A demo's Caddyfile forwards this into the
+/// actual request via `forward_auth`'s `copy_headers`, so the origin/bridge can
+/// read who's really signed in instead of trusting anything client-supplied.
+const GATE_EMAIL_HEADER: &str = "x-gate-email";
+
 /// `GET /gate/check`: Caddy's `forward_auth` target. `X-Forwarded-Host` (Caddy
 /// sets this automatically) or a `?host=` query param names the hostname being
 /// visited. A demo's Caddyfile wires this call UNCONDITIONALLY -- the on/off
 /// toggle lives entirely server-side (the tunnel owner's `require_login`
 /// setting), not in Caddy's own config -- so: `200` immediately when the host
-/// doesn't have the gate enabled at all; `200` when it does AND a valid,
-/// unexpired `ct_gate_session` cookie for exactly that host is present;
-/// `401` otherwise (Caddy turns a `401` here into the login redirect via its
-/// own `handle_errors`).
-async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Query<CheckQuery>) -> StatusCode {
+/// doesn't have the gate enabled at all; `200` (with the verified email in
+/// `X-Gate-Email`) when it does AND a valid, unexpired `ct_gate_session` cookie
+/// for exactly that host is present; `401` otherwise (Caddy turns a `401` here
+/// into the login redirect via its own `handle_errors`).
+async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Query<CheckQuery>) -> Response {
     let Some(host) = headers
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .or(q.host)
     else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     match st.tunnels.require_login_for_hostname(&host) {
-        Ok(false) => return StatusCode::OK,
+        Ok(false) => return StatusCode::OK.into_response(),
         Ok(true) => {}
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
     let now = now_secs();
     match cookie_value(&headers, GATE_SESSION_COOKIE).and_then(|t| verify_gate_session(&st.session_key, &t, now)) {
-        Some(claims) if claims.host == host => StatusCode::OK,
-        _ => StatusCode::UNAUTHORIZED,
+        Some(claims) if claims.host == host => match HeaderValue::from_str(&claims.email) {
+            Ok(v) => (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response(),
+            // A malformed/non-ASCII email can't ride in a header value -- fail
+            // closed (no identity to report is worse than none at all here).
+            Err(_) => StatusCode::UNAUTHORIZED.into_response(),
+        },
+        _ => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
 
@@ -448,13 +460,14 @@ fn sign_gate_session(key: &[u8], host: &str, email: &str, exp: u64) -> String {
 
 struct GateSessionClaims {
     host: String,
+    email: String,
 }
 
 fn verify_gate_session(key: &[u8], token: &str, now: u64) -> Option<GateSessionClaims> {
     let (payload, tag_hex) = token.rsplit_once('.')?;
     let mut parts = payload.splitn(3, ':');
     let host_hex = parts.next()?;
-    let _email_hex = parts.next()?;
+    let email_hex = parts.next()?;
     let exp_str = parts.next()?;
     if exp_str.parse::<u64>().ok()? <= now {
         return None;
@@ -463,7 +476,8 @@ fn verify_gate_session(key: &[u8], token: &str, now: u64) -> Option<GateSessionC
         return None;
     }
     let host = String::from_utf8(unhex(host_hex)?).ok()?;
-    Some(GateSessionClaims { host })
+    let email = String::from_utf8(unhex(email_hex)?).ok()?;
+    Some(GateSessionClaims { host, email })
 }
 
 #[cfg(test)]
@@ -582,7 +596,8 @@ mod tests {
             .unwrap();
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "a session minted for a different host is refused");
 
-        // A valid session for the RIGHT host -> 200.
+        // A valid session for the RIGHT host -> 200, with the verified email
+        // available to Caddy's forward_auth via X-Gate-Email.
         let right_token = sign_gate_session(TEST_KEY, "demo.bunsenbrenner.org", "alice@example.com", now + 3600);
         let ok = app
             .oneshot(
@@ -595,6 +610,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get(GATE_EMAIL_HEADER).unwrap(), "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn gate_check_never_sets_the_email_header_when_the_hostname_isnt_gated_at_all() {
+        // Nothing to report for a hostname with the gate off -- absence of the
+        // header, not an empty one, is what app-side code should treat as "no
+        // verified identity."
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap();
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+        let resp = app
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", "not-gated.bunsenbrenner.org")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(GATE_EMAIL_HEADER).is_none());
     }
 
     #[tokio::test]
