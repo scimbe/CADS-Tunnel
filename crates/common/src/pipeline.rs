@@ -291,7 +291,7 @@ impl PipelineSpec {
                     .filter(|c| c.is_valid(now) && c.role_tags.iter().any(|t| t == &role.tag))
                     .map(|c| InviteCandidate { holder: c.holder_pubkey, channels: c.channels.clone() })
                     .collect();
-                RoleInvitation { service: role.service, tag: role.tag.clone(), candidates }
+                RoleInvitation { service: role.service.clone(), tag: role.tag.clone(), candidates }
             })
             .collect()
     }
@@ -376,12 +376,12 @@ impl PipelineSpec {
                 })
                 .collect();
             if qualifying.is_empty() {
-                return Err(PipelineError::UnfilledRole { service: role.service });
+                return Err(PipelineError::UnfilledRole { service: role.service.clone() });
             }
             let o = policy_for(role).pick(&role.tag, &qualifying, state);
             assigned.push(o.holder_pubkey);
             assignments.push(RoleAssignment {
-                service: role.service,
+                service: role.service.clone(),
                 provider: o.holder_pubkey,
                 units: role.units,
                 price: o.min_price,
@@ -668,6 +668,57 @@ mod tests {
         assert_eq!(
             PipelineSpec { id: "e".into(), roles: vec![], operator_pubkey_hex: None, selection_policy: SelectionPolicy::LowestFloor }.convene(&[safety], 100),
             Err(PipelineError::Empty),
+        );
+    }
+
+    #[test]
+    fn a_pipeline_designer_can_declare_a_role_ct_tunnel_never_hardcoded() {
+        // #382 follow-up: the actual proof "generalize RequiredRole/convene() for non-demo
+        // pipeline roles" holds -- a pipeline for The Development System's plan/test/implement/
+        // review/verify/remember/improve stages needs service types (StaticAnalysis,
+        // AndroidInstrumentedTest, ...) this crate never declared and never will need to, one
+        // core-crate release per new pipeline-stage type. ServiceType::Custom makes that a
+        // pipeline-designer-level decision instead of a CADS-Tunnel core change.
+        let static_analysis = ServiceType::Custom("StaticAnalysis".into());
+        let instrumented_test = ServiceType::Custom("AndroidInstrumentedTest".into());
+        let spec = PipelineSpec {
+            id: "devsystem-android".into(),
+            roles: vec![
+                RequiredRole { service: static_analysis.clone(), units: 1, tag: "lint".into(), selection_policy: None },
+                RequiredRole { service: instrumented_test.clone(), units: 1, tag: "device-test".into(), selection_policy: None },
+            ],
+            operator_pubkey_hex: None,
+            selection_policy: SelectionPolicy::LowestFloor,
+        };
+
+        let lint_agent = offer(11, vec![static_analysis.clone()], 5, 10, 1000);
+        let device_farm = offer(12, vec![instrumented_test.clone()], 5, 200, 1000);
+        let assignments = spec
+            .convene(&[lint_agent.clone(), device_farm.clone()], 100)
+            .expect("both custom-service roles have a matching online offer -> convenes");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].service, static_analysis, "the winning assignment carries the SAME custom service, not a stand-in");
+        assert_eq!(assignments[0].provider, holder(11));
+        assert_eq!(assignments[1].service, instrumented_test);
+        assert_eq!(assignments[1].provider, holder(12));
+
+        // A fixed built-in service (CodeGeneration) never matches a custom-named role, and vice
+        // versa -- custom and fixed service types don't silently alias each other.
+        let wrong_kind_offer = offer(13, vec![CodeGeneration], 5, 1, 1000);
+        assert_eq!(
+            spec.convene(&[wrong_kind_offer, device_farm], 100),
+            Err(PipelineError::UnfilledRole { service: ServiceType::Custom("StaticAnalysis".into()) }),
+            "a CodeGeneration offer does not fill a Custom(\"StaticAnalysis\") role"
+        );
+
+        // Two DIFFERENT custom-named offers never cross-qualify for each other's role, even
+        // though both are ServiceType::Custom (the tag byte alone is NOT how these compare --
+        // Custom carries its own name, checked by full equality).
+        let mislabeled = offer(14, vec![ServiceType::Custom("SomethingElse".into())], 5, 1, 1000);
+        assert_eq!(
+            spec.convene(&[mislabeled, offer(12, vec![instrumented_test], 5, 200, 1000)], 100),
+            Err(PipelineError::UnfilledRole { service: static_analysis }),
+            "a differently-NAMED custom service never fills a role it wasn't declared for"
         );
     }
 
