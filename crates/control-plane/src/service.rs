@@ -3449,13 +3449,17 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .trust-strip span{display:flex;align-items:center;gap:.45rem}
  .trust-strip .dot{width:6px;height:6px;border-radius:50%;background:var(--accent2);flex-shrink:0}
 
- a.btn{display:inline-flex;align-items:center;gap:.4rem;background:var(--accent);color:#20130a;
+ /* `button.btn` added alongside `a.btn` -- the join form's "Continue" submit
+    (the single most important click on the page) is a <button>, not an <a>,
+    and was silently falling back to the browser's default button chrome since
+    this rule only ever matched <a> tags. */
+ a.btn,button.btn{display:inline-flex;align-items:center;gap:.4rem;background:var(--accent);color:#20130a;
   padding:.65rem 1.2rem;border-radius:6px;font-weight:600;font-size:.92rem;text-decoration:none;border:1px solid transparent;
-  transition:filter .15s ease,transform .15s ease}
- a.btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
- a.btn:active{transform:translateY(0)}
- a.btn.secondary{background:transparent;color:var(--text);border-color:var(--line)}
- a.btn.secondary:hover{background:var(--panel2);border-color:var(--muted)}
+  cursor:pointer;font-family:inherit;transition:filter .15s ease,transform .15s ease}
+ a.btn:hover,button.btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
+ a.btn:active,button.btn:active{transform:translateY(0)}
+ a.btn.secondary,button.btn.secondary{background:transparent;color:var(--text);border-color:var(--line)}
+ a.btn.secondary:hover,button.btn.secondary:hover{background:var(--panel2);border-color:var(--muted)}
 
  .join{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1.15rem 1.25rem;max-width:30rem}
  .join label{display:block;font-family:var(--mono);font-size:.72rem;letter-spacing:.05em;text-transform:uppercase;
@@ -3587,6 +3591,28 @@ const LANDING_HTML: &str = r#"<!doctype html>
  .cookie-notice button{background:var(--accent);color:#20130a;border:none;border-radius:6px;padding:.5rem 1.1rem;font-weight:600;cursor:pointer}
 
  @media (max-width:640px){ .support{flex-direction:column;align-items:flex-start} }
+
+ /* Scroll-reveal -- content fades/slides in as it enters the viewport instead
+    of the whole page just appearing at once. Progressive enhancement: the
+    `.reveal-pre` (hidden) state is only ever added by JS, and only when the
+    visitor hasn't asked for reduced motion -- so with JS disabled, or motion
+    reduced, everything stays exactly as visible as it always was. See the
+    IntersectionObserver wiring at the bottom of the page. */
+ .reveal{transition:opacity .5s ease,transform .5s ease}
+ .reveal.reveal-pre{opacity:0;transform:translateY(16px)}
+ .reveal.reveal-in{opacity:1;transform:translateY(0)}
+ @media (prefers-reduced-motion: reduce){ .reveal.reveal-pre{opacity:1;transform:none} }
+
+ /* Hover-lift on the static panels that had zero hover feedback before --
+    buttons/links already responded to touch, these silently didn't. */
+ .feature,.demo-card,.diagram-card,.grid .card{transition:transform .15s ease,border-color .15s ease,box-shadow .15s ease}
+ .feature:hover,.demo-card:hover,.diagram-card:hover,.grid .card:hover{
+  transform:translateY(-2px);border-color:var(--muted);box-shadow:0 6px 20px rgba(0,0,0,.18)}
+ ul.list li{transition:background .15s ease}
+ ul.list li:hover{background:var(--panel2)}
+ @media (prefers-reduced-motion: reduce){
+  .feature:hover,.demo-card:hover,.diagram-card:hover,.grid .card:hover{transform:none}
+ }
 </style></head><body>
 
 <header class="hero">
@@ -3667,27 +3693,27 @@ const LANDING_HTML: &str = r#"<!doctype html>
  <div class="section" id="demos">
   <div class="section-head"><h2>See it live</h2><a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" target="_blank" rel="noopener">All demos on GitHub &rarr;</a></div>
   <div class="demo-carousel">
-   <div class="demo-card">
+   <div class="demo-card reveal" style="transition-delay:0ms">
     <div class="demo-card-top"><span class="demo-name">flappy-demo</span><span class="demo-badge live"><i></i>live</span></div>
     <p>Flappy Pipeline Studio — customize and generate your own Flappy Bird game over the Agent-Fabric channel.</p>
     <div class="demo-links"><a class="btn" href="https://flappy-demo.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-flappy-demo" target="_blank" rel="noopener">Source</a></div>
    </div>
-   <div class="demo-card">
+   <div class="demo-card reveal" style="transition-delay:60ms">
     <div class="demo-card-top"><span class="demo-name">cookbook-demo</span><span class="demo-badge"><i></i>source</span></div>
     <p>Recipe generator with photo input, wired over the Agent-Fabric channel — a reference pipeline. Live instance coming soon.</p>
     <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-cookbook-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
    </div>
-   <div class="demo-card">
+   <div class="demo-card reveal" style="transition-delay:120ms">
     <div class="demo-card-top"><span class="demo-name">a2a-demo</span><span class="demo-badge"><i></i>source</span></div>
     <p>Live dashboard over a real Agent-Fabric channel call between two independent ct-agent processes.</p>
     <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-a2a-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
    </div>
-   <div class="demo-card">
+   <div class="demo-card reveal" style="transition-delay:180ms">
     <div class="demo-card-top"><span class="demo-name">auction-demo</span><span class="demo-badge"><i></i>source</span></div>
     <p>Live dashboard over CADS-Tunnel's real workflow-pipeline auction algorithm (ct_common::pipeline).</p>
     <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-auction-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
    </div>
-   <div class="demo-card">
+   <div class="demo-card reveal" style="transition-delay:240ms">
     <div class="demo-card-top"><span class="demo-name">p2p-vault</span><span class="demo-badge"><i></i>source</span></div>
     <p>Encrypted, CRDT-versioned, gossip-converging P2P file share for CADS-Tunnel-connected agents — the core only coordinates, it never touches file bytes.</p>
     <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-p2p-vault" target="_blank" rel="noopener">Source &rarr;</a></div>
@@ -3761,7 +3787,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    host — that way a bug in your own code can't reach past the sandbox onto the rest of your machine.
   </div>
 
-  <div class="use-case">
+  <div class="use-case reveal">
    <div>
     <h3>Still works on restrictive networks</h3>
     <p>Your agent tries a direct QUIC connection to the edge first. Blocked by a firewall that only
@@ -3777,12 +3803,12 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
  </div>
 
  <div class="features">
-  <div class="feature"><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
-  <div class="feature"><h3>Any hardware</h3><p>Laptop, Raspberry Pi, spare VM, container, or your own AI agent — nothing runs on our infrastructure.</p></div>
-  <div class="feature"><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
+  <div class="feature reveal" style="transition-delay:0ms"><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
+  <div class="feature reveal" style="transition-delay:60ms"><h3>Any hardware</h3><p>Laptop, Raspberry Pi, spare VM, container, or your own AI agent — nothing runs on our infrastructure.</p></div>
+  <div class="feature reveal" style="transition-delay:120ms"><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
  </div>
 
- <div class="use-case">
+ <div class="use-case reveal">
   <div>
    <h3>Your own mesh, optimized</h3>
    <p>Draw your agents into a graph in the topology editor — direct links, or let it plan for you.
@@ -3796,7 +3822,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   </div>
  </div>
 
- <div class="lab">
+ <div class="lab reveal">
   <h2 style="margin-top:0">What is "Bunsenbrenner"?</h2>
   <p>
    Picture a lab bench. A Bunsen burner isn't the experiment — it's the reliable, unglamorous heat
@@ -3816,7 +3842,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   <div class="section-head"><h2>Workflow pipelines</h2><a class="btn secondary" href="/registry/pipelines">Pipeline registry (raw) &rarr;</a></div>
   <ul class="list" id="pipeline-list"><li class="empty">loading…</li></ul>
 
-  <div class="use-case reverse">
+  <div class="use-case reverse reveal">
    <div class="diagram-card">
     <div class="diagram-head"><span>ROLE AUCTION · 3 devices, 1 role each</span><span class="live"><i></i>live</span></div>
     <canvas id="diagram-pipeline" width="400" height="160" aria-label="Animated diagram of three devices each publishing an offer, an auction selecting winners, and one composed service"></canvas>
@@ -3835,7 +3861,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
 
  <div class="section" id="mcp">
   <h2>MCP</h2>
-  <div class="mcp-strip">
+  <div class="mcp-strip reveal">
    <p>
     Once your <code>ct-agent channel --serve</code> process joins a channel, it answers real
     <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener">Model Context Protocol</a>
@@ -3848,7 +3874,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    <div class="install">curl … | ct-agent onboard</div>
   </div>
 
-  <div class="use-case">
+  <div class="use-case reveal">
    <div>
     <h3>Direct, agent to agent</h3>
     <p>Two agents connect directly when the network allows it; when it doesn't, the same Noise session
@@ -3863,7 +3889,7 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    </div>
   </div>
 
-  <div class="use-case reverse">
+  <div class="use-case reverse reveal">
    <div class="diagram-card">
     <div class="diagram-head"><span>REGISTRY · publish once, found by many</span><span class="live"><i></i>public</span></div>
     <canvas id="diagram-directory" width="400" height="160" aria-label="Animated diagram of your agent publishing a card to the public registry, then several other agents discovering and connecting to it"></canvas>
@@ -3887,15 +3913,15 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   </p>
   <div id="health" class="l">loading…</div>
   <div class="grid">
-   <div class="card"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
-   <div class="card"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
-   <div class="card"><div class="n" id="pipelines">–</div><div class="l">published pipelines</div></div>
-   <div class="card"><div class="n" id="directory">–</div><div class="l">discoverable agents</div></div>
-   <div class="card"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
+   <div class="card reveal" style="transition-delay:0ms"><div class="n" id="tunnels">–</div><div class="l">registered tunnels</div></div>
+   <div class="card reveal" style="transition-delay:40ms"><div class="n" id="agents">–</div><div class="l">enrolled agents</div></div>
+   <div class="card reveal" style="transition-delay:80ms"><div class="n" id="pipelines">–</div><div class="l">published pipelines</div></div>
+   <div class="card reveal" style="transition-delay:120ms"><div class="n" id="directory">–</div><div class="l">discoverable agents</div></div>
+   <div class="card reveal" style="transition-delay:160ms"><div class="n" id="uptime">–</div><div class="l">uptime (s)</div></div>
   </div>
  </div>
 
- <div class="section support">
+ <div class="section support reveal">
   <p><strong>Keep the lab running.</strong> Bunsenbrenner is free to use and runs on donated time and
   server costs. If it helped you get something live, a small contribution keeps it going.</p>
   <div class="actions">
@@ -4134,6 +4160,26 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    {path:[1,2],speed:1,phase:.2,color:'accent2'}, {path:[1,3],speed:1,phase:.5,color:'accent2'}, {path:[1,4],speed:1,phase:.8,color:'accent2'},
   ]
  );
+
+ // Scroll-reveal for .reveal elements -- progressive enhancement only: the
+ // "hidden" (.reveal-pre) state is added by this script, never present in the
+ // static markup, so a visitor with JS disabled (or reduced motion) simply
+ // sees every section fully visible with no reveal at all.
+ (function(){
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var els = document.querySelectorAll('.reveal');
+  if (!els.length || !('IntersectionObserver' in window)) return;
+  els.forEach(function(el){ el.classList.add('reveal-pre'); });
+  var io = new IntersectionObserver(function(entries){
+   entries.forEach(function(entry){
+    if (entry.isIntersecting){
+     entry.target.classList.add('reveal-in');
+     io.unobserve(entry.target);
+    }
+   });
+  }, { threshold: .12, rootMargin: '0px 0px -40px 0px' });
+  els.forEach(function(el){ io.observe(el); });
+ })();
 </script>
 <div class="cookie-notice" id="cookie-notice">
  <span>We only use technically necessary cookies (login session, CSRF protection) — no tracking, no
