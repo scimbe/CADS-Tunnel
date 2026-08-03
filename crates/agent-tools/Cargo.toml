@@ -30,7 +30,7 @@ nat-lab = ["ct-agent/nat-lab"]
 # real release exists switch both to `tag = "vX.Y.Z"`. natlab's nat_lab_relay/
 # listen/dial live here and nowhere else.
 git = "https://github.com/scimbe/ct-agent"
-rev = "0d6adb649612646d6a4901f4608a9a3fc5530d53"
+rev = "86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408"
 optional = true
 
 [[bin]]
