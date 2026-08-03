@@ -28,6 +28,15 @@ axum = { version = "0.7", features = ["ws"] }
 # (ws_channel.rs), so it can feed the same channel_broker core every other
 # transport uses.
 futures-util = "0.3"
+# ws_channel.rs's native-TLS-termination option (CT_EDGE_WS_CHANNEL_CERT/_KEY):
+# axum 0.7's `axum::serve` only accepts a concrete `tokio::net::TcpListener` (the
+# generic `Listener` trait allowing a per-connection TLS wrap arrived in axum 0.8,
+# which this workspace doesn't use -- its route-param syntax change is a much
+# larger, unrelated migration). Both are already resolved transitively via axum
+# itself; this just names them directly for the low-level connection API axum's
+# own examples use for exactly this case.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "tokio", "service"] }
 # #81 SEC81c-c c-ii: the edge queries the control plane's channel-authorize endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
