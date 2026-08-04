@@ -390,6 +390,151 @@ impl SqliteEnrollment {
     }
 }
 
+/// A real M2M credential a subject self-issued (real self-service feature,
+/// 2026-08-04 -- account owners can create their own Keycloak service-account
+/// clients, not just have core create one for them out-of-band). Keycloak's
+/// own client object has no subject/owner concept at all -- this table is
+/// what makes "this account's service accounts" a real, queryable thing.
+/// Never stores the client secret: Keycloak itself is the source of truth for
+/// that (fetch/rotate on demand), so a leaked DB row alone can't hand out a
+/// live credential.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceAccountClient {
+    pub client_id: String,
+    pub name: String,
+    pub created_at: i64,
+}
+
+/// SQLite-backed subject -> Keycloak-service-account-client ownership map.
+pub struct SqliteServiceAccountStore {
+    conn: Mutex<Connection>,
+}
+
+sqlite_store_ctors!(SqliteServiceAccountStore);
+
+impl SqliteServiceAccountStore {
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS service_account_clients (
+                 client_id   TEXT PRIMARY KEY,
+                 subject     TEXT NOT NULL,
+                 internal_id TEXT NOT NULL,
+                 name        TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_service_account_clients_subject
+                 ON service_account_clients (subject);",
+        )?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Record a freshly-created Keycloak client as owned by `subject`. Called
+    /// only after the real Keycloak admin-API create call already succeeded --
+    /// this is bookkeeping, never the thing that actually creates the client.
+    pub fn record(&self, subject: &str, client_id: &str, internal_id: &str, name: &str, created_at: i64) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "INSERT INTO service_account_clients (client_id, subject, internal_id, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![client_id, subject, internal_id, name, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every service-account client `subject` has self-issued, oldest first.
+    /// Never carries a secret -- see the type's own doc comment.
+    pub fn list_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<ServiceAccountClient>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT client_id, name, created_at FROM service_account_clients WHERE subject = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![subject], |r| {
+            Ok(ServiceAccountClient { client_id: r.get(0)?, name: r.get(1)?, created_at: r.get(2)? })
+        })?;
+        rows.collect()
+    }
+
+    /// The real Keycloak internal id for `client_id`, but ONLY if `subject`
+    /// actually owns it -- the one lookup every rotate/revoke call must make
+    /// first, so a caller can never act on a client they don't own even if
+    /// they somehow already know its `client_id`.
+    pub fn internal_id_for(&self, subject: &str, client_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT internal_id FROM service_account_clients WHERE subject = ?1 AND client_id = ?2",
+                params![subject, client_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Drop the ownership record -- called only after the real Keycloak
+    /// admin-API delete call already succeeded. `false` if `subject` didn't
+    /// own `client_id` (nothing removed).
+    pub fn remove(&self, subject: &str, client_id: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .conn
+            .lock_safe()
+            .execute("DELETE FROM service_account_clients WHERE subject = ?1 AND client_id = ?2", params![subject, client_id])?;
+        Ok(n > 0)
+    }
+}
+
+#[cfg(test)]
+mod service_account_store_tests {
+    use super::*;
+
+    #[test]
+    fn record_then_list_returns_only_that_subjects_clients_oldest_first() {
+        let store = SqliteServiceAccountStore::open_in_memory().unwrap();
+        store.record("alice", "sa-1", "kc-internal-1", "CI bot", 100).unwrap();
+        store.record("alice", "sa-2", "kc-internal-2", "Bridge", 200).unwrap();
+        store.record("bob", "sa-3", "kc-internal-3", "Bob's thing", 150).unwrap();
+
+        let alice_clients = store.list_for_subject("alice").unwrap();
+        assert_eq!(alice_clients.len(), 2);
+        assert_eq!(alice_clients[0].client_id, "sa-1");
+        assert_eq!(alice_clients[1].client_id, "sa-2");
+        assert_eq!(alice_clients[0].name, "CI bot");
+
+        let bob_clients = store.list_for_subject("bob").unwrap();
+        assert_eq!(bob_clients.len(), 1);
+        assert_eq!(bob_clients[0].client_id, "sa-3");
+    }
+
+    #[test]
+    fn internal_id_for_is_owner_scoped_not_just_client_id_scoped() {
+        let store = SqliteServiceAccountStore::open_in_memory().unwrap();
+        store.record("alice", "sa-1", "kc-internal-1", "CI bot", 100).unwrap();
+
+        assert_eq!(store.internal_id_for("alice", "sa-1").unwrap(), Some("kc-internal-1".to_string()));
+        assert_eq!(store.internal_id_for("mallory", "sa-1").unwrap(), None, "a non-owner must never resolve another subject's client");
+        assert_eq!(store.internal_id_for("alice", "sa-does-not-exist").unwrap(), None);
+    }
+
+    #[test]
+    fn remove_is_owner_scoped_and_reports_whether_anything_was_actually_removed() {
+        let store = SqliteServiceAccountStore::open_in_memory().unwrap();
+        store.record("alice", "sa-1", "kc-internal-1", "CI bot", 100).unwrap();
+
+        assert!(!store.remove("mallory", "sa-1").unwrap(), "a non-owner's remove must be a real no-op, not silently succeed");
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 1, "mallory's attempt must not have removed alice's row");
+
+        assert!(store.remove("alice", "sa-1").unwrap());
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 0);
+        assert!(!store.remove("alice", "sa-1").unwrap(), "removing an already-gone row reports false, not an error");
+    }
+
+    #[test]
+    fn service_account_client_never_serializes_a_secret_field() {
+        // Real, not just a docstring claim: proves the JSON wire shape genuinely
+        // has no place a secret could ever leak through this type.
+        let c = ServiceAccountClient { client_id: "sa-1".to_string(), name: "CI bot".to_string(), created_at: 100 };
+        let json = serde_json::to_value(&c).unwrap();
+        let keys: std::collections::BTreeSet<&str> = json.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, ["client_id", "name", "created_at"].into_iter().collect());
+    }
+}
+
 /// Why a bootstrap-token redemption failed (#90/#97 SEC90b).
 #[derive(Debug)]
 pub enum BootstrapError {

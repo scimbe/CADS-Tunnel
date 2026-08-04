@@ -1465,6 +1465,7 @@ sessions -- all handled by your identity provider, not by CADS-Tunnel itself.</p
  <button type="submit">Create payment intent</button>
 </form>
 {manage_section}
+{service_accounts_section}
 <h2>Danger zone</h2>
 <p class="help">Permanently deletes every tunnel, channel, topology (including ones shared with
 you), declarative network and published pipeline this account owns -- credits are forfeited, and
@@ -1484,9 +1485,92 @@ this cannot be undone.{danger_kc_note}</p>
         account = escape(account_hex),
         balance = balance,
         manage_section = manage_section,
+        service_accounts_section = service_accounts_section_html(),
         danger_kc_note = danger_kc_note,
     );
     page("your account", &body)
+}
+
+/// Real self-service M2M credentials (2026-08-04): a fetch()-driven section on
+/// the account page, same pattern as `topologies_html`'s own client-side shell
+/// -- all actual data access goes through the already dual-authed
+/// `/me/service-accounts*` API (`subject_of_topology`, service.rs), this is
+/// purely the shell. A freshly created or rotated secret is shown exactly
+/// once, inline, with an explicit "copy it now" warning -- `GET
+/// /me/service-accounts` itself never carries a secret, so there is no second
+/// chance to view it here or anywhere else.
+fn service_accounts_section_html() -> &'static str {
+    r#"<h2>Service accounts (API credentials)</h2>
+<p class="help">Machine-to-machine credentials for your own bots/bridges/integrations --
+authenticate as <code>client_id</code> + <code>client_secret</code>
+(<code>grant_type=client_credentials</code>) instead of a browser session. Each one is its
+own, separate identity: it can only ever access/own what it itself creates, never your
+existing tunnels/channels or anyone else's data.</p>
+<div id="sa-secret-box" class="help" style="display:none"></div>
+<form id="sa-create-form" class="inline">
+ <input type="text" id="sa-name" placeholder="e.g. webconference bridge" required maxlength="200">
+ <button type="submit">Create service account</button>
+</form>
+<span id="sa-msg" class="help"></span>
+<div id="sa-list" class="help">Loading…</div>
+<script>
+(function(){
+ var list=document.getElementById('sa-list'),msg=document.getElementById('sa-msg'),secretBox=document.getElementById('sa-secret-box');
+ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+ function say(t){if(msg)msg.textContent=t;}
+ function showSecret(clientId,secret){
+  secretBox.style.display='block';
+  secretBox.innerHTML='<strong>Copy this secret now -- it will not be shown again:</strong>'
+   +'<div class="row"><span class="k">client_id</span><span class="v"><code>'+esc(clientId)+'</code></span></div>'
+   +'<div class="row"><span class="k">client_secret</span><span class="v"><code>'+esc(secret)+'</code></span></div>';
+ }
+ function rows(items){
+  return items.map(function(sa){
+   return '<div class="row"><span class="v">'+esc(sa.name)+' <code>'+esc(sa.client_id)+'</code></span>'
+        + '<span><button type="button" class="btn sec" data-rotate="'+esc(sa.client_id)+'">Rotate</button> '
+        + '<button type="button" class="btn danger" data-revoke="'+esc(sa.client_id)+'">Revoke</button></span></div>';
+  }).join('');
+ }
+ function load(){
+  fetch('/me/service-accounts').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+   .then(function(items){
+    list.innerHTML=items.length?rows(items):'<p class="help">No service accounts yet.</p>';
+    Array.prototype.forEach.call(list.querySelectorAll('[data-rotate]'),function(b){
+     b.addEventListener('click',function(){
+      if(!window.confirm('Rotate the secret for '+b.getAttribute('data-rotate')+'? The old secret stops working immediately.'))return;
+      say('rotating…');
+      fetch('/me/service-accounts/'+encodeURIComponent(b.getAttribute('data-rotate'))+'/rotate',{method:'POST'})
+       .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+       .then(function(res){say('');showSecret(b.getAttribute('data-rotate'),res.secret);})
+       .catch(function(s){say('rotate failed ('+s+')');});
+     });
+    });
+    Array.prototype.forEach.call(list.querySelectorAll('[data-revoke]'),function(b){
+     b.addEventListener('click',function(){
+      if(!window.confirm('Revoke '+b.getAttribute('data-revoke')+'? This deletes the real credential immediately and cannot be undone.'))return;
+      say('revoking…');
+      fetch('/me/service-accounts/'+encodeURIComponent(b.getAttribute('data-revoke')),{method:'DELETE'})
+       .then(function(r){if(!r.ok)return Promise.reject(r.status);say('');load();})
+       .catch(function(s){say('revoke failed ('+s+')');});
+     });
+    });
+   })
+   .catch(function(s){list.textContent='';say('could not load service accounts ('+s+')');});
+ }
+ load();
+ var form=document.getElementById('sa-create-form');
+ form.addEventListener('submit',function(ev){
+  ev.preventDefault();
+  var name=document.getElementById('sa-name').value.trim();
+  if(!name)return;
+  say('creating…');
+  fetch('/me/service-accounts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:name})})
+   .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+   .then(function(res){say('');document.getElementById('sa-name').value='';showSecret(res.client_id,res.secret);load();})
+   .catch(function(s){say('create failed ('+s+')');});
+ });
+})();
+</script>"#
 }
 
 /// Shared state for the self-service channel-allowlist **claim** route (#248-follow):
@@ -2109,6 +2193,9 @@ mod tests {
         assert!(html.contains("Credit&nbsp;balance"), "shows the balance row");
         assert!(html.contains("/portal/account/credits"), "offers buy-credits");
         assert!(html.contains("/portal/logout"), "offers sign-out");
+        assert!(html.contains("Service accounts"), "the account page must surface real self-service M2M credentials, not just link out");
+        assert!(html.contains("/me/service-accounts"), "the shell must target the real API, not a placeholder");
+        assert!(html.contains("will not be shown again"), "the secret-shown-once warning must be real, present copy, not implied");
         // No OIDC configured in test_app() -- omitted, not a dead link.
         assert!(
             !html.contains("Account Console"),

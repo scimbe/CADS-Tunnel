@@ -29,7 +29,7 @@ use crate::storage::{
     AgentDirectoryEntry, AgentDirectoryError, BootstrapError, IssueBatchError, LedgerOpError,
     PaymentOpError, RedeemError, SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore,
     SqliteEnrollment,
-    SqliteLedger, SqliteNetworkStore, SqlitePipelineRegistry, SqliteRegistry, SqliteTopologyStore,
+    SqliteLedger, SqliteNetworkStore, SqlitePipelineRegistry, SqliteRegistry, SqliteServiceAccountStore, SqliteTopologyStore,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -974,6 +974,170 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/share", post(topology_share_add))
         .route("/me/topologies/:id/share/:email/remove", post(topology_share_remove))
         .with_state(AuthedTopologyState { topologies, verifier, session_key, channels })
+}
+
+/// State for real self-service M2M credentials (2026-08-04): an account owner
+/// creates/rotates/revokes their own Keycloak service-account clients from
+/// their own account page, rather than only core being able to (as
+/// `webconference-bridge` was). `kc` is `None` on a deployment with no
+/// Keycloak admin API configured -- every handler reports `503`, honestly,
+/// rather than pretending the feature works.
+#[derive(Clone)]
+pub struct AuthedServiceAccountState {
+    store: Arc<SqliteServiceAccountStore>,
+    verifier: OidcVerifierHandle,
+    session_key: Arc<[u8]>,
+    kc: Option<crate::keycloak_admin::KeycloakAdminConfig>,
+}
+
+/// * `POST /me/service-accounts` `{name}` → create a real Keycloak service-account
+///   client (client_credentials-only, no browser flows), owned by the caller.
+///   Returns `{client_id, secret}` -- the secret is visible in this response ONLY;
+///   it is never stored (Keycloak itself is the source of truth) and never
+///   returned again except via `rotate`.
+/// * `GET /me/service-accounts` → the caller's own clients (`client_id`, `name`,
+///   `created_at`) -- never a secret.
+/// * `POST /me/service-accounts/:client_id/rotate` → regenerate the client's
+///   secret; the old one stops working immediately. Returns `{secret}` once.
+/// * `DELETE /me/service-accounts/:client_id` → revoke: deletes the real
+///   Keycloak client, then the ownership row.
+///
+/// Same dual-auth (`subject_of_topology`: portal session cookie OR OIDC
+/// bearer) as the Topology Editor's own `/me/topologies*` -- the account page
+/// drives this the same way, via `fetch()` against the ambient session.
+pub fn authed_service_account_router(
+    store: Arc<SqliteServiceAccountStore>,
+    verifier: OidcVerifierHandle,
+    session_key: Arc<[u8]>,
+    kc: Option<crate::keycloak_admin::KeycloakAdminConfig>,
+) -> Router {
+    Router::new()
+        .route("/me/service-accounts", post(service_account_create).get(service_account_list))
+        .route("/me/service-accounts/:client_id/rotate", post(service_account_rotate))
+        .route("/me/service-accounts/:client_id", delete(service_account_delete))
+        .with_state(AuthedServiceAccountState { store, verifier, session_key, kc })
+}
+
+const MAX_SERVICE_ACCOUNT_NAME_LEN: usize = 200;
+/// Defensive cap on how many M2M credentials one subject can self-issue --
+/// generous for any real integration use case, small enough that a runaway
+/// script can't spam Keycloak with clients unbounded.
+const MAX_SERVICE_ACCOUNTS_PER_SUBJECT: usize = 50;
+
+#[derive(Deserialize)]
+struct CreateServiceAccountReq {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct CreateServiceAccountResp {
+    client_id: String,
+    /// Visible exactly once -- this response. Never persisted, never returned
+    /// by GET /me/service-accounts.
+    secret: String,
+}
+
+async fn service_account_create(
+    State(state): State<AuthedServiceAccountState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateServiceAccountReq>,
+) -> Result<Json<CreateServiceAccountResp>, (StatusCode, String)> {
+    let subject = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name is required".to_string()));
+    }
+    if name.len() > MAX_SERVICE_ACCOUNT_NAME_LEN {
+        return Err((StatusCode::BAD_REQUEST, format!("name must be under {MAX_SERVICE_ACCOUNT_NAME_LEN} characters")));
+    }
+    let Some(kc) = &state.kc else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Keycloak admin API not configured on this deployment".to_string()));
+    };
+    let existing_count = state.store.list_for_subject(&subject).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.len();
+    if existing_count >= MAX_SERVICE_ACCOUNTS_PER_SUBJECT {
+        return Err((StatusCode::BAD_REQUEST, format!("at most {MAX_SERVICE_ACCOUNTS_PER_SUBJECT} service accounts per subject")));
+    }
+
+    // sa-<16 hex bytes>: server-generated, never user-supplied -- a real
+    // Keycloak clientId with no injection/collision surface to worry about.
+    let client_id = format!("sa-{}", gen_hex_id());
+    let http = reqwest::Client::new();
+    let created = crate::keycloak_admin::create_service_account_client(&http, kc, &client_id, name)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    if let Err(e) = state.store.record(&subject, &client_id, &created.internal_id, name, now) {
+        // The Keycloak client is real and live at this point but we failed to
+        // record ownership -- best-effort cleanup so it isn't silently
+        // orphaned (unreachable by this subject, invisible to list/rotate/
+        // delete, but still live and spendable). Logged, not surfaced as a
+        // second error -- the operator already gets the real DB error below.
+        if let Err(cleanup_err) = crate::keycloak_admin::delete_client(&http, kc, &created.internal_id).await {
+            eprintln!("ct-cp: service_account_create: ownership record failed AND cleanup delete failed for {client_id}: {cleanup_err}");
+        }
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+
+    Ok(Json(CreateServiceAccountResp { client_id, secret: created.secret }))
+}
+
+async fn service_account_list(
+    State(state): State<AuthedServiceAccountState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::storage::ServiceAccountClient>>, (StatusCode, String)> {
+    let subject = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let list = state.store.list_for_subject(&subject).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(list))
+}
+
+#[derive(Serialize)]
+struct RotateServiceAccountResp {
+    secret: String,
+}
+
+async fn service_account_rotate(
+    State(state): State<AuthedServiceAccountState>,
+    headers: HeaderMap,
+    Path(client_id): Path<String>,
+) -> Result<Json<RotateServiceAccountResp>, (StatusCode, String)> {
+    let subject = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let Some(kc) = &state.kc else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Keycloak admin API not configured on this deployment".to_string()));
+    };
+    let internal_id = state
+        .store
+        .internal_id_for(&subject, &client_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown service account or not owned by you".to_string()))?;
+    let http = reqwest::Client::new();
+    let secret = crate::keycloak_admin::rotate_client_secret(&http, kc, &internal_id)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
+    Ok(Json(RotateServiceAccountResp { secret }))
+}
+
+async fn service_account_delete(
+    State(state): State<AuthedServiceAccountState>,
+    headers: HeaderMap,
+    Path(client_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let subject = subject_of_topology(&state.session_key, &state.verifier, &headers)?;
+    let Some(kc) = &state.kc else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Keycloak admin API not configured on this deployment".to_string()));
+    };
+    let internal_id = state
+        .store
+        .internal_id_for(&subject, &client_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown service account or not owned by you".to_string()))?;
+    let http = reqwest::Client::new();
+    crate::keycloak_admin::delete_client(&http, kc, &internal_id).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
+    // Real Keycloak delete already succeeded -- drop the ownership row too. A
+    // failure here leaves a harmless dangling row (the client_id no longer
+    // resolves to a live Keycloak client either way), not a security issue.
+    let _ = state.store.remove(&subject, &client_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// State for the searchable agent directory (#144 ②): the store + the shared
@@ -4844,6 +5008,9 @@ pub fn persistent_control_plane_router(
     {
         // #102-rest: the declarative-network REST surface (owner = verified subject).
         let networks = Arc::new(SqliteNetworkStore::open(db_path)?);
+        // Real self-service M2M credentials (2026-08-04): same DB file as every
+        // other store here, its own table.
+        let service_accounts = Arc::new(SqliteServiceAccountStore::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -4864,6 +5031,16 @@ pub fn persistent_control_plane_router(
             ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
+            // Real self-service M2M credentials -- an account owner's own
+            // Keycloak service-account clients, /me/service-accounts*. `None`
+            // kc_admin (no KEYCLOAK_PUBLIC_URL/KC_ADMIN_*) means every handler
+            // reports 503 rather than the feature silently not working.
+            .merge(authed_service_account_router(
+                service_accounts,
+                oidc.clone(),
+                Arc::from(session_key),
+                crate::keycloak_admin::KeycloakAdminConfig::from_env(),
+            ))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc.clone(), Arc::from(session_key)))
@@ -9082,5 +9259,262 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ready.status(), StatusCode::OK, "readiness ok (db reachable)");
+    }
+
+    /// A real local server standing in for Keycloak's admin API -- same
+    /// pattern `keycloak_admin.rs`'s own tests use, reused here so the full
+    /// HTTP round trip (service_account_create/rotate/delete -> real
+    /// reqwest calls -> this fake server) is proven, not just the storage
+    /// layer or keycloak_admin functions in isolation.
+    async fn spawn_fake_keycloak_admin() -> String {
+        use axum::extract::Path as AxPath;
+        use axum::routing::{delete as axdelete, get as axget, post as axpost};
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "access_token": "test-admin-token" }))
+        }
+        async fn create_client() -> axum::response::Response {
+            IntoResponse::into_response((
+                StatusCode::CREATED,
+                [(axum::http::header::LOCATION, "http://kc/admin/realms/ct-demo/clients/fake-internal-id")],
+            ))
+        }
+        async fn client_secret() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "type": "secret", "value": "fake-secret-value" }))
+        }
+        async fn delete_client_route(AxPath(_id): AxPath<String>) -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", axpost(token))
+            .route("/admin/realms/ct-demo/clients", axpost(create_client))
+            .route("/admin/realms/ct-demo/clients/:id/client-secret", axget(client_secret).post(client_secret))
+            .route("/admin/realms/ct-demo/clients/:id", axdelete(delete_client_route));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn test_kc_admin_config(base_url: String) -> crate::keycloak_admin::KeycloakAdminConfig {
+        crate::keycloak_admin::KeycloakAdminConfig {
+            base_url,
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn service_account_create_list_rotate_delete_round_trip_against_real_keycloak_calls() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let store = Arc::new(SqliteServiceAccountStore::open_in_memory().unwrap());
+        let kc_base = spawn_fake_keycloak_admin().await;
+        let app = authed_service_account_router(
+            store,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(&b"session-key"[..]),
+            Some(test_kc_admin_config(kc_base)),
+        );
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+
+        // Create.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/me/service-accounts")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"name": "CI bot"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let client_id = body["client_id"].as_str().unwrap().to_string();
+        assert!(client_id.starts_with("sa-"));
+        assert_eq!(body["secret"], "fake-secret-value");
+
+        // List -- present, and never carries a secret field at all.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/me/service-accounts").header("authorization", format!("Bearer {alice}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let entries = list.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["client_id"], client_id);
+        assert_eq!(entries[0]["name"], "CI bot");
+        assert!(entries[0].get("secret").is_none(), "list must never carry a secret");
+
+        // Rotate.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/me/service-accounts/{client_id}/rotate"))
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rotated: serde_json::Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(rotated["secret"], "fake-secret-value", "the fake server always returns this value -- proves rotate hit the real endpoint, not that the value differs (see keycloak_admin's own test for that)");
+
+        // Delete.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/me/service-accounts/{client_id}"))
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .oneshot(Request::get("/me/service-accounts").header("authorization", format!("Bearer {alice}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0, "delete must actually remove it from the owner's list");
+    }
+
+    #[tokio::test]
+    async fn service_account_rotate_and_delete_are_owner_scoped() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let store = Arc::new(SqliteServiceAccountStore::open_in_memory().unwrap());
+        store.record("alice", "sa-real", "kc-internal-real", "Alice's bot", 100).unwrap();
+        let kc_base = spawn_fake_keycloak_admin().await;
+        let app = authed_service_account_router(
+            store,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(&b"session-key"[..]),
+            Some(test_kc_admin_config(kc_base)),
+        );
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let mallory = jwt_for("mallory");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/me/service-accounts/sa-real/rotate")
+                    .header("authorization", format!("Bearer {mallory}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a non-owner must never rotate someone else's credential");
+
+        let resp = app
+            .oneshot(
+                Request::delete("/me/service-accounts/sa-real")
+                    .header("authorization", format!("Bearer {mallory}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a non-owner must never delete someone else's credential");
+    }
+
+    #[tokio::test]
+    async fn service_account_create_reports_503_honestly_when_keycloak_admin_isnt_configured() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let store = Arc::new(SqliteServiceAccountStore::open_in_memory().unwrap());
+        let app = authed_service_account_router(store, OidcVerifierHandle::new(Some(verifier)), Arc::from(&b"session-key"[..]), None);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::post("/me/service-accounts")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"name": "CI bot"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "must say plainly this deployment has no Keycloak admin API, not fail some other way");
+    }
+
+    #[tokio::test]
+    async fn service_account_create_rejects_an_empty_name() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let store = Arc::new(SqliteServiceAccountStore::open_in_memory().unwrap());
+        let kc_base = spawn_fake_keycloak_admin().await;
+        let app =
+            authed_service_account_router(store, OidcVerifierHandle::new(Some(verifier)), Arc::from(&b"session-key"[..]), Some(test_kc_admin_config(kc_base)));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::post("/me/service-accounts")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"name": "   "}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
