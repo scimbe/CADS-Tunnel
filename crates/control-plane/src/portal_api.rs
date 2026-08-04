@@ -1570,7 +1570,10 @@ pub fn login_gate_portal_router(
 ) -> Router {
     Router::new()
         .route("/portal/tunnels/:id/require-login", post(set_require_login_route))
-        .route("/portal/tunnels/:id/login-allowlist", post(login_allowlist_add_route))
+        .route(
+            "/portal/tunnels/:id/login-allowlist",
+            post(login_allowlist_add_route).get(login_allowlist_list_route),
+        )
         .route("/portal/tunnels/:id/login-allowlist/:email/remove", post(login_allowlist_remove_route))
         .with_state(LoginGateState {
             session_key: Arc::from(session_key.to_vec()),
@@ -1664,6 +1667,39 @@ async fn login_allowlist_remove_route(
         Ok(true) => Redirect::to("/portal/tunnels").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
         Err(e) => internal_error("login_allowlist_remove", e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct LoginAllowlistResp {
+    emails: Vec<String>,
+}
+
+/// `GET /portal/tunnels/:id/login-allowlist` -- the JSON read side the write
+/// routes above never had (core request, 2026-08-04): an address-book-style
+/// consumer (a bridge, not a browser navigating pages) can now see the current
+/// allow-list instead of only being able to blindly add/remove. Same owner
+/// scoping as add/remove, via the exact same `login_allowlist_list` the
+/// storage layer already exposed -- this handler is genuinely just a thin
+/// wrapper, no new storage-layer code needed.
+///
+/// Deliberately a real `401`/`404` here rather than `Redirect::to("/portal")`
+/// like the sibling form-POST routes: those redirect because a browser is
+/// mid-navigation when the session's missing; a JSON GET has no page to land
+/// on, and a fetch() caller needs a real status code to branch on, not a
+/// redirect to follow into an HTML page.
+async fn login_allowlist_list_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not signed in".to_string()).into_response();
+    };
+    match st.tunnels.login_allowlist_list(&subject, &id) {
+        Ok(Some(emails)) => Json(LoginAllowlistResp { emails }).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "unknown tunnel, not owned by you, or no hostname assigned yet".to_string()).into_response(),
+        Err(e) => internal_error("login_allowlist_list", e).into_response(),
     }
 }
 
@@ -3513,5 +3549,82 @@ mod tests {
         // #107-complex: both "owned" and "shared with me" sections are present.
         assert!(body.contains("/me/topologies/shared"), "fetches the shared-with-me listing too");
         assert!(body.contains("Shared with you"));
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_returns_the_real_owner_scoped_emails_in_order() {
+        // Core request (2026-08-04): a JSON read side for a tunnel's login
+        // allow-list, mirroring the existing owner-scoped write routes exactly --
+        // login_allowlist_list already existed in the storage layer with zero
+        // changes needed, so this is purely the HTTP wrapper being proven.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 1000).unwrap();
+        tunnels.login_allowlist_add("alice", &t.id, "carol@example.com", 2000).unwrap();
+
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/login-allowlist", t.id))
+                    .header("cookie", session_header("alice"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["emails"], serde_json::json!(["bob@example.com", "carol@example.com"]), "added-at order, matching login_allowlist_list");
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_requires_a_real_session_not_a_redirect() {
+        // Deliberately a 401, unlike the sibling form-POST routes' Redirect --
+        // this is a JSON endpoint for a fetch() caller (e.g. an address-book
+        // view), which has no page to land on and needs a real status to branch on.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app.oneshot(Request::get("/portal/tunnels/doesnotmatter/login-allowlist").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_404s_for_a_tunnel_owned_by_someone_else() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 1000).unwrap();
+
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/login-allowlist", t.id))
+                    .header("cookie", session_header("mallory"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a real subject mismatch must not leak another owner's allow-list");
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_returns_an_empty_list_honestly_not_an_error() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/login-allowlist", t.id))
+                    .header("cookie", session_header("alice"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["emails"], serde_json::json!([]));
     }
 }
