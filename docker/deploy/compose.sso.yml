@@ -122,6 +122,17 @@ services:
       KC_GITHUB_CLIENT_SECRET: "${KC_GITHUB_CLIENT_SECRET:-}"
       KC_GITLAB_CLIENT_ID: "${KC_GITLAB_CLIENT_ID:-}"
       KC_GITLAB_CLIENT_SECRET: "${KC_GITLAB_CLIENT_SECRET:-}"
+      # Outbound mail (password reset / email verification) -- the realm JSON's
+      # smtpServer block resolves these via ${VAR:default} at import time. Empty
+      # KC_SMTP_PASSWORD by default (mail just won't send, same as before this
+      # existed); set real values in .env to enable it. Never commit real values.
+      KC_SMTP_HOST: "${KC_SMTP_HOST:-smtp.strato.de}"
+      KC_SMTP_PORT: "${KC_SMTP_PORT:-465}"
+      KC_SMTP_FROM: "${KC_SMTP_FROM:-no-reply@bunsenbrenner.org}"
+      KC_SMTP_SSL: "${KC_SMTP_SSL:-true}"
+      KC_SMTP_STARTTLS: "${KC_SMTP_STARTTLS:-false}"
+      KC_SMTP_USER: "${KC_SMTP_USER:-no-reply@bunsenbrenner.org}"
+      KC_SMTP_PASSWORD: "${KC_SMTP_PASSWORD:-}"
     volumes:
       # #307: persist Keycloak's own data dir (its H2 DB file lives here) across
       # recreates -- see the header comment above for why this matters.
