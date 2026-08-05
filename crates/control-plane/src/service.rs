@@ -3260,7 +3260,12 @@ async fn channel_invite_redeem(
 /// the background refresh may still bring it up) rather than `401` (this
 /// specific request's credentials are the problem) or the old, indistinguishable
 /// `404` (route not found at all).
-fn subject_of(
+///
+/// `pub(crate)` (was private) since `gate.rs`'s `/gate/check` now reuses this
+/// exact same verified-subject extraction for its own bearer-token path
+/// (#382-follow M2M) rather than re-implementing bearer parsing/verification
+/// a second time.
+pub(crate) fn subject_of(
     handle: &OidcVerifierHandle,
     headers: &HeaderMap,
 ) -> Result<String, (StatusCode, String)> {
@@ -4921,7 +4926,7 @@ pub fn persistent_control_plane_router(
                 .as_ref()
                 .map(|c| c.account_console_url_with_referrer(&portal_base_url, "/portal/account"));
             crate::portal::portal_router(oidc_cfg.clone(), session_key)
-                .merge(crate::gate::gate_router(tunnels.clone(), oidc_cfg, session_key))
+                .merge(crate::gate::gate_router(tunnels.clone(), oidc_cfg, session_key, oidc.clone()))
                 .merge(
                 crate::portal_api::portal_api_router(
                     session_key,
