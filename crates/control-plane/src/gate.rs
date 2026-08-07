@@ -1157,8 +1157,14 @@ mod tests {
     #[tokio::test]
     async fn gate_callback_csrf_mismatch_offers_a_retry_link_when_target_cookie_present() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+        let app = gate_router_with(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
 
         let resp = app
             .oneshot(
