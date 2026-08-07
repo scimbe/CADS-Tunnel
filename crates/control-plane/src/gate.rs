@@ -345,7 +345,7 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
         return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
     }
     if cookie_value(&headers, GATE_STATE_COOKIE).as_deref() != Some(state) {
-        return (StatusCode::FORBIDDEN, "invalid or missing CSRF state").into_response();
+        return gate_csrf_mismatch_response(&headers);
     }
     let Some(target) = cookie_value(&headers, GATE_TARGET_COOKIE) else {
         return (StatusCode::BAD_REQUEST, "missing gate target -- please retry from the original link").into_response();
@@ -383,6 +383,34 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
             set_cookie(&mut resp, &cleared_gate_target_cookie());
             resp
         }
+    }
+}
+
+/// The CSRF-state cookie is a single slot per browser/host: a second
+/// `/gate/start` in flight at the same time (a second tab, a reload of the
+/// Keycloak redirect, going back and retrying) silently overwrites it, so
+/// completing an earlier attempt lands here with a state that no longer
+/// matches. Rather than a dead-end error, `ct_gate_target` is left untouched
+/// on this path (only the success/denied/exchange-error branches clear it),
+/// so it still names the most recent attempt's host+return -- enough to offer
+/// a one-click "try again" straight back into `/gate/start` instead of making
+/// the visitor navigate back to wherever they started.
+fn gate_csrf_mismatch_response(headers: &HeaderMap) -> Response {
+    let retry = cookie_value(headers, GATE_TARGET_COOKIE).and_then(|target| {
+        let (host, return_path) = target.split_once('|')?;
+        Some(format!("/gate/start?host={}&return={}", urlencode(host), urlencode(return_path)))
+    });
+    match retry {
+        Some(retry_url) => {
+            let mut resp = (StatusCode::FORBIDDEN, Html(csrf_expired_html(&retry_url))).into_response();
+            set_cookie(&mut resp, &cleared_gate_state_cookie());
+            set_cookie(&mut resp, &cleared_gate_target_cookie());
+            resp
+        }
+        // No target cookie either -- nothing to recover to (e.g. a forged
+        // callback hit with no prior /gate/start at all); the old plain
+        // 403 is the honest response here.
+        None => (StatusCode::FORBIDDEN, "invalid or missing CSRF state").into_response(),
     }
 }
 
@@ -426,6 +454,41 @@ async fn gate_logout(State(st): State<GateState>, Query(q): Query<LogoutQuery>) 
     let mut resp = Redirect::to(&target).into_response();
     set_cookie(&mut resp, &cleared_gate_session_cookie(domain));
     resp
+}
+
+/// Shown when the CSRF-state cookie no longer matches the callback's `state`
+/// -- almost always a second `/gate/start` (another tab, a reload, going back
+/// and retrying) clobbering the single state-cookie slot before the first
+/// attempt finished, not an actual forged callback. `retry_url` is built by
+/// [`gate_csrf_mismatch_response`] entirely from `urlencode`-escaped pieces of
+/// our own previously-set `ct_gate_target` cookie, so it's safe to embed as-is.
+fn csrf_expired_html(retry_url: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign-in session expired</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:center;justify-content:center}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
+ p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ a.retry{{display:inline-block;margin-top:1rem;background:var(--accent);color:var(--accent-ink);
+      font-weight:600;text-decoration:none;padding:.6rem 1.1rem;border-radius:8px}}
+ a.retry:hover{{filter:brightness(1.05)}}
+</style></head><body>
+<div class="card">
+ <h1>Sign-in session expired</h1>
+ <p>This usually happens when sign-in was started twice at once &mdash; a second
+    tab, a page reload, or going back and trying again. Just start over below;
+    it only takes a moment.</p>
+ <a class="retry" href="{retry_url}">Try signing in again</a>
+</div>
+</body></html>"#
+    )
 }
 
 fn access_denied_html(host: &str) -> String {
@@ -797,6 +860,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mismatched.status(), StatusCode::FORBIDDEN, "mismatched state -> refused");
+    }
+
+    /// The realistic case behind #CSRF-state reports: a second `/gate/start`
+    /// (another tab, a reload) overwrote `ct_gate_state` before the first
+    /// attempt's Keycloak redirect landed back at `/gate/callback`. The
+    /// mismatch is still refused, but since `ct_gate_target` still names a
+    /// real host+return (untouched on this path), the response should offer a
+    /// one-click way back into `/gate/start` instead of a dead end.
+    #[tokio::test]
+    async fn gate_callback_csrf_mismatch_offers_a_retry_link_when_target_cookie_present() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+
+        let resp = app
+            .oneshot(
+                Request::get("/gate/callback?code=abc&state=stale-state")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=fresh-state-from-second-tab; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "still refused -- CSRF protection itself is unaffected");
+        // Stale state/target cookies get cleared so the retry starts clean.
+        let set_cookies: Vec<_> = resp.headers().get_all(SET_COOKIE).iter().map(|v| v.to_str().unwrap().to_string()).collect();
+        assert!(set_cookies.iter().any(|c| c.starts_with(&format!("{GATE_STATE_COOKIE}=;"))), "clears the stale state cookie");
+        assert!(set_cookies.iter().any(|c| c.starts_with(&format!("{GATE_TARGET_COOKIE}=;"))), "clears the stale target cookie");
+
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("/gate/start?host=demo.bunsenbrenner.org&return=%2Froom%2F1"),
+            "offers a retry link built from the still-present target cookie, got: {html}"
+        );
     }
 
     #[tokio::test]
