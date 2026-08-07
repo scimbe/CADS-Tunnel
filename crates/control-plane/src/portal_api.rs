@@ -571,7 +571,11 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                 // existing owner-only convention for Revoke/Share above.
                 let require_login = st.tunnels.require_login(&subject, &t.id).ok().flatten().unwrap_or(false);
                 let login_allowlist = st.tunnels.login_allowlist_list(&subject, &t.id).ok().flatten().unwrap_or_default();
-                rows.push((t, owned, admission, status, require_login, login_allowlist));
+                // Self-service access requests (#382-follow, issue #18): same
+                // owner-scoped, best-effort-defaults-empty convention as
+                // login_allowlist above.
+                let pending_requests = st.tunnels.pending_access_requests(&subject, &t.id).ok().flatten().unwrap_or_default();
+                rows.push((t, owned, admission, status, require_login, login_allowlist, pending_requests));
             }
             Html(tunnels_html(&rows)).into_response()
         }
@@ -1093,7 +1097,7 @@ fn human_bytes(n: u64) -> String {
 /// its public content is served, and -- while enabled -- the allow-list itself
 /// with add/remove forms. Owner-scoped by construction: only called for owned
 /// rows (see `tunnels_html`).
-fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) -> String {
+fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String], pending_requests: &[(String, String, i64)]) -> String {
     let checked = if require_login { " checked" } else { "" };
     let allowlist_section = if require_login {
         let items = login_allowlist
@@ -1111,12 +1115,42 @@ fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) ->
         } else {
             ""
         };
+        // Self-service access requests (#382-follow, issue #18): a visitor who
+        // hit the gate's own "not on the access list" page can now leave a
+        // real request instead of a dead end -- surfaced here, right next to
+        // the allow-list it's asking to join, with one click to grant it
+        // (reuses the exact same add-to-allowlist form/route the manual entry
+        // below already posts to) or dismiss it.
+        let requests_section = if pending_requests.is_empty() {
+            String::new()
+        } else {
+            let items = pending_requests
+                .iter()
+                .map(|(email, note, _requested_at)| {
+                    let email_esc = escape(email);
+                    let note_html = if note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(r#" <span class="k">&mdash; {}</span>"#, escape(note))
+                    };
+                    format!(
+                        r#"<li>{email_esc}{note_html}
+ <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist">
+  <input type="hidden" name="email" value="{email_esc}">
+  <button class="sec" type="submit">Grant</button></form>
+ <form class="inline fade-out-submit" method="post" action="/portal/tunnels/{id}/access-requests/{email_esc}/dismiss">
+  <button class="sec" type="submit">Dismiss</button></form></li>"#
+                    )
+                })
+                .collect::<String>();
+            format!(r#"<div class="row"><p class="k">Pending access requests:</p><ul class="login-allowlist">{items}</ul></div>"#)
+        };
         format!(
             r#"<div class="row"><ul class="login-allowlist">{items}</ul>{empty_note}
 <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist">
  <input type="email" name="email" placeholder="invite@example.com" required>
  <button class="sec" type="submit">Add to access list</button>
-</form></div>"#
+</form></div>{requests_section}"#
         )
     } else {
         String::new()
@@ -1129,19 +1163,26 @@ fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) ->
     )
 }
 
-fn tunnels_html(
-    tunnels: &[(
-        crate::storage::SubjectTunnel,
-        bool,
-        Option<crate::storage::CertAdmission>,
-        Option<EdgeTunnelStatus>,
-        bool,
-        Vec<String>,
-    )],
-) -> String {
+/// One row of `GET /portal/tunnels`: the tunnel itself, whether the caller owns
+/// it, its cert-admission tier, live connection status, and (owner-only) its
+/// Browser-Plane login-gate state -- whether it's required, the allow-list, and
+/// any pending self-service access requests (#382-follow, issue #18). Named
+/// (clippy's `type_complexity`, found running clippy across the whole crate for
+/// this same change) rather than left as an inline 7-tuple.
+type TunnelRow = (
+    crate::storage::SubjectTunnel,
+    bool,
+    Option<crate::storage::CertAdmission>,
+    Option<EdgeTunnelStatus>,
+    bool,
+    Vec<String>,
+    Vec<(String, String, i64)>,
+);
+
+fn tunnels_html(tunnels: &[TunnelRow]) -> String {
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, login_allowlist)| {
+        .map(|(t, owned, admission, status, require_login, login_allowlist, pending_requests)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -1197,7 +1238,7 @@ fn tunnels_html(
             // Browser-Plane login gate (#382-follow): owner-only, and only shown for
             // a tunnel that actually has public content to protect (a hostname).
             let login_gate = if *owned && t.hostname.is_some() {
-                login_gate_html(&id, *require_login, login_allowlist)
+                login_gate_html(&id, *require_login, login_allowlist, pending_requests)
             } else {
                 String::new()
             };
@@ -1659,6 +1700,7 @@ pub fn login_gate_portal_router(
             post(login_allowlist_add_route).get(login_allowlist_list_route),
         )
         .route("/portal/tunnels/:id/login-allowlist/:email/remove", post(login_allowlist_remove_route))
+        .route("/portal/tunnels/:id/access-requests/:email/dismiss", post(access_request_dismiss_route))
         .with_state(LoginGateState {
             session_key: Arc::from(session_key.to_vec()),
             tunnels,
@@ -1713,6 +1755,13 @@ async fn login_allowlist_add_route(
         .unwrap_or(0);
     match st.tunnels.login_allowlist_add(&subject, &id, email, now) {
         Ok(true) => {
+            // Self-service access requests (#382-follow, issue #18): once this
+            // email is actually granted access, its pending request (if any)
+            // is satisfied -- clear it so it doesn't linger in the "pending"
+            // list after the owner just acted on it. Best-effort: a missing
+            // request is the normal case (most grants aren't self-service
+            // requests at all), not an error.
+            let _ = st.tunnels.dismiss_access_request(&subject, &id, email);
             // Best-effort account provisioning (#382-follow): never blocks the
             // allow-list add itself, matching `authorize_hostname`'s own
             // "side effect, logged not surfaced" convention above. This realm has
@@ -1751,6 +1800,25 @@ async fn login_allowlist_remove_route(
         Ok(true) => Redirect::to("/portal/tunnels").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
         Err(e) => internal_error("login_allowlist_remove", e).into_response(),
+    }
+}
+
+/// `POST /portal/tunnels/:id/access-requests/:email/dismiss` (#382-follow,
+/// issue #18): the owner's "Dismiss" action next to a pending self-service
+/// request in `login_gate_html` -- declines it without granting access,
+/// same owner-scoping as `login_allowlist_remove_route` above.
+async fn access_request_dismiss_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path((id, email)): Path<(String, String)>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.dismiss_access_request(&subject, &id, &email) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel or request".to_string()).into_response(),
+        Err(e) => internal_error("access_request_dismiss", e).into_response(),
     }
 }
 

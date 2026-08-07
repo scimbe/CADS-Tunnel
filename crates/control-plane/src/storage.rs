@@ -1521,6 +1521,23 @@ impl SqliteTunnelStore {
                  added_by  TEXT NOT NULL,
                  added_at  INTEGER NOT NULL,
                  PRIMARY KEY (hostname, email)
+             );
+             -- Self-service access requests (#382-follow, issue #18): lets a
+             -- visitor who fails the login gate's allow-list check leave a real,
+             -- durable request instead of hitting a dead end -- the tunnel owner
+             -- reviews these from the same portal page that already manages the
+             -- allow-list (login_gate_html). No new notification infrastructure:
+             -- this crate has none (Keycloak's own SMTP config is a separate,
+             -- account-verification-only concern), so the owner checks the
+             -- portal, same as they already do for the allow-list itself.
+             -- Idempotent per (hostname, email): resubmitting refreshes the
+             -- note/timestamp instead of growing an unbounded duplicate queue.
+             CREATE TABLE IF NOT EXISTS gate_access_requests (
+                 hostname     TEXT NOT NULL,
+                 email        TEXT NOT NULL,
+                 note         TEXT NOT NULL DEFAULT '',
+                 requested_at INTEGER NOT NULL,
+                 PRIMARY KEY (hostname, email)
              );",
         )?;
         Ok(Self {
@@ -1813,6 +1830,75 @@ impl SqliteTunnelStore {
             )
             .optional()?
             .is_some())
+    }
+
+    /// Record a self-service access-request for a gated hostname (#382-follow,
+    /// issue #18): a visitor who fails `GET /gate/callback`'s allow-list check
+    /// otherwise had no real next step. Only accepted for a hostname that
+    /// currently has the login gate enabled -- rejects everything else so this
+    /// can't be used to leave requests against an arbitrary, non-gated
+    /// hostname (or a typo'd/nonexistent one). Idempotent per (hostname,
+    /// email): resubmitting refreshes the note/timestamp, never grows an
+    /// unbounded duplicate queue.
+    pub fn record_access_request(&self, hostname: &str, email: &str, note: &str, now: u64) -> rusqlite::Result<bool> {
+        if !self.require_login_for_hostname(hostname)? {
+            return Ok(false);
+        }
+        self.conn.lock_safe().execute(
+            "INSERT INTO gate_access_requests (hostname, email, note, requested_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hostname, email) DO UPDATE SET note = excluded.note, requested_at = excluded.requested_at",
+            params![hostname, email.to_ascii_lowercase(), note, now as i64],
+        )?;
+        Ok(true)
+    }
+
+    /// Pending self-service access requests for a tunnel the caller owns
+    /// (#382-follow), owner-scoped like
+    /// [`login_allowlist_list`](Self::login_allowlist_list): `None` if the id is
+    /// unknown, owned by someone else, or has no hostname yet. Oldest first, so
+    /// the owner reviews in the order requests actually arrived.
+    pub fn pending_access_requests(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<Vec<(String, String, i64)>>> {
+        let conn = self.conn.lock_safe();
+        let hostname: Option<String> = conn
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(hostname) = hostname else { return Ok(None) };
+        let mut stmt = conn.prepare(
+            "SELECT email, note, requested_at FROM gate_access_requests WHERE hostname = ?1 ORDER BY requested_at ASC",
+        )?;
+        let rows = stmt.query_map(params![hostname], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        Ok(Some(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+
+    /// Dismiss a pending access request (#382-follow), owner-scoped like
+    /// [`pending_access_requests`](Self::pending_access_requests). Used both
+    /// when the owner explicitly declines a request and, from
+    /// `login_allowlist_add_route`, to clear a request once its email has
+    /// actually been granted access so it doesn't linger as "pending" after
+    /// being satisfied.
+    pub fn dismiss_access_request(&self, subject: &str, tunnel_id: &str, email: &str) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let hostname: Option<String> = conn
+            .query_row(
+                "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(hostname) = hostname else { return Ok(false) };
+        let n = conn.execute(
+            "DELETE FROM gate_access_requests WHERE hostname = ?1 AND email = ?2",
+            params![hostname, email.to_ascii_lowercase()],
+        )?;
+        Ok(n > 0)
     }
 
     /// The routing token of a tunnel `subject` is **authorized** to use — as its

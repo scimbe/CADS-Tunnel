@@ -2348,6 +2348,13 @@ pub struct CapacityMatch {
 /// kind(u8) ‖ ⟨model⟩ ‖ units(LE) ‖ total_price(LE) ‖ bid_issued_at(LE) ‖ offer_issued_at(LE))`.
 /// Both parties compute the same value; including both timestamps makes distinct auctions for the
 /// same terms distinct matches.
+// Found while running clippy across the whole workspace for an unrelated change
+// (#382-follow, gate.rs): 8 arguments, one per real field of the match_ref
+// domain-separated hash below -- bundling them into a struct would just move the
+// same eight fields one level of indirection away, not reduce anything real.
+// Not touching this crypto-relevant function's signature/call sites as a side
+// effect of an unrelated fix.
+#[allow(clippy::too_many_arguments)]
 fn compute_match_ref(
     provider: &[u8; 32],
     consumer: &[u8; 32],

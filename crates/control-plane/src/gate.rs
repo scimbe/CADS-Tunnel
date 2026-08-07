@@ -31,7 +31,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -123,6 +123,7 @@ fn gate_router_with(
         .route("/gate/start", get(gate_start))
         .route("/gate/callback", get(gate_callback))
         .route("/gate/logout", get(gate_logout))
+        .route("/gate/request-access", get(gate_request_access_form).post(gate_request_access_submit))
         .with_state(state)
 }
 
@@ -481,6 +482,7 @@ fn access_denied_html(host: &str) -> String {
  .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
  h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
  p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ a{{color:var(--accent)}}
  code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
 </style></head><body>
 <div class="card">
@@ -488,9 +490,129 @@ fn access_denied_html(host: &str) -> String {
  <p>Your sign-in succeeded, but your email isn't on the list of people invited to
     <code>{host}</code>. If you think this is a mistake, contact whoever shared
     this link with you.</p>
+ <p>New here and don't know who to ask?
+    <a href="/gate/request-access?host={host_q}">Request access</a> instead.</p>
 </div>
 </body></html>"#,
-        host = crate::portal::escape(host)
+        host = crate::portal::escape(host),
+        host_q = urlencode(host),
+    )
+}
+
+/// `GET /gate/request-access?host=...` (#382-follow, issue #18): the real
+/// self-service next step linked from `access_denied_html` above -- a visitor
+/// who just failed the allow-list check gets a real form instead of a dead
+/// end with no way to reach whoever administers it. Only rendered for a
+/// hostname that actually has the gate enabled right now (mirrors
+/// `record_access_request`'s own check) -- a stray or typo'd host gets an
+/// honest 404 rather than a form that can never actually be recorded.
+async fn gate_request_access_form(State(st): State<GateState>, Query(q): Query<RequestAccessQuery>) -> Response {
+    match st.tunnels.require_login_for_hostname(&q.host) {
+        Ok(true) => Html(request_access_form_html(&q.host, None)).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown or ungated hostname").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RequestAccessQuery {
+    host: String,
+}
+
+#[derive(Deserialize)]
+struct RequestAccessForm {
+    host: String,
+    email: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn gate_request_access_submit(State(st): State<GateState>, Form(form): Form<RequestAccessForm>) -> Response {
+    let email = form.email.trim();
+    // Real bound, not just cosmetic: the column has no length constraint of its
+    // own (SQLite is dynamically typed), so an unbounded note/email would let a
+    // single submission bloat this table -- same discipline as every other
+    // free-text field this session's own Trojan-Source/injection sweep already
+    // applies elsewhere in this codebase's request bodies.
+    let note: String = form.note.chars().take(500).collect();
+    if email.is_empty() || !email.contains('@') || email.len() > 254 {
+        return Html(request_access_form_html(&form.host, Some("Enter a real email address."))).into_response();
+    }
+    match st.tunnels.record_access_request(&form.host, email, &note, now_secs()) {
+        Ok(true) => Html(request_recorded_html(&form.host)).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown or ungated hostname").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request").into_response(),
+    }
+}
+
+fn request_access_form_html(host: &str, error: Option<&str>) -> String {
+    let host_escaped = crate::portal::escape(host);
+    let error_html = error
+        .map(|e| format!(r#"<p class="err">{}</p>"#, crate::portal::escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request access</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:center;justify-content:center}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
+ p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ p.err{{color:#f0883e}}
+ label{{display:block;margin-top:1rem;font-size:.9rem;color:var(--text)}}
+ input,textarea{{width:100%;box-sizing:border-box;margin-top:.3rem;background:#0d1117;border:1px solid var(--border);
+       border-radius:6px;color:var(--text);padding:.5rem;font:inherit}}
+ button{{margin-top:1.4rem;background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;
+       padding:.55rem 1.1rem;font-weight:600;cursor:pointer}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
+</style></head><body>
+<div class="card">
+ <h1>Request access</h1>
+ <p>Ask the owner of <code>{host_escaped}</code> to add you to its access list.</p>
+ {error_html}
+ <form method="post" action="/gate/request-access">
+  <input type="hidden" name="host" value="{host_escaped}">
+  <label>Your email
+   <input type="email" name="email" required maxlength="254" placeholder="you@example.com">
+  </label>
+  <label>Note (optional)
+   <textarea name="note" maxlength="500" rows="3" placeholder="Who you are / why you're asking"></textarea>
+  </label>
+  <button type="submit">Send request</button>
+ </form>
+</div>
+</body></html>"#
+    )
+}
+
+fn request_recorded_html(host: &str) -> String {
+    let host_escaped = crate::portal::escape(host);
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request recorded</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:center;justify-content:center}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
+ p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
+</style></head><body>
+<div class="card">
+ <h1>Request recorded</h1>
+ <p>The owner of <code>{host_escaped}</code> can see your request and grant access from their
+    dashboard. No automatic notification is sent -- if it's urgent, reach them another way too.</p>
+</div>
+</body></html>"#
     )
 }
 
@@ -1126,5 +1248,127 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get("location").unwrap(), "https://bunsenbrenner.org/");
+    }
+
+    /// #382-follow, issue #18: the "not on the access list" page must actually
+    /// link somewhere real, not just apologize -- a visitor arriving with no
+    /// prior contact otherwise has no discoverable next step at all.
+    #[tokio::test]
+    async fn gate_callback_denial_page_links_to_the_real_request_access_form() {
+        use axum::body::to_bytes;
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let resp = app
+            .oneshot(
+                Request::get("/gate/callback?code=abc&state=xyz")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("/gate/request-access?host=demo.bunsenbrenner.org"),
+            "the denial page must link a real visitor to a real next step, not just apologize: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_request_access_form_404s_for_an_ungated_or_unknown_hostname() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let resp = app
+            .oneshot(Request::get("/gate/request-access?host=not-a-real-host.bunsenbrenner.org").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a stray/typo'd host must not render a form that can never be recorded");
+    }
+
+    #[tokio::test]
+    async fn gate_request_access_submit_records_a_real_request_the_owner_can_see_and_rejects_a_bad_email() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app =
+            gate_router_with(tunnels.clone(), Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+
+        // A bad email is rejected before ever touching storage.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::post("/gate/request-access")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("host=demo.bunsenbrenner.org&email=not-an-email&note="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::OK, "re-renders the form (with an error), not a redirect or a 400");
+        assert!(tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap().is_empty(), "the bad submission must not have been recorded");
+
+        // A real submission is recorded and visible to the tunnel's real owner.
+        let ok = app
+            .oneshot(
+                Request::post("/gate/request-access")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("host=demo.bunsenbrenner.org&email=carol%40example.com&note=found+via+the+README"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let pending = tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "carol@example.com");
+        assert_eq!(pending[0].1, "found via the README");
+    }
+
+    #[tokio::test]
+    async fn record_access_request_is_idempotent_per_hostname_and_email_and_rejects_an_ungated_host() {
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+
+        // Not yet gated -- rejected outright, not silently recorded.
+        assert!(!tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "hi", 100).unwrap());
+
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "first note", 100).unwrap());
+        assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "updated note", 200).unwrap());
+
+        let pending = tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap();
+        assert_eq!(pending.len(), 1, "resubmitting the same email must refresh, not duplicate");
+        assert_eq!(pending[0].1, "updated note");
+        assert_eq!(pending[0].2, 200);
+    }
+
+    #[tokio::test]
+    async fn granting_access_via_the_allowlist_auto_dismisses_the_matching_pending_request() {
+        // dismiss_access_request itself, and the auto-dismiss wiring in
+        // login_allowlist_add_route (portal_api.rs), are exercised together
+        // here at the storage layer -- the route's own auto-dismiss call is a
+        // thin, untestable-in-isolation wrapper around exactly this method.
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "", 100).unwrap());
+
+        assert!(tunnels.dismiss_access_request("alice", &t.id, "carol@example.com").unwrap());
+        assert!(tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap().is_empty());
+        // Dismissing again (nothing left to dismiss) is an honest no-op, not an error.
+        assert!(!tunnels.dismiss_access_request("alice", &t.id, "carol@example.com").unwrap());
     }
 }
