@@ -197,6 +197,123 @@ pub async fn ensure_user(
     })
 }
 
+/// A freshly-created service-account client's real Keycloak internal id + its
+/// one-time-visible secret (real self-service M2M credentials, 2026-08-04).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedClient {
+    pub internal_id: String,
+    pub secret: String,
+}
+
+#[derive(Deserialize)]
+struct ClientSecretResp {
+    value: String,
+}
+
+async fn fetch_client_secret(client: &reqwest::Client, token: &str, realm_url: &str, internal_id: &str) -> Result<String, KcError> {
+    let resp = client
+        .get(format!("{realm_url}/clients/{internal_id}/client-secret"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(KcError::Http(format!("GET client-secret returned {}", resp.status())));
+    }
+    resp.json::<ClientSecretResp>().await.map(|s| s.value).map_err(|e| KcError::Http(e.to_string()))
+}
+
+/// Create a real, confidential, service-account-only Keycloak client (pure
+/// client_credentials M2M -- no browser flows: standardFlow/directAccessGrants
+/// both off) and return its internal id + the secret Keycloak minted for it.
+/// `client_id` is trusted as already-validated/unique by the caller (the
+/// portal route generates it server-side -- see `portal_api.rs` -- rather
+/// than accepting arbitrary user input here), matching `ensure_user`'s own
+/// division of validation (caller) vs. API mechanics (this module).
+pub async fn create_service_account_client(
+    client: &reqwest::Client,
+    cfg: &KeycloakAdminConfig,
+    client_id: &str,
+    name: &str,
+) -> Result<CreatedClient, KcError> {
+    let token = admin_token(client, cfg).await?;
+    let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
+
+    let create = client
+        .post(format!("{realm_url}/clients"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "clientId": client_id,
+            "name": name,
+            "protocol": "openid-connect",
+            "enabled": true,
+            "publicClient": false,
+            "standardFlowEnabled": false,
+            "directAccessGrantsEnabled": false,
+            "serviceAccountsEnabled": true,
+            "authorizationServicesEnabled": false,
+            "clientAuthenticatorType": "client-secret",
+        }))
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    if !create.status().is_success() {
+        return Err(KcError::Http(format!("POST clients returned {}", create.status())));
+    }
+    // Same shape as ensure_user's create response: the new id only ever comes
+    // back in Location, never the body.
+    let location = create
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| KcError::Http("client create response had no Location header".to_string()))?;
+    let internal_id = location
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| KcError::Http("could not parse client internal id from Location header".to_string()))?
+        .to_string();
+
+    let secret = fetch_client_secret(client, &token, &realm_url, &internal_id).await?;
+    Ok(CreatedClient { internal_id, secret })
+}
+
+/// Regenerate `internal_id`'s client secret and return the new value -- the
+/// old secret stops working immediately (Keycloak's own regenerate semantics).
+/// Ownership must already be verified by the caller (`SqliteServiceAccountStore
+/// ::internal_id_for`) before this is ever called with a real internal id.
+pub async fn rotate_client_secret(client: &reqwest::Client, cfg: &KeycloakAdminConfig, internal_id: &str) -> Result<String, KcError> {
+    let token = admin_token(client, cfg).await?;
+    let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
+    let resp = client
+        .post(format!("{realm_url}/clients/{internal_id}/client-secret"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(KcError::Http(format!("POST client-secret (rotate) returned {}", resp.status())));
+    }
+    resp.json::<ClientSecretResp>().await.map(|s| s.value).map_err(|e| KcError::Http(e.to_string()))
+}
+
+/// Delete `internal_id` from Keycloak entirely -- the client stops
+/// authenticating immediately. Ownership must already be verified by the
+/// caller, same as [`rotate_client_secret`].
+pub async fn delete_client(client: &reqwest::Client, cfg: &KeycloakAdminConfig, internal_id: &str) -> Result<(), KcError> {
+    let token = admin_token(client, cfg).await?;
+    let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
+    let resp = client
+        .delete(format!("{realm_url}/clients/{internal_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(KcError::Http(format!("DELETE client returned {}", resp.status())));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +413,101 @@ mod tests {
         assert!(fresh.temporary_password.is_some(), "a freshly created account gets a temp password");
         assert_eq!(create_calls.load(Ordering::SeqCst), 1);
         assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn create_service_account_client_returns_the_real_internal_id_and_secret() {
+        use axum::extract::{Path, State};
+        use axum::routing::{delete, get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct St {
+            secret_calls: Arc<AtomicUsize>,
+            deleted: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn create_client() -> axum::response::Response {
+            axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::CREATED,
+                [(axum::http::header::LOCATION, "http://kc/admin/realms/ct-demo/clients/internal-abc-123")],
+            ))
+        }
+        async fn client_secret(State(st): State<St>) -> Json<serde_json::Value> {
+            let n = st.secret_calls.fetch_add(1, Ordering::SeqCst);
+            Json(json!({ "type": "secret", "value": format!("secret-v{n}") }))
+        }
+        async fn delete_client_route(State(st): State<St>, Path(id): Path<String>) -> axum::http::StatusCode {
+            st.deleted.lock().unwrap().push(id);
+            axum::http::StatusCode::NO_CONTENT
+        }
+
+        let secret_calls = Arc::new(AtomicUsize::new(0));
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let st = St { secret_calls: secret_calls.clone(), deleted: deleted.clone() };
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/clients", post(create_client))
+            .route("/admin/realms/ct-demo/clients/:id/client-secret", get(client_secret).post(client_secret))
+            .route("/admin/realms/ct-demo/clients/:id", delete(delete_client_route))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let client = reqwest::Client::new();
+
+        let created = create_service_account_client(&client, &cfg, "sa-test123", "Test bot").await.unwrap();
+        assert_eq!(created.internal_id, "internal-abc-123", "the internal id must come from the real Location header");
+        assert_eq!(created.secret, "secret-v0");
+
+        let rotated = rotate_client_secret(&client, &cfg, &created.internal_id).await.unwrap();
+        assert_eq!(rotated, "secret-v1", "rotate must return a genuinely different value than the original create");
+        assert_ne!(rotated, created.secret);
+
+        delete_client(&client, &cfg, &created.internal_id).await.unwrap();
+        assert_eq!(deleted.lock().unwrap().as_slice(), ["internal-abc-123"], "delete must target the real internal id, not the client_id");
+    }
+
+    #[tokio::test]
+    async fn create_service_account_client_surfaces_a_real_keycloak_failure_honestly() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn create_client_conflict() -> axum::http::StatusCode {
+            axum::http::StatusCode::CONFLICT
+        }
+
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/clients", post(create_client_conflict));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let client = reqwest::Client::new();
+
+        let err = create_service_account_client(&client, &cfg, "sa-dup", "Test bot").await.unwrap_err();
+        assert!(err.to_string().contains("409") || err.to_string().to_lowercase().contains("conflict"), "a real 409 must surface as a real error, not a fabricated success: {err}");
     }
 }

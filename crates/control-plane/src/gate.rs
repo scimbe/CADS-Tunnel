@@ -31,7 +31,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -41,6 +41,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 
+use crate::oidc::OidcVerifierHandle;
 use crate::portal::{identity_from_verified_id_token, oidc_http_client, urlencode, ExchangedIdentity, PortalOidc};
 use crate::storage::SqliteTunnelStore;
 
@@ -69,6 +70,16 @@ struct GateState {
     /// the gate entirely (routes answer 503): a gate cookie scoped to just one
     /// host is not the cross-subdomain primitive this feature needs.
     cookie_domain: Option<Arc<str>>,
+    /// M2M bearer-token path for `/gate/check` (#382-follow): a *different*
+    /// verifier than `oidc` above -- `oidc` is authorization-code-flow config
+    /// for the interactive browser login this gate already does; `verifier`
+    /// validates an already-issued token (real service-account JWTs from
+    /// #42's `client_credentials` flow) presented directly in the request,
+    /// the same `OidcVerifierHandle` every other bearer-token-accepting route
+    /// in this crate already shares (`service.rs::subject_of`). See
+    /// `gate_check`'s own doc comment for why this doesn't widen the gate's
+    /// actual security property.
+    verifier: OidcVerifierHandle,
 }
 
 /// Build the Browser-Plane login-gate router: `GET /gate/check` (Caddy
@@ -76,14 +87,19 @@ struct GateState {
 /// `GET /gate/callback` (the OIDC redirect target). Mounted unconditionally;
 /// each handler answers `503` until both `oidc` and `CT_GATE_COOKIE_DOMAIN`
 /// are configured, matching this project's opt-in-until-configured convention.
-pub fn gate_router(tunnels: Arc<SqliteTunnelStore>, oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
+pub fn gate_router(
+    tunnels: Arc<SqliteTunnelStore>,
+    oidc: Option<PortalOidc>,
+    session_key: &[u8],
+    verifier: OidcVerifierHandle,
+) -> Router {
     let cookie_domain = std::env::var("CT_GATE_COOKIE_DOMAIN")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(Arc::from);
     let exchange = default_gate_exchanger();
-    gate_router_with(tunnels, oidc, session_key, exchange, cookie_domain)
+    gate_router_with(tunnels, oidc, session_key, exchange, cookie_domain, verifier)
 }
 
 fn gate_router_with(
@@ -92,6 +108,7 @@ fn gate_router_with(
     session_key: &[u8],
     exchange: GateExchanger,
     cookie_domain: Option<Arc<str>>,
+    verifier: OidcVerifierHandle,
 ) -> Router {
     let state = GateState {
         tunnels,
@@ -99,12 +116,14 @@ fn gate_router_with(
         exchange,
         session_key: Arc::from(session_key.to_vec()),
         cookie_domain,
+        verifier,
     };
     Router::new()
         .route("/gate/check", get(gate_check))
         .route("/gate/start", get(gate_start))
         .route("/gate/callback", get(gate_callback))
         .route("/gate/logout", get(gate_logout))
+        .route("/gate/request-access", get(gate_request_access_form).post(gate_request_access_submit))
         .with_state(state)
 }
 
@@ -260,6 +279,27 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
             // A malformed/non-ASCII email can't ride in a header value -- fall
             // through to the redirect below (no identity to report is worse
             // than none at all here).
+        }
+    }
+    // M2M path (#382-follow): a headless caller (e.g. devsystem_iterate --remote)
+    // has no browser session to hold `ct_gate_session` and never will -- it can
+    // only ever authenticate via a real, already-verified `Authorization: Bearer`
+    // token (a #42 service-account `client_credentials` JWT). Accepting it here
+    // is NOT a scope-widening of the gate's own security property, for the same
+    // reason `service.rs::subject_of_topology`'s doc comment gives for its
+    // identical dual-auth precedent: both paths must resolve to a subject this
+    // host's OWNER explicitly allow-listed -- reusing `tunnel_login_allowlist`
+    // (the exact table/check `email_allowed_for_hostname` already enforces for
+    // the cookie path, not a new parallel authorization surface) rather than
+    // trusting any valid token from any service account anywhere. The column is
+    // untyped TEXT; a service-account token's `sub` (its real Keycloak client id)
+    // is stored/checked the same way an email is -- the owner adds it to the
+    // allow-list the same way, from the same UI, once #42-follow exposes that.
+    if let Ok(subject) = crate::service::subject_of(&st.verifier, &headers) {
+        if matches!(st.tunnels.email_allowed_for_hostname(&host, &subject), Ok(true)) {
+            if let Ok(v) = HeaderValue::from_str(&subject) {
+                return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
+            }
         }
     }
     let Some(cfg) = &st.oidc else {
@@ -505,6 +545,7 @@ fn access_denied_html(host: &str) -> String {
  .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
  h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
  p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ a{{color:var(--accent)}}
  code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
 </style></head><body>
 <div class="card">
@@ -512,9 +553,129 @@ fn access_denied_html(host: &str) -> String {
  <p>Your sign-in succeeded, but your email isn't on the list of people invited to
     <code>{host}</code>. If you think this is a mistake, contact whoever shared
     this link with you.</p>
+ <p>New here and don't know who to ask?
+    <a href="/gate/request-access?host={host_q}">Request access</a> instead.</p>
 </div>
 </body></html>"#,
-        host = crate::portal::escape(host)
+        host = crate::portal::escape(host),
+        host_q = urlencode(host),
+    )
+}
+
+/// `GET /gate/request-access?host=...` (#382-follow, issue #18): the real
+/// self-service next step linked from `access_denied_html` above -- a visitor
+/// who just failed the allow-list check gets a real form instead of a dead
+/// end with no way to reach whoever administers it. Only rendered for a
+/// hostname that actually has the gate enabled right now (mirrors
+/// `record_access_request`'s own check) -- a stray or typo'd host gets an
+/// honest 404 rather than a form that can never actually be recorded.
+async fn gate_request_access_form(State(st): State<GateState>, Query(q): Query<RequestAccessQuery>) -> Response {
+    match st.tunnels.require_login_for_hostname(&q.host) {
+        Ok(true) => Html(request_access_form_html(&q.host, None)).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown or ungated hostname").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RequestAccessQuery {
+    host: String,
+}
+
+#[derive(Deserialize)]
+struct RequestAccessForm {
+    host: String,
+    email: String,
+    #[serde(default)]
+    note: String,
+}
+
+async fn gate_request_access_submit(State(st): State<GateState>, Form(form): Form<RequestAccessForm>) -> Response {
+    let email = form.email.trim();
+    // Real bound, not just cosmetic: the column has no length constraint of its
+    // own (SQLite is dynamically typed), so an unbounded note/email would let a
+    // single submission bloat this table -- same discipline as every other
+    // free-text field this session's own Trojan-Source/injection sweep already
+    // applies elsewhere in this codebase's request bodies.
+    let note: String = form.note.chars().take(500).collect();
+    if email.is_empty() || !email.contains('@') || email.len() > 254 {
+        return Html(request_access_form_html(&form.host, Some("Enter a real email address."))).into_response();
+    }
+    match st.tunnels.record_access_request(&form.host, email, &note, now_secs()) {
+        Ok(true) => Html(request_recorded_html(&form.host)).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown or ungated hostname").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "could not record the request").into_response(),
+    }
+}
+
+fn request_access_form_html(host: &str, error: Option<&str>) -> String {
+    let host_escaped = crate::portal::escape(host);
+    let error_html = error
+        .map(|e| format!(r#"<p class="err">{}</p>"#, crate::portal::escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request access</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:center;justify-content:center}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
+ p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ p.err{{color:#f0883e}}
+ label{{display:block;margin-top:1rem;font-size:.9rem;color:var(--text)}}
+ input,textarea{{width:100%;box-sizing:border-box;margin-top:.3rem;background:#0d1117;border:1px solid var(--border);
+       border-radius:6px;color:var(--text);padding:.5rem;font:inherit}}
+ button{{margin-top:1.4rem;background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;
+       padding:.55rem 1.1rem;font-weight:600;cursor:pointer}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
+</style></head><body>
+<div class="card">
+ <h1>Request access</h1>
+ <p>Ask the owner of <code>{host_escaped}</code> to add you to its access list.</p>
+ {error_html}
+ <form method="post" action="/gate/request-access">
+  <input type="hidden" name="host" value="{host_escaped}">
+  <label>Your email
+   <input type="email" name="email" required maxlength="254" placeholder="you@example.com">
+  </label>
+  <label>Note (optional)
+   <textarea name="note" maxlength="500" rows="3" placeholder="Who you are / why you're asking"></textarea>
+  </label>
+  <button type="submit">Send request</button>
+ </form>
+</div>
+</body></html>"#
+    )
+}
+
+fn request_recorded_html(host: &str) -> String {
+    let host_escaped = crate::portal::escape(host);
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request recorded</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:center;justify-content:center}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
+ h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
+ p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
+</style></head><body>
+<div class="card">
+ <h1>Request recorded</h1>
+ <p>The owner of <code>{host_escaped}</code> can see your request and grant access from their
+    dashboard. No automatic notification is sent -- if it's urgent, reach them another way too.</p>
+</div>
+</body></html>"#
     )
 }
 
@@ -700,7 +861,7 @@ mod tests {
         tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap();
         // Deliberately never call set_require_login.
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
                 Request::get("/gate/check")
@@ -719,7 +880,7 @@ mod tests {
         let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
 
         // No cookie at all -> 302 straight to /gate/start (NOT a bare 401 --
         // forward_auth copies our response to the client verbatim, so this
@@ -783,7 +944,7 @@ mod tests {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap();
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
                 Request::get("/gate/check")
@@ -797,11 +958,136 @@ mod tests {
         assert!(resp.headers().get(GATE_EMAIL_HEADER).is_none());
     }
 
+    /// #382-follow (M2M): a headless caller with no browser session (e.g.
+    /// `devsystem_iterate --remote`) can never hold `ct_gate_session`, but a
+    /// real Keycloak service-account bearer token whose subject the tunnel
+    /// owner explicitly allow-listed must clear the gate exactly like a
+    /// cookie session does -- same 200 + X-Gate-Email contract.
+    #[tokio::test]
+    async fn gate_check_accepts_an_allow_listed_bearer_token_as_an_alternative_to_the_cookie() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header as JwtHeader};
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc.example/realms/ct";
+        let verifier = std::sync::Arc::new(crate::oidc::OidcVerifier::from_hs_secret(secret, issuer));
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels
+            .login_allowlist_add("alice", &t.id, "svc-android-build@clients", now_secs())
+            .unwrap());
+
+        let app = gate_router_with(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::new(Some(verifier)),
+        );
+
+        let now = now_secs();
+        let claims = serde_json::json!({ "sub": "svc-android-build@clients", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&JwtHeader::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "an allow-listed service-account token clears the gate");
+        assert_eq!(resp.headers().get(GATE_EMAIL_HEADER).unwrap(), "svc-android-build@clients");
+    }
+
+    /// A valid, correctly-signed bearer token whose subject the owner never
+    /// allow-listed must NOT bypass the gate -- it's a real credential, just
+    /// not one this host's owner authorized, so it falls through to the
+    /// normal redirect exactly like "no credential at all" would.
+    #[tokio::test]
+    async fn gate_check_falls_through_to_redirect_for_a_valid_bearer_token_thats_not_allow_listed() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header as JwtHeader};
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc.example/realms/ct";
+        let verifier = std::sync::Arc::new(crate::oidc::OidcVerifier::from_hs_secret(secret, issuer));
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        // Deliberately never allow-list this subject.
+
+        let app = gate_router_with(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::new(Some(verifier)),
+        );
+
+        let now = now_secs();
+        let claims = serde_json::json!({ "sub": "some-other-service@clients", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&JwtHeader::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "a valid but non-allow-listed token doesn't bypass the gate");
+    }
+
+    /// An invalid/malformed/garbage bearer token must never bypass the gate
+    /// either -- `subject_of` returning `Err` is just another reason to fall
+    /// through to the normal redirect, not a special case.
+    #[tokio::test]
+    async fn gate_check_falls_through_to_redirect_for_a_malformed_bearer_token() {
+        let secret = b"realm-secret";
+        let issuer = "https://kc.example/realms/ct";
+        let verifier = std::sync::Arc::new(crate::oidc::OidcVerifier::from_hs_secret(secret, issuer));
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app = gate_router_with(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::new(Some(verifier)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                    .header("authorization", "Bearer not-a-real-jwt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND, "a malformed token doesn't bypass the gate");
+    }
+
     #[tokio::test]
     async fn gate_start_refuses_to_act_as_an_open_redirect_for_a_hostname_that_isnt_gated() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(Request::get("/gate/start?host=not-gated.bunsenbrenner.org&return=/").body(Body::empty()).unwrap())
             .await
@@ -816,7 +1102,7 @@ mod tests {
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
                 Request::get("/gate/start?host=demo.bunsenbrenner.org&return=/room/1")
@@ -841,7 +1127,7 @@ mod tests {
     async fn gate_callback_rejects_a_mismatched_or_missing_csrf_state() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
 
         let no_state = app
             .clone()
@@ -908,7 +1194,7 @@ mod tests {
         // Deliberately do NOT allow-list bob@example.com.
 
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
                 Request::get("/gate/callback?code=abc&state=xyz")
@@ -940,7 +1226,7 @@ mod tests {
         assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", now_secs()).unwrap());
 
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .clone()
             .oneshot(
@@ -986,7 +1272,7 @@ mod tests {
         let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
-        let app = gate_router_with(tunnels, Some(cfg()), TEST_KEY, failing_exchanger(), Some(Arc::from(".bunsenbrenner.org")));
+        let app = gate_router_with(tunnels, Some(cfg()), TEST_KEY, failing_exchanger(), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
                 Request::get("/gate/callback?code=abc&state=xyz")
@@ -1013,7 +1299,7 @@ mod tests {
         let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
 
         let resp = app
             .clone()
@@ -1056,12 +1342,134 @@ mod tests {
     async fn gate_logout_without_a_host_falls_back_to_the_control_planes_own_public_host() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let app =
-            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")));
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(Request::get("/gate/logout").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get("location").unwrap(), "https://bunsenbrenner.org/");
+    }
+
+    /// #382-follow, issue #18: the "not on the access list" page must actually
+    /// link somewhere real, not just apologize -- a visitor arriving with no
+    /// prior contact otherwise has no discoverable next step at all.
+    #[tokio::test]
+    async fn gate_callback_denial_page_links_to_the_real_request_access_form() {
+        use axum::body::to_bytes;
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let resp = app
+            .oneshot(
+                Request::get("/gate/callback?code=abc&state=xyz")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("/gate/request-access?host=demo.bunsenbrenner.org"),
+            "the denial page must link a real visitor to a real next step, not just apologize: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_request_access_form_404s_for_an_ungated_or_unknown_hostname() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let resp = app
+            .oneshot(Request::get("/gate/request-access?host=not-a-real-host.bunsenbrenner.org").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a stray/typo'd host must not render a form that can never be recorded");
+    }
+
+    #[tokio::test]
+    async fn gate_request_access_submit_records_a_real_request_the_owner_can_see_and_rejects_a_bad_email() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app =
+            gate_router_with(tunnels.clone(), Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+
+        // A bad email is rejected before ever touching storage.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::post("/gate/request-access")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("host=demo.bunsenbrenner.org&email=not-an-email&note="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::OK, "re-renders the form (with an error), not a redirect or a 400");
+        assert!(tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap().is_empty(), "the bad submission must not have been recorded");
+
+        // A real submission is recorded and visible to the tunnel's real owner.
+        let ok = app
+            .oneshot(
+                Request::post("/gate/request-access")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("host=demo.bunsenbrenner.org&email=carol%40example.com&note=found+via+the+README"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let pending = tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "carol@example.com");
+        assert_eq!(pending[0].1, "found via the README");
+    }
+
+    #[tokio::test]
+    async fn record_access_request_is_idempotent_per_hostname_and_email_and_rejects_an_ungated_host() {
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+
+        // Not yet gated -- rejected outright, not silently recorded.
+        assert!(!tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "hi", 100).unwrap());
+
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "first note", 100).unwrap());
+        assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "updated note", 200).unwrap());
+
+        let pending = tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap();
+        assert_eq!(pending.len(), 1, "resubmitting the same email must refresh, not duplicate");
+        assert_eq!(pending[0].1, "updated note");
+        assert_eq!(pending[0].2, 200);
+    }
+
+    #[tokio::test]
+    async fn granting_access_via_the_allowlist_auto_dismisses_the_matching_pending_request() {
+        // dismiss_access_request itself, and the auto-dismiss wiring in
+        // login_allowlist_add_route (portal_api.rs), are exercised together
+        // here at the storage layer -- the route's own auto-dismiss call is a
+        // thin, untestable-in-isolation wrapper around exactly this method.
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "", 100).unwrap());
+
+        assert!(tunnels.dismiss_access_request("alice", &t.id, "carol@example.com").unwrap());
+        assert!(tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap().is_empty());
+        // Dismissing again (nothing left to dismiss) is an honest no-op, not an error.
+        assert!(!tunnels.dismiss_access_request("alice", &t.id, "carol@example.com").unwrap());
     }
 }

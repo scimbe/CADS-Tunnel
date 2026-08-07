@@ -446,6 +446,14 @@ pub fn register_service_tools(
     handler: impl Fn(crate::channel::ServiceType, &str) -> Result<String, String> + Send + Sync + 'static,
 ) {
     let handler = std::sync::Arc::new(handler);
+    // Found while running clippy across the whole workspace for an unrelated
+    // change (#382-follow, gate.rs): clippy's `unnecessary_to_owned` suggestion
+    // (iterate by reference instead) doesn't account for `service` being moved
+    // into the `'static` `move |args| ...` closure below (stored in `reg` past
+    // this function's return) -- a borrowed `&ServiceType` tied to this
+    // function's own `services: &[..]` parameter can't satisfy that. The owned
+    // clone per iteration is real, not unnecessary.
+    #[allow(clippy::unnecessary_to_owned)]
     for service in services.iter().cloned() {
         let slug = service_slug(&service);
         let h = std::sync::Arc::clone(&handler);

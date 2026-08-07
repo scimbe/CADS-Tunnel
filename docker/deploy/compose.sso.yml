@@ -41,6 +41,17 @@
 #                         control-plane uses the same var for the code→token
 #                         exchange, so they never drift — no more copying a
 #                         Keycloak-minted secret by hand after each recreate.
+#   KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET  optional: the `webconference-bridge`
+#                         service-account client's secret (core request, 2026-08-04).
+#                         A downstream demo's bridge process authenticates as this
+#                         client (grant_type=client_credentials) to call /me/channels
+#                         etc. as a real M2M credential instead of a browser-session
+#                         cookie a control-plane restart can invalidate. Empty by
+#                         default like the KC_GOOGLE_*/KC_GITHUB_* brokering secrets
+#                         above — this client is feature-specific (one demo's bridge),
+#                         not core to every self-hoster, so it stays optional; set it
+#                         once and keep it in .env for the same drift-free reason as
+#                         KC_PORTAL_CLIENT_SECRET.
 
 # #307 (found live, 2026-08-01 -- this exact failure mode already hit the running
 # deployment once this session: a `docker compose up` that only named other services
@@ -109,6 +120,11 @@ services:
       # drifts out of sync and every login 502s. The realm JSON substitutes this via
       # ${env.KC_PORTAL_CLIENT_SECRET}; the control-plane below reads the SAME var.
       KC_PORTAL_CLIENT_SECRET: "${KC_PORTAL_CLIENT_SECRET:?set KC_PORTAL_CLIENT_SECRET=<random hex; stable across Keycloak reimports>}"
+      # Same pinning mechanism as KC_PORTAL_CLIENT_SECRET just above, but optional
+      # (empty default) -- this client only matters to whichever demo's bridge
+      # actually uses it, not to every self-hoster. Substituted into the realm
+      # JSON's webconference-bridge client via ${env.KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET}.
+      KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET: "${KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET:-}"
       # #310: the ct-portal client's redirectUris/post.logout.redirect.uris were
       # hardcoded to bunsenbrenner.org in the committed realm JSON -- any self-hoster
       # on their own domain got an unregistered-redirect-uri 400 on every login,

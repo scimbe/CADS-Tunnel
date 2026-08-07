@@ -571,7 +571,11 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                 // existing owner-only convention for Revoke/Share above.
                 let require_login = st.tunnels.require_login(&subject, &t.id).ok().flatten().unwrap_or(false);
                 let login_allowlist = st.tunnels.login_allowlist_list(&subject, &t.id).ok().flatten().unwrap_or_default();
-                rows.push((t, owned, admission, status, require_login, login_allowlist));
+                // Self-service access requests (#382-follow, issue #18): same
+                // owner-scoped, best-effort-defaults-empty convention as
+                // login_allowlist above.
+                let pending_requests = st.tunnels.pending_access_requests(&subject, &t.id).ok().flatten().unwrap_or_default();
+                rows.push((t, owned, admission, status, require_login, login_allowlist, pending_requests));
             }
             Html(tunnels_html(&rows)).into_response()
         }
@@ -1093,7 +1097,7 @@ fn human_bytes(n: u64) -> String {
 /// its public content is served, and -- while enabled -- the allow-list itself
 /// with add/remove forms. Owner-scoped by construction: only called for owned
 /// rows (see `tunnels_html`).
-fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) -> String {
+fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String], pending_requests: &[(String, String, i64)]) -> String {
     let checked = if require_login { " checked" } else { "" };
     let allowlist_section = if require_login {
         let items = login_allowlist
@@ -1111,12 +1115,42 @@ fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) ->
         } else {
             ""
         };
+        // Self-service access requests (#382-follow, issue #18): a visitor who
+        // hit the gate's own "not on the access list" page can now leave a
+        // real request instead of a dead end -- surfaced here, right next to
+        // the allow-list it's asking to join, with one click to grant it
+        // (reuses the exact same add-to-allowlist form/route the manual entry
+        // below already posts to) or dismiss it.
+        let requests_section = if pending_requests.is_empty() {
+            String::new()
+        } else {
+            let items = pending_requests
+                .iter()
+                .map(|(email, note, _requested_at)| {
+                    let email_esc = escape(email);
+                    let note_html = if note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(r#" <span class="k">&mdash; {}</span>"#, escape(note))
+                    };
+                    format!(
+                        r#"<li>{email_esc}{note_html}
+ <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist">
+  <input type="hidden" name="email" value="{email_esc}">
+  <button class="sec" type="submit">Grant</button></form>
+ <form class="inline fade-out-submit" method="post" action="/portal/tunnels/{id}/access-requests/{email_esc}/dismiss">
+  <button class="sec" type="submit">Dismiss</button></form></li>"#
+                    )
+                })
+                .collect::<String>();
+            format!(r#"<div class="row"><p class="k">Pending access requests:</p><ul class="login-allowlist">{items}</ul></div>"#)
+        };
         format!(
             r#"<div class="row"><ul class="login-allowlist">{items}</ul>{empty_note}
 <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist">
  <input type="email" name="email" placeholder="invite@example.com" required>
  <button class="sec" type="submit">Add to access list</button>
-</form></div>"#
+</form></div>{requests_section}"#
         )
     } else {
         String::new()
@@ -1129,19 +1163,26 @@ fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String]) ->
     )
 }
 
-fn tunnels_html(
-    tunnels: &[(
-        crate::storage::SubjectTunnel,
-        bool,
-        Option<crate::storage::CertAdmission>,
-        Option<EdgeTunnelStatus>,
-        bool,
-        Vec<String>,
-    )],
-) -> String {
+/// One row of `GET /portal/tunnels`: the tunnel itself, whether the caller owns
+/// it, its cert-admission tier, live connection status, and (owner-only) its
+/// Browser-Plane login-gate state -- whether it's required, the allow-list, and
+/// any pending self-service access requests (#382-follow, issue #18). Named
+/// (clippy's `type_complexity`, found running clippy across the whole crate for
+/// this same change) rather than left as an inline 7-tuple.
+type TunnelRow = (
+    crate::storage::SubjectTunnel,
+    bool,
+    Option<crate::storage::CertAdmission>,
+    Option<EdgeTunnelStatus>,
+    bool,
+    Vec<String>,
+    Vec<(String, String, i64)>,
+);
+
+fn tunnels_html(tunnels: &[TunnelRow]) -> String {
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, login_allowlist)| {
+        .map(|(t, owned, admission, status, require_login, login_allowlist, pending_requests)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -1197,7 +1238,7 @@ fn tunnels_html(
             // Browser-Plane login gate (#382-follow): owner-only, and only shown for
             // a tunnel that actually has public content to protect (a hostname).
             let login_gate = if *owned && t.hostname.is_some() {
-                login_gate_html(&id, *require_login, login_allowlist)
+                login_gate_html(&id, *require_login, login_allowlist, pending_requests)
             } else {
                 String::new()
             };
@@ -1465,6 +1506,7 @@ sessions -- all handled by your identity provider, not by CADS-Tunnel itself.</p
  <button type="submit">Create payment intent</button>
 </form>
 {manage_section}
+{service_accounts_section}
 <h2>Danger zone</h2>
 <p class="help">Permanently deletes every tunnel, channel, topology (including ones shared with
 you), declarative network and published pipeline this account owns -- credits are forfeited, and
@@ -1484,9 +1526,92 @@ this cannot be undone.{danger_kc_note}</p>
         account = escape(account_hex),
         balance = balance,
         manage_section = manage_section,
+        service_accounts_section = service_accounts_section_html(),
         danger_kc_note = danger_kc_note,
     );
     page("your account", &body)
+}
+
+/// Real self-service M2M credentials (2026-08-04): a fetch()-driven section on
+/// the account page, same pattern as `topologies_html`'s own client-side shell
+/// -- all actual data access goes through the already dual-authed
+/// `/me/service-accounts*` API (`subject_of_topology`, service.rs), this is
+/// purely the shell. A freshly created or rotated secret is shown exactly
+/// once, inline, with an explicit "copy it now" warning -- `GET
+/// /me/service-accounts` itself never carries a secret, so there is no second
+/// chance to view it here or anywhere else.
+fn service_accounts_section_html() -> &'static str {
+    r#"<h2>Service accounts (API credentials)</h2>
+<p class="help">Machine-to-machine credentials for your own bots/bridges/integrations --
+authenticate as <code>client_id</code> + <code>client_secret</code>
+(<code>grant_type=client_credentials</code>) instead of a browser session. Each one is its
+own, separate identity: it can only ever access/own what it itself creates, never your
+existing tunnels/channels or anyone else's data.</p>
+<div id="sa-secret-box" class="help" style="display:none"></div>
+<form id="sa-create-form" class="inline">
+ <input type="text" id="sa-name" placeholder="e.g. webconference bridge" required maxlength="200">
+ <button type="submit">Create service account</button>
+</form>
+<span id="sa-msg" class="help"></span>
+<div id="sa-list" class="help">Loading…</div>
+<script>
+(function(){
+ var list=document.getElementById('sa-list'),msg=document.getElementById('sa-msg'),secretBox=document.getElementById('sa-secret-box');
+ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+ function say(t){if(msg)msg.textContent=t;}
+ function showSecret(clientId,secret){
+  secretBox.style.display='block';
+  secretBox.innerHTML='<strong>Copy this secret now -- it will not be shown again:</strong>'
+   +'<div class="row"><span class="k">client_id</span><span class="v"><code>'+esc(clientId)+'</code></span></div>'
+   +'<div class="row"><span class="k">client_secret</span><span class="v"><code>'+esc(secret)+'</code></span></div>';
+ }
+ function rows(items){
+  return items.map(function(sa){
+   return '<div class="row"><span class="v">'+esc(sa.name)+' <code>'+esc(sa.client_id)+'</code></span>'
+        + '<span><button type="button" class="btn sec" data-rotate="'+esc(sa.client_id)+'">Rotate</button> '
+        + '<button type="button" class="btn danger" data-revoke="'+esc(sa.client_id)+'">Revoke</button></span></div>';
+  }).join('');
+ }
+ function load(){
+  fetch('/me/service-accounts').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+   .then(function(items){
+    list.innerHTML=items.length?rows(items):'<p class="help">No service accounts yet.</p>';
+    Array.prototype.forEach.call(list.querySelectorAll('[data-rotate]'),function(b){
+     b.addEventListener('click',function(){
+      if(!window.confirm('Rotate the secret for '+b.getAttribute('data-rotate')+'? The old secret stops working immediately.'))return;
+      say('rotating…');
+      fetch('/me/service-accounts/'+encodeURIComponent(b.getAttribute('data-rotate'))+'/rotate',{method:'POST'})
+       .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+       .then(function(res){say('');showSecret(b.getAttribute('data-rotate'),res.secret);})
+       .catch(function(s){say('rotate failed ('+s+')');});
+     });
+    });
+    Array.prototype.forEach.call(list.querySelectorAll('[data-revoke]'),function(b){
+     b.addEventListener('click',function(){
+      if(!window.confirm('Revoke '+b.getAttribute('data-revoke')+'? This deletes the real credential immediately and cannot be undone.'))return;
+      say('revoking…');
+      fetch('/me/service-accounts/'+encodeURIComponent(b.getAttribute('data-revoke')),{method:'DELETE'})
+       .then(function(r){if(!r.ok)return Promise.reject(r.status);say('');load();})
+       .catch(function(s){say('revoke failed ('+s+')');});
+     });
+    });
+   })
+   .catch(function(s){list.textContent='';say('could not load service accounts ('+s+')');});
+ }
+ load();
+ var form=document.getElementById('sa-create-form');
+ form.addEventListener('submit',function(ev){
+  ev.preventDefault();
+  var name=document.getElementById('sa-name').value.trim();
+  if(!name)return;
+  say('creating…');
+  fetch('/me/service-accounts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:name})})
+   .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+   .then(function(res){say('');document.getElementById('sa-name').value='';showSecret(res.client_id,res.secret);load();})
+   .catch(function(s){say('create failed ('+s+')');});
+ });
+})();
+</script>"#
 }
 
 /// Shared state for the self-service channel-allowlist **claim** route (#248-follow):
@@ -1570,8 +1695,12 @@ pub fn login_gate_portal_router(
 ) -> Router {
     Router::new()
         .route("/portal/tunnels/:id/require-login", post(set_require_login_route))
-        .route("/portal/tunnels/:id/login-allowlist", post(login_allowlist_add_route))
+        .route(
+            "/portal/tunnels/:id/login-allowlist",
+            post(login_allowlist_add_route).get(login_allowlist_list_route),
+        )
         .route("/portal/tunnels/:id/login-allowlist/:email/remove", post(login_allowlist_remove_route))
+        .route("/portal/tunnels/:id/access-requests/:email/dismiss", post(access_request_dismiss_route))
         .with_state(LoginGateState {
             session_key: Arc::from(session_key.to_vec()),
             tunnels,
@@ -1626,6 +1755,13 @@ async fn login_allowlist_add_route(
         .unwrap_or(0);
     match st.tunnels.login_allowlist_add(&subject, &id, email, now) {
         Ok(true) => {
+            // Self-service access requests (#382-follow, issue #18): once this
+            // email is actually granted access, its pending request (if any)
+            // is satisfied -- clear it so it doesn't linger in the "pending"
+            // list after the owner just acted on it. Best-effort: a missing
+            // request is the normal case (most grants aren't self-service
+            // requests at all), not an error.
+            let _ = st.tunnels.dismiss_access_request(&subject, &id, email);
             // Best-effort account provisioning (#382-follow): never blocks the
             // allow-list add itself, matching `authorize_hostname`'s own
             // "side effect, logged not surfaced" convention above. This realm has
@@ -1664,6 +1800,58 @@ async fn login_allowlist_remove_route(
         Ok(true) => Redirect::to("/portal/tunnels").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
         Err(e) => internal_error("login_allowlist_remove", e).into_response(),
+    }
+}
+
+/// `POST /portal/tunnels/:id/access-requests/:email/dismiss` (#382-follow,
+/// issue #18): the owner's "Dismiss" action next to a pending self-service
+/// request in `login_gate_html` -- declines it without granting access,
+/// same owner-scoping as `login_allowlist_remove_route` above.
+async fn access_request_dismiss_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path((id, email)): Path<(String, String)>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.dismiss_access_request(&subject, &id, &email) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel or request".to_string()).into_response(),
+        Err(e) => internal_error("access_request_dismiss", e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct LoginAllowlistResp {
+    emails: Vec<String>,
+}
+
+/// `GET /portal/tunnels/:id/login-allowlist` -- the JSON read side the write
+/// routes above never had (core request, 2026-08-04): an address-book-style
+/// consumer (a bridge, not a browser navigating pages) can now see the current
+/// allow-list instead of only being able to blindly add/remove. Same owner
+/// scoping as add/remove, via the exact same `login_allowlist_list` the
+/// storage layer already exposed -- this handler is genuinely just a thin
+/// wrapper, no new storage-layer code needed.
+///
+/// Deliberately a real `401`/`404` here rather than `Redirect::to("/portal")`
+/// like the sibling form-POST routes: those redirect because a browser is
+/// mid-navigation when the session's missing; a JSON GET has no page to land
+/// on, and a fetch() caller needs a real status code to branch on, not a
+/// redirect to follow into an HTML page.
+async fn login_allowlist_list_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not signed in".to_string()).into_response();
+    };
+    match st.tunnels.login_allowlist_list(&subject, &id) {
+        Ok(Some(emails)) => Json(LoginAllowlistResp { emails }).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "unknown tunnel, not owned by you, or no hostname assigned yet".to_string()).into_response(),
+        Err(e) => internal_error("login_allowlist_list", e).into_response(),
     }
 }
 
@@ -2073,6 +2261,9 @@ mod tests {
         assert!(html.contains("Credit&nbsp;balance"), "shows the balance row");
         assert!(html.contains("/portal/account/credits"), "offers buy-credits");
         assert!(html.contains("/portal/logout"), "offers sign-out");
+        assert!(html.contains("Service accounts"), "the account page must surface real self-service M2M credentials, not just link out");
+        assert!(html.contains("/me/service-accounts"), "the shell must target the real API, not a placeholder");
+        assert!(html.contains("will not be shown again"), "the secret-shown-once warning must be real, present copy, not implied");
         // No OIDC configured in test_app() -- omitted, not a dead link.
         assert!(
             !html.contains("Account Console"),
@@ -3513,5 +3704,82 @@ mod tests {
         // #107-complex: both "owned" and "shared with me" sections are present.
         assert!(body.contains("/me/topologies/shared"), "fetches the shared-with-me listing too");
         assert!(body.contains("Shared with you"));
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_returns_the_real_owner_scoped_emails_in_order() {
+        // Core request (2026-08-04): a JSON read side for a tunnel's login
+        // allow-list, mirroring the existing owner-scoped write routes exactly --
+        // login_allowlist_list already existed in the storage layer with zero
+        // changes needed, so this is purely the HTTP wrapper being proven.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 1000).unwrap();
+        tunnels.login_allowlist_add("alice", &t.id, "carol@example.com", 2000).unwrap();
+
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/login-allowlist", t.id))
+                    .header("cookie", session_header("alice"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["emails"], serde_json::json!(["bob@example.com", "carol@example.com"]), "added-at order, matching login_allowlist_list");
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_requires_a_real_session_not_a_redirect() {
+        // Deliberately a 401, unlike the sibling form-POST routes' Redirect --
+        // this is a JSON endpoint for a fetch() caller (e.g. an address-book
+        // view), which has no page to land on and needs a real status to branch on.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app.oneshot(Request::get("/portal/tunnels/doesnotmatter/login-allowlist").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_404s_for_a_tunnel_owned_by_someone_else() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 1000).unwrap();
+
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/login-allowlist", t.id))
+                    .header("cookie", session_header("mallory"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a real subject mismatch must not leak another owner's allow-list");
+    }
+
+    #[tokio::test]
+    async fn login_allowlist_get_route_returns_an_empty_list_honestly_not_an_error() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        let app = login_gate_portal_router(KEY, tunnels, None);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/portal/tunnels/{}/login-allowlist", t.id))
+                    .header("cookie", session_header("alice"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["emails"], serde_json::json!([]));
     }
 }

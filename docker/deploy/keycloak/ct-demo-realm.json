@@ -90,6 +90,21 @@
         "email",
         "profile"
       ]
+    },
+    {
+      "clientId": "webconference-bridge",
+      "name": "webconference-demo bridge (service account)",
+      "description": "M2M credential for a downstream demo's bridge process (e.g. CADS-webconference-demo's bridge/server.js) -- calls /me/channels etc. via client_credentials instead of a browser-session cookie a control-plane restart can invalidate (core request, 2026-08-04). subject_of()/subject_of_channel() only ever check a valid bearer token's sub+iss (crates/control-plane/src/service.rs, crates/control-plane/src/oidc.rs) -- no extra realm role needed beyond this client existing and having a secret.",
+      "secret": "${KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "authorizationServicesEnabled": false,
+      "fullScopeAllowed": true
     }
   ],
   "identityProviders": [
