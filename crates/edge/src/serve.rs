@@ -62,8 +62,20 @@ const TCP_FALLBACK_DELIVER_WAIT: Duration = Duration::from_millis(1500);
 
 /// First 8 hex chars of a token, for correlating an Edge trace line with a
 /// field-supplied token during cross-host diagnosis.
-fn token_hex(token: &RoutingToken) -> String {
-    token.0.iter().take(4).map(|b| format!("{b:02x}")).collect()
+/// #342: hex-encodes `token`'s first 4 bytes into `buf` (8 hex chars) and
+/// returns a borrowed `&str` into it -- avoids the 5 heap allocations
+/// (`format!` per byte, plus the final `collect::<String>()`) the previous
+/// `-> String` version did on every relay call. This label is usually only a
+/// trace-log argument, discarded unread whenever `CT_EDGE_TRACE` is unset (the
+/// production default) -- pure allocation waste on the hot relay path at real
+/// connection volume.
+fn token_hex<'a>(token: &RoutingToken, buf: &'a mut [u8; 8]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, b) in token.0.iter().take(4).enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    std::str::from_utf8(buf).expect("hex digits are always valid UTF-8")
 }
 
 /// Parse a 64-hex admin token (`CT_EDGE_ADMIN_TOKEN`) into 32 bytes, if valid (#27 RB3).
@@ -98,7 +110,8 @@ async fn open_agent_stream_with(
     token: &RoutingToken,
     timeout: Duration,
 ) -> Result<(SendStream, RecvStream), BoxError> {
-    let th = token_hex(token);
+    let mut th_buf = [0u8; 8];
+    let th = token_hex(token, &mut th_buf);
     let agents = state.routes(token);
     if agents.is_empty() {
         edge_trace(format_args!("route token={th} -> MISS (no registration)"));
@@ -157,7 +170,8 @@ pub async fn route_and_relay(
     client_recv: RecvStream,
 ) -> Result<(), BoxError> {
     let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
-    let (a, b) = relay_quic(client_send, client_recv, agent_send, agent_recv, &token_hex(token)).await?;
+    let mut th_buf = [0u8; 8];
+    let (a, b) = relay_quic(client_send, client_recv, agent_send, agent_recv, token_hex(token, &mut th_buf)).await?;
     state.note_relay(token, a, b); // #10 O2
     Ok(())
 }
@@ -1069,8 +1083,9 @@ pub async fn serve_connection(
             }
             match open_agent_stream(state, &token).await {
                 Ok((agent_send, agent_recv)) => {
+                    let mut th_buf = [0u8; 8];
                     let (a, b) =
-                        relay_quic(send, recv, agent_send, agent_recv, &token_hex(&token)).await?;
+                        relay_quic(send, recv, agent_send, agent_recv, token_hex(&token, &mut th_buf)).await?;
                     state.note_relay(&token, a, b); // #10 O2
                     Ok(None)
                 }
@@ -2460,6 +2475,29 @@ mod tests {
         // Partial config (one half missing) is a gap naming the missing half.
         assert_eq!(front_door_cert_gap(Some("/c"), None, c, k), Some(format!("{k} unset/empty")));
         assert_eq!(front_door_cert_gap(None, Some("/k"), c, k), Some(format!("{c} unset/empty")));
+    }
+
+    #[test]
+    fn token_hex_matches_the_first_4_bytes_lowercase_hex_342() {
+        // #342: the stack-buffer rewrite must produce byte-identical output to
+        // the old `.iter().take(4).map(|b| format!("{b:02x}")).collect()` --
+        // real correctness proof, not just "it compiles and doesn't allocate".
+        let token = RoutingToken({
+            let mut b = [0u8; 32];
+            b[0] = 0xde;
+            b[1] = 0x0a;
+            b[2] = 0xff;
+            b[3] = 0x01;
+            b[4] = 0xff; // must NOT appear -- only the first 4 bytes are hex-encoded
+            b
+        });
+        let mut buf = [0u8; 8];
+        assert_eq!(token_hex(&token, &mut buf), "de0aff01");
+
+        // All-zero token -> all-zero hex, not e.g. an empty string or a panic.
+        let zero = RoutingToken([0u8; 32]);
+        let mut buf2 = [0u8; 8];
+        assert_eq!(token_hex(&zero, &mut buf2), "00000000");
     }
 
     #[test]
