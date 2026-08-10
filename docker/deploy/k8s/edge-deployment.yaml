@@ -141,13 +141,22 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          # #380: QUIC handshakes, PoW verification (CT_EDGE_POW_DIFFICULTY), TLS
+          # termination, and channel-relay are all real CPU/memory work under load --
+          # 50m/64Mi requests against a 1 CPU/256Mi limit gave this pod Burstable QoS
+          # (early eviction under node memory pressure) plus real CFS-throttling and
+          # OOMKill risk once several relay streams are active at once. Aligned to
+          # the SAME edge binary's already-tuned, real production values from
+          # compose.selfhost.yml (mem_reservation/mem_limit/cpus, #312 -- "the one
+          # most likely to actually spike... needs its own headroom") rather than
+          # guessing new numbers: 128Mi/512Mi memory, up to 1.5 CPUs.
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 250m
+              memory: 128Mi
             limits:
-              cpu: "1"
-              memory: 256Mi
+              cpu: "1.5"
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
