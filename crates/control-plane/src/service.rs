@@ -3479,11 +3479,26 @@ pub struct StatusState {
     /// from the outside, "OIDC not configured" and "OIDC configured but not
     /// available yet" both mean the exact same thing for `/me/*`'s availability.
     oidc: OidcVerifierHandle,
+    /// #346: `/status` is public, unauthenticated, and NOT behind
+    /// `with_unauth_write_limit` (it's a GET) -- every request previously ran six
+    /// sequential store operations (each taking that store's own connection/lock,
+    /// see #344) plus a real HTTP scrape of the edge with up to a 2s timeout, with
+    /// no backstop against a poll loop or a `/status` burst. Cached here for
+    /// `STATUS_CACHE_TTL`; only the first request after expiry pays the real
+    /// aggregation cost, every other request during that window clones this.
+    status_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, StatusResp)>>>,
 }
+
+/// #346: how long a `/status` response is served from cache before the next
+/// request re-aggregates. Short enough that the operator landing page's own
+/// auto-refresh (real-time-feeling) is barely affected; long enough that a
+/// `/status` burst or poll loop costs at most one real aggregation per window
+/// instead of one per request.
+const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Aggregated operator status — health plus metadata counts the operator
 /// legitimately sees (never payload; consistent with ADR-0016 / the threat model).
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct StatusResp {
     /// Database reachable (same signal as `/readyz`).
     pub ready: bool,
@@ -3531,13 +3546,18 @@ pub fn status_router(
         edge_metrics_url,
         http: reqwest::Client::new(),
         oidc,
+        status_cache: Arc::new(tokio::sync::RwLock::new(None)),
     })
 }
 
-async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
-    Json(StatusResp {
+/// #346: the real aggregation -- six sequential store operations plus a real
+/// HTTP scrape of the edge (up to 2s). Unchanged from before this issue;
+/// `status_handler` below is what changed, wrapping this in a short-TTL cache
+/// instead of running it on every single request.
+async fn aggregate_status(s: &StatusState) -> StatusResp {
+    StatusResp {
         ready: s.ledger.ping().is_ok(),
-        tunnels: live_tunnel_count(&s).await,
+        tunnels: live_tunnel_count(s).await,
         agents: s.enrollment.agent_count().unwrap_or(0),
         pipelines_published: s.pipeline_registry.list().map(|v| v.len() as i64).unwrap_or(0),
         agents_directory: s.agent_directory.search(None, None).map(|v| v.len() as i64).unwrap_or(0),
@@ -3545,7 +3565,45 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
         uptime_seconds: s.started.elapsed().as_secs(),
         oidc_enabled: s.oidc.is_ready(),
-    })
+    }
+}
+
+async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
+    // #346: fast path -- a read lock, cheap, no store/network I/O -- serves a
+    // still-fresh cached response. Real hot path for any burst/poll within the
+    // same STATUS_CACHE_TTL window. `oidc_enabled` is overwritten with a fresh
+    // read even on a cache hit: unlike the six store/network operations this
+    // cache exists to bound, `oidc.is_ready()` is already a cheap live-handle
+    // check (#328's own doc comment: "a live handle, not a boot-time snapshot"),
+    // never the expensive part of this handler -- and #328's own regression
+    // test requires it to reflect a self-heal within the SAME test, with no
+    // restart and no tolerance for a multi-second cache delay. Caching
+    // everything else while keeping this one field always-live preserves both
+    // guarantees at once instead of trading one off against the other.
+    if let Some((cached_at, resp)) = s.status_cache.read().await.as_ref() {
+        if cached_at.elapsed() < STATUS_CACHE_TTL {
+            let mut resp = resp.clone();
+            resp.oidc_enabled = s.oidc.is_ready();
+            return Json(resp);
+        }
+    }
+    // Stale (or never populated): acquire the write lock and re-check inside
+    // it (the standard check-lock-check pattern) -- if a concurrent request
+    // already refreshed it while this one was waiting for the lock, use that
+    // result instead of redundantly re-aggregating. Only the first stale
+    // request to actually win the write lock pays the real cost; every other
+    // concurrent stale request just observes the fresh result it produced.
+    let mut guard = s.status_cache.write().await;
+    if let Some((cached_at, resp)) = guard.as_ref() {
+        if cached_at.elapsed() < STATUS_CACHE_TTL {
+            let mut resp = resp.clone();
+            resp.oidc_enabled = s.oidc.is_ready();
+            return Json(resp);
+        }
+    }
+    let fresh = aggregate_status(&s).await;
+    *guard = Some((std::time::Instant::now(), fresh.clone()));
+    Json(fresh)
 }
 
 /// Resolve the operator "registered tunnels" count. The live tunnel registry
@@ -9252,6 +9310,58 @@ mod tests {
         assert_eq!(s.pipelines_published, 1);
         assert_eq!(s.agents_directory, 1);
         assert!(!s.oidc_enabled, "328: unconfigured/unavailable OIDC must read false on /status");
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_caches_its_response_within_the_ttl_346() {
+        // #346: the real point of the fix -- prove the cache actually short-
+        // circuits re-aggregation, not just "the response looks right once".
+        // Seed one agent, hit /status (agents=1), THEN seed a SECOND agent via
+        // the real enrollment API, hit /status again immediately -- a real
+        // re-aggregation would now report agents=2; a cached response still
+        // reports 1, proving the second request never touched the store.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let registry = Arc::new(SqliteRegistry::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let agent_directory = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+
+        let tenant = TenantId("t".into());
+        let jt1 = enrollment.issue_join_token(&tenant).unwrap();
+        enrollment.redeem(&jt1, &AgentId("a1".into()), [1u8; 32]).unwrap();
+
+        let app = status_router(
+            enrollment.clone(),
+            registry,
+            ledger,
+            agent_directory,
+            pipeline_registry,
+            None,
+            OidcVerifierHandle::empty(),
+        );
+
+        let get_agents = |app: Router| async {
+            let resp = app.oneshot(Request::get("/status").body(Body::empty()).unwrap()).await.unwrap();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<StatusResp>(&body).unwrap().agents
+        };
+
+        assert_eq!(get_agents(app.clone()).await, 1, "first request reports the real, freshly-aggregated count");
+
+        // A second agent enrolls -- a real re-aggregation would now see 2.
+        let jt2 = enrollment.issue_join_token(&tenant).unwrap();
+        enrollment.redeem(&jt2, &AgentId("a2".into()), [2u8; 32]).unwrap();
+
+        assert_eq!(
+            get_agents(app).await,
+            1,
+            "a request within STATUS_CACHE_TTL must still serve the cached count, not re-aggregate -- \
+             proves the cache actually short-circuited the store call"
+        );
     }
 
     #[test]
