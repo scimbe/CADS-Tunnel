@@ -56,6 +56,22 @@ fn is_insecure_cp_url(cp_url: &str) -> bool {
 /// never hang the edge's boot sequence or its periodic heartbeat loop.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// #358: a single, shared `reqwest::Client` for every call in this module,
+/// instead of `rehydrate`/`fetch_revoked_tokens`/`heartbeat`/`lookup_owner_by_host`
+/// each building (and TLS-handshaking) a fresh one per invocation. Deliberately
+/// the opposite tradeoff from [`crate::channel_authorize::ChannelAuthorizer`]'s
+/// own `pool_max_idle_per_host(0)`: that call is low-frequency and
+/// latency-sensitive per-call (one real user-facing channel join), so a stale
+/// pooled connection surviving a CP restart risks a single request stuck until
+/// an OS-level TCP timeout. `heartbeat` here runs every 10-30s and is already
+/// fail-soft/retried by design — a stale pooled connection on one tick just
+/// means that tick's request fails fast (hyper's pool evicts a dead connection
+/// on a failed write) and the next tick, seconds later, succeeds fresh. At that
+/// call frequency, reusing keep-alive/TLS-session state is the real win the
+/// issue asks for, not a risk.
+static SHARED_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build().unwrap_or_else(|_| reqwest::Client::new()));
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -102,12 +118,8 @@ pub struct RehydratedPair {
 /// this boot starts with nothing to replay, the same as before this feature
 /// existed. Malformed individual token hex strings are skipped, not fatal.
 pub async fn rehydrate(cp_url: &str, admin_token: &[u8; 32], edge_id: &str) -> Vec<RehydratedPair> {
-    let client = match reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
     let url = format!("{}/internal/edges/rehydrate/{}", cp_url.trim_end_matches('/'), edge_id);
-    let resp = match client.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
+    let resp = match SHARED_CLIENT.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
     };
@@ -137,12 +149,8 @@ struct RevokedTokensResp {
 /// that existed before this feature (not a regression). Malformed individual
 /// token hex strings are skipped, not fatal.
 pub async fn fetch_revoked_tokens(cp_url: &str, admin_token: &[u8; 32]) -> Vec<[u8; 32]> {
-    let client = match reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
     let url = format!("{}/internal/revoked-tokens", cp_url.trim_end_matches('/'));
-    let resp = match client.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
+    let resp = match SHARED_CLIENT.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
     };
@@ -157,12 +165,8 @@ pub async fn fetch_revoked_tokens(cp_url: &str, admin_token: &[u8; 32]) -> Vec<[
 /// mesh registry. Fail-soft: a failure is silent (no panic, no log spam on a
 /// tight retry loop) — the next heartbeat tick tries again.
 pub async fn heartbeat(cp_url: &str, admin_token: &[u8; 32], id: &str, peer_addr: &str) {
-    let client = match reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
     let url = format!("{}/internal/edges/heartbeat", cp_url.trim_end_matches('/'));
-    let _ = client
+    let _ = SHARED_CLIENT
         .post(&url)
         .header("x-ct-admin-token", hex(admin_token))
         .json(&HeartbeatReq { id, peer_addr })
@@ -185,9 +189,8 @@ struct OwnerResp {
 /// registry hiccup never turns into a hard failure beyond what already existed
 /// before this feature.
 pub async fn lookup_owner_by_host(cp_url: &str, admin_token: &[u8; 32], hostname: &str) -> Option<String> {
-    let client = reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build().ok()?;
     let url = format!("{}/internal/edges/lookup", cp_url.trim_end_matches('/'));
-    let resp = client
+    let resp = SHARED_CLIENT
         .get(&url)
         .query(&[("host", hostname)])
         .header("x-ct-admin-token", hex(admin_token))
