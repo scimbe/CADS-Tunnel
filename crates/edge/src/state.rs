@@ -130,6 +130,16 @@ pub struct EdgeState<H> {
     /// Hostnames are stored lowercased. The payload stays blind (TLS ciphertext
     /// is passed through); only the SNI hostname is visible to the Edge.
     hosts: Mutex<HashMap<String, RoutingToken>>,
+    /// #360: reverse index of [`hosts`](Self::hosts) -- routing token ->
+    /// every hostname currently bound to it. Kept in lockstep at `hosts`'s
+    /// own two real mutation sites, [`register_host`](Self::register_host)
+    /// (insert) and [`clear_hosts_for`](Self::clear_hosts_for) (bulk
+    /// removal) -- confirmed via a full `grep` these are the only two.
+    /// `clear_hosts_for` used to `retain()`-scan the *entire* `hosts` map on
+    /// every last-agent teardown to find the handful belonging to one token;
+    /// this turns that into an O(hosts for this token) removal instead of
+    /// O(all hosts on the Edge).
+    hosts_by_token: Mutex<HashMap<RoutingToken, HashSet<String>>>,
     /// Revoked routing tokens (#27 RB3): a token here is torn down and refuses
     /// re-registration, so a customer's "revoke" actually stops the tunnel even
     /// though the agent keeps reconnecting.
@@ -238,6 +248,7 @@ impl<H: Clone> EdgeState<H> {
             tcp_agents: Mutex::new(HashMap::new()),
             tcp_agent_parked: Notify::new(),
             hosts: Mutex::new(HashMap::new()),
+            hosts_by_token: Mutex::new(HashMap::new()),
             revoked: Mutex::new(HashSet::new()),
             admin_token: Mutex::new(None),
             host_auth: Mutex::new(None),
@@ -272,6 +283,12 @@ impl<H: Clone> EdgeState<H> {
         match hosts.get(&key) {
             Some(existing) if *existing != token => false,
             _ => {
+                // #360: keep the reverse index in lockstep. A HashSet insert
+                // is naturally idempotent, so the "same token reconnects,
+                // rebinding the same hostname" case (this same match arm)
+                // never double-counts -- unlike a plain counter, no separate
+                // "was it already there" check is needed here.
+                self.hosts_by_token.lock_safe().entry(token.clone()).or_default().insert(key.clone());
                 hosts.insert(key, token);
                 true
             }
@@ -282,8 +299,20 @@ impl<H: Clone> EdgeState<H> {
     /// or it is revoked, so no stale host->token route lingers (#23 BP4a).
     /// Callers already hold `registration_lock` (see [`remove_registration`]/
     /// [`remove`]) -- this does not re-acquire it.
+    ///
+    /// #360: used to `retain()`-scan the *entire* `hosts` map to find the
+    /// handful bound to this one token -- real cost on an Edge with many
+    /// bound hostnames, on every last-agent teardown. The reverse index
+    /// gives the exact set to remove directly, so this is now
+    /// O(hosts for this token), not O(every host on the Edge).
     fn clear_hosts_for(&self, token: &RoutingToken) {
-        self.hosts.lock_safe().retain(|_, v| v != token);
+        let Some(owned) = self.hosts_by_token.lock_safe().remove(token) else {
+            return;
+        };
+        let mut hosts = self.hosts.lock_safe();
+        for host in owned {
+            hosts.remove(&host);
+        }
     }
 
     /// Every currently-authorized (hostname, token) pair, or `None` if
@@ -1000,15 +1029,25 @@ mod tests {
         assert!(state.register_host("app.example", t1.clone()), "same-token rebind ok");
         assert_eq!(state.route_host("app.example"), Some(t1.clone()));
 
+        // #360: bind a SECOND, different hostname to the same token. This is
+        // the case the hosts_by_token reverse index has to get right -- one
+        // token owning multiple hostnames, all of which must be found and
+        // cleared on teardown, not just the first one ever bound.
+        assert!(state.register_host("app-2.example", t1.clone()));
+        assert_eq!(state.route_host("app-2.example"), Some(t1.clone()));
+
         // A conflicting bind to a DIFFERENT token is refused; route untouched.
         assert!(!state.register_host("app.example", t2.clone()), "takeover refused");
         assert_eq!(state.route_host("app.example"), Some(t1.clone()), "original route intact");
 
-        // When the tunnel's last agent drops, the stale host route is cleared.
+        // When the tunnel's last agent drops, BOTH stale host routes are
+        // cleared -- proving the reverse index tracked the full set owned by
+        // this token, not just the most recently bound one.
         state.remove_registration(&t1, id);
         assert_eq!(state.route_host("app.example"), None, "host route cleared on drop");
+        assert_eq!(state.route_host("app-2.example"), None, "second host route also cleared on drop");
 
-        // ...so the hostname is now free for a different tunnel to claim.
+        // ...so the hostnames are now free for a different tunnel to claim.
         assert!(state.register_host("app.example", t2.clone()));
         assert_eq!(state.route_host("app.example"), Some(t2));
     }
