@@ -61,7 +61,12 @@ fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
 }
 
 /// Find the first extension of type `want` in `exts` and map its data with `f`.
-fn find_extension<T>(exts: &[u8], want: u16, f: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
+// #339: `'a` is explicit (not an elided/higher-ranked lifetime) and shared between
+// `exts` and the closure's own parameter, so `T` is allowed to borrow from it --
+// e.g. `T = &'a str`, which `sni_from_extensions` below needs. A `for<'r> Fn(&'r
+// [u8]) -> Option<T>` bound (what eliding the lifetime here produces) can't
+// express that, since `T` is fixed before any particular `'r` is chosen.
+fn find_extension<'a, T>(exts: &'a [u8], want: u16, f: impl FnOnce(&'a [u8]) -> Option<T>) -> Option<T> {
     let mut q = 0usize;
     while q + 4 <= exts.len() {
         let etype = u16::from_be_bytes([exts[q], exts[q + 1]]);
@@ -75,12 +80,13 @@ fn find_extension<T>(exts: &[u8], want: u16, f: impl Fn(&[u8]) -> Option<T>) -> 
     None
 }
 
-/// Parse the SNI `host_name` from a buffered TLS ClientHello record (the raw
-/// bytes starting at the TLS record header). Returns the lowercased hostname, or
-/// `None` if `buf` is not a ClientHello record or carries no SNI. Fully
-/// bounds-checked — never panics on malformed input.
-pub fn peek_sni(buf: &[u8]) -> Option<String> {
-    let exts = client_hello_extensions(buf)?;
+/// Zero-allocation core of [`peek_sni`]: the SNI hostname borrowed directly from
+/// `exts` (already-extracted extensions, see [`client_hello_extensions`]), in its
+/// **original case** — the caller lowercases only if/when it actually needs to
+/// (#339: `classify_front_door` compares case-insensitively and only allocates a
+/// lowercased copy for the one hostname it ends up returning, never for a
+/// rejected candidate).
+fn sni_from_extensions(exts: &[u8]) -> Option<&str> {
     // server_name (0x0000): list len(2) + first entry type(1)=0 host_name,
     // name_len(2), name.
     find_extension(exts, 0x0000, |edata| {
@@ -94,12 +100,57 @@ pub fn peek_sni(buf: &[u8]) -> Option<String> {
         }
         let name_len = u16::from_be_bytes([list[1], list[2]]) as usize;
         let name = list.get(3..3 + name_len)?;
-        std::str::from_utf8(name).ok().map(|s| s.to_ascii_lowercase())
+        std::str::from_utf8(name).ok()
     })
+}
+
+/// Parse the SNI `host_name` from a buffered TLS ClientHello record (the raw
+/// bytes starting at the TLS record header). Returns the lowercased hostname, or
+/// `None` if `buf` is not a ClientHello record or carries no SNI. Fully
+/// bounds-checked — never panics on malformed input. Real callers needing only a
+/// yes/no ALPN check or the SNI to compare (not own) should prefer
+/// [`classify_front_door`], which parses the extensions block once and never
+/// allocates for a candidate that doesn't end up mattering.
+pub fn peek_sni(buf: &[u8]) -> Option<String> {
+    let exts = client_hello_extensions(buf)?;
+    sni_from_extensions(exts).map(|s| s.to_ascii_lowercase())
+}
+
+/// Zero-allocation core of [`peek_alpn`]/[`classify_front_door`]'s ALPN checks:
+/// does the already-extracted extensions block `exts` advertise `want`? Scans the
+/// raw protocol-name entries and compares bytes directly — never materializes a
+/// `String` for any entry, matching or not (#339: `peek_alpn` below still builds
+/// the full `Vec<String>` for callers that genuinely need to enumerate every
+/// advertised protocol; `classify_front_door` only ever needs membership checks
+/// against a handful of known constants, so it uses this instead).
+fn alpn_extension_has(exts: &[u8], want: &str) -> bool {
+    let want = want.as_bytes();
+    find_extension(exts, 0x0010, |edata| {
+        if edata.len() < 2 {
+            return None;
+        }
+        let list_len = u16::from_be_bytes([edata[0], edata[1]]) as usize;
+        let list = edata.get(2..2 + list_len)?;
+        let mut i = 0usize;
+        while i < list.len() {
+            let l = *list.get(i)? as usize;
+            let name = list.get(i + 1..i + 1 + l)?;
+            if name == want {
+                return Some(true);
+            }
+            i += 1 + l;
+        }
+        Some(false)
+    })
+    .unwrap_or(false)
 }
 
 /// Parse the ALPN protocol list from a buffered TLS ClientHello (#31 FD1).
 /// Returns the advertised protocols in order, or an empty vec if absent/malformed.
+/// For a simple "is protocol X present" check, prefer [`classify_front_door`] (or
+/// `alpn_extension_has` internally) — this allocates a `String` per advertised
+/// protocol, which is only worth paying for when the caller genuinely needs the
+/// full list (e.g. diagnostics), not just membership.
 pub fn peek_alpn(buf: &[u8]) -> Vec<String> {
     let Some(exts) = client_hello_extensions(buf) else {
         return Vec::new();
@@ -162,37 +213,52 @@ pub enum FrontDoorRoute {
 /// other SNI is a Browser-Plane passthrough candidate; a web ALPN with no SNI
 /// (e.g. `curl https://<ip>/`) lands on `default_host` (the Portal); anything else
 /// is refused. `terminate_hosts` and `default_host` are compared case-insensitively.
-pub fn classify_front_door(
-    alpn: &[String],
-    sni: Option<&str>,
-    terminate_hosts: &[&str],
-    default_host: Option<&str>,
-) -> FrontDoorRoute {
-    if alpn.iter().any(|p| p == CT_EDGE_ALPN) {
+///
+/// #339: takes the raw buffered ClientHello directly (rather than a pre-parsed
+/// `alpn: Vec<String>` + `sni: Option<&str>`, the shape before this fix) and
+/// parses its extensions block exactly once, reused for every ALPN/SNI check
+/// below — this is the single real classification path every `:443` front-door
+/// connection goes through, so per-connection allocation there was measurable
+/// under a connection storm: previously a `Vec<String>` (one heap string per
+/// advertised ALPN protocol) plus a `String` for the SNI, on EVERY connection,
+/// almost always just to run a handful of equality checks against constants and
+/// then get thrown away. Now: zero allocations for `EdgeRelay`/`ChannelBroker`/
+/// `RelayGate`/`Reject` (the majority of real front-door traffic is the tunnel
+/// data-plane ALPN, which needs no SNI or hostname at all), and exactly one
+/// `String` allocation for `Proxy`/`BrowserTunnel` — the final matched hostname,
+/// never a rejected candidate.
+///
+/// `is_terminate_host` is a case-insensitive membership check (the real caller
+/// passes a closure over its own host registry, e.g. `proxies.contains_key`) —
+/// deliberately not a `&[&str]` slice, since that shape forced a fresh `Vec`
+/// collected from the registry's keys on every single connection (the third
+/// allocation this issue named) just to hand this function something to
+/// iterate. A callback needs no per-connection collection at all.
+pub fn classify_front_door(hello: &[u8], is_terminate_host: impl Fn(&str) -> bool, default_host: Option<&str>) -> FrontDoorRoute {
+    let exts = client_hello_extensions(hello);
+    let alpn_has = |want: &str| exts.map(|e| alpn_extension_has(e, want)).unwrap_or(false);
+    if alpn_has(CT_EDGE_ALPN) {
         return FrontDoorRoute::EdgeRelay;
     }
     // #106: a channel member on a `:4435`-blocked network falls back to `:443` with
     // the channel ALPN. Like the `ct-edge` data-plane leg, it carries no SNI, so the
     // ALPN discriminator wins ahead of any SNI-based routing.
-    if alpn.iter().any(|p| p == CT_EDGE_CHANNEL_ALPN) {
+    if alpn_has(CT_EDGE_CHANNEL_ALPN) {
         return FrontDoorRoute::ChannelBroker;
     }
     // Same ALPN-before-SNI precedence as the channel leg above -- a relay client
     // carries no SNI either.
-    if alpn.iter().any(|p| p == CT_EDGE_RELAY_ALPN) {
+    if alpn_has(CT_EDGE_RELAY_ALPN) {
         return FrontDoorRoute::RelayGate;
     }
-    if let Some(sni) = sni.map(|s| s.to_ascii_lowercase()) {
-        if let Some(h) = terminate_hosts
-            .iter()
-            .find(|h| h.to_ascii_lowercase() == sni)
-        {
-            return FrontDoorRoute::Proxy(h.to_ascii_lowercase());
+    if let Some(sni) = exts.and_then(sni_from_extensions) {
+        if is_terminate_host(sni) {
+            return FrontDoorRoute::Proxy(sni.to_ascii_lowercase());
         }
-        return FrontDoorRoute::BrowserTunnel(sni);
+        return FrontDoorRoute::BrowserTunnel(sni.to_ascii_lowercase());
     }
     // No SNI: a plain web client (curl https://<ip>/) defaults to the Portal.
-    if alpn.iter().any(|p| p == "http/1.1" || p == "h2") {
+    if alpn_has("http/1.1") || alpn_has("h2") {
         if let Some(d) = default_host {
             return FrontDoorRoute::Proxy(d.to_ascii_lowercase());
         }
@@ -341,62 +407,67 @@ mod tests {
         assert!(peek_alpn(b"").is_empty());
     }
 
+    /// #339: `classify_front_door` now takes the raw ClientHello directly, so
+    /// these tests build one via the same `synth_client_hello` fixture
+    /// `peek_sni`/`peek_alpn`'s own tests use, instead of pre-parsed
+    /// `Vec<String>`/`Option<&str>` values. `terminate_host` mirrors the real
+    /// caller's closure (case-insensitive membership over a small fixed set).
+    fn terminate_host(h: &str) -> bool {
+        ["portal.z", "auth.z"].iter().any(|t| t.eq_ignore_ascii_case(h))
+    }
+
     #[test]
     fn classify_front_door_routes_by_alpn_then_sni() {
         // #31 FD1 / #48: the demux precedence for the unified :443 front door.
-        let s = |v: &str| v.to_string();
-        let hosts = ["portal.z", "auth.z"]; // two terminate targets (Portal + IdP)
         let default = Some("portal.z");
         // Tunnel data-plane ALPN wins, even with an SNI present.
         assert_eq!(
-            classify_front_door(&[s("ct-edge")], Some("whatever.z"), &hosts, default),
+            classify_front_door(&client_hello(Some("whatever.z"), &["ct-edge"]), terminate_host, default),
             FrontDoorRoute::EdgeRelay
         );
         // A configured terminate host -> Proxy(host) (case-insensitive) — Portal…
         assert_eq!(
-            classify_front_door(&[s("h2")], Some("Portal.Z"), &hosts, default),
+            classify_front_door(&client_hello(Some("Portal.Z"), &["h2"]), terminate_host, default),
             FrontDoorRoute::Proxy("portal.z".into())
         );
         // …and the #48 Auth IdP host, the second terminate target.
         assert_eq!(
-            classify_front_door(&[s("h2")], Some("Auth.Z"), &hosts, default),
+            classify_front_door(&client_hello(Some("Auth.Z"), &["h2"]), terminate_host, default),
             FrontDoorRoute::Proxy("auth.z".into())
         );
         // Any other SNI -> Browser-Plane passthrough candidate.
         assert_eq!(
-            classify_front_door(&[], Some("app1.z"), &hosts, default),
+            classify_front_door(&client_hello(Some("app1.z"), &[]), terminate_host, default),
             FrontDoorRoute::BrowserTunnel("app1.z".into())
         );
         // Web ALPN, no SNI (curl to the bare IP) -> the default (Portal).
         assert_eq!(
-            classify_front_door(&[s("http/1.1")], None, &hosts, default),
+            classify_front_door(&client_hello(None, &["http/1.1"]), terminate_host, default),
             FrontDoorRoute::Proxy("portal.z".into())
         );
         // Nothing usable -> reject.
-        assert_eq!(classify_front_door(&[], None, &hosts, default), FrontDoorRoute::Reject);
+        assert_eq!(classify_front_door(&client_hello(None, &[]), terminate_host, default), FrontDoorRoute::Reject);
     }
 
     #[test]
     fn classify_front_door_routes_the_channel_alpn_to_the_broker() {
         // #106: a channel member blocked on :4435 falls back to :443 with the
         // ct-edge-channel ALPN; the front door routes it to the channel broker.
-        let s = |v: &str| v.to_string();
-        let hosts = ["portal.z", "auth.z"];
         let default = Some("portal.z");
         // The channel ALPN -> ChannelBroker, and (like the ct-edge leg) it wins ahead
         // of any SNI-based routing.
         assert_eq!(
-            classify_front_door(&[s(CT_EDGE_CHANNEL_ALPN)], None, &hosts, default),
+            classify_front_door(&client_hello(None, &[CT_EDGE_CHANNEL_ALPN]), terminate_host, default),
             FrontDoorRoute::ChannelBroker
         );
         assert_eq!(
-            classify_front_door(&[s("ct-edge-channel")], Some("portal.z"), &hosts, default),
+            classify_front_door(&client_hello(Some("portal.z"), &["ct-edge-channel"]), terminate_host, default),
             FrontDoorRoute::ChannelBroker,
             "channel ALPN wins over a terminate-host SNI"
         );
         // The classic tunnel ALPN is unaffected — still routes to the edge relay.
         assert_eq!(
-            classify_front_door(&[s(CT_EDGE_ALPN)], None, &hosts, default),
+            classify_front_door(&client_hello(None, &[CT_EDGE_ALPN]), terminate_host, default),
             FrontDoorRoute::EdgeRelay
         );
         // The two data-plane ALPN ids are distinct.
@@ -407,15 +478,13 @@ mod tests {
     fn classify_front_door_routes_the_relay_alpn_to_the_relay_gate() {
         // A NAT-to-NAT hole-punch relay client -> RelayGate, winning ahead of SNI just
         // like the other two data-plane ALPN ids.
-        let s = |v: &str| v.to_string();
-        let hosts = ["portal.z", "auth.z"];
         let default = Some("portal.z");
         assert_eq!(
-            classify_front_door(&[s(CT_EDGE_RELAY_ALPN)], None, &hosts, default),
+            classify_front_door(&client_hello(None, &[CT_EDGE_RELAY_ALPN]), terminate_host, default),
             FrontDoorRoute::RelayGate
         );
         assert_eq!(
-            classify_front_door(&[s(CT_EDGE_RELAY_ALPN)], Some("portal.z"), &hosts, default),
+            classify_front_door(&client_hello(Some("portal.z"), &[CT_EDGE_RELAY_ALPN]), terminate_host, default),
             FrontDoorRoute::RelayGate,
             "relay ALPN wins over a terminate-host SNI"
         );

@@ -782,10 +782,13 @@ pub async fn serve_front_door(
     // (the TLS-TCP analog of QUIC's `conn.remote_address()`).
     let observed = inbound.peer_addr()?;
     let hello = read_client_hello_bytes_bounded(&mut inbound).await?;
-    let alpn = crate::sni::peek_alpn(&hello);
-    let sni = crate::sni::peek_sni(&hello);
-    let hosts: Vec<&str> = proxies.keys().map(|s| s.as_str()).collect();
-    match crate::sni::classify_front_door(&alpn, sni.as_deref(), &hosts, default_host) {
+    // #339: no per-connection `Vec<String>`/`Vec<&str>` collection here anymore --
+    // `classify_front_door` parses `hello` directly and this closure does a
+    // case-insensitive scan of `proxies`' own (already-lowercased) keys, which
+    // costs nothing to build since it captures `proxies` by reference. `proxies`
+    // is a small, fixed set (Portal + optional Auth IdP, built once at process
+    // start, not one entry per live tunnel), so the O(n) scan here is negligible.
+    match crate::sni::classify_front_door(&hello, |h| proxies.keys().any(|k| k.eq_ignore_ascii_case(h)), default_host) {
         crate::sni::FrontDoorRoute::EdgeRelay => {
             let joined = Prepend {
                 pre: hello,
