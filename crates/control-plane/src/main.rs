@@ -220,6 +220,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// #350: without this, a SIGTERM (a k8s rollout/restart is the real-world trigger) makes
+/// `axum::serve` abort immediately -- dropping every in-flight request, including ones
+/// that already kicked off a side effect elsewhere (an OIDC token exchange already sent
+/// to the IdP, an edge revoke already in flight after the DB row is gone, a payment
+/// webhook that already credited the ledger but hasn't finished responding). Waiting on
+/// this future before `axum::serve` returns makes it drain in-flight connections instead
+/// of cutting them off; still bounded by axum's own default per-connection idle limits and
+/// server operators' own pod termination grace period, not an unbounded wait.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            std::future::pending::<()>().await;
+            unreachable!();
+        };
+        sig.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("ct-control-plane: shutdown signal received, draining in-flight requests");
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn graceful_shutdown_lets_an_in_flight_request_finish_instead_of_dropping_it_350() {
+        // #350: the real property this fix buys -- a shutdown signal that arrives WHILE a
+        // request is in flight (an OIDC callback mid-token-exchange, an edge-revoke mid-
+        // delete_tunnel) must not cut that request off; the server must finish serving it
+        // before it actually stops. This proves the exact axum `.with_graceful_shutdown`
+        // wiring `shutdown_signal()` feeds into. It does NOT test OS-signal delivery itself
+        // (sending a real SIGTERM/SIGINT to the test process would risk killing the test
+        // binary, not something to do in a hermetic unit test) -- the signal SOURCE is
+        // swapped for a manually-triggerable oneshot here; everything downstream of it is
+        // the real axum shutdown path `main()` actually runs.
+        use axum::routing::get;
+        use axum::Router;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        // Start the slow request, then -- while it's still sleeping -- fire the shutdown
+        // signal. Without with_graceful_shutdown wired up there is no such hook to test at
+        // all; this proves the wired-up hook actually lets the in-flight request finish
+        // rather than being cut off the instant shutdown is requested.
+        let url = format!("http://{addr}/slow");
+        let req = tokio::spawn(async move { reqwest::get(&url).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx.send(()).unwrap();
+
+        let resp = req.await.unwrap().unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "an in-flight request must complete, not be dropped, when shutdown fires mid-request"
+        );
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        server.await.unwrap();
+    }
 }
