@@ -923,6 +923,25 @@ impl SqlitePipelineRegistry {
                 return Ok(false);
             }
         }
+        // #233: operator_pubkey_hex is Option<T> purely for backward compat with specs
+        // published before the field existed -- a FRESH publish/re-publish has no such
+        // excuse, since the designer always has their own pubkey to hand, and omitting
+        // it silently breaks the "no prior relationship needed" registry-discovery
+        // promise (role_channel_id returns None with no other signal). Making it a hard
+        // requirement is a real API-contract change this crate shouldn't decide
+        // unilaterally (a currently-passing publisher could start failing); this is the
+        // safe middle ground -- purely a visibility signal, no behavior change for any
+        // existing caller -- so an operator watching logs actually notices the gap
+        // instead of it staying silent indefinitely, which is exactly how both real
+        // demo pipelines ended up in this state for this long.
+        if spec.operator_pubkey_hex.is_none() {
+            eprintln!(
+                "ct-cp: WARNING -- pipeline '{}' published with no operator_pubkey_hex (#233): \
+                 registry-based channel discovery (GET /registry/pipelines/{}) won't work for \
+                 this pipeline's roles until it republishes with one set",
+                spec.id, spec.id
+            );
+        }
         conn.execute(
             "INSERT OR REPLACE INTO pipelines (id, owner, spec_json, published_at) VALUES (?1, ?2, ?3, ?4)",
             params![spec.id, owner, json, now as i64],
