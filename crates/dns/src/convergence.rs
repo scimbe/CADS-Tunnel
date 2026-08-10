@@ -163,13 +163,13 @@ pub async fn wait_for_convergence(
 /// `None` when it's confirmed converged.
 async fn probe_node(
     host: String,
-    ips: Vec<std::net::IpAddr>,
+    ips: Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>,
     zone: String,
     name: String,
     expected: String,
 ) -> (bool, Option<String>) {
-    for ip in &ips {
-        match txt_at(*ip, &name).await {
+    for (_ip, resolver) in &ips {
+        match txt_at(resolver, &name).await {
             Ok(values) => {
                 return if values.iter().any(|v| v == &expected) {
                     (true, None)
@@ -187,7 +187,7 @@ async fn probe_node(
             // serve: an SOA answer proves the node is live and the TXT miss is
             // real lag; no SOA answer means we could not reach this node at all.
             Err(_) => {
-                if soa_reachable(*ip, &zone).await {
+                if soa_reachable(resolver, &zone).await {
                     return (true, Some(host));
                 }
             }
@@ -329,8 +329,12 @@ impl ConvergenceCoalescer {
 
 /// Resolve each node hostname to every address it has (typically one IPv4 and
 /// one IPv6), skipping any node that no longer resolves at all so a stale
-/// entry cannot block issuance.
-async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<std::net::IpAddr>)> {
+/// entry cannot block issuance. #355: builds each address's [`Resolver`] here,
+/// once, rather than leaving `txt_at`/`soa_reachable` to build a fresh one on
+/// every single probe call -- a long convergence wait (12 nodes, up to 60 poll
+/// rounds over 300s) previously meant up to ~720 identical Resolver
+/// constructions for the same, unchanging set of (node, ip) pairs.
+async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>)> {
     let Ok(system) = Resolver::builder_tokio() else {
         return Vec::new();
     };
@@ -340,7 +344,10 @@ async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<std::net::IpAddr>)> {
     let mut out = Vec::new();
     for host in nodes {
         if let Ok(lookup) = system.lookup_ip(format!("{host}.")).await {
-            let ips: Vec<_> = lookup.iter().collect();
+            let ips: Vec<_> = lookup
+                .iter()
+                .filter_map(|ip| build_resolver(ip).map(|r| (ip, std::sync::Arc::new(r))))
+                .collect();
             if !ips.is_empty() {
                 out.push((host.to_string(), ips));
             }
@@ -349,18 +356,35 @@ async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<std::net::IpAddr>)> {
     out
 }
 
-/// Query one specific node directly for `name`'s TXT values.
-async fn txt_at(server: std::net::IpAddr, name: &str) -> Result<Vec<String>, String> {
+/// #355 (test-only instrumentation): hickory's `Resolver` exposes no public
+/// identity/equality check, so this is the only way to directly measure "was a
+/// fresh resolver actually built here" rather than just asserting the code
+/// looks like it builds one only once.
+#[cfg(test)]
+static RESOLVER_BUILD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Build the resolver used to query one specific node directly -- shared by
+/// [`txt_at`] and [`soa_reachable`], since both want the exact same
+/// [`NameServerConfig`]/[`ResolverOpts`] for a given address; only the query
+/// type (TXT vs SOA) differs, and that's chosen at lookup time, not at
+/// resolver-construction time.
+fn build_resolver(server: std::net::IpAddr) -> Option<Resolver<TokioRuntimeProvider>> {
+    #[cfg(test)]
+    RESOLVER_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let name_server = NameServerConfig::udp_and_tcp(server);
     let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
     let mut opts = ResolverOpts::default();
     opts.timeout = QUERY_TIMEOUT;
     opts.attempts = 1;
     opts.cache_size = 0;
-    let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
         .build()
-        .map_err(|e| e.to_string())?;
+        .ok()
+}
+
+/// Query one specific node directly for `name`'s TXT values.
+async fn txt_at(resolver: &Resolver<TokioRuntimeProvider>, name: &str) -> Result<Vec<String>, String> {
     let lookup = resolver.txt_lookup(format!("{name}.")).await.map_err(|e| e.to_string())?;
     Ok(lookup
         .answers()
@@ -377,19 +401,7 @@ async fn txt_at(server: std::net::IpAddr, name: &str) -> Result<Vec<String>, Str
 /// alone cannot distinguish "this node is live and simply doesn't have the
 /// record yet" from "this node never answered at all", since both render
 /// with the same "no records found" text.
-async fn soa_reachable(server: std::net::IpAddr, zone: &str) -> bool {
-    let name_server = NameServerConfig::udp_and_tcp(server);
-    let config = ResolverConfig::from_parts(None, Vec::new(), vec![name_server]);
-    let mut opts = ResolverOpts::default();
-    opts.timeout = QUERY_TIMEOUT;
-    opts.attempts = 1;
-    opts.cache_size = 0;
-    let Ok(resolver) = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-        .with_options(opts)
-        .build()
-    else {
-        return false;
-    };
+async fn soa_reachable(resolver: &Resolver<TokioRuntimeProvider>, zone: &str) -> bool {
     resolver.soa_lookup(format!("{zone}.")).await.is_ok()
 }
 
@@ -457,6 +469,39 @@ mod tests {
         assert_eq!(count, NODES);
         assert_eq!(sequential, DELAY * NODES as u32, "sequential really did sum the delays");
         assert_eq!(concurrent, DELAY, "concurrent (JoinSet) ran every node's delay in parallel, not summed");
+    }
+
+    #[tokio::test]
+    async fn resolve_nodes_builds_one_resolver_per_address_and_polling_never_rebuilds_one_355() {
+        // #355: two real claims to prove, not just assert -- (1) resolve_nodes
+        // builds exactly one Resolver per resolved address, not more; (2) once
+        // built, probing (what every poll round does) never triggers another
+        // build -- txt_at/soa_reachable just use the resolver handed to them.
+        // "localhost" always resolves via loopback, so resolve_nodes itself
+        // succeeds without needing a real DNS server anywhere on the network;
+        // no other test in this file calls resolve_nodes with a hostname that
+        // actually resolves, so this counter is exclusively this test's.
+        use std::sync::atomic::Ordering;
+
+        RESOLVER_BUILD_COUNT.store(0, Ordering::SeqCst);
+        let addrs = resolve_nodes(&["localhost"]).await;
+        let total_addrs: usize = addrs.iter().map(|(_, ips)| ips.len()).sum();
+        assert!(total_addrs > 0, "localhost must resolve to at least one address for this test to prove anything");
+        let after_resolve = RESOLVER_BUILD_COUNT.load(Ordering::SeqCst);
+        assert_eq!(after_resolve, total_addrs, "exactly one Resolver built per resolved address");
+
+        // Simulate two poll rounds against the SAME addrs -- exactly how
+        // wait_for_convergence's loop reuses them (ips.clone() clones the Arc
+        // pointers, never rebuilds the Resolver inside).
+        for (host, ips) in &addrs {
+            probe_node(host.clone(), ips.clone(), "example.invalid".to_string(), "_acme-challenge.example.invalid".to_string(), "v".to_string()).await;
+            probe_node(host.clone(), ips.clone(), "example.invalid".to_string(), "_acme-challenge.example.invalid".to_string(), "v".to_string()).await;
+        }
+        assert_eq!(
+            RESOLVER_BUILD_COUNT.load(Ordering::SeqCst),
+            after_resolve,
+            "probing (what every poll round does) must never build another Resolver"
+        );
     }
 
     #[tokio::test]
