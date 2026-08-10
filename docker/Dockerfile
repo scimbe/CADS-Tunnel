@@ -66,11 +66,31 @@ COPY --from=builder /build/bin/ct-cookbook-bridge /usr/local/bin/ct-cookbook-bri
 # default so every existing testbed compose file keeps working unchanged) --
 # `docker/deploy/compose.selfhost.yml` opts into this explicitly via `target:
 # production`. #305's non-root posture applies equally here.
+#
+# #376: ct-edge/ct-control-plane run with NO signal handler at all (grep-confirmed
+# -- no tokio::signal anywhere in either crate) and, until now, no init process
+# either -- as PID 1, an unhandled SIGTERM is a no-op on Linux, so every real
+# k8s rollout/compose restart/node-drain ran the process undisturbed until the
+# grace period expired and SIGKILL hard-killed it: in-flight tunnels and any
+# unflushed writes ended abruptly, and a generous grace period bought nothing
+# without something to actually forward/act on the signal. `tini` as a real
+# init (PID 1 itself) fixes the *delivery* half: SIGTERM now reaches the real
+# process promptly instead of being silently dropped, and `tini` also reaps
+# zombies correctly (irrelevant today with one process per container, but the
+# textbook reason an init belongs at PID 1 regardless). `STOPSIGNAL SIGTERM`
+# is Docker's own default already -- set explicitly so it's not accidental.
+# The other real half -- an actual `tokio::signal` handler with a bounded,
+# correct graceful-drain path in ct-edge/ct-control-plane's own application
+# logic -- is real, separate, larger work on a live production service's
+# shutdown behavior, deliberately not attempted in this same change (#376
+# tracks it as a distinct, explicitly-scoped follow-up).
 FROM runtime-base AS production
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/*
 USER 65532:65532
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["ct-edge"]
 
 # The default target (must stay LAST in this file -- `docker build`/`docker compose
@@ -81,8 +101,14 @@ CMD ["ct-edge"]
 # unchanged from before #315 so none of them need to change.
 FROM runtime-base AS runtime
 # iproute2 for tc/netem inside the node containers; ca-certificates is harmless.
+# tini (#376, see the `production` target above for the full reasoning) -- every
+# real testbed/netem compose service using this target already overrides
+# `entrypoint:` with `netem-entrypoint.sh`, so this only matters if the image is
+# ever run directly without that override; kept consistent with `production`
+# regardless, matching this Dockerfile's own "shared setup stays one place"
+# convention (see `runtime-base`'s own comment).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates curl \
+    && apt-get install -y --no-install-recommends iproute2 iptables ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/*
 COPY docker/netem-entrypoint.sh /usr/local/bin/netem-entrypoint.sh
 RUN chmod +x /usr/local/bin/netem-entrypoint.sh
@@ -105,4 +131,6 @@ RUN chmod +x /usr/local/bin/netem-entrypoint.sh
 # `cap_add: [NET_ADMIN]` on that specific service -- this default only changes the
 # default, not what's possible to opt back into for testing.
 USER 65532:65532
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["ct-edge"]
