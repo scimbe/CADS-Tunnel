@@ -185,6 +185,18 @@ pub struct EdgeState<H> {
     relays: Counter,
     relay_bytes: Counter,
     failovers: Counter,
+    /// #359: live gauges maintained incrementally at every real mutation of
+    /// `agents` (`register_locked`/`remove_registration`/`remove`, the only
+    /// three call sites that ever insert into or remove from that map -- all
+    /// three already run under `registration_lock`, so a plain `Relaxed`
+    /// store here is fully consistent with no extra synchronization cost).
+    /// [`active_tunnels`](Self::active_tunnels)/[`total_registrations`](Self::total_registrations)
+    /// used to be O(n) scans over the whole map on every read -- real cost on
+    /// a frequently-scraped `/metrics` endpoint, and one that grows with
+    /// tunnel count while blocking the same lock the routing hot path needs.
+    /// Reading a gauge is now O(1) and lock-free.
+    active_tunnels_gauge: AtomicU64,
+    total_registrations_gauge: AtomicU64,
     /// Per-token cumulative relay byte counters -- `(bytes client->agent,
     /// bytes agent->client)` -- monitoring-feature v1 follow-up (operator
     /// decision, 2026-08-01): the "bytes sent/received" half of the original
@@ -237,6 +249,8 @@ impl<H: Clone> EdgeState<H> {
             failovers: Counter::default(),
             tunnel_bytes: Mutex::new(HashMap::new()),
             registration_lock: Mutex::new(()),
+            active_tunnels_gauge: AtomicU64::new(0),
+            total_registrations_gauge: AtomicU64::new(0),
         }
     }
 
@@ -545,11 +559,15 @@ impl<H: Clone> EdgeState<H> {
     /// so this must never call back into `register`).
     fn register_locked(&self, token: RoutingToken, handle: H) -> u64 {
         let id = self.next_reg.fetch_add(1, Ordering::Relaxed);
-        self.agents
-            .lock_safe()
-            .entry(token)
-            .or_default()
-            .push((id, handle));
+        {
+            let mut agents = self.agents.lock_safe();
+            let entry = agents.entry(token).or_default();
+            if entry.is_empty() {
+                self.active_tunnels_gauge.fetch_add(1, Ordering::Relaxed);
+            }
+            entry.push((id, handle));
+        }
+        self.total_registrations_gauge.fetch_add(1, Ordering::Relaxed);
         self.registrations.inc();
         id
     }
@@ -618,14 +636,23 @@ impl<H: Clone> EdgeState<H> {
 
     /// Distinct routing tokens with at least one live Agent — the number of
     /// tunnels the Edge is currently serving (observability gauge, #10).
+    ///
+    /// #359: was an O(n) scan over `agents` on every call (real cost on a
+    /// frequently-scraped `/metrics` endpoint, competing with the routing hot
+    /// path for the same lock). Now a lock-free O(1) read of a gauge
+    /// maintained incrementally by every real mutation of `agents` --
+    /// [`register_locked`](Self::register_locked)/[`remove_registration`]/[`remove`].
     pub fn active_tunnels(&self) -> usize {
-        self.agents.lock_safe().values().filter(|v| !v.is_empty()).count()
+        self.active_tunnels_gauge.load(Ordering::Relaxed) as usize
     }
 
     /// Total live Agent registrations across all tokens — redundant Agents (#8)
     /// counted separately (observability gauge, #10).
+    ///
+    /// #359: same lock-free O(1) gauge read as [`active_tunnels`](Self::active_tunnels),
+    /// same reason.
     pub fn total_registrations(&self) -> usize {
-        self.agents.lock_safe().values().map(Vec::len).sum()
+        self.total_registrations_gauge.load(Ordering::Relaxed) as usize
     }
 
     /// Evict exactly the registration `id` for `token` — an Agent whose
@@ -644,9 +671,18 @@ impl<H: Clone> EdgeState<H> {
         let _guard = self.registration_lock.lock_safe();
         let mut agents = self.agents.lock_safe();
         let Some(v) = agents.get_mut(token) else { return };
+        let before = v.len();
         v.retain(|(rid, _)| *rid != id);
+        let removed = before - v.len();
+        // #359: keep the incremental gauges in lockstep with the real removal
+        // below, not just the map -- `removed` is 0 if `id` wasn't actually
+        // present (a no-op retain), which must not decrement anything.
+        self.total_registrations_gauge.fetch_sub(removed as u64, Ordering::Relaxed);
         if !v.is_empty() {
             return;
+        }
+        if removed > 0 {
+            self.active_tunnels_gauge.fetch_sub(1, Ordering::Relaxed);
         }
         agents.remove(token);
         drop(agents);
@@ -662,7 +698,18 @@ impl<H: Clone> EdgeState<H> {
     /// [`remove_registration`](Self::remove_registration).
     pub fn remove(&self, token: &RoutingToken) {
         let _guard = self.registration_lock.lock_safe();
-        self.agents.lock_safe().remove(token);
+        // #359: unlike remove_registration's single-id retain, this always
+        // drops the token's *entire* entry -- gauges move by however many
+        // registrations it actually held, not by a flat 1, and only if it
+        // was ever inserted (registration_count() > 0 -> a real, non-empty
+        // entry, matching register_locked's own invariant that an entry is
+        // never left empty in the map).
+        if let Some(v) = self.agents.lock_safe().remove(token) {
+            if !v.is_empty() {
+                self.active_tunnels_gauge.fetch_sub(1, Ordering::Relaxed);
+                self.total_registrations_gauge.fetch_sub(v.len() as u64, Ordering::Relaxed);
+            }
+        }
         self.candidates.lock_safe().remove(token);
         self.direct.lock_safe().remove(token);
         self.tcp_agents.lock_safe().remove(token);
@@ -988,10 +1035,17 @@ mod tests {
         let t = token(9);
         state.register_host("app.example", t.clone());
         state.register(t.clone(), 1u32);
+        state.register(t.clone(), 4u32); // a second, redundant registration (#8)
         assert_eq!(state.active_tunnels(), 1);
+        assert_eq!(state.total_registrations(), 2, "both redundant registrations counted");
 
         state.revoke_token(&t);
+        // #359: remove() tears down the whole token's entry in one shot --
+        // both gauges must reflect the real count that was actually there,
+        // not just decrement by one regardless of how many registrations
+        // the token held.
         assert_eq!(state.active_tunnels(), 0, "revoke drops the live registration");
+        assert_eq!(state.total_registrations(), 0, "revoke drops every redundant registration too");
         assert!(state.is_revoked(&t));
         assert_eq!(state.route_host("app.example"), None, "hostname mapping cleared");
 
@@ -1045,22 +1099,33 @@ mod tests {
         let b = state.register(t.clone(), 20); // Agent B (more recent)
         assert_eq!(state.registration_count(&t), 2, "both agents registered");
         assert_eq!(state.route(&t), Some(20), "most-recent agent serves");
+        // #359: one token, two redundant registrations -- active_tunnels counts
+        // the token once, total_registrations counts each real registration.
+        assert_eq!(state.active_tunnels(), 1, "one distinct token, however many redundant agents");
+        assert_eq!(state.total_registrations(), 2);
 
         // Agent B's connection drops → evict just B → fail over to A.
         state.remove_registration(&t, b);
         assert_eq!(state.route(&t), Some(10), "failover to the surviving agent");
         assert_eq!(state.registration_count(&t), 1);
         assert!(state.is_known(&t), "tunnel still up on one agent");
+        assert_eq!(state.active_tunnels(), 1, "the token is still live on the surviving agent");
+        assert_eq!(state.total_registrations(), 1);
 
-        // Evicting an already-gone id is a no-op (idempotent).
+        // Evicting an already-gone id is a no-op (idempotent) -- must not
+        // double-decrement the gauges for a registration that was never real.
         state.remove_registration(&t, b);
         assert_eq!(state.route(&t), Some(10));
+        assert_eq!(state.active_tunnels(), 1, "a no-op eviction must not touch the gauge");
+        assert_eq!(state.total_registrations(), 1, "a no-op eviction must not touch the gauge");
 
         // Last agent drops → tunnel is gone and its metadata is cleaned up.
         state.remove_registration(&t, a);
         assert_eq!(state.route(&t), None, "no agents left");
         assert!(!state.is_known(&t));
         assert_eq!(state.registration_count(&t), 0);
+        assert_eq!(state.active_tunnels(), 0, "the last real registration is gone");
+        assert_eq!(state.total_registrations(), 0);
     }
 
     #[test]
