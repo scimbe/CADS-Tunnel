@@ -16,6 +16,12 @@ pub mod dns01_challenge;
 pub mod edge_mesh;
 pub mod enrollment;
 pub mod gate;
+/// #438: real test scaffolding (M13.1's in-memory, unauthenticated router) that
+/// otherwise read as shipping API -- gated out of every real build. Reachable from
+/// this crate's own tests via `cfg(test)`; a dependent crate's tests enable
+/// `test-support` on its dev-dependency to reach it too (see `ct-client`'s
+/// `rendezvous.rs`).
+#[cfg(any(test, feature = "test-support"))]
 pub mod http;
 pub mod installer;
 pub mod issuance;

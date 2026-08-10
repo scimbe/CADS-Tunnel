@@ -93,7 +93,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // background self-heal task below, instead of permanently disabling `/me/*`
     // for the rest of this process's life. Recurred live twice in one session
     // before this fix (a transient Keycloak/network blip at exactly boot time).
-    let mut retry_issuer: Option<String> = None;
+    // #430: tracked whenever JWKS mode is in play (not just on a failed boot fetch,
+    // unlike the old `retry_issuer` this replaces) -- a realm's signing key can
+    // rotate at any time after a *successful* boot too, so the background task
+    // below must keep running in the healthy case as well, not just self-heal a
+    // bad boot.
+    let mut jwks_issuer: Option<String> = None;
+    let mut jwks_boot_failed = false;
     let oidc = match std::env::var("CT_OIDC_ISSUER") {
         Ok(issuer) if !issuer.is_empty() => match std::env::var("CT_OIDC_PUBKEY_PATH") {
             Ok(path) if !path.is_empty() => {
@@ -107,26 +113,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // warming up, a rotated key not yet propagated, or a momentary network
             // blip at exactly this moment must not permanently disable /me/* for the
             // rest of this process's life. ~15.5s worst case across 6 attempts.
-            _ => match verifier_from_jwks_with_retry(
-                &issuer,
-                fetch_jwks,
-                &[0, 500, 1000, 2000, 4000, 8000],
-                |ms| tokio::time::sleep(std::time::Duration::from_millis(ms)),
-            )
-            .await
-            {
-                Some(v) => {
-                    eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=JWKS)");
-                    Some(v)
+            _ => {
+                jwks_issuer = Some(issuer.clone());
+                match verifier_from_jwks_with_retry(
+                    &issuer,
+                    fetch_jwks,
+                    &[0, 500, 1000, 2000, 4000, 8000],
+                    |ms| tokio::time::sleep(std::time::Duration::from_millis(ms)),
+                )
+                .await
+                {
+                    Some(v) => {
+                        eprintln!("ct-control-plane: OIDC enabled (issuer={issuer}, key=JWKS)");
+                        Some(v)
+                    }
+                    None => {
+                        eprintln!(
+                            "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key after retrying — /me/* disabled; retrying in the background (#328)"
+                        );
+                        jwks_boot_failed = true;
+                        None
+                    }
                 }
-                None => {
-                    eprintln!(
-                        "ct-control-plane: CT_OIDC_ISSUER set but the realm JWKS had no usable RS256 key after retrying — /me/* disabled; retrying in the background (#328)"
-                    );
-                    retry_issuer = Some(issuer);
-                    None
-                }
-            },
+            }
         },
         _ => {
             eprintln!("ct-control-plane: CT_OIDC_ISSUER unset — /me/* endpoints disabled");
@@ -145,35 +154,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let oidc_handle = OidcVerifierHandle::new(oidc.map(|v| apply_access_aud(v, access_aud.as_deref())));
 
-    // #328: self-heal a failed boot-time JWKS fetch instead of leaving /me/*
-    // permanently disabled. Long, fixed-cadence retries (not the boot path's short
-    // backoff) so a genuinely down/misconfigured realm isn't hammered, while a
-    // transient blip that outlasts the ~15.5s boot window still recovers within a
-    // couple of minutes -- no operator noticing and restarting the process needed.
+    // #328/#430: self-heals a failed boot-time JWKS fetch (permanently disabled
+    // /me/* used to need an operator restart to recover) AND periodically re-fetches
+    // once healthy, so a realm signing-key rotation -- a routine Keycloak operation
+    // -- doesn't turn into an outage for the rest of this process's life either. The
+    // old version returned after its first success, which self-healed a bad boot but
+    // never refreshed again in the (far more common) case where boot succeeded in
+    // the first place. Runs whenever JWKS mode is configured, boot success or not.
     // `/status`'s `oidc_enabled` field (already shipped) reflects this handle live,
-    // so recovery is observable the moment it happens, not just in process logs.
-    if let Some(issuer) = retry_issuer {
+    // so a self-heal is observable the moment it happens, not just in process logs.
+    if let Some(issuer) = jwks_issuer {
         let handle = oidc_handle.clone();
         let access_aud = access_aud.clone();
         tokio::spawn(async move {
-            let mut delay = std::time::Duration::from_secs(30);
-            const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+            const PERIODIC_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
+            const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+            // A failed boot starts retrying soon (self-heal); a healthy boot already
+            // has a fresh verifier, so its first re-fetch waits the full period.
+            let mut delay = if jwks_boot_failed {
+                std::time::Duration::from_secs(30)
+            } else {
+                PERIODIC_REFRESH
+            };
             loop {
                 tokio::time::sleep(delay).await;
                 match verifier_from_jwks(&issuer, fetch_jwks).await {
                     Some(v) => {
                         eprintln!(
-                            "ct-control-plane: OIDC self-healed (issuer={issuer}, key=JWKS) — /me/* now available (#328)"
+                            "ct-control-plane: OIDC verifier refreshed (issuer={issuer}, key=JWKS) — /me/* available (#328/#430)"
                         );
                         handle.set(apply_access_aud(v, access_aud.as_deref()));
-                        return;
+                        delay = PERIODIC_REFRESH;
                     }
                     None => {
                         eprintln!(
-                            "ct-control-plane: OIDC background retry failed (issuer={issuer}) — retrying in {}s (#328)",
+                            "ct-control-plane: OIDC background refresh failed (issuer={issuer}) — retrying in {}s (#328/#430)",
                             delay.as_secs()
                         );
-                        delay = std::cmp::min(delay * 2, MAX_DELAY);
+                        delay = std::cmp::min(delay * 2, MAX_RETRY_DELAY);
                     }
                 }
             }

@@ -72,10 +72,12 @@ pub struct EnsureUserResult {
     pub temporary_password: Option<String>,
 }
 
-async fn admin_token(client: &reqwest::Client, cfg: &KeycloakAdminConfig) -> Result<String, KcError> {
+async fn admin_token(client: &reqwest::Client, cfg: &KeycloakAdminConfig) -> Result<(String, u64), KcError> {
     #[derive(Deserialize)]
     struct TokenResp {
         access_token: String,
+        #[serde(default)]
+        expires_in: u64,
     }
     let resp = client
         .post(format!(
@@ -96,8 +98,44 @@ async fn admin_token(client: &reqwest::Client, cfg: &KeycloakAdminConfig) -> Res
     }
     resp.json::<TokenResp>()
         .await
-        .map(|t| t.access_token)
+        .map(|t| (t.access_token, t.expires_in))
         .map_err(|e| KcError::Http(e.to_string()))
+}
+
+/// #434: was a fresh `master`-realm password grant (a real bcrypt verification,
+/// ~50-100ms) on EVERY admin operation, minting a new Keycloak session each
+/// time -- so even the cheapest op (`ensure_user` on an already-existing
+/// account) paid two round trips, one pure auth overhead. Cached process-wide
+/// (one Keycloak admin config per process, matching this module's own
+/// `KeycloakAdminConfig::from_env()` singleton convention), refreshed when the
+/// token's real `expires_in` TTL is within `EXPIRY_MARGIN` of expiring.
+struct CachedToken {
+    token: String,
+    expires_at: std::time::Instant,
+}
+
+static TOKEN_CACHE: std::sync::RwLock<Option<CachedToken>> = std::sync::RwLock::new(None);
+/// Refresh this far ahead of the token's real expiry -- covers request latency
+/// and clock skew without over-fetching.
+const EXPIRY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A cached admin token, refreshing it (and every other in-flight caller's view
+/// of it) if it's missing, expired, or `force_refresh` is set -- the single
+/// retry path uses `force_refresh` to cover a token invalidated early (e.g. an
+/// out-of-band Keycloak session revoke) without waiting out its normal TTL.
+async fn cached_admin_token(client: &reqwest::Client, cfg: &KeycloakAdminConfig, force_refresh: bool) -> Result<String, KcError> {
+    if !force_refresh {
+        if let Some(cached) = TOKEN_CACHE.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if cached.expires_at > std::time::Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+    }
+    let (token, expires_in) = admin_token(client, cfg).await?;
+    let ttl = std::time::Duration::from_secs(expires_in).saturating_sub(EXPIRY_MARGIN);
+    let expires_at = std::time::Instant::now() + ttl;
+    *TOKEN_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(CachedToken { token: token.clone(), expires_at });
+    Ok(token)
 }
 
 /// Random temporary password: 24 bytes of CSPRNG output, base64url-encoded --
@@ -126,16 +164,29 @@ pub async fn ensure_user(
     cfg: &KeycloakAdminConfig,
     email: &str,
 ) -> Result<EnsureUserResult, KcError> {
-    let token = admin_token(client, cfg).await?;
+    let mut token = cached_admin_token(client, cfg, false).await?;
     let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
 
-    let existing = client
+    let mut existing = client
         .get(format!("{realm_url}/users"))
         .bearer_auth(&token)
         .query(&[("email", email), ("exact", "true")])
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
+    // #434: single retry with a force-refreshed token -- covers a cached token
+    // invalidated early (e.g. an out-of-band Keycloak session revoke), not just
+    // the normal TTL-expiry path `cached_admin_token` already handles.
+    if existing.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        existing = client
+            .get(format!("{realm_url}/users"))
+            .bearer_auth(&token)
+            .query(&[("email", email), ("exact", "true")])
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
     if !existing.status().is_success() {
         return Err(KcError::Http(format!("GET users?email= returned {}", existing.status())));
     }
@@ -236,27 +287,39 @@ pub async fn create_service_account_client(
     client_id: &str,
     name: &str,
 ) -> Result<CreatedClient, KcError> {
-    let token = admin_token(client, cfg).await?;
+    let mut token = cached_admin_token(client, cfg, false).await?;
     let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
 
-    let create = client
+    let new_client_body = json!({
+        "clientId": client_id,
+        "name": name,
+        "protocol": "openid-connect",
+        "enabled": true,
+        "publicClient": false,
+        "standardFlowEnabled": false,
+        "directAccessGrantsEnabled": false,
+        "serviceAccountsEnabled": true,
+        "authorizationServicesEnabled": false,
+        "clientAuthenticatorType": "client-secret",
+    });
+    let mut create = client
         .post(format!("{realm_url}/clients"))
         .bearer_auth(&token)
-        .json(&json!({
-            "clientId": client_id,
-            "name": name,
-            "protocol": "openid-connect",
-            "enabled": true,
-            "publicClient": false,
-            "standardFlowEnabled": false,
-            "directAccessGrantsEnabled": false,
-            "serviceAccountsEnabled": true,
-            "authorizationServicesEnabled": false,
-            "clientAuthenticatorType": "client-secret",
-        }))
+        .json(&new_client_body)
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
+    // #434: single retry with a force-refreshed token, same reasoning as ensure_user.
+    if create.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        create = client
+            .post(format!("{realm_url}/clients"))
+            .bearer_auth(&token)
+            .json(&new_client_body)
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
     if !create.status().is_success() {
         return Err(KcError::Http(format!("POST clients returned {}", create.status())));
     }
@@ -282,14 +345,24 @@ pub async fn create_service_account_client(
 /// Ownership must already be verified by the caller (`SqliteServiceAccountStore
 /// ::internal_id_for`) before this is ever called with a real internal id.
 pub async fn rotate_client_secret(client: &reqwest::Client, cfg: &KeycloakAdminConfig, internal_id: &str) -> Result<String, KcError> {
-    let token = admin_token(client, cfg).await?;
+    let mut token = cached_admin_token(client, cfg, false).await?;
     let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
-    let resp = client
+    let mut resp = client
         .post(format!("{realm_url}/clients/{internal_id}/client-secret"))
         .bearer_auth(&token)
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
+    // #434: single retry with a force-refreshed token, same reasoning as ensure_user.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        resp = client
+            .post(format!("{realm_url}/clients/{internal_id}/client-secret"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
     if !resp.status().is_success() {
         return Err(KcError::Http(format!("POST client-secret (rotate) returned {}", resp.status())));
     }
@@ -300,14 +373,24 @@ pub async fn rotate_client_secret(client: &reqwest::Client, cfg: &KeycloakAdminC
 /// authenticating immediately. Ownership must already be verified by the
 /// caller, same as [`rotate_client_secret`].
 pub async fn delete_client(client: &reqwest::Client, cfg: &KeycloakAdminConfig, internal_id: &str) -> Result<(), KcError> {
-    let token = admin_token(client, cfg).await?;
+    let mut token = cached_admin_token(client, cfg, false).await?;
     let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
-    let resp = client
+    let mut resp = client
         .delete(format!("{realm_url}/clients/{internal_id}"))
         .bearer_auth(&token)
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
+    // #434: single retry with a force-refreshed token, same reasoning as ensure_user.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        resp = client
+            .delete(format!("{realm_url}/clients/{internal_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
     if !resp.status().is_success() {
         return Err(KcError::Http(format!("DELETE client returned {}", resp.status())));
     }

@@ -23,7 +23,7 @@ ct-edge = { path = "../edge" }
 # Pinned by commit (no tagged release exists yet); switch to `tag = "vX.Y.Z"` once
 # one does, same rev as crates/agent-tools's ct-agent dependency.
 ct-agent = { git = "https://github.com/scimbe/ct-agent", rev = "86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408" }
-ct-control-plane = { path = "../control-plane" }
+ct-control-plane = { path = "../control-plane", features = ["test-support"] }
 axum = "0.7"
 # `test-util` (dev-only) enables tokio's paused clock for the #367 racing
 # tests (`#[tokio::test(start_paused = true)]`), same purpose/pattern as

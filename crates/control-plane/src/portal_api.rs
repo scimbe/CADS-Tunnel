@@ -54,6 +54,17 @@ pub(crate) fn edge_admin_http_client() -> reqwest::Client {
     CLIENT.get_or_init(|| edge_admin_http_client_with(std::time::Duration::from_secs(5))).clone()
 }
 
+/// #435: the same `OnceLock`-cached-client shape as [`edge_admin_http_client`] and
+/// `portal::oidc_http_client`, for the Keycloak admin-provisioning call in the
+/// allow-list-add handler below -- was a fresh `reqwest::Client::new()` per call
+/// (no pooling, no timeout, so a hung Keycloak blocked the handler indefinitely).
+fn keycloak_admin_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| edge_admin_http_client_with(std::time::Duration::from_secs(5)))
+        .clone()
+}
+
 /// Automatic DNS-record management for tunnel hostnames (#38 DL2): create the A
 /// record on hostname-set, delete it on revoke, pointing at the edge's public IP.
 #[derive(Clone)]
@@ -556,30 +567,31 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     }
     match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(tunnels) => {
-            // #233: fetch each hostname's Rot/Gelb/Grün admission state, and
+            // #233/#437: fetch each hostname's Rot/Gelb/Grün admission state, and
             // (monitoring v1) its live connection status, alongside its tunnel row
             // -- best-effort per-row (a lookup failure just omits that row's badge
             // rather than failing the whole page, matching this handler's existing
-            // tolerance for partial data). The admission lookup is batched (#351)
-            // into one query regardless of row count; `edge_tunnel_status`'s HTTP
-            // scrape stays sequential per row -- Standard tier is one tunnel per
-            // account today, so that's at most one extra round trip per page view.
+            // tolerance for partial data). Every store lookup is now batched into
+            // one query regardless of row count (the admission lookup already was,
+            // #351); `edge_tunnel_status`'s HTTP scrape runs concurrently via
+            // `join_all` instead of one sequential await per row.
             let hostnames: Vec<&str> =
                 tunnels.iter().filter_map(|(t, _)| t.hostname.as_deref()).collect();
             let admissions = st.tunnels.cert_admission_for_hostnames(&hostnames).unwrap_or_default();
+            let tunnel_ids: Vec<&str> = tunnels.iter().map(|(t, _)| t.id.as_str()).collect();
+            let require_logins = st.tunnels.require_login_batch(&subject, &tunnel_ids).unwrap_or_default();
+            let allow_and_pending = st.tunnels.allowlist_and_pending_batch(&subject, &tunnel_ids).unwrap_or_default();
+            let statuses: Vec<_> =
+                futures::future::join_all(tunnels.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
             let mut rows = Vec::with_capacity(tunnels.len());
-            for (t, owned) in tunnels {
+            for ((t, owned), status) in tunnels.into_iter().zip(statuses) {
                 let admission = t.hostname.as_deref().and_then(|h| admissions.get(h).cloned());
-                let status = edge_tunnel_status(&st, &t.routing_token).await;
                 // #382-follow (Browser-Plane login gate): owner-scoped, so a shared
                 // (not-owned) row simply gets the off/empty defaults -- matching the
                 // existing owner-only convention for Revoke/Share above.
-                let require_login = st.tunnels.require_login(&subject, &t.id).ok().flatten().unwrap_or(false);
-                let login_allowlist = st.tunnels.login_allowlist_list(&subject, &t.id).ok().flatten().unwrap_or_default();
-                // Self-service access requests (#382-follow, issue #18): same
-                // owner-scoped, best-effort-defaults-empty convention as
-                // login_allowlist above.
-                let pending_requests = st.tunnels.pending_access_requests(&subject, &t.id).ok().flatten().unwrap_or_default();
+                let require_login = require_logins.get(&t.id).copied().unwrap_or(false);
+                let (login_allowlist, pending_requests) =
+                    allow_and_pending.get(&t.id).cloned().unwrap_or_default();
                 rows.push((t, owned, admission, status, require_login, login_allowlist, pending_requests));
             }
             Html(tunnels_html(&rows)).into_response()
@@ -610,8 +622,15 @@ async fn provision_tunnel(st: &ApiState, subject: &str, name: &str) {
         .as_deref()
         .and_then(|h| h.split('.').next())
         .unwrap_or(name);
-    let tunnel = match st.tunnels.create(subject, display_name, hostname.as_deref()) {
-        Ok(t) => t,
+    // #432: atomic count-check + insert (see create_if_under_owned_limit's own
+    // doc) -- auto-provisioning has always been capped at exactly 1 regardless of
+    // an account's real (possibly admin-raised) max_tunnels, matching this
+    // function's existing "owns_one" caller-side pre-check in tunnels_page;
+    // unchanged here, just made race-free. `Ok(None)` means a concurrent request
+    // already provisioned one first -- nothing to do, not an error.
+    let tunnel = match st.tunnels.create_if_under_owned_limit(subject, display_name, hostname.as_deref(), 1) {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
         Err(e) => {
             eprintln!("ct-cp: auto-provisioning a tunnel for {subject} failed: {e}");
             return;
@@ -704,10 +723,6 @@ async fn create_tunnel(
     // unlock self-service creation of additional subdomains -- so the gate
     // compares against that account's own limit, not a hardcoded "ever own
     // one at all".
-    let owned_count = match st.tunnels.list_authorized_for_subject(&subject) {
-        Ok(rows) => rows.iter().filter(|(_, owned)| *owned).count() as u32,
-        Err(e) => return internal_error("create_tunnel/list(owns_one)", e).into_response(),
-    };
     let max = match st.ledger.account_for_subject(&subject) {
         Ok(account) => match st.ledger.max_tunnels(&account) {
             Ok(m) => m,
@@ -715,13 +730,6 @@ async fn create_tunnel(
         },
         Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
     };
-    if owned_count >= max {
-        return (
-            StatusCode::FORBIDDEN,
-            "the Standard tier includes one tunnel per account; additional tunnels are a planned paid-tier feature (or ask the operator to raise your account's limit)",
-        )
-            .into_response();
-    }
     let hostname = st
         .dns
         .as_ref()
@@ -731,8 +739,19 @@ async fn create_tunnel(
     // Same reasoning as provision_tunnel: show the account-unique hostname
     // label, not the bare user-typed name two different accounts could share.
     let display_name = hostname.as_deref().and_then(|h| h.split('.').next()).unwrap_or(name);
-    let tunnel = match st.tunnels.create(&subject, display_name, hostname.as_deref()) {
-        Ok(t) => t,
+    // #432: the count check and the insert now run as one atomic unit under the
+    // store's own writer lock (create_if_under_owned_limit) -- previously a
+    // separate list_authorized_for_subject() read followed by create() let two
+    // concurrent requests both observe owned_count < max before either commit.
+    let tunnel = match st.tunnels.create_if_under_owned_limit(&subject, display_name, hostname.as_deref(), max) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                StatusCode::FORBIDDEN,
+                "the Standard tier includes one tunnel per account; additional tunnels are a planned paid-tier feature (or ask the operator to raise your account's limit)",
+            )
+                .into_response()
+        }
         Err(e) => return internal_error("create_tunnel/create", e).into_response(),
     };
     authorize_hostname(&st, &tunnel).await;
@@ -1775,7 +1794,7 @@ async fn login_allowlist_add_route(
             // account's one-time temporary password is only ever logged
             // server-side -- the operator relays it to the invitee out of band.
             if let Some(kc) = &st.kc_admin {
-                let client = reqwest::Client::new();
+                let client = keycloak_admin_http_client();
                 match crate::keycloak_admin::ensure_user(&client, kc, email).await {
                     Ok(result) if !result.already_existed => eprintln!(
                         "ct-cp: provisioned a new Keycloak account for {email} (tunnel {id}) -- \

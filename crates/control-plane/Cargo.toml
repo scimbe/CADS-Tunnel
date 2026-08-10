@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 
+[features]
+# #438: `http` (M13.1's in-memory, unauthenticated router) is real test scaffolding
+# that reads like a shipping API -- gated so a real build never has it reachable at
+# all. This crate's own tests get it via plain `cfg(test)`; a dependent crate's tests
+# (ct-client's rendezvous.rs) enable this feature on its dev-dependency instead.
+test-support = []
+
 [dependencies]
 ct-common = { path = "../common" }
 ct-dns = { path = "../dns" }
@@ -27,6 +34,9 @@ jsonwebtoken = "9"
 hmac = "0.12"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "signal"] }
+# #437: join_all for tunnels_page's concurrent edge_tunnel_status calls (was N
+# sequential awaited round trips, one per tunnel row).
+futures = "0.3"
 # Browser-Plane login gate (#382-follow): keycloak_admin.rs's temporary-password
 # generation for a freshly provisioned account.
 base64 = "0.22"

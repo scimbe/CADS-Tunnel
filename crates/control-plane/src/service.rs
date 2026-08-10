@@ -597,7 +597,7 @@ async fn buy_token(
     // no new debit.
     if let Some(key) = &idempotency_key {
         if let Some(existing) = store
-            .issuance_for_key(key)
+            .issuance_for_key(&AccountId(account), key)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         {
             return Ok(Json(TokenResp { token: hex_encode(&existing) }));
@@ -619,6 +619,12 @@ async fn buy_token(
                             StatusCode::PAYMENT_REQUIRED
                         }
                         LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+                        // #440: this account's own issuance_for_key lookup just found
+                        // nothing for this key, yet the insert hit a live row -- another
+                        // account already used this exact key.
+                        LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => {
+                            StatusCode::CONFLICT
+                        }
                         LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     (code, e.to_string())
@@ -632,6 +638,11 @@ async fn buy_token(
                         StatusCode::PAYMENT_REQUIRED
                     }
                     LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+                    // #440: only debit_and_record_issuance's insert can produce this --
+                    // unreachable via the plain debit() this arm covers.
+                    LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
                     LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (code, e.to_string())
@@ -3384,6 +3395,11 @@ async fn me_account(
 #[derive(Deserialize)]
 struct MeIssueReq {
     price: u64,
+    /// #441: optional client-supplied idempotency key, same shape and purpose as
+    /// `/billing/issue`'s (#272) -- without it, a lost response after a successful
+    /// debit leaves the customer's credit spent with no key to retry under and no
+    /// way to recover the minted token except paying again.
+    idempotency_key: Option<String>,
 }
 
 async fn me_issue(
@@ -3412,23 +3428,53 @@ async fn me_issue(
             format!("a routing token costs at least {} credit(s)", crate::billing::TOKEN_PRICE),
         ));
     }
+    let idempotency_key = match req.idempotency_key.as_deref() {
+        Some(s) => Some(
+            hex_decode_32(s).ok_or((StatusCode::BAD_REQUEST, "malformed idempotency_key".to_string()))?,
+        ),
+        None => None,
+    };
     let account = state
         .ledger
         .account_for_subject(&sub)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // Debit the authenticated user's own account; mint only if they can pay.
-    state.ledger.debit(&account, req.price).map_err(|e| {
-        let code = match &e {
-            LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => {
-                StatusCode::PAYMENT_REQUIRED
-            }
-            LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
-            LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        (code, e.to_string())
-    })?;
+    // #441: a retry with the same key gets back the same token, no new debit --
+    // same pattern as buy_token (#272/#440).
+    if let Some(key) = &idempotency_key {
+        if let Some(existing) = state
+            .ledger
+            .issuance_for_key(&account, key)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        {
+            return Ok(Json(TokenResp { token: hex_encode(&existing) }));
+        }
+    }
     let mut token = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+    let ledger_err_code = |e: &LedgerOpError| match e {
+        LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => StatusCode::PAYMENT_REQUIRED,
+        LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+        LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => StatusCode::CONFLICT,
+        LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    match &idempotency_key {
+        Some(key) => {
+            state
+                .ledger
+                .debit_and_record_issuance(&account, req.price, key, &token, now_secs())
+                .map_err(|e| {
+                    let code = ledger_err_code(&e);
+                    (code, e.to_string())
+                })?;
+        }
+        // No key supplied: unchanged legacy behavior, no idempotency protection.
+        None => {
+            state.ledger.debit(&account, req.price).map_err(|e| {
+                let code = ledger_err_code(&e);
+                (code, e.to_string())
+            })?;
+        }
+    }
     Ok(Json(TokenResp {
         token: hex_encode(&token),
     }))
@@ -4756,6 +4802,9 @@ const UNAUTH_WRITE_PATHS: &[&str] = &[
     "/accounts/open",
     "/registry/register",
     "/payment/intent",
+    // #431: added after this list -- storage is idempotent per (hostname, email),
+    // which bounds duplicates but not distinct emails flooding a gated hostname.
+    "/gate/request-access",
 ];
 
 /// Per-client-IP fixed-window limiter state for the unauthenticated DB-writers.

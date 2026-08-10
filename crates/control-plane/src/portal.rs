@@ -25,7 +25,25 @@ use sha2::Sha256;
 
 /// Name of the single-use CSRF cookie that binds the `state` in the authorize
 /// redirect to the browser, so the callback can reject a forged/replayed `state`.
-const STATE_COOKIE: &str = "ct_portal_state";
+/// #429: `__Host-`-prefixed (not just plain `ct_portal_state`). Every customer
+/// tunnel lives on a subdomain of this same shared zone (e.g.
+/// `site-a1b2c3d4.bunsenbrenner.org`), and per RFC 6265 ANY subdomain can set a
+/// cookie of the SAME NAME scoped to the parent domain (`Domain=bunsenbrenner.org`)
+/// even though this cookie is itself issued Domain-less -- the browser doesn't
+/// distinguish cookies by who set them, only by name+domain+path, so a
+/// same-named cookie injected by a hostile customer subdomain can shadow or
+/// collide with the real one on the callback request. A malicious customer
+/// could set `state` to a value of their own choosing this way, then trick a
+/// victim into completing the OAuth callback with that attacker-known state --
+/// a login-CSRF that logs the victim into the attacker's own identity. Browsers
+/// enforce three real guarantees for a `__Host-`-prefixed cookie name: `Secure`
+/// required, no `Domain=` attribute allowed (strictly host-only), and
+/// `Path=/` required -- critically, the no-`Domain=` + host-only rule means
+/// only a response from THIS EXACT host can ever set or overwrite it, so no
+/// subdomain can inject a same-named collision anymore. Path had to widen from
+/// `/portal` to `/` to satisfy the prefix's own requirement -- harmless for a
+/// short-lived (600s), single-use token read at exactly one endpoint.
+const STATE_COOKIE: &str = "__Host-ct_portal_state";
 
 /// Name of the signed session cookie identifying the logged-in customer.
 const SESSION_COOKIE: &str = "ct_portal_session";
@@ -881,8 +899,16 @@ pub(crate) fn cleared_session_cookie() -> String {
     format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
+/// #436: was `bytes.iter().map(|b| format!("{b:02x}")).collect()` -- one heap
+/// allocation per byte via `format!`, collected into a final `String`. Pushes
+/// directly into one pre-sized `String` instead.
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
@@ -896,17 +922,24 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// HTML-escape untrusted text before embedding it in the page.
+///
+/// #436: was a `flat_map` returning a fresh `Vec<char>` per input character
+/// (including the common `other => vec![other]` no-op arm) -- every ordinary
+/// character in every escaped string cost a heap allocation. Now pushes
+/// directly into one pre-sized `String`, zero allocations for the common case.
 pub(crate) fn escape(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            '&' => "&amp;".chars().collect::<Vec<_>>(),
-            '<' => "&lt;".chars().collect(),
-            '>' => "&gt;".chars().collect(),
-            '"' => "&quot;".chars().collect(),
-            '\'' => "&#39;".chars().collect(),
-            other => vec![other],
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The logged-in customer home page (self-contained, CSP-safe).
@@ -960,12 +993,12 @@ fn set_cookie(resp: &mut Response, cookie: &str) {
 /// only), SameSite=Lax (sent on the top-level IdP redirect back), scoped to
 /// `/portal`, expiring in 10 minutes.
 fn state_cookie(state: &str) -> String {
-    format!("{STATE_COOKIE}={state}; Path=/portal; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
+    format!("{STATE_COOKIE}={state}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
 }
 
 /// The same cookie with an immediate expiry, to retire it after the callback.
 fn cleared_state_cookie() -> String {
-    format!("{STATE_COOKIE}=; Path=/portal; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+    format!("{STATE_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
 /// Read a named cookie from the request `Cookie` header, if present.
@@ -990,11 +1023,14 @@ fn random_state() -> String {
 /// Percent-encode a query-parameter value (encode everything but the RFC 3986
 /// unreserved set), so `redirect_uri` (with `:` and `/`) survives intact.
 pub(crate) fn urlencode(s: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
+            // #436: was `out.push_str(&format!("%{b:02X}"))` -- a small heap
+            // allocation per escaped byte. `write!` formats straight into `out`.
+            _ => { let _ = write!(out, "%{b:02X}"); }
         }
     }
     out
@@ -1778,16 +1814,26 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(cookie.contains("ct_portal_state="), "sets the state cookie");
+        assert!(cookie.contains("__Host-ct_portal_state="), "sets the state cookie");
         assert!(cookie.contains("HttpOnly"), "not readable by JS");
         assert!(cookie.contains("Secure"), "HTTPS only");
         assert!(cookie.contains("SameSite=Lax"), "sent on the IdP top-level redirect back");
+        // #429: the three attributes browsers actually enforce the `__Host-`
+        // prefix's guarantees against -- Secure is asserted above; `Domain=`
+        // must be absent (host-only, so no other subdomain of the shared zone
+        // can set/overwrite this cookie for THIS host) and `Path=/` must be
+        // exact (the prefix's own requirement). Missing any one of these and
+        // a real browser would silently refuse to set a `__Host-`-prefixed
+        // cookie at all -- so this is a real correctness check, not
+        // decoration.
+        assert!(!cookie.contains("Domain="), "__Host- cookies must be host-only, no Domain=: {cookie}");
+        assert!(cookie.contains("Path=/;") || cookie.ends_with("Path=/"), "__Host- requires exact Path=/: {cookie}");
         // The cookie's state must equal the redirect's state.
         let from_cookie = cookie
             .split(';')
             .next()
             .unwrap()
-            .trim_start_matches("ct_portal_state=")
+            .trim_start_matches("__Host-ct_portal_state=")
             .to_string();
         assert!(
             loc.contains(&format!("state={from_cookie}")),
@@ -1823,7 +1869,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=OTHER")
+                    .header("cookie", "__Host-ct_portal_state=OTHER")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1839,7 +1885,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1861,7 +1907,7 @@ mod tests {
             .expect("session cookie set");
         assert!(session.contains("HttpOnly") && session.contains("Secure"));
         assert!(
-            cookies.iter().any(|c| c.starts_with("ct_portal_state=;")),
+            cookies.iter().any(|c| c.starts_with("__Host-ct_portal_state=;")),
             "state cookie cleared"
         );
         // The minted session verifies to the exchanged subject.
@@ -1881,7 +1927,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1896,7 +1942,7 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .collect();
         assert!(cookies.iter().all(|c| !c.starts_with("ct_portal_session=")), "no session");
-        assert!(cookies.iter().any(|c| c.starts_with("ct_portal_state=;")), "state cleared");
+        assert!(cookies.iter().any(|c| c.starts_with("__Host-ct_portal_state=;")), "state cleared");
     }
 
     /// Sign an id_token with a throwaway RSA key (RS256, kid `k1`) and return it
@@ -1997,7 +2043,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2024,7 +2070,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2065,7 +2111,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2106,7 +2152,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2146,7 +2192,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2185,7 +2231,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::get("/portal/callback?code=abc&state=s1")
-                    .header("cookie", "ct_portal_state=s1")
+                    .header("cookie", "__Host-ct_portal_state=s1")
                     .body(Body::empty())
                     .unwrap(),
             )

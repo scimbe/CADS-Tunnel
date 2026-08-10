@@ -1260,24 +1260,31 @@ impl SqliteLedger {
     }
 
     /// Add prepaid credit (saturating); returns the new balance.
+    ///
+    /// #442: reads then writes inside a transaction, matching
+    /// [`Self::debit_and_record_issuance`]'s established shape -- a second
+    /// control-plane process sharing this DB (the self-hostability goal this
+    /// crate documents elsewhere) could otherwise interleave its own
+    /// read-modify-write between this one's read and write, losing an update.
+    /// The app-level `Mutex<Connection>` already excludes that within one
+    /// process; this closes the same gap across processes.
     pub fn credit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
-        let conn = self.conn.lock_safe();
-        let bal = Self::balance_of(&conn, id)?
-            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let bal = Self::balance_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
         let new = bal.saturating_add(amount as i64);
-        conn.execute(
-            "UPDATE accounts SET balance = ?1 WHERE account = ?2",
-            params![new, &id.0[..]],
-        )?;
+        tx.execute("UPDATE accounts SET balance = ?1 WHERE account = ?2", params![new, &id.0[..]])?;
+        tx.commit()?;
         Ok(new as u64)
     }
 
     /// Spend credit; fails with [`LedgerError::InsufficientCredit`] and leaves
-    /// the balance unchanged when the account cannot cover `amount`.
+    /// the balance unchanged when the account cannot cover `amount`. #442: same
+    /// transactional shape as [`Self::credit`] -- see its doc for why.
     pub fn debit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
-        let conn = self.conn.lock_safe();
-        let bal = Self::balance_of(&conn, id)?
-            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let bal = Self::balance_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
         let bal_u = bal as u64;
         if bal_u < amount {
             return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
@@ -1286,10 +1293,8 @@ impl SqliteLedger {
             }));
         }
         let new = bal - amount as i64;
-        conn.execute(
-            "UPDATE accounts SET balance = ?1 WHERE account = ?2",
-            params![new, &id.0[..]],
-        )?;
+        tx.execute("UPDATE accounts SET balance = ?1 WHERE account = ?2", params![new, &id.0[..]])?;
+        tx.commit()?;
         Ok(new as u64)
     }
 
@@ -1298,12 +1303,19 @@ impl SqliteLedger {
     /// network drop) uses this to get back the SAME already-minted token instead of
     /// [`Self::debit_and_record_issuance`] debiting the account a second time for a
     /// token that was already paid for.
-    pub fn issuance_for_key(&self, idempotency_key: &[u8]) -> rusqlite::Result<Option<[u8; 32]>> {
+    ///
+    /// #440: scoped to `id` -- `idempotency_key` is free-form client input with no
+    /// global-uniqueness guarantee (a counter, a copied example value), so without
+    /// this check one caller's key colliding with another's would hand back the
+    /// OTHER account's already-minted Routing Token, un-debited. A key recorded
+    /// under a different account is treated as "no issuance for THIS caller" (the
+    /// insert path below then surfaces the real conflict).
+    pub fn issuance_for_key(&self, id: &AccountId, idempotency_key: &[u8]) -> rusqlite::Result<Option<[u8; 32]>> {
         self.conn
             .lock_safe()
             .query_row(
-                "SELECT token FROM token_issuances WHERE idempotency_key = ?1",
-                params![idempotency_key],
+                "SELECT token FROM token_issuances WHERE idempotency_key = ?1 AND account = ?2",
+                params![idempotency_key, &id.0[..]],
                 |r| r.get::<_, Vec<u8>>(0),
             )
             .optional()
@@ -1346,11 +1358,27 @@ impl SqliteLedger {
         }
         let new = bal - amount as i64;
         tx.execute("UPDATE accounts SET balance = ?1 WHERE account = ?2", params![new, &id.0[..]])?;
+        // #440: idempotency_key is still the table's sole PRIMARY KEY (not
+        // (account, idempotency_key) -- that would need a full table rebuild,
+        // SQLite has no in-place PK change). issuance_for_key already scopes its
+        // lookup to this account, so by the time execution reaches here the
+        // caller has confirmed THEIR account has no prior issuance for this key
+        // -- a UNIQUE violation now means a DIFFERENT account already used this
+        // exact key, a real (if now-caller-visible) conflict rather than a raw
+        // DB error.
         tx.execute(
             "INSERT INTO token_issuances (idempotency_key, account, token, price, issued_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![idempotency_key, &id.0[..], &token[..], amount as i64, now as i64],
-        )?;
+        )
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(err, _)
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused)
+            }
+            _ => LedgerOpError::Db(e),
+        })?;
         tx.commit()?;
         Ok(new as u64)
     }
@@ -1709,6 +1737,51 @@ impl SqliteTunnelStore {
                  PRIMARY KEY (hostname, email)
              );",
         )?;
+        // #406: nothing previously enforced one-tunnel-per-hostname -- `idx_subject_tunnels_
+        // hostname` above is a plain, non-unique index. Two reachable collisions: a raised
+        // per-account tunnel limit lets `auto_hostname(zone, name, subject)` (deterministic
+        // in (name, subject)) produce two rows with the same hostname, and
+        // `admin_provision_tunnel` accepts an arbitrary hostname with no availability check
+        // at all, so two DIFFERENT subjects can be provisioned the identical hostname --
+        // every hostname-keyed lookup (`routing_token_for_hostname`, `cert_admission_for_
+        // hostname`, `require_login_for_hostname`, ...) then silently reads whichever row
+        // SQLite returns first, including leaking one subject's `require_login`/allow-list
+        // state onto a DIFFERENT subject's hostname.
+        //
+        // A partial UNIQUE index (NULL hostnames -- Mesh-Plane-only tunnels -- excluded)
+        // closes this at the DB layer, race-proof regardless of which code path inserts.
+        // Migration safety: on a pre-existing, already-duplicated DB, creating a UNIQUE
+        // index over duplicate values fails outright -- rather than let that crash boot
+        // for every self-hosted deployment (some of which may already be in this state),
+        // check for duplicates first and skip the index (loudly) if any exist, so a boot
+        // never breaks in place. `create()`/callers already return normal `rusqlite::Error`
+        // on any constraint failure, so no caller signature change is needed once the
+        // index is live -- a would-be duplicate insert now fails cleanly instead of
+        // silently succeeding.
+        let dup_hostnames: Vec<String> = conn
+            .prepare(
+                "SELECT hostname FROM subject_tunnels
+                 WHERE hostname IS NOT NULL
+                 GROUP BY hostname HAVING COUNT(*) > 1",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if dup_hostnames.is_empty() {
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_subject_tunnels_hostname_unique
+                     ON subject_tunnels (hostname) WHERE hostname IS NOT NULL;",
+            )?;
+        } else {
+            eprintln!(
+                "ct-cp: WARNING -- #406: {} hostname(s) already have duplicate subject_tunnels \
+                 rows, skipping the new UNIQUE index this boot so it doesn't fail: {:?}. Every \
+                 hostname-keyed lookup for these hostnames may still read the wrong row until \
+                 the duplicates are resolved (keep one row, delete/rehome the other(s)) and the \
+                 process is restarted so the index can be created.",
+                dup_hostnames.len(),
+                dup_hostnames
+            );
+        }
         Ok(Self {
             writer: Mutex::new(conn),
             readers: None,
@@ -3376,6 +3449,29 @@ impl SqliteTopologyStore {
         // consult the derived id, so an explicit channel_id here cannot be used to smuggle
         // admission for a channel the drawn edge doesn't actually imply).
         ensure_column(&conn, "topology_edges", "channel_id", "BLOB")?;
+        // #405: one-time migration for rows written before add_edge/remove_edge/*_collab/
+        // set_edge_channel normalized case (this same change). Pre-existing rows may have
+        // the caller's original, possibly-mixed-case spelling, and topology_authorizes'
+        // own `lower(e.a)`/`lower(e.b)` check silently masked that until now.
+        //
+        // Two differently-cased rows for the SAME logical edge (e.g. ('A','b') and
+        // ('a','B')) would both lowercase to the same (topology, a, b) triple, colliding
+        // on `PRIMARY KEY (topology, a, b)` — a plain `UPDATE ... SET a=lower(a),
+        // b=lower(b)` would abort partway through on that collision. Dedupe defensively
+        // first (keep the row with a non-NULL channel_id if the group has one, otherwise
+        // any row — losing a purely-cosmetic duplicate is fine; losing which channel_id
+        // was attached is not) via a fresh temp table, then replace the row set atomically.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS topology_edges_405_dedup AS
+                 SELECT topology, lower(a) AS a, lower(b) AS b,
+                        MAX(channel_id) AS channel_id
+                 FROM topology_edges
+                 GROUP BY topology, lower(a), lower(b);
+             DELETE FROM topology_edges;
+             INSERT INTO topology_edges (topology, a, b, channel_id)
+                 SELECT topology, a, b, channel_id FROM topology_edges_405_dedup;
+             DROP TABLE topology_edges_405_dedup;",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -3613,6 +3709,12 @@ impl SqliteTopologyStore {
     /// `false` (no-op) if the caller doesn't own the topology, the edge is a self-loop
     /// (`a == b`), or it already exists.
     pub fn add_edge(&self, owner: &str, topology: &str, a: &str, b: &str) -> rusqlite::Result<bool> {
+        // #405: node ids are hex-encoded holder keys (case-insensitive), but ordering
+        // canonicalization below was case-SENSITIVE byte comparison over the caller's raw
+        // spelling — topology_authorizes' own `lower(e.a)`/`lower(e.b)` check assumes
+        // case doesn't matter, so lowercasing here first is what actually makes that true.
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
         if a == b {
             return Ok(false);
         }
@@ -3631,6 +3733,11 @@ impl SqliteTopologyStore {
     /// Remove the undirected edge `a—b` from `owner`'s topology (owner-scoped, canonical).
     /// Returns whether a row was removed.
     pub fn remove_edge(&self, owner: &str, topology: &str, a: &str, b: &str) -> rusqlite::Result<bool> {
+        // #405: see add_edge's comment — must lowercase identically, or a remove using
+        // different casing than the original add silently deletes nothing while
+        // topology_authorizes' lower()-based check keeps authorizing the surviving row.
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let conn = self.conn.lock_safe();
         if !Self::owns_topology(&conn, owner, topology)? {
@@ -3888,6 +3995,9 @@ impl SqliteTopologyStore {
         a: &str,
         b: &str,
     ) -> rusqlite::Result<bool> {
+        // #405: see add_edge's comment — same case-normalization requirement.
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
         if a == b {
             return Ok(false);
         }
@@ -3913,6 +4023,9 @@ impl SqliteTopologyStore {
         a: &str,
         b: &str,
     ) -> rusqlite::Result<bool> {
+        // #405: see add_edge's comment — same case-normalization requirement.
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let conn = self.conn.lock_safe();
         if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
@@ -3941,6 +4054,9 @@ impl SqliteTopologyStore {
         b: &str,
         channel_id: Option<[u8; 32]>,
     ) -> rusqlite::Result<bool> {
+        // #405: see add_edge's comment — same case-normalization requirement.
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let conn = self.conn.lock_safe();
         if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
@@ -4452,6 +4568,67 @@ mod tests {
     }
 
     #[test]
+    fn edges_are_case_normalized_so_a_differently_cased_remove_actually_removes_405() {
+        // #405: node ids are case-insensitive hex holder keys. Wiring with one casing then
+        // removing with another must actually delete the row — otherwise topology_authorizes'
+        // own lower()-based check keeps authorizing a channel the UI showed as removed.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.create_topology("alice", "t1", "u1").unwrap();
+
+        assert!(store.add_edge("alice", "t1", "AABB", "ccdd").unwrap());
+        assert_eq!(store.edges("t1").unwrap(), vec![("aabb".into(), "ccdd".into())], "stored lowercased");
+
+        // Removing with yet another casing combination must find and delete the same row.
+        assert!(
+            store.remove_edge("alice", "t1", "aabb", "CCDD").unwrap(),
+            "differently-cased remove must still match the lowercased stored row"
+        );
+        assert!(store.edges("t1").unwrap().is_empty());
+
+        // Adding the same logical edge under two different raw casings is a single edge,
+        // not two — case-insensitive dedup, matching the ordinary same-case dedup above.
+        assert!(store.add_edge("alice", "t1", "ABCD", "1234").unwrap());
+        assert!(!store.add_edge("alice", "t1", "abcd", "1234").unwrap(), "same edge, different case -> no-op");
+        assert!(!store.add_edge("alice", "t1", "1234", "ABCD").unwrap(), "same edge, reversed + different case -> no-op");
+        assert_eq!(store.edges("t1").unwrap(), vec![("1234".into(), "abcd".into())]);
+    }
+
+    #[test]
+    fn opening_a_db_with_pre_existing_mixed_case_and_colliding_edges_migrates_cleanly_405() {
+        // #405: a self-host DB written before this fix may have mixed-case rows, including
+        // two differently-cased rows for the SAME logical edge (which would collide on the
+        // PRIMARY KEY once both are lowercased) — the boot-time migration must dedupe
+        // safely rather than fail to open or silently drop a channel_id.
+        let path = temp_db_path();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE topologies (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL);
+                 CREATE TABLE topology_edges (
+                     topology TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL,
+                     PRIMARY KEY (topology, a, b)
+                 );
+                 INSERT INTO topologies VALUES ('t1', 'alice', 'net');
+                 -- Two rows that collide once lowercased: ('AA','bb') and ('aa','BB').
+                 INSERT INTO topology_edges VALUES ('t1', 'AA', 'bb');
+                 INSERT INTO topology_edges VALUES ('t1', 'aa', 'BB');
+                 -- An unrelated, already-lowercase row must survive untouched.
+                 INSERT INTO topology_edges VALUES ('t1', 'cc', 'dd');",
+            )
+            .unwrap();
+        }
+        // Opening (running the migration) must succeed, not error or panic on the collision.
+        let store = SqliteTopologyStore::open(&path).unwrap();
+        let edges = store.edges("t1").unwrap();
+        assert_eq!(edges.len(), 2, "the two colliding rows deduped to one, plus the untouched one");
+        assert!(edges.contains(&("aa".into(), "bb".into())), "the colliding pair survived, lowercased");
+        assert!(edges.contains(&("cc".into(), "dd".into())), "the untouched row survived, unchanged");
+        // The store is otherwise fully functional post-migration.
+        assert!(store.add_edge("alice", "t1", "EE", "ff").unwrap());
+        assert!(edges.len() < store.edges("t1").unwrap().len());
+    }
+
+    #[test]
     fn topology_overlay_mode_persists_owner_scoped_and_defaults_to_direct() {
         // #107-ui-mode: the owner picks direct (baseline) vs complex-adaptive (smart-route).
         use ct_common::overlay::RoutingApproach;
@@ -4772,6 +4949,77 @@ mod tests {
         // Revoking an unknown id is a no-op false; bob's tunnel is untouched.
         assert!(store.revoke("alice", "deadbeef", 1_000).unwrap().is_none());
         assert_eq!(store.list_for_subject("bob").unwrap(), vec![b1]);
+    }
+
+    #[test]
+    fn hostname_is_unique_across_subjects_and_within_one_subjects_own_tunnels_406() {
+        // #406: nothing previously enforced one-tunnel-per-hostname -- two different
+        // subjects (the cross-tenant case admin_provision_tunnel could hit) or the same
+        // subject twice (the auto_hostname collision case) could both claim the same
+        // hostname, and every hostname-keyed lookup would then silently read whichever
+        // row SQLite happened to return first.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.create("alice", "web", Some("shared.example")).unwrap();
+
+        // Cross-subject collision: bob claiming alice's exact hostname must fail, not
+        // silently create a second row for the same hostname.
+        assert!(
+            store.create("bob", "other", Some("shared.example")).is_err(),
+            "a second subject claiming an already-owned hostname must be rejected"
+        );
+        // Same-subject collision (the auto_hostname(name, subject) determinism case).
+        assert!(
+            store.create("alice", "web-again", Some("shared.example")).is_err(),
+            "the SAME subject claiming a hostname they already own a row for must also be rejected"
+        );
+        // Only the original row exists — no partial/duplicate state from the failed inserts.
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 1);
+        assert_eq!(store.list_for_subject("bob").unwrap().len(), 0);
+
+        // Mesh-Plane-only tunnels (no hostname at all) are unaffected — the index is
+        // partial (`WHERE hostname IS NOT NULL`), so multiple NULLs are never a conflict.
+        store.create("alice", "ssh-1", None).unwrap();
+        store.create("alice", "ssh-2", None).unwrap();
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 3, "two NULL-hostname tunnels + the original");
+
+        // A different hostname is, of course, completely unaffected.
+        store.create("bob", "own", Some("bob-owns-this.example")).unwrap();
+        assert_eq!(store.list_for_subject("bob").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn opening_a_db_with_pre_existing_duplicate_hostnames_never_fails_to_boot_406() {
+        // #406: a self-host DB that already has duplicate hostname rows (from before this
+        // fix existed) must not crash on open when the new UNIQUE index can't be created
+        // over already-duplicated data — the fix must degrade to "index skipped, loudly
+        // logged" rather than making an existing, already-broken deployment worse by
+        // refusing to boot at all.
+        let path = temp_db_path();
+        {
+            // Seed pre-existing duplicate rows directly, bypassing create()'s own (not yet
+            // existing at this raw-SQL point) protection — simulates a genuinely
+            // already-duplicated legacy DB.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE subject_tunnels (
+                     id TEXT PRIMARY KEY, subject TEXT NOT NULL, name TEXT NOT NULL,
+                     hostname TEXT, created_at INTEGER NOT NULL,
+                     routing_token TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO subject_tunnels VALUES ('id1','alice','web','dup.example',1,'');
+                 INSERT INTO subject_tunnels VALUES ('id2','bob','other','dup.example',2,'');",
+            )
+            .unwrap();
+        }
+        // Opening (running every migration, including this one) must succeed, not error.
+        let store = SqliteTunnelStore::open(&path).unwrap();
+        // Both pre-existing duplicate rows are still there (nothing was destructively
+        // resolved automatically — that decision needs an operator, not this migration).
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 1);
+        assert_eq!(store.list_for_subject("bob").unwrap().len(), 1);
+        // The store is otherwise fully functional — a fresh, non-conflicting hostname
+        // still works normally.
+        assert!(store.create("carol", "fresh", Some("fresh.example")).is_ok());
     }
 
     #[test]
@@ -5457,13 +5705,13 @@ mod tests {
         let key = [0x11u8; 32];
         let token = [0xAAu8; 32];
 
-        assert_eq!(ledger.issuance_for_key(&key).unwrap(), None, "nothing recorded yet");
+        assert_eq!(ledger.issuance_for_key(&acct, &key).unwrap(), None, "nothing recorded yet");
         let bal = ledger.debit_and_record_issuance(&acct, 3, &key, &token, 1_000).unwrap();
         assert_eq!(bal, 7, "debited once");
         assert_eq!(ledger.balance(&acct).unwrap(), 7);
 
         // The "retry": same key looked up first, exactly what the HTTP handler does.
-        assert_eq!(ledger.issuance_for_key(&key).unwrap(), Some(token), "the same token comes back");
+        assert_eq!(ledger.issuance_for_key(&acct, &key).unwrap(), Some(token), "the same token comes back");
         assert_eq!(ledger.balance(&acct).unwrap(), 7, "looking it up never debits");
 
         // A genuinely NEW purchase (different key) still debits normally.
@@ -5471,7 +5719,47 @@ mod tests {
         let token2 = [0xBBu8; 32];
         ledger.debit_and_record_issuance(&acct, 2, &key2, &token2, 1_001).unwrap();
         assert_eq!(ledger.balance(&acct).unwrap(), 5, "a different key debits again");
-        assert_eq!(ledger.issuance_for_key(&key2).unwrap(), Some(token2));
+        assert_eq!(ledger.issuance_for_key(&acct, &key2).unwrap(), Some(token2));
+    }
+
+    #[test]
+    fn issuance_for_key_is_scoped_per_account_and_a_cross_account_reuse_is_refused_440() {
+        // #440: idempotency_key is free-form client input with no global-uniqueness
+        // guarantee -- account B must never get back account A's token for a key
+        // collision, and the insert path must refuse rather than silently letting
+        // B's own (later) call land under a foreign key.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct_a = ledger.open_account().unwrap();
+        let acct_b = ledger.open_account().unwrap();
+        ledger.credit(&acct_a, 10).unwrap();
+        ledger.credit(&acct_b, 10).unwrap();
+        let key = [0x99u8; 32];
+        let token_a = [0xAAu8; 32];
+
+        ledger.debit_and_record_issuance(&acct_a, 3, &key, &token_a, 1_000).unwrap();
+
+        // B's lookup under the SAME key must find nothing -- not A's token.
+        assert_eq!(
+            ledger.issuance_for_key(&acct_b, &key).unwrap(),
+            None,
+            "B must never see A's issuance for a colliding key"
+        );
+        assert_eq!(ledger.balance(&acct_b).unwrap(), 10, "B untouched by A's issuance");
+
+        // B then tries to record its own issuance under the same (globally-unique) key
+        // -- refused with a distinct error, not silently overwriting A's row or
+        // debiting B for nothing.
+        let token_b = [0xBBu8; 32];
+        let result = ledger.debit_and_record_issuance(&acct_b, 4, &key, &token_b, 1_001);
+        assert!(
+            matches!(result, Err(LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused))),
+            "got {result:?}"
+        );
+        assert_eq!(ledger.balance(&acct_b).unwrap(), 10, "refused issuance must not debit B");
+
+        // A's own original issuance is untouched throughout.
+        assert_eq!(ledger.issuance_for_key(&acct_a, &key).unwrap(), Some(token_a));
+        assert_eq!(ledger.balance(&acct_a).unwrap(), 7);
     }
 
     #[test]
@@ -5490,7 +5778,7 @@ mod tests {
             Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: 1, requested: 5 }))
         ));
         assert_eq!(ledger.balance(&acct).unwrap(), 1, "balance untouched");
-        assert_eq!(ledger.issuance_for_key(&key).unwrap(), None, "no issuance recorded for the refused debit");
+        assert_eq!(ledger.issuance_for_key(&acct, &key).unwrap(), None, "no issuance recorded for the refused debit");
     }
 
     #[test]
