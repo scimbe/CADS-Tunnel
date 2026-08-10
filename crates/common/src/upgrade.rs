@@ -507,19 +507,99 @@ where
 /// direct Noise session, which is installed into the pump and cut over to. Establishment is done
 /// only after `Ready`, concurrently with the initiator's accept, so neither handshake blocks.
 ///
-/// **#416: `peer_noise_public` is required, mirroring [`run_upgradable_session_initiator`]'s own
-/// `peer_noise_public` parameter** — the initiator side always pinned its expected peer via
-/// [`crate::a2a::a2a_initiate`]; this responder side previously called the unauthenticated
-/// [`crate::a2a::a2a_respond`] and accepted whichever static key showed up. Callers must supply
-/// the channel-attested `noise_pubkey` for the member they believe they're relaying with — the
-/// same value the caller already used to admit this pairing at the channel broker.
+/// **#416 note**: this raw form does not verify the relay peer's Noise static key against a
+/// channel-attested value (see [`crate::a2a::a2a_respond`] — the same asymmetry applies here).
+/// Kept with its original signature/behavior for its cross-repo caller (`scimbe/ct-agent`,
+/// pinned by git rev — a workspace path-dependency on this crate rebuilds that pinned source
+/// against whatever's here *right now*, so a breaking signature change here breaks that build
+/// immediately, not just "once the pin is bumped"). Prefer
+/// [`run_upgradable_session_responder_verified`] for any new/updatable caller.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_upgradable_session_responder<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    own_noise_private: &[u8; 32],
+    coord: UpgradeCoordinator,
+    now: u64,
+    dial_probe: DF,
+    dial_and_establish: EF,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    DF: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = bool>,
+    EF: FnOnce(String) -> EFut,
+    EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    run_upgradable_session_responder_inner(
+        relay_send,
+        relay_recv,
+        local,
+        own_noise_private,
+        None,
+        coord,
+        now,
+        dial_probe,
+        dial_and_establish,
+    )
+    .await
+}
+
+/// [`run_upgradable_session_responder`], plus the check its own doc says most callers actually
+/// need (#416): `peer_noise_public` must match the relay peer's learned Noise static key — the
+/// channel-attested value for whichever member the caller believes it's relaying with, the same
+/// value already used to admit this pairing at the channel broker. Mirrors
+/// [`run_upgradable_session_initiator`]'s own `peer_noise_public` parameter, which the initiator
+/// side always had (via [`crate::a2a::a2a_initiate`]) — this was the missing responder half.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_upgradable_session_responder_verified<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    coord: UpgradeCoordinator,
+    now: u64,
+    dial_probe: DF,
+    dial_and_establish: EF,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    DF: FnOnce(String) -> DFut,
+    DFut: std::future::Future<Output = bool>,
+    EF: FnOnce(String) -> EFut,
+    EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    run_upgradable_session_responder_inner(
+        relay_send,
+        relay_recv,
+        local,
+        own_noise_private,
+        Some(peer_noise_public),
+        coord,
+        now,
+        dial_probe,
+        dial_and_establish,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_upgradable_session_responder_inner<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
     mut relay_send: RW,
     mut relay_recv: RR,
     local: P,
     own_noise_private: &[u8; 32],
-    peer_noise_public: &[u8; 32],
+    peer_noise_public: Option<&[u8; 32]>,
     mut coord: UpgradeCoordinator,
     now: u64,
     dial_probe: DF,
@@ -536,13 +616,13 @@ where
     EF: FnOnce(String) -> EFut,
     EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
 {
-    let relay_ts = crate::a2a::a2a_respond_verified(
-        &mut relay_send,
-        &mut relay_recv,
-        own_noise_private,
-        peer_noise_public,
-    )
-    .await?;
+    let relay_ts = match peer_noise_public {
+        Some(expected) => {
+            crate::a2a::a2a_respond_verified(&mut relay_send, &mut relay_recv, own_noise_private, expected)
+                .await?
+        }
+        None => crate::a2a::a2a_respond(&mut relay_send, &mut relay_recv, own_noise_private).await?.0,
+    };
     let (plain_r, plain_w) = tokio::io::split(local);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -863,7 +943,7 @@ mod tests {
             .await
         });
         let resp_task = tokio::spawn(async move {
-            run_upgradable_session_responder(
+            run_upgradable_session_responder_verified(
                 rb2a_w, ra2b_r, resp_app, &b_priv, &a_pub, coord_r, 5,
                 |ep| async move { ep == EP },
                 move |_ep| async move { Some((resp_ts, resp_dr, resp_dw)) },
