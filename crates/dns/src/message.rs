@@ -37,8 +37,11 @@ pub fn parse_query(buf: &[u8]) -> Option<Query> {
         return None;
     }
     // Question qname: sequence of length-prefixed labels ending in a 0 length.
+    // Folded directly into one pre-reserved, lowercased String (one allocation)
+    // instead of a Vec<String> of per-label heap strings joined afterward
+    // (N+1 allocations) -- #357, real cost on a high-rate small-query path.
     let mut p = 12usize;
-    let mut labels = Vec::new();
+    let mut name = String::with_capacity(buf.len().saturating_sub(p));
     loop {
         let len = *buf.get(p)? as usize;
         if len == 0 {
@@ -49,17 +52,16 @@ pub fn parse_query(buf: &[u8]) -> Option<Query> {
             return None; // compression pointer is illegal in a question qname
         }
         let label = buf.get(p + 1..p + 1 + len)?;
-        labels.push(std::str::from_utf8(label).ok()?.to_ascii_lowercase());
+        let label = std::str::from_utf8(label).ok()?;
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.extend(label.chars().map(|c| c.to_ascii_lowercase()));
         p += 1 + len;
     }
     let qtype = u16::from_be_bytes([*buf.get(p)?, *buf.get(p + 1)?]);
     let qclass = u16::from_be_bytes([*buf.get(p + 2)?, *buf.get(p + 3)?]);
-    Some(Query {
-        id,
-        name: labels.join("."),
-        qtype,
-        qclass,
-    })
+    Some(Query { id, name, qtype, qclass })
 }
 
 /// #299: classic DNS-over-UDP payload ceiling (no EDNS0 OPT support here, so no
