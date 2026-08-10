@@ -341,7 +341,7 @@ pub fn register_auction_tools(
         move |_| serde_json::to_value(&offer_for_get).map_err(|e| e.to_string()),
     );
     let limiter = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::new(max_bids_per_window),
+        crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::with_max_tracked_keys(max_bids_per_window, MAX_TRACKED_RATE_LIMIT_PEERS),
     ));
     // #158: authoritative per-offer capacity tally so cleared matches can't oversell this offer beyond
     // its `units_available` (match_offer alone is a stateless preview and would double-book).
@@ -488,6 +488,15 @@ pub fn register_service_tools(
 /// caller can't grow server memory with an arbitrarily large message.
 pub const MAX_CHAT_MESSAGE_BYTES: usize = 16 * 1024;
 
+/// #414: `auction/bid` and `chat` are commonly run with `window_secs == 0` ("a single
+/// all-time window", see both functions' own doc comments) — the rate limiter's normal
+/// periodic sweep only fires on a window transition, which never happens in that mode, so
+/// every distinct authenticated peer ever seen accumulates in the limiter forever (an
+/// attacker can mint fresh ed25519 keys for free). Caps distinct tracked peers instead;
+/// generous for any real deployment's peer count while keeping worst-case memory bounded
+/// (~50 bytes/entry * this cap is a few MB, not unbounded).
+const MAX_TRACKED_RATE_LIMIT_PEERS: usize = 100_000;
+
 /// Register the #163 **`chat`** collaboration tool — an *inert* text-message primitive so two agents can
 /// exchange free-text over the same authenticated channel they discover + cooperate on, instead of over
 /// GitHub comments. Opt-in exactly like [`register_service_tools`] — an agent that never registers it has
@@ -512,7 +521,7 @@ pub fn register_chat_tool(
     on_message: impl Fn([u8; 32], &str) + Send + Sync + 'static,
 ) {
     let limiter = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::new(max_msgs_per_window),
+        crate::ratelimit::KeyedRateLimiter::<[u8; 32]>::with_max_tracked_keys(max_msgs_per_window, MAX_TRACKED_RATE_LIMIT_PEERS),
     ));
     reg.register_ctx(
         "chat",

@@ -130,4 +130,50 @@ mod tests {
         assert!(rl2.allow(&7, 5), "a much later window resets the key");
         assert_eq!(rl2.tracked_keys(), 1);
     }
+
+    #[test]
+    fn with_max_tracked_keys_never_exceeds_the_cap_in_a_single_all_time_window_414() {
+        // #414: `window_secs == 0` callers always pass `window = 0` forever, so the
+        // window-transition sweep above never fires -- this is the actual bug scenario.
+        // Without a capacity bound, every one of these 10,000 distinct keys would
+        // accumulate forever.
+        let mut rl: KeyedRateLimiter<u64> = KeyedRateLimiter::with_max_tracked_keys(5, 100);
+        for k in 0..10_000u64 {
+            rl.allow(&k, 0);
+            assert!(rl.tracked_keys() <= 100, "never exceeds the configured cap, key {k}");
+        }
+        assert_eq!(rl.tracked_keys(), 100, "settles at exactly the cap, not below it");
+    }
+
+    #[test]
+    fn with_max_tracked_keys_evicts_oldest_first_and_keeps_limiting_correctly_414() {
+        let mut rl: KeyedRateLimiter<u64> = KeyedRateLimiter::with_max_tracked_keys(2, 3);
+        assert!(rl.allow(&1, 0) && rl.allow(&1, 0) && !rl.allow(&1, 0), "key 1 hits its own per-window cap");
+        assert!(rl.allow(&2, 0));
+        assert!(rl.allow(&3, 0));
+        assert_eq!(rl.tracked_keys(), 3, "at capacity, not yet evicting");
+
+        // A 4th distinct key evicts the oldest (key 1) to make room.
+        assert!(rl.allow(&4, 0));
+        assert_eq!(rl.tracked_keys(), 3, "still at the cap, not over it");
+
+        // Key 1 was evicted -- it gets a FRESH budget on next use (its old count is gone),
+        // proving eviction actually happened rather than just refusing new keys outright.
+        assert!(rl.allow(&1, 0), "evicted key 1 starts over with a clean budget");
+        assert!(rl.allow(&1, 0));
+        assert!(!rl.allow(&1, 0), "and is still correctly capped going forward");
+    }
+
+    #[test]
+    fn with_max_tracked_keys_reusing_an_existing_key_does_not_evict_414() {
+        // Re-using an already-tracked key must not count as "a new key" for eviction
+        // purposes, and must not itself get evicted just for being used again.
+        let mut rl: KeyedRateLimiter<u64> = KeyedRateLimiter::with_max_tracked_keys(10, 2);
+        assert!(rl.allow(&1, 0));
+        assert!(rl.allow(&2, 0));
+        for _ in 0..5 {
+            assert!(rl.allow(&1, 0), "repeatedly using key 1 must not evict it or anything else");
+        }
+        assert_eq!(rl.tracked_keys(), 2, "still exactly the two real keys, no phantom growth");
+    }
 }
