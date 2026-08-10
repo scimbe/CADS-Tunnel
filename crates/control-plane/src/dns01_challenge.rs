@@ -171,6 +171,16 @@ async fn publish(
                     ),
                 ));
             }
+            // #265: distinct from TimedOut -- this control plane, not deSEC, is the
+            // bottleneck (too many distinct hostnames publishing concurrently). The
+            // TXT write above already succeeded; the agent's ACME client should
+            // retry the publish shortly rather than treat this as a permanent failure.
+            Convergence::Saturated => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("published, but too many concurrent DNS-01 convergence checks in flight for {record_name} -- retry shortly"),
+                ));
+            }
         }
     }
     Ok(StatusCode::OK)

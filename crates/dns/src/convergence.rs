@@ -81,6 +81,13 @@ pub enum Convergence {
     /// Not one node could be reached — this says something about *our* network,
     /// not about propagation, so the caller must not read it as failure.
     NoNodesReachable,
+    /// #265: [`ConvergenceCoalescer::MAX_CONCURRENT_POLLERS`] distinct polls were
+    /// already in flight and this caller did not get a slot within
+    /// [`ConvergenceCoalescer::PERMIT_WAIT`] — distinct from [`Convergence::TimedOut`]
+    /// (which means deSEC itself is slow) so a caller/operator can tell "the DNS
+    /// provider is lagging" apart from "this control plane is under a concurrent-key
+    /// burst, retry shortly".
+    Saturated,
 }
 
 /// Poll every node in `nodes` until all of them serve `expected` for `name`,
@@ -181,6 +188,12 @@ pub async fn wait_for_convergence(
 /// replaying a stale result.
 pub struct ConvergenceCoalescer {
     inflight: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<Convergence>>>>,
+    /// #265: caps the number of *distinct* keys polling concurrently. Coalescing
+    /// (above) already collapses a same-key burst to one poll; this bounds the
+    /// orthogonal case -- many *different* hostnames publishing at once, each of
+    /// which becomes its own poller and would otherwise stack unboundedly, each
+    /// holding a handler task for up to [`DEFAULT_TIMEOUT`].
+    poll_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for ConvergenceCoalescer {
@@ -190,8 +203,22 @@ impl Default for ConvergenceCoalescer {
 }
 
 impl ConvergenceCoalescer {
+    /// this control plane runs with `cpus: 1.0` (docker/deploy/compose.selfhost.yml,
+    /// #312) -- a small, deliberately conservative cap on simultaneous distinct
+    /// pollers rather than a throughput target. Real-world fan-out (one operator's
+    /// tenants renewing/publishing around the same time) is expected to be far
+    /// below this; it exists to bound a pathological burst, not ordinary use.
+    const MAX_CONCURRENT_POLLERS: usize = 4;
+    /// How long a would-be poller waits for a free slot before giving up as
+    /// [`Convergence::Saturated`] rather than silently queuing for up to another
+    /// [`DEFAULT_TIMEOUT`] on top of whatever it already waited in the handler.
+    const PERMIT_WAIT: Duration = Duration::from_secs(10);
+
     pub fn new() -> Self {
-        Self { inflight: std::sync::Mutex::new(std::collections::HashMap::new()) }
+        Self {
+            inflight: std::sync::Mutex::new(std::collections::HashMap::new()),
+            poll_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLERS)),
+        }
     }
 
     /// [`wait_for_convergence`], coalesced by `key` (the caller picks it -- typically
@@ -236,8 +263,18 @@ impl ConvergenceCoalescer {
 
         match existing_or_new_rx {
             Ok(tx) => {
-                // This caller is the poller.
-                let result = poll().await;
+                // This caller is the poller -- bounded by `poll_slots` (#265): only
+                // subscribers (the `Err` arm below) skip this, since they don't run
+                // `poll` themselves and would otherwise wait on both this permit AND
+                // the poller's own permit-wait, double-counting the same slot.
+                let result = match tokio::time::timeout(Self::PERMIT_WAIT, self.poll_slots.clone().acquire_owned()).await {
+                    Ok(Ok(_permit)) => poll().await,
+                    // Either the wait itself timed out, or `acquire_owned` returned
+                    // `Err` (the semaphore was closed) -- both mean "no slot", and the
+                    // semaphore is never explicitly closed in this process's lifetime,
+                    // so in practice this is always the timeout.
+                    _ => Convergence::Saturated,
+                };
                 let _ = tx.send(Some(result.clone()));
                 self.inflight.lock().expect("convergence coalescer mutex poisoned").remove(key);
                 result
@@ -447,5 +484,106 @@ mod tests {
                 .await;
         }
         assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 3, "three sequential calls, three fresh polls");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_distinct_keys_beyond_the_cap_is_reported_saturated_not_left_unbounded_265() {
+        // #265: MAX_CONCURRENT_POLLERS (4) distinct-key pollers can run at once; a
+        // 5th distinct key must not become a 5th unbounded concurrent poll -- it
+        // should wait for a slot and, since every slot here is held for longer than
+        // PERMIT_WAIT, eventually give up as Saturated rather than hang.
+        let coalescer = Arc::new(ConvergenceCoalescer::new());
+        let concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for i in 0..(ConvergenceCoalescer::MAX_CONCURRENT_POLLERS + 1) {
+            let coalescer = coalescer.clone();
+            let concurrent = concurrent.clone();
+            let peak_concurrent = peak_concurrent.clone();
+            handles.push(tokio::spawn(async move {
+                coalescer
+                    .coalesce(&format!("zone/{i}/expected"), || async move {
+                        let now = concurrent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        peak_concurrent.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                        // Longer than PERMIT_WAIT: a slot never frees up in time for
+                        // the (MAX+1)th caller, which is the scenario under test.
+                        tokio::time::sleep(ConvergenceCoalescer::PERMIT_WAIT * 2).await;
+                        concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                    })
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        assert_eq!(
+            results.iter().filter(|r| **r == Convergence::Saturated).count(),
+            1,
+            "exactly one of the {} callers exceeded the cap and gave up: {results:?}",
+            ConvergenceCoalescer::MAX_CONCURRENT_POLLERS + 1
+        );
+        assert_eq!(
+            results.iter().filter(|r| matches!(r, Convergence::Converged { .. })).count(),
+            ConvergenceCoalescer::MAX_CONCURRENT_POLLERS,
+            "the other callers actually ran their poll and converged"
+        );
+        assert!(
+            peak_concurrent.load(std::sync::atomic::Ordering::SeqCst) <= ConvergenceCoalescer::MAX_CONCURRENT_POLLERS,
+            "never more than {} pollers ran their closure at once",
+            ConvergenceCoalescer::MAX_CONCURRENT_POLLERS
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_result_is_shared_with_coalesced_subscribers_for_the_same_key_265() {
+        // The poller giving up as Saturated must still notify same-key subscribers
+        // with that same result, not hang them waiting for a poll that never ran --
+        // and it must never invoke the poll closure at all once every slot stays
+        // held for the whole test (so which of the concurrent callers happens to
+        // become the poller doesn't matter: none of them ever gets to run `poll`).
+        let coalescer = Arc::new(ConvergenceCoalescer::new());
+        for i in 0..ConvergenceCoalescer::MAX_CONCURRENT_POLLERS {
+            let coalescer = coalescer.clone();
+            tokio::spawn(async move {
+                coalescer
+                    .coalesce(&format!("zone/filler-{i}/expected"), || async move {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                    })
+                    .await
+            });
+        }
+        // Under paused time this drives the runtime through a full turn -- enough
+        // for all 4 spawned fillers to run up to (and register) their long sleep,
+        // so their semaphore permits are genuinely held before we proceed.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let coalescer = coalescer.clone();
+            let poll_count = poll_count.clone();
+            handles.push(tokio::spawn(async move {
+                coalescer
+                    .coalesce("zone/contended/expected", || {
+                        let poll_count = poll_count.clone();
+                        async move {
+                            poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                        }
+                    })
+                    .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        assert!(results.iter().all(|r| *r == Convergence::Saturated), "every caller for the contended key sees the same Saturated result: {results:?}");
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 0, "the poll closure never ran -- no slot was ever available");
     }
 }
