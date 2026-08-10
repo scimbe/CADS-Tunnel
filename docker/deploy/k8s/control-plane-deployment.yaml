@@ -7,6 +7,16 @@
 # - readinessProbe -> /readyz  (pings the DB; pod leaves the Service on 503, so
 #   traffic only arrives once the durable store is reachable).
 # - runs non-root with a read-only root FS; only /data (the PVC) is writable.
+#
+# #309: CT_CP_EDGE_ADMIN_TOKEN below must be the SAME Secret/key edge-
+# deployment.yaml's CT_EDGE_ADMIN_TOKEN reads (ct-edge-admin-token / token) --
+# see that file's header for how to create it out-of-band before `kubectl
+# apply -k`. This is the shared credential that authenticates the control
+# plane to the edge's admin API (CT_CP_EDGE_ADMIN_URL, control-plane-
+# config.yaml) for host-ownership authorize/revoke and tunnel revoke pushes,
+# and also gates this control plane's own machine-writer endpoints
+# (/enroll/issue, /registry/*, etc., #87/#90/#161) -- unset leaves those
+# routes open (dev/back-compat), same as compose's CT_CP_EDGE_ADMIN_TOKEN.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,6 +49,14 @@ spec:
           envFrom:
             - configMapRef:
                 name: ct-control-plane-config
+          env:
+            # #309: see the header comment above -- same Secret/key as the
+            # edge's CT_EDGE_ADMIN_TOKEN.
+            - name: CT_CP_EDGE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ct-edge-admin-token
+                  key: token
           ports:
             - name: http
               containerPort: 8090

@@ -1,10 +1,37 @@
-# Hosted deployment (M21.2a): kustomize base for the control plane.
+# Hosted deployment (M21.2a): kustomize base for the control plane + edge.
 #
 #   kubectl kustomize docker/deploy/k8s        # render (offline, no cluster)
 #   kubectl apply -k docker/deploy/k8s         # apply to a cluster
 #
 # Raw kustomize manifests (not Helm) so they render and validate with the
 # kustomize built into kubectl, no extra tooling.
+#
+# --- Secrets you must create out-of-band before `kubectl apply -k` (#309) ---
+# Never committed, following this base's existing convention (control-plane-
+# ingress.yaml's tls.secretName / control-plane-config.yaml's own comment):
+#   1. ct-edge-admin-token (key `token`) -- 64-hex shared edge<->control-plane
+#      admin credential. See edge-deployment.yaml's header for the exact
+#      `kubectl create secret` command.
+#   2. ct-edge-portal-tls (tls.crt/tls.key) -- the front door's Portal TLS
+#      cert. Auto-created by edge-certificate.yaml IF you run cert-manager
+#      with a DNS-01 ClusterIssuer configured (see that file); otherwise
+#      create it yourself and drop edge-certificate.yaml from resources below.
+#
+# --- #309: control-plane-ingress.yaml is intentionally NOT listed below ----
+# The k8s edge now runs its own unified :443 front door (ADR-0019, mirroring
+# compose.frontdoor.yml) as the SOLE public TLS-terminating entry point for
+# the Portal, replacing this Ingress's job. Running both for the same public
+# hostname would be two independent TLS terminators racing for one DNS name
+# -- see control-plane-ingress.yaml's own header for the full reasoning and
+# how to opt back into it instead (a real, supported alternative, just not
+# the default).
+#
+# --- #309: also intentionally out of scope here (see edge-config.yaml and
+# control-plane-config.yaml's own comments for the full reasoning) ---------
+#   - Keycloak/OIDC login (CT_EDGE_AUTH_*, CT_OIDC_CLIENT_*): no Keycloak k8s
+#     manifest exists yet in this directory.
+#   - The Gelb-tier wildcard cert (CT_EDGE_WILDCARD_CERT/_KEY, #233): separate
+#     tenant-tier feature, optional/non-fatal by design even when absent.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ct-system
@@ -15,12 +42,13 @@ resources:
   - control-plane-pvc.yaml
   - control-plane-deployment.yaml
   - control-plane-service.yaml
-  - control-plane-ingress.yaml
   - control-plane-pdb.yaml
   - control-plane-networkpolicy.yaml
   - edge-config.yaml
   - edge-pvc.yaml
+  - edge-certificate.yaml
   - edge-deployment.yaml
   - edge-service.yaml
+  - edge-admin-service.yaml
   - edge-pdb.yaml
   - edge-networkpolicy.yaml

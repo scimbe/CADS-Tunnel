@@ -5,6 +5,12 @@
 # NOTE: a single Service with mixed protocols on a LoadBalancer requires
 # Kubernetes >= 1.26 (MixedProtocolLBService, GA in 1.26). On older clusters,
 # split this into two Services (one UDP, one TCP).
+#
+# #309: adds the front door (443/80, public), and the Agent-Fabric channel
+# broker (4435/4436, public — same self-host compose base-stack surface, see
+# edge-config.yaml). Deliberately does NOT add the admin port (9601): that
+# stays cluster-internal only, on the separate ClusterIP Service edge-admin-
+# service.yaml — see that file's header for why it must not be here.
 apiVersion: v1
 kind: Service
 metadata:
@@ -25,4 +31,37 @@ spec:
     - name: tls-tcp
       port: 4433
       targetPort: tls-tcp
+      protocol: TCP
+    # #309: unified :443/:80 front door. External port 443/80 -> container
+    # 8443/8080 (edge-config.yaml's CT_FRONT_DOOR/CT_EDGE_HTTP_REDIRECT
+    # comment explains the non-root-can't-bind-<1024 reason for the remap;
+    # this Service is what makes it transparent to clients, same job
+    # compose.frontdoor.yml's "443:8443"/"80:8080" port-publish mapping does).
+    - name: front-door
+      port: 443
+      targetPort: front-door
+      protocol: TCP
+    - name: http-redirect
+      port: 80
+      targetPort: http-redirect
+      protocol: TCP
+    # #309: Agent-Fabric channel broker — rendezvous (4435) pairs two members
+    # for a direct dial, relay (4436) is the fallback when they can't reach
+    # each other directly. Both udp+tcp, same as the self-host compose base
+    # stack (compose.selfhost.yml) always publishes.
+    - name: chan-rndzv-udp
+      port: 4435
+      targetPort: chan-rndzv-udp
+      protocol: UDP
+    - name: chan-rndzv-tcp
+      port: 4435
+      targetPort: chan-rndzv-tcp
+      protocol: TCP
+    - name: chan-relay-udp
+      port: 4436
+      targetPort: chan-relay-udp
+      protocol: UDP
+    - name: chan-relay-tcp
+      port: 4436
+      targetPort: chan-relay-tcp
       protocol: TCP

@@ -10,10 +10,20 @@
 #      ingress controller lives in a differently-named namespace, change the
 #      label value below to match (same "adjust before deploy" posture as
 #      control-plane-ingress.yaml's own `cp.example.com` placeholder).
+#
+#      #309: control-plane-ingress.yaml is NO LONGER in kustomization.yaml's
+#      default resource list (see its own header for why -- the edge's :443
+#      front door replaced it as the default Portal TLS-termination path).
+#      This rule is harmless-but-inert by default: nothing matches
+#      `ingress-nginx` unless you deploy an actual ingress-nginx controller in
+#      a namespace with that name. It's kept, not deleted, so it's already in
+#      place for an operator who deliberately opts back into the alternate
+#      control-plane-ingress.yaml path (see that file's header).
 #   2. the edge pod, which calls the control plane's internal API directly
 #      (host-ownership authorize/revoke, channel-broker authorize, metrics
 #      scrape -- CT_CP_EDGE_ADMIN_TOKEN-gated internal routes) over the
-#      cluster network, not through the ingress.
+#      cluster network, not through the ingress. This is the path the front
+#      door's Portal route (CT_CP_PROXY_ADDR) also uses by default now (#309).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

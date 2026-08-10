@@ -1,0 +1,27 @@
+# #309: the edge's admin API (POST /admin/revoke/:token tunnel revoke, plus
+# the host-ownership authorize/revoke routes the control plane calls,
+# CT_EDGE_ADMIN_LISTEN — see edge-config.yaml). Deliberately a SEPARATE
+# ClusterIP Service from ct-edge (edge-service.yaml), not a port added to that
+# LoadBalancer: compose.frontdoor.yml publishes the same admin API to
+# 127.0.0.1 ONLY on the host (never the public internet, since it's an
+# unauthenticated-by-network, token-gated-only API) — a ClusterIP Service is
+# the k8s-native equivalent of "reachable only from this side of the network
+# boundary, never externally". edge-networkpolicy.yaml further scopes ingress
+# on this port to the control-plane pod specifically.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ct-edge-admin
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ct-edge
+  ports:
+    - name: admin
+      port: 9601
+      targetPort: admin
+      protocol: TCP

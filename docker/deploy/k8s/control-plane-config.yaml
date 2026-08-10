@@ -2,6 +2,12 @@
 # secret (it is a public Keycloak realm URL); the realm's signing key is fetched
 # by the verifier. Real per-environment secrets (if any) belong in a Secret that
 # is supplied out-of-band (sealed-secrets / external-secrets), never committed.
+#
+# #309: CT_OIDC_ISSUER below stays a PRE-EXISTING placeholder, not something
+# this issue wires up further -- see the note at the bottom of this file for
+# why CT_OIDC_CLIENT_ID/_SECRET/_REDIRECT_URI (needed to actually turn OIDC
+# login on, crates/control-plane/src/portal.rs PortalOidc::from_lookup) are
+# deliberately left unset.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,3 +22,31 @@ data:
   CT_CONTROL_PLANE_DB: "/data/control-plane.db"
   # Replace with the real Keycloak realm issuer before deploying.
   CT_OIDC_ISSUER: "https://keycloak.example/realms/CADS-Tunnel"
+  # #309: let the control plane reach the edge's admin API (host-ownership
+  # authorize/revoke, tunnel revoke push) over the cluster network -- the
+  # ClusterIP Service edge-admin-service.yaml, not a public address. Not a
+  # secret (it's just a Service DNS name); CT_CP_EDGE_ADMIN_TOKEN right below
+  # is the actual credential, and it IS a secret (see control-plane-
+  # deployment.yaml's env).
+  CT_CP_EDGE_ADMIN_URL: "http://ct-edge-admin:9601"
+  # #309: the public Portal URL embedded in customer install one-liners
+  # (crates/control-plane/src/main.rs, issue #68) -- unset silently defaults
+  # to https://localhost. MUST be the same hostname as edge-config.yaml's
+  # CT_EDGE_PORTAL_HOST (the front door only terminates TLS for the SNI it's
+  # configured for); replace ct-portal.example.com with your real Portal
+  # hostname before deploying, same posture as CT_OIDC_ISSUER above.
+  CT_PORTAL_BASE_URL: "https://ct-portal.example.com"
+  # #309: OIDC/Keycloak SSO is DELIBERATELY OUT OF SCOPE for this pass. The
+  # self-host compose stack's SSO overlay (compose.sso.yml, #42/#48) runs a
+  # full Keycloak alongside the edge's Auth route (CT_EDGE_AUTH_HOST/_ADDR on
+  # the edge, CT_OIDC_CLIENT_ID/_SECRET/_REDIRECT_URI here) -- but there is no
+  # Keycloak k8s manifest anywhere in this directory yet. Wiring
+  # CT_OIDC_CLIENT_ID/_SECRET/_REDIRECT_URI here without a real Keycloak
+  # Service behind them would silently reference infrastructure that doesn't
+  # exist (portal.rs::PortalOidc::from_lookup would build a login URL nothing
+  # answers) -- worse than just leaving OIDC login off, which is the existing,
+  # already-safe default (CT_OIDC_ISSUER alone only enables JWKS-verified
+  # /me/* for bearer tokens minted elsewhere; it does NOT enable browser
+  # login, portal.rs L98-111). A follow-up issue should add a Keycloak k8s
+  # Deployment/Service/PVC (mirroring compose.sso.yml's Postgres-backed setup,
+  # #307) and the edge's Auth-route env before this is turned on here.

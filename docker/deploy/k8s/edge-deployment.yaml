@@ -15,6 +15,25 @@
 #   on 4433 (the TLS-TCP fallback listener) as the "edge is accepting" signal.
 # - Hardened: non-root, read-only rootfs, all caps dropped. It needs no
 #   NET_ADMIN — that was only for netem in the testbed image.
+#
+# #309: front-door (443/80 published as 8443/8080, see edge-config.yaml),
+# admin (9601, cluster-internal only via edge-admin-service.yaml) and
+# channel-broker (4435/4436) ports/env, plus the CT_EDGE_ADMIN_TOKEN Secret
+# and the Portal TLS cert volume the front door needs. See edge-config.yaml's
+# header for the full Option-A architecture reasoning and what was
+# deliberately left out of scope (Keycloak Auth route, Gelb wildcard cert).
+#
+# CT_EDGE_ADMIN_TOKEN must exist as a Secret named ct-edge-admin-token (key
+# `token`) BEFORE `kubectl apply -k` — like control-plane-ingress.yaml's TLS
+# secretName, it is supplied out-of-band and never committed:
+#
+#   kubectl -n ct-system create secret generic ct-edge-admin-token \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#
+# The SAME value must also back control-plane-deployment.yaml's
+# CT_CP_EDGE_ADMIN_TOKEN (it reads the same Secret/key) -- edge and control
+# plane authenticate to each other with one shared 64-hex token, exactly like
+# compose.frontdoor.yml's CT_EDGE_ADMIN_TOKEN / CT_CP_EDGE_ADMIN_TOKEN pair.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,12 +66,50 @@ spec:
           envFrom:
             - configMapRef:
                 name: ct-edge-config
+          env:
+            # #309: the shared edge<->control-plane admin token (tunnel
+            # revoke, host-ownership authorize, channel-broker authorize).
+            # Secret is NOT part of this kustomize base -- see the header
+            # comment above for how to create it out-of-band.
+            - name: CT_EDGE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ct-edge-admin-token
+                  key: token
           ports:
             - name: quic
               containerPort: 4433
               protocol: UDP
             - name: tls-tcp
               containerPort: 4433
+              protocol: TCP
+            # #309: unified :443/:80 front door -- see edge-config.yaml's
+            # CT_FRONT_DOOR/CT_EDGE_HTTP_REDIRECT for why these bind 8443/8080
+            # instead of 443/80 directly (non-root, no CAP_NET_BIND_SERVICE).
+            - name: front-door
+              containerPort: 8443
+              protocol: TCP
+            - name: http-redirect
+              containerPort: 8080
+              protocol: TCP
+            # #309: Agent-Fabric channel broker (rendezvous + relay).
+            - name: chan-rndzv-udp
+              containerPort: 4435
+              protocol: UDP
+            - name: chan-rndzv-tcp
+              containerPort: 4435
+              protocol: TCP
+            - name: chan-relay-udp
+              containerPort: 4436
+              protocol: UDP
+            - name: chan-relay-tcp
+              containerPort: 4436
+              protocol: TCP
+            # #309: admin API -- cluster-internal only (edge-admin-
+            # service.yaml is a ClusterIP Service, not on the public
+            # LoadBalancer in edge-service.yaml).
+            - name: admin
+              containerPort: 9601
               protocol: TCP
           # #375: livenessProbe/readinessProbe alone gave a slow first start (each
           # edge mints its own internal CA and runs PoW setup *before* binding the
@@ -99,6 +156,12 @@ spec:
           volumeMounts:
             - name: shared
               mountPath: /shared
+            # #309: the Portal hostname's TLS cert+key the front door
+            # terminates with (CT_EDGE_PORTAL_CERT/_KEY, edge-config.yaml).
+            # Read-only, matching compose.frontdoor.yml's BYO-cert-dir mount.
+            - name: portal-tls
+              mountPath: /certs/portal
+              readOnly: true
       volumes:
         # #308: persistent (PVC), not emptyDir -- see the header comment. The
         # edge writes its CA root here; the operator extracts and distributes
@@ -106,3 +169,12 @@ spec:
         - name: shared
           persistentVolumeClaim:
             claimName: ct-edge-shared
+        # #309: sourced from cert-manager (edge-certificate.yaml) by default;
+        # see edge-config.yaml's CT_EDGE_PORTAL_CERT comment for the out-of-
+        # band alternative if you don't run cert-manager. Either way this
+        # Secret (ct-edge-portal-tls) must exist before the pod starts, or the
+        # mount fails and the pod stays Pending -- same fail-closed shape as
+        # every other required-secret reference in this Deployment.
+        - name: portal-tls
+          secret:
+            secretName: ct-edge-portal-tls

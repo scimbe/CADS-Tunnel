@@ -1,5 +1,37 @@
 # TLS termination for the control plane (M23.4 — "TLS everywhere").
 #
+# #309 STATUS CHANGE: NOT in kustomization.yaml's default resource list
+# anymore -- kept in this directory as a documented ALTERNATIVE path, not the
+# default. Read this before re-adding it.
+#
+# #309 investigated a real conflict this file created: the k8s base's edge
+# (edge-deployment.yaml/edge-config.yaml) now implements the SAME unified
+# :443 front door the self-host compose deployment has (ADR-0019, Option A of
+# the fork discussed on #309) -- the edge itself terminates TLS for the
+# Portal hostname and reverse-proxies to control-plane:8090
+# (CT_EDGE_PORTAL_HOST/CT_CP_PROXY_ADDR). This Ingress does the EXACT SAME
+# job (TLS-terminate + reverse-proxy to control-plane:8090) via a completely
+# separate mechanism (ingress-nginx + cert-manager HTTP-01/DNS-01). Running
+# both for the same public hostname is not a "belt and suspenders" safety
+# margin -- it is two independent TLS terminators that would both need the
+# SAME DNS name pointed at them, which no DNS record can do at once. An
+# operator would have to consciously pick exactly one, and the two are
+# easy to accidentally half-configure together (e.g. leaving this Ingress's
+# `cp.example.com` unedited while the edge front door is correctly set up
+# elsewhere, or vice versa) with no error until a real request arrives at
+# the wrong one.
+#
+# So: this file is preserved for operators who deliberately do NOT want to
+# run the edge's own :443 mux (e.g. no restrictive-:443-only-network
+# requirement, prefer a conventional ingress-nginx + cert-manager HTTP-01
+# setup they already operate) and are fine giving up the edge's "everything
+# rides one :443" property (ADR-0019's actual point) in exchange. If you
+# choose this path: add this file back to kustomization.yaml's resources AND
+# make sure the edge's CT_EDGE_PORTAL_HOST (edge-config.yaml) is left UNSET
+# (or points at a different, unused hostname) so the edge never also tries to
+# terminate the same name -- and don't apply edge-certificate.yaml for the
+# same hostname either.
+#
 # The control plane serves plain HTTP internally; all external access is over
 # HTTPS, terminated here at the ingress. The data path is already encrypted
 # independently (edge QUIC/TLS + end-to-end Noise), so this closes the last

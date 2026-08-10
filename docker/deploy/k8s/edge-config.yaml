@@ -1,6 +1,18 @@
 # Non-secret edge configuration (M21.2b). The PoW difficulty is an operational
 # knob (rendezvous cost); the edge mints its own internal CA at startup and
 # writes the CA root to CT_EDGE_CERT_OUT for out-of-band distribution to clients.
+#
+# #309: feature parity with the self-host compose stack's front door + channel
+# broker (compose.selfhost.yml + compose.frontdoor.yml). This is Option A of
+# the two shapes discussed on #309: the edge keeps its OWN bespoke SNI/ALPN
+# :443 mux (ADR-0019) as the SOLE public entry point in this k8s deployment too
+# -- not a k8s Ingress in front of it -- because the whole point of the unified
+# gateway is a single :443 that a restrictive client network will actually let
+# through (ADR-0019's "Context" section); a per-port/per-service Ingress
+# wouldn't carry the raw TCP/UDP mesh-relay or channel-broker planes anyway, and
+# running an Ingress AND the edge's own terminate-mode side by side for the same
+# public hostname would be two competing TLS terminators for one name -- see
+# kustomization.yaml's header for what that meant for control-plane-ingress.yaml.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,3 +25,69 @@ data:
   CT_EDGE_LISTEN: "0.0.0.0:4433"
   CT_EDGE_POW_DIFFICULTY: "16"
   CT_EDGE_CERT_OUT: "/shared/edge-cert.der"
+  # --- Unified :443 front door (ADR-0019, #31/#60) ------------------------
+  # Binds 8443/8080 INSIDE the container (not 443/80) -- same reasoning as
+  # compose.frontdoor.yml's own CT_FRONT_DOOR comment: the edge runs as
+  # non-root (uid 65532, see the Deployment's securityContext) and can't bind
+  # a port <1024 without CAP_NET_BIND_SERVICE, which this hardened pod
+  # deliberately does not grant. edge-service.yaml's LoadBalancer Service does
+  # the 443->8443 / 80->8080 remap at the k8s network layer instead, so
+  # externally this is unchanged: clients still connect to :443/:80.
+  CT_FRONT_DOOR: "0.0.0.0:8443"
+  CT_EDGE_HTTP_REDIRECT: "0.0.0.0:8080"
+  # Portal SNI -> terminate + reverse-proxy to the control plane, exactly like
+  # compose.frontdoor.yml's CT_EDGE_PORTAL_HOST/CT_CP_PROXY_ADDR pair. The
+  # control-plane target is the in-cluster Service DNS name (control-plane-
+  # service.yaml), not a host-network address.
+  #
+  # REPLACE ct-portal.example.com with your real Portal hostname before
+  # deploying -- same "adjust before deploy" posture as control-plane-
+  # ingress.yaml's cp.example.com placeholder and control-plane-config.yaml's
+  # CT_OIDC_ISSUER placeholder. Point this hostname's DNS at the ct-edge
+  # Service's external IP (A record), and it must match control-plane-
+  # config.yaml's CT_PORTAL_BASE_URL below -- the two are the same public
+  # hostname read by two different processes.
+  CT_EDGE_PORTAL_HOST: "ct-portal.example.com"
+  CT_CP_PROXY_ADDR: "ct-control-plane:8090"
+  # PEM cert+key the front door terminates the Portal hostname's TLS with.
+  # Sourced from a cert-manager Certificate (edge-certificate.yaml) writing to
+  # the ct-edge-portal-tls Secret, mounted read-only below -- cert-manager's
+  # own Secret key names (tls.crt/tls.key), so no remapping needed. If you are
+  # not running cert-manager, create that Secret yourself out-of-band (`kubectl
+  # create secret tls ct-edge-portal-tls --cert=... --key=...`) and drop
+  # edge-certificate.yaml from kustomization.yaml -- either way the edge just
+  # reads these two file paths.
+  CT_EDGE_PORTAL_CERT: "/certs/portal/tls.crt"
+  CT_EDGE_PORTAL_KEY: "/certs/portal/tls.key"
+  # CT_EDGE_REQUIRE_HOST_AUTH is intentionally NOT set here: unset fail-closes
+  # to "required" the moment CT_FRONT_DOOR is set (crates/edge/src/serve.rs
+  # host_auth_required(), #84) -- the safe default for a public :443, and it
+  # needs no explicit value to get it. CT_EDGE_ADMIN_TOKEN (which host-auth
+  # depends on) is a Secret -- see the Deployment's env for how it's wired.
+  #
+  # --- Agent-Fabric channel broker (#100/#103/#105) -----------------------
+  # Same ports the base self-host compose stack (compose.selfhost.yml, not an
+  # overlay) always publishes; it only actually starts listening once
+  # CT_EDGE_ADMIN_TOKEN is set (see the Deployment), same as compose.
+  CT_EDGE_CP_URL: "http://ct-control-plane:8090"
+  CT_EDGE_CHANNEL_LISTEN: "0.0.0.0:4435"
+  CT_EDGE_CHANNEL_RELAY_LISTEN: "0.0.0.0:4436"
+  # --- Admin API (#27 RB3/RB4, #23 BP4b) -----------------------------------
+  # Serves POST /admin/revoke/:token (tunnel revoke) and the host-ownership
+  # authorize/revoke routes the control plane calls (CT_CP_EDGE_ADMIN_URL).
+  # Bound on all interfaces INSIDE the pod, same as compose -- but unlike
+  # compose (which publishes it to 127.0.0.1 only on the host), here it is
+  # NOT on the public ct-edge LoadBalancer Service at all: edge-admin-
+  # service.yaml is a separate ClusterIP Service (cluster-internal only), and
+  # edge-networkpolicy.yaml scopes its ingress to the control-plane pod only
+  # -- the k8s-native equivalent of compose's loopback-only publish.
+  CT_EDGE_ADMIN_LISTEN: "0.0.0.0:9601"
+  # --- Left out of scope by #309 (see kustomization.yaml's header) --------
+  # CT_EDGE_AUTH_HOST/_ADDR/_CERT/_KEY (Keycloak Auth route, #48) and
+  # CT_EDGE_WILDCARD_CERT/_KEY (Gelb-tier tunnel wildcard, #233) are NOT wired
+  # here. Auth: no Keycloak k8s manifest exists yet in this directory --
+  # setting CT_EDGE_AUTH_* would point the front door at a Service that
+  # doesn't exist. Wildcard: it is already optional/non-fatal by design
+  # (absent -> no hostname is ever Gelb-terminated, ordinary passthrough
+  # continues) and belongs to the separate #233 tenant-tier feature, not this
+  # issue's front-door/admin/channel-broker parity scope.

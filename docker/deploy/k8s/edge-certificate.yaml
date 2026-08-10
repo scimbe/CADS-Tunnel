@@ -1,0 +1,52 @@
+# #309: real cert delivery for the edge front door's Portal TLS termination
+# (CT_EDGE_PORTAL_CERT/_KEY, edge-config.yaml) -- the k8s-native shape for
+# what the self-host compose deployment gets via `scripts/deploy-selfhost.sh`
+# running acme.sh + deSEC DNS-01 on the host and bind-mounting the resulting
+# fullchain.pem/privkey.pem into the edge container read-only
+# (compose.frontdoor.yml's PORTAL_CERT_DIR).
+#
+# This uses cert-manager (already a dependency of this kustomize base --
+# control-plane-ingress.yaml's `cert-manager.io/cluster-issuer` annotation)
+# with a DNS-01 solver, matching ADR-0019's own committed cert-issuance
+# mechanism: "Cloudflare (free API, anycast NS) remains the zero-code
+# alternative if a third party is acceptable" to the project's self-hosted
+# ct-dns responder. DNS-01 (not HTTP-01) is required here because the front
+# door's Portal route is reached on the SAME :443 the Certificate resource
+# would need an HTTP-01 challenge port for -- circular before the cert
+# exists; DNS-01 has no such chicken-and-egg problem.
+#
+# Prereqs this Kustomization does NOT provide (cluster-wide infra, same
+# "supplied out-of-band" posture as control-plane-ingress.yaml's TLS Secret):
+#   1. cert-manager installed in the cluster.
+#   2. A ClusterIssuer named `letsencrypt-dns01` (referenced below) configured
+#      with a DNS-01 solver for YOUR DNS provider -- e.g. cert-manager's
+#      built-in Cloudflare solver, or a deSEC webhook solver if you want to
+#      match ADR-0019's ct-dns/deSEC self-host mechanism exactly. See
+#      cert-manager's own ClusterIssuer docs; this is operator/DNS-provider-
+#      specific and can't be generically templated here.
+#
+# If you don't run cert-manager: delete this file's entry from
+# kustomization.yaml and instead create the ct-edge-portal-tls Secret
+# yourself, out-of-band, e.g.:
+#   kubectl -n ct-system create secret tls ct-edge-portal-tls \
+#     --cert=fullchain.pem --key=privkey.pem
+# (the same fullchain.pem/privkey.pem a deSEC DNS-01 acme.sh run produces,
+# per docs/dns01-desec.md -- just applied as a Secret instead of bind-mounted
+# into a Docker container).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ct-edge-portal-tls
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  # REPLACE with your real Portal hostname -- MUST match edge-config.yaml's
+  # CT_EDGE_PORTAL_HOST and control-plane-config.yaml's CT_PORTAL_BASE_URL.
+  dnsNames:
+    - ct-portal.example.com
+  secretName: ct-edge-portal-tls
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer

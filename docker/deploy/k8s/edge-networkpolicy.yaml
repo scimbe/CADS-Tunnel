@@ -3,18 +3,23 @@
 # see edge-config.yaml/edge-deployment.yaml) ARE the public product -- the
 # whole point of a tunnel edge is that arbitrary Agents and Clients on the
 # open internet dial in, via the ct-edge Service's `type: LoadBalancer`
-# (edge-service.yaml). There is no "internal-only" edge port in this k8s
-# deployment to lock down (unlike the compose self-host path's separate
-# admin/metrics listeners, CT_EDGE_ADMIN_LISTEN/CT_EDGE_METRICS_LISTEN --
-# neither is configured here, see edge-config.yaml).
+# (edge-service.yaml).
 #
-# So this is deliberately a from-everywhere allow, scoped only to the actual
-# data-plane port -- the point of pairing it with the default-deny policy is
-# making that "this port is intentionally open to the internet, everything
-# else on this pod is not" explicit and auditable, not narrowing it further.
-# If a future change adds an edge admin/metrics port to the k8s deployment,
-# it must get its own explicitly-scoped allow rule here (or its own policy)
-# rather than silently riding on this one.
+# So the first ingress rule below is deliberately a from-everywhere allow,
+# scoped only to the actual public data-plane ports -- the point of pairing
+# it with the default-deny policy is making that "these ports are
+# intentionally open to the internet, everything else on this pod is not"
+# explicit and auditable, not narrowing it further.
+#
+# #309 fulfills this file's own prior warning ("if a future change adds an
+# edge admin/metrics port to the k8s deployment, it must get its own
+# explicitly-scoped allow rule here"): the admin port (9601,
+# CT_EDGE_ADMIN_LISTEN) is now configured (edge-config.yaml) and served on
+# its own ClusterIP Service (edge-admin-service.yaml, NOT the public
+# LoadBalancer) -- so it gets the second, narrowly-scoped rule below instead
+# of silently riding on the from-everywhere one. Metrics
+# (CT_EDGE_METRICS_LISTEN) is still not configured here, so it still needs no
+# rule of its own.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -30,8 +35,36 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # Public data plane: mesh-relay (4433), front door (443/80), Agent-Fabric
+    # channel broker (4435/4436) -- all reachable from anywhere via the
+    # ct-edge LoadBalancer Service (edge-service.yaml). No `from` -- these are
+    # meant to be internet-reachable, same posture as 4433 already had.
     - ports:
         - protocol: UDP
           port: 4433
         - protocol: TCP
           port: 4433
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+        - protocol: UDP
+          port: 4435
+        - protocol: TCP
+          port: 4435
+        - protocol: UDP
+          port: 4436
+        - protocol: TCP
+          port: 4436
+    # #309: admin API (9601) -- cluster-internal only, and only from the
+    # control-plane pod (the only legitimate caller: host-ownership
+    # authorize/revoke, tunnel revoke push). Mirrors control-plane-
+    # networkpolicy.yaml's own pod-to-pod rule shape for the reverse
+    # direction (edge -> control-plane :8090).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ct-control-plane
+      ports:
+        - protocol: TCP
+          port: 9601

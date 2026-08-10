@@ -63,13 +63,48 @@ unchanged without either overlay.
 
 ### Hosted (Kubernetes)
 
+Before `apply`, create the two out-of-band Secrets the base needs (never
+committed — see `docker/deploy/k8s/kustomization.yaml`'s header for details):
+
+```bash
+kubectl -n ct-system create secret generic ct-edge-admin-token \
+  --from-literal=token="$(openssl rand -hex 32)"
+# ct-edge-portal-tls (tls.crt/tls.key) is auto-created by edge-certificate.yaml
+# if you run cert-manager with a DNS-01 ClusterIssuer configured; otherwise
+# create it yourself the same way as above (`kubectl create secret tls ...`).
+```
+
 ```bash
 kubectl kustomize docker/deploy/k8s   # review
 kubectl apply -k docker/deploy/k8s
 ```
 
 Deploys into namespace `ct-system`: control plane (PVC-backed, liveness/readiness
-probes), edge (LoadBalancer UDP+TCP), and a TLS-terminating ingress.
+probes) and edge (LoadBalancer UDP+TCP+the front door — see below). Also update
+`edge-config.yaml`'s `CT_EDGE_PORTAL_HOST` and `control-plane-config.yaml`'s
+`CT_PORTAL_BASE_URL`/`CT_OIDC_ISSUER` placeholders with your real values first.
+
+**Front door (#309)**: the edge runs the SAME unified `:443` front door as the
+self-host compose deployment (`compose.frontdoor.yml`, ADR-0019) — it is the
+sole public TLS-terminating entry point for the Portal, reverse-proxying to
+`ct-control-plane:8090` in-cluster. This **replaced** a separate TLS-terminating
+`Ingress` (`control-plane-ingress.yaml`) that used to do this job; that file is
+kept in the directory as a documented, opt-in alternative (see its header) for
+operators who'd rather use a conventional `ingress-nginx` + `cert-manager`
+HTTP-01 setup instead of the edge's own `:443` mux — but not both at once for
+the same hostname. The edge Service also publishes the Agent-Fabric channel
+broker (`4435`/`4436`, UDP+TCP) and keeps its admin API (`9601`) cluster-internal
+only (`ct-edge-admin`, a separate `ClusterIP` Service, not on the public
+LoadBalancer — mirroring the self-host stack's loopback-only publish of the
+same port).
+
+**Deliberately out of scope (#309)**: Keycloak/OIDC login — there is no
+Keycloak Deployment/Service in this kustomize base yet, so `CT_EDGE_AUTH_*` and
+`CT_OIDC_CLIENT_*` are left unset rather than half-wired against infrastructure
+that doesn't exist. `CT_OIDC_ISSUER` alone (already present) only enables
+JWKS-verified `/me/*` for bearer tokens minted elsewhere; it does not turn on
+browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
+`compose.sso.yml`'s Postgres-backed setup) before wiring the rest.
 
 ## Configuration
 
