@@ -15,6 +15,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+# #344: SqliteTunnelStore's read-only methods use a real connection pool instead
+# of the app-level Mutex<Connection> every other Sqlite* store still uses (see
+# storage.rs's module + struct docs for the full read/write-contention
+# reasoning). r2d2_sqlite is pinned to the exact 0.24 series because that is the
+# last version whose own Cargo.toml requires `rusqlite = "^0.31"` -- 0.25+ bumps
+# to rusqlite 0.32, which would conflict with this workspace's pinned 0.31.
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 jsonwebtoken = "9"
 hmac = "0.12"
 sha2 = "0.10"

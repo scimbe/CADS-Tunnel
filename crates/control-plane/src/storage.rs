@@ -11,6 +11,17 @@
 //! The store is deliberately backend-shaped (open / issue / redeem / binding) so
 //! a Postgres backend for the hosted deployment can follow behind the same
 //! surface.
+//!
+//! #344: every `Sqlite*` store here still uses that single `Mutex<Connection>`
+//! shape *except* [`SqliteTunnelStore`], which also pools extra read-only
+//! connections via `r2d2`/`r2d2_sqlite` (see its own struct doc for the full
+//! read/write-contention reasoning). That's a deliberate, bounded first slice,
+//! not a full migration -- every other store below (`SqliteEnrollment`,
+//! `SqliteServiceAccountStore`, `SqliteBootstrap`, `SqliteAgentDirectory`,
+//! `SqlitePipelineRegistry`, `SqliteRegistry`, `SqliteLedger`,
+//! `SqliteChannelStore`, `SqliteNetworkStore`, `SqliteTopologyStore`, plus
+//! `SqliteEdgeMesh` in `edge_mesh.rs`) is tracked, real, unattempted follow-up
+//! work, deliberately left out of scope here (see the issue for why).
 
 use std::sync::Mutex;
 
@@ -59,12 +70,43 @@ pub(crate) fn ensure_column(conn: &Connection, table: &str, column: &str, decl: 
 /// variants skip this — WAL and file locking are moot for a `:memory:` database.
 pub(crate) fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    tune_connection(&conn)?;
+    Ok(conn)
+}
+
+/// The WAL + busy_timeout tuning itself (#344), factored out of [`open_tuned`]
+/// so [`SqliteTunnelStore::open`]'s pooled reader connections (via
+/// `r2d2_sqlite::SqliteConnectionManager::with_init`) get the *identical*
+/// tuning as the hand-opened `writer` connection above, from one source of
+/// truth, instead of a second copy that could drift out of sync.
+pub(crate) fn tune_connection(conn: &Connection) -> rusqlite::Result<()> {
     // `PRAGMA journal_mode` returns the resulting mode as a row, so it must be
     // set via `query_row` — `execute`/`pragma_update` reject row-returning
     // statements. The returned value is the mode SQLite actually applied.
     let _mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(conn)
+    Ok(())
+}
+
+/// A connection for a READ-only [`SqliteTunnelStore`] method (#344; see that
+/// struct's doc): either one checked out of its `readers` pool, or —
+/// in-memory store / pool exhausted — its single `writer` connection locked
+/// directly, same as before this migration. `Deref`s to [`Connection`] so
+/// every read method's existing `conn.prepare(...)` / `conn.query_row(...)`
+/// call sites work completely unchanged regardless of which variant it holds.
+enum ReadConn<'a> {
+    Pooled(r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>),
+    Direct(std::sync::MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReadConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            ReadConn::Pooled(c) => c,
+            ReadConn::Direct(c) => c,
+        }
+    }
 }
 
 /// #192: the identical `open` / `open_in_memory` constructor pair that every `Sqlite*` store below
@@ -1432,13 +1474,94 @@ impl From<rusqlite::Error> for GrantError {
 /// It also holds per-tunnel access **grants** (#29): the owner shares a tunnel
 /// with other subjects, and [`is_authorized`](Self::is_authorized) answers
 /// whether a subject may use it.
+///
+/// #344: this store is one of two (so far) with a connection **pool**
+/// (`readers`) alongside its dedicated single writer connection, instead of
+/// every operation sharing one `Mutex<Connection>` like the other Sqlite*
+/// stores in this file still do. It was picked as the first slice because its
+/// own hottest path (`/portal/tunnels` -> [`list_authorized_for_subject`] +
+/// per-row [`cert_admission_for_hostname`], the finding's own cited example)
+/// is genuinely read-heavy, and its WAL journal mode ([`open_tuned`]) already
+/// supports concurrent readers at the SQLite engine level -- the old
+/// `Mutex<Connection>` was the only thing serializing them anyway.
+///
+/// This store is **not** read-only, though (`create`/`revoke`/`grant`/the
+/// Rot-Gelb-Grün admission-queue transitions all write), so pooling every
+/// method would let previously-impossible concurrent writers race for
+/// SQLite's single engine-level write lock, with only the 5s `busy_timeout`
+/// standing between that race and a real `SQLITE_BUSY` surfacing to a caller
+/// (see `open_tuned`'s doc: today the app-level `Mutex` makes that timeout
+/// decorative, since this process never contends with itself). Rather than
+/// prove that's safe under contention, every WRITE method keeps going through
+/// `writer` -- the exact same single dedicated connection, same lock, same
+/// full serialization as every other store's `conn` field today. Only the
+/// READ-only methods (see [`Self::read`]) take a connection from `readers`
+/// instead, so this migration changes nothing about write behavior and only
+/// parallelizes what WAL already allowed to run concurrently at the engine
+/// level. `r2d2`/`r2d2_sqlite` has no separate "pooled reads, one writer"
+/// primitive -- `SqliteConnectionManager` just manages homogeneous pooled
+/// connections -- so this hybrid is hand-rolled at the store level instead.
 pub struct SqliteTunnelStore {
-    conn: Mutex<Connection>,
+    /// The one connection every WRITE method uses, unchanged from before this
+    /// migration (see the struct doc above for why writes stay serialized).
+    writer: Mutex<Connection>,
+    /// Extra read-only connections for every READ-only method (see
+    /// [`Self::read`]). `None` for an in-memory store: a `:memory:` database is
+    /// private to the `Connection` that opened it, so a second pooled
+    /// connection would see an empty, disconnected database rather than a
+    /// shared one (SQLite's shared-cache URI mode could fix this, but
+    /// `open_in_memory` is test/stateless-run-only, so it isn't worth the
+    /// complexity -- reads there just fall back to `writer`, exactly like
+    /// before this migration).
+    readers: Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>,
 }
 
-sqlite_store_ctors!(SqliteTunnelStore);
-
 impl SqliteTunnelStore {
+    /// Open (creating if needed) a durable store at `path` on a tuned WAL
+    /// connection, plus a pool of extra read-only connections to the same file
+    /// (#344; see the struct doc). Hand-written rather than
+    /// [`sqlite_store_ctors!`] because that macro's `open`/`open_in_memory` pair
+    /// is deliberately identical modulo `Connection::open` vs `open_in_memory`
+    /// -- this store's `open` does genuinely more (builds the pool too), and
+    /// its `open_in_memory` deliberately does NOT (see `readers`' doc), so the
+    /// two are no longer simple twins of each other.
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let mut store = Self::from_connection(open_tuned(path)?)?;
+        // `build_unchecked`: connections are opened lazily on first checkout
+        // rather than eagerly here, so a transient issue opening extra reader
+        // connections can never fail store construction -- the eagerly-opened
+        // `writer` connection above already proved `path` itself is openable.
+        // Every pooled connection gets the identical WAL + busy_timeout tuning
+        // as `writer` via `with_init` (`tune_connection`, factored out of
+        // `open_tuned` so both share one source of truth for the tuning).
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
+        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        Ok(store)
+    }
+
+    /// Open an ephemeral in-memory store (for tests / stateless runs). No
+    /// reader pool (#344; see the struct doc) -- every method, read or write,
+    /// goes through `writer`, exactly like before this migration.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// A connection for a READ-only method (#344). Prefers a pooled reader
+    /// connection when one exists (a file-backed store, concurrent with other
+    /// readers at the SQLite/WAL engine level); falls back to `writer` for an
+    /// in-memory store (no pool -- see `readers`' doc) or if the pool is
+    /// transiently exhausted/unavailable (never a hard failure: a read simply
+    /// degrades to the same serialized-but-correct path every method used
+    /// before this migration, rather than surfacing a pool error to the
+    /// caller).
+    fn read(&self) -> ReadConn<'_> {
+        match self.readers.as_ref().and_then(|pool| pool.get().ok()) {
+            Some(pooled) => ReadConn::Pooled(pooled),
+            None => ReadConn::Direct(self.writer.lock_safe()),
+        }
+    }
+
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS subject_tunnels (
@@ -1541,7 +1664,8 @@ impl SqliteTunnelStore {
              );",
         )?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers: None,
         })
     }
 
@@ -1565,7 +1689,7 @@ impl SqliteTunnelStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.conn.lock_safe().execute(
+        self.writer.lock_safe().execute(
             "INSERT INTO subject_tunnels (id, subject, name, hostname, created_at, routing_token)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, subject, name, hostname, created_at, routing_token],
@@ -1581,7 +1705,7 @@ impl SqliteTunnelStore {
 
     /// List `subject`'s own tunnels, newest first.
     pub fn list_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<SubjectTunnel>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT id, name, hostname, created_at, routing_token FROM subject_tunnels
              WHERE subject = ?1 ORDER BY created_at DESC, id",
@@ -1602,7 +1726,7 @@ impl SqliteTunnelStore {
     /// portal-created tunnels (an admin/migration read, not subject-scoped like the rest
     /// of this store's API; deliberately doesn't leak into any customer-facing route).
     pub fn all(&self) -> rusqlite::Result<Vec<SubjectTunnel>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT id, name, hostname, created_at, routing_token FROM subject_tunnels ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
@@ -1631,7 +1755,7 @@ impl SqliteTunnelStore {
     /// restart. This table is the CP's half of that fix (see
     /// [`Self::list_revoked_tokens`]); the Edge's boot-time fetch is the other.
     pub fn revoke(&self, subject: &str, id: &str, now: u64) -> rusqlite::Result<Option<String>> {
-        let mut guard = self.conn.lock_safe();
+        let mut guard = self.writer.lock_safe();
         let tx = guard.transaction()?;
         let token: Option<String> = tx
             .query_row(
@@ -1663,7 +1787,7 @@ impl SqliteTunnelStore {
     /// kind of durable, queryable store the growth concern in #280 was about
     /// the Edge NOT having.
     pub fn list_revoked_tokens(&self) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT token FROM revoked_tokens")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect()
@@ -1673,14 +1797,13 @@ impl SqliteTunnelStore {
     /// Used to gate agent onboarding — only the owner installs an agent for a
     /// tunnel (#28).
     pub fn owns(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
-        Ok(Self::owner_of(&self.conn.lock_safe(), tunnel_id)?.as_deref() == Some(subject))
+        Ok(Self::owner_of(&self.read(), tunnel_id)?.as_deref() == Some(subject))
     }
 
     /// The Browser-Plane hostname of a tunnel the caller owns, if any (#38 DL2):
     /// used to clear the tunnel's DNS record on revoke. Owner-scoped.
     pub fn tunnel_hostname(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
                 params![tunnel_id, subject],
@@ -1694,8 +1817,7 @@ impl SqliteTunnelStore {
     /// unknown or owned by someone else (#27 RB2). Owner-scoped so a non-owner
     /// cannot read another customer's routing token.
     pub fn routing_token(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT routing_token FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
                 params![tunnel_id, subject],
@@ -1707,7 +1829,7 @@ impl SqliteTunnelStore {
     /// Enable/disable the Browser-Plane login gate for a tunnel the caller owns
     /// (#382-follow). `false` if the id is unknown or owned by someone else.
     pub fn set_require_login(&self, subject: &str, tunnel_id: &str, enabled: bool) -> rusqlite::Result<bool> {
-        let n = self.conn.lock_safe().execute(
+        let n = self.writer.lock_safe().execute(
             "UPDATE subject_tunnels SET require_login = ?1 WHERE id = ?2 AND subject = ?3",
             params![enabled as i64, tunnel_id, subject],
         )?;
@@ -1718,8 +1840,7 @@ impl SqliteTunnelStore {
     /// `None` if the id is unknown or owned by someone else. Owner-scoped, for
     /// rendering the portal checkbox's current state.
     pub fn require_login(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<bool>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT require_login FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
                 params![tunnel_id, subject],
@@ -1737,8 +1858,7 @@ impl SqliteTunnelStore {
     /// hostname-only shape.
     pub fn require_login_for_hostname(&self, hostname: &str) -> rusqlite::Result<bool> {
         Ok(self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT require_login FROM subject_tunnels WHERE hostname = ?1",
                 params![hostname],
@@ -1759,7 +1879,7 @@ impl SqliteTunnelStore {
         email: &str,
         now: u64,
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let hostname: Option<String> = conn
             .query_row(
                 "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
@@ -1780,7 +1900,7 @@ impl SqliteTunnelStore {
     /// Remove `email` from a tunnel's login-gate allow-list (#382-follow),
     /// owner-scoped like [`login_allowlist_add`](Self::login_allowlist_add).
     pub fn login_allowlist_remove(&self, subject: &str, tunnel_id: &str, email: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let hostname: Option<String> = conn
             .query_row(
                 "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
@@ -1800,7 +1920,7 @@ impl SqliteTunnelStore {
     /// List a tunnel's login-gate allow-listed emails (#382-follow), owner-scoped:
     /// `None` if the id is unknown, owned by someone else, or has no hostname yet.
     pub fn login_allowlist_list(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<Vec<String>>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let hostname: Option<String> = conn
             .query_row(
                 "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
@@ -1821,8 +1941,7 @@ impl SqliteTunnelStore {
     /// -- the one check `GET /portal/callback` needs after a successful gate login.
     pub fn email_allowed_for_hostname(&self, hostname: &str, email: &str) -> rusqlite::Result<bool> {
         Ok(self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT 1 FROM tunnel_login_allowlist WHERE hostname = ?1 AND email = ?2",
                 params![hostname, email.to_ascii_lowercase()],
@@ -1844,7 +1963,7 @@ impl SqliteTunnelStore {
         if !self.require_login_for_hostname(hostname)? {
             return Ok(false);
         }
-        self.conn.lock_safe().execute(
+        self.writer.lock_safe().execute(
             "INSERT INTO gate_access_requests (hostname, email, note, requested_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(hostname, email) DO UPDATE SET note = excluded.note, requested_at = excluded.requested_at",
             params![hostname, email.to_ascii_lowercase(), note, now as i64],
@@ -1858,7 +1977,7 @@ impl SqliteTunnelStore {
     /// unknown, owned by someone else, or has no hostname yet. Oldest first, so
     /// the owner reviews in the order requests actually arrived.
     pub fn pending_access_requests(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<Vec<(String, String, i64)>>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let hostname: Option<String> = conn
             .query_row(
                 "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
@@ -1884,7 +2003,7 @@ impl SqliteTunnelStore {
     /// actually been granted access so it doesn't linger as "pending" after
     /// being satisfied.
     pub fn dismiss_access_request(&self, subject: &str, tunnel_id: &str, email: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let hostname: Option<String> = conn
             .query_row(
                 "SELECT hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
@@ -1910,7 +2029,7 @@ impl SqliteTunnelStore {
         subject: &str,
         tunnel_id: &str,
     ) -> rusqlite::Result<Option<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let row: Option<(String, String)> = conn
             .query_row(
                 "SELECT subject, routing_token FROM subject_tunnels WHERE id = ?1",
@@ -1945,7 +2064,7 @@ impl SqliteTunnelStore {
         subject: &str,
         tunnel_id: &str,
     ) -> rusqlite::Result<Option<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let row: Option<(String, Option<String>)> = conn
             .query_row(
                 "SELECT subject, hostname FROM subject_tunnels WHERE id = ?1",
@@ -1976,7 +2095,7 @@ impl SqliteTunnelStore {
         &self,
         subject: &str,
     ) -> rusqlite::Result<Vec<(SubjectTunnel, bool)>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT id, name, hostname, created_at, routing_token, subject = ?1
              FROM subject_tunnels
@@ -2007,8 +2126,7 @@ impl SqliteTunnelStore {
     /// [`Self::all`]'s "admin/migration read, deliberately not customer-facing"
     /// precedent rather than reusing the owner-scoped lookups above.
     pub fn routing_token_for_hostname(&self, hostname: &str) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT routing_token FROM subject_tunnels WHERE hostname = ?1",
                 params![hostname],
@@ -2024,7 +2142,7 @@ impl SqliteTunnelStore {
     /// hostname is already `gruen` -- a queue position stops meaning anything
     /// the moment a hostname leaves the "waiting" sub-state.
     pub fn cert_admission_for_hostname(&self, hostname: &str) -> rusqlite::Result<Option<CertAdmission>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let row: Option<(String, Option<String>, String, Option<i64>, Option<i64>)> = conn
             .query_row(
                 "SELECT status, assigned_ca, claim_state, claim_deadline, queued_at
@@ -2056,7 +2174,7 @@ impl SqliteTunnelStore {
     /// first time (`queued_at = now`). No-op (`Ok(false)`) unless the
     /// hostname is currently `rot` -- callers must not clobber later state.
     pub fn enter_gelb_queue(&self, hostname: &str, now: i64) -> rusqlite::Result<bool> {
-        let affected = self.conn.lock_safe().execute(
+        let affected = self.writer.lock_safe().execute(
             "UPDATE subject_tunnels SET status = 'gelb', queued_at = ?2
              WHERE hostname = ?1 AND status = 'rot'",
             params![hostname, now],
@@ -2071,7 +2189,7 @@ impl SqliteTunnelStore {
     /// store has no visibility into that, deliberately (edge_mesh is a
     /// separate database with a separate concern).
     pub fn rot_hostnames(&self) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT hostname FROM subject_tunnels WHERE status = 'rot' AND hostname IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -2087,7 +2205,7 @@ impl SqliteTunnelStore {
     /// so that gap self-heals within one tick of any edge restart, current or
     /// future, without a new edge-side rehydration protocol.
     pub fn gelb_hostnames(&self) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT hostname FROM subject_tunnels WHERE status = 'gelb' AND hostname IS NOT NULL")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -2097,7 +2215,7 @@ impl SqliteTunnelStore {
     /// Hostnames queued (Gelb, unclaimed, unassigned) in strict FIFO order --
     /// the admission sweep's candidate list, oldest `queued_at` first.
     pub fn gelb_queue_fifo(&self) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT hostname FROM subject_tunnels
              WHERE status = 'gelb' AND claim_state = 'none' AND assigned_ca IS NULL
@@ -2113,7 +2231,7 @@ impl SqliteTunnelStore {
     /// window. Returns `false` if the hostname already had a CA assigned
     /// (already offered or already `gruen`) -- a race-safe no-op, not an error.
     pub fn offer_claim(&self, hostname: &str, ca: &str, now: i64, deadline: i64) -> rusqlite::Result<bool> {
-        let affected = self.conn.lock_safe().execute(
+        let affected = self.writer.lock_safe().execute(
             "UPDATE subject_tunnels
              SET assigned_ca = ?2, claim_state = 'offered', claim_offered_at = ?3, claim_deadline = ?4
              WHERE hostname = ?1 AND assigned_ca IS NULL",
@@ -2129,7 +2247,7 @@ impl SqliteTunnelStore {
     /// `lapsed`, awaiting an explicit customer re-request. Returns the number
     /// of rows lapsed this sweep.
     pub fn lapse_expired_claims(&self, now: i64) -> rusqlite::Result<usize> {
-        self.conn.lock_safe().execute(
+        self.writer.lock_safe().execute(
             "UPDATE subject_tunnels
              SET claim_state = 'lapsed', assigned_ca = NULL, claim_offered_at = NULL, claim_deadline = NULL
              WHERE claim_state = 'offered' AND claim_deadline < ?1",
@@ -2144,7 +2262,7 @@ impl SqliteTunnelStore {
     /// is both owned by `subject` and actually `lapsed` -- can't be used to
     /// jump a still-waiting, already-offered, or already-`gruen` hostname.
     pub fn reclaim_cert_slot(&self, subject: &str, hostname: &str, now: i64) -> rusqlite::Result<bool> {
-        let affected = self.conn.lock_safe().execute(
+        let affected = self.writer.lock_safe().execute(
             "UPDATE subject_tunnels
              SET claim_state = 'none', queued_at = ?3
              WHERE hostname = ?1 AND subject = ?2 AND claim_state = 'lapsed'",
@@ -2192,7 +2310,7 @@ impl SqliteTunnelStore {
         domain: &str,
         now: i64,
     ) -> rusqlite::Result<Option<String>> {
-        let mut guard = self.conn.lock_safe();
+        let mut guard = self.writer.lock_safe();
         let tx = guard.transaction()?;
         let ca: Option<String> = tx
             .query_row(
@@ -2232,7 +2350,7 @@ impl SqliteTunnelStore {
     /// sweep retries every row here each tick until [`Self::clear_pending_revert`]
     /// confirms one actually landed.
     pub fn pending_revert_hostnames(&self) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT hostname FROM subject_tunnels WHERE status = 'gruen' AND pending_revert = 1 AND hostname IS NOT NULL",
         )?;
@@ -2244,7 +2362,7 @@ impl SqliteTunnelStore {
     /// [`crate::acme_broker::push_channel_tier`] reports success, so
     /// [`Self::pending_revert_hostnames`] stops retrying it.
     pub fn clear_pending_revert(&self, hostname: &str) -> rusqlite::Result<()> {
-        self.conn
+        self.writer
             .lock_safe()
             .execute("UPDATE subject_tunnels SET pending_revert = 0 WHERE hostname = ?1", params![hostname])?;
         Ok(())
@@ -2258,7 +2376,7 @@ impl SqliteTunnelStore {
     /// budget, and must count against headroom just as much as a completed
     /// issuance so the admission sweep never over-commits a CA's real limit.
     pub fn ca_budget_usage(&self, ca: &str, domain: &str, since: i64) -> rusqlite::Result<(i64, i64)> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let used: i64 = conn.query_row(
             "SELECT COUNT(*) FROM acme_issuance_log WHERE ca = ?1 AND domain = ?2 AND issued_at >= ?3",
             params![ca, domain, since],
@@ -2286,7 +2404,7 @@ impl SqliteTunnelStore {
     /// re-granting the same subject is a no-op. Fails with
     /// [`GrantError::NotOwner`] unless `owner` actually owns `tunnel_id`.
     pub fn grant(&self, owner: &str, tunnel_id: &str, grantee: &str) -> Result<(), GrantError> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         match Self::owner_of(&conn, tunnel_id)? {
             Some(s) if s == owner => {}
             _ => return Err(GrantError::NotOwner),
@@ -2306,7 +2424,7 @@ impl SqliteTunnelStore {
         tunnel_id: &str,
         grantee: &str,
     ) -> Result<bool, GrantError> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         match Self::owner_of(&conn, tunnel_id)? {
             Some(s) if s == owner => {}
             _ => return Err(GrantError::NotOwner),
@@ -2322,7 +2440,7 @@ impl SqliteTunnelStore {
     /// Fails with [`GrantError::NotOwner`] for non-owners (so a non-owner cannot
     /// even enumerate who a tunnel is shared with).
     pub fn list_grants(&self, owner: &str, tunnel_id: &str) -> Result<Vec<String>, GrantError> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         match Self::owner_of(&conn, tunnel_id)? {
             Some(s) if s == owner => {}
             _ => return Err(GrantError::NotOwner),
@@ -2338,7 +2456,7 @@ impl SqliteTunnelStore {
     /// a grant (#29). This is the authorization gate for capability access to a
     /// shared tunnel — `false` for an unknown tunnel.
     pub fn is_authorized(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         if Self::owner_of(&conn, tunnel_id)?.as_deref() == Some(subject) {
             return Ok(true);
         }
@@ -3803,10 +3921,17 @@ mod tests {
 
     #[test]
     fn every_sqlite_store_constructs_via_the_shared_ctor_macro() {
-        // #192 (frozen): sqlite_store_ctors! generates open/open_in_memory for all 10 stores, each
-        // delegating to its own from_connection. The regression the macro could introduce is "a store
-        // no longer opens / its schema isn't applied", so construct every one — a failure here (a
-        // store dropped from the macro, a broken from_connection) fails loudly, not silently at boot.
+        // #192 (frozen): sqlite_store_ctors! generates open/open_in_memory for 9 of these 10
+        // stores, each delegating to its own from_connection. The regression the macro could
+        // introduce is "a store no longer opens / its schema isn't applied", so construct every
+        // one — a failure here (a store dropped from the macro, a broken from_connection) fails
+        // loudly, not silently at boot.
+        //
+        // #344: SqliteTunnelStore is the one exception — it now has its own hand-written
+        // open/open_in_memory (see its struct doc) instead of the macro, because its `open` also
+        // builds a reader connection pool that the macro's shared shape has no parameter for.
+        // Its `open_in_memory` still exists with the identical signature, so it belongs in this
+        // same "every store constructs" regression net regardless of which ctor wrote it.
         SqliteEnrollment::open_in_memory().unwrap();
         SqliteBootstrap::open_in_memory().unwrap();
         SqliteAgentDirectory::open_in_memory().unwrap();
@@ -4348,6 +4473,154 @@ mod tests {
         drop(store);
 
         // Clean up the DB plus the WAL/SHM sidecars WAL mode creates.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn pooled_reads_run_concurrently_while_the_same_pattern_serializes_without_a_pool_344() {
+        // #344: the actual performance claim -- a file-backed `open()` store's READ-only
+        // methods (`Self::read`) take a connection from `readers` instead of the single
+        // `writer` `Mutex<Connection>` every other store still uses, so N concurrent slow
+        // reads should overlap instead of queuing one after another. Matching this repo's
+        // own house style for proving a performance claim empirically (#341,
+        // crates/edge/src/serve.rs): real concurrent threads, a real elapsed-time
+        // measurement, and a generous-but-real threshold -- not a micro-benchmark
+        // assertion. Proven two ways in one test, same workload, only the store shape
+        // differs: a file-backed pooled store (fast, ~1 SLEEP) vs. an in-memory store
+        // (`readers: None`, per its own struct doc) that still serializes every read
+        // through `writer` exactly like before this migration (~N * SLEEP) -- so the
+        // speedup is demonstrably attributable to the pool, not some other test artifact.
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const N: usize = 8;
+        const SLEEP: Duration = Duration::from_millis(100);
+
+        fn run_n_concurrent_slow_reads(store: &Arc<SqliteTunnelStore>, n: usize) -> Duration {
+            let started = Instant::now();
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let store = Arc::clone(store);
+                    std::thread::spawn(move || {
+                        // Hold a real connection from `Self::read` for the sleep duration --
+                        // simulates a slow query without needing one, and exercises the exact
+                        // guard (`ReadConn`) every read method above actually uses.
+                        let _conn = store.read();
+                        std::thread::sleep(SLEEP);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            started.elapsed()
+        }
+
+        // File-backed: `open()` builds the reader pool (max_size 8, matching N here) --
+        // all N reads should be able to check out their own connection and overlap.
+        let path = temp_db_path();
+        let pooled = Arc::new(SqliteTunnelStore::open(&path).unwrap());
+        let pooled_elapsed = run_n_concurrent_slow_reads(&pooled, N);
+
+        // In-memory: no pool, so every `read()` falls back to locking `writer` directly --
+        // the same single-`Mutex<Connection>` serialization #344's finding describes.
+        let unpooled = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let unpooled_elapsed = run_n_concurrent_slow_reads(&unpooled, N);
+
+        assert!(
+            pooled_elapsed < SLEEP * 3,
+            "pooled reads should run concurrently (~1x SLEEP), not serialize: {pooled_elapsed:?} for \
+             {N} reads of {SLEEP:?} each"
+        );
+        assert!(
+            unpooled_elapsed >= SLEEP * (N as u32) / 2,
+            "unpooled (in-memory) reads should still serialize through the writer mutex \
+             (~{N}x SLEEP): got only {unpooled_elapsed:?} for {N} reads of {SLEEP:?} each"
+        );
+
+        drop(pooled);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn concurrent_readers_and_writers_all_succeed_under_the_pool_within_busy_timeout_344() {
+        // #344: the correctness question the migration's own struct doc raises -- pooling
+        // reads means pooled reader connections now run against the SAME on-disk file WHILE
+        // `writer` is actively landing writes, a genuinely new interleaving that didn't exist
+        // when one Mutex<Connection> serialized everything in-process. WRITE methods
+        // (`create`) still all funnel through the single `writer` connection (unchanged from
+        // before this migration), so they can never race EACH OTHER for SQLite's one
+        // engine-level write lock -- what this test actually exercises is real concurrent
+        // readers (the pool) mixed with a real concurrent write workload, asserting both that
+        // no operation ever errors (would surface as a real SQLITE_BUSY past the 5s
+        // busy_timeout) and that the durable end state has exactly the rows every writer
+        // thread actually wrote -- not just "it didn't panic once".
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WRITERS: usize = 4;
+        const CREATES_PER_WRITER: usize = 25;
+        const READERS: usize = 4;
+
+        let path = temp_db_path();
+        let store = Arc::new(SqliteTunnelStore::open(&path).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Readers hammer the hot path #344's own finding cites (`list_authorized_for_subject`,
+        // the `/portal/tunnels` handler's own call) via the pool, for the whole test.
+        let reader_handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        store
+                            .list_authorized_for_subject("writer-0")
+                            .expect("a concurrent read must not error while writes are landing");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        // Writers concurrently create real rows through `writer` -- the exact same
+        // serialization every other store's Mutex<Connection> already provides today, now
+        // proven under real concurrent callers plus a concurrent read workload on top.
+        let writer_handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for i in 0..CREATES_PER_WRITER {
+                        store
+                            .create(&format!("writer-{w}"), &format!("t{i}"), None)
+                            .expect("a concurrent create must succeed within the 5s busy_timeout");
+                    }
+                })
+            })
+            .collect();
+
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total_reads: u32 = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total_reads > 0, "readers actually ran concurrently with the writers, not sequentially after");
+
+        // Durable end state: every create() from every writer thread landed exactly once --
+        // no write silently lost to a race, no duplicate, under real concurrent access.
+        assert_eq!(
+            store.all().unwrap().len(),
+            WRITERS * CREATES_PER_WRITER,
+            "every concurrent create() across every writer thread landed exactly once"
+        );
+
+        drop(store);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
