@@ -1115,12 +1115,43 @@ mod tests {
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert!(location.starts_with("https://kc.example/realms/ct/protocol/openid-connect/auth?"));
         assert!(location.contains("redirect_uri=https%3A%2F%2Fbunsenbrenner.org%2Fgate%2Fcallback"));
+        assert!(
+            location.contains("&prompt=login&"),
+            "devsystem#20: gate_start must force a real re-auth, never silently reuse an existing Keycloak SSO session: {location}"
+        );
 
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
         assert!(cookies.iter().any(|c| c.starts_with(&format!("{GATE_STATE_COOKIE}="))));
         assert!(cookies
             .iter()
             .any(|c| c.starts_with(&format!("{GATE_TARGET_COOKIE}=demo.bunsenbrenner.org"))));
+    }
+
+    #[tokio::test]
+    // devsystem#20: reported live -- clicking the in-app "logout" link only clears
+    // this host's own gate cookie (see `gate_logout`'s doc comment), so the very
+    // next "Sign in" click silently re-authenticated as the SAME account via the
+    // still-live `auth.bunsenbrenner.org` SSO session, with no prompt at all. This
+    // is the one place `gate_start` can still force a real credentials check.
+    async fn gate_start_forces_a_real_reauth_instead_of_silently_reusing_an_existing_sso_session_devsystem_20() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let resp = app
+            .oneshot(Request::get("/gate/start?host=demo.bunsenbrenner.org&return=/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(
+            location.contains("prompt=login"),
+            "must send the standard OIDC prompt=login parameter so Keycloak re-authenticates \
+             regardless of any existing SSO session, instead of silently redirecting straight \
+             back into the app as whoever was already signed in: {location}"
+        );
     }
 
     #[tokio::test]

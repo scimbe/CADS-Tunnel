@@ -216,9 +216,21 @@ impl PortalOidc {
     /// authorize request's `redirect_uri` must exactly match whichever one the
     /// later token exchange will send). No idp/login hint or register-mode
     /// support -- the gate flow doesn't need either.
+    ///
+    /// (devsystem#20) Always sends `prompt=login` (a standard OIDC parameter,
+    /// which Keycloak honors) -- without it, an explicit "Sign in" click here
+    /// silently reuses any still-live `auth.bunsenbrenner.org` SSO session
+    /// instead of asking for credentials, which is indistinguishable from the
+    /// gate's own logout having done nothing: clicking logout only clears this
+    /// host's own gate cookie (see `gate_logout`'s doc comment), so the next
+    /// "Sign in" click is the one place this route can still force a real
+    /// re-auth. The sole caller today is `gate_start`; if `authorize_redirect_to`
+    /// ever gets a second caller that legitimately wants silent SSO reuse, that
+    /// caller needs its own explicit opt-out, not a shared default that forgets
+    /// this bug.
     pub(crate) fn authorize_redirect_to(&self, state: &str, redirect_uri: &str) -> String {
         format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}&ui_locales=en",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}&prompt=login&ui_locales=en",
             self.authorize_url,
             urlencode(&self.client_id),
             urlencode(redirect_uri),
