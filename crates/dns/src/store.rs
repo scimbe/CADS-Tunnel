@@ -17,13 +17,20 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{PoisonError, RwLock};
 
 /// Thread-safe store of challenge name -> TXT values, with optional crash-safe
 /// persistence to a flat file (#302).
+///
+/// #356: `RwLock`, not `Mutex` -- `txt()` (the real DNS hot path, called once per
+/// incoming query) only ever needs a shared read; `add_txt`/`set_txt`/`clear`
+/// (ACME publish/cleanup, orders of magnitude rarer) need exclusive write access.
+/// A `Mutex` made every read exclusive too, serializing concurrent queries behind
+/// each other for no reason -- a burst of resolver retries/parallel TCP queries
+/// all wait on the same lock even though none of them are mutating anything.
 #[derive(Default)]
 pub struct AcmeDnsStore {
-    txt: Mutex<HashMap<String, Vec<String>>>,
+    txt: RwLock<HashMap<String, Vec<String>>>,
     persist_path: Option<PathBuf>,
 }
 
@@ -51,15 +58,29 @@ impl AcmeDnsStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e),
         };
-        let store = Self { txt: Mutex::new(txt), persist_path: Some(path) };
+        let store = Self { txt: RwLock::new(txt), persist_path: Some(path) };
         // Prove the path is actually writable now, at startup, rather than silently
         // discovering it on the first real publish deep into an issuance attempt.
         store.persist()?;
         Ok(store)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<String>>> {
-        self.txt.lock().unwrap_or_else(PoisonError::into_inner)
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<String>>> {
+        self.txt.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Vec<String>>> {
+        self.txt.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// #356 (test-only instrumentation): the whole point of an `RwLock` over a
+    /// `Mutex` is that multiple readers can hold it at once, which isn't
+    /// otherwise observable through `txt()`'s public API alone (it acquires and
+    /// releases its guard within one call). Exposes a way to hold a read guard
+    /// open so a test can prove a SECOND concurrent read still succeeds.
+    #[cfg(test)]
+    pub(crate) fn hold_read_lock_for_test(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<String>>> {
+        self.read()
     }
 
     /// Write the full current state to `persist_path`, if set. Atomic: write to a
@@ -67,7 +88,7 @@ impl AcmeDnsStore {
     /// atomic replace, so a crash mid-write can never leave a torn/partial file.
     fn persist(&self) -> std::io::Result<()> {
         let Some(path) = &self.persist_path else { return Ok(()) };
-        let json = serde_json::to_vec(&*self.lock())?;
+        let json = serde_json::to_vec(&*self.read())?;
         let tmp_path = path.with_extension("tmp");
         let mut tmp = std::fs::File::create(&tmp_path)?;
         tmp.write_all(&json)?;
@@ -79,7 +100,7 @@ impl AcmeDnsStore {
     /// Publish a TXT value for `name` (ACME may need two challenges live at once,
     /// so values accumulate). Names are matched case-insensitively.
     pub fn add_txt(&self, name: &str, value: &str) {
-        self.lock()
+        self.write()
             .entry(name.to_ascii_lowercase())
             .or_default()
             .push(value.to_string());
@@ -94,7 +115,7 @@ impl AcmeDnsStore {
 
     /// Replace all TXT values for `name` with a single value.
     pub fn set_txt(&self, name: &str, value: &str) {
-        self.lock()
+        self.write()
             .insert(name.to_ascii_lowercase(), vec![value.to_string()]);
         // Fail-soft: the in-memory map (already updated above) stays authoritative
         // for this process's lifetime regardless of persist() succeeding -- a
@@ -107,7 +128,7 @@ impl AcmeDnsStore {
 
     /// Remove all TXT values for `name` (challenge cleanup).
     pub fn clear(&self, name: &str) {
-        self.lock().remove(&name.to_ascii_lowercase());
+        self.write().remove(&name.to_ascii_lowercase());
         // Fail-soft: the in-memory map (already updated above) stays authoritative
         // for this process's lifetime regardless of persist() succeeding -- a
         // transient write failure (e.g. disk full) must not block issuance, only
@@ -128,8 +149,12 @@ impl AcmeDnsStore {
     /// API's tests, still gets the same case-insensitive lookup this store's own
     /// contract promises -- this is purely an allocation-avoidance fast path, not a
     /// narrowed contract).
+    ///
+    /// #356: takes only a shared read lock (RwLock), not an exclusive one -- many
+    /// concurrent queries can read at once, and only ever contend with the rare
+    /// ACME publish/cleanup write, not with each other.
     pub fn txt(&self, name: &str) -> Vec<String> {
-        let guard = self.lock();
+        let guard = self.read();
         if name.bytes().any(|b| b.is_ascii_uppercase()) {
             guard.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default()
         } else {
@@ -160,6 +185,37 @@ mod tests {
         assert_eq!(s.txt("_acme-challenge.host.test"), vec!["only".to_string()]);
         s.clear("_acme-challenge.host.test");
         assert!(s.txt("_acme-challenge.host.test").is_empty());
+    }
+
+    #[test]
+    fn concurrent_reads_do_not_serialize_behind_each_other_356() {
+        // #356: the real point of RwLock over Mutex -- multiple readers can hold
+        // the lock at the same time, so a burst of concurrent queries never waits
+        // on another query that's ALSO just reading. Hold a read guard open on
+        // this thread, then have a second thread call the real, public txt()
+        // concurrently: with a Mutex-backed store, that second read would block
+        // until this thread's guard drops (deadlocking this test, since the guard
+        // is held for the test's own duration); with RwLock it must succeed
+        // promptly.
+        let s = std::sync::Arc::new(AcmeDnsStore::new());
+        s.add_txt("_acme-challenge.host.test", "tok");
+
+        let guard = s.hold_read_lock_for_test();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s2 = s.clone();
+        std::thread::spawn(move || {
+            tx.send(s2.txt("_acme-challenge.host.test")).unwrap();
+        });
+
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect(
+                "a second concurrent read must complete while another read guard is \
+                 still held -- a Mutex-backed store would have blocked here",
+            );
+        assert_eq!(result, vec!["tok".to_string()]);
+        drop(guard);
     }
 
     #[test]
