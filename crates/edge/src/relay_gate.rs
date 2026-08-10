@@ -35,6 +35,60 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// it can't wedge the front door.
 const RELAY_GATE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// #422: bound on completing the TLS handshake itself, before [`RELAY_GATE_TIMEOUT`]'s
+/// pre-auth exchange even starts. [`RELAY_GATE_TIMEOUT`] only covers the grant/challenge
+/// exchange that follows a completed handshake — the handshake (`TlsAcceptor::accept`)
+/// itself was unbounded, so a peer that opens a TCP connection and stalls mid-handshake
+/// held a front-door connection-cap permit forever. Same 10s value as
+/// `crate::serve::FRONT_DOOR_TLS_ACCEPT_TIMEOUT`, the sibling bound on the other
+/// TLS-terminating front-door legs.
+const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// #427: the relay-gate's own module doc names the threat precisely — "an unguarded
+/// public relay is an open proxy" — but that guard was only ever the admission gate
+/// ([`admit_relay_gate`]); once past it, [`serve_relay_gate`] spliced the connection with
+/// a plain `copy_bidirectional` and no bound on how long an admitted holder could keep
+/// it open. An idle connection (no bytes either direction for this long) is closed,
+/// freeing the relay-node slot and front-door cap permit it holds — a legitimate DCUtR
+/// hole-punch/relay session is bursty, not silent, so this bounds the "open forever"
+/// failure mode without disrupting active traffic. 5 minutes: generous for real libp2p
+/// keepalive/traffic cadence, short enough that an admitted-but-idle holder can't squat
+/// on the relay-node indefinitely.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Splice `a`↔`b` like [`tokio::io::copy_bidirectional`], but close the connection if
+/// NEITHER side produces a byte within [`RELAY_IDLE_TIMEOUT`] (#427) — `copy_bidirectional`
+/// itself has no such hook, so this drives two manual read/write loops via `select!`,
+/// resetting the shared idle deadline on any activity from either side.
+async fn copy_bidirectional_with_idle_timeout<A, B>(a: &mut A, b: &mut B) -> Result<(u64, u64), BoxError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf_a = vec![0u8; 16 * 1024];
+    let mut buf_b = vec![0u8; 16 * 1024];
+    let (mut a_to_b, mut b_to_a) = (0u64, 0u64);
+    loop {
+        tokio::select! {
+            r = a.read(&mut buf_a) => {
+                let n = r?;
+                if n == 0 { return Ok((a_to_b, b_to_a)); }
+                b.write_all(&buf_a[..n]).await?;
+                a_to_b += n as u64;
+            }
+            r = b.read(&mut buf_b) => {
+                let n = r?;
+                if n == 0 { return Ok((a_to_b, b_to_a)); }
+                a.write_all(&buf_b[..n]).await?;
+                b_to_a += n as u64;
+            }
+            _ = tokio::time::sleep(RELAY_IDLE_TIMEOUT) => {
+                return Err(format!("relay-gate: connection idle for {RELAY_IDLE_TIMEOUT:?}, closing (#427)").into());
+            }
+        }
+    }
+}
+
 /// The membership check a relay-gate pre-auth needs: is `holder` a current member of
 /// `channel`, and if so, what is the channel's operator public key (which the grant's
 /// signature must verify against)? Reuses [`crate::serve::ChannelMemberResolver`] — the
@@ -156,22 +210,25 @@ fn hex_of(b: &[u8; 32]) -> String {
 /// Serve one `:443` front-door connection classified [`crate::sni::FrontDoorRoute::RelayGate`]:
 /// TLS-terminate with the dedicated relay acceptor, run [`admit_relay_gate`], then on
 /// success splice the still-open stream 1:1 to the internal relay-node
-/// (`ctx.relay_upstream`) — `tokio::io::copy_bidirectional`, the identical pattern
-/// [`crate::serve::serve_front_door`]'s `Proxy` arm already uses. From here on this
-/// function never interprets a byte it forwards: the libp2p protocol between the
-/// requester and the relay-node is opaque to it, same as any other relayed ciphertext.
+/// (`ctx.relay_upstream`) — [`copy_bidirectional_with_idle_timeout`] (#427), an
+/// idle-bounded variant of the identical pattern [`crate::serve::serve_front_door`]'s
+/// `Proxy` arm uses. From here on this function never interprets a byte it forwards: the
+/// libp2p protocol between the requester and the relay-node is opaque to it, same as any
+/// other relayed ciphertext.
 pub async fn serve_relay_gate<S>(joined: S, ctx: &RelayGateContext, now: u64) -> Result<(), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let tls = ctx
-        .acceptor
-        .accept(joined)
+    let tls = tokio::time::timeout(TLS_ACCEPT_TIMEOUT, ctx.acceptor.accept(joined))
         .await
+        .map_err(|_| -> BoxError {
+            eprintln!("ct-edge: relay-gate NO [tls-accept-timeout]: handshake not completed within {TLS_ACCEPT_TIMEOUT:?}");
+            "relay-gate: TLS handshake not completed within the timeout (#422)".into()
+        })?
         .map_err(|e| { eprintln!("ct-edge: relay-gate NO [tls-accept]: {e}"); e })?;
     let mut admitted = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
     let mut upstream = tokio::net::TcpStream::connect(ctx.relay_upstream).await?;
-    tokio::io::copy_bidirectional(&mut admitted, &mut upstream).await?;
+    copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream).await?;
     Ok(())
 }
 
@@ -316,5 +373,104 @@ mod tests {
         c_w.write_all(&[0xffu8; SignedChannelGrant::WIRE_LEN]).await.unwrap();
 
         assert!(server_task.await.unwrap().is_err(), "garbage grant bytes are refused, not a panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copy_bidirectional_with_idle_timeout_closes_a_silent_connection_427() {
+        // #427: neither side ever writes anything -- must not hang forever.
+        let (mut a, _a_peer) = tokio::io::duplex(64);
+        let (mut b, _b_peer) = tokio::io::duplex(64);
+        let start = tokio::time::Instant::now();
+        let res = copy_bidirectional_with_idle_timeout(&mut a, &mut b).await;
+        assert!(res.is_err(), "a fully silent connection must be closed, not held open forever");
+        assert!(
+            start.elapsed() >= RELAY_IDLE_TIMEOUT,
+            "must wait the full idle window before closing, not close early"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copy_bidirectional_with_idle_timeout_survives_periodic_activity_427() {
+        // #427: a connection that stays active (even from just ONE side) must NOT be
+        // closed -- proves this is a real idle-reset timeout, not a disguised absolute
+        // session-length cap that would kill a legitimate long-lived relay/hole-punch.
+        let (mut a, mut a_peer) = tokio::io::duplex(64);
+        let (mut b, _b_peer) = tokio::io::duplex(64);
+
+        let relay_task = tokio::spawn(async move { copy_bidirectional_with_idle_timeout(&mut a, &mut b).await });
+
+        // Send a byte every half-idle-window, well past the raw idle timeout in total
+        // wall-clock, and confirm the relay is still alive throughout.
+        for _ in 0..4 {
+            tokio::time::sleep(RELAY_IDLE_TIMEOUT / 2).await;
+            a_peer.write_all(b"x").await.unwrap();
+            let mut echo = [0u8; 1];
+            a_peer.read_exact(&mut echo).await.unwrap_or_default(); // no reply expected; just drains nothing
+        }
+        assert!(!relay_task.is_finished(), "periodic activity must keep the relay alive past the raw idle window");
+        relay_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn copy_bidirectional_with_idle_timeout_forwards_bytes_correctly_both_directions_427() {
+        // #427: the idle-timeout wrapper must not change the actual relay behavior --
+        // real bytes in both directions still arrive intact.
+        let (mut a, mut a_peer) = tokio::io::duplex(64);
+        let (mut b, mut b_peer) = tokio::io::duplex(64);
+
+        let relay_task = tokio::spawn(async move {
+            let mut a = a;
+            let mut b = b;
+            copy_bidirectional_with_idle_timeout(&mut a, &mut b).await
+        });
+
+        a_peer.write_all(b"hello-from-a").await.unwrap();
+        let mut buf = [0u8; 12];
+        b_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello-from-a");
+
+        b_peer.write_all(b"hello-from-b").await.unwrap();
+        let mut buf2 = [0u8; 12];
+        a_peer.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"hello-from-b");
+
+        drop(a_peer);
+        drop(b_peer);
+        let (a_to_b, b_to_a) = relay_task.await.unwrap().expect("clean EOF close, not an error");
+        assert_eq!(a_to_b, 12);
+        assert_eq!(b_to_a, 12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_relay_gate_tls_accept_times_out_on_a_silent_peer_422() {
+        // #422: a peer that opens the connection but never sends a ClientHello must not
+        // hold the relay-gate slot forever.
+        crate::transport::install_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["relay-gate.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            certified.key_pair.serialize_der(),
+        ));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+        let resolver: RelayGateResolver = std::sync::Arc::new(MockResolver {
+            operator: [0u8; 32],
+            channel: ChannelId([0u8; 32]),
+            holder: [0u8; 32],
+        });
+        let ctx = RelayGateContext::new(resolver, acceptor, "127.0.0.1:1".parse().unwrap(), "relay-peer-test".to_string());
+
+        let (edge_side, _attacker_side) = tokio::io::duplex(64); // attacker never writes anything
+        let start = tokio::time::Instant::now();
+        let res = serve_relay_gate(edge_side, &ctx, 1_000).await;
+        assert!(res.is_err(), "a stalled TLS handshake must not hang forever");
+        assert!(
+            start.elapsed() >= TLS_ACCEPT_TIMEOUT && start.elapsed() < RELAY_GATE_TIMEOUT + TLS_ACCEPT_TIMEOUT,
+            "must fail at the TLS-accept bound, not fall through to a much longer timeout"
+        );
     }
 }

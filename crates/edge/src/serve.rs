@@ -330,7 +330,9 @@ where
     let token = state
         .route_host(host)
         .ok_or_else(|| format!("no tunnel registered for host '{host}'"))?;
-    let tls = wildcard_acceptor.accept(inbound).await?;
+    let tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, wildcard_acceptor.accept(inbound))
+        .await
+        .map_err(|_| -> BoxError { "gelb-terminate: TLS handshake not completed within the timeout (#422)".into() })??;
     // #233 follow-up (found live, #229): a TCP-fallback agent (UDP/QUIC
     // blocked) is parked with no QUIC connection to open a stream on at all
     // -- `open_agent_stream` below would always fail "no agent tunnel for
@@ -779,6 +781,18 @@ const CLIENT_HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// unbounded, same as everywhere else in this file.
 const TCP_FALLBACK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// #422: bound on completing the TLS handshake itself (`TlsAcceptor::accept`) on the
+/// three `:443` front-door legs that terminate TLS at the edge -- `EdgeRelay`, `Proxy`,
+/// and Gelb-terminate ([`serve_gelb_terminated`]). [`CLIENT_HELLO_READ_TIMEOUT`] only
+/// bounds reading the ClientHello bytes; the handshake completion that follows (key
+/// exchange, certificate send, Finished) was unbounded, so a peer that opens a TCP
+/// connection, sends a valid ClientHello, then stalls mid-handshake held a
+/// [`crate::state::ConnectionCap`] permit forever -- N such connections exhaust the cap
+/// the same way an un-timed-out ClientHello read did before #111. Same 10s value as
+/// [`CLIENT_HELLO_READ_TIMEOUT`]/[`TCP_FALLBACK_ADMISSION_TIMEOUT`] for consistency; a
+/// real TLS handshake is a handful of round trips, not a long-lived exchange.
+const FRONT_DOOR_TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read the raw front-door ClientHello under [`CLIENT_HELLO_READ_TIMEOUT`] (#111): the
 /// timeout-bounded seam wrapping the panic-free parser [`crate::sni::read_client_hello_bytes`]
 /// so a client that stalls mid-record is dropped (freeing its #119 cap permit) instead of
@@ -824,7 +838,9 @@ pub async fn serve_front_door(
                 pos: 0,
                 inner: inbound,
             };
-            let tls = acceptor.accept(joined).await?;
+            let tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, acceptor.accept(joined))
+                .await
+                .map_err(|_| -> BoxError { "front door: TLS handshake not completed within the timeout (#422)".into() })??;
             serve_tcp_connection(tls, state, challenge).await
         }
         crate::sni::FrontDoorRoute::Proxy(host) => {
@@ -842,7 +858,9 @@ pub async fn serve_front_door(
                 // plane, or the Keycloak IdP) — so an HTTP-only upstream serves over
                 // HTTPS on :443, one cert per host.
                 Some(pacc) => {
-                    let mut tls = pacc.accept(joined).await?;
+                    let mut tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, pacc.accept(joined))
+                        .await
+                        .map_err(|_| -> BoxError { "front door: TLS handshake not completed within the timeout (#422)".into() })??;
                     let mut upstream = tokio::net::TcpStream::connect(*addr).await?;
                     tokio::io::copy_bidirectional(&mut tls, &mut upstream).await?;
                     Ok(())
@@ -3358,7 +3376,7 @@ mod tests {
             nonce: chal[..16].try_into().unwrap(),
             difficulty: chal[16],
         };
-        client.write_all(&build_request(&ch, &token)).await.unwrap();
+        client.write_all(&build_request(&ch, &token).unwrap()).await.unwrap();
         client.write_all(b"tcp-tunnel-data").await.unwrap();
         client.flush().await.unwrap();
         let mut got = [0u8; 15];
@@ -3511,7 +3529,7 @@ mod tests {
             nonce: chal[..16].try_into().unwrap(),
             difficulty: chal[16],
         };
-        cs.write_all(&build_request(&ch, &token)).await.unwrap();
+        cs.write_all(&build_request(&ch, &token).unwrap()).await.unwrap();
         cs.write_all(b"quic-to-tcp-agt").await.unwrap();
         let mut got = [0u8; 15];
         cr.read_exact(&mut got).await.unwrap();
@@ -3923,6 +3941,39 @@ mod tests {
 
         agent_task.await.unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), gelb_task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_gelb_terminated_tls_accept_times_out_on_a_silent_peer_422() {
+        // #422: `wildcard_acceptor.accept(inbound)` was unbounded -- a peer that opens
+        // the connection but never sends a ClientHello must not hold this Gelb-terminate
+        // slot forever.
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        crate::transport::install_crypto_provider();
+
+        let certified = rcgen::generate_simple_self_signed(vec!["app.example.test".to_string()]).unwrap();
+        let wildcard_cert = certified.cert.der().clone();
+        let wildcard_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![wildcard_cert], wildcard_key)
+            .unwrap();
+        let wildcard_tls = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        let token = RoutingToken([0x89; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.register_host("app.example.test", token.clone());
+        state.set_cert_tier("app.example.test", true);
+
+        let (_attacker_side, edge_inbound) = tokio::io::duplex(64); // attacker never writes anything
+        let start = tokio::time::Instant::now();
+        let res = serve_gelb_terminated(edge_inbound, "app.example.test", &state, &wildcard_tls).await;
+        assert!(res.is_err(), "a stalled TLS handshake must not hang forever");
+        assert!(
+            start.elapsed() >= FRONT_DOOR_TLS_ACCEPT_TIMEOUT && start.elapsed() < Duration::from_secs(30),
+            "must fail at the TLS-accept bound (~{FRONT_DOOR_TLS_ACCEPT_TIMEOUT:?}), not hang: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
