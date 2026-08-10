@@ -113,6 +113,11 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 /// (a legitimate registration racing a retry is the one case this must not break).
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
+/// #423: how often [`ChannelAuthorizer::maybe_sweep_expired`] actually walks both caches
+/// to drop expired entries. Independent of either TTL above — this bounds how long a
+/// dead entry can linger past its own expiry, not how long a live one is trusted.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
 type CacheKey = (ChannelId, [u8; 32]);
 
 /// Resolves channel-join authorization by querying the control plane's c-i endpoint.
@@ -125,6 +130,15 @@ pub struct ChannelAuthorizer {
     cache_ttl: Duration,
     negative_cache: Arc<Mutex<HashMap<CacheKey, Instant>>>,
     negative_cache_ttl: Duration,
+    /// #423: both caches above check expiry lazily on read but never proactively evict an
+    /// expired entry — an entry only ever leaves early via an explicit `remove` on the
+    /// opposite outcome (a fresh Authorized clears `negative_cache`, a fresh Refused
+    /// clears `cache`). A holder that's asked about once and never again (the #248 attack
+    /// shape this cache exists to blunt: many distinct never-valid `(channel, holder)`
+    /// pairs, each refused once) leaves a dead entry in `negative_cache` forever. Tracks
+    /// when [`Self::maybe_sweep_expired`] last ran a full pass.
+    last_swept: Arc<Mutex<Instant>>,
+    sweep_interval: Duration,
 }
 
 /// How the CP responded, coarsened to the three cases [`ChannelAuthorizer::resolve`]
@@ -176,6 +190,20 @@ impl ChannelAuthorizer {
         cache_ttl: Duration,
         negative_cache_ttl: Duration,
     ) -> Self {
+        Self::with_ttls_and_sweep_interval(cp_base, admin_token, timeout, cache_ttl, negative_cache_ttl, SWEEP_INTERVAL)
+    }
+
+    /// Like [`with_ttls`](Self::with_ttls) but with an explicit sweep interval too
+    /// (#423) — exposed mainly so tests can use a short interval instead of waiting out
+    /// the real [`SWEEP_INTERVAL`].
+    pub fn with_ttls_and_sweep_interval(
+        cp_base: &str,
+        admin_token: &[u8; 32],
+        timeout: Duration,
+        cache_ttl: Duration,
+        negative_cache_ttl: Duration,
+        sweep_interval: Duration,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(timeout)
@@ -200,6 +228,35 @@ impl ChannelAuthorizer {
             cache_ttl,
             negative_cache: Arc::new(Mutex::new(HashMap::new())),
             negative_cache_ttl,
+            // Backdated so the FIRST real call is eligible to sweep immediately rather
+            // than waiting out a full interval from process start (matters for a
+            // just-created authorizer under sustained load from the very first request).
+            last_swept: Arc::new(Mutex::new(Instant::now() - sweep_interval)),
+            sweep_interval,
+        }
+    }
+
+    /// #423: opportunistically drop every already-expired entry from both caches, at
+    /// most once per [`Self::sweep_interval`] (amortized — checked on every
+    /// [`Self::resolve`] call, but the actual O(n) sweep only runs when the interval has
+    /// elapsed, the same "amortized O(1) per call" shape `KeyedRateLimiter`'s window
+    /// sweep uses). A holder still within its TTL is untouched regardless of how long
+    /// it's been in the map — this only removes entries the lazy expiry check on read
+    /// would already treat as gone, it never changes `resolve`'s observable behavior.
+    fn maybe_sweep_expired(&self) {
+        let Ok(mut last) = self.last_swept.lock() else { return };
+        if last.elapsed() < self.sweep_interval {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
+        if let Ok(mut cache) = self.cache.lock() {
+            let ttl = self.cache_ttl;
+            cache.retain(|_, (_, at)| at.elapsed() < ttl);
+        }
+        if let Ok(mut neg) = self.negative_cache.lock() {
+            let ttl = self.negative_cache_ttl;
+            neg.retain(|_, at| at.elapsed() < ttl);
         }
     }
 
@@ -294,6 +351,7 @@ impl ChannelAuthorizer {
     /// with no prior successful resolution still fails closed on a transport failure —
     /// this never admits anyone the CP hasn't actually vouched for at some point.
     pub async fn resolve(&self, channel: &ChannelId, holder: &[u8; 32]) -> Option<MemberResolution> {
+        self.maybe_sweep_expired();
         let key: CacheKey = (*channel, *holder);
         // #248-follow: a repeated, still-fresh definitive refusal skips the CP round-trip
         // entirely — the exact fix for a tight non-backing-off retry loop hammering ONE
