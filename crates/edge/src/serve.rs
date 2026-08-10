@@ -4011,6 +4011,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn front_door_wires_the_ct_edge_alpn_to_the_real_tcp_fallback_admission_protocol_329() {
+        // #329 area 5, integration-level: proves classify_front_door's EdgeRelay
+        // decision is actually wired through serve_front_door's real dispatch into
+        // serve_tcp_connection's real role/admission protocol -- not just that the
+        // pure classifier function returns the right enum variant in isolation
+        // (already proven by classify_front_door_routes_the_channel_alpn_to_the_broker
+        // and friends in sni.rs). No prior test in this file drives the plain
+        // "ct-edge" ALPN through a real listener + real TLS handshake.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::transport::install_crypto_provider();
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let certified = rcgen::generate_simple_self_signed(vec!["edge.test".to_string()]).unwrap();
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let proxies: std::collections::HashMap<String, ProxyTarget> = std::collections::HashMap::new();
+
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, None).await
+        });
+
+        // Real client: TCP connect, real TLS handshake offering ONLY the ct-edge
+        // ALPN (no SNI -- the data-plane leg carries none), trusting the same
+        // self-signed cert the acceptor above presents.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let mut ccfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        ccfg.alpn_protocols = vec![crate::sni::CT_EDGE_ALPN.as_bytes().to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let tcp = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("edge.test").unwrap();
+        let mut tls = connector.connect(sni, tcp).await.expect("real TLS handshake completes");
+
+        // Speak serve_tcp_connection's OWN real admission protocol (role 'A' +
+        // a 32-byte token) and get back its real "OK" ack -- this is only reachable
+        // if classify_front_door really routed this connection to EdgeRelay and
+        // serve_front_door really dispatched it into serve_tcp_connection, not some
+        // other arm (which would speak a different protocol or hang differently).
+        tls.write_all(b"A").await.unwrap();
+        tls.write_all(&[0x42u8; 32]).await.unwrap(); // an arbitrary but well-formed RoutingToken
+        tls.flush().await.unwrap();
+        let mut ack = [0u8; 2];
+        tls.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"OK", "the real serve_tcp_connection admission ack proves EdgeRelay dispatch actually happened");
+
+        drop(tls);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
     async fn front_door_sheds_a_browser_tunnel_connection_once_its_own_sub_cap_is_full_254() {
         // #254: the BrowserTunnel arm must admit against its own sub-cap, separate
         // from the shared front-door `conn_cap` -- proven here by holding the sub-cap's

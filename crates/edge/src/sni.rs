@@ -510,4 +510,268 @@ mod tests {
         assert_eq!(sni, "host.test");
         assert_eq!(buf, ch, "the full ClientHello is buffered for passthrough");
     }
+
+    // #329 area 1: multi-ALPN precedence. A real client can offer several ALPN
+    // protocol ids in one ClientHello (e.g. a library trying several fallbacks);
+    // the documented precedence (data-plane > channel > relay > SNI-based >
+    // default-host) must hold even when more than one of our own ALPN ids is
+    // present at once, not just when exactly one is offered as every existing
+    // test above does.
+    #[test]
+    fn classify_front_door_precedence_holds_with_multiple_alpn_ids_offered_at_once_329() {
+        let default = Some("portal.z");
+        // ct-edge beats ct-edge-channel beats ct-edge-relay, regardless of the
+        // ORDER they're offered in.
+        assert_eq!(
+            classify_front_door(&client_hello(None, &[CT_EDGE_CHANNEL_ALPN, CT_EDGE_ALPN, CT_EDGE_RELAY_ALPN]), terminate_host, default),
+            FrontDoorRoute::EdgeRelay,
+            "ct-edge wins even offered after the others"
+        );
+        assert_eq!(
+            classify_front_door(&client_hello(None, &[CT_EDGE_ALPN, CT_EDGE_CHANNEL_ALPN]), terminate_host, default),
+            FrontDoorRoute::EdgeRelay,
+            "ct-edge wins over ct-edge-channel"
+        );
+        // ct-edge-channel beats ct-edge-relay when ct-edge is absent.
+        assert_eq!(
+            classify_front_door(&client_hello(None, &[CT_EDGE_RELAY_ALPN, CT_EDGE_CHANNEL_ALPN]), terminate_host, default),
+            FrontDoorRoute::ChannelBroker,
+            "ct-edge-channel wins over ct-edge-relay"
+        );
+        // Any of the three data-plane ALPNs beats a terminate-host SNI and a web ALPN
+        // offered in the SAME hello.
+        assert_eq!(
+            classify_front_door(&client_hello(Some("Portal.Z"), &["h2", "http/1.1", CT_EDGE_RELAY_ALPN]), terminate_host, default),
+            FrontDoorRoute::RelayGate,
+            "a data-plane ALPN wins over web ALPNs and a terminate-host SNI in the same hello"
+        );
+        // Two web ALPNs together with an SNI: SNI-based routing still wins over the
+        // web-ALPN default-host fallback (the SNI branch is checked before the
+        // no-SNI web-ALPN branch).
+        assert_eq!(
+            classify_front_door(&client_hello(Some("app1.z"), &["h2", "http/1.1"]), terminate_host, default),
+            FrontDoorRoute::BrowserTunnel("app1.z".into()),
+            "SNI-based routing wins over the web-ALPN default-host fallback when both are present"
+        );
+    }
+
+    // #329 area 2: case sensitivity asymmetry. TLS ALPN protocol ids are exact-byte
+    // match per RFC 7301; SNI/terminate_hosts/default_host matching is deliberately
+    // case-insensitive. Both halves of this asymmetry must hold, not just the
+    // SNI-insensitivity half the existing tests already cover.
+    #[test]
+    fn classify_front_door_alpn_matching_is_case_sensitive_sni_matching_is_not_329() {
+        let default = Some("portal.z");
+        // A differently-cased ALPN id must NOT match -- falls through to Reject
+        // (no SNI, no matching web ALPN either).
+        assert_eq!(
+            classify_front_door(&client_hello(None, &["CT-EDGE"]), terminate_host, default),
+            FrontDoorRoute::Reject,
+            "ALPN matching is exact-byte, RFC 7301 -- \"CT-EDGE\" must not match \"ct-edge\""
+        );
+        assert_eq!(
+            classify_front_door(&client_hello(None, &["Ct-Edge-Channel"]), terminate_host, default),
+            FrontDoorRoute::Reject,
+            "mixed-case ct-edge-channel must not match either"
+        );
+        assert_eq!(
+            classify_front_door(&client_hello(None, &["HTTP/1.1"]), terminate_host, default),
+            FrontDoorRoute::Reject,
+            "the web ALPN check (\"http/1.1\"/\"h2\") is also exact-byte -- differently-cased must not match"
+        );
+        // SNI matching against terminate_hosts stays case-insensitive (already proven
+        // for one case in classify_front_door_routes_by_alpn_then_sni; this proves
+        // several more casings agree on the SAME lowercased result).
+        for variant in ["portal.z", "Portal.Z", "PORTAL.Z", "PoRtAl.z"] {
+            assert_eq!(
+                classify_front_door(&client_hello(Some(variant), &[]), terminate_host, default),
+                FrontDoorRoute::Proxy("portal.z".into()),
+                "terminate-host SNI matching must be case-insensitive for {variant:?}"
+            );
+        }
+        // default_host is compared case-insensitively too -- covered here since no
+        // existing test exercises a non-lowercase default_host.
+        assert_eq!(
+            classify_front_door(&client_hello(None, &["http/1.1"]), terminate_host, Some("Portal.Z")),
+            FrontDoorRoute::Proxy("portal.z".into()),
+            "default_host is lowercased regardless of its own casing"
+        );
+    }
+
+    // #329 area 3: adversarial/malformed ClientHello parsing. Every parser here
+    // (client_hello_extensions, find_extension, sni_from_extensions,
+    // alpn_extension_has, peek_alpn) reads bytes from an unauthenticated remote
+    // peer BEFORE any other check runs. "Doesn't panic" isn't the bar -- these
+    // assert the actual resulting behavior (clean None/Reject/empty, not a
+    // misroute) for each malformed shape.
+    #[test]
+    fn parsers_reject_cleanly_rather_than_misroute_on_malformed_input_329() {
+        let default = Some("portal.z");
+
+        // Truncated at every offset of a real, well-formed hello: never a panic,
+        // and never silently returns a *plausible-looking-but-wrong* SNI/ALPN --
+        // any truncation must fail closed (route to Reject, or peek_* -> None/empty).
+        let good = client_hello(Some("app1.z"), &[CT_EDGE_ALPN]);
+        for cut in 1..good.len() {
+            let truncated = &good[..cut];
+            // Must never panic (the real assertion -- a panic here would abort the
+            // whole edge process on one malformed connection).
+            let _ = classify_front_door(truncated, terminate_host, default);
+            let _ = peek_sni(truncated);
+            let _ = peek_alpn(truncated);
+        }
+        // A specific truncation that chops mid-ALPN-entry: fails closed to Reject,
+        // not a partial/garbage route.
+        let mut chopped = client_hello(None, &[CT_EDGE_ALPN]);
+        chopped.truncate(chopped.len() - 2); // chop the last 2 bytes of the "ct-edge" entry
+        assert_eq!(
+            classify_front_door(&chopped, terminate_host, default),
+            FrontDoorRoute::Reject,
+            "a truncated ALPN entry must never be misread as a match"
+        );
+
+        // Not a ClientHello at all (wrong content type / wrong handshake type).
+        assert_eq!(classify_front_door(&[0x17, 0x03, 0x03, 0x00, 0x01, 0x00], terminate_host, default), FrontDoorRoute::Reject);
+        assert_eq!(classify_front_door(b"", terminate_host, default), FrontDoorRoute::Reject);
+        assert_eq!(classify_front_door(b"GET / HTTP/1.1\r\n", terminate_host, default), FrontDoorRoute::Reject);
+
+        // A length field that overflows the buffer: the TLS record length claims far
+        // more data than is actually present. `client_hello_extensions` must return
+        // None (via `.get()`, not index-and-panic), not read past the real buffer.
+        let mut overflow = client_hello(Some("x.z"), &[]);
+        overflow[3] = 0xFF;
+        overflow[4] = 0xFF; // rec_len now claims 65535 bytes, buffer is much shorter
+        assert_eq!(classify_front_door(&overflow, terminate_host, default), FrontDoorRoute::Reject);
+        assert_eq!(peek_sni(&overflow), None);
+
+        // An extensions-length that disagrees with the actual bytes present (claims
+        // more extension bytes than the record actually carries).
+        let mut ext_overflow = client_hello(Some("x.z"), &[CT_EDGE_ALPN]);
+        let n = ext_overflow.len();
+        ext_overflow[n - 200.min(n)] = 0xFF; // corrupt somewhere in the extensions area
+        // Must not panic; whatever it resolves to is acceptable as long as it's a
+        // clean route (fails closed rather than fabricating a match past the real
+        // data). The real assertion is the earlier "never panics" sweep above; this
+        // just adds one more concrete corrupted-length shape to that sweep.
+        let _ = classify_front_door(&ext_overflow, terminate_host, default);
+
+        // A duplicate SNI extension: two server_name extensions in the same hello.
+        // find_extension returns the FIRST match it scans -- assert that's genuinely
+        // what happens (deterministic, not "whichever the allocator felt like"),
+        // by building one by hand with two distinct hostnames back to back.
+        // Build a hello whose extensions block carries a raw, hand-assembled
+        // sequence rather than going through `client_hello`/`synth_client_hello`
+        // (which only ever emit one of each extension) -- needed for the
+        // duplicate-extension and empty-ALPN-list cases below.
+        fn hello_with_raw_extensions(exts: &[u8]) -> Vec<u8> {
+            let mut body = vec![0x03, 0x03];
+            body.extend_from_slice(&[0u8; 32]);
+            body.push(0x00);
+            body.extend_from_slice(&2u16.to_be_bytes());
+            body.extend_from_slice(&[0x13, 0x01]);
+            body.push(0x01);
+            body.push(0x00);
+            body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            body.extend_from_slice(exts);
+            let mut hs = vec![0x01];
+            let bl = body.len();
+            hs.extend_from_slice(&[(bl >> 16) as u8, (bl >> 8) as u8, bl as u8]);
+            hs.extend_from_slice(&body);
+            let mut rec = vec![0x16, 0x03, 0x01];
+            rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+            rec.extend_from_slice(&hs);
+            rec
+        }
+        fn sni_extension(host: &str) -> Vec<u8> {
+            let h = host.as_bytes();
+            let mut entry = vec![0x00];
+            entry.extend_from_slice(&(h.len() as u16).to_be_bytes());
+            entry.extend_from_slice(h);
+            let mut snl = (entry.len() as u16).to_be_bytes().to_vec();
+            snl.extend_from_slice(&entry);
+            let mut ext = vec![0x00, 0x00];
+            ext.extend_from_slice(&(snl.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&snl);
+            ext
+        }
+
+        // Two server_name extensions concatenated in the extensions block.
+        let mut dup_exts = sni_extension("first.z");
+        dup_exts.extend_from_slice(&sni_extension("second.z"));
+        let dup_sni = hello_with_raw_extensions(&dup_exts);
+        assert_eq!(
+            peek_sni(&dup_sni).as_deref(),
+            Some("first.z"),
+            "a duplicate SNI extension deterministically resolves to the FIRST one scanned, not the last or a panic"
+        );
+
+        // Non-UTF8 bytes in the SNI hostname field: must yield None, not a lossy
+        // conversion or a panic (std::str::from_utf8 rejects, peek_sni returns None).
+        let mut bad_utf8 = client_hello_with_sni("x");
+        // Overwrite the single-byte hostname ("x", at a known fixed offset in this
+        // fixture: TLS record header(5) + handshake header(4) + version(2) +
+        // random(32) + session_id_len(1) + cipher_suites(2+2) + compression(1+1) +
+        // ext_total(2) + ext_type(2) + ext_len(2) + list_len(2) + name_type(1) +
+        // name_len(2) = last byte is the hostname itself).
+        let last = bad_utf8.len() - 1;
+        bad_utf8[last] = 0xFF; // invalid UTF-8 continuation byte with no lead byte
+        assert_eq!(peek_sni(&bad_utf8), None, "non-UTF8 SNI bytes must yield None, not a panic or lossy string");
+
+        // Empty ALPN protocol list (the extension is present but carries zero
+        // entries): must behave exactly like "no ALPN offered", not panic or match
+        // anything.
+        // An ALPN extension with list_len=0 and no entries.
+        let mut empty_alpn_ext = vec![0x00, 0x10]; // ALPN extension type
+        empty_alpn_ext.extend_from_slice(&2u16.to_be_bytes()); // ext data len = 2 (just the list len)
+        empty_alpn_ext.extend_from_slice(&0u16.to_be_bytes()); // protocol list len = 0
+        let empty_alpn_hello = hello_with_raw_extensions(&empty_alpn_ext);
+        assert!(peek_alpn(&empty_alpn_hello).is_empty(), "an empty ALPN list parses to an empty Vec, not a panic");
+        assert_eq!(
+            classify_front_door(&empty_alpn_hello, terminate_host, default),
+            FrontDoorRoute::Reject,
+            "an empty ALPN list with no SNI and no matching web ALPN rejects cleanly"
+        );
+    }
+
+    // #329 area 4: boundary/absence cases.
+    #[test]
+    fn classify_front_door_boundary_and_absence_cases_329() {
+        // Empty terminate_hosts (closure always returns false): every SNI becomes a
+        // BrowserTunnel candidate, never a Proxy -- proving the classifier doesn't
+        // implicitly special-case "no terminate hosts configured" into a reject.
+        let never_terminate = |_: &str| false;
+        assert_eq!(
+            classify_front_door(&client_hello(Some("portal.z"), &[]), never_terminate, Some("portal.z")),
+            FrontDoorRoute::BrowserTunnel("portal.z".into()),
+            "with an empty terminate_hosts set, even the configured default_host's own name is just a BrowserTunnel SNI, not a Proxy"
+        );
+
+        // default_host: None with only a web ALPN (no SNI at all): must Reject, not
+        // panic or silently fall back to some other host.
+        assert_eq!(
+            classify_front_door(&client_hello(None, &["http/1.1"]), terminate_host, None),
+            FrontDoorRoute::Reject,
+            "no SNI, web ALPN, but no default_host configured -> Reject, never a panic or an implicit fallback"
+        );
+        assert_eq!(
+            classify_front_door(&client_hello(None, &["h2"]), terminate_host, None),
+            FrontDoorRoute::Reject
+        );
+
+        // SNI present but matching neither a terminate host nor (from this pure
+        // classifier's point of view) any registered tunnel: always BrowserTunnel(sni).
+        // This classifier is deliberately permissive here -- it's only safe because
+        // `serve_front_door`'s BrowserTunnel arm gates on `state.route_host(&host)`
+        // before serving anything (see crates/edge/src/serve.rs, the
+        // `if state.route_host(&host).is_none()` check right after the BrowserTunnel
+        // arm is entered) -- an unregistered host never reaches an actual backend,
+        // it falls through to the mesh-relay-or-reject path there instead. This test
+        // documents the classifier's own permissive-by-design contract; the downstream
+        // gate itself is exercised by serve.rs's own front-door integration tests.
+        assert_eq!(
+            classify_front_door(&client_hello(Some("never-registered.z"), &[]), terminate_host, Some("portal.z")),
+            FrontDoorRoute::BrowserTunnel("never-registered.z".into()),
+            "an unknown/unregistered SNI is still classified as a BrowserTunnel candidate -- rejecting it is serve_front_door's job, not this pure function's"
+        );
+    }
 }
