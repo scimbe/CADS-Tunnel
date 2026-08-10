@@ -198,7 +198,7 @@ mod tests {
         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
         let mut chal = [0u8; 17];
         recv.read_exact(&mut chal).await.unwrap();
-        let req = build_request(&challenge_from(&chal), &known);
+        let req = build_request(&challenge_from(&chal), &known).unwrap();
         send.write_all(&req).await.unwrap();
         send.finish().unwrap();
         let ack = recv.read_to_end(64).await.unwrap();

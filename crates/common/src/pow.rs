@@ -53,12 +53,47 @@ pub fn verify(challenge: &Challenge, token: &RoutingToken, solution: u64) -> boo
     leading_zero_bits(&hash(&challenge.nonce, token, solution)) >= challenge.difficulty as u32
 }
 
+/// #413: the Edge sends `difficulty` as an untrusted, unbounded `u8` (0-255) —
+/// [`CT_EDGE_POW_DIFFICULTY`](https://github.com/scimbe/CADS-Tunnel) legitimately
+/// defaults to 16, and even 24 (this crate's own upper test fixture) is already a
+/// deliberately-heavy value. Expected cost grows ~2^difficulty hashes; anything
+/// requiring noticeably more than a few seconds of a single core stops being a flood
+/// deterrent and becomes an infeasible brute force (2^40 is already ~months on one
+/// core) — a rogue or misconfigured Edge sending `difficulty: 255` would otherwise make
+/// [`solve`] spin forever, a client-side DoS regardless of what the Edge itself intended.
+/// 32 leaves generous headroom above any real operational value while staying a task
+/// [`solve`] can still complete in a bounded, human-noticeable time on ordinary hardware.
+pub const MAX_CLIENT_SOLVABLE_DIFFICULTY: u8 = 32;
+
+/// The Edge-supplied [`Challenge::difficulty`] exceeds what a client should ever
+/// attempt to brute-force (#413) — the Edge is untrusted for this value.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DifficultyTooHigh(pub u8);
+
+impl std::fmt::Display for DifficultyTooHigh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PoW challenge difficulty {} exceeds the client's max solvable difficulty {MAX_CLIENT_SOLVABLE_DIFFICULTY} (#413)",
+            self.0
+        )
+    }
+}
+impl std::error::Error for DifficultyTooHigh {}
+
 /// Solve `challenge` for `token` by brute force. Expected cost grows ~2^difficulty.
-pub fn solve(challenge: &Challenge, token: &RoutingToken) -> u64 {
+///
+/// #413: refuses (rather than looping forever) a `challenge.difficulty` above
+/// [`MAX_CLIENT_SOLVABLE_DIFFICULTY`] — the Edge that issued the challenge is not
+/// trusted to cap this value itself.
+pub fn solve(challenge: &Challenge, token: &RoutingToken) -> Result<u64, DifficultyTooHigh> {
+    if challenge.difficulty > MAX_CLIENT_SOLVABLE_DIFFICULTY {
+        return Err(DifficultyTooHigh(challenge.difficulty));
+    }
     let mut solution = 0u64;
     loop {
         if verify(challenge, token, solution) {
-            return solution;
+            return Ok(solution);
         }
         solution += 1;
     }
@@ -87,8 +122,11 @@ pub fn assemble_request(solution: u64, token: &RoutingToken) -> Vec<u8> {
 /// Wire form: `solution(8 LE) | token(32)`. Synchronous — CPU-bound; async callers on a
 /// Tokio runtime should offload the solve via `tokio::task::spawn_blocking` (#202) rather
 /// than calling this inline (see `ct_client`'s `build_request_blocking`).
-pub fn build_request(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
-    assemble_request(solve(challenge, token), token)
+///
+/// #413: propagates [`solve`]'s [`DifficultyTooHigh`] rather than looping forever on an
+/// Edge-supplied difficulty above [`MAX_CLIENT_SOLVABLE_DIFFICULTY`].
+pub fn build_request(challenge: &Challenge, token: &RoutingToken) -> Result<Vec<u8>, DifficultyTooHigh> {
+    Ok(assemble_request(solve(challenge, token)?, token))
 }
 
 /// Verify a PoW-gated rendezvous request against `challenge` and extract the
@@ -129,7 +167,7 @@ mod tests {
     fn solve_then_verify() {
         let c = challenge(12);
         let t = token(1);
-        let s = solve(&c, &t);
+        let s = solve(&c, &t).unwrap();
         assert!(verify(&c, &t, s));
     }
 
@@ -137,7 +175,7 @@ mod tests {
     fn solution_meets_difficulty() {
         let c = challenge(12);
         let t = token(1);
-        let s = solve(&c, &t);
+        let s = solve(&c, &t).unwrap();
         assert!(leading_zero_bits(&hash(&c.nonce, &t, s)) >= 12);
     }
 
@@ -152,7 +190,7 @@ mod tests {
         // this solution actually provides — it must be rejected. Deterministic.
         let c = challenge(4);
         let t = token(1);
-        let s = solve(&c, &t);
+        let s = solve(&c, &t).unwrap();
         let actual = leading_zero_bits(&hash(&c.nonce, &t, s));
         let harder = Challenge {
             nonce: c.nonce,
@@ -170,7 +208,7 @@ mod tests {
         let c = challenge(12);
         let a = token(0xAA);
         let b = token(0xBB);
-        let s = solve(&c, &a);
+        let s = solve(&c, &a).unwrap();
         assert!(verify(&c, &a, s), "solution verifies for the token it was solved against");
         assert!(!verify(&c, &b, s), "the same solution must not verify for a different token");
     }
@@ -182,7 +220,7 @@ mod tests {
         let c = challenge(12);
         let a = token(0xAA);
         let b = token(0xBB);
-        let mut req = build_request(&c, &a);
+        let mut req = build_request(&c, &a).unwrap();
         req[8..40].copy_from_slice(&b.0);
         assert_eq!(check_request(&c, &req), Err(GateError::BadProofOfWork));
     }
@@ -191,7 +229,7 @@ mod tests {
     fn build_then_check_roundtrips() {
         let c = challenge(12);
         let token = RoutingToken([3u8; 32]);
-        let req = build_request(&c, &token);
+        let req = build_request(&c, &token).unwrap();
         assert_eq!(check_request(&c, &req), Ok(token));
     }
 
@@ -206,7 +244,7 @@ mod tests {
         // bits than that solution provides — deterministically rejected.
         let easy = challenge(4);
         let token = RoutingToken([4u8; 32]);
-        let req = build_request(&easy, &token);
+        let req = build_request(&easy, &token).unwrap();
         let solution = u64::from_le_bytes(req[..8].try_into().unwrap());
         let actual = leading_zero_bits(&hash(&easy.nonce, &token, solution));
         let harder = Challenge {
@@ -214,5 +252,32 @@ mod tests {
             difficulty: (actual + 1) as u8,
         };
         assert_eq!(check_request(&harder, &req), Err(GateError::BadProofOfWork));
+    }
+
+    #[test]
+    fn solve_refuses_a_difficulty_above_the_client_cap_413() {
+        // #413: a rogue/misconfigured Edge sending an infeasible difficulty (up to 255,
+        // the field's full range) must be refused immediately, not spun on forever. The
+        // boundary itself (`> MAX_CLIENT_SOLVABLE_DIFFICULTY`, not `>=`) is deliberately
+        // not exercised with a real solve at exactly the cap here -- an expected ~2^32
+        // hashes is far too slow for a unit test and would burn CPU in the background
+        // for the rest of a parallel `cargo test` run even if spawned off-thread; it's
+        // a one-line `>` comparison, verified by inspection instead.
+        let c = challenge(MAX_CLIENT_SOLVABLE_DIFFICULTY + 1);
+        let t = token(1);
+        assert_eq!(solve(&c, &t), Err(DifficultyTooHigh(MAX_CLIENT_SOLVABLE_DIFFICULTY + 1)));
+        assert_eq!(build_request(&c, &t), Err(DifficultyTooHigh(MAX_CLIENT_SOLVABLE_DIFFICULTY + 1)));
+    }
+
+    #[test]
+    fn solve_at_a_realistic_high_difficulty_under_the_cap_still_succeeds_413() {
+        // Confirms the new guard doesn't accidentally reject legitimate (if heavy)
+        // difficulties well under the cap -- 24 is already this crate's own
+        // deliberately-heavy fixture elsewhere (`crates/edge/src/rendezvous.rs`),
+        // fast enough for a unit test (well under a second on ordinary hardware).
+        let c = challenge(24);
+        let t = token(1);
+        let s = solve(&c, &t).expect("24 is comfortably under the client's cap");
+        assert!(verify(&c, &t, s));
     }
 }

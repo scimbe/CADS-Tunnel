@@ -29,13 +29,13 @@ fn install_crypto_provider() {
 /// runtime keeps servicing other tasks meanwhile, then we assemble the wire form via
 /// `pow::assemble_request` (the shared layout, no duplication). Used by every client
 /// rendezvous path in place of the sync `build_request`.
-pub(crate) async fn build_request_blocking(challenge: &Challenge, token: &RoutingToken) -> Vec<u8> {
+pub(crate) async fn build_request_blocking(challenge: &Challenge, token: &RoutingToken) -> Result<Vec<u8>, BoxError> {
     let challenge = challenge.clone();
     let solve_token = token.clone();
     let solution = tokio::task::spawn_blocking(move || solve(&challenge, &solve_token))
         .await
-        .expect("pow solve task panicked");
-    assemble_request(solution, token)
+        .expect("pow solve task panicked")?;
+    Ok(assemble_request(solution, token))
 }
 
 /// Build a fresh outgoing-only `quinn::Endpoint` (one ephemeral UDP socket),
@@ -120,47 +120,9 @@ pub async fn dial_edge_timed(
     }
 }
 
-/// After rendezvous, open a data stream to the Edge and exchange `input` for the
-/// tunnel's response. In the daemon, `input`/output are the Client's local
-/// socket; the Edge relays the stream to the Agent → Origin.
-pub async fn client_exchange(conn: &Connection, input: &[u8]) -> Result<Vec<u8>, BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(input).await?;
-    send.finish()?;
-    let response = recv.read_to_end(64 * 1024).await?;
-    Ok(response)
-}
-
 /// Load an Edge certificate (DER) the Edge published to a shared path.
 pub fn load_cert(path: impl AsRef<Path>) -> std::io::Result<CertificateDer<'static>> {
     Ok(CertificateDer::from(std::fs::read(path)?))
-}
-
-/// Tunnel `input` to the Origin through the Edge in one stream, matching the
-/// Edge's `serve_connection` `'C'` path: send role `'C'`, read the challenge,
-/// present `solution | token`, send the data, and read the tunnel's response.
-pub async fn client_tunnel(
-    conn: &Connection,
-    token: &RoutingToken,
-    input: &[u8],
-) -> Result<Vec<u8>, BoxError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"C").await?;
-
-    let mut chal = [0u8; 17];
-    recv.read_exact(&mut chal).await?;
-    let challenge = Challenge {
-        nonce: chal[..16].try_into().unwrap(),
-        difficulty: chal[16],
-    };
-
-    let req = build_request_blocking(&challenge, token).await; // solution(8) | token(32) = 40 bytes
-    send.write_all(&req).await?;
-    send.write_all(input).await?;
-    send.finish()?;
-
-    let response = recv.read_to_end(64 * 1024).await?;
-    Ok(response)
 }
 
 /// Tunnel `payload` to the Origin over Noise E2E (M8.4a): open a stream, complete
@@ -183,7 +145,7 @@ pub async fn client_tunnel_noise(
         nonce: chal[..16].try_into().unwrap(),
         difficulty: chal[16],
     };
-    let req = build_request_blocking(&challenge, token).await;
+    let req = build_request_blocking(&challenge, token).await?;
     send.write_all(&req).await?;
 
     // The stream is now bridged to the Agent; run Noise over it.
@@ -278,7 +240,7 @@ where
         nonce: chal[..16].try_into().unwrap(),
         difficulty: chal[16],
     };
-    let req = build_request_blocking(&challenge, token).await;
+    let req = build_request_blocking(&challenge, token).await?;
     stream.write_all(&req).await?;
 
     // Noise over the same stream (split into read/write halves).
@@ -383,7 +345,7 @@ where
             nonce: chal[..16].try_into().unwrap(),
             difficulty: chal[16],
         };
-        let req = build_request_blocking(&challenge, token).await;
+        let req = build_request_blocking(&challenge, token).await?;
         send.write_all(&req).await?;
 
         // Noise_IK initiator handshake over the relayed stream.
@@ -505,27 +467,43 @@ pub async fn client_tunnel_udp(
     cap: &Capability,
     client_private: &[u8; 32],
     local: UdpSocket,
+    setup_deadline: Duration,
 ) -> Result<(), BoxError> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(b"C").await?;
 
-    let mut chal = [0u8; 17];
-    recv.read_exact(&mut chal).await?;
-    let challenge = Challenge {
-        nonce: chal[..16].try_into().unwrap(),
-        difficulty: chal[16],
+    // #419: bound the rendezvous + Noise handshake, mirroring every other
+    // client entry point (`client_tunnel_stream`'s `setup_deadline`,
+    // `client_tunnel_noise_timed`/`client_tunnel_noise_tcp_timed`'s `deadline`)
+    // -- this was the one mode the existing timeout sweep missed, so a stalled
+    // or hostile Edge could block this task on the setup read forever instead
+    // of failing fast. The datagram bridge itself stays unbounded once the
+    // session is actually up, same as every sibling.
+    let transport = match tokio::time::timeout(setup_deadline, async {
+        send.write_all(b"C").await?;
+
+        let mut chal = [0u8; 17];
+        recv.read_exact(&mut chal).await?;
+        let challenge = Challenge {
+            nonce: chal[..16].try_into().unwrap(),
+            difficulty: chal[16],
+        };
+        let req = build_request_blocking(&challenge, token).await?;
+        send.write_all(&req).await?;
+
+        let mut hs = client_handshake_for(client_private, cap)?;
+        let mut buf = vec![0u8; 65535];
+        let mut tmp = vec![0u8; 65535];
+        let n = hs.write_message(&[], &mut buf)?;
+        send.write_all(&frame(&buf[..n])).await?;
+        let m2 = read_frame(&mut recv).await?;
+        hs.read_message(&m2, &mut tmp)?;
+        Ok::<_, BoxError>(hs.into_transport_mode()?)
+    })
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => return Err(tunnel_timeout_error(setup_deadline)),
     };
-    let req = build_request_blocking(&challenge, token).await;
-    send.write_all(&req).await?;
-
-    let mut hs = client_handshake_for(client_private, cap)?;
-    let mut buf = vec![0u8; 65535];
-    let mut tmp = vec![0u8; 65535];
-    let n = hs.write_message(&[], &mut buf)?;
-    send.write_all(&frame(&buf[..n])).await?;
-    let m2 = read_frame(&mut recv).await?;
-    hs.read_message(&m2, &mut tmp)?;
-    let transport = hs.into_transport_mode()?;
 
     let ts = Mutex::new(transport);
     // `e` infers to snow::Error (naming it needs snow as a direct dep).
@@ -787,7 +765,9 @@ pub async fn udp_selftest(
 
     let mut got = vec![0u8; 65535];
     tokio::select! {
-        r = client_tunnel_udp(conn, token, cap, client_private, local) => {
+        // #419: same DEFAULT_STREAM_SETUP_DEADLINE every other setup-bounded
+        // client entry point uses.
+        r = client_tunnel_udp(conn, token, cap, client_private, local, DEFAULT_STREAM_SETUP_DEADLINE) => {
             r?;
             Err("udp tunnel exited before the echo arrived".into())
         }
@@ -837,7 +817,7 @@ mod tests {
 
         let token = RoutingToken([5u8; 32]);
         let challenge = Challenge { nonce: [0x11; 16], difficulty: 20 };
-        let req = build_request_blocking(&challenge, &token).await;
+        let req = build_request_blocking(&challenge, &token).await.expect("difficulty 20 is well under the client's cap");
 
         assert_eq!(req.len(), 40, "solution(8) | token(32)");
         let solution = u64::from_le_bytes(req[..8].try_into().unwrap());
@@ -943,6 +923,47 @@ mod tests {
             Duration::from_millis(300),
         )
         .await;
+        let elapsed = start.elapsed();
+
+        assert!(r.is_err(), "must error, not hang, when the edge never relays");
+        assert!(
+            r.unwrap_err().to_string().contains("timed out"),
+            "error should name the timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must return near the setup deadline, took {elapsed:?}"
+        );
+        edge.abort();
+    }
+
+    /// #419: `client_tunnel_udp` was the one client entry point the existing
+    /// timeout sweep missed — against a stalled edge that accepts the QUIC
+    /// connection but never sends the rendezvous challenge, setup must return a
+    /// timeout error promptly instead of hanging forever.
+    #[tokio::test]
+    async fn client_tunnel_udp_setup_times_out_against_a_stalled_edge_419() {
+        let token = RoutingToken([9u8; 32]);
+        let origin_kp = generate_static_keypair();
+        let client_kp = generate_static_keypair();
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let edge = tokio::spawn(async move {
+            let _conn = server.accept().await.unwrap().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let cap = Capability {
+            token: token.clone(),
+            origin: OriginIdentity(origin_kp.public),
+            edge_addr: addr.to_string(),
+        };
+        let conn = dial_edge(addr, cert).await.expect("client dial");
+        let local = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+
+        let start = Instant::now();
+        let r = client_tunnel_udp(&conn, &token, &cap, &client_kp.private, local, Duration::from_millis(300)).await;
         let elapsed = start.elapsed();
 
         assert!(r.is_err(), "must error, not hang, when the edge never relays");
