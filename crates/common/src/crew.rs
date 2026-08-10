@@ -46,6 +46,30 @@ pub struct Palette {
     pub accent: String,
 }
 
+impl Palette {
+    /// #456: every field really is `^#[0-9a-fA-F]{6}$`, not just documented as such. The art
+    /// fragment is LLM-authored free text deserialized straight through — an unparseable value
+    /// (`"dark blue"`, `""`, `"#fff"`) reaches the browser's canvas `addColorStop`, which throws a
+    /// `SyntaxError` and kills the render loop entirely instead of engaging the `Option<Palette>`
+    /// fallback this type was designed to support.
+    fn is_valid(&self) -> bool {
+        let is_hex6 = |s: &str| {
+            s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
+        };
+        [
+            &self.sky_top,
+            &self.sky_bottom,
+            &self.pipe,
+            &self.pipe_edge,
+            &self.ground,
+            &self.ground_edge,
+            &self.accent,
+        ]
+        .into_iter()
+        .all(|s| is_hex6(s))
+    }
+}
+
 /// The art agent's fragment — central's b1 art handler output shape, plus an optional #176 custom
 /// `palette` so the LLM can invent a full sky/pipe/ground colour scheme, not just name one of five.
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +125,11 @@ pub struct CrewConfig {
 impl CrewConfig {
     /// Merge the physics + art fragments into the demo config, reconciling the handlers' field
     /// names with the game's (`flapPower→jump`, `pipeGap→gap`, `pipeSpeed→speed`).
+    ///
+    /// #456: a custom `palette` that fails [`Palette::is_valid`] is dropped to `None` here rather
+    /// than passed through — the documented `theme`-preset fallback then actually engages instead
+    /// of an LLM-authored non-hex color reaching the browser's canvas gradient and killing the
+    /// render loop.
     pub fn from_fragments(physics: &PhysicsFragment, art: &ArtFragment) -> Self {
         CrewConfig {
             gravity: physics.gravity,
@@ -111,7 +140,7 @@ impl CrewConfig {
             bird_color: art.bird_color.clone(),
             bird_emoji: art.bird_emoji.clone(),
             title: art.title.clone(),
-            palette: art.palette.clone(),
+            palette: art.palette.clone().filter(Palette::is_valid),
             pipe_emoji: art.pipe_emoji.clone(),
             bg_effect: art.bg_effect.clone(),
         }
@@ -259,5 +288,30 @@ mod tests {
 
         // A malformed fragment fails closed (Err), never a partial/garbage config.
         assert!(CrewConfig::from_fragment_json("{\"gravity\":1}", art).is_err(), "missing physics fields → Err");
+    }
+
+    #[test]
+    fn invalid_palette_colors_drop_to_none_instead_of_reaching_the_browser_456() {
+        let physics = r#"{"gravity":1,"flapPower":2,"pipeGap":3,"pipeSpeed":4}"#;
+        let base = |sky_top: &str| {
+            format!(
+                r##"{{"theme":"night","birdColor":"#00ff41","birdEmoji":"","title":"Dusk","palette":{{"skyTop":"{sky_top}","skyBottom":"#7a3b1f","pipe":"#c85a2a","pipeEdge":"#8a3b18","ground":"#3a2a1a","groundEdge":"#241a10","accent":"#ffd18a"}}}}"##
+            )
+        };
+
+        let cfg = CrewConfig::from_fragment_json(physics, &base("dark blue")).expect("still parses");
+        assert!(cfg.palette.is_none(), "non-hex color must drop the whole palette, not pass it through");
+
+        let cfg = CrewConfig::from_fragment_json(physics, &base("")).expect("still parses");
+        assert!(cfg.palette.is_none(), "empty color must drop the whole palette");
+
+        let cfg = CrewConfig::from_fragment_json(physics, &base("#fff")).expect("still parses");
+        assert!(cfg.palette.is_none(), "3-digit hex must drop the whole palette (not #rrggbb)");
+
+        let cfg = CrewConfig::from_fragment_json(physics, &base("2a0f3a")).expect("still parses");
+        assert!(cfg.palette.is_none(), "missing '#' must drop the whole palette");
+
+        let cfg = CrewConfig::from_fragment_json(physics, &base("#2a0f3a")).expect("still parses");
+        assert_eq!(cfg.palette.as_ref().map(|p| p.sky_top.as_str()), Some("#2a0f3a"), "a valid palette is untouched");
     }
 }

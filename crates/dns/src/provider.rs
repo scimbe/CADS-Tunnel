@@ -155,12 +155,21 @@ impl DesecClient {
 
     /// Upsert the TXT record via a bulk PATCH (leaves other records untouched);
     /// deSEC requires TXT values wrapped in double quotes.
+    ///
+    /// #459: guarded under the operator's own zone, matching [`set_a`](Self::set_a) — without it,
+    /// a name outside the zone falls through `subname_of` unchanged and still gets a `200 OK`
+    /// PATCH against a name that was never actually written, so a misconfigured hostname reads as
+    /// a slow/failing DNS provider (the convergence wait polls a name that never existed) instead
+    /// of an immediate, accurate config error.
     pub async fn set_txt(&self, name: &str, value: &str) -> Result<(), String> {
+        self.guard_under_zone(name)?;
         self.patch_rrset(name, "TXT", vec![format!("\"{value}\"")]).await
     }
 
-    /// Clear the challenge TXT — an empty `records` list removes the RRset.
+    /// Clear the challenge TXT — an empty `records` list removes the RRset. #459: same zone guard
+    /// as [`set_txt`](Self::set_txt)/[`clear_a`](Self::clear_a).
     pub async fn clear_txt(&self, name: &str) -> Result<(), String> {
+        self.guard_under_zone(name)?;
         self.patch_rrset(name, "TXT", Vec::new()).await
     }
 
@@ -369,6 +378,14 @@ mod tests {
         client.clear_txt("_acme-challenge.bunsenbrenner.org").await.unwrap();
         let (_p, _a, body) = captured.lock().unwrap().clone().unwrap();
         assert!(body.contains("\"records\":[]"), "empty records clears it");
+
+        // #459: a name outside the configured zone is refused before any request reaches deSEC —
+        // matching set_a/clear_a's existing guard.
+        *captured.lock().unwrap() = None;
+        assert!(client.set_txt("_acme-challenge.wrong.example", "v").await.is_err());
+        assert!(captured.lock().unwrap().is_none(), "guard fires before any HTTP call for set_txt");
+        assert!(client.clear_txt("_acme-challenge.wrong.example").await.is_err());
+        assert!(captured.lock().unwrap().is_none(), "guard fires before any HTTP call for clear_txt");
     }
 
     #[tokio::test]

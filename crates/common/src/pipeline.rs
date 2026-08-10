@@ -20,6 +20,7 @@
 //! wins each role.
 
 use crate::channel::{AgentCard, CapacityOffer, ChannelId, ServiceType, UnixSeconds};
+use crate::preimage::Preimage;
 use crate::settlement::Hold;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -489,16 +490,23 @@ const PIPELINE_MATCH_DOMAIN: &[u8] = b"ct-pipeline-escrow-match-v1";
 /// from the pipeline id + the assignment's terms; because [`convene`](PipelineSpec::convene) gives
 /// each role a **distinct** provider (#172 cross-role exclusivity), `(pipeline_id, provider)` is
 /// unique per role, so no two roles of one convened pipeline share a match id.
+///
+/// #454: built via [`Preimage`] rather than hand-rolled — the domain constant used to be appended
+/// with no length prefix of its own, reopening the exact gap #252 closed in `Preimage::new` (a
+/// future second pipeline-match domain that happens to be a byte-prefix of this one could collide).
+/// Not exploitable with today's single domain constant, but `Preimage` makes it unconditionally
+/// safe rather than relying on that staying true. **Breaking change**: this changes the derived
+/// `match_ref` for any already-minted hold, matching #252's own precedent — no in-place migration
+/// exists for durably-stored pre-#454 match refs.
 pub fn role_match_ref(pipeline_id: &str, assignment: &RoleAssignment) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(PIPELINE_MATCH_DOMAIN);
-    h.update((pipeline_id.len() as u64).to_le_bytes());
-    h.update(pipeline_id.as_bytes());
-    h.update(assignment.provider);
-    h.update(assignment.units.to_le_bytes());
-    h.update(assignment.price.to_le_bytes());
-    h.finalize().into()
+    let preimage = Preimage::new(PIPELINE_MATCH_DOMAIN)
+        .var_bytes(pipeline_id.as_bytes())
+        .fixed(&assignment.provider)
+        .u64(assignment.units)
+        .u64(assignment.price)
+        .finish();
+    Sha256::digest(preimage).into()
 }
 
 /// **Settle a convened pipeline for real** (#175 gap 2, maintainer 2026-07-25: settlement is now):
@@ -871,6 +879,31 @@ mod tests {
         );
         escrow.refund(&holds[1].match_ref, 500).expect("refund after expiry");
         assert_eq!(escrow.balance(&buyer), 910 + 40, "unspent role refunded to the buyer");
+    }
+
+    #[test]
+    fn role_match_ref_length_prefixes_the_pipeline_id_so_boundary_ambiguity_cant_collide_454() {
+        // The classic missing-length-prefix collision: "ab" + "c" vs "a" + "bc" -- without
+        // length-prefixing pipeline_id, both would concatenate to the same bytes after the domain.
+        let assignment = RoleAssignment { service: SafetyCheck, provider: [7u8; 32], units: 1, price: 1 };
+        let a = role_match_ref("abc", &assignment);
+        let b = role_match_ref("ab", &assignment);
+        assert_ne!(a, b, "different pipeline_id lengths must never collide");
+
+        // Direct proof the domain itself is now length-prefixed: a hand-built preimage using the
+        // OLD (pre-#454) unprefixed-domain scheme must NOT match the new one for identical inputs.
+        use sha2::{Digest, Sha256};
+        let old_scheme: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(PIPELINE_MATCH_DOMAIN);
+            h.update((b"abc".len() as u64).to_le_bytes());
+            h.update(b"abc");
+            h.update(assignment.provider);
+            h.update(assignment.units.to_le_bytes());
+            h.update(assignment.price.to_le_bytes());
+            h.finalize().into()
+        };
+        assert_ne!(a, old_scheme, "the fixed encoding must differ from the old hand-rolled one");
     }
 
     /// A single-role flappy-style `physics` spec — the reference role of #207/#208.
