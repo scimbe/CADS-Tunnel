@@ -726,6 +726,15 @@ fn split_tokens(s: &str) -> Vec<String> {
     }
 }
 
+/// Escape a token for safe use inside a `LIKE ... ESCAPE '\'` pattern (backslash, then `%`/`_`,
+/// the two characters `LIKE` itself treats as wildcards). `register`'s own newline check already
+/// keeps tokens free of `\n`/`\r`, so this only has to defang `LIKE`'s own special characters —
+/// otherwise a role/skill token containing e.g. `%` would silently widen the exact-token match
+/// `search` promises (see its own doc comment) into a substring match.
+fn like_escape_token(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// Why an agent-directory [`register`](SqliteAgentDirectory::register) was rejected.
 #[derive(Debug)]
 pub enum AgentDirectoryError {
@@ -818,18 +827,34 @@ impl SqliteAgentDirectory {
     /// `skill_ids` contain `skill` (when given), matched as **exact tokens** (not substrings, so
     /// `"admin"` never matches `"administrator"`). Both `None` → the whole directory. Sorted by
     /// holder key for a stable result.
+    ///
+    /// The exact-token match happens in the `WHERE` clause itself (#347): each stored column is
+    /// wrapped in `char(10)` delimiters and matched against `%\n<escaped token>\n%`, so only rows
+    /// that actually carry the token are pulled from SQLite and deserialized — a directory search
+    /// no longer loads + token-splits every row just to discard most of them in Rust.
     pub fn search(
         &self,
         role: Option<&str>,
         skill: Option<&str>,
     ) -> rusqlite::Result<Vec<AgentDirectoryEntry>> {
         let conn = self.conn.lock_safe();
-        let mut stmt = conn.prepare(
+        let mut sql = String::from(
             "SELECT holder_pubkey, card_url, role_tags, skill_ids, registered_at
-             FROM agent_cards ORDER BY holder_pubkey",
-        )?;
-        let all = stmt
-            .query_map([], |r| {
+             FROM agent_cards WHERE 1=1",
+        );
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(r) = role {
+            sql.push_str(" AND (char(10) || role_tags || char(10)) LIKE ? ESCAPE '\\'");
+            binds.push(format!("%\n{}\n%", like_escape_token(r)));
+        }
+        if let Some(s) = skill {
+            sql.push_str(" AND (char(10) || skill_ids || char(10)) LIKE ? ESCAPE '\\'");
+            binds.push(format!("%\n{}\n%", like_escape_token(s)));
+        }
+        sql.push_str(" ORDER BY holder_pubkey");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                 let role_tags: String = r.get(2)?;
                 let skill_ids: String = r.get(3)?;
                 Ok(AgentDirectoryEntry {
@@ -841,13 +866,15 @@ impl SqliteAgentDirectory {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(all
-            .into_iter()
-            .filter(|e| {
-                role.is_none_or(|r| e.role_tags.iter().any(|t| t == r))
-                    && skill.is_none_or(|s| e.skill_ids.iter().any(|t| t == s))
-            })
-            .collect())
+        Ok(rows)
+    }
+
+    /// Directory size without deserializing a single row (#347) — `status_handler`'s aggregate
+    /// count only ever needed `COUNT(*)`, not every row's token-split facets.
+    pub fn count(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .lock_safe()
+            .query_row("SELECT COUNT(*) FROM agent_cards", [], |r| r.get(0))
     }
 }
 
@@ -5733,5 +5760,33 @@ mod tests {
         assert!(matches!(injected, Err(AgentDirectoryError::InvalidToken(_))), "newline token rejected");
         assert!(dir.search(Some("admin"), None).unwrap().is_empty(), "the injected facet never landed");
         assert!(dir.search(None, None).unwrap().iter().all(|e| e.holder_pubkey != "cc"), "no partial row for the rejected register");
+    }
+
+    #[test]
+    fn agent_directory_search_filters_in_sql_and_escapes_like_wildcards_347() {
+        // #347: search's WHERE clause matches role_tags/skill_ids via LIKE, so a token containing
+        // LIKE's own wildcard characters (`%`, `_`) must still be matched EXACTLY -- not widened
+        // into a substring/wildcard match -- or the exact-token guarantee this store's own doc
+        // comment promises would quietly break for any agent that self-asserts such a token.
+        let dir = SqliteAgentDirectory::open_in_memory().unwrap();
+        dir.register("aa", "https://a.z/.well-known/agent-card.json",
+            &["role%wild".to_string()], &["skill_under".to_string()], 100).unwrap();
+        dir.register("bb", "https://b.z/.well-known/agent-card.json",
+            &["roleXwild".to_string()], &["skillAunder".to_string()], 100).unwrap();
+
+        // A literal "%" in the stored token must not act as a SQL wildcard: searching for the
+        // exact literal token matches only "aa", never "bb" (which would match if % were live).
+        let by_percent = dir.search(Some("role%wild"), None).unwrap();
+        assert_eq!(by_percent.len(), 1, "% in a token must be matched literally, not as a wildcard");
+        assert_eq!(by_percent[0].holder_pubkey, "aa");
+
+        let by_underscore = dir.search(None, Some("skill_under")).unwrap();
+        assert_eq!(by_underscore.len(), 1, "_ in a token must be matched literally, not as a wildcard");
+        assert_eq!(by_underscore[0].holder_pubkey, "aa");
+
+        // The unrelated entries never match a pattern-shaped query for the other holder's token.
+        assert!(dir.search(Some("roleXwild"), None).unwrap().iter().all(|e| e.holder_pubkey == "bb"));
+
+        assert_eq!(dir.count().unwrap(), 2, "count() matches the real row count");
     }
 }

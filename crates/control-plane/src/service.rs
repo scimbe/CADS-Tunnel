@@ -3560,7 +3560,7 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         tunnels: live_tunnel_count(s).await,
         agents: s.enrollment.agent_count().unwrap_or(0),
         pipelines_published: s.pipeline_registry.list().map(|v| v.len() as i64).unwrap_or(0),
-        agents_directory: s.agent_directory.search(None, None).map(|v| v.len() as i64).unwrap_or(0),
+        agents_directory: s.agent_directory.count().unwrap_or(0),
         accounts: s.ledger.account_count().unwrap_or(0),
         payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
         uptime_seconds: s.started.elapsed().as_secs(),
