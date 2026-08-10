@@ -90,13 +90,17 @@ pub fn build_response(query: &Query, txts: &[String]) -> Vec<u8> {
                 rr.extend_from_slice(&TYPE_TXT.to_be_bytes());
                 rr.extend_from_slice(&CLASS_IN.to_be_bytes());
                 rr.extend_from_slice(&60u32.to_be_bytes()); // TTL
-                let mut rdata = Vec::new();
+                // #353: write rdata straight into `rr` and backpatch its 2-byte length
+                // afterward, instead of building a separate `rdata` Vec just to copy it
+                // into `rr` right after -- one fewer heap allocation per TXT answer.
+                let rdlen_pos = rr.len();
+                rr.extend_from_slice(&[0, 0]); // placeholder, overwritten below
                 for chunk in txt.as_bytes().chunks(255) {
-                    rdata.push(chunk.len() as u8);
-                    rdata.extend_from_slice(chunk);
+                    rr.push(chunk.len() as u8);
+                    rr.extend_from_slice(chunk);
                 }
-                rr.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-                rr.extend_from_slice(&rdata);
+                let rdlen = (rr.len() - rdlen_pos - 2) as u16;
+                rr[rdlen_pos..rdlen_pos + 2].copy_from_slice(&rdlen.to_be_bytes());
                 rr
             })
             .collect()
@@ -312,6 +316,28 @@ mod tests {
         let resp = build_response(&q, &["a-normal-challenge-token".to_string()]);
         assert_eq!(resp[2] & 0x02, 0, "TC bit NOT set");
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "the one answer is present");
+    }
+
+    #[test]
+    fn build_response_splits_a_txt_value_over_255_bytes_into_multiple_chunks_353() {
+        // #353: no prior test exercised the multi-chunk path (every existing TXT value
+        // was <= 255 bytes) -- exactly the path this change touches (rdata now written
+        // straight into `rr` with a backpatched length instead of via a separate `rdata`
+        // Vec). A 300-byte value must split into two DNS character-strings (255 + 45)
+        // with a correctly backpatched rdlength spanning both, and round-trip intact.
+        let q = parse_query(&query_bytes(0x42, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let long_value = "y".repeat(300);
+        let resp = build_response(&q, &[long_value.clone()]);
+
+        assert_eq!(parse_txt_answers(&resp), vec![long_value], "multi-chunk value round-trips intact");
+
+        // rdlength must span BOTH chunks: 1+255 (len byte + first chunk) + 1+45 (len
+        // byte + second chunk) = 302 -- not just the first chunk's length.
+        let needle = [0xC0, 0x0C];
+        let name_pos = resp.windows(2).position(|w| w == needle).unwrap();
+        let rdlen_pos = name_pos + 2 + 2 + 2 + 4; // name + type + class + ttl
+        let rdlen = u16::from_be_bytes([resp[rdlen_pos], resp[rdlen_pos + 1]]);
+        assert_eq!(rdlen, 302, "rdlength covers both character-strings, not just the first");
     }
 
     #[test]
