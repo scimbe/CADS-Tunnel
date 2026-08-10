@@ -60,6 +60,29 @@ spec:
           ports:
             - name: http
               containerPort: 8090
+          # #378: main.rs's OIDC-enabled boot path fetches the realm JWKS before the
+          # listener binds (#271's short retry backoff, #295's per-attempt timeout) --
+          # bounded, but still up to ~75s worst case (6 attempts, each up to the
+          # 10s fetch timeout, plus the ~15.5s of backoff sleeps between them) if
+          # Keycloak is genuinely slow/hanging at exactly boot time. Without a
+          # startupProbe, livenessProbe alone kills the pod at ~50s
+          # (initialDelaySeconds 5 + periodSeconds 15 * failureThreshold 3) --
+          # before that boot path can even finish -- and /healthz is unreachable
+          # (connection refused, listener not bound yet) the whole time, so
+          # liveness has nothing to see but failure. A startupProbe on the same
+          # /healthz suppresses liveness/readiness evaluation until it first
+          # succeeds, giving up to periodSeconds * failureThreshold = 150s for a
+          # slow first boot -- comfortably over the ~75s worst case with margin --
+          # while a normal-speed boot (no OIDC, or a healthy Keycloak) still
+          # passes on its very first check and liveness/readiness take over
+          # immediately as before.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /healthz
