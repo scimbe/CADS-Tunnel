@@ -292,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let force_tcp = std::env::var("CT_CLIENT_FORCE_TCP").is_ok();
     let edge_port = edge_addr.port();
     let ladder = filtered_ladder(force_tcp, edge_port);
-    let netsig = network_signature();
+    let netsig = network_signature().await;
     let per_rung = Duration::from_secs(2);
     let edge_ip = edge_addr.ip();
     let mut cache = LadderCache::new();

@@ -178,11 +178,22 @@ pub fn filtered_ladder(force_tcp: bool, edge_port: u16) -> Vec<Rung> {
 /// default egress interface's IPv4 /24 (stable per LAN, distinct across networks);
 /// else `"default"`. It only needs to be stable-per-network and distinct-across —
 /// it is a local cache key and never leaves the host.
-pub fn network_signature() -> String {
-    network_signature_from(
-        std::env::var("CT_CLIENT_NET_SIG").ok(),
-        local_egress_ip(),
-    )
+///
+/// #371: `local_egress_ip`'s `UdpSocket::bind`/`connect`/`local_addr` are real,
+/// synchronous, blocking syscalls (plus a routing-table lookup that can genuinely
+/// stall on some systems) -- calling them directly from an async fn would block
+/// whatever Tokio worker thread is running it for their duration. Run on a real
+/// blocking-pool thread via `spawn_blocking` instead, matching this codebase's own
+/// convention for the one other blocking call on this path (`build_request_blocking`'s
+/// PoW solve, `transport.rs`). The explicit-override branch (`CT_CLIENT_NET_SIG` set)
+/// never touches a socket at all -- only the fallback path pays this real cost.
+pub async fn network_signature() -> String {
+    let override_env = std::env::var("CT_CLIENT_NET_SIG").ok();
+    let egress = match tokio::task::spawn_blocking(local_egress_ip).await {
+        Ok(egress) => egress,
+        Err(_) => None, // the blocking task panicked -- treat as "no route", same as a real lookup failure
+    };
+    network_signature_from(override_env, egress)
 }
 
 /// Pure core of [`network_signature`] (testable): explicit override wins, else the
@@ -315,6 +326,23 @@ mod tests {
         // A stale cached rung (not in this ladder) is ignored.
         cache.remember("net-c", Rung::TlsTcp(8443));
         assert_eq!(attempt_order(&cache, "net-c", &ladder), ladder);
+    }
+
+    // #371: the real async wrapper end to end -- proves it actually runs off the
+    // Tokio runtime (a real `#[tokio::test]`, not `#[test]`) and returns the real
+    // value `network_signature_from`'s own already-covered logic would produce.
+    // The explicit-override path is used deliberately (not the real egress lookup)
+    // so this stays fast and hermetic -- CI/dev sandboxes vary in real routing
+    // table contents, `CT_CLIENT_NET_SIG` does not.
+    #[tokio::test]
+    async fn network_signature_runs_async_and_honors_the_override() {
+        // SAFETY: test-only env mutation; ct-tunnel's test suites don't run this
+        // specific test concurrently with another that reads/sets this same var
+        // (grep-confirmed: no other test touches CT_CLIENT_NET_SIG).
+        unsafe { std::env::set_var("CT_CLIENT_NET_SIG", "async-wrapper-test-net") };
+        let sig = network_signature().await;
+        unsafe { std::env::remove_var("CT_CLIENT_NET_SIG") };
+        assert_eq!(sig, "async-wrapper-test-net");
     }
 
     // #367: paused clock so the real 250ms-per-position stagger in
