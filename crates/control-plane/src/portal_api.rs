@@ -560,15 +560,16 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             // (monitoring v1) its live connection status, alongside its tunnel row
             // -- best-effort per-row (a lookup failure just omits that row's badge
             // rather than failing the whole page, matching this handler's existing
-            // tolerance for partial data). Sequential, not concurrent: Standard tier
-            // is one tunnel per account, so this is at most one extra HTTP round
-            // trip per page view today.
+            // tolerance for partial data). The admission lookup is batched (#351)
+            // into one query regardless of row count; `edge_tunnel_status`'s HTTP
+            // scrape stays sequential per row -- Standard tier is one tunnel per
+            // account today, so that's at most one extra round trip per page view.
+            let hostnames: Vec<&str> =
+                tunnels.iter().filter_map(|(t, _)| t.hostname.as_deref()).collect();
+            let admissions = st.tunnels.cert_admission_for_hostnames(&hostnames).unwrap_or_default();
             let mut rows = Vec::with_capacity(tunnels.len());
             for (t, owned) in tunnels {
-                let admission = t
-                    .hostname
-                    .as_deref()
-                    .and_then(|h| st.tunnels.cert_admission_for_hostname(h).ok().flatten());
+                let admission = t.hostname.as_deref().and_then(|h| admissions.get(h).cloned());
                 let status = edge_tunnel_status(&st, &t.routing_token).await;
                 // #382-follow (Browser-Plane login gate): owner-scoped, so a shared
                 // (not-owned) row simply gets the off/empty defaults -- matching the

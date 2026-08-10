@@ -2197,6 +2197,59 @@ impl SqliteTunnelStore {
         Ok(Some(CertAdmission { status, assigned_ca, claim_state, claim_deadline, queue_position }))
     }
 
+    /// Batched form of [`Self::cert_admission_for_hostname`] (#351): a page rendering N
+    /// tunnel rows was calling the single-hostname lookup once per row (up to 2N queries
+    /// once the `queue_position` sub-query is counted) -- N sequential round trips that
+    /// grow with the number of tunnels a page shows, instead of one. Fetches every
+    /// requested hostname's row in a single `WHERE hostname IN (...)`, and computes
+    /// `queue_position` for the whole batch from one sorted list of queued timestamps
+    /// (`partition_point` on a sorted-ascending list is the same count a per-row
+    /// `COUNT(*) WHERE queued_at < ?` would produce) instead of one `COUNT(*)` per row.
+    /// Two queries total, regardless of how many hostnames are asked for.
+    pub fn cert_admission_for_hostnames(
+        &self,
+        hostnames: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, CertAdmission>> {
+        if hostnames.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read();
+        let placeholders = std::iter::repeat("?").take(hostnames.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT hostname, status, assigned_ca, claim_state, claim_deadline, queued_at
+             FROM subject_tunnels WHERE hostname IN ({placeholders})"
+        );
+        let rows: Vec<(String, String, Option<String>, String, Option<i64>, Option<i64>)> = conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(hostnames.iter()), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut queued_ats: Vec<i64> = conn
+            .prepare(
+                "SELECT queued_at FROM subject_tunnels
+                 WHERE status = 'gelb' AND claim_state = 'none' AND queued_at IS NOT NULL",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        queued_ats.sort_unstable();
+
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for (hostname, status, assigned_ca, claim_state, claim_deadline, queued_at) in rows {
+            let queue_position = if status == "gelb" && claim_state == "none" {
+                queued_at.map(|qa| queued_ats.partition_point(|&x| x < qa) as i64)
+            } else {
+                None
+            };
+            out.insert(
+                hostname,
+                CertAdmission { status, assigned_ca, claim_state, claim_deadline, queue_position },
+            );
+        }
+        Ok(out)
+    }
+
     /// Flip a hostname from Rot to Gelb, entering the admission queue for the
     /// first time (`queued_at = now`). No-op (`Ok(false)`) unless the
     /// hostname is currently `rot` -- callers must not clobber later state.
@@ -4807,6 +4860,48 @@ mod tests {
         assert_eq!(store.cert_admission_for_hostname("a.example").unwrap().unwrap().queue_position, Some(0));
         assert_eq!(store.cert_admission_for_hostname("b.example").unwrap().unwrap().queue_position, Some(1));
         assert_eq!(store.cert_admission_for_hostname("c.example").unwrap().unwrap().queue_position, Some(2));
+    }
+
+    #[test]
+    fn cert_admission_for_hostnames_batches_exactly_what_the_per_row_lookup_would_return_351() {
+        // #351: the real claim is "one batched call returns the SAME data N per-row calls
+        // would have" -- not just "the batched call doesn't crash". Mixes a gruen hostname
+        // (no queue_position), a not-yet-gelb host, an unknown hostname (must be absent
+        // from the map, not present with a default), and three gelb-queued hosts with a
+        // TIE in queued_at (b and c) to prove the batched queue_position math (a sorted
+        // Vec + partition_point) reproduces the per-row `COUNT(*) WHERE queued_at < ?`
+        // semantics exactly, ties included, not just for the easy strictly-increasing case.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap();
+        store.create("alice", "b", Some("b.example")).unwrap();
+        store.create("alice", "c", Some("c.example")).unwrap();
+        store.create("alice", "d", Some("d.example")).unwrap();
+        store.enter_gelb_queue("a.example", 100).unwrap();
+        store.enter_gelb_queue("b.example", 200).unwrap();
+        store.enter_gelb_queue("c.example", 200).unwrap(); // tie with b
+        // d.example stays "rot" (never entered the queue).
+
+        let hostnames = ["a.example", "b.example", "c.example", "d.example", "no-such-host"];
+        let batched = store.cert_admission_for_hostnames(&hostnames).unwrap();
+
+        assert_eq!(batched.len(), 4, "the unknown hostname must be absent, not present with a default");
+        assert!(!batched.contains_key("no-such-host"));
+
+        for h in ["a.example", "b.example", "c.example", "d.example"] {
+            let per_row = store.cert_admission_for_hostname(h).unwrap().unwrap();
+            assert_eq!(
+                batched.get(h).cloned(),
+                Some(per_row),
+                "batched result for {h} must exactly match the single-hostname lookup, ties included"
+            );
+        }
+        // Spell out the tie result explicitly too, not just "matches the other method":
+        // b and c share queued_at=200, so both must see exactly 1 hostname (a) ahead of
+        // them, and neither counts the other despite the tie.
+        assert_eq!(batched["a.example"].queue_position, Some(0));
+        assert_eq!(batched["b.example"].queue_position, Some(1));
+        assert_eq!(batched["c.example"].queue_position, Some(1));
+        assert_eq!(batched["d.example"].queue_position, None, "not gelb -- no queue position");
     }
 
     #[test]
