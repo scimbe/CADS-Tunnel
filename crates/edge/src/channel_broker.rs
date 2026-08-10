@@ -637,6 +637,16 @@ fn member_ack_suffix(noise: Option<[u8; 32]>, holder: &[u8; 32], attest: Option<
     }
 }
 
+/// #276 piece 1: whether a paired pair's two edge-observed reflexive addresses share the
+/// same public IP (same NAT/network) — the edge-attested fact a client needs before it may
+/// safely try a private-range dial candidate against its peer (#137's SSRF guard still
+/// applies to any candidate that ISN'T independently corroborated this way). Compares only
+/// the IP, not the port: two members behind the same NAT get the same public IP but distinct
+/// NAT-assigned ports.
+fn same_public_ip(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    a.ip() == b.ip()
+}
+
 /// A channel member that has cleared admission (`accept_and_read_join` /
 /// [`read_join_on_connection`]): its live QUIC connection and reply stream, the
 /// verified [`ChannelJoinRequest`] it presented, the operator key its grant was
@@ -704,17 +714,29 @@ pub(crate) async fn finish_rendezvous_pair(
             // admits through before any relay fallback — surfaces as a `RelayHandoffError` naming the
             // dead side, not a bare error that reads like a refusal (the fix #148/#154 gave the other
             // two completers; this is the one actually in source-2/sink's admission path).
+            //
+            // #276 piece 1: append `sp=<0|1>` — whether this pair's two edge-observed reflexive
+            // (public) IPs match, i.e. both members are behind the same NAT/on the same network.
+            // This is the edge-attested fact #276 needs to safely gate a LAN-local dial candidate:
+            // a private-range candidate is only safe to dial when the edge independently observed
+            // BOTH sides arriving from the same public IP, not merely a self-reported claim. Purely
+            // additive, always present (unlike the noise/attest suffix's all-or-nothing convention)
+            // so the client can parse it unambiguously without a presence check; a legacy client
+            // that doesn't look for `sp=` is unaffected exactly as an unrecognized `r=` was.
+            let sp = same_public_ip(a.observed, b.observed);
             let a_ack = format!(
-                "OK {}{} r={}",
+                "OK {}{} r={} sp={}",
                 b.req.endpoint,
                 member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
-                a.observed
+                a.observed,
+                sp as u8
             );
             let b_ack = format!(
-                "OK {}{} r={}",
+                "OK {}{} r={} sp={}",
                 a.req.endpoint,
                 member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
-                b.observed
+                b.observed,
+                sp as u8
             );
             quic_ack_member(&mut a.send, a_ack.as_bytes(), PairSide::A).await?;
             quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
@@ -776,17 +798,26 @@ pub(crate) async fn finish_relay_pair(
             // edge, only in in-process tests that bypass this completer entirely. Fixed by including
             // the endpoint + `member_ack_suffix` exactly as `finish_rendezvous_pair` does (a relay-only
             // member's `req.endpoint` is already the relay-only sentinel, harmless to echo back).
+            //
+            // #276 piece 1: same `sp=<0|1>` edge-attested same-public-IP token as
+            // `finish_rendezvous_pair` — see that function's comment. Relay-only members reach this
+            // completer via the direct QUIC broker port (not the :443 front door), so their reflexive
+            // is genuinely meaningful here, unlike `finish_relay_pair_over_streams`'s deliberately
+            // deferred case.
+            let sp = same_public_ip(a.observed, b.observed);
             let a_ack = format!(
-                "OK {}{} r={}",
+                "OK {}{} r={} sp={}",
                 b.req.endpoint,
                 member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
-                a.observed
+                a.observed,
+                sp as u8
             );
             let b_ack = format!(
-                "OK {}{} r={}",
+                "OK {}{} r={} sp={}",
                 a.req.endpoint,
                 member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
-                b.observed
+                b.observed,
+                sp as u8
             );
             quic_ack_member(&mut a.send, a_ack.as_bytes(), PairSide::A).await?;
             quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
@@ -1270,6 +1301,32 @@ mod tests {
 
     fn operator_pubkey() -> [u8; 32] {
         SigningKey::from_bytes(&OP_SEED).verifying_key().to_bytes()
+    }
+
+    #[test]
+    fn same_public_ip_matches_by_ip_ignoring_port_276() {
+        let a: std::net::SocketAddr = "203.0.113.9:40001".parse().unwrap();
+        let b: std::net::SocketAddr = "203.0.113.9:51234".parse().unwrap();
+        assert!(same_public_ip(a, b), "same IP, different NAT-assigned ports must still match");
+    }
+
+    #[test]
+    fn same_public_ip_rejects_different_ips_even_with_the_same_port_276() {
+        let a: std::net::SocketAddr = "203.0.113.9:40001".parse().unwrap();
+        let b: std::net::SocketAddr = "203.0.113.10:40001".parse().unwrap();
+        assert!(!same_public_ip(a, b), "different IPs must never match regardless of port");
+    }
+
+    #[test]
+    fn same_public_ip_treats_ipv4_and_ipv6_forms_of_the_same_address_as_distinct_276() {
+        // Deliberately conservative: an IPv4-mapped-IPv6 vs plain-IPv4 representation of "the
+        // same" address does NOT compare equal here (std::net::IpAddr::eq is exact-form, no
+        // normalization) -- correct for this use, since a client that got fed a spuriously
+        // "same" signal across address families could be misled into dialing an IPv6-only
+        // local candidate a genuinely-IPv4-only peer can never reach.
+        let a: std::net::SocketAddr = "203.0.113.9:1".parse().unwrap();
+        let b: std::net::SocketAddr = "[::ffff:203.0.113.9]:1".parse().unwrap();
+        assert!(!same_public_ip(a, b), "no cross-family normalization -- exact IpAddr equality only");
     }
 
     /// A grant for `channel`, bound to `holder`, signed by the channel operator.
@@ -2567,6 +2624,11 @@ mod tests {
             let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
             let ack_a = present_join(&conn, &req_a.encode(), &holder_a).await;
             assert!(ack_a.starts_with(b"OK 203.0.113.2:7002 r="), "A admitted to relay with B's endpoint + its own observed reflexive, got {:?}", String::from_utf8_lossy(&ack_a));
+            // #276 piece 1: both test clients dial from loopback, so the edge observes the SAME
+            // reflexive IP for both -- proving the `sp=1` token is genuinely wired end to end
+            // through `finish_relay_pair`, not just correct in the pure `same_public_ip` unit tests.
+            let text_a = String::from_utf8_lossy(&ack_a);
+            assert!(text_a.ends_with(" sp=1"), "same-loopback-IP pair must be tagged sp=1, got {text_a:?}");
             let (mut s, mut r) = conn.open_bi().await.expect("a data bi"); // initiator opens
             s.write_all(b"tunnel A->B via edge").await.expect("a write");
             let mut got = vec![0u8; 20];
@@ -2656,6 +2718,12 @@ mod tests {
         let text_b = String::from_utf8_lossy(&ack_b);
         let r_a = text_a.strip_prefix("OK 203.0.113.4:7004 r=").expect("A's ack carries B's endpoint + its own r= token");
         let r_b = text_b.strip_prefix("OK 203.0.113.3:7003 r=").expect("B's ack carries A's endpoint + its own r= token");
+        // #276 piece 1 added a trailing ` sp=<0|1>` token after `r=<addr>` -- split it off before
+        // parsing the address.
+        let (r_a, sp_a) = r_a.split_once(" sp=").expect("A's ack carries the sp= token after r=");
+        let (r_b, sp_b) = r_b.split_once(" sp=").expect("B's ack carries the sp= token after r=");
+        assert_eq!(sp_a, "1", "same-loopback-IP pair must be tagged sp=1");
+        assert_eq!(sp_b, "1", "same-loopback-IP pair must be tagged sp=1");
 
         // Both connected from loopback, so each reflexive is 127.0.0.1:<ephemeral port>; the
         // real assertion is that the two are DIFFERENT (each got its own address, not a shared
