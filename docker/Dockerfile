@@ -19,9 +19,10 @@
 #
 # ct-agent itself was extracted to its own repo (scimbe/ct-agent) and is NOT built
 # here -- no self-host compose service ever ran it ("customers run their own agents,
-# outbound-only"). What stayed behind in crates/agent-tools (ct-crew-bridge,
-# ct-cookbook-bridge, metrics_probe, udp_echo) is still built as part of this
-# workspace, same as before.
+# outbound-only"). What stayed behind in crates/agent-tools (metrics_probe, udp_echo)
+# is still built as part of this workspace, same as before. ct-crew-bridge/
+# ct-cookbook-bridge were removed in #232: both demos migrated to their own thin
+# Node.js bridges weeks before this image's side of the cleanup landed.
 #
 # #165: the builder is pinned to `-bookworm` explicitly, matching the runtime's
 # `debian:bookworm-slim` glibc (2.36). The unsuffixed `rust:1-slim` tag floats to
@@ -41,8 +42,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/ct-edge target/release/ct-client \
           target/release/ct-control-plane target/release/cp_selftest \
           target/release/metrics_probe target/release/udp_echo \
-          target/release/quic_echo target/release/direct_bench \
-          target/release/ct-crew-bridge target/release/ct-cookbook-bridge /build/bin/
+          target/release/quic_echo target/release/direct_bench /build/bin/
 
 # Shared non-root setup both runtime stages below apply identically -- kept as one
 # place so the uid/gid convention (#305) can never drift between them.
@@ -56,10 +56,6 @@ COPY --from=builder /build/bin/metrics_probe /usr/local/bin/metrics_probe
 COPY --from=builder /build/bin/udp_echo /usr/local/bin/udp_echo
 COPY --from=builder /build/bin/quic_echo /usr/local/bin/quic_echo
 COPY --from=builder /build/bin/direct_bench /usr/local/bin/direct_bench
-# #173 flappy-demo crew: the HTTP bridge the demo's Caddy origin reverse-proxies /crew/build to.
-COPY --from=builder /build/bin/ct-crew-bridge /usr/local/bin/ct-crew-bridge
-# #201 cookbook-demo crew: the HTTP bridge for /cookbook/build.
-COPY --from=builder /build/bin/ct-cookbook-bridge /usr/local/bin/ct-cookbook-bridge
 
 # #315: the real production/self-host image -- ca-certificates + curl only, no
 # iproute2/iptables. Not the default target (see `runtime` below, which stays the

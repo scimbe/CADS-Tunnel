@@ -534,12 +534,9 @@ dependencies = [
 name = "ct-agent-tools"
 version = "0.0.0"
 dependencies = [
- "axum",
  "ct-agent",
  "ct-common",
- "serde_json",
  "tokio",
- "tokio-stream",
 ]
 
 [[package]]

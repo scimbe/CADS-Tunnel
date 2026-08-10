@@ -140,7 +140,7 @@ print_next_steps() {
   local bindir="$PREFIX/bin"
   echo
   log "done — core system installed"
-  echo "  binaries: ${bindir}  (ct-client, ct-control-plane, ct-edge, ct-dns, ct-crew-bridge, ct-cookbook-bridge, + tools)"
+  echo "  binaries: ${bindir}  (ct-client, ct-control-plane, ct-edge, ct-dns, + tools)"
   case ":$PATH:" in
     *":$bindir:"*) : ;;
     *) warn "add it to PATH:  export PATH=\"$bindir:\$PATH\"" ;;

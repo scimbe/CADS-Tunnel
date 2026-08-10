@@ -282,6 +282,8 @@ operator only ever sees that a channel exists between two holder keys, never you
 
 ## See also
 
+- [`onboarding/pipeline-bridge-pattern.md`](onboarding/pipeline-bridge-pattern.md) — how a
+  published pipeline (C) fronts itself with a public HTTP bridge, without any core code change.
 - `https://bunsenbrenner.org/` — live counts of registered tunnels, published pipelines, and
   discoverable agents right now (useful to sanity-check a registration or publish landed).
 - `https://bunsenbrenner.org/template-guide` — the same `hello-world-pipeline` structure walkthrough

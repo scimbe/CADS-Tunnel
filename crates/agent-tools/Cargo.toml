@@ -5,19 +5,23 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 
-# Demo bridges (ct-crew-bridge, ct-cookbook-bridge -- kept in core per #219) and
-# test/diagnostic tools (natlab, metrics_probe, udp_echo) that stayed in CADS-Tunnel
+# Test/diagnostic tools (natlab, metrics_probe, udp_echo) that stayed in CADS-Tunnel
 # when ct-agent itself was extracted to its own repo (scimbe/ct-agent). Only `natlab`
 # actually depends on ct-agent (its nat_lab_* test harness functions); the rest depend
-# on nothing from ct-agent at all -- crew_bridge/cookbook_bridge only need ct-common's
-# crew/cookbook orchestration primitives, and metrics_probe/udp_echo are standalone.
+# on nothing from ct-agent at all -- both are standalone.
+#
+# The demo-specific crew/cookbook bridge *binaries* (ct-crew-bridge, ct-cookbook-bridge,
+# #219) were removed in #232: both demos migrated to their own thin Node.js bridges
+# weeks before core's side of that cleanup landed (see
+# docs/onboarding/pipeline-bridge-pattern.md for the pattern that replaces them for any
+# future pipeline). `ct_common::crew`/`ct_common::cookbook` themselves stay, though --
+# #232's own hermetic gate caught that `scimbe/ct-agent`'s `channel_run.rs`
+# (`crew_build_over`) still depends on them directly as a library primitive, so removing
+# the modules would have broken that separate repo's build.
 
 [dependencies]
 ct-common = { path = "../common" }
-axum = "0.7"
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "sync"] }
-tokio-stream = "0.1"
 
 [features]
 # See ct-agent's own `nat-lab` feature doc comment -- required to build `natlab`.
@@ -32,14 +36,6 @@ nat-lab = ["ct-agent/nat-lab"]
 git = "https://github.com/scimbe/ct-agent"
 rev = "86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408"
 optional = true
-
-[[bin]]
-name = "ct-crew-bridge"
-path = "src/bin/crew_bridge.rs"
-
-[[bin]]
-name = "ct-cookbook-bridge"
-path = "src/bin/cookbook_bridge.rs"
 
 [[bin]]
 name = "metrics_probe"
