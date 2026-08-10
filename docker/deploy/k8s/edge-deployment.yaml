@@ -54,6 +54,22 @@ spec:
             - name: tls-tcp
               containerPort: 4433
               protocol: TCP
+          # #375: livenessProbe/readinessProbe alone gave a slow first start (each
+          # edge mints its own internal CA and runs PoW setup *before* binding the
+          # tls-tcp listener) only ~35-50s before liveness's own failureThreshold
+          # kills the pod -- a cold start on a loaded node, a large PoW difficulty,
+          # or slow PVC I/O could all genuinely exceed that, causing a real
+          # CrashLoopBackOff with the dataplane never coming up. A startupProbe
+          # disables liveness/readiness until it succeeds once, so a legitimately
+          # slow first start is tolerated without weakening the tight
+          # already-running liveness bound below. ~150s window
+          # (5s * 30 == 150s), generous for a one-time cold start.
+          startupProbe:
+            tcpSocket:
+              port: tls-tcp
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
           livenessProbe:
             tcpSocket:
               port: tls-tcp
