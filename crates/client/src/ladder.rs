@@ -7,6 +7,10 @@
 //! without real sockets or timeouts.
 
 use std::collections::HashMap;
+use std::time::Duration;
+
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 
 /// One rung of the fallback ladder: a transport over a port on the edge host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,11 +85,46 @@ pub fn attempt_order(cache: &LadderCache, network: &str, ladder: &[Rung]) -> Vec
     order
 }
 
-/// Try each rung in [`attempt_order`] via the injected async `dial`, returning the
-/// first rung that connects together with its connection, and recording that rung
-/// in `cache` for `network`. `dial` yields `None` for an unreachable rung (a
-/// timeout/refusal in the live path), so the ladder walks on to the next rung.
-/// Returns `None` only when every rung fails.
+/// RFC 8305-style "Happy Eyeballs" stagger between starting successive rungs
+/// (#367): the rung at position `i` in [`attempt_order`]'s output starts
+/// `STAGGER_DELAY * i` after the race begins, so a fast-responding early rung
+/// still wins well before a later one even starts, but a blocked/slow early
+/// rung no longer blocks later rungs from starting concurrently -- unlike the
+/// old fully-serial "await one at a time" walk, the worst case (every rung
+/// blocked) is now bounded by the slowest rung's own timeout plus its
+/// stagger offset, not the SUM of every rung's own timeout.
+const STAGGER_DELAY: Duration = Duration::from_millis(250);
+
+/// Race every rung in [`attempt_order`] concurrently via the injected async
+/// `dial`, returning the first rung that connects together with its
+/// connection, and recording that rung in `cache` for `network`. `dial`
+/// yields `None` for an unreachable rung (a timeout/refusal in the live
+/// path). Returns `None` only when every rung fails.
+///
+/// #367: this used to await each rung one at a time, so a client on a
+/// restrictive network paid the SUM of every blocked rung's own timeout
+/// before reaching the one that works. Now every rung starts concurrently
+/// (staggered — see [`STAGGER_DELAY`]), so the worst case is bounded by the
+/// slowest rung's own timeout plus its stagger offset instead. The
+/// cache-preferred rung (`attempt_order` already puts it first, unchanged)
+/// gets stagger offset zero -- a real, genuine head start, not merely "tried
+/// first" the way the old serial walk gave it.
+///
+/// `dial(rung)` is called eagerly here to build each rung's future, but
+/// nothing it does actually runs until that future is first polled -- which
+/// the `sleep` inside each entry defers until its own stagger offset elapses
+/// -- so a later rung's real dial (its socket connect / QUIC handshake)
+/// genuinely doesn't start early just because its future object exists.
+///
+/// Real cancellation, not merely "stopped awaiting": the first rung to
+/// actually connect wins, and every future still pending in the race when
+/// this function returns -- including a rung's dial mid-flight, or one still
+/// waiting out its own stagger delay and never even touching a socket -- is
+/// dropped along with the race itself. That is real, standard Rust async
+/// cancellation: neither `dial_edge` nor `tcp_tls_connect` (the two real
+/// per-rung dialers in `transport.rs`) registers anything that needs an
+/// explicit close — each owns its socket/QUIC endpoint locally and Drop
+/// cleans it up, so a dropped in-flight dial leaks nothing.
 pub async fn connect_via_ladder<T, F, Fut>(
     cache: &mut LadderCache,
     network: &str,
@@ -96,8 +135,23 @@ where
     F: FnMut(Rung) -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    for rung in attempt_order(cache, network, ladder) {
-        if let Some(conn) = dial(rung).await {
+    let mut races: FuturesUnordered<_> = attempt_order(cache, network, ladder)
+        .into_iter()
+        .enumerate()
+        .map(|(i, rung)| {
+            let attempt = dial(rung);
+            let offset = STAGGER_DELAY * i as u32;
+            async move {
+                if !offset.is_zero() {
+                    tokio::time::sleep(offset).await;
+                }
+                (rung, attempt.await)
+            }
+        })
+        .collect();
+
+    while let Some((rung, result)) = races.next().await {
+        if let Some(conn) = result {
             cache.remember(network, rung);
             return Some((rung, conn));
         }
@@ -263,7 +317,11 @@ mod tests {
         assert_eq!(attempt_order(&cache, "net-c", &ladder), ladder);
     }
 
-    #[tokio::test]
+    // #367: paused clock so the real 250ms-per-position stagger in
+    // connect_via_ladder resolves at virtual-time speed, not real wall-clock
+    // time -- same pattern/rationale as ct-edge's #111 and ct-common's #269
+    // paused-clock tests.
+    #[tokio::test(start_paused = true)]
     async fn connect_via_ladder_picks_first_reachable_and_caches_it() {
         let ladder = default_ladder(4433);
         let mut cache = LadderCache::new();
@@ -309,7 +367,7 @@ mod tests {
         assert_eq!(tried.lock().unwrap().len(), 1, "no blocked rung re-attempted");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn connect_via_ladder_returns_none_when_every_rung_fails() {
         let ladder = default_ladder(4433);
         let mut cache = LadderCache::new();
@@ -317,5 +375,163 @@ mod tests {
             connect_via_ladder(&mut cache, "dead", &ladder, |_rung| async { None }).await;
         assert_eq!(got, None);
         assert_eq!(cache.remembered("dead"), None, "nothing cached when all fail");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_via_ladder_races_concurrently_a_fast_later_rung_beats_a_slow_earlier_one_367() {
+        // #367: a fast rung ordered SECOND must still win well before a slow/blocked
+        // rung ordered FIRST finishes its own (much longer) timeout -- proving real
+        // concurrent racing, not just serial-with-extra-steps. Rung::Quic(1) never
+        // resolves within the test's own patience (2s); Rung::TlsTcp(2), staggered
+        // 250ms behind it, resolves 50ms after it starts (t=300ms).
+        let ladder = vec![Rung::Quic(1), Rung::TlsTcp(2)];
+        let mut cache = LadderCache::new();
+
+        let start = tokio::time::Instant::now();
+        let got = connect_via_ladder(&mut cache, "race-net", &ladder, |rung| async move {
+            match rung {
+                Rung::Quic(1) => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    None
+                }
+                Rung::TlsTcp(2) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Some("fast")
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(got, Some((Rung::TlsTcp(2), "fast")), "the fast rung wins despite being second");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "must not wait anywhere near the slow rung's own 2s timeout, elapsed {elapsed:?}"
+        );
+        assert_eq!(cache.remembered("race-net"), Some(Rung::TlsTcp(2)), "the real winner is cached");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_via_ladder_racing_still_gives_the_cached_rung_a_real_head_start_367() {
+        // #367: A and B are BOTH immediately reachable (0-latency dials) -- with no
+        // cache, A (first in the raw ladder) would win by simply being polled first.
+        // But B is the cache-remembered rung for this network, so attempt_order puts
+        // it at position 0 (offset zero) and pushes A back to position 1 (a real
+        // 250ms stagger behind it) -- B must still win, proving cache preference
+        // survives the move from serial to concurrent racing, not just in
+        // attempt_order's own (unit-tested, unchanged) ordering logic.
+        let ladder = vec![Rung::Quic(10), Rung::TlsTcp(20)];
+        let mut cache = LadderCache::new();
+        cache.remember("cached-net", Rung::TlsTcp(20));
+
+        let got = connect_via_ladder(&mut cache, "cached-net", &ladder, |rung| async move {
+            Some(match rung {
+                Rung::Quic(10) => "A",
+                Rung::TlsTcp(20) => "B",
+                _ => unreachable!(),
+            })
+        })
+        .await;
+
+        assert_eq!(got, Some((Rung::TlsTcp(20), "B")), "the cache-preferred rung wins its real head start");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_via_ladder_genuinely_cancels_losers_not_just_stops_awaiting_them_367() {
+        // #367: three rungs -- one already mid-dial when the race is won (must be
+        // cancelled before its own long completion), one that hasn't even started
+        // yet (its stagger delay hasn't elapsed -- must never touch its own dial
+        // body at all), and the real winner. Each tracks "started" (incremented the
+        // instant its OWN dial body -- after any stagger -- begins) and "completed"
+        // (incremented only if it runs to its own natural end) independently, so a
+        // nonzero started/zero completed is real, observable proof of cancellation,
+        // not merely "the test didn't wait for it."
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mid_flight_started = Arc::new(AtomicUsize::new(0));
+        let mid_flight_completed = Arc::new(AtomicUsize::new(0));
+        let never_started_started = Arc::new(AtomicUsize::new(0));
+
+        let ladder = vec![Rung::Quic(1), Rung::TlsTcp(2), Rung::Quic(3)];
+        let mut cache = LadderCache::new();
+
+        let (mfs, mfc, nss) = (
+            Arc::clone(&mid_flight_started),
+            Arc::clone(&mid_flight_completed),
+            Arc::clone(&never_started_started),
+        );
+        let got = connect_via_ladder(&mut cache, "cancel-net", &ladder, move |rung| {
+            let (mfs, mfc, nss) = (Arc::clone(&mfs), Arc::clone(&mfc), Arc::clone(&nss));
+            async move {
+                match rung {
+                    // Position 0 (offset 0): starts immediately, would take 5s to
+                    // finish -- must be cancelled long before then.
+                    Rung::Quic(1) => {
+                        mfs.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        mfc.fetch_add(1, Ordering::SeqCst);
+                        None
+                    }
+                    // Position 1 (offset 250ms): the real winner, done at t=300ms.
+                    Rung::TlsTcp(2) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Some("winner")
+                    }
+                    // Position 2 (offset 500ms): the race is already won at t=300ms,
+                    // well before this rung's own 500ms stagger elapses -- its dial
+                    // body must never run at all.
+                    Rung::Quic(3) => {
+                        nss.fetch_add(1, Ordering::SeqCst);
+                        None
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(got, Some((Rung::TlsTcp(2), "winner")));
+        assert_eq!(mid_flight_started.load(Ordering::SeqCst), 1, "the mid-flight loser did start");
+        assert_eq!(
+            mid_flight_completed.load(Ordering::SeqCst),
+            0,
+            "the mid-flight loser's own 5s sleep must never have been allowed to elapse -- real cancellation"
+        );
+        assert_eq!(
+            never_started_started.load(Ordering::SeqCst),
+            0,
+            "a rung whose stagger delay hadn't elapsed yet must never touch its own dial body"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_via_ladder_all_fail_waits_the_slowest_stagger_plus_timeout_not_the_sum_367() {
+        // #367: two rungs, both eventually fail, each with its own 100ms dial delay.
+        // Under the OLD fully-serial walk this would need rung0's 100ms + rung1's
+        // 100ms one after the other; concurrently (250ms stagger between starts) the
+        // real bound is rung1's own offset+duration (250 + 100 = 350ms), since rung0
+        // finishes (at 100ms) well before rung1 even starts.
+        let ladder = vec![Rung::Quic(1), Rung::TlsTcp(2)];
+        let mut cache = LadderCache::new();
+
+        let start = tokio::time::Instant::now();
+        let got: Option<(Rung, &str)> = connect_via_ladder(&mut cache, "all-fail-net", &ladder, |_rung| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            None
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(got, None, "every rung genuinely failed");
+        assert_eq!(cache.remembered("all-fail-net"), None, "nothing cached when all fail");
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "must wait out the real slowest rung's own offset+timeout, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "must NOT wait the serial sum (would be ~450ms+ with old behavior plus real overhead), elapsed {elapsed:?}"
+        );
     }
 }

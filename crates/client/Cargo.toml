@@ -11,6 +11,10 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# #367: connect_via_ladder races the fallback ladder's rungs concurrently
+# (FuturesUnordered) instead of one at a time; same crate ct-edge already
+# depends on for the identical reason.
+futures-util = "0.3"
 
 [dev-dependencies]
 ct-edge = { path = "../edge" }
@@ -21,3 +25,7 @@ ct-edge = { path = "../edge" }
 ct-agent = { git = "https://github.com/scimbe/ct-agent", rev = "86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408" }
 ct-control-plane = { path = "../control-plane" }
 axum = "0.7"
+# `test-util` (dev-only) enables tokio's paused clock for the #367 racing
+# tests (`#[tokio::test(start_paused = true)]`), same purpose/pattern as
+# ct-edge's #111 Slowloris test and ct-common's #269 idle-timeout tests.
+tokio = { version = "1", features = ["test-util"] }

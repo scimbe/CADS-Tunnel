@@ -551,6 +551,7 @@ dependencies = [
  "ct-common",
  "ct-control-plane",
  "ct-edge",
+ "futures-util",
  "quinn",
  "rustls",
  "tokio",
