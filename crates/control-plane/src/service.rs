@@ -4600,6 +4600,23 @@ async fn llms_txt_handler() -> impl axum::response::IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], LLMS_TXT)
 }
 
+/// #345: `GET /pki/ca` used to `std::fs::read` the CA root fresh on EVERY
+/// request -- blocking file I/O directly on the async worker, and real
+/// wasted disk reads for a value the module's own doc comment already
+/// called "stable across edge redeploys now that the CA persists" (#2
+/// `f9e64e9`). Caches the bytes in a `OnceCell` after the first successful
+/// read; every request after that clones an `Arc` instead of touching disk
+/// at all. Deliberately NOT eagerly loaded at `pki_router` construction time
+/// (a sync fn, and the file may legitimately not exist yet -- the edge
+/// writes its cert asynchronously after its own startup) -- the existing
+/// "503 until published, then works" behavior must keep re-checking disk on
+/// every request until the FIRST success, exactly as before; only after
+/// that does it stop touching disk.
+struct CaCache {
+    path: String,
+    cached: tokio::sync::OnceCell<Vec<u8>>,
+}
+
 /// Build the CA-publish router (#11 C1): `GET /pki/ca` serves the edge CA root
 /// DER read from `cert_path` — the same file the edge writes (`CT_EDGE_CERT_OUT`),
 /// co-located with the control plane on the central host. This is **public key
@@ -4610,16 +4627,23 @@ async fn llms_txt_handler() -> impl axum::response::IntoResponse {
 pub fn pki_router(cert_path: String) -> Router {
     Router::new()
         .route("/pki/ca", get(ca_handler))
-        .with_state(Arc::new(cert_path))
+        .with_state(Arc::new(CaCache {
+            path: cert_path,
+            cached: tokio::sync::OnceCell::new(),
+        }))
 }
 
-async fn ca_handler(State(path): State<Arc<String>>) -> axum::response::Response {
+async fn ca_handler(State(cache): State<Arc<CaCache>>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match std::fs::read(path.as_str()) {
+    // `tokio::fs::read` (not `std::fs::read`): the one real disk read this can
+    // still do -- on the first successful request, and again on every request
+    // before that first success -- runs via tokio's own spawn_blocking under
+    // the hood instead of blocking this async worker directly.
+    match cache.cached.get_or_try_init(|| tokio::fs::read(&cache.path)).await {
         Ok(der) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/x-x509-ca-cert")],
-            der,
+            der.clone(),
         )
             .into_response(),
         Err(_) => (
@@ -9115,6 +9139,52 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn pki_endpoint_caches_the_ca_root_after_the_first_successful_read_345() {
+        // #345: the real point of the fix -- once the CA root has been read
+        // successfully once, later requests must serve the cached bytes
+        // WITHOUT touching disk again. Proven directly (not just "it's fast"):
+        // delete the file after the first successful request, then request
+        // again -- if the handler were still reading from disk on every
+        // request (the pre-#345 behavior), this second request would 503,
+        // exactly like the "missing file" case above. A cached response
+        // proves the disk read only happened once.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let der: &[u8] = b"\x30\x82\x02\x0a-another-fake-ca-root-der";
+        let path = std::env::temp_dir().join(format!("ct-cp-ca-cache-{}.der", std::process::id()));
+        std::fs::write(&path, der).unwrap();
+
+        let app = pki_router(path.to_string_lossy().into_owned());
+
+        let first = app
+            .clone()
+            .oneshot(Request::get("/pki/ca").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "first request reads the real file");
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&first_body[..], der);
+
+        // Delete the file -- a real disk read on the next request would now 503.
+        std::fs::remove_file(&path).unwrap();
+
+        let second = app
+            .oneshot(Request::get("/pki/ca").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "a cached CA root must still be served even after the source file is gone -- \
+             proves this request never touched disk"
+        );
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&second_body[..], der, "the cached bytes are byte-identical to the original file");
     }
 
     #[tokio::test]
