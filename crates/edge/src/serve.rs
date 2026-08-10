@@ -1022,14 +1022,20 @@ pub async fn serve_connection(
             let mut token = [0u8; 32];
             recv.read_exact(&mut token).await?;
             let token = RoutingToken(token);
-            // #27 RB3: a revoked token stays down even though the agent keeps
-            // reconnecting — refuse the registration instead of accepting it.
-            if state.is_revoked(&token) {
+            // #27 RB3 / #421: a revoked token stays down even though the agent
+            // keeps reconnecting — refuse the registration instead of accepting
+            // it. Checked-and-registered atomically (one `registration_lock`
+            // acquisition inside `register_with_candidate_unless_revoked`) so a
+            // concurrent revoke can't complete inside the gap between a
+            // separate check and a separate register call — see that method's
+            // doc for the exact race this closes.
+            let Some(reg) =
+                state.register_with_candidate_unless_revoked(token.clone(), conn.clone(), conn.remote_address())
+            else {
                 send.write_all(b"NO").await?;
                 send.finish()?;
                 return Ok(None);
-            }
-            let reg = state.register_with_candidate(token.clone(), conn.clone(), conn.remote_address());
+            };
             send.write_all(b"OK").await?;
             send.finish()?;
             // Return the (token, registration id) so the caller can evict exactly
@@ -1267,18 +1273,37 @@ where
         b'A' => {
             // #258: bound the admission exchange (not the park/relay that follows --
             // that's deliberately unbounded, same as everywhere else in this file).
-            let token = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+            // #411: this arm previously acked `OK` and parked unconditionally --
+            // no `is_revoked` check anywhere, unlike the QUIC role-`'A'` arm --
+            // so a revoked token could still register (and keep re-registering)
+            // over the TCP fallback, defeating `revoke_token` for any Agent
+            // reachable over it. The token is read first, then checked+parked
+            // atomically via `park_tcp_agent_unless_revoked` (same
+            // `registration_lock`-guarded pattern as the QUIC arm's
+            // `register_with_candidate_unless_revoked`), and the ack now
+            // reflects the real outcome (`NO` on revoked, matching the QUIC
+            // arm's wire behavior) instead of always claiming `OK` up front.
+            let (_token, parked) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
                 let mut token_buf = [0u8; 32];
                 stream.read_exact(&mut token_buf).await?;
                 let token = RoutingToken(token_buf);
-                stream.write_all(b"OK").await?;
+                let parked = state.park_tcp_agent_unless_revoked(token.clone());
+                if parked.is_some() {
+                    stream.write_all(b"OK").await?;
+                } else {
+                    stream.write_all(b"NO").await?;
+                }
                 stream.flush().await?;
-                Ok::<_, BoxError>(token)
+                Ok::<_, BoxError>((token, parked))
             })
             .await
             .map_err(|_| "tcp-fallback: role 'A' admission timed out")??;
-            // Park and await a Client, then relay this agent stream to it.
-            match state.park_tcp_agent(token).await {
+            let Some(parked) = parked else {
+                let _ = stream.shutdown().await;
+                return Ok(());
+            };
+            // Await the parked Client, then relay this agent stream to it.
+            match parked.await {
                 Ok(mut client) => {
                     relay(&mut stream, &mut client).await?;
                     Ok(())
