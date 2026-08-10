@@ -357,13 +357,56 @@ where
     Ok(())
 }
 
+/// #366: get the shared QUIC connection [`client_forward`] reuses across every
+/// accepted local connection, redialing (a full QUIC handshake + TLS) only when
+/// none is cached yet or the cached one is actually closed/closing --
+/// `close_reason()` is a real, direct check (quinn's own API for this), not an
+/// arbitrary IO error inferred to mean the connection died. Holds `shared`'s
+/// lock across the redial itself so concurrently-accepted local connections
+/// racing this call never redial in parallel: the first task to notice a
+/// dead/missing connection redials once and caches it; every other task
+/// blocked on the lock in the meantime simply reuses what it just cached,
+/// instead of each independently paying for its own redundant QUIC handshake.
+async fn client_forward_conn(
+    shared: &tokio::sync::Mutex<Option<Connection>>,
+    edge_addr: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<Connection, BoxError> {
+    let mut guard = shared.lock().await;
+    let needs_dial = match guard.as_ref() {
+        Some(c) => c.close_reason().is_some(),
+        None => true,
+    };
+    if needs_dial {
+        let conn = dial_edge(edge_addr, edge_cert).await?;
+        *guard = Some(conn.clone());
+        Ok(conn)
+    } else {
+        Ok(guard.as_ref().expect("checked Some above").clone())
+    }
+}
+
 /// Local-forward proxy (#22 HW2a): accept plain TCP connections on `listener`
-/// and bridge each, over its own fresh tunnel, to the Origin via
-/// [`client_tunnel_stream`]. This turns the payload-only client into a usable
-/// local port: any TCP/TLS app (curl, a browser) can connect to `listener` and
-/// ride the tunnel, with TLS terminating **at the Origin** (the Edge stays
-/// provider-blind). One local connection = one edge connection = one tunnel, so
-/// concurrent connections are independent. Runs until cancelled.
+/// and bridge each to the Origin via [`client_tunnel_stream`]. This turns the
+/// payload-only client into a usable local port: any TCP/TLS app (curl, a
+/// browser) can connect to `listener` and ride the tunnel, with TLS
+/// terminating **at the Origin** (the Edge stays provider-blind). Runs until
+/// cancelled.
+///
+/// #366: local connections share ONE underlying QUIC connection to the Edge
+/// (dialed lazily on first accept, redialed via [`client_forward_conn`] only
+/// if it's actually gone) instead of each paying for its own fresh QUIC
+/// handshake + TLS. This changes zero cryptographic/trust properties: each
+/// local connection still gets its own independent PoW-gated rendezvous AND
+/// its own independent, fresh `Noise_IK` handshake, exactly as before --
+/// [`client_tunnel_stream`] does both per call by opening its own
+/// `conn.open_bi()` bidirectional QUIC **stream** and negotiating rendezvous +
+/// Noise on that stream alone, regardless of which QUIC connection carries it.
+/// That per-stream Noise session -- not the outer QUIC transport connection --
+/// is what actually makes concurrent local connections independent (the Edge
+/// only ever relays ciphertext it cannot decrypt or correlate across
+/// sessions); sharing the transport connection removes only redundant
+/// QUIC-handshake setup cost, nothing the tunnel's own trust model relies on.
 pub async fn client_forward(
     listener: tokio::net::TcpListener,
     edge_addr: SocketAddr,
@@ -373,21 +416,26 @@ pub async fn client_forward(
     client_private: [u8; 32],
     setup_deadline: Duration,
 ) -> Result<(), BoxError> {
+    let shared_conn: Arc<tokio::sync::Mutex<Option<Connection>>> = Arc::new(tokio::sync::Mutex::new(None));
     loop {
         let (sock, _peer) = listener.accept().await?;
         let edge_cert = edge_cert.clone();
         let token = token.clone();
         let cap = cap.clone();
+        let shared_conn = shared_conn.clone();
         tokio::spawn(async move {
-            match dial_edge(edge_addr, edge_cert).await {
+            match client_forward_conn(&shared_conn, edge_addr, edge_cert).await {
                 Ok(conn) => {
+                    // Never `conn.close()` here -- it's shared; closing it here would
+                    // sever every OTHER local connection currently riding it. A dead
+                    // connection is naturally noticed and redialed by the next accept's
+                    // own `client_forward_conn` call via `close_reason()`.
                     if let Err(e) =
                         client_tunnel_stream(&conn, &token, &cap, &client_private, sock, setup_deadline)
                             .await
                     {
                         eprintln!("ct-client: forwarded connection ended: {e}");
                     }
-                    conn.close(0u32.into(), b"done");
                 }
                 Err(e) => eprintln!("ct-client: forward dial failed: {e}"),
             }
@@ -776,6 +824,102 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "must return near the setup deadline, took {elapsed:?}"
+        );
+        edge.abort();
+    }
+
+    /// #366: `client_forward`'s shared-connection helper must actually reuse
+    /// the cached QUIC connection across calls, not silently redial every
+    /// time. A real fake edge counts every genuine QUIC connection it accepts
+    /// (each accepted connection is held open in its own spawned task so the
+    /// edge's own accept loop is free to notice a second dial immediately, if
+    /// one wrongly happened).
+    #[tokio::test]
+    async fn client_forward_conn_reuses_the_cached_connection_across_calls_366() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let ac = accept_count.clone();
+        let edge = tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let ac = ac.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        ac.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        drop(conn);
+                    }
+                });
+            }
+        });
+
+        let shared: tokio::sync::Mutex<Option<Connection>> = tokio::sync::Mutex::new(None);
+        let conn1 = client_forward_conn(&shared, addr, cert.clone()).await.expect("first dial");
+        let conn2 = client_forward_conn(&shared, addr, cert.clone()).await.expect("second call");
+        let conn3 = client_forward_conn(&shared, addr, cert).await.expect("third call");
+
+        assert_eq!(conn1.stable_id(), conn2.stable_id(), "second call reused the cached connection");
+        assert_eq!(conn1.stable_id(), conn3.stable_id(), "third call reused the cached connection too");
+        // Give the edge's spawned accept-handler tasks a moment to actually
+        // register the connection before checking the counter.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            1,
+            "the edge saw exactly ONE real QUIC connection across all three calls, not three"
+        );
+        edge.abort();
+    }
+
+    /// #366: when the cached connection is actually closed, the next call must
+    /// notice (via `close_reason()`, not an inferred IO error) and redial a
+    /// genuinely new one -- rather than keep handing out a dead connection
+    /// forever, which would silently black-hole every subsequent local
+    /// connection accepted after the shared connection died.
+    #[tokio::test]
+    async fn client_forward_conn_redials_after_the_cached_connection_closes_366() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("edge");
+        let addr = server.local_addr().expect("addr");
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let ac = accept_count.clone();
+        let edge = tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let ac = ac.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        ac.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        drop(conn);
+                    }
+                });
+            }
+        });
+
+        let shared: tokio::sync::Mutex<Option<Connection>> = tokio::sync::Mutex::new(None);
+        let conn1 = client_forward_conn(&shared, addr, cert.clone()).await.expect("first dial");
+        assert!(conn1.close_reason().is_none(), "freshly dialed connection is not closed");
+
+        // Simulate the shared connection dying (network blip / edge restart):
+        // close it directly, exactly what `close_reason()` is meant to detect.
+        conn1.close(0u32.into(), b"simulated death");
+        assert!(conn1.close_reason().is_some(), "close() takes effect immediately per quinn's own docs");
+
+        let conn2 = client_forward_conn(&shared, addr, cert).await.expect("redial after death");
+        assert_ne!(
+            conn1.stable_id(),
+            conn2.stable_id(),
+            "the next call detected the dead connection and dialed a genuinely new one"
+        );
+        assert!(conn2.close_reason().is_none(), "the redialed connection is alive");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "the edge saw exactly two real QUIC connections: the original, then the redial"
         );
         edge.abort();
     }
