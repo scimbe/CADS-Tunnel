@@ -336,19 +336,30 @@ where
 
     // Encrypt `[tag ‖ payload]` with `ts` and frame it into `ct` (2-byte len prefix reserved at
     // the front, as `noise_pump`); returns the total framed length.
-    let seal = |ts: &Mutex<snow::TransportState>, tag: u8, payload: &[u8], ct: &mut [u8]| -> io::Result<usize> {
+    //
+    // #364: `msg` is a caller-owned scratch buffer, not built fresh per call. The base `noise_pump`
+    // already avoids a per-frame allocation on this exact path (#114 #1) by handing `write_message`
+    // the app bytes directly; this multiplexed variant needs the extra 1-byte tag prefix, which
+    // `seal_frame` (shared with the base pump, #189) can't take separately since it wants one
+    // contiguous plaintext slice -- so the tag+payload still has to be assembled somewhere. Doing
+    // that into a buffer the caller hoists once (`clear()` + `push()` + `extend_from_slice()` reuses
+    // its already-grown capacity every frame) turns what was a fresh `Vec::with_capacity` heap
+    // allocation and a full payload memcpy on EVERY outbound frame -- up to 16KiB, hundreds of times
+    // per second on a bulk-traffic relay -- into a one-time allocation that then just gets refilled.
+    let seal = |ts: &Mutex<snow::TransportState>, tag: u8, payload: &[u8], msg: &mut Vec<u8>, ct: &mut [u8]| -> io::Result<usize> {
         // #189: multiplexed frames `[tag] ‖ payload`; the encrypt+frame is the shared seal_frame, so the
         // wire framing is provably identical to the base pump (only this leading tag byte differs).
-        let mut msg = Vec::with_capacity(1 + payload.len());
+        msg.clear();
         msg.push(tag);
         msg.extend_from_slice(payload);
-        seal_frame(ts, &msg, ct)
+        seal_frame(ts, msg, ct)
     };
 
     // app bytes + in-band control -> tagged frames, over relay until cutover, then over direct.
     let outbound = async {
         let mut buf = vec![0u8; CHUNK];
         let mut ct = vec![0u8; 2 + 1 + CHUNK + 256];
+        let mut msg = Vec::with_capacity(1 + CHUNK);
         let mut control_open = true;
         let mut dir_out_rx = Some(dir_out_rx); // moved into this loop; taken at cutover
         let mut direct: Option<(std::sync::Arc<Mutex<snow::TransportState>>, DW)> = None;
@@ -365,7 +376,7 @@ where
                         // subsequent frames go direct.
                         if let Some(rx) = dir_out_rx.take() {
                             if let Ok(entry) = rx.await {
-                                let total = seal(&relay_ts, PUMP_TAG_CUTOVER, &[], &mut ct)?;
+                                let total = seal(&relay_ts, PUMP_TAG_CUTOVER, &[], &mut msg, &mut ct)?;
                                 relay_write.write_all(&ct[..total]).await?;
                                 relay_write.flush().await?;
                                 direct = Some(entry);
@@ -374,11 +385,11 @@ where
                     }
                     Some(PumpControl::Send(payload)) => {
                         if let Some((dts, dw)) = direct.as_mut() {
-                            let total = seal(dts, PUMP_TAG_CONTROL, &payload, &mut ct)?;
+                            let total = seal(dts, PUMP_TAG_CONTROL, &payload, &mut msg, &mut ct)?;
                             dw.write_all(&ct[..total]).await?;
                             dw.flush().await?;
                         } else {
-                            let total = seal(&relay_ts, PUMP_TAG_CONTROL, &payload, &mut ct)?;
+                            let total = seal(&relay_ts, PUMP_TAG_CONTROL, &payload, &mut msg, &mut ct)?;
                             relay_write.write_all(&ct[..total]).await?;
                             relay_write.flush().await?;
                         }
@@ -394,11 +405,11 @@ where
                         return Ok::<(), io::Error>(());
                     }
                     if let Some((dts, dw)) = direct.as_mut() {
-                        let total = seal(dts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                        let total = seal(dts, PUMP_TAG_DATA, &buf[..n], &mut msg, &mut ct)?;
                         dw.write_all(&ct[..total]).await?;
                         dw.flush().await?;
                     } else {
-                        let total = seal(&relay_ts, PUMP_TAG_DATA, &buf[..n], &mut ct)?;
+                        let total = seal(&relay_ts, PUMP_TAG_DATA, &buf[..n], &mut msg, &mut ct)?;
                         relay_write.write_all(&ct[..total]).await?;
                         relay_write.flush().await?;
                     }
