@@ -15,6 +15,18 @@
 
 use std::collections::HashMap;
 
+/// #363: how often [`check_and_record`](ReplayCache::check_and_record) pays for a
+/// full [`evict_expired`](ReplayCache::evict_expired) sweep, instead of on every
+/// single call. Mirrors [`crate::ratelimit::KeyedRateLimiter::allow`]'s own
+/// `last_swept_window` amortization (#195) for the identical reason: this is a
+/// hot verify-path primitive (`credential`/`channel`'s own `verify_fresh`), and an
+/// O(n) `HashMap::retain()` scan on every lookup — including every cache HIT —
+/// degrades what should be an O(1) check to O(n) under load with many concurrent
+/// valid tokens. Unlike the rate limiter's discrete window boundaries, this
+/// cache's time has no natural "next window" to gate on (real wall-clock seconds,
+/// ticking on essentially every call), so a fixed interval is used instead.
+const EVICT_INTERVAL_SECS: u64 = 5;
+
 /// A bounded-lifetime set of seen token identifiers. Each identifier is remembered
 /// only until its token's `expires_at`, after which the token would be rejected on
 /// expiry anyway and the entry is dropped.
@@ -22,6 +34,13 @@ use std::collections::HashMap;
 pub struct ReplayCache {
     /// identifier bytes -> the token's `expires_at` (caller time units, e.g. seconds)
     seen: HashMap<Vec<u8>, u64>,
+    /// #363: wall-clock time of the last full [`evict_expired`](Self::evict_expired)
+    /// sweep. `0` (the `Default` value) triggers a sweep on the first call in real
+    /// production usage, since a real Unix timestamp is always far more than
+    /// [`EVICT_INTERVAL_SECS`] past `0` -- not a universal guarantee for any `now`
+    /// (a test using small values, e.g. `now=1`, can and does exercise the "not
+    /// enough time has passed yet" path even on a brand-new cache).
+    last_evict_at: u64,
 }
 
 impl ReplayCache {
@@ -34,17 +53,34 @@ impl ReplayCache {
     /// presented, `false` if the same `id` was already recorded and has not yet
     /// expired (a replay). An `id` whose `expires_at <= now` is treated as already
     /// invalid: it is not admitted as fresh and not stored (the caller's expiry
-    /// check rejects it regardless). Every call first evicts entries that have
-    /// expired by `now`, so the map only ever holds currently-valid identifiers.
+    /// check rejects it regardless).
+    ///
+    /// #363: the fast path no longer pays for a full map scan on every call — it
+    /// looks up only the specific `id` being checked (real O(1)), so an
+    /// already-expired entry under a DIFFERENT id (still present because its own
+    /// full sweep hasn't run yet) can never cause a false replay: it's simply
+    /// invisible to a lookup for a different id, and if that same id resurfaces,
+    /// `self.seen.get(id)` seeing its expired entry and `insert` overwriting it
+    /// behaves identically to the old evict-then-contains_key-then-insert
+    /// sequence. The full sweep (bounding total memory across every id, not just
+    /// the one being looked up right now) still runs, just at most once per
+    /// [`EVICT_INTERVAL_SECS`] instead of every call — see its own doc comment.
     pub fn check_and_record(&mut self, id: &[u8], expires_at: u64, now: u64) -> bool {
-        self.evict_expired(now);
+        if now.saturating_sub(self.last_evict_at) >= EVICT_INTERVAL_SECS {
+            self.evict_expired(now);
+            self.last_evict_at = now;
+        }
         // An already-expired token is never fresh and never stored — expiry alone
-        // rejects it, and storing it would only add an entry we'd evict next call.
+        // rejects it, and storing it would only add an entry we'd evict next sweep.
         if expires_at <= now {
             return false;
         }
-        if self.seen.contains_key(id) {
-            return false;
+        if let Some(&existing_expiry) = self.seen.get(id) {
+            if existing_expiry > now {
+                return false; // a live, unexpired replay
+            }
+            // Present but already expired (the periodic sweep hasn't reached it
+            // yet) -- exactly as invisible to this check as if it were absent.
         }
         self.seen.insert(id.to_vec(), expires_at);
         true
@@ -112,5 +148,44 @@ mod tests {
             "an access after expiry admits a new token"
         );
         assert_eq!(c.len(), 1, "the expired entry was evicted, not accumulated");
+    }
+
+    #[test]
+    fn full_sweep_is_amortized_but_a_lookup_still_treats_its_own_expired_entry_as_gone_363() {
+        let mut c = ReplayCache::new();
+        // t=1: `last_evict_at` starts at 0 (`Default`); 1 - 0 = 1 < EVICT_INTERVAL_SECS
+        // (5), so even this very first call doesn't sweep yet -- deliberately
+        // exercising the "not enough real time has passed" path, not the
+        // "brand new cache" path a real Unix timestamp would always take.
+        assert!(c.check_and_record(&[1u8; 64], 3, 1), "id_a fresh, expires at t=3");
+        assert_eq!(c.len(), 1);
+
+        // t=4: id_a (expiry 3) is now logically expired, but only 4s have passed
+        // since `last_evict_at` (still 0) -- still under EVICT_INTERVAL_SECS, so
+        // the periodic full sweep is deliberately skipped again, and id_a's stale
+        // entry is still physically present. This is the real, documented
+        // relaxation #363 makes: the cache no longer guarantees "never holds more
+        // than the currently-unexpired set" at every instant, only that a LOOKUP
+        // always behaves as if it did.
+        assert!(c.check_and_record(&[2u8; 64], 1000, 4), "id_b fresh, unrelated to id_a");
+        assert_eq!(c.len(), 2, "id_a's stale entry is still physically present -- sweep hasn't run");
+
+        // The real correctness property: even though id_a's own entry is still
+        // sitting in the map, presenting id_a AGAIN at t=4 must NOT be treated as
+        // a replay of a live token -- its own expiry (3) is in the past relative
+        // to now (4), so the fast per-id lookup path must see it as gone, exactly
+        // as if the full sweep had already run.
+        assert!(
+            c.check_and_record(&[1u8; 64], 1000, 4),
+            "id_a's own expired entry never causes a false replay before the next sweep"
+        );
+
+        // t=6: 6s have now passed since `last_evict_at` (still 0) -- >= 5, so the
+        // deferred full sweep finally runs. Note id_a was just re-inserted with
+        // expiry=1000 at t=4 above, so it correctly survives this sweep; only a
+        // genuinely stale entry with no matching lookup in between would ever be
+        // reclaimed by it.
+        assert!(c.check_and_record(&[3u8; 64], 1000, 6), "id_c fresh, triggers the deferred sweep");
+        assert_eq!(c.len(), 3, "id_a (re-inserted), id_b, and id_c all still genuinely unexpired at t=6");
     }
 }
