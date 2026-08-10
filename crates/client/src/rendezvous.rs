@@ -972,8 +972,14 @@ mod tests {
         let (_ep, throwaway_cert) =
             build_direct_listener_at((Ipv4Addr::LOCALHOST, 0).into()).expect("cert");
 
-        // Orchestrator: direct fails → relay delivers.
+        // Orchestrator: direct fails → relay delivers. #374: `timeout` is
+        // deliberately generous (2s) so the assertion below draws a sharp,
+        // unflaky line between "raced" (returns in well under a second, since
+        // the dead direct candidate never blocks the relay from starting) and
+        // the pre-#374 serial behavior (would have eaten close to the full 2s
+        // waiting out the dead direct candidate before ever trying the relay).
         let conn = dial_edge(addr, cert).await.expect("client dial");
+        let start = std::time::Instant::now();
         let (used_direct, resp) = client_tunnel_p2p_or_relay(
             &conn,
             &token,
@@ -981,12 +987,18 @@ mod tests {
             &client_kp.private,
             b"fallback-payload",
             Some((dead_addr, throwaway_cert)),
-            Duration::from_millis(400),
+            Duration::from_secs(2),
         )
         .await
         .expect("p2p-or-relay");
+        let elapsed = start.elapsed();
         assert!(!used_direct, "unreachable direct candidate → fell back to relay");
         assert_eq!(resp, b"fallback-payload", "relay delivered the payload");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "#374: the relay attempt must race concurrently with the dead direct \
+             candidate, not wait out its own full 2s timeout first -- took {elapsed:?}"
+        );
 
         conn.close(0u32.into(), b"done");
         agent.abort();

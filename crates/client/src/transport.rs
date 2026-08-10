@@ -628,10 +628,49 @@ pub async fn client_tunnel_auto(
     client_tunnel_p2p_or_relay(edge_conn, token, cap, client_private, payload, direct, timeout).await
 }
 
-/// Try the **direct** P2P path first, else fall back to the **Edge relay**
-/// (M11.4). `direct` is the Agent's advertised `(candidate, cert)`; if it is
-/// `None`, or the direct connect/tunnel fails within `timeout`, the tunnel goes
-/// through the Edge relay on `edge_conn`. Returns `(used_direct, response)`.
+/// #374: how much of a real head start the direct P2P attempt gets over the
+/// relay fallback once both are raced concurrently -- within RFC 8305's own
+/// suggested 50-100ms connection-attempt-delay range (the same convention
+/// #367's ladder racing already cites). Short enough that a genuinely
+/// reachable direct path (the common case: it's cheaper than the relay's own
+/// PoW-gated rendezvous, so it almost always finishes first regardless) still
+/// avoids paying for relay setup at all; long enough that a slow-but-live
+/// direct path isn't starved by a relay that happens to be faster to reach.
+const DIRECT_HEAD_START: Duration = Duration::from_millis(75);
+
+/// Try the **direct** P2P path, racing it against the **Edge relay** fallback
+/// (M11.4, #374). `direct` is the Agent's advertised `(candidate, cert)`; if
+/// it is `None`, the tunnel goes straight through the Edge relay on
+/// `edge_conn` with no racing overhead, unchanged from before #374. Returns
+/// `(used_direct, response)`.
+///
+/// #374: previously ran fully serially -- the direct attempt got the WHOLE
+/// `timeout` budget before the relay fallback was even started, so a
+/// slow-but-not-dead direct candidate (e.g. behind NAT with high packet loss)
+/// made every tunnel operation eat the full timeout even though the relay
+/// path was reachable the whole time. Now both race concurrently
+/// (`futures_util::future::select`, not the `tokio::select!` macro -- this
+/// needs the *other* future handed back on one side resolving so a failed
+/// direct attempt can keep waiting on a relay attempt already in flight,
+/// rather than restarting it from scratch), with the direct attempt getting
+/// [`DIRECT_HEAD_START`] before the relay attempt is even started, so a fast
+/// direct connect still wins outright without ever touching `edge_conn`.
+///
+/// Real correctness properties preserved, not just perf: if the relay
+/// resolves first (whether success or error), that IS the terminal outcome,
+/// exactly as when relay was the last-resort fallback before -- there is no
+/// "fall back again" past the relay. If direct resolves first with an error,
+/// this keeps polling the SAME already-in-flight relay future (not a fresh
+/// one) for its real result, matching the original "then try relay" order
+/// while still getting the real concurrency win. Cancelling whichever side
+/// loses a race is real, safe async cancellation: `client_direct_connect`
+/// dials via `dial_edge` (Drop-safe per #366/#367's own investigation of the
+/// identical call), and dropping `edge_conn`'s `SendStream`/`RecvStream`
+/// mid-flight (a relay attempt that loses after already opening its stream)
+/// only finishes/resets that one stream (quinn's own `Drop` impls) -- `
+/// edge_conn` itself is untouched and stays valid, moot anyway since the one
+/// real caller (`main.rs`'s p2p mode) always closes `edge_conn` right after
+/// this call returns regardless of outcome.
 pub async fn client_tunnel_p2p_or_relay(
     edge_conn: &Connection,
     token: &RoutingToken,
@@ -641,25 +680,57 @@ pub async fn client_tunnel_p2p_or_relay(
     direct: Option<(SocketAddr, CertificateDer<'static>)>,
     timeout: Duration,
 ) -> Result<(bool, Vec<u8>), BoxError> {
-    if let Some((candidate, cert)) = direct {
-        if let Ok(conn) = client_direct_connect(candidate, cert, timeout).await {
-            if let Ok(resp) = client_tunnel_direct(&conn, cap, client_private, payload).await {
-                conn.close(0u32.into(), b"done");
-                return Ok((true, resp));
-            }
+    let Some((candidate, cert)) = direct else {
+        // No advertised direct endpoint at all -- straight to the relay, no
+        // racing overhead, byte-for-byte the same path as before #374.
+        let resp = relay_attempt(edge_conn, token, cap, client_private, payload, timeout).await?;
+        return Ok((false, resp));
+    };
+
+    let direct_fut = std::pin::pin!(async {
+        let conn = client_direct_connect(candidate, cert, timeout).await?;
+        let resp = client_tunnel_direct(&conn, cap, client_private, payload).await;
+        conn.close(0u32.into(), b"done");
+        resp
+    });
+    let relay_fut = std::pin::pin!(async {
+        tokio::time::sleep(DIRECT_HEAD_START).await;
+        relay_attempt(edge_conn, token, cap, client_private, payload, timeout).await
+    });
+
+    match futures_util::future::select(direct_fut, relay_fut).await {
+        futures_util::future::Either::Left((Ok(resp), _relay_dropped)) => Ok((true, resp)),
+        futures_util::future::Either::Left((Err(_), relay_fut)) => {
+            // Direct failed -- fall back to relay, same as before #374. The
+            // relay attempt may already be in flight (its own head start may
+            // have already elapsed); keep polling THIS future, don't restart.
+            let resp = relay_fut.await?;
+            Ok((false, resp))
+        }
+        futures_util::future::Either::Right((relay_result, _direct_dropped)) => {
+            // Relay is the terminal fallback -- its result (success or error)
+            // is the real outcome either way, matching the original
+            // "direct, then relay, nothing past that" order.
+            Ok((false, relay_result?))
         }
     }
-    // Fallback: PoW-gated rendezvous + Noise tunnel through the Edge relay. #283:
-    // this ran with no deadline of its own -- only the direct-connect attempt
-    // above respected `timeout`. A stalled/malicious Edge that accepts the
-    // connection but never sends the challenge (or stalls the Noise handshake)
-    // hung this forever after a failed/absent direct attempt, undercutting the
-    // caller's tunnel-timeout guarantee. Reuses `timeout` (same bound already
-    // applied to the direct attempt) via the existing _timed wrapper
-    // (client_tunnel_noise_tcp_timed's QUIC analog) rather than inventing a
-    // second, separate relay deadline.
-    let resp = client_tunnel_noise_timed(edge_conn, token, cap, client_private, payload, timeout).await?;
-    Ok((false, resp))
+}
+
+/// PoW-gated rendezvous + Noise tunnel through the Edge relay -- the shared
+/// core of [`client_tunnel_p2p_or_relay`]'s relay path, factored out so the
+/// `direct: None` fast path and the raced relay attempt both go through the
+/// identical real call. #283: bounded by `timeout` (a stalled/malicious Edge
+/// that accepts the connection but never sends the challenge, or stalls the
+/// Noise handshake, must not hang forever) via the existing `_timed` wrapper.
+async fn relay_attempt(
+    edge_conn: &Connection,
+    token: &RoutingToken,
+    cap: &Capability,
+    client_private: &[u8; 32],
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, BoxError> {
+    client_tunnel_noise_timed(edge_conn, token, cap, client_private, payload, timeout).await
 }
 
 /// Ask the Edge for the Agent's advertised direct endpoint for `token`
