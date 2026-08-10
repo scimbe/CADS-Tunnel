@@ -487,17 +487,32 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Read up to the header terminator (bounded — a redirect never needs a body).
+    //
+    // #341: only scan the newly-read tail for `\r\n\r\n`, not the whole
+    // accumulated buffer on every iteration. The old `buf.windows(4).any(...)`
+    // re-scanned everything read so far on every single read() -- O(n^2) in the
+    // total bytes for a client that trickles the request in slowly (a scanner
+    // dribbling 1 byte per read on the public :80 port could force ~128M
+    // comparisons for one redirect before ever hitting the 16KB cap, real CPU
+    // cost the size cap alone doesn't bound). `scanned` tracks how much of `buf`
+    // has already been confirmed terminator-free; each iteration only re-checks
+    // from `scanned - 3` (the terminator can start up to 3 bytes before new
+    // data, spanning a read boundary) through the end -- bounding total scan
+    // work to O(total bytes), not O(total bytes^2).
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 1024];
+    let mut scanned = 0usize;
     loop {
         let n = inbound.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16384 {
+        let start = scanned.saturating_sub(3);
+        if buf[start..].windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16384 {
             break;
         }
+        scanned = buf.len();
     }
     let req = String::from_utf8_lossy(&buf);
     let mut lines = req.split("\r\n");
@@ -4058,6 +4073,84 @@ mod tests {
             "host port stripped"
         );
         s2.await.unwrap().unwrap();
+    }
+
+    /// #341: an `AsyncRead` that always returns exactly one byte per `poll_read`
+    /// (until its source is exhausted) -- the worst case for a header-terminator
+    /// scanner, and the exact shape the finding described (a client/scanner on
+    /// the public `:80` port dribbling bytes one at a time). Forces
+    /// `serve_http_redirect` to actually go through many small reads rather than
+    /// relying on `tokio::io::duplex`'s own batching (which the existing
+    /// `http_redirect_bounces_to_https_preserving_host_and_path` test never
+    /// exercises, since it writes the whole request in one `write_all`).
+    struct OneByteAtATime {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl AsyncRead for OneByteAtATime {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.pos < this.data.len() {
+                buf.put_slice(&this.data[this.pos..this.pos + 1]);
+                this.pos += 1;
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn http_redirect_finds_the_terminator_correctly_one_byte_at_a_time_341() {
+        // Correctness under the worst-case read pattern: the \r\n\r\n terminator
+        // (and every other byte of the request) arrives as its own single-byte
+        // read. The old whole-buffer `windows(4)` rescan was still CORRECT here
+        // (just slow) -- this proves the new tail-only scan (#341) is too, not
+        // just faster: a terminator split across many read-boundary-adjacent
+        // positions must still be found.
+        let req = b"GET /path?q=1 HTTP/1.1\r\nHost: slow.example\r\n\r\n".to_vec();
+        let reader = OneByteAtATime { data: req, pos: 0 };
+        let (mut out_rx, out_tx) = tokio::io::duplex(4096);
+        let stream = tokio::io::join(reader, out_tx);
+        let srv = tokio::spawn(async move { serve_http_redirect(stream).await });
+        let mut resp = Vec::new();
+        out_rx.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 308"), "terminator found even one byte at a time: {text:?}");
+        assert!(text.contains("Location: https://slow.example/path?q=1"), "host+path still parsed correctly: {text:?}");
+        srv.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_redirect_stays_fast_under_a_slow_drip_up_to_the_16kb_cap_341() {
+        // #341: the real regression guard. Before this fix, `buf.windows(4)`
+        // rescanned the WHOLE accumulated buffer on every one-byte read --
+        // O(n^2) in the total bytes. A client dribbling ~16KB of padding one
+        // byte at a time (never sending a real terminator, so this runs all the
+        // way to the 16KB cap) forced roughly (16384/1)^2 / 2 ~= 128M four-byte
+        // comparisons pre-fix. Post-fix, each read only rescans its own tail
+        // (bounded overlap), so total work is O(n). Assert real wall-clock time
+        // stays well under what the quadratic version would need -- this is a
+        // real regression guard, not a micro-benchmark: it would reliably fail
+        // (multi-second+) against the old implementation and reliably pass
+        // (sub-second) against this fix.
+        let req = vec![b'A'; 16400]; // never contains \r\n\r\n; > 16384 so the loop exits on the size cap, not EOF
+        let reader = OneByteAtATime { data: req, pos: 0 };
+        let (_out_rx, out_tx) = tokio::io::duplex(4096);
+        let stream = tokio::io::join(reader, out_tx);
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(5), serve_http_redirect(stream))
+            .await
+            .expect("must finish well under 5s -- the old O(n^2) scan could take far longer than this for 16000 one-byte reads")
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "tail-only scan should finish in well under a second for 16KB of one-byte reads, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
