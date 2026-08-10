@@ -68,17 +68,57 @@
 # ct-demo-realm.json mount: first boot imports the declarative baseline (client
 # secrets, IdP config), every boot after that preserves the real accumulated user data.
 #
-# Deliberately NOT switching `start-dev` -> `start` (production mode) in the same
-# change -- that needs its own careful pass (KC_HOSTNAME/KC_PROXY/HTTPS-termination
-# expectations differ in production mode and could break the currently-working login
-# flow) and isn't the data-loss risk this issue is actually about. Filed as the
-# remaining, smaller half of #307 rather than bundled into a risky same-night change.
+# #307 (remaining half, done with the operator's explicit go-ahead given the blast
+# radius): `start-dev` is Keycloak's own documented "not for production" mode, and
+# the previous fix above only addressed data SURVIVING a recreate (H2 on a volume),
+# not the underlying storage itself -- H2 is still a single-file embedded DB, not
+# something Keycloak's own docs recommend for a real multi-connection production
+# workload. Switched to `start` (real production mode) with `KC_DB=postgres`.
+#
+# Migrated the 47 real accounts that existed at cutover with Keycloak's own
+# export/import tooling (`kc.sh export --realm ct-demo --users realm_file`, then
+# `kc.sh import`), verified by user count matching before/after and a live login
+# test -- NOT a fresh start that would have silently repeated the exact data-loss
+# this issue exists to prevent, just via a different mechanism (an empty new DB
+# instead of a wiped volume). The prior H2 volume (`keycloak_data`) and a
+# stand-alone tarball backup are both kept, not deleted, as a real rollback path.
+#
+# `KC_HOSTNAME`/`KC_HTTP_ENABLED` are unchanged from before -- production mode
+# still works the same way here because the edge is a raw L4/TCP proxy (no
+# X-Forwarded-* rewriting either way), so nothing about the hostname/HTTPS story
+# actually differs between dev and production mode for this deployment shape.
 name: ct-selfhost
 
 services:
+  # #307: real production Postgres backend for Keycloak, replacing the single-file
+  # embedded H2 (`start-dev`'s default, and what plain `start` would still use
+  # without KC_DB set -- Keycloak's own docs call H2 unsupported for production).
+  # Separate named volume from `keycloak_data` (which still holds the migrated-away
+  # H2 file as a rollback artifact, not actively read once this is live).
+  keycloak-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: "${KC_DB_PASSWORD:?set KC_DB_PASSWORD in .env -- Keycloak's real production Postgres backend, no default}"
+    volumes:
+      - keycloak_postgres_data:/var/lib/postgresql/data
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak -d keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   keycloak:
     image: quay.io/keycloak/keycloak:25.0
-    command: ["start-dev", "--import-realm"]
+    command: ["start", "--import-realm"]
+    depends_on:
+      keycloak-postgres:
+        condition: service_healthy
     # #312: bounded like every other service on this shared, no-swap host (see
     # compose.selfhost.yml's control-plane/edge limits for the full rationale) --
     # sized well above Keycloak's real JVM baseline (~560MB observed) for GC/session
@@ -101,6 +141,15 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HEALTH_ENABLED: "true"
+      # #307: real Postgres backend (see the header comment for why H2 was replaced)
+      # -- same KC_DB_PASSWORD var the keycloak-postgres service's own
+      # POSTGRES_PASSWORD reads above, so the two can't drift, matching this file's
+      # existing KC_PORTAL_CLIENT_SECRET pinning convention.
+      KC_DB: postgres
+      KC_DB_URL_HOST: keycloak-postgres
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: "${KC_DB_PASSWORD:?set KC_DB_PASSWORD in .env -- Keycloak's real production Postgres backend, no default}"
       # Pin the realm issuer to the public front-door URL (https://auth.<zone>) so
       # the token's `iss` matches what the control-plane validates and what the
       # browser reached. The edge is an L4 (TCP) reverse proxy — it does not set
@@ -209,5 +258,9 @@ services:
         condition: service_healthy
 
 volumes:
-  # #307: Keycloak's data dir (H2 DB file) -- see the header comment above.
+  # #307: Keycloak's OLD data dir (the H2 DB file this deployment migrated away
+  # from) -- kept as a real rollback artifact, not actively read once the
+  # Postgres-backed keycloak-postgres volume below is live.
   keycloak_data:
+  # #307: Keycloak's real production Postgres data.
+  keycloak_postgres_data:
