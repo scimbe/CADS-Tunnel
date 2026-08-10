@@ -257,6 +257,19 @@ impl SqliteEdgeMesh {
     /// Record that `edge_id` now owns `token` (and `hostname`, if this
     /// tunnel has a Browser-Plane binding). Upserts — a tunnel re-authorized
     /// or reassigned just overwrites its previous row.
+    ///
+    /// #334: `token` is this table's primary key, not `hostname` (a hostname column
+    /// is only indexed, not unique) -- so without this, a hostname that changes which
+    /// token owns it (its old tunnel deleted/replaced by a new one, a re-onboard under
+    /// the same hostname with a fresh token, etc.) can end up with TWO rows both
+    /// claiming it: the stale old token's row (never explicitly removed) and the new
+    /// token's freshly-recorded one. `owned_by`/rehydration then replays BOTH pairs to
+    /// the edge with no ordering guarantee tied to which is actually current -- an edge
+    /// restart can rehydrate the stale one last and silently reject the live agent's
+    /// real token. A hostname belongs to exactly one token at a time in reality, so
+    /// enforce that here: clear any OTHER token's claim on this hostname before
+    /// recording this one, rather than leaving that invariant to rehydration replay
+    /// order (which was never a real ordering guarantee in the first place).
     pub fn record_ownership(
         &self,
         token: &str,
@@ -264,7 +277,11 @@ impl SqliteEdgeMesh {
         edge_id: &str,
         now: i64,
     ) -> rusqlite::Result<()> {
-        self.conn.lock_safe().execute(
+        let conn = self.conn.lock_safe();
+        if let Some(h) = hostname {
+            conn.execute("DELETE FROM mesh_ownership WHERE hostname = ?1 AND token != ?2", params![h, token])?;
+        }
+        conn.execute(
             "INSERT INTO mesh_ownership (token, hostname, edge_id, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(token) DO UPDATE SET
                  hostname = excluded.hostname, edge_id = excluded.edge_id, updated_at = excluded.updated_at",
@@ -341,6 +358,20 @@ impl SqliteEdgeMesh {
         self.conn
             .lock_safe()
             .execute("DELETE FROM mesh_ownership WHERE token = ?1", params![token])?;
+        Ok(())
+    }
+
+    /// #334: remove any OTHER token's stale claim on `hostname`, without touching
+    /// `keep_token`'s own row (unlike [`Self::record_ownership`], this never
+    /// creates or reassigns `keep_token`'s row — safe to call for a tunnel whose
+    /// own row already exists and must NOT have its `edge_id` silently
+    /// reassigned). Used by the boot-time reconciliation pass to self-heal
+    /// hostnames that predate the fix in `record_ownership` -- a live tunnel
+    /// whose hostname a now-stale token's row still also claims.
+    pub fn reconcile_hostname_owner(&self, hostname: &str, keep_token: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock_safe()
+            .execute("DELETE FROM mesh_ownership WHERE hostname = ?1 AND token != ?2", params![hostname, keep_token])?;
         Ok(())
     }
 }
@@ -779,6 +810,77 @@ mod tests {
         let (edge_id, peer_addr) = s.lookup_by_token("tok").unwrap().unwrap();
         assert_eq!(edge_id, "edge-2");
         assert_eq!(peer_addr, "10.0.0.2:4437");
+    }
+
+    #[test]
+    fn record_ownership_clears_a_stale_other_tokens_claim_on_the_same_hostname_334() {
+        // #334: the real bug -- a hostname's OLD token's row was never cleared when a
+        // NEW token claimed the same hostname (e.g. the old tunnel was deleted and
+        // replaced), so BOTH rows coexisted in the durable registry (unique per
+        // token, not per hostname) and rehydration replayed both with no ordering
+        // guarantee, letting the edge pick up the stale token after a restart.
+        // Proves the real property: after the new token records the hostname, the
+        // OLD token's row for it is gone -- owned_by/rehydration can never replay
+        // both again, not just "the new one also got recorded".
+        let s = store();
+        let now = now_secs();
+        s.record_ownership("old-tok", Some("app.example.com"), "edge-1", now).unwrap();
+        assert!(s.token_owns_hostname("old-tok", "app.example.com").unwrap());
+
+        // The hostname moves to a new tunnel/token (old tunnel deleted+replaced).
+        s.record_ownership("new-tok", Some("app.example.com"), "edge-1", now + 1).unwrap();
+
+        assert!(s.token_owns_hostname("new-tok", "app.example.com").unwrap(), "the new owner is recorded");
+        assert!(
+            !s.token_owns_hostname("old-tok", "app.example.com").unwrap(),
+            "the stale old owner's claim on this hostname must be gone, not just superseded"
+        );
+        // The old token itself wasn't touched otherwise -- only its claim on THIS
+        // hostname was cleared (matches remove_ownership's own narrower "the whole
+        // token is gone" semantics being a distinct, separate operation).
+        assert!(s.lookup_by_token("old-tok").unwrap().is_none(), "old-tok's row (hostname=None now) was replaced, not left dangling");
+
+        let owned: Vec<_> = s.owned_by("edge-1").unwrap();
+        let app_claims: Vec<_> = owned.iter().filter(|(_, h)| h.as_deref() == Some("app.example.com")).collect();
+        assert_eq!(app_claims.len(), 1, "exactly one token claims this hostname, never two");
+        assert_eq!(app_claims[0].0, "new-tok");
+    }
+
+    #[test]
+    fn reconcile_hostname_owner_removes_a_stale_claim_without_touching_the_kept_tokens_own_row_334() {
+        // #334: the boot-time self-heal path -- for a hostname whose CURRENT owner
+        // (per subject_tunnels) already has a correct row, reconciliation must still
+        // remove any OTHER stale token's leftover claim on that same hostname, and
+        // must NOT touch/reassign the kept token's own row (record_ownership itself
+        // is deliberately not reused here for exactly that reason).
+        let s = store();
+        let now = now_secs();
+        s.heartbeat("edge-1", "10.0.0.1:4437", None, now).unwrap();
+        s.heartbeat("edge-2", "10.0.0.2:4437", None, now).unwrap();
+        // Simulate the pre-fix legacy state directly via raw SQL (not
+        // record_ownership, which now cleans this up itself) -- two tokens both
+        // claiming the same hostname, exactly what could accumulate over time
+        // before this fix existed.
+        {
+            let conn = s.conn.lock_safe();
+            conn.execute(
+                "INSERT INTO mesh_ownership (token, hostname, edge_id, updated_at) VALUES ('stale-tok', 'app.example.com', 'edge-1', ?1)",
+                params![now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mesh_ownership (token, hostname, edge_id, updated_at) VALUES ('current-tok', 'app.example.com', 'edge-2', ?1)",
+                params![now + 1],
+            )
+            .unwrap();
+        }
+        assert!(s.token_owns_hostname("stale-tok", "app.example.com").unwrap(), "sanity: both rows coexist before reconciling");
+
+        s.reconcile_hostname_owner("app.example.com", "current-tok").unwrap();
+
+        assert!(!s.token_owns_hostname("stale-tok", "app.example.com").unwrap(), "stale claim removed");
+        let (edge_id, _) = s.lookup_by_token("current-tok").unwrap().unwrap();
+        assert_eq!(edge_id, "edge-2", "the kept token's own row (edge_id) is untouched by reconciliation");
     }
 
     #[test]

@@ -4877,18 +4877,38 @@ pub fn persistent_control_plane_router(
     // this deployment's local edge, skipping any token already recorded (never
     // overwrites a token that's since been assigned elsewhere). Safe to run every
     // boot -- it's a no-op once every tunnel has a record.
+    //
+    // #334: separately, reconcile stale hostname claims for EVERY existing tunnel,
+    // not just ones missing a row -- record_ownership (as of this fix) keeps a
+    // hostname's mesh_ownership claim unique going forward, but that alone can't
+    // retroactively clean up a hostname that already has a stale OTHER token's row
+    // left over from before the fix (an old tunnel deleted/replaced under the same
+    // hostname, its row never explicitly removed). subject_tunnels is the real
+    // source of truth for which token currently owns a hostname, so use it here to
+    // self-heal on the next boot with no operator DB intervention needed --
+    // deliberately NOT reusing record_ownership itself for this (that would also
+    // reassign edge_id for a tunnel whose own row already correctly points
+    // elsewhere in a future multi-edge deployment; this only clears OTHER tokens'
+    // claims, never touches a tunnel's own row).
     {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         match tunnels.all() {
             Ok(existing) => {
                 for t in existing {
-                    if edge_mesh_store.lookup_by_token(&t.routing_token).ok().flatten().is_some() {
-                        continue;
+                    if edge_mesh_store.lookup_by_token(&t.routing_token).ok().flatten().is_none() {
+                        if let Err(e) = edge_mesh_store.record_ownership(
+                            &t.routing_token,
+                            t.hostname.as_deref(),
+                            &local_edge_id,
+                            now,
+                        ) {
+                            eprintln!("ct-cp: edge_mesh backfill failed for tunnel {}: {e}", t.id);
+                        }
                     }
-                    if let Err(e) =
-                        edge_mesh_store.record_ownership(&t.routing_token, t.hostname.as_deref(), &local_edge_id, now)
-                    {
-                        eprintln!("ct-cp: edge_mesh backfill failed for tunnel {}: {e}", t.id);
+                    if let Some(h) = t.hostname.as_deref() {
+                        if let Err(e) = edge_mesh_store.reconcile_hostname_owner(h, &t.routing_token) {
+                            eprintln!("ct-cp: edge_mesh hostname reconciliation failed for {h}: {e}");
+                        }
                     }
                 }
             }
