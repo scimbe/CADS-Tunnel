@@ -17,7 +17,8 @@ use ct_client::ladder::{
 };
 use ct_client::transport::{
     client_forward, client_tunnel_auto, client_tunnel_noise_tcp_timed, client_tunnel_noise_timed,
-    dial_edge_timed, dial_rung, load_cert, udp_selftest, EdgeConn, DEFAULT_STREAM_SETUP_DEADLINE,
+    dial_edge_timed, dial_rung, load_cert, new_client_endpoint, udp_selftest, EdgeConn,
+    DEFAULT_STREAM_SETUP_DEADLINE,
 };
 use ct_common::noise::generate_static_keypair;
 use ct_common::Capability;
@@ -296,9 +297,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let edge_ip = edge_addr.ip();
     let mut cache = LadderCache::new();
     let cert_for_dial = edge_cert.clone();
+    // #368: one shared QUIC endpoint for every Quic rung this ladder attempt
+    // races (#367 can genuinely dial more than one concurrently) instead of
+    // each rung binding its own throwaway UDP socket.
+    let quic_endpoint = new_client_endpoint()?;
     let picked = connect_via_ladder(&mut cache, &netsig, &ladder, |rung| {
         let cert = cert_for_dial.clone();
-        async move { dial_rung(rung, edge_ip, cert, per_rung).await }
+        let quic_endpoint = &quic_endpoint;
+        async move { dial_rung(rung, edge_ip, cert, quic_endpoint, per_rung).await }
     })
     .await
     .ok_or_else(|| format!("ct-client: no edge rung reachable (tried the :{edge_port}/:443 ladder)"))?;

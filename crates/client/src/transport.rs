@@ -38,8 +38,43 @@ pub(crate) async fn build_request_blocking(challenge: &Challenge, token: &Routin
     assemble_request(solution, token)
 }
 
-/// Dial the Edge over QUIC, trusting `edge_cert`.
-pub async fn dial_edge(
+/// Build a fresh outgoing-only `quinn::Endpoint` (one ephemeral UDP socket),
+/// bound to all interfaces (not loopback) so the Client can reach a non-local
+/// Edge.
+///
+/// #368: split out of [`dial_edge`] so a caller that dials multiple times
+/// within its own already-bounded async scope -- concretely,
+/// [`crate::ladder::connect_via_ladder`]'s own concurrent rung racing (#367),
+/// which can now genuinely call [`dial_edge_with_endpoint`] more than once at
+/// the same moment for one connection attempt -- can build ONE endpoint once
+/// and reuse it across every rung dial, instead of each racing rung binding
+/// its own throwaway socket. A **process-global** shared endpoint was tried
+/// first and reverted: `quinn::Endpoint` owns a background driver task tied to
+/// the specific Tokio runtime it was created under, and a `static` shared
+/// across `#[tokio::test]`'s separate per-test runtimes (or, in principle,
+/// across separate runtimes in one real process) breaks with a real
+/// `ConnectError::EndpointStopping` -- proven live by 24 real test failures
+/// during this fix's own development, not a hypothetical. Explicitly scoping
+/// the shared endpoint's lifetime to one caller's own async call (never a
+/// process-wide `static`) avoids that hazard entirely, mirroring
+/// `client_forward_conn`'s own explicitly-owned-and-passed shared-state
+/// pattern (#366) rather than a bare global.
+pub fn new_client_endpoint() -> io::Result<Endpoint> {
+    Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+}
+
+/// Dial the Edge over `endpoint`, trusting `edge_cert`, via quinn's own
+/// per-connection [`Endpoint::connect_with`] (not a single cached "default"
+/// config set on the endpoint) -- `edge_cert` genuinely varies per call on a
+/// SHARED endpoint in this codebase: [`client_direct_connect`] dials an
+/// Agent's own `agent_cert` through the exact same connect path, a real,
+/// different-cert-in-the-same-endpoint case, not a hypothetical. Building the
+/// per-cert `rustls`/`quinn::ClientConfig` fresh each call is real but
+/// comparatively cheap next to binding a new UDP socket and spawning a new
+/// endpoint driver task -- the actual cost #368's own review flagged, and the
+/// part [`new_client_endpoint`] lets a caller stop paying repeatedly.
+pub async fn dial_edge_with_endpoint(
+    endpoint: &Endpoint,
     edge: SocketAddr,
     edge_cert: CertificateDer<'static>,
 ) -> Result<Connection, BoxError> {
@@ -52,11 +87,21 @@ pub async fn dial_edge(
     let cfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
-    // Bind all interfaces (not loopback) so the Client can reach a non-local Edge.
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
-    endpoint.set_default_client_config(cfg);
-    let conn = endpoint.connect(edge, "localhost")?.await?;
+    let conn = endpoint.connect_with(cfg, edge, "localhost")?.await?;
     Ok(conn)
+}
+
+/// Dial the Edge over QUIC, trusting `edge_cert`, on a fresh one-shot endpoint.
+/// Unchanged single-dial behavior (#368 adds [`dial_edge_with_endpoint`]
+/// alongside this, for callers that want to reuse one endpoint across several
+/// dials within their own async scope; see its own doc comment for why that's
+/// scoped per-caller, not a process-global).
+pub async fn dial_edge(
+    edge: SocketAddr,
+    edge_cert: CertificateDer<'static>,
+) -> Result<Connection, BoxError> {
+    let endpoint = new_client_endpoint()?;
+    dial_edge_with_endpoint(&endpoint, edge, edge_cert).await
 }
 
 /// [`dial_edge`] bounded by `timeout` (#284). The p2p/udp client modes dial the
@@ -180,17 +225,23 @@ pub enum EdgeConn {
 /// timeout or failure so [`crate::ladder::connect_via_ladder`] walks to the next
 /// rung instead of surfacing the error — the ladder only cares "did this rung
 /// connect?", and a blocked rung on a restrictive network simply times out.
+/// #368: `quic_endpoint` is the one real endpoint every `Rung::Quic` dial for
+/// this connection attempt reuses -- built once by the caller (see
+/// [`new_client_endpoint`]) before racing the ladder (#367 lets multiple
+/// rungs genuinely dial concurrently), instead of each rung binding its own
+/// throwaway UDP socket. TLS-TCP rungs are unaffected; they never used QUIC.
 pub async fn dial_rung(
     rung: crate::ladder::Rung,
     edge_ip: std::net::IpAddr,
     edge_cert: CertificateDer<'static>,
+    quic_endpoint: &Endpoint,
     timeout: Duration,
 ) -> Option<EdgeConn> {
     use crate::ladder::Rung;
     match rung {
         Rung::Quic(port) => {
             let addr = SocketAddr::new(edge_ip, port);
-            match tokio::time::timeout(timeout, dial_edge(addr, edge_cert)).await {
+            match tokio::time::timeout(timeout, dial_edge_with_endpoint(quic_endpoint, addr, edge_cert)).await {
                 Ok(Ok(c)) => Some(EdgeConn::Quic(c)),
                 _ => None,
             }
@@ -1047,6 +1098,55 @@ mod tests {
         );
     }
 
+    /// #368: `dial_edge_with_endpoint` genuinely reuses the caller-supplied
+    /// endpoint's own UDP socket across calls -- the real, observable proof is
+    /// that the endpoint's own bound local port stays identical across two
+    /// dials, unlike plain `dial_edge` (which binds a fresh ephemeral port
+    /// every single call, confirmed as the second half of this same test).
+    #[tokio::test]
+    async fn dial_edge_with_endpoint_reuses_the_same_local_socket_across_calls_368() {
+        let (server1, cert1) = build_server_endpoint_with_cert().expect("edge 1");
+        let addr1 = server1.local_addr().expect("addr 1");
+        let edge1 = tokio::spawn(async move {
+            let _c = server1.accept().await.unwrap().await.unwrap();
+        });
+        let (server2, cert2) = build_server_endpoint_with_cert().expect("edge 2");
+        let addr2 = server2.local_addr().expect("addr 2");
+        let edge2 = tokio::spawn(async move {
+            let _c = server2.accept().await.unwrap().await.unwrap();
+        });
+
+        let endpoint = new_client_endpoint().expect("client endpoint");
+        let local_port_before = endpoint.local_addr().expect("local addr").port();
+
+        // Two dials to two DIFFERENT real edges (different certs, proving
+        // #368's own real production scenario -- client_direct_connect dials
+        // an Agent's own agent_cert through this same path) on the SAME
+        // supplied endpoint.
+        let conn1 = dial_edge_with_endpoint(&endpoint, addr1, cert1).await.expect("dial 1");
+        let conn2 = dial_edge_with_endpoint(&endpoint, addr2, cert2).await.expect("dial 2");
+        assert_eq!(conn1.remote_address(), addr1, "conn1 reached edge 1");
+        assert_eq!(conn2.remote_address(), addr2, "conn2 reached edge 2");
+        assert_eq!(
+            endpoint.local_addr().expect("local addr").port(),
+            local_port_before,
+            "the shared endpoint's own local UDP port never changed across two dials to two different, differently-certed edges"
+        );
+        edge1.abort();
+        edge2.abort();
+
+        // Contrast: a plain dial_edge call still works unchanged, binding its
+        // OWN fresh ephemeral endpoint rather than reusing anything above.
+        let (server3, cert3) = build_server_endpoint_with_cert().expect("edge 3");
+        let addr3 = server3.local_addr().expect("addr 3");
+        let edge3 = tokio::spawn(async move {
+            let _c = server3.accept().await.unwrap().await.unwrap();
+        });
+        let conn3 = dial_edge(addr3, cert3).await.expect("plain dial_edge still works, unchanged");
+        assert_eq!(conn3.remote_address(), addr3);
+        edge3.abort();
+    }
+
     // #21 WC4: cover client_tunnel_noise_tcp_timed (the TLS-over-TCP timed
     // variant, issue #2) over an in-memory duplex — both the deadline arm and
     // the surfaced-inner-error arm, without needing a real edge.
@@ -1112,9 +1212,11 @@ mod tests {
         let ladder = vec![Rung::TlsTcp(addr.port()), Rung::Quic(addr.port())];
         let mut cache = LadderCache::new();
         let ip = addr.ip();
+        let quic_endpoint = new_client_endpoint().expect("client endpoint");
         let got = connect_via_ladder(&mut cache, "test-net", &ladder, |rung| {
             let cert = cert.clone();
-            async move { dial_rung(rung, ip, cert, Duration::from_millis(500)).await }
+            let quic_endpoint = &quic_endpoint;
+            async move { dial_rung(rung, ip, cert, quic_endpoint, Duration::from_millis(500)).await }
         })
         .await;
 
