@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::noise::client_noise_exchange;
-use ct_common::noise::{client_handshake_for, frame, noise_pump, read_frame};
+use ct_common::noise::{client_handshake_for, frame, noise_pump, read_frame, read_frame_into};
 use ct_common::pow::{assemble_request, solve, Challenge};
 use ct_common::{Capability, RoutingToken};
 use quinn::{Connection, Endpoint};
@@ -545,13 +545,20 @@ pub async fn client_tunnel_udp(
     };
 
     // Frame from the Edge -> decrypt -> local datagram.
+    //
+    // #373: this used to call `read_frame` (a fresh `Vec` allocated per call) even
+    // though it already holds a reusable `pt` scratch buffer right below for the
+    // decrypt side -- `read_frame_into` (already real, tested, and used by
+    // `noise_pump`'s own bulk data path for the identical reason, #114) reads into
+    // a caller-owned buffer instead, so this loop no longer allocates a fresh `Vec`
+    // per received datagram.
     let from_edge = async {
+        let mut fr = Vec::new();
         let mut pt = vec![0u8; 65535];
         loop {
-            let fr = match read_frame(&mut recv).await {
-                Ok(f) => f,
-                Err(_) => break,
-            };
+            if read_frame_into(&mut recv, &mut fr).await.is_err() {
+                break;
+            }
             let len = ts.lock().unwrap().read_message(&fr, &mut pt).map_err(noise_err)?;
             local.send(&pt[..len]).await?;
         }
