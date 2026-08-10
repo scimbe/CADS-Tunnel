@@ -10,9 +10,19 @@
 //!
 //! The drivers are generic over the byte stream, so they run over a QUIC bi-stream
 //! (the live path — `quinn::SendStream`/`RecvStream`) or any `AsyncRead`/`AsyncWrite`
-//! pair (an in-memory duplex, for hermetic tests). `Noise_IK` authenticates the peer:
-//! the initiator encrypts to the responder's static key, so a wrong `peer_noise_pubkey`
-//! fails the AEAD tag and no session forms — only the intended member can complete it.
+//! pair (an in-memory duplex, for hermetic tests).
+//!
+//! **Pinning is asymmetric by construction, and both sides must pin (#416).** The
+//! initiator ([`a2a_initiate`]) always encrypts to a caller-supplied `peer_noise_pubkey`,
+//! so a wrong one fails the AEAD tag outright — cheap and automatic. The responder
+//! ([`a2a_respond`]) only *learns* the initiator's static key from message 1; Noise_IK
+//! gives it no way to refuse based on that key during the handshake itself (any
+//! initiator that holds a real private key completes a cryptographically valid session,
+//! not just an attacker guessing). So the responder must check the learned key
+//! **after** the handshake, against the channel-attested `noise_pubkey` for whichever
+//! member it believes it's responding to — [`a2a_respond_verified`] does that; the raw
+//! [`a2a_respond`] does not and exists only for callers with no attested identity to
+//! check against.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -87,11 +97,22 @@ where
 
 /// Responder half: read the initiator's first message (learning its static key), reply
 /// with the second, and return the established transport session.
+///
+/// **#416: unlike [`a2a_initiate`], the responder learns the initiator's static key from
+/// message 1 but this alone proves only that the initiator holds *some* private key — not
+/// that it's the *expected* member. Returns that learned key alongside the session so the
+/// caller can check it against a channel-attested `noise_pubkey`
+/// ([`crate::channel::verify_member_noise_attestation`] verifies the attestation itself at
+/// registration time; nothing previously checked the live peer against it at handshake
+/// time). Prefer [`a2a_respond_verified`], which does that check for you — this raw form
+/// exists for callers that must be `Send`+trait-generic over an owned key, and for the one
+/// call site (relay.rs's protocol-shape test) that has no channel/attestation context at
+/// all.
 pub async fn a2a_respond<W, R>(
     send: &mut W,
     recv: &mut R,
     own_noise_private: &[u8; 32],
-) -> io::Result<TransportState>
+) -> io::Result<(TransportState, [u8; 32])>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -119,9 +140,43 @@ where
         }
     };
     hs.read_message(&m1, &mut tmp).map_err(noise_io)?;
+    // Captured before `write_message`'s second call below only touches the send-cipher
+    // state, and before `into_transport_mode()` consumes `hs` -- `get_remote_static()` is
+    // `None` only pre-message-1 (already past that) or for a pattern with no remote static
+    // at all, which Noise_IK never is (`build_responder` fails at construction otherwise).
+    let peer_static: [u8; 32] = hs
+        .get_remote_static()
+        .and_then(|k| k.try_into().ok())
+        .expect("Noise_IK responder always learns a 32-byte remote static from message 1");
     let n = hs.write_message(&[], &mut buf).map_err(noise_io)?;
     send.write_all(&frame(&buf[..n])).await?;
-    hs.into_transport_mode().map_err(noise_io)
+    Ok((hs.into_transport_mode().map_err(noise_io)?, peer_static))
+}
+
+/// [`a2a_respond`], plus the check its own doc says most callers actually need: the learned
+/// peer static key must equal `expected_peer_noise_pubkey` (the channel-attested value for
+/// whichever member the caller believes it's responding to) or the session is refused with
+/// `InvalidData` — the initiator already completed a valid Noise_IK handshake (it holds a
+/// real private key), it's just not the member this responder was told to expect.
+pub async fn a2a_respond_verified<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    own_noise_private: &[u8; 32],
+    expected_peer_noise_pubkey: &[u8; 32],
+) -> io::Result<TransportState>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let (transport, peer_static) = a2a_respond(send, recv, own_noise_private).await?;
+    if &peer_static != expected_peer_noise_pubkey {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a2a: peer completed the handshake with a static key that doesn't match the \
+             channel-attested member key (#416)",
+        ));
+    }
+    Ok(transport)
 }
 
 /// Encrypt and send one application message over an established A2A session.
@@ -244,9 +299,11 @@ where
     let session = if initiator {
         a2a_initiate(&mut send, &mut recv, own_noise_private, peer_noise_public).await?
     } else {
-        // The responder derives the peer identity from the handshake itself; `peer_noise_public`
-        // is unused here but kept in the signature so both roles share one call shape.
-        a2a_respond(&mut send, &mut recv, own_noise_private).await?
+        // #416: previously discarded `peer_noise_public` entirely and trusted whatever key the
+        // handshake happened to present. Both roles now share one call shape for the same real
+        // reason: the responder must pin the same peer it's told to expect, exactly as the
+        // initiator direction already did.
+        a2a_respond_verified(&mut send, &mut recv, own_noise_private, peer_noise_public).await?
     };
     // The pump's late-bind tuple is (transport, read, write).
     Ok((session, recv, send))
@@ -400,12 +457,12 @@ mod tests {
 
         let recv_task = tokio::spawn(async move {
             // Establish the relay session, drain its DATA until the cutover marker.
-            let mut relay = a2a_respond(&mut rb_w, &mut ra_r, &b_priv).await.expect("relay respond");
+            let (mut relay, _peer) = a2a_respond(&mut rb_w, &mut ra_r, &b_priv).await.expect("relay respond");
             let relay_msgs = a2a_drain_relay_until_cutover(&mut ra_r, &mut relay)
                 .await
                 .expect("drain relay to cutover");
             // Establish the direct session, read the post-cutover DATA.
-            let mut direct = a2a_respond(&mut db_w, &mut da_r, &b_priv).await.expect("direct respond");
+            let (mut direct, _peer) = a2a_respond(&mut db_w, &mut da_r, &b_priv).await.expect("direct respond");
             let mut direct_msgs = Vec::new();
             for _ in 0..3 {
                 let (tag, p) = a2a_recv_framed(&mut da_r, &mut direct).await.expect("direct recv");
@@ -456,7 +513,7 @@ mod tests {
         let (mut b_w, mut b_r) = tokio::io::duplex(4096);
 
         let responder_task = tokio::spawn(async move {
-            let mut sess = a2a_respond(&mut b_w, &mut a_r, &resp_priv).await.expect("respond");
+            let (mut sess, _peer) = a2a_respond(&mut b_w, &mut a_r, &resp_priv).await.expect("respond");
             let got = a2a_recv(&mut a_r, &mut sess).await.expect("recv ping");
             assert_eq!(got, b"ping from initiator", "responder decrypts the initiator's message");
             a2a_send(&mut b_w, &mut sess, b"pong from responder").await.expect("send pong");
@@ -500,13 +557,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a2a_respond_verified_rejects_a_genuine_handshake_from_an_unexpected_peer_416() {
+        // #416: unlike the initiator direction (proven above), the raw `a2a_respond` never
+        // checked the peer it actually handshaked with -- a real Noise_IK peer with ITS OWN
+        // valid keypair (not an impostor pinning the wrong key; a genuinely different, fully
+        // legitimate identity) could complete a session the responder never meant to accept.
+        // This proves `a2a_respond_verified` closes that: a REAL, cryptographically-valid
+        // handshake from the wrong peer must still be refused once checked against the
+        // channel-attested key the responder actually expected.
+        let responder = generate_static_keypair();
+        let expected_initiator = generate_static_keypair();
+        let actual_initiator = generate_static_keypair(); // a real peer, just not the expected one
+        let resp_priv = responder.private;
+        let expected_pub = expected_initiator.public;
+        let actual_priv = actual_initiator.private;
+        let actual_pub = actual_initiator.public;
+
+        let (mut a_w, mut a_r) = tokio::io::duplex(4096);
+        let (mut b_w, mut b_r) = tokio::io::duplex(4096);
+
+        let responder_task = tokio::spawn(async move {
+            a2a_respond_verified(&mut b_w, &mut a_r, &resp_priv, &expected_pub).await.is_ok()
+        });
+
+        // The actual initiator completes a fully valid Noise_IK handshake -- own real key,
+        // pins the responder's real public key correctly. No AEAD failure anywhere.
+        let init = a2a_initiate(&mut a_w, &mut b_r, &actual_priv, &responder.public).await;
+        assert!(init.is_ok(), "the handshake itself is genuinely valid -- not an AEAD failure");
+        let responder_ok = responder_task.await.expect("responder task");
+        assert!(
+            !responder_ok,
+            "a real, valid handshake from an unexpected (if genuine) peer must still be refused"
+        );
+
+        // Sanity: the SAME actual peer succeeds once it's the one actually expected.
+        let (mut a_w2, mut a_r2) = tokio::io::duplex(4096);
+        let (mut b_w2, mut b_r2) = tokio::io::duplex(4096);
+        let resp_priv2 = responder.private;
+        let responder_task2 = tokio::spawn(async move {
+            a2a_respond_verified(&mut b_w2, &mut a_r2, &resp_priv2, &actual_pub).await.is_ok()
+        });
+        let init2 = a2a_initiate(&mut a_w2, &mut b_r2, &actual_priv, &responder.public).await;
+        assert!(init2.is_ok());
+        assert!(
+            responder_task2.await.expect("responder task 2"),
+            "the expected peer's own real handshake must still succeed"
+        );
+    }
+
+    #[tokio::test]
     async fn establish_direct_session_brings_up_a_paired_noise_ik_link_with_usable_halves() {
         // #104 direct-P2P (frozen): the two halves of a fresh direct link handshake into a paired
         // Noise_IK session, and the returned (transport, read, write) form a working encrypted
         // tunnel in both directions — exactly what the pump's late-bind one-shot consumes.
         let a_kp = generate_static_keypair();
         let b_kp = generate_static_keypair();
-        let (a_priv, b_priv, b_pub) = (a_kp.private, b_kp.private, b_kp.public);
+        let (a_priv, a_pub, b_priv, b_pub) = (a_kp.private, a_kp.public, b_kp.private, b_kp.public);
 
         // One duplex per direction: a→b and b→a.
         let (a2b_w, a2b_r) = tokio::io::duplex(1 << 16);
@@ -516,8 +622,9 @@ mod tests {
         let a_task = tokio::spawn(async move {
             establish_direct_session(a2b_w, b2a_r, true, &a_priv, &b_pub).await
         });
+        // #416: the responder now actually pins its peer, so this must be `a`'s real key.
         let (mut b_ts, mut b_recv, mut b_send) =
-            establish_direct_session(b2a_w, a2b_r, false, &b_priv, &[0u8; 32])
+            establish_direct_session(b2a_w, a2b_r, false, &b_priv, &a_pub)
                 .await
                 .expect("responder establishes the direct session");
         let (mut a_ts, mut a_recv, mut a_send) =

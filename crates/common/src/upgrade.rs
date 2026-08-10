@@ -506,12 +506,20 @@ where
 /// (the driver replies `Ready` on success), then `dial_and_establish` dials it + handshakes the
 /// direct Noise session, which is installed into the pump and cut over to. Establishment is done
 /// only after `Ready`, concurrently with the initiator's accept, so neither handshake blocks.
+///
+/// **#416: `peer_noise_public` is required, mirroring [`run_upgradable_session_initiator`]'s own
+/// `peer_noise_public` parameter** — the initiator side always pinned its expected peer via
+/// [`crate::a2a::a2a_initiate`]; this responder side previously called the unauthenticated
+/// [`crate::a2a::a2a_respond`] and accepted whichever static key showed up. Callers must supply
+/// the channel-attested `noise_pubkey` for the member they believe they're relaying with — the
+/// same value the caller already used to admit this pairing at the channel broker.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_upgradable_session_responder<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
     mut relay_send: RW,
     mut relay_recv: RR,
     local: P,
     own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
     mut coord: UpgradeCoordinator,
     now: u64,
     dial_probe: DF,
@@ -528,7 +536,13 @@ where
     EF: FnOnce(String) -> EFut,
     EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
 {
-    let relay_ts = crate::a2a::a2a_respond(&mut relay_send, &mut relay_recv, own_noise_private).await?;
+    let relay_ts = crate::a2a::a2a_respond_verified(
+        &mut relay_send,
+        &mut relay_recv,
+        own_noise_private,
+        peer_noise_public,
+    )
+    .await?;
     let (plain_r, plain_w) = tokio::io::split(local);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -816,8 +830,10 @@ mod tests {
         let resp_est = tokio::spawn(async move {
             establish_direct_session(hd_r2i_w, hd_i2r_r, true, &b_priv, &a_pub).await
         });
+        // #416: `establish_direct_session`'s responder branch now actually pins its peer, so this
+        // must be the real expected key (B, the direct-Noise initiator above), not a placeholder.
         let (ini_ts, ini_dr, ini_dw) =
-            establish_direct_session(hd_i2r_w, hd_r2i_r, false, &a_priv, &[0u8; 32])
+            establish_direct_session(hd_i2r_w, hd_r2i_r, false, &a_priv, &b_pub)
                 .await
                 .expect("initiator direct handshake");
         let (resp_ts, resp_dr, resp_dw) = resp_est.await.expect("join").expect("responder direct handshake");
@@ -848,7 +864,7 @@ mod tests {
         });
         let resp_task = tokio::spawn(async move {
             run_upgradable_session_responder(
-                rb2a_w, ra2b_r, resp_app, &b_priv, coord_r, 5,
+                rb2a_w, ra2b_r, resp_app, &b_priv, &a_pub, coord_r, 5,
                 |ep| async move { ep == EP },
                 move |_ep| async move { Some((resp_ts, resp_dr, resp_dw)) },
             )

@@ -64,6 +64,20 @@ pub fn client_handshake(
 }
 
 /// Build the Origin (responder) Noise_IK handshake state.
+///
+/// **#416: this intentionally never checks the Client's static key against anything, and
+/// that's correct for THIS (classic Mesh Plane) path specifically** — `client_private`
+/// (see `crates/client/src/main.rs`) is a fresh [`generate_static_keypair`] per client
+/// process, not a pre-registered identity, so there is no "expected value" for the Origin
+/// to compare against even in principle. ADR-0013 calls the Client↔Origin channel
+/// "mutually authenticated," which holds in the sense that both sides prove possession
+/// of their claimed static key (Noise_IK's own mutual key-confirmation property, real
+/// protection against a network MITM that holds neither key) — it does not mean the
+/// Origin authorizes a specific, known Client identity. That authorization happens one
+/// layer up, at the Edge (Routing Token / Capability / PoW), before a byte of this
+/// handshake is ever reached. Contrast [`crate::a2a::a2a_respond_verified`] (the A2A/
+/// channel path), where members DO have a persistent, channel-attested identity — there,
+/// checking the learned peer key is both meaningful and required.
 pub fn origin_handshake(origin_private: &[u8; 32]) -> Result<snow::HandshakeState, snow::Error> {
     let params: snow::params::NoiseParams = NOISE_PARAMS.parse().expect("valid noise params");
     snow::Builder::new(params)
