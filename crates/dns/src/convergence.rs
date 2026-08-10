@@ -108,55 +108,27 @@ pub async fn wait_for_convergence(
         return Convergence::NoNodesReachable;
     }
     loop {
+        // #354: probe every node concurrently (JoinSet), not one after another --
+        // a strictly sequential poll round could take up to
+        // nodes.len() * addrs_per_node * QUERY_TIMEOUT (worst case, all nodes
+        // slow/unreachable on their first address), which can exceed both
+        // POLL_INTERVAL and this call's own deadline even though the nodes are
+        // fully independent probes with nothing to serialize on. The within-node
+        // IP-fallback (try each of a node's addresses in turn) stays sequential --
+        // only the nodes themselves run in parallel.
+        let mut set = tokio::task::JoinSet::new();
+        for (host, ips) in &addrs {
+            set.spawn(probe_node(host.clone(), ips.clone(), zone.to_string(), name.to_string(), expected.to_string()));
+        }
         let mut lagging = Vec::new();
         let mut answered = 0usize;
-        for (host, ips) in &addrs {
-            // Try every address this node resolved to (typically one IPv4 and
-            // one IPv6) and take the first that actually answers, rather than
-            // only the first address hickory happened to return. One address
-            // family being unreachable from this host is not the same as the
-            // node being down -- conflating them silently halved the fleet
-            // this checked on a host whose outbound UDP/53 over IPv6 stalled
-            // while IPv4 to the very same node answered immediately. That
-            // would have reintroduced this module's own root cause (a check
-            // quietly covering fewer nodes than it claims to) one layer down.
-            let mut node_answered = false;
-            for ip in ips {
-                match txt_at(*ip, name).await {
-                    Ok(values) => {
-                        node_answered = true;
-                        answered += 1;
-                        if !values.iter().any(|v| v == expected) {
-                            lagging.push(host.clone());
-                        }
-                        break;
-                    }
-                    // This cannot be read off the TXT query's own error: hickory
-                    // renders BOTH a genuine "no such record" answer from a live,
-                    // reachable server AND a bare timeout with the same "no
-                    // records found" text (confirmed directly against this same
-                    // fleet -- see dns01_authoritative.rs, which hit the exact
-                    // same rendering ambiguity for the same reason). Ask the same
-                    // address for the zone's SOA, which every authoritative
-                    // server for the zone must serve: an SOA answer proves the
-                    // node is live and the TXT miss is real lag; no SOA answer
-                    // means we could not reach this node at all.
-                    Err(_) => {
-                        if soa_reachable(*ip, zone).await {
-                            node_answered = true;
-                            answered += 1;
-                            lagging.push(host.clone());
-                            break;
-                        }
-                    }
-                }
+        while let Some(res) = set.join_next().await {
+            let (node_answered, lag) = res.expect("probe_node task panicked");
+            if node_answered {
+                answered += 1;
             }
-            // Every address for this node failed even the SOA probe -- that IS
-            // a real gap in this check's coverage, unlike a single-address
-            // miss. Surface it as lagging (conservative: keep waiting) rather
-            // than quietly dropping the node from consideration.
-            if !node_answered {
-                lagging.push(format!("{host} (unreachable on all {} address(es))", ips.len()));
+            if let Some(l) = lag {
+                lagging.push(l);
             }
         }
         if answered == 0 {
@@ -166,10 +138,66 @@ pub async fn wait_for_convergence(
             return Convergence::Converged { nodes: answered, took: started.elapsed() };
         }
         if Instant::now() >= deadline {
+            // Concurrent probes finish in arbitrary order -- sort so the
+            // operator-facing lagging list is stable/reproducible, not an
+            // artifact of which task happened to resolve first.
+            lagging.sort();
             return Convergence::TimedOut { lagging };
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Probe one node -- try each of its resolved addresses in turn (typically one
+/// IPv4 and one IPv6), taking the first that actually answers, rather than only
+/// the first address hickory happened to return. One address family being
+/// unreachable from this host is not the same as the node being down --
+/// conflating them silently halved the fleet this checked on a host whose
+/// outbound UDP/53 over IPv6 stalled while IPv4 to the very same node answered
+/// immediately. That would have reintroduced this module's own root cause (a
+/// check quietly covering fewer nodes than it claims to) one layer down.
+///
+/// Returns `(answered, lagging_entry)`: `answered` is whether ANY address for
+/// this node responded at all (TXT or SOA); `lagging_entry` is `Some(host)` (or
+/// an "(unreachable...)" note) when this node should count as lagging/unclear,
+/// `None` when it's confirmed converged.
+async fn probe_node(
+    host: String,
+    ips: Vec<std::net::IpAddr>,
+    zone: String,
+    name: String,
+    expected: String,
+) -> (bool, Option<String>) {
+    for ip in &ips {
+        match txt_at(*ip, &name).await {
+            Ok(values) => {
+                return if values.iter().any(|v| v == &expected) {
+                    (true, None)
+                } else {
+                    (true, Some(host))
+                };
+            }
+            // This cannot be read off the TXT query's own error: hickory renders
+            // BOTH a genuine "no such record" answer from a live, reachable
+            // server AND a bare timeout with the same "no records found" text
+            // (confirmed directly against this same fleet -- see
+            // dns01_authoritative.rs, which hit the exact same rendering
+            // ambiguity for the same reason). Ask the same address for the
+            // zone's SOA, which every authoritative server for the zone must
+            // serve: an SOA answer proves the node is live and the TXT miss is
+            // real lag; no SOA answer means we could not reach this node at all.
+            Err(_) => {
+                if soa_reachable(*ip, &zone).await {
+                    return (true, Some(host));
+                }
+            }
+        }
+    }
+    // Every address for this node failed even the SOA probe -- that IS a real
+    // gap in this check's coverage, unlike a single-address miss. Surface it as
+    // lagging (conservative: keep waiting) rather than quietly dropping the
+    // node from consideration.
+    (false, Some(format!("{host} (unreachable on all {} address(es))", ips.len())))
 }
 
 /// #301: coalesce concurrent [`wait_for_convergence`] calls for the same
@@ -383,6 +411,47 @@ mod tests {
         for n in DESEC_NODES {
             assert!(n.ends_with(".desec.io"), "{n} is a deSEC node hostname");
         }
+    }
+
+    #[tokio::test]
+    async fn probing_two_unreachable_nodes_concurrently_is_faster_than_sequentially_354() {
+        // #354: the real property being claimed -- probing N nodes concurrently
+        // must be meaningfully faster than probing them one after another, not
+        // just "the code compiles and looks concurrent". Two genuinely
+        // unreachable addresses (192.0.2.0/24, RFC 5737 TEST-NET-1 -- reserved,
+        // never routable, so packets are silently dropped rather than answered)
+        // each cost close to two full QUERY_TIMEOUTs to fail (the TXT probe
+        // times out, then the SOA fallback probe times out too). Measure the
+        // SAME two probes both the old way (sequential) and the new way
+        // (JoinSet, matching wait_for_convergence's actual poll loop) and assert
+        // concurrent is substantially faster -- a real, quantitative A/B
+        // comparison, not a hardcoded absolute-timing guess.
+        let targets: Vec<std::net::IpAddr> = vec!["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
+
+        let seq_start = Instant::now();
+        for ip in &targets {
+            probe_node(ip.to_string(), vec![*ip], "example.invalid".to_string(), "_acme-challenge.example.invalid".to_string(), "v".to_string()).await;
+        }
+        let sequential = seq_start.elapsed();
+
+        let conc_start = Instant::now();
+        let mut set = tokio::task::JoinSet::new();
+        for ip in &targets {
+            set.spawn(probe_node(ip.to_string(), vec![*ip], "example.invalid".to_string(), "_acme-challenge.example.invalid".to_string(), "v".to_string()));
+        }
+        let mut count = 0;
+        while set.join_next().await.is_some() {
+            count += 1;
+        }
+        let concurrent = conc_start.elapsed();
+
+        assert_eq!(count, 2, "both probes completed");
+        assert!(
+            concurrent < sequential.mul_f32(0.75),
+            "concurrent probing ({concurrent:?}) must be substantially faster than \
+             sequential probing of the same two unreachable nodes ({sequential:?}) -- \
+             otherwise the nodes are still being probed one after another"
+        );
     }
 
     #[tokio::test]
