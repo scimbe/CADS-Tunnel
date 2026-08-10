@@ -45,7 +45,15 @@ use crate::oidc::OidcVerifierHandle;
 use crate::portal::{identity_from_verified_id_token, oidc_http_client, urlencode, ExchangedIdentity, PortalOidc};
 use crate::storage::SqliteTunnelStore;
 
-const GATE_STATE_COOKIE: &str = "ct_gate_state";
+/// #429: `__Host-`-prefixed, same reasoning as `portal.rs`'s `STATE_COOKIE` --
+/// every gated hostname lives on this same shared zone, so without the
+/// prefix any OTHER customer subdomain could inject a same-named,
+/// `Domain=`-scoped cookie that collides with this one on a victim's gate
+/// callback (a login-CSRF against a *different* tenant's gate this time,
+/// same mechanism). `__Host-` forces `Secure` + no `Domain=` + `Path=/`,
+/// which browsers enforce can only ever be set by the exact host being
+/// navigated to -- no subdomain can inject a collision anymore.
+const GATE_STATE_COOKIE: &str = "__Host-ct_gate_state";
 const GATE_TARGET_COOKIE: &str = "ct_gate_target";
 const GATE_SESSION_COOKIE: &str = "ct_gate_session";
 const GATE_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
@@ -273,7 +281,20 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
         return StatusCode::BAD_REQUEST.into_response();
     };
     match st.tunnels.require_login_for_hostname(&host) {
-        Ok(false) => return StatusCode::OK.into_response(),
+        // #433: this used to be a bare `200` with NO `X-Gate-Email` header at
+        // all -- fine for a well-behaved `forward_auth copy_headers` config
+        // (which only forwards headers this response actually sets), but a
+        // reverse proxy configured to copy the auth response's headers onto
+        // the ALREADY-INCOMING client request (rather than starting from a
+        // clean slate) would leave whatever `X-Gate-Email` value the CLIENT
+        // itself supplied completely untouched on the "not gated at all"
+        // path -- there being nothing here to overwrite it with. The origin
+        // is meant to trust this header as verified identity; a client that
+        // can set it directly defeats that. Setting it explicitly to EMPTY
+        // here means any client-supplied value is always overwritten with a
+        // definite "no identity", never silently left as whatever the client
+        // sent, regardless of how the reverse proxy's copy semantics work.
+        Ok(false) => return (StatusCode::OK, [(GATE_EMAIL_HEADER, HeaderValue::from_static(""))]).into_response(),
         Ok(true) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -493,12 +514,26 @@ async fn gate_logout(State(st): State<GateState>, Query(q): Query<LogoutQuery>) 
     let Some(domain) = &st.cookie_domain else {
         return gate_unconfigured();
     };
-    let target = match q.host {
+    // #428: `q.host` used to go straight into the redirect target with no
+    // check that it's a real, currently-tracked hostname at all -- a bare
+    // `?host=evil.example` issued a 302 to an attacker from this trusted
+    // origin (a phishing primitive that also launders the domain's
+    // reputation). Validated against `routing_token_for_hostname` (the same
+    // durable `subject_tunnels` lookup every other real-hostname check in
+    // this module uses) before it's ever allowed into the redirect target;
+    // an unknown host falls through to the same safe default as "no host
+    // given at all". Lowercased first, matching #393's normalize-at-entry
+    // convention (the lookup itself isn't `COLLATE NOCASE`).
+    let known_host = q
+        .host
+        .map(|h| h.to_ascii_lowercase())
+        .filter(|h| matches!(st.tunnels.routing_token_for_hostname(h), Ok(Some(_))));
+    let target = match known_host {
         Some(host) => {
             let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
             format!("https://{host}{return_path}")
         }
-        // No specific hostname given -- land on the control plane's own
+        // No specific (or no *known*) hostname given -- land on the control plane's own
         // public host (the same one /gate/start's redirects resolve to),
         // never a bare, hardcoded domain.
         None => match st.oidc.as_ref().and_then(|cfg| gate_public_host(&cfg.redirect_uri)) {
@@ -719,11 +754,11 @@ fn random_state() -> String {
 }
 
 fn gate_state_cookie(state: &str) -> String {
-    format!("{GATE_STATE_COOKIE}={state}; Path=/gate; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
+    format!("{GATE_STATE_COOKIE}={state}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
 }
 
 fn cleared_gate_state_cookie() -> String {
-    format!("{GATE_STATE_COOKIE}=; Path=/gate; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+    format!("{GATE_STATE_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
 fn gate_target_cookie(target: &str) -> String {
@@ -956,10 +991,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_check_never_sets_the_email_header_when_the_hostname_isnt_gated_at_all() {
-        // Nothing to report for a hostname with the gate off -- absence of the
-        // header, not an empty one, is what app-side code should treat as "no
-        // verified identity."
+    async fn gate_check_sets_an_explicitly_empty_email_header_when_the_hostname_isnt_gated_at_all_433() {
+        // #433: this used to omit the header entirely on the "not gated" path,
+        // relying on ABSENCE as the "no verified identity" signal -- fragile
+        // under a reverse-proxy config that copies auth-response headers onto
+        // an already-incoming client request rather than a clean slate, where
+        // an absent header leaves a client-forged `X-Gate-Email` untouched
+        // instead of overwriting it. Now the header is always present, and
+        // explicitly EMPTY (not absent) is the "no verified identity" signal
+        // -- a value a client-supplied header can be overwritten with but
+        // never be genuinely mistaken for, regardless of proxy copy semantics.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap();
         let app =
@@ -968,13 +1009,21 @@ mod tests {
             .oneshot(
                 Request::get("/gate/check")
                     .header("x-forwarded-host", "not-gated.bunsenbrenner.org")
+                    // A client attempting to spoof identity by supplying the
+                    // header itself -- this must never survive as a non-empty
+                    // value on the response Caddy would copy from.
+                    .header(GATE_EMAIL_HEADER, "attacker@evil.example")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(resp.headers().get(GATE_EMAIL_HEADER).is_none());
+        assert_eq!(
+            resp.headers().get(GATE_EMAIL_HEADER).map(|v| v.to_str().unwrap()),
+            Some(""),
+            "must be explicitly empty, not absent and not the client-supplied value"
+        );
     }
 
     /// #382-follow (M2M): a headless caller with no browser session (e.g.
@@ -1140,7 +1189,20 @@ mod tests {
         );
 
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
-        assert!(cookies.iter().any(|c| c.starts_with(&format!("{GATE_STATE_COOKIE}="))));
+        let state_cookie = cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{GATE_STATE_COOKIE}=")))
+            .expect("sets the state cookie");
+        // #429: the real guarantees the `__Host-` prefix's name relies on --
+        // browsers refuse to honor the prefix at all unless these hold, so
+        // this is what actually makes the cookie un-collidable by another
+        // subdomain of the shared zone.
+        assert!(!state_cookie.contains("Domain="), "__Host- cookies must be host-only, no Domain=: {state_cookie}");
+        assert!(
+            state_cookie.contains("Path=/;") || state_cookie.ends_with("Path=/"),
+            "__Host- requires exact Path=/: {state_cookie}"
+        );
+        assert!(state_cookie.contains("Secure"), "__Host- requires Secure: {state_cookie}");
         assert!(cookies
             .iter()
             .any(|c| c.starts_with(&format!("{GATE_TARGET_COOKIE}=demo.bunsenbrenner.org"))));
@@ -1392,6 +1454,33 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(recheck.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn gate_logout_refuses_to_redirect_to_an_unknown_host_428() {
+        // #428: `?host=` used to go straight into the redirect target with no
+        // check that it names a real, currently-tracked hostname -- a bare
+        // `?host=evil.example` issued a 302 to an attacker from this trusted
+        // origin. Only `demo.bunsenbrenner.org` is a real tunnel here;
+        // `evil.example` is not, and must fall back to the safe default
+        // (the control plane's own public host) instead of redirecting there.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+
+        let resp = app
+            .oneshot(
+                Request::get("/gate/logout?host=evil.example&return=/steal-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(!location.contains("evil.example"), "must never redirect to an unknown host: {location}");
+        assert_eq!(location, "https://bunsenbrenner.org/", "falls back to the same safe default as no host at all");
     }
 
     #[tokio::test]
