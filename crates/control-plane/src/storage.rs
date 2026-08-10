@@ -36,6 +36,13 @@ use ct_common::channel::ChannelId;
 use ct_common::{AgentId, RoutingToken, TenantId};
 use ct_common::sync::MutexExt;
 
+/// #407: `record_issuance_complete`'s minimum interval, per hostname, before it logs
+/// another `acme_issuance_log` row — closes an unbounded-replay CA-budget amplifier (a
+/// customer-controlled agent could otherwise flood the shared per-domain budget bucket by
+/// re-POSTing "issuance complete" for its own already-gruen hostname). Real renewals are
+/// ~60 days apart, so a 24h floor costs nothing legitimate.
+const MIN_ISSUANCE_LOG_INTERVAL_SECS: i64 = 24 * 60 * 60;
+
 /// Additive schema migration for in-place self-host upgrades (#44). SQLite's
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a column
 /// introduced in a later commit is silently absent from a DB file created by an
@@ -1610,7 +1617,19 @@ impl SqliteTunnelStore {
         // `open_tuned` so both share one source of truth for the tuning).
         let manager =
             r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
-        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        // #444: r2d2's documented default connection_timeout is 30s -- `read()`'s own
+        // doc claims pool exhaustion "never a hard failure: a read simply degrades",
+        // but without this override a burst past max_size(8) parks the calling tokio
+        // worker thread for up to 30s BEFORE that degradation even begins, strictly
+        // worse than the pre-pool behavior this was meant to improve on. 50ms is
+        // "try briefly, then degrade" -- long enough to ride out a genuine transient
+        // burst, short enough that the promised fallback actually happens promptly.
+        store.readers = Some(
+            r2d2::Pool::builder()
+                .max_size(8)
+                .connection_timeout(std::time::Duration::from_millis(50))
+                .build_unchecked(manager),
+        );
         Ok(store)
     }
 
@@ -1820,6 +1839,55 @@ impl SqliteTunnelStore {
             created_at,
             routing_token,
         })
+    }
+
+    /// Like [`Self::create`], but the owned-tunnel-count check and the insert run
+    /// under the SAME `writer` lock acquisition as one atomic unit (#432) —
+    /// closing the check-then-act race where `create_tunnel`'s handler used to
+    /// read `owned_count` via a separate, earlier call to
+    /// [`Self::list_authorized_for_subject`] and only insert afterward: two
+    /// concurrent requests could both observe `owned_count < max` before either
+    /// one's insert committed. Returns `Ok(None)` (no row created) when `subject`
+    /// already owns `max` or more tunnels at the moment of the same lock
+    /// acquisition that performs the insert.
+    pub fn create_if_under_owned_limit(
+        &self,
+        subject: &str,
+        name: &str,
+        hostname: Option<&str>,
+        max: u32,
+    ) -> rusqlite::Result<Option<SubjectTunnel>> {
+        let conn = self.writer.lock_safe();
+        let owned_count: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM subject_tunnels WHERE subject = ?1",
+            params![subject],
+            |r| r.get(0),
+        )?;
+        if owned_count >= max {
+            return Ok(None);
+        }
+        let mut idb = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut idb);
+        let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
+        let mut tokb = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut tokb);
+        let routing_token: String = tokb.iter().map(|b| format!("{b:02x}")).collect();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO subject_tunnels (id, subject, name, hostname, created_at, routing_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, subject, name, hostname, created_at, routing_token],
+        )?;
+        Ok(Some(SubjectTunnel {
+            id,
+            name: name.to_string(),
+            hostname: hostname.map(str::to_string),
+            created_at,
+            routing_token,
+        }))
     }
 
     /// List `subject`'s own tunnels, newest first.
@@ -2091,14 +2159,27 @@ impl SqliteTunnelStore {
     /// hostname (or a typo'd/nonexistent one). Idempotent per (hostname,
     /// email): resubmitting refreshes the note/timestamp, never grows an
     /// unbounded duplicate queue.
+    /// #431: bound on distinct pending access requests per hostname -- resubmits
+    /// under the same email are idempotent and never count against this, only
+    /// genuinely distinct emails do.
+    const MAX_PENDING_ACCESS_REQUESTS_PER_HOSTNAME: i64 = 500;
+
     pub fn record_access_request(&self, hostname: &str, email: &str, note: &str, now: u64) -> rusqlite::Result<bool> {
         if !self.require_login_for_hostname(hostname)? {
             return Ok(false);
         }
-        self.writer.lock_safe().execute(
+        let conn = self.writer.lock_safe();
+        conn.execute(
             "INSERT INTO gate_access_requests (hostname, email, note, requested_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(hostname, email) DO UPDATE SET note = excluded.note, requested_at = excluded.requested_at",
             params![hostname, email.to_ascii_lowercase(), note, now as i64],
+        )?;
+        conn.execute(
+            "DELETE FROM gate_access_requests WHERE hostname = ?1 AND email NOT IN (
+                 SELECT email FROM gate_access_requests WHERE hostname = ?1
+                 ORDER BY requested_at DESC LIMIT ?2
+             )",
+            params![hostname, Self::MAX_PENDING_ACCESS_REQUESTS_PER_HOSTNAME],
         )?;
         Ok(true)
     }
@@ -2131,6 +2212,110 @@ impl SqliteTunnelStore {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
         })?;
         Ok(Some(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+    }
+
+    /// #437: batched form of [`Self::require_login`] for the tunnels-page render
+    /// loop -- one query for every row instead of one query per row. Keyed by
+    /// tunnel id; a row with no entry means "off" (matching the original's
+    /// `unwrap_or(false)` caller-side default).
+    pub fn require_login_batch(
+        &self,
+        subject: &str,
+        tunnel_ids: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, bool>> {
+        if tunnel_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read();
+        let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, require_login FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+        })?;
+        rows.collect()
+    }
+
+    /// #437: batched form of [`Self::login_allowlist_list`] +
+    /// [`Self::pending_access_requests`] together for the tunnels-page render loop
+    /// -- both derive from the same owned-tunnel id->hostname mapping, so one pass
+    /// resolves it and two `IN (...)` queries (instead of one query per tunnel per
+    /// concern) fetch the allowlist and pending requests for every hostname at
+    /// once. Keyed by tunnel id, matching the per-row lookup callers already do;
+    /// a row with no entry means "no hostname yet" (same as the originals'
+    /// `Option` return narrowing to empty-default at the call site).
+    pub fn allowlist_and_pending_batch(
+        &self,
+        subject: &str,
+        tunnel_ids: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, (Vec<String>, Vec<(String, String, i64)>)>> {
+        if tunnel_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read();
+        let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
+        let id_hostname_sql =
+            format!("SELECT id, hostname FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders})");
+        let mut stmt = conn.prepare(&id_hostname_sql)?;
+        let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
+        let id_to_hostname: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params_from_iter(params_iter), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let hostnames: Vec<&str> = id_to_hostname.iter().filter_map(|(_, h)| h.as_deref()).collect();
+        let mut out = std::collections::HashMap::with_capacity(id_to_hostname.len());
+        if hostnames.is_empty() {
+            for (id, _) in id_to_hostname {
+                out.insert(id, (Vec::new(), Vec::new()));
+            }
+            return Ok(out);
+        }
+
+        let host_placeholders = std::iter::repeat("?").take(hostnames.len()).collect::<Vec<_>>().join(",");
+        let allow_sql = format!(
+            "SELECT hostname, email FROM tunnel_login_allowlist WHERE hostname IN ({host_placeholders}) ORDER BY added_at ASC"
+        );
+        let mut allow_by_host: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare(&allow_sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(hostnames.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (hostname, email) = row?;
+                allow_by_host.entry(hostname.to_ascii_lowercase()).or_default().push(email);
+            }
+        }
+
+        let pending_sql = format!(
+            "SELECT hostname, email, note, requested_at FROM gate_access_requests
+             WHERE hostname IN ({host_placeholders}) COLLATE NOCASE ORDER BY requested_at ASC"
+        );
+        let mut pending_by_host: std::collections::HashMap<String, Vec<(String, String, i64)>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare(&pending_sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(hostnames.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            })?;
+            for row in rows {
+                let (hostname, email, note, requested_at) = row?;
+                pending_by_host.entry(hostname.to_ascii_lowercase()).or_default().push((email, note, requested_at));
+            }
+        }
+
+        for (id, hostname) in id_to_hostname {
+            let key = hostname.map(|h| h.to_ascii_lowercase());
+            let allow = key.as_ref().and_then(|k| allow_by_host.get(k)).cloned().unwrap_or_default();
+            let pending = key.as_ref().and_then(|k| pending_by_host.get(k)).cloned().unwrap_or_default();
+            out.insert(id, (allow, pending));
+        }
+        Ok(out)
     }
 
     /// Dismiss a pending access request (#382-follow), owner-scoped like
@@ -2523,10 +2708,31 @@ impl SqliteTunnelStore {
             return Ok(None);
         }
         if let Some(ca) = &ca {
-            tx.execute(
-                "INSERT INTO acme_issuance_log (ca, domain, hostname, issued_at) VALUES (?1, ?2, ?3, ?4)",
-                params![ca, domain, hostname, now],
-            )?;
+            // #407: this endpoint can't distinguish a genuine renewal from a replay/retry —
+            // the caller is a customer-controlled agent, not the operator, and nothing
+            // previously de-duplicated or rate-limited the ledger insert. Once a hostname is
+            // gruen, this guard passes forever, so an unbounded flood of "complete" calls
+            // for the SAME hostname could exhaust the whole registered domain's shared CA
+            // budget bucket, locking out every other tenant for the rest of the window.
+            // Real renewals are ~60 days apart, so a same-hostname floor of
+            // MIN_ISSUANCE_LOG_INTERVAL_SECS costs nothing legitimate while bounding the
+            // worst case to one ledger entry per hostname per floor window regardless of
+            // how many times the endpoint is hit.
+            let recent: Option<i64> = tx
+                .query_row(
+                    "SELECT issued_at FROM acme_issuance_log WHERE hostname = ?1 ORDER BY issued_at DESC LIMIT 1",
+                    params![hostname],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let already_logged_recently =
+                recent.is_some_and(|last| now.saturating_sub(last) < MIN_ISSUANCE_LOG_INTERVAL_SECS);
+            if !already_logged_recently {
+                tx.execute(
+                    "INSERT INTO acme_issuance_log (ca, domain, hostname, issued_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![ca, domain, hostname, now],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(ca)
@@ -3633,8 +3839,18 @@ impl SqliteTopologyStore {
     /// Delete `owner`'s topology `id` (owner-scoped); returns whether a row was removed.
     /// A non-owner's delete is a no-op (`false`), so one subject can't drop another's.
     pub fn delete_topology(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
-        let n = conn.execute(
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let removed = Self::delete_topology_tx(&tx, owner, id)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// The body of [`Self::delete_topology`], factored out so
+    /// [`Self::delete_all_owned_by`] (#443) can run it for every owned topology
+    /// inside ONE transaction/lock instead of one per id -- see that method's doc.
+    fn delete_topology_tx(tx: &rusqlite::Transaction<'_>, owner: &str, id: &str) -> rusqlite::Result<bool> {
+        let n = tx.execute(
             "DELETE FROM topologies WHERE id = ?1 AND owner = ?2",
             params![id, owner],
         )?;
@@ -3644,9 +3860,9 @@ impl SqliteTopologyStore {
             // assigned into it back to "unassigned" rather than leaving it pointed at
             // a dangling topology id (previously left orphaned -- account-deletion
             // cascade work surfaced this as a real, if mostly harmless, leak).
-            conn.execute("DELETE FROM topology_edges WHERE topology = ?1", params![id])?;
-            conn.execute("DELETE FROM topology_shares WHERE topology = ?1", params![id])?;
-            conn.execute(
+            tx.execute("DELETE FROM topology_edges WHERE topology = ?1", params![id])?;
+            tx.execute("DELETE FROM topology_shares WHERE topology = ?1", params![id])?;
+            tx.execute(
                 "UPDATE topology_agents SET topology = NULL WHERE topology = ?1",
                 params![id],
             )?;
@@ -3655,15 +3871,27 @@ impl SqliteTopologyStore {
     }
 
     /// Every owned topology, agent, edge and share for `owner`, gone (account-deletion
-    /// cascade). Reuses [`delete_topology`](Self::delete_topology) per id so the same
-    /// cascade rules apply; also drops the owner's now-ownerless
+    /// cascade). Reuses [`delete_topology_tx`](Self::delete_topology_tx) per id so the
+    /// same cascade rules apply; also drops the owner's now-ownerless
     /// `topology_agents` rows (agents it registered but never assigned) and strips it
     /// as a collaborator from anyone else's share list. Returns the number of owned
     /// topologies removed.
+    ///
+    /// #443: the whole cascade -- id lookup, every per-topology delete, and the two
+    /// final cleanup statements -- runs inside ONE transaction/lock, not one
+    /// transaction per topology plus separate un-transacted cleanup. A DB error
+    /// partway through previously left an arbitrary prefix of the account's
+    /// topologies deleted with no record of how far it got (a retry wasn't
+    /// equivalent to a clean run), and released the lock between steps, letting a
+    /// concurrent `create_topology` by the same owner slip a row in mid-cascade that
+    /// then survived the "delete all" that raced it. Now either the whole cascade
+    /// lands or none of it does, and no concurrent writer can observe or create a
+    /// half-deleted state.
     pub fn delete_all_owned_by(&self, owner: &str) -> rusqlite::Result<usize> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
         let ids: Vec<String> = {
-            let conn = self.conn.lock_safe();
-            let mut stmt = conn.prepare("SELECT id FROM topologies WHERE owner = ?1")?;
+            let mut stmt = tx.prepare("SELECT id FROM topologies WHERE owner = ?1")?;
             let rows = stmt
                 .query_map(params![owner], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3671,13 +3899,13 @@ impl SqliteTopologyStore {
         };
         let mut removed = 0usize;
         for id in &ids {
-            if self.delete_topology(owner, id)? {
+            if Self::delete_topology_tx(&tx, owner, id)? {
                 removed += 1;
             }
         }
-        let conn = self.conn.lock_safe();
-        conn.execute("DELETE FROM topology_agents WHERE owner = ?1", params![owner])?;
-        conn.execute("DELETE FROM topology_shares WHERE added_by = ?1", params![owner])?;
+        tx.execute("DELETE FROM topology_agents WHERE owner = ?1", params![owner])?;
+        tx.execute("DELETE FROM topology_shares WHERE added_by = ?1", params![owner])?;
+        tx.commit()?;
         Ok(removed)
     }
 
@@ -4603,12 +4831,12 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
-                "CREATE TABLE topologies (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL);
+                "CREATE TABLE topologies (id TEXT PRIMARY KEY, owner TEXT NOT NULL, net_uuid TEXT NOT NULL UNIQUE);
                  CREATE TABLE topology_edges (
                      topology TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL,
                      PRIMARY KEY (topology, a, b)
                  );
-                 INSERT INTO topologies VALUES ('t1', 'alice', 'net');
+                 INSERT INTO topologies VALUES ('t1', 'alice', 'net-uuid-1');
                  -- Two rows that collide once lowercased: ('AA','bb') and ('aa','BB').
                  INSERT INTO topology_edges VALUES ('t1', 'AA', 'bb');
                  INSERT INTO topology_edges VALUES ('t1', 'aa', 'BB');

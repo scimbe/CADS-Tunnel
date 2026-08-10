@@ -4944,7 +4944,13 @@ pub fn persistent_control_plane_router(
         match tunnels.all() {
             Ok(existing) => {
                 for t in existing {
-                    if edge_mesh_store.lookup_by_token(&t.routing_token).ok().flatten().is_none() {
+                    // #445: existence check, not lookup_by_token's liveness-gated one --
+                    // this decides whether to backfill a MISSING row, and lookup_by_token
+                    // routinely reports "none" at boot for perfectly-correct rows too (its
+                    // owning edge just hasn't heartbeated yet this boot), which would
+                    // silently re-home every tunnel to the local edge in a multi-edge
+                    // deployment.
+                    if !edge_mesh_store.has_ownership(&t.routing_token).unwrap_or(false) {
                         if let Err(e) = edge_mesh_store.record_ownership(
                             &t.routing_token,
                             t.hostname.as_deref(),
