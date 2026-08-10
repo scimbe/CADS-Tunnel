@@ -36,12 +36,59 @@ where
     copy_bidirectional(a, b).await
 }
 
-/// Pump one direction: read from `r`, write+**flush** each chunk to `w`, until
-/// `r` reaches EOF, then shut `w` down. Flushing per chunk means a small reply
-/// (e.g. a Noise handshake response) is pushed to the wire immediately instead
-/// of waiting for more source data — and the per-direction byte count + trace
-/// make a stalled direction visible in real time (issue #2, mode b: the agent's
-/// reply reached the edge but never made it back to the client).
+/// Pump one direction: read from `r`, write each chunk to `w`, flushing only
+/// on a **short** read, until `r` reaches EOF, then shut `w` down. The
+/// per-direction byte count + trace make a stalled direction visible in real
+/// time (issue #2, mode b: the agent's reply reached the edge but never made
+/// it back to the client).
+///
+/// #338: flush only when the just-completed read was short (`n < buf.len()`),
+/// not on every chunk. A full-buffer read (`n == buf.len()`) means the source
+/// likely has more data immediately ready (a bulk transfer mid-flight, e.g. a
+/// large upload or video stream) — skipping the flush there lets the writer's
+/// own layer coalesce it with the next write instead of forcing a
+/// syscall/round-trip per 16KB chunk. A short read means the source just gave
+/// us everything it currently has: small/interactive traffic (the common case
+/// for this tunnel's Noise-encrypted application data) or the tail of a bulk
+/// transfer — flush immediately there, which is exactly what preserves the
+/// original per-chunk-flush's reason to exist: a small reply (e.g. a Noise
+/// handshake response) must reach the wire promptly, not wait behind more
+/// source data that may never come soon.
+///
+/// This is safe at EOF even when the last real chunk was a full-buffer read
+/// that skipped its own flush: `shutdown()` below is unconditional, and for
+/// every concrete writer this crate hands to `pump_dir` in production,
+/// `poll_shutdown` drains any writer-internal buffered output before the
+/// underlying transport closes (verified against this workspace's pinned
+/// crate versions, not assumed — see the #338 commit message for the full
+/// evidence trail):
+///   - `quinn::SendStream` (`relay_quic`, quinn 0.11.11): `poll_flush` is a
+///     hardcoded no-op (`Poll::Ready(Ok(()))`) — flushing this writer type has
+///     literally zero observable effect either way. All bytes handed to
+///     `poll_write` are already inside quinn's own connection-driver state;
+///     transmission is scheduled by quinn's background connection task, not
+///     by the application calling flush. `shutdown()` calls `finish()`, which
+///     only signals "no more data is coming" — previously written (already
+///     buffered-in-quinn) data is still transmitted normally.
+///   - `tokio_rustls::server::TlsStream`/`client::TlsStream` (the `:443`
+///     TLS-TCP channel-relay fallback, tokio-rustls 0.26.4 / rustls 0.23.43):
+///     `poll_write` itself already drains any produced TLS records to the
+///     underlying socket in an inner loop (`while session.wants_write() {
+///     write_io(cx) }`) before returning — rustls's `ConnectionCommon::write`
+///     encrypts application data into ready-to-send records immediately, it
+///     does not hold plaintext back awaiting a flush (that only happens
+///     mid-handshake). The only way bytes can still be sitting unsent after a
+///     `write_all` is if the socket briefly applied backpressure; even then,
+///     `poll_shutdown` explicitly loops `while session.wants_write() {
+///     write_io(cx) }` before closing the socket, so a skipped flush can never
+///     strand data at EOF.
+///   - `WsByteStream` (`ws_channel.rs`, the browser `/ws/channel` transport):
+///     `poll_write` already calls `poll_flush` on the WebSocket sink inline,
+///     before returning — there is never unflushed data left after a
+///     `write_all` completes, whether or not the caller flushes separately.
+/// A test double modeling a writer with *real* internal buffering (unlike
+/// `tokio::io::DuplexStream`, whose `poll_flush` is a no-op and so can't
+/// stress this) proves the EOF property directly below.
 /// Render an error together with its full `source()` chain.
 ///
 /// Without this, a relay failure surfaces as the bare top-level message. For
@@ -92,7 +139,9 @@ where
         }
         total += n as u64;
         w.write_all(&buf[..n]).await.map_err(|e| relay_io_error(e, dir, label))?;
-        w.flush().await.map_err(|e| relay_io_error(e, dir, label))?;
+        if n < buf.len() {
+            w.flush().await.map_err(|e| relay_io_error(e, dir, label))?;
+        }
     }
     relay_trace(format_args!("relay {label} {dir}: {total} bytes total then EOF"));
     Ok(total)
@@ -250,6 +299,140 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #338: a writer double that mimics a writer with **real internal
+    /// buffering** (like tokio-rustls's TLS record layer under socket
+    /// backpressure) -- unlike `tokio::io::DuplexStream`, whose `poll_flush`
+    /// is a no-op because it never buffers, so it can't exercise the EOF
+    /// property the fix depends on. Bytes handed to `poll_write` sit in
+    /// `pending` and only become visible in `sink` once `poll_flush` or
+    /// `poll_shutdown` runs (mirroring `TlsStream::poll_shutdown`, which
+    /// drains `session.wants_write()` before closing) -- so a test can prove
+    /// bytes survive a skipped per-chunk flush as long as shutdown still
+    /// drains them. Also counts `poll_flush` calls, matching this crate's
+    /// `Metered<S>` convention (`ct_common::metrics`) of a transparent
+    /// counting `AsyncWrite`/`AsyncRead` wrapper.
+    struct BufferingCounter {
+        pending: Vec<u8>,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        flushed: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncWrite for BufferingCounter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let drained: Vec<u8> = self.pending.drain(..).collect();
+            self.sink.lock().unwrap().extend(drained);
+            self.flushed.notify_one();
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            // Real writers (tokio-rustls's TlsStream) drain any pending
+            // buffered output during shutdown before closing -- mirror that
+            // here so the EOF-safety test below reflects real behavior.
+            self.as_mut().poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_dir_flushes_fewer_times_than_chunks_read_for_bulk_data() {
+        // #338: a bulk transfer (bunch of full-16KB-buffer chunks) must NOT
+        // flush on every chunk -- that was the whole per-chunk-flush-forever
+        // overhead the issue flagged. Feed three full-buffer chunks then EOF
+        // and prove the writer's flush count is far below the read count.
+        use tokio::io::{duplex, AsyncWriteExt};
+
+        let chunk = vec![0xABu8; 16 * 1024];
+        let (mut src_w, src_r) = duplex(4 * 16 * 1024);
+        for _ in 0..3 {
+            src_w.write_all(&chunk).await.unwrap();
+        }
+        src_w.shutdown().await.unwrap(); // EOF after three full chunks
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = BufferingCounter {
+            pending: Vec::new(),
+            sink: sink.clone(),
+            flushes: flushes.clone(),
+            flushed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+
+        let total = pump_dir(src_r, w, "a->b", "bulk-test").await.unwrap();
+
+        assert_eq!(total, 3 * 16 * 1024, "all bytes were read from the source");
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only one flush -- from the unconditional shutdown-drain -- across three full-buffer chunks, not one per chunk"
+        );
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            3 * 16 * 1024,
+            "every byte still reached the writer's sink despite the skipped per-chunk flushes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_dir_flushes_immediately_on_a_short_chunk_no_added_latency() {
+        // #338: the case the original per-chunk flush existed for -- a small
+        // reply (e.g. a Noise handshake response) -- must still reach the
+        // wire immediately, not wait behind more source data that may never
+        // come soon. Write a short (< 16KB) chunk and DON'T close the source,
+        // then prove the writer flushes before the source ever reaches EOF.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut src_w, src_r) = tokio::io::duplex(1024);
+        let flushed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = BufferingCounter {
+            pending: Vec::new(),
+            sink: sink.clone(),
+            flushes: flushes.clone(),
+            flushed: flushed.clone(),
+        };
+
+        let pump_task = tokio::spawn(pump_dir(src_r, w, "a->b", "short-chunk-test"));
+
+        src_w.write_all(b"handshake-reply").await.unwrap();
+        // Source deliberately stays open -- pump_dir's next read() blocks.
+        // If the flush only happened at EOF/shutdown, this would hang.
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed.notified())
+            .await
+            .expect("the short chunk was flushed promptly, without waiting for EOF");
+        assert_eq!(
+            &sink.lock().unwrap()[..],
+            b"handshake-reply",
+            "the short chunk reached the writer's sink immediately"
+        );
+
+        // Clean up: close the source so the still-running pump task finishes.
+        src_w.shutdown().await.unwrap();
+        let total = tokio::time::timeout(std::time::Duration::from_secs(2), pump_task)
+            .await
+            .expect("pump_dir finished after EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, "handshake-reply".len() as u64);
+    }
 
     #[test]
     fn cause_chain_surfaces_the_underlying_reason_not_just_connection_lost() {
