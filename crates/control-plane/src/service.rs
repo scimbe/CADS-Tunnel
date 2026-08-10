@@ -3555,14 +3555,41 @@ pub fn status_router(
 /// `status_handler` below is what changed, wrapping this in a short-TTL cache
 /// instead of running it on every single request.
 async fn aggregate_status(s: &StatusState) -> StatusResp {
+    // #348: rusqlite is sync, so each of these six store calls was running directly on
+    // the Tokio async worker -- blocking it (and every unrelated handler sharing that
+    // worker) for the duration of real disk I/O. `tokio::task::spawn_blocking` moves them
+    // onto Tokio's dedicated blocking-thread pool, which is exactly what that pool exists
+    // for. One join instead of six separate ones: the calls don't depend on each other, so
+    // batching them into a single blocking closure costs one thread-pool round trip, not
+    // six. `live_tunnel_count`'s edge scrape is genuinely async I/O (reqwest) and stays
+    // un-wrapped -- spawn_blocking is for *sync* blocking work, not for slow-but-async work.
+    let (ledger, enrollment, pipeline_registry, agent_directory) = (
+        s.ledger.clone(),
+        s.enrollment.clone(),
+        s.pipeline_registry.clone(),
+        s.agent_directory.clone(),
+    );
+    let (ready, agents, pipelines_published, agents_directory, accounts, payments_confirmed) =
+        tokio::task::spawn_blocking(move || {
+            (
+                ledger.ping().is_ok(),
+                enrollment.agent_count().unwrap_or(0),
+                pipeline_registry.list().map(|v| v.len() as i64).unwrap_or(0),
+                agent_directory.count().unwrap_or(0),
+                ledger.account_count().unwrap_or(0),
+                ledger.confirmed_payment_count().unwrap_or(0),
+            )
+        })
+        .await
+        .unwrap_or((false, 0, 0, 0, 0, 0));
     StatusResp {
-        ready: s.ledger.ping().is_ok(),
+        ready,
         tunnels: live_tunnel_count(s).await,
-        agents: s.enrollment.agent_count().unwrap_or(0),
-        pipelines_published: s.pipeline_registry.list().map(|v| v.len() as i64).unwrap_or(0),
-        agents_directory: s.agent_directory.count().unwrap_or(0),
-        accounts: s.ledger.account_count().unwrap_or(0),
-        payments_confirmed: s.ledger.confirmed_payment_count().unwrap_or(0),
+        agents,
+        pipelines_published,
+        agents_directory,
+        accounts,
+        payments_confirmed,
         uptime_seconds: s.started.elapsed().as_secs(),
         oidc_enabled: s.oidc.is_ready(),
     }
@@ -9361,6 +9388,46 @@ mod tests {
             1,
             "a request within STATUS_CACHE_TTL must still serve the cached count, not re-aggregate -- \
              proves the cache actually short-circuited the store call"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn aggregate_status_spawn_blocking_does_not_stall_a_concurrent_async_task_348() {
+        // #348: the real property being claimed is "a slow sync store call no longer
+        // blocks the async worker" -- not just "aggregate_status still returns the right
+        // numbers" (the #346/#328 tests already cover that). Proves it directly against
+        // the exact pattern aggregate_status now uses: a single Tokio worker thread (so
+        // there is nowhere else for a directly-run sync call to hide) runs a
+        // spawn_blocking closure that sleeps synchronously for 150ms, concurrently with a
+        // plain async task that sleeps only 10ms. If the six store calls ran on the async
+        // worker directly (the pre-#348 shape), a single-worker runtime would serialize
+        // them behind the "slow store call", and the 10ms task would only complete after
+        // the full 150ms blocking sleep. With spawn_blocking, the blocking work runs on
+        // Tokio's separate blocking-thread pool, so the worker stays free and the 10ms
+        // task finishes first.
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+        let blocking_order = order.clone();
+        let blocking = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            blocking_order.lock().unwrap().push("slow_blocking_call");
+        });
+
+        let async_order = order.clone();
+        let quick_async = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            async_order.lock().unwrap().push("quick_async_task");
+        });
+
+        let (b, a) = tokio::join!(blocking, quick_async);
+        b.unwrap();
+        a.unwrap();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["quick_async_task", "slow_blocking_call"],
+            "the quick async task must finish first -- if it finished after, the blocking \
+             call was starving the single async worker instead of running on the blocking pool"
         );
     }
 
