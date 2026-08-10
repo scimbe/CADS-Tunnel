@@ -8,12 +8,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use ct_common::metrics::Counter;
 use ct_common::ratelimit::RateLimiter;
 use ct_common::RoutingToken;
-use ct_common::sync::MutexExt;
+use ct_common::sync::{MutexExt, RwLockExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 use std::sync::Arc;
@@ -101,13 +101,21 @@ pub struct EdgeState<H> {
     /// Live Agent tunnels per token. **Multiple** Agents may register the same
     /// token for redundancy/failover (#8); each is tagged with a monotonic
     /// registration id so exactly one can be evicted when its connection drops.
-    agents: Mutex<HashMap<RoutingToken, Vec<(u64, H)>>>,
+    /// #362: `RwLock`, not `Mutex` -- read far more often (every `route`/
+    /// `routes`/`is_known`/`registration_count` call, the rendezvous hot
+    /// path) than written (only `register_locked`/`remove_registration`/
+    /// `remove`, connection-setup-time operations, not per-relay-byte).
+    agents: RwLock<HashMap<RoutingToken, Vec<(u64, H)>>>,
     /// Source of monotonic registration ids.
     next_reg: AtomicU64,
-    candidates: Mutex<HashMap<RoutingToken, SocketAddr>>,
+    /// #362: `RwLock` -- read on every `candidate()` lookup (P2P rendezvous),
+    /// written only at register/teardown.
+    candidates: RwLock<HashMap<RoutingToken, SocketAddr>>,
     /// Agent-advertised direct-path listener: (address, cert DER) a Client can
     /// connect to directly, bypassing the Edge relay (M11.4b).
-    direct: Mutex<HashMap<RoutingToken, (SocketAddr, Vec<u8>)>>,
+    /// #362: `RwLock` -- read on every `direct_endpoint()` lookup, written
+    /// only at advertise/teardown.
+    direct: RwLock<HashMap<RoutingToken, (SocketAddr, Vec<u8>)>>,
     /// Parked TCP-fallback agents (issue #3 / P1.2c-3, pooled since #229): a
     /// `token` maps to a FIFO queue of senders, one per concurrently-parked
     /// registration -- the Agent-side pool (`run_agent_tcp_fallback`) holds
@@ -129,7 +137,9 @@ pub struct EdgeState<H> {
     /// TLS connection can be mapped to a tunnel without the Client protocol.
     /// Hostnames are stored lowercased. The payload stays blind (TLS ciphertext
     /// is passed through); only the SNI hostname is visible to the Edge.
-    hosts: Mutex<HashMap<String, RoutingToken>>,
+    /// #362: `RwLock` -- read on every `route_host()` SNI lookup (the
+    /// rendezvous hot path), written only at bind/teardown.
+    hosts: RwLock<HashMap<String, RoutingToken>>,
     /// #360: reverse index of [`hosts`](Self::hosts) -- routing token ->
     /// every hostname currently bound to it. Kept in lockstep at `hosts`'s
     /// own two real mutation sites, [`register_host`](Self::register_host)
@@ -167,7 +177,9 @@ pub struct EdgeState<H> {
     /// separately (deserves its own fix: a boot-time sync endpoint or
     /// replay-on-connect from the CP), since building that is a real feature
     /// addition, not the same bounded scope as this unbounded-growth finding.
-    revoked: Mutex<HashSet<RoutingToken>>,
+    /// #362: `RwLock` -- read on every `is_revoked()` check (the rendezvous
+    /// hot path), written only at revoke/boot-seed time.
+    revoked: RwLock<HashSet<RoutingToken>>,
     /// Shared admin secret authenticating the control plane's `'R'` revoke op
     /// (#27 RB3). `None` = revocation disabled (no `CT_EDGE_ADMIN_TOKEN`).
     admin_token: Mutex<Option<[u8; 32]>>,
@@ -175,7 +187,10 @@ pub struct EdgeState<H> {
     /// binds allowed, subject to BP4a takeover-safety). `Some(map)` = required:
     /// a hostname may only be bound by the token the control plane authorized for
     /// it — so an anonymous `'H'` bind on a public `:443` can't claim a name.
-    host_auth: Mutex<Option<HashMap<String, RoutingToken>>>,
+    /// #362: `RwLock` -- read on every `host_bind_allowed()` check (the
+    /// rendezvous hot path) and `dump_host_auth()`, written only when the
+    /// control plane pushes an authorization change.
+    host_auth: RwLock<Option<HashMap<String, RoutingToken>>>,
     /// Rot/Gelb/Grün certificate tier (#233): hostnames currently in the
     /// **Gelb** tier — live via the shared front-door wildcard certificate,
     /// not yet on their own agent-held one. Absence here (the default for
@@ -184,7 +199,10 @@ pub struct EdgeState<H> {
     /// ever gets TLS-terminated at the edge with the wildcard cert when the
     /// control plane has explicitly pushed it here via
     /// `POST /admin/authorize-host/:token/:host?channel_tier=gelb`.
-    gelb_hosts: Mutex<HashSet<String>>,
+    /// #362: `RwLock` -- read on every `is_gelb()` check (the TLS-terminate
+    /// decision on the connection-accept hot path), written only when the
+    /// control plane pushes a tier change.
+    gelb_hosts: RwLock<HashSet<String>>,
     /// Per-token fixed-window rendezvous rate limit (#86, ADR-0018). `None` = off
     /// (no cap). `Some(limiter)` caps how many rendezvous a single routing token may
     /// drive per window — the second half of the layered rendezvous-flood defense
@@ -241,18 +259,18 @@ pub struct EdgeState<H> {
 impl<H: Clone> EdgeState<H> {
     pub fn new() -> Self {
         Self {
-            agents: Mutex::new(HashMap::new()),
+            agents: RwLock::new(HashMap::new()),
             next_reg: AtomicU64::new(1),
-            candidates: Mutex::new(HashMap::new()),
-            direct: Mutex::new(HashMap::new()),
+            candidates: RwLock::new(HashMap::new()),
+            direct: RwLock::new(HashMap::new()),
             tcp_agents: Mutex::new(HashMap::new()),
             tcp_agent_parked: Notify::new(),
-            hosts: Mutex::new(HashMap::new()),
+            hosts: RwLock::new(HashMap::new()),
             hosts_by_token: Mutex::new(HashMap::new()),
-            revoked: Mutex::new(HashSet::new()),
+            revoked: RwLock::new(HashSet::new()),
             admin_token: Mutex::new(None),
-            host_auth: Mutex::new(None),
-            gelb_hosts: Mutex::new(HashSet::new()),
+            host_auth: RwLock::new(None),
+            gelb_hosts: RwLock::new(HashSet::new()),
             rendezvous_limiter: Mutex::new(None),
             registrations: Counter::default(),
             relays: Counter::default(),
@@ -279,7 +297,7 @@ impl<H: Clone> EdgeState<H> {
         // teardown for this token can't observe "not yet bound" and wipe this
         // bind out from under it a moment later -- see registration_lock's doc.
         let _guard = self.registration_lock.lock_safe();
-        let mut hosts = self.hosts.lock_safe();
+        let mut hosts = self.hosts.write_safe();
         match hosts.get(&key) {
             Some(existing) if *existing != token => false,
             _ => {
@@ -309,7 +327,7 @@ impl<H: Clone> EdgeState<H> {
         let Some(owned) = self.hosts_by_token.lock_safe().remove(token) else {
             return;
         };
-        let mut hosts = self.hosts.lock_safe();
+        let mut hosts = self.hosts.write_safe();
         for host in owned {
             hosts.remove(&host);
         }
@@ -324,7 +342,7 @@ impl<H: Clone> EdgeState<H> {
     /// for hostnames bound via the loopback admin API directly).
     pub fn dump_host_auth(&self) -> Option<Vec<(String, RoutingToken)>> {
         self.host_auth
-            .lock_safe()
+            .read_safe()
             .as_ref()
             .map(|m| m.iter().map(|(h, t)| (h.clone(), t.clone())).collect())
     }
@@ -333,7 +351,7 @@ impl<H: Clone> EdgeState<H> {
     /// `'H'` bind is refused unless the control plane has authorized that
     /// (hostname, token) pair. Enabled at startup for a reachable `:443`.
     pub fn require_host_auth(&self) {
-        let mut ha = self.host_auth.lock_safe();
+        let mut ha = self.host_auth.write_safe();
         if ha.is_none() {
             *ha = Some(HashMap::new());
         }
@@ -345,7 +363,7 @@ impl<H: Clone> EdgeState<H> {
     pub fn authorize_host(&self, host: &str, token: RoutingToken) {
         if let Some(key) = ct_common::normalize_hostname(host) {
             self.host_auth
-                .lock_safe()
+                .write_safe()
                 .get_or_insert_with(HashMap::new)
                 .insert(key, token);
         }
@@ -359,7 +377,7 @@ impl<H: Clone> EdgeState<H> {
     /// revoke, that call path too.
     pub fn unauthorize_host(&self, host: &str) {
         if let Some(key) = ct_common::normalize_hostname(host) {
-            if let Some(map) = self.host_auth.lock_safe().as_mut() {
+            if let Some(map) = self.host_auth.write_safe().as_mut() {
                 map.remove(&key);
             }
         }
@@ -375,7 +393,7 @@ impl<H: Clone> EdgeState<H> {
     /// and the entry must not linger in memory for the rest of the process's
     /// life either.
     fn clear_host_auth_for(&self, token: &RoutingToken) {
-        if let Some(map) = self.host_auth.lock_safe().as_mut() {
+        if let Some(map) = self.host_auth.write_safe().as_mut() {
             map.retain(|_, t| t != token);
         }
     }
@@ -387,7 +405,7 @@ impl<H: Clone> EdgeState<H> {
         let Some(key) = ct_common::normalize_hostname(host) else {
             return false; // a malformed hostname is never bindable (#23 BP4b-d)
         };
-        match self.host_auth.lock_safe().as_ref() {
+        match self.host_auth.read_safe().as_ref() {
             None => true,
             Some(map) => map.get(&key) == Some(token),
         }
@@ -413,7 +431,7 @@ impl<H: Clone> EdgeState<H> {
     /// Resolve a public hostname (from the TLS SNI) to its routing token.
     pub fn route_host(&self, host: &str) -> Option<RoutingToken> {
         let key = ct_common::normalize_hostname(host)?;
-        self.hosts.lock_safe().get(&key).cloned()
+        self.hosts.read_safe().get(&key).cloned()
     }
 
     /// Set whether `host` is currently in the **Gelb** certificate tier
@@ -427,7 +445,7 @@ impl<H: Clone> EdgeState<H> {
         let Some(key) = ct_common::normalize_hostname(host) else {
             return;
         };
-        let mut gelb_hosts = self.gelb_hosts.lock_safe();
+        let mut gelb_hosts = self.gelb_hosts.write_safe();
         if gelb {
             gelb_hosts.insert(key);
         } else {
@@ -442,7 +460,7 @@ impl<H: Clone> EdgeState<H> {
     /// feature doesn't touch.
     pub fn is_gelb(&self, host: &str) -> bool {
         match ct_common::normalize_hostname(host) {
-            Some(key) => self.gelb_hosts.lock_safe().contains(&key),
+            Some(key) => self.gelb_hosts.read_safe().contains(&key),
             None => false,
         }
     }
@@ -564,12 +582,12 @@ impl<H: Clone> EdgeState<H> {
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
     /// the address and cert DER a Client uses to connect directly.
     pub fn advertise_direct(&self, token: RoutingToken, addr: SocketAddr, cert: Vec<u8>) {
-        self.direct.lock_safe().insert(token, (addr, cert));
+        self.direct.write_safe().insert(token, (addr, cert));
     }
 
     /// The Agent's advertised direct-path `(addr, cert)` for `token`, if any.
     pub fn direct_endpoint(&self, token: &RoutingToken) -> Option<(SocketAddr, Vec<u8>)> {
-        self.direct.lock_safe().get(token).cloned()
+        self.direct.read_safe().get(token).cloned()
     }
 
     /// Register an Agent tunnel serving `token`, returning a **registration id**.
@@ -589,7 +607,7 @@ impl<H: Clone> EdgeState<H> {
     fn register_locked(&self, token: RoutingToken, handle: H) -> u64 {
         let id = self.next_reg.fetch_add(1, Ordering::Relaxed);
         {
-            let mut agents = self.agents.lock_safe();
+            let mut agents = self.agents.write_safe();
             let entry = agents.entry(token).or_default();
             if entry.is_empty() {
                 self.active_tunnels_gauge.fetch_add(1, Ordering::Relaxed);
@@ -618,13 +636,13 @@ impl<H: Clone> EdgeState<H> {
     ) -> u64 {
         let _guard = self.registration_lock.lock_safe();
         let id = self.register_locked(token.clone(), handle);
-        self.candidates.lock_safe().insert(token, candidate);
+        self.candidates.write_safe().insert(token, candidate);
         id
     }
 
     /// The Agent's Edge-observed peer candidate for `token`, if recorded.
     pub fn candidate(&self, token: &RoutingToken) -> Option<SocketAddr> {
-        self.candidates.lock_safe().get(token).copied()
+        self.candidates.read_safe().get(token).copied()
     }
 
     /// Route `token` to a live Agent tunnel handle, if any. Returns the **most
@@ -633,7 +651,7 @@ impl<H: Clone> EdgeState<H> {
     /// (the next takes over on its drop).
     pub fn route(&self, token: &RoutingToken) -> Option<H> {
         self.agents
-            .lock_safe()
+            .read_safe()
             .get(token)
             .and_then(|v| v.last().map(|(_, h)| h.clone()))
     }
@@ -642,14 +660,14 @@ impl<H: Clone> EdgeState<H> {
     /// the failover order for the relay: try the newest, fall back to older ones
     /// if its `open_bi()` fails (#8 R2, covers the dead-but-not-yet-evicted race).
     pub fn routes(&self, token: &RoutingToken) -> Vec<H> {
-        self.agents.lock_safe().get(token).map_or_else(Vec::new, |v| {
+        self.agents.read_safe().get(token).map_or_else(Vec::new, |v| {
             v.iter().rev().map(|(_, h)| h.clone()).collect()
         })
     }
 
     /// Number of redundant Agent registrations currently serving `token` (#8).
     pub fn registration_count(&self, token: &RoutingToken) -> usize {
-        self.agents.lock_safe().get(token).map_or(0, Vec::len)
+        self.agents.read_safe().get(token).map_or(0, Vec::len)
     }
 
     /// Is `token` currently connected (at least one live Agent registration)?
@@ -698,7 +716,7 @@ impl<H: Clone> EdgeState<H> {
     /// re-reading it added nothing once the lock spans both.
     pub fn remove_registration(&self, token: &RoutingToken, id: u64) {
         let _guard = self.registration_lock.lock_safe();
-        let mut agents = self.agents.lock_safe();
+        let mut agents = self.agents.write_safe();
         let Some(v) = agents.get_mut(token) else { return };
         let before = v.len();
         v.retain(|(rid, _)| *rid != id);
@@ -715,8 +733,8 @@ impl<H: Clone> EdgeState<H> {
         }
         agents.remove(token);
         drop(agents);
-        self.candidates.lock_safe().remove(token);
-        self.direct.lock_safe().remove(token);
+        self.candidates.write_safe().remove(token);
+        self.direct.write_safe().remove(token);
         // The tunnel is gone — drop its hostname routes too (#23 BP4a).
         self.clear_hosts_for(token);
     }
@@ -733,14 +751,14 @@ impl<H: Clone> EdgeState<H> {
         // was ever inserted (registration_count() > 0 -> a real, non-empty
         // entry, matching register_locked's own invariant that an entry is
         // never left empty in the map).
-        if let Some(v) = self.agents.lock_safe().remove(token) {
+        if let Some(v) = self.agents.write_safe().remove(token) {
             if !v.is_empty() {
                 self.active_tunnels_gauge.fetch_sub(1, Ordering::Relaxed);
                 self.total_registrations_gauge.fetch_sub(v.len() as u64, Ordering::Relaxed);
             }
         }
-        self.candidates.lock_safe().remove(token);
-        self.direct.lock_safe().remove(token);
+        self.candidates.write_safe().remove(token);
+        self.direct.write_safe().remove(token);
         self.tcp_agents.lock_safe().remove(token);
         self.clear_hosts_for(token);
     }
@@ -750,7 +768,7 @@ impl<H: Clone> EdgeState<H> {
     /// is what makes a customer's "revoke" actually stop the tunnel — without the
     /// revoked set, the Agent's reconnect loop would simply register again.
     pub fn revoke_token(&self, token: &RoutingToken) {
-        self.revoked.lock_safe().insert(token.clone());
+        self.revoked.write_safe().insert(token.clone());
         self.remove(token); // also clears the token's hostname routes (#23 BP4a)
         // #281: also drop any host_auth grant(s) for this token, so a revoked
         // token can never re-authorize a hostname bind on a later reconnect --
@@ -761,7 +779,7 @@ impl<H: Clone> EdgeState<H> {
 
     /// Whether `token` has been revoked (#27 RB3).
     pub fn is_revoked(&self, token: &RoutingToken) -> bool {
-        self.revoked.lock_safe().contains(token)
+        self.revoked.read_safe().contains(token)
     }
 
     /// Seed the revoked set from the control plane's durable record (#327
@@ -770,7 +788,7 @@ impl<H: Clone> EdgeState<H> {
     /// yet, so there's nothing to tear down, only the future re-registration
     /// to refuse.
     pub fn seed_revoked_tokens(&self, tokens: impl IntoIterator<Item = RoutingToken>) {
-        let mut set = self.revoked.lock_safe();
+        let mut set = self.revoked.write_safe();
         set.extend(tokens);
     }
 
@@ -805,7 +823,7 @@ impl<H: Clone> EdgeState<H> {
     /// Whether `token` currently has at least one live Agent tunnel.
     pub fn is_known(&self, token: &RoutingToken) -> bool {
         self.agents
-            .lock_safe()
+            .read_safe()
             .get(token)
             .is_some_and(|v| !v.is_empty())
     }
