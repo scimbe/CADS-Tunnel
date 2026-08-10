@@ -99,13 +99,20 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
+          # #381: SQLite (tunnel registry, credit ledger), a boot-time reqwest JWKS
+          # fetch, OIDC verification, and the portal are all real memory/CPU work --
+          # 64Mi is tight for a Rust app with a SQLite cache + HTTP client (real
+          # OOMKill risk during first boot's JWKS-fetch + migration), and 50m throttles
+          # exactly that same startup work plus real login spikes. Aligned to the SAME
+          # binary's already-tuned, real production values from compose.selfhost.yml
+          # (mem_reservation/mem_limit/cpus, #312) rather than guessing new numbers.
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 250m
+              memory: 128Mi
             limits:
               cpu: "1"
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
