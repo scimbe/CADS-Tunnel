@@ -360,8 +360,14 @@ fn oidc_http_client_with(timeout: std::time::Duration) -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// #349: a fresh `reqwest::Client` means a fresh connection pool -- a new TLS handshake
+/// and DNS lookup to the IdP on every single call, instead of reusing a warm keep-alive
+/// connection. Built once (lazily, on first use) and cloned thereafter -- `Client::clone`
+/// is cheap (an `Arc` bump), so every caller shares the same pool without needing to
+/// thread a client through `State`.
 pub(crate) fn oidc_http_client() -> reqwest::Client {
-    oidc_http_client_with(OIDC_HTTP_TIMEOUT)
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| oidc_http_client_with(OIDC_HTTP_TIMEOUT)).clone()
 }
 
 fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
@@ -1099,6 +1105,75 @@ mod tests {
 
         assert!(result.is_err(), "a hanging IdP errors, it does not hang the login path");
         assert!(elapsed < Duration::from_secs(2), "failed fast in {elapsed:?}, not forever");
+    }
+
+    #[tokio::test]
+    async fn oidc_http_client_is_built_once_and_reuses_its_connection_pool_349() {
+        // #349: the real property claimed -- "one call to oidc_http_client() reuses the
+        // same client, so a real keep-alive TCP connection is reused across requests" --
+        // not just "the function still returns a working client". Pre-fix, every call
+        // built a brand-new `reqwest::Client` (a brand-new connection pool with nothing
+        // cached in it), so two calls would each open their OWN TCP connection to the
+        // same server. A real local server counts distinct TCP accepts; two
+        // oidc_http_client() calls each making one request must add up to exactly ONE
+        // accept if the client (and therefore its pool) is actually being reused.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = accepts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        // Serve requests on this SAME connection (HTTP/1.1 keep-alive)
+                        // until the client closes it -- proves reuse, not just
+                        // "the first request succeeded".
+                        loop {
+                            let n = match sock.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => n,
+                            };
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        buf.clear();
+                        let body = b"{}";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err()
+                            || sock.write_all(body).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/");
+        oidc_http_client().get(&url).send().await.unwrap();
+        oidc_http_client().get(&url).send().await.unwrap();
+        // Let the connection settle back into the pool's idle state before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "two oidc_http_client() calls making one request each must share a single \
+             pooled TCP connection -- a distinct accept means a fresh client (and pool) \
+             was built per call, exactly the regression this fix closes"
+        );
     }
 
     #[test]

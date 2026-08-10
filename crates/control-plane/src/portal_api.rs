@@ -46,8 +46,12 @@ fn edge_admin_http_client_with(timeout: std::time::Duration) -> reqwest::Client 
 /// The edge admin client with the production timeout — a hung edge must not wedge
 /// the portal request. `pub(crate)`: also reused by `acme_broker`'s
 /// channel-tier-push calls (#233), the same shared secret and endpoint shape as here.
+/// #349: same reasoning as `portal::oidc_http_client` -- built once (lazily) and cloned
+/// (a cheap `Arc` bump) instead of paying a fresh TLS handshake + DNS lookup to the edge
+/// admin API on every create/delete_tunnel/authorize_hostname call.
 pub(crate) fn edge_admin_http_client() -> reqwest::Client {
-    edge_admin_http_client_with(std::time::Duration::from_secs(5))
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| edge_admin_http_client_with(std::time::Duration::from_secs(5))).clone()
 }
 
 /// Automatic DNS-record management for tunnel hostnames (#38 DL2): create the A
