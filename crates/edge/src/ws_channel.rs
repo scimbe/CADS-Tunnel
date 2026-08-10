@@ -280,7 +280,19 @@ pub fn ws_channel_router(state: WsChannelState) -> Router {
     Router::new().route("/ws/channel", get(ws_upgrade_handler)).with_state(state)
 }
 
+/// #412: axum's default `WebSocketConfig` allows a 64 MiB message (16 MiB frame), and
+/// `WsByteStream::poll_read` copies a whole decoded message into `read_buf` before
+/// admission ever reads a byte of it -- an unauthenticated peer could force up to that
+/// much allocation per connection. The wire protocol this stream actually carries
+/// (Agent-Fabric channel admission + relay) already has its own real ceiling --
+/// `ct_common::a2a::MAX_MESSAGE_BYTES` (`u16::MAX`), the same bound the QUIC/TCP
+/// transports' length-prefixed framing enforces -- so capping the WebSocket layer at the
+/// identical value costs no legitimate message headroom while cutting the pre-auth
+/// worst case by roughly 1000x (64 MiB -> 64 KiB).
+const WS_MAX_MESSAGE_BYTES: usize = ct_common::a2a::MAX_MESSAGE_BYTES;
+
 async fn ws_upgrade_handler(ws: WebSocketUpgrade, State(state): State<WsChannelState>) -> Response {
+    let ws = ws.max_message_size(WS_MAX_MESSAGE_BYTES).max_frame_size(WS_MAX_MESSAGE_BYTES);
     // Shed BEFORE upgrading (cheaper than admitting then dropping mid-handshake),
     // same posture as every other public listener's `ConnectionCap` -- see
     // WsChannelState::cap's doc comment.
@@ -742,6 +754,45 @@ mod tests {
         // received a "NO" (or closed) well within this window.
         let quiet = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
         assert!(quiet.is_err(), "a parked solo member gets silence, not a refusal or an ack: {quiet:?}");
+    }
+
+    #[tokio::test]
+    async fn oversized_pre_auth_message_is_rejected_not_buffered_412() {
+        // #412: axum's DEFAULT WebSocketConfig (64 MiB message) would let an
+        // unauthenticated peer force a huge allocation via `WsByteStream::poll_read`
+        // before a single byte of admission ever runs. `ws_upgrade_handler` now caps
+        // both message and frame size at `WS_MAX_MESSAGE_BYTES` (`ct_common::a2a`'s own
+        // `MAX_MESSAGE_BYTES`, `u16::MAX`) -- confirm a message over that bound is
+        // refused at the WebSocket layer itself, never reaching admission at all.
+        let operator = SigningKey::from_bytes(&[0x77u8; 32]);
+        let channel = ChannelId([0x66u8; 32]);
+        let resolver = Arc::new(FixedResolver { operator_pubkey: operator.verifying_key().to_bytes(), channel, holders: vec![] });
+        let state = WsChannelState::standalone(resolver);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, ws_channel_router(state)).await;
+        });
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/channel")).await.unwrap();
+        // One byte over the real wire-protocol ceiling -- a legitimate join request is
+        // a couple hundred bytes at most (SignedChannelGrant::WIRE_LEN + a short
+        // endpoint string), so this is purely an attacker-shaped oversized frame, not
+        // anything a real client would ever send.
+        let oversized = vec![0u8; WS_MAX_MESSAGE_BYTES + 1];
+        ws.send(WsMessage::Binary(oversized)).await.unwrap();
+
+        // Either the send itself is rejected client-side (tungstenite enforces its own
+        // negotiated config) or the connection closes/errors when the server refuses
+        // the oversized frame -- either way, nothing resembling a normal admission
+        // response (a 32-byte challenge) can arrive.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        match outcome {
+            Err(_) => panic!("server neither closed nor errored on an oversized pre-auth message"),
+            Ok(None) => {} // connection closed -- correctly refused
+            Ok(Some(Err(_))) => {} // protocol error -- correctly refused
+            Ok(Some(Ok(msg))) => panic!("oversized message was NOT refused, server responded: {msg:?}"),
+        }
     }
 
     #[tokio::test]
