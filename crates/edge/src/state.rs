@@ -1116,6 +1116,157 @@ mod tests {
     }
 
     #[test]
+    fn revoke_clears_the_gelb_tier_so_a_re_bound_hostname_starts_neutral_426() {
+        // #426: `gelb_hosts` is keyed purely by hostname (Gelb/Grün is a
+        // property of the hostname's cert tier, not of any one token) --
+        // `revoke_token`'s teardown never touched it, so a re-bound hostname
+        // silently inherited whatever tier flag the PREVIOUS tenant's token
+        // left behind, independent of the new tenant's own actual cert state.
+        let state = EdgeState::<u32>::new();
+        let old_owner = token(11);
+        state.register_host("shared.example", old_owner.clone());
+        state.set_cert_tier("shared.example", true); // old tenant is Gelb
+        assert!(state.is_gelb("shared.example"));
+
+        state.revoke_token(&old_owner);
+        assert!(
+            !state.is_gelb("shared.example"),
+            "revoke must clear the hostname's tier flag, not just its routing/auth"
+        );
+
+        // A different tenant/token now binds the SAME hostname (e.g. after
+        // re-provisioning) -- it must start neutral (not-Gelb), not inherit
+        // the old tenant's tier.
+        let new_owner = token(12);
+        assert!(state.register_host("shared.example", new_owner));
+        assert!(
+            !state.is_gelb("shared.example"),
+            "a freshly re-bound hostname must never inherit a previous tenant's Gelb/Grün tier"
+        );
+    }
+
+    #[test]
+    fn register_with_candidate_unless_revoked_refuses_a_revoked_token_411_421() {
+        // #421: the atomic QUIC-role-'A' registration path -- direct functional
+        // check that a revoked token is refused, distinct from the concurrency
+        // stress test below which proves it can't be raced around.
+        let state = EdgeState::new();
+        let t = token(1);
+        state.revoke_token(&t);
+        assert!(
+            state
+                .register_with_candidate_unless_revoked(t.clone(), 1u32, "127.0.0.1:1".parse().unwrap())
+                .is_none(),
+            "a revoked token must never acquire a live registration"
+        );
+        assert!(!state.is_known(&t));
+
+        let live = token(2);
+        assert!(
+            state
+                .register_with_candidate_unless_revoked(live.clone(), 2u32, "127.0.0.1:2".parse().unwrap())
+                .is_some(),
+            "an unrevoked token registers normally"
+        );
+        assert!(state.is_known(&live));
+    }
+
+    #[test]
+    fn park_tcp_agent_unless_revoked_refuses_a_revoked_token_411() {
+        // #411: the TCP-fallback registration path previously had NO revocation
+        // check at all -- `park_tcp_agent` would happily queue a revoked token
+        // forever. Direct functional check that the new atomic entry point
+        // refuses it instead.
+        let state = EdgeState::<u32>::new();
+        let t = token(3);
+        state.revoke_token(&t);
+        assert!(
+            state.park_tcp_agent_unless_revoked(t).is_none(),
+            "a revoked token must never be parked as a waiting TCP-fallback agent"
+        );
+
+        let live = token(4);
+        assert!(
+            state.park_tcp_agent_unless_revoked(live).is_some(),
+            "an unrevoked token parks normally"
+        );
+    }
+
+    #[test]
+    fn register_host_refuses_a_revoked_token_411() {
+        // #411: neither the QUIC 'H' arm nor the TCP-fallback 'B' arm checked
+        // revocation before calling `register_host` -- fixed inside
+        // `register_host` itself so no caller can forget it.
+        let state = EdgeState::<u32>::new();
+        let t = token(5);
+        state.revoke_token(&t);
+        assert!(
+            !state.register_host("revoked.example", t),
+            "a revoked token must never be able to bind a public hostname"
+        );
+        assert_eq!(state.route_host("revoked.example"), None);
+    }
+
+    #[test]
+    fn revoke_and_register_race_never_leaves_a_revoked_token_registered_421() {
+        // #421: real, multi-threaded proof that the TOCTOU this issue described
+        // is actually closed, not just that the individual functions look right
+        // in isolation. Before the fix, `register_with_candidate_unless_revoked`'s
+        // predecessor did a bare `is_revoked` read, then a SEPARATE
+        // `register_with_candidate` call with no lock spanning both -- a
+        // concurrent `revoke_token` that ran entirely inside that gap left the
+        // token both revoked AND registered, permanently (nothing ever swept it
+        // again). Hammering register/revoke concurrently from real OS threads
+        // and asserting the invariant after every round is the same "prove the
+        // actual property, not just that code changed" style used elsewhere
+        // this session for concurrency claims.
+        use std::sync::Arc;
+
+        let state = Arc::new(EdgeState::new());
+
+        // A FRESH token every round (revocation is permanent in the real API,
+        // so reusing one token would only genuinely race on round 0 -- every
+        // later round would see `is_revoked` already true before its threads
+        // even start, which can't exercise the timing-sensitive window this
+        // test exists to stress).
+        for round in 0u32..300 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&round.to_be_bytes());
+            let t = RoutingToken(bytes);
+
+            let mut handles = Vec::new();
+            for i in 0..4u16 {
+                let state = Arc::clone(&state);
+                let t = t.clone();
+                handles.push(std::thread::spawn(move || {
+                    let addr = format!("127.0.0.1:{}", 10_000 + i).parse().unwrap();
+                    let _ = state.register_with_candidate_unless_revoked(t, u32::from(i), addr);
+                }));
+            }
+            {
+                let state = Arc::clone(&state);
+                let t = t.clone();
+                handles.push(std::thread::spawn(move || {
+                    state.revoke_token(&t);
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // The invariant this issue exists to guarantee: once revoked (and
+            // every round DOES revoke it), the token can never be found with a
+            // live registration, no matter how the register/revoke threads in
+            // this round happened to interleave.
+            assert!(state.is_revoked(&t), "sanity: revoke always runs each round");
+            assert!(
+                !state.is_known(&t),
+                "round {round}: a revoked token ended up with a live registration -- the race is not closed"
+            );
+        }
+    }
+
+    #[test]
     fn seed_revoked_tokens_blocks_registration_without_touching_a_live_one_327() {
         // #327: boot-time replay from the control plane's durable record must
         // block re-registration of a previously-revoked token, exactly like a
