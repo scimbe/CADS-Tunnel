@@ -255,11 +255,20 @@ const GATE_EMAIL_HEADER: &str = "x-gate-email";
 /// live testing the first real gated demo (devsystem-demo.bunsenbrenner.org,
 /// #382), not from re-reading the docs first.
 async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Query<CheckQuery>) -> Response {
+    // #393: normalize at the boundary -- DNS hostnames are case-insensitive
+    // (RFC 4343), and everything downstream of this point (the target cookie
+    // this handler's own redirect below encodes, the session claims minted
+    // at /gate/callback, `claims.host == host` a few lines down) compares
+    // this value verbatim. storage.rs's own lookups are additionally
+    // COLLATE NOCASE as defense-in-depth against already-stored mixed-case
+    // data, but the request/session/target flow itself needs ONE canonical
+    // casing to stay internally consistent across the whole login round trip.
     let Some(host) = headers
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .or(q.host)
+        .map(|h| h.to_ascii_lowercase())
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -343,10 +352,16 @@ struct StartQuery {
 /// `404` if `host` doesn't have the login gate enabled at all -- refusing to
 /// act as an open redirect for an arbitrary hostname that isn't actually gated.
 async fn gate_start(State(st): State<GateState>, Query(q): Query<StartQuery>) -> Response {
+    // #393: this endpoint is independently public (not just reached via
+    // gate_check's own redirect), so it normalizes its own `host` too --
+    // this is what actually flows into the target cookie below and becomes
+    // /gate/callback's `claims.host`, so it's the canonical point where the
+    // whole login round trip's casing gets fixed for good.
+    let host = q.host.to_ascii_lowercase();
     let (Some(cfg), Some(_domain)) = (&st.oidc, &st.cookie_domain) else {
         return gate_unconfigured();
     };
-    match st.tunnels.require_login_for_hostname(&q.host) {
+    match st.tunnels.require_login_for_hostname(&host) {
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "this hostname does not require login").into_response(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -356,7 +371,7 @@ async fn gate_start(State(st): State<GateState>, Query(q): Query<StartQuery>) ->
     };
     let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
     let state = random_state();
-    let target = format!("{}|{}", q.host, return_path);
+    let target = format!("{host}|{return_path}");
     let authorize_url = cfg.authorize_redirect_to(&state, &redirect_uri);
     let mut resp = Redirect::to(&authorize_url).into_response();
     set_cookie(&mut resp, &gate_state_cookie(&state));
@@ -570,8 +585,12 @@ fn access_denied_html(host: &str) -> String {
 /// `record_access_request`'s own check) -- a stray or typo'd host gets an
 /// honest 404 rather than a form that can never actually be recorded.
 async fn gate_request_access_form(State(st): State<GateState>, Query(q): Query<RequestAccessQuery>) -> Response {
-    match st.tunnels.require_login_for_hostname(&q.host) {
-        Ok(true) => Html(request_access_form_html(&q.host, None)).into_response(),
+    // #393: normalized here too -- rendered into the form's own hidden `host`
+    // field below, so the POST submit (gate_request_access_submit) inherits
+    // the same canonical casing without needing its own separate fix.
+    let host = q.host.to_ascii_lowercase();
+    match st.tunnels.require_login_for_hostname(&host) {
+        Ok(true) => Html(request_access_form_html(&host, None)).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown or ungated hostname").into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response(),
     }
@@ -1491,6 +1510,105 @@ mod tests {
         assert_eq!(pending.len(), 1, "resubmitting the same email must refresh, not duplicate");
         assert_eq!(pending[0].1, "updated note");
         assert_eq!(pending[0].2, 200);
+    }
+
+    #[tokio::test]
+    async fn require_login_and_email_allowed_match_hostname_case_insensitively_393() {
+        // #393: the real auth-bypass shape -- enroll a hostname with ONE casing,
+        // then query with a DIFFERENT casing (exactly what a mixed-case gate
+        // input vs. the stored casing would produce). Before this fix,
+        // require_login_for_hostname would have returned `false` (gate not
+        // required -> the tunnel admitted with NO authentication), and
+        // email_allowed_for_hostname would have returned `false` even for a
+        // correctly allow-listed email (a real lockout).
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 100).unwrap());
+
+        // Queried with every casing variant a real gate input could produce.
+        for variant in ["demo.bunsenbrenner.org", "DEMO.BUNSENBRENNER.ORG", "Demo.Bunsenbrenner.Org"] {
+            assert!(
+                tunnels.require_login_for_hostname(variant).unwrap(),
+                "require_login_for_hostname({variant}) must find the gated tunnel regardless of casing -- \
+                 a false negative here means the gate is silently bypassed"
+            );
+            assert!(
+                tunnels.email_allowed_for_hostname(variant, "bob@example.com").unwrap(),
+                "email_allowed_for_hostname({variant}) must find the allow-listed email regardless of casing -- \
+                 a false negative here locks out a correctly-added user"
+            );
+        }
+        // An email that genuinely isn't allow-listed is still correctly denied --
+        // the case-insensitivity fix must not have widened this into "anyone".
+        assert!(!tunnels.email_allowed_for_hostname("demo.bunsenbrenner.org", "eve@example.com").unwrap());
+    }
+
+    #[tokio::test]
+    async fn pending_access_requests_finds_a_request_recorded_under_different_hostname_casing_393() {
+        // #393: record_access_request is called with the GATE's own caller-
+        // supplied hostname casing, while pending_access_requests looks it up
+        // via the tunnel's canonical (owner-facing) hostname -- these two must
+        // never be assumed to agree in casing.
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        assert!(tunnels
+            .record_access_request("demo.bunsenbrenner.org", "carol@example.com", "hi", 100)
+            .unwrap());
+
+        let pending = tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap();
+        assert_eq!(pending.len(), 1, "the request must be visible to the owner despite the casing mismatch");
+        assert_eq!(pending[0].0, "carol@example.com");
+
+        assert!(
+            tunnels.dismiss_access_request("alice", &t.id, "carol@example.com").unwrap(),
+            "dismissal must also find the row despite the same casing mismatch"
+        );
+        assert!(tunnels.pending_access_requests("alice", &t.id).unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gate_check_still_requires_login_when_x_forwarded_host_casing_differs_from_enrollment_393() {
+        // #393: the actual end-to-end auth-bypass this issue describes --
+        // a tunnel enrolled/require_login-enabled under one hostname casing,
+        // then a real gate_check request arriving with X-Forwarded-Host in a
+        // DIFFERENT casing (exactly what a proxy/CDN/browser could plausibly
+        // send). Before this fix this returned 200 with no X-Gate-Email header
+        // set -- the exact "admitted with no authentication at all" shape.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+
+        let app = gate_router_with(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("alice@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::get("/gate/check")
+                    .header("x-forwarded-host", "demo.bunsenbrenner.org") // enrolled as "Demo.Bunsenbrenner.Org"
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Gate required, no session cookie present -> a 302 redirect to
+        // /gate/start, not the 200-no-auth-required bypass response.
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "a casing mismatch between the request and the enrolled hostname must never \
+             read as \"this hostname doesn't require login\""
+        );
+        assert_eq!(resp.status(), StatusCode::FOUND, "must redirect to the real login flow");
     }
 
     #[tokio::test]

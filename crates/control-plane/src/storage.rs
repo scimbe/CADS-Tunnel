@@ -1883,11 +1883,19 @@ impl SqliteTunnelStore {
     /// this is the one lookup the gate-check path needs, mirroring
     /// [`routing_token_for_hostname`](Self::routing_token_for_hostname)'s same
     /// hostname-only shape.
+    /// #393: `hostname` here is caller-supplied (the gate derives it from
+    /// `X-Forwarded-Host`/`?host=`), matched against whatever casing this
+    /// tunnel's hostname happened to be stored with -- `COLLATE NOCASE`
+    /// (DNS hostnames are case-insensitive, RFC 4343, the same reasoning
+    /// `email`'s own `.to_ascii_lowercase()` normalization already applies
+    /// elsewhere in this file) so a casing mismatch can never make this
+    /// return a false `false` -- which `gate_check` reads as "gate not
+    /// required", admitting the request with **no authentication at all**.
     pub fn require_login_for_hostname(&self, hostname: &str) -> rusqlite::Result<bool> {
         Ok(self
             .read()
             .query_row(
-                "SELECT require_login FROM subject_tunnels WHERE hostname = ?1",
+                "SELECT require_login FROM subject_tunnels WHERE hostname = ?1 COLLATE NOCASE",
                 params![hostname],
                 |r| r.get::<_, i64>(0),
             )
@@ -1966,11 +1974,16 @@ impl SqliteTunnelStore {
     /// Whether `email` is allow-listed for `hostname`'s login gate (#382-follow).
     /// Unscoped like [`require_login_for_hostname`](Self::require_login_for_hostname)
     /// -- the one check `GET /portal/callback` needs after a successful gate login.
+    /// #393: same reasoning as [`require_login_for_hostname`](Self::require_login_for_hostname)
+    /// -- `hostname` is caller-supplied, matched case-insensitively against
+    /// whichever casing `login_allowlist_add` originally stored (it always
+    /// mirrors `subject_tunnels.hostname`'s own casing at add-time, which may
+    /// predate this fix).
     pub fn email_allowed_for_hostname(&self, hostname: &str, email: &str) -> rusqlite::Result<bool> {
         Ok(self
             .read()
             .query_row(
-                "SELECT 1 FROM tunnel_login_allowlist WHERE hostname = ?1 AND email = ?2",
+                "SELECT 1 FROM tunnel_login_allowlist WHERE hostname = ?1 COLLATE NOCASE AND email = ?2",
                 params![hostname, email.to_ascii_lowercase()],
                 |_| Ok(()),
             )
@@ -2014,8 +2027,13 @@ impl SqliteTunnelStore {
             .optional()?
             .flatten();
         let Some(hostname) = hostname else { return Ok(None) };
+        // #393: gate_access_requests rows were written under the GATE's own caller-
+        // supplied hostname casing (record_access_request), which may not match
+        // subject_tunnels' canonical casing fetched above -- COLLATE NOCASE so a
+        // request never silently goes missing from the owner's own pending-requests
+        // view over a casing mismatch.
         let mut stmt = conn.prepare(
-            "SELECT email, note, requested_at FROM gate_access_requests WHERE hostname = ?1 ORDER BY requested_at ASC",
+            "SELECT email, note, requested_at FROM gate_access_requests WHERE hostname = ?1 COLLATE NOCASE ORDER BY requested_at ASC",
         )?;
         let rows = stmt.query_map(params![hostname], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
@@ -2040,8 +2058,9 @@ impl SqliteTunnelStore {
             .optional()?
             .flatten();
         let Some(hostname) = hostname else { return Ok(false) };
+        // #393: same reasoning as pending_access_requests just above.
         let n = conn.execute(
-            "DELETE FROM gate_access_requests WHERE hostname = ?1 AND email = ?2",
+            "DELETE FROM gate_access_requests WHERE hostname = ?1 COLLATE NOCASE AND email = ?2",
             params![hostname, email.to_ascii_lowercase()],
         )?;
         Ok(n > 0)
