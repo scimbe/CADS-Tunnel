@@ -5,11 +5,15 @@
 //! optional mandatory no-write-down constraint — and two agents, it decides whether
 //! `from` may establish a directed flow to `to`, with a human/AI-legible reason.
 //!
-//! This is the SDN-style control plane's core, independent of the live mesh: the
-//! controller compiles a declaration into channel grants from it, the edge broker
-//! enforces it at channel admission (#81/#99), and the MCP `net.explain(a, b)` tool
-//! renders its [`Decision`]. Two access-control models compose, matching the locked
-//! design in #102:
+//! This is the SDN-style control plane's core, independent of the live mesh — it is a
+//! pure decision function, tested standalone, with no live caller today. The intended
+//! end state (#102) is that the controller compiles a declaration into channel grants
+//! from it, the edge broker consults it at channel admission, and an MCP `net.explain`
+//! tool renders its [`Decision`] — **none of that wiring exists yet** (#235): the edge
+//! broker's admission path never references this module, and there is no `explain` MCP
+//! tool. Until that wiring lands, this is a network-*planning* tool, not a live control;
+//! the actually-enforced access control today is channel admission itself. Two
+//! access-control models compose, matching the locked design in #102:
 //!
 //! * **RBAC** (discretionary): default-deny — a flow is permitted only if at least one
 //!   [`AllowRule`] matches the `(from, to)` pair by group and/or label.
