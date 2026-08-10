@@ -118,11 +118,23 @@ impl AcmeDnsStore {
     }
 
     /// The TXT values currently published for `name` (empty if none).
+    ///
+    /// #352: the DNS responder's real caller ([`crate::server`]) already lowercases
+    /// `name` itself (`message::parse_query`), so under a validation storm (multiple
+    /// Let's Encrypt perspectives, retries, local convergence polls) this is the hot
+    /// path -- allocating a fresh lowercased `String` on every single query just to
+    /// build a lookup key identical to the input contributes nothing. Only allocate
+    /// when `name` genuinely isn't already lowercase (any other caller, e.g. the admin
+    /// API's tests, still gets the same case-insensitive lookup this store's own
+    /// contract promises -- this is purely an allocation-avoidance fast path, not a
+    /// narrowed contract).
     pub fn txt(&self, name: &str) -> Vec<String> {
-        self.lock()
-            .get(&name.to_ascii_lowercase())
-            .cloned()
-            .unwrap_or_default()
+        let guard = self.lock();
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            guard.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default()
+        } else {
+            guard.get(name).cloned().unwrap_or_default()
+        }
     }
 }
 
@@ -148,6 +160,26 @@ mod tests {
         assert_eq!(s.txt("_acme-challenge.host.test"), vec!["only".to_string()]);
         s.clear("_acme-challenge.host.test");
         assert!(s.txt("_acme-challenge.host.test").is_empty());
+    }
+
+    #[test]
+    fn txt_returns_the_same_result_via_its_allocation_free_fast_path_as_its_lowercasing_fallback_352() {
+        // #352: txt() now takes two different code paths depending on whether `name`
+        // is already lowercase (the real DNS hot path never allocates a key) or not
+        // (any other caller still gets a correctly lowercased lookup). Prove both
+        // paths agree on the SAME stored record -- not just that each looks
+        // individually plausible -- across the already-lowercase case, an
+        // all-uppercase case, and a mixed-case case.
+        let s = AcmeDnsStore::new();
+        s.add_txt("_acme-challenge.host.test", "tok");
+
+        let already_lowercase = s.txt("_acme-challenge.host.test");
+        let all_uppercase = s.txt("_ACME-CHALLENGE.HOST.TEST");
+        let mixed_case = s.txt("_Acme-Challenge.Host.Test");
+
+        assert_eq!(already_lowercase, vec!["tok".to_string()]);
+        assert_eq!(already_lowercase, all_uppercase, "fast path and fallback path must agree");
+        assert_eq!(already_lowercase, mixed_case, "fast path and fallback path must agree");
     }
 
     /// A path under the OS temp dir, unique enough for concurrent test runs not to
