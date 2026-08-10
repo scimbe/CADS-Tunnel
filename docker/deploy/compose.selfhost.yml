@@ -188,6 +188,25 @@ services:
       # the host port with EDGE_METRICS_PORT in .env; defaults to 9600.
       - "127.0.0.1:${EDGE_METRICS_PORT:-9600}:9600"
     restart: unless-stopped
+    # #377: unlike control-plane, edge had no healthcheck at all -- restart:
+    # unless-stopped only recovers a crashed container, not one whose process is
+    # still running but hung (listener bound, CA-minting stuck, etc.), and with no
+    # health status a future dependent service (a front-door/Keycloak overlay that
+    # needs edge up first) has no `condition: service_healthy` to wait on the way
+    # edge itself already waits on control-plane below. Reuses the same tool
+    # (curl, already proven available in this image by control-plane's own
+    # healthcheck) against edge's real, already-relied-upon /metrics HTTP endpoint
+    # (control-plane's own CT_CP_EDGE_METRICS_URL scrapes this exact same URL for
+    # /status) -- a genuine "the process is alive and serving" signal, not just a
+    # bare TCP connect to the QUIC/TLS front-door port, which isn't an HTTP server
+    # and wouldn't validate the same probe request the finding's own suggested
+    # command sent to it.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9600/metrics"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     depends_on:
       control-plane:
         condition: service_healthy
