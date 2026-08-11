@@ -621,7 +621,7 @@ where
             crate::a2a::a2a_respond_verified(&mut relay_send, &mut relay_recv, own_noise_private, expected)
                 .await?
         }
-        None => crate::a2a::a2a_respond(&mut relay_send, &mut relay_recv, own_noise_private).await?.0,
+        None => crate::a2a::a2a_respond(&mut relay_send, &mut relay_recv, own_noise_private).await?,
     };
     let (plain_r, plain_w) = tokio::io::split(local);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();

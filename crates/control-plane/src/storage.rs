@@ -5493,12 +5493,47 @@ mod tests {
         assert_eq!(used, 1);
         assert_eq!(reserved, 0, "no longer 'offered' once complete -- doesn't double-count");
 
-        // A renewal (calling this again) is a harmless idempotent re-affirmation
-        // that still adds a second, correct ledger row -- renewals really do
-        // consume CA capacity again.
-        store.record_issuance_complete("a.example", "example.com", 400).unwrap();
+        // A genuine renewal, temporally distant (past #407's anti-flood floor,
+        // MIN_ISSUANCE_LOG_INTERVAL_SECS = 24h -- real renewals are ~60 days apart),
+        // still adds a second, correct ledger row -- renewals really do consume CA
+        // capacity again. A call within the floor window (not this one) is the
+        // replay/flood case #407 exists to suppress -- see the dedicated test below.
+        store.record_issuance_complete("a.example", "example.com", 300 + 25 * 60 * 60).unwrap();
         let (used_after_renewal, _) = store.ca_budget_usage("google-trust-services", "example.com", 0).unwrap();
         assert_eq!(used_after_renewal, 2);
+    }
+
+    #[test]
+    fn record_issuance_complete_does_not_double_log_within_the_anti_flood_floor_407() {
+        // #407: this endpoint can't tell a genuine renewal apart from a replay/retry --
+        // the caller is a customer-controlled agent, not the operator. Once a hostname is
+        // gruen, a repeat call still passes the UPDATE's WHERE clause (status = 'gruen'),
+        // so without a floor an unbounded flood of "complete" calls for the SAME hostname
+        // could exhaust the whole domain's shared CA budget bucket and lock out every
+        // other tenant. Real proof: many repeat calls, all within
+        // MIN_ISSUANCE_LOG_INTERVAL_SECS (24h) of the first, must log exactly once.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap();
+        store.enter_gelb_queue("a.example", 100).unwrap();
+        store.offer_claim("a.example", "google-trust-services", 200, 999_999).unwrap();
+
+        store.record_issuance_complete("a.example", "example.com", 300).unwrap();
+        for i in 0..50 {
+            // Every call lands well inside the 24h floor from the first (max offset here
+            // is 50 * 60s = 50 minutes), simulating a flood/replay, not real renewals.
+            store.record_issuance_complete("a.example", "example.com", 300 + i * 60).unwrap();
+        }
+        let (used, _) = store.ca_budget_usage("google-trust-services", "example.com", 0).unwrap();
+        assert_eq!(used, 1, "50 repeat calls within the floor must log exactly once, not 51 times");
+
+        // A different hostname's own flood is tracked independently -- the floor is
+        // per-hostname, not a single global gate that would starve unrelated tenants.
+        store.create("bob", "b", Some("b.example")).unwrap();
+        store.enter_gelb_queue("b.example", 100).unwrap();
+        store.offer_claim("b.example", "google-trust-services", 200, 999_999).unwrap();
+        store.record_issuance_complete("b.example", "example.com", 300).unwrap();
+        let (used_both, _) = store.ca_budget_usage("google-trust-services", "example.com", 0).unwrap();
+        assert_eq!(used_both, 2, "an unrelated hostname's own completion is unaffected");
     }
 
     #[test]

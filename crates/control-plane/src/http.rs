@@ -257,6 +257,7 @@ async fn buy_token(
                 LedgerError::UnknownAccount => StatusCode::NOT_FOUND,
                 // Not enough credit to pay for the token.
                 LedgerError::InsufficientCredit { .. } => StatusCode::PAYMENT_REQUIRED,
+                LedgerError::IdempotencyKeyReused => StatusCode::CONFLICT,
             };
             (code, e.to_string())
         })?;

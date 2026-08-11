@@ -400,12 +400,15 @@ mod tests {
         let relay_task = tokio::spawn(async move { copy_bidirectional_with_idle_timeout(&mut a, &mut b).await });
 
         // Send a byte every half-idle-window, well past the raw idle timeout in total
-        // wall-clock, and confirm the relay is still alive throughout.
+        // wall-clock, and confirm the relay is still alive throughout. The relay only
+        // forwards a->b (nothing echoes back on `a`), so this must NOT try to read a
+        // reply here -- under the paused virtual clock, a blocking read with no data
+        // ever coming makes the runtime auto-advance straight past this loop's own next
+        // scheduled sleep to the relay's real idle-timeout, killing it (a real bug this
+        // test itself had, caught by actually running it).
         for _ in 0..4 {
             tokio::time::sleep(RELAY_IDLE_TIMEOUT / 2).await;
             a_peer.write_all(b"x").await.unwrap();
-            let mut echo = [0u8; 1];
-            a_peer.read_exact(&mut echo).await.unwrap_or_default(); // no reply expected; just drains nothing
         }
         assert!(!relay_task.is_finished(), "periodic activity must keep the relay alive past the raw idle window");
         relay_task.abort();

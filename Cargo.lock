@@ -578,6 +578,7 @@ dependencies = [
  "ct-common",
  "ct-dns",
  "ed25519-dalek",
+ "futures",
  "hmac",
  "http-body-util",
  "jsonwebtoken",

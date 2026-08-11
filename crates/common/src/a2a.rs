@@ -96,7 +96,28 @@ where
 }
 
 /// Responder half: read the initiator's first message (learning its static key), reply
-/// with the second, and return the established transport session.
+/// with the second, and return the established transport session — discarding the
+/// learned peer key. Kept with this exact name and signature for source compatibility
+/// (a cross-repo caller, `scimbe/ct-agent`, is pinned by git rev and calls this by name —
+/// a workspace path-dependency on this crate rebuilds that pinned source against
+/// whatever's here *right now*, so a breaking signature change here breaks that build
+/// immediately, not just "once the pin is bumped"; learned the hard way fixing #416's own
+/// [`crate::upgrade::run_upgradable_session_responder`] regression). Prefer
+/// [`a2a_respond_with_peer_key`] (or [`a2a_respond_verified`], which uses it) for any
+/// new/updatable caller that can actually check the learned key.
+pub async fn a2a_respond<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    own_noise_private: &[u8; 32],
+) -> io::Result<TransportState>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    a2a_respond_with_peer_key(send, recv, own_noise_private).await.map(|(t, _peer)| t)
+}
+
+/// [`a2a_respond`], but also returns the initiator's learned static key.
 ///
 /// **#416: unlike [`a2a_initiate`], the responder learns the initiator's static key from
 /// message 1 but this alone proves only that the initiator holds *some* private key — not
@@ -104,11 +125,8 @@ where
 /// caller can check it against a channel-attested `noise_pubkey`
 /// ([`crate::channel::verify_member_noise_attestation`] verifies the attestation itself at
 /// registration time; nothing previously checked the live peer against it at handshake
-/// time). Prefer [`a2a_respond_verified`], which does that check for you — this raw form
-/// exists for callers that must be `Send`+trait-generic over an owned key, and for the one
-/// call site (relay.rs's protocol-shape test) that has no channel/attestation context at
-/// all.
-pub async fn a2a_respond<W, R>(
+/// time). Prefer [`a2a_respond_verified`], which does that check for you.
+pub async fn a2a_respond_with_peer_key<W, R>(
     send: &mut W,
     recv: &mut R,
     own_noise_private: &[u8; 32],
@@ -168,7 +186,7 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let (transport, peer_static) = a2a_respond(send, recv, own_noise_private).await?;
+    let (transport, peer_static) = a2a_respond_with_peer_key(send, recv, own_noise_private).await?;
     if &peer_static != expected_peer_noise_pubkey {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -457,12 +475,12 @@ mod tests {
 
         let recv_task = tokio::spawn(async move {
             // Establish the relay session, drain its DATA until the cutover marker.
-            let (mut relay, _peer) = a2a_respond(&mut rb_w, &mut ra_r, &b_priv).await.expect("relay respond");
+            let (mut relay, _peer) = a2a_respond_with_peer_key(&mut rb_w, &mut ra_r, &b_priv).await.expect("relay respond");
             let relay_msgs = a2a_drain_relay_until_cutover(&mut ra_r, &mut relay)
                 .await
                 .expect("drain relay to cutover");
             // Establish the direct session, read the post-cutover DATA.
-            let (mut direct, _peer) = a2a_respond(&mut db_w, &mut da_r, &b_priv).await.expect("direct respond");
+            let (mut direct, _peer) = a2a_respond_with_peer_key(&mut db_w, &mut da_r, &b_priv).await.expect("direct respond");
             let mut direct_msgs = Vec::new();
             for _ in 0..3 {
                 let (tag, p) = a2a_recv_framed(&mut da_r, &mut direct).await.expect("direct recv");
@@ -513,7 +531,7 @@ mod tests {
         let (mut b_w, mut b_r) = tokio::io::duplex(4096);
 
         let responder_task = tokio::spawn(async move {
-            let (mut sess, _peer) = a2a_respond(&mut b_w, &mut a_r, &resp_priv).await.expect("respond");
+            let (mut sess, _peer) = a2a_respond_with_peer_key(&mut b_w, &mut a_r, &resp_priv).await.expect("respond");
             let got = a2a_recv(&mut a_r, &mut sess).await.expect("recv ping");
             assert_eq!(got, b"ping from initiator", "responder decrypts the initiator's message");
             a2a_send(&mut b_w, &mut sess, b"pong from responder").await.expect("send pong");

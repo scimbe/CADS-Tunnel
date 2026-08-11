@@ -308,6 +308,25 @@ impl SqliteEdgeMesh {
             .optional()
     }
 
+    /// Whether `token` has ANY recorded ownership row at all (#445) — a plain existence
+    /// check, deliberately NOT liveness-gated like [`lookup_by_token`](Self::lookup_by_token).
+    /// Boot-time backfill uses this to decide whether a tunnel's row is genuinely MISSING
+    /// and needs creating; `lookup_by_token`'s liveness join routinely reports "none" at
+    /// boot for perfectly-correct existing rows too (their owning edge just hasn't
+    /// heartbeated yet this boot) — using that as the existence check would silently
+    /// re-home every tunnel to the local edge on every restart in a multi-edge deployment.
+    pub fn has_ownership(&self, token: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM mesh_ownership WHERE token = ?1",
+                params![token],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+    }
+
     /// Whether `token` is the recorded owner of exactly `hostname` — the
     /// authorization check the ACME DNS-01 endpoint gates on (#153 follow-up):
     /// an agent proves it may claim `_acme-challenge.<hostname>` by presenting

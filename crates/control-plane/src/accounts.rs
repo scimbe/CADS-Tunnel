@@ -27,6 +27,13 @@ pub enum LedgerError {
     /// The account exists but lacks the credit to cover the debit; the balance
     /// is left unchanged.
     InsufficientCredit { balance: u64, requested: u64 },
+    /// #440/#441: this exact idempotency key was already used by a DIFFERENT account's
+    /// issuance — `token_issuances.idempotency_key` is the table's sole `PRIMARY KEY`
+    /// (not yet scoped to `(account, idempotency_key)`; the caller's own per-account
+    /// lookup already ruled out "my own retry", so a `UNIQUE` violation reaching this
+    /// point means a genuine cross-account key collision, a real conflict to surface,
+    /// not a raw DB error).
+    IdempotencyKeyReused,
 }
 
 impl std::fmt::Display for LedgerError {
@@ -35,6 +42,9 @@ impl std::fmt::Display for LedgerError {
             LedgerError::UnknownAccount => write!(f, "unknown account"),
             LedgerError::InsufficientCredit { balance, requested } => {
                 write!(f, "insufficient credit: balance {balance}, requested {requested}")
+            }
+            LedgerError::IdempotencyKeyReused => {
+                write!(f, "idempotency key already used by a different account")
             }
         }
     }

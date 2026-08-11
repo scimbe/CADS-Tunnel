@@ -5,7 +5,7 @@
 //! stays deterministic and wall-clock-free.
 
 use crate::RoutingToken;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 
 /// Fixed-window rate limiter keyed by an arbitrary key `K` (a Routing Token, an
@@ -18,6 +18,17 @@ pub struct KeyedRateLimiter<K> {
     /// #195: the most recent window we pruned at — so past-window entries get evicted on each window
     /// transition instead of accumulating one dead entry per key ever seen (unbounded growth).
     last_swept_window: u64,
+    /// #414: an independent, optional FIFO capacity bound — `None` (the default via [`Self::new`])
+    /// is today's exact unbounded-within-a-window behavior. Callers that run with
+    /// `window_secs == 0` ("a single all-time window") never trigger the window-transition sweep
+    /// above at all (`window` is always `0`, so `window > last_swept_window` never holds past the
+    /// first call), so that sweep alone can't bound them — every distinct key ever seen would
+    /// otherwise accumulate forever.
+    max_tracked_keys: Option<usize>,
+    /// Oldest-first insertion order of currently-tracked keys, maintained only when
+    /// `max_tracked_keys` is set — the eviction order for [`Self::allow`]'s capacity bound. A
+    /// `HashMap` has no ordering of its own, hence this side structure.
+    insertion_order: VecDeque<K>,
 }
 
 impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
@@ -26,6 +37,22 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
             max_per_window,
             counters: HashMap::new(),
             last_swept_window: 0,
+            max_tracked_keys: None,
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    /// [`Self::new`], plus a hard cap on how many distinct keys are tracked at once (#414) —
+    /// once at capacity, admitting a new key evicts the oldest tracked key first (FIFO), which
+    /// then starts over with a fresh budget on its next use. Existing callers of `new` are
+    /// completely unaffected (`max_tracked_keys` defaults to `None` there, meaning "no cap").
+    pub fn with_max_tracked_keys(max_per_window: u32, max_tracked_keys: usize) -> Self {
+        Self {
+            max_per_window,
+            counters: HashMap::new(),
+            last_swept_window: 0,
+            max_tracked_keys: Some(max_tracked_keys),
+            insertion_order: VecDeque::new(),
         }
     }
 
@@ -39,7 +66,30 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
         // out-of-order/backward window never wrongly evicts current entries.
         if window > self.last_swept_window {
             self.counters.retain(|_, (w, _)| *w >= window);
+            if self.max_tracked_keys.is_some() {
+                // #414: keep the eviction-order side structure in lockstep with a real
+                // window-sweep too, so it can't itself leak stale keys if this is ever combined
+                // with window_secs > 0.
+                let counters = &self.counters;
+                self.insertion_order.retain(|k| counters.contains_key(k));
+            }
             self.last_swept_window = window;
+        }
+        // #414: only a genuinely NEW key can trigger eviction — reusing an already-tracked key
+        // must never evict anything (including itself), or a legitimate repeat caller could be
+        // starved by its own traffic.
+        if !self.counters.contains_key(key) {
+            if let Some(cap) = self.max_tracked_keys {
+                if self.counters.len() >= cap {
+                    while let Some(oldest) = self.insertion_order.pop_front() {
+                        if self.counters.remove(&oldest).is_some() {
+                            break;
+                        }
+                        // Already gone (e.g. pruned by the window sweep above) — keep popping.
+                    }
+                }
+            }
+            self.insertion_order.push_back(key.clone());
         }
         let entry = self.counters.entry(key.clone()).or_insert((window, 0));
         if entry.0 != window {
