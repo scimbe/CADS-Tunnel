@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::noise::client_noise_exchange;
 use ct_common::noise::{client_handshake_for, frame, noise_pump, read_frame, read_frame_into};
 use ct_common::pow::{assemble_request, solve, Challenge};
+use ct_common::sync::MutexExt as _;
 use ct_common::{Capability, RoutingToken};
 use quinn::{Connection, Endpoint};
 use rustls::pki_types::CertificateDer;
@@ -515,7 +516,7 @@ pub async fn client_tunnel_udp(
         let mut ct = vec![0u8; 65535 + 256];
         loop {
             let n = local.recv(&mut dg).await?;
-            let len = ts.lock().unwrap().write_message(&dg[..n], &mut ct).map_err(noise_err)?;
+            let len = ts.lock_safe().write_message(&dg[..n], &mut ct).map_err(noise_err)?;
             send.write_all(&frame(&ct[..len])).await?;
         }
         #[allow(unreachable_code)]
@@ -537,7 +538,7 @@ pub async fn client_tunnel_udp(
             if read_frame_into(&mut recv, &mut fr).await.is_err() {
                 break;
             }
-            let len = ts.lock().unwrap().read_message(&fr, &mut pt).map_err(noise_err)?;
+            let len = ts.lock_safe().read_message(&fr, &mut pt).map_err(noise_err)?;
             local.send(&pt[..len]).await?;
         }
         Ok::<(), io::Error>(())

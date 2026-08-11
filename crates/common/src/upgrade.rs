@@ -438,14 +438,106 @@ where
 /// multiplexed pump while, in the background, opportunistically upgrading it to a direct link.
 /// First handshakes the relay Noise_IK session, then runs the pump; concurrently it advertises our
 /// reachable endpoint (`discover_direct`) via the in-band driver, and on the peer's `Ready` accepts
-/// the incoming direct dial + handshakes it (`accept_and_establish`, which returns the pump-ready
-/// `(TransportState, read, write)`), installs it into the pump's late-bind one-shot, and triggers
+/// the incoming direct dial + handshakes it (`accept_and_establish`), which returns the pump-ready
+/// `(TransportState, read, write)`, installs it into the pump's late-bind one-shot, and triggers
 /// the cutover. If either the negotiation or the establishment fails, the session simply stays on
 /// the relay. The pump alone decides when the session ends. **The direct Noise handshake happens
 /// only AFTER `Ready` is exchanged** — the responder replies `Ready` on reachability, not on a
 /// completed handshake — so the two sides handshake concurrently and neither blocks the other.
+///
+/// **#480 note**: `accept_and_establish` here takes no arguments — kept for source
+/// compatibility with this crate's real, live cross-repo caller (`scimbe/ct-agent`'s
+/// `channel_run.rs`/`p2p.rs`, both pinned by git rev — a workspace path-dependency rebuilds
+/// that pinned source against whatever's here *right now*, so a breaking signature change here
+/// breaks that build immediately; see `run_upgradable_session_responder`'s own #416 doc note for
+/// the same lesson learned the hard way earlier this session). The caller must still pin the
+/// expected peer itself (by capturing it, as `ct-agent`'s current callback already does) —
+/// nothing here enforces it. Prefer [`run_upgradable_session_initiator_verified`] for any
+/// new/updatable caller, which threads the expected peer key through the callback signature so
+/// it can't be forgotten.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_upgradable_session_initiator<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    coord: UpgradeCoordinator,
+    now: u64,
+    discover_direct: DF,
+    accept_and_establish: EF,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    DF: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Option<String>>,
+    EF: FnOnce() -> EFut,
+    EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    run_upgradable_session_initiator_inner(
+        relay_send,
+        relay_recv,
+        local,
+        own_noise_private,
+        peer_noise_public,
+        coord,
+        now,
+        discover_direct,
+        move |_expected_peer: [u8; 32]| accept_and_establish(),
+    )
+    .await
+}
+
+/// [`run_upgradable_session_initiator`], plus the check its own doc says most new callers
+/// actually need (#480): `accept_and_establish` is called with the same `peer_noise_public`
+/// this function was given, so the callback can't compile without deciding what to pin —
+/// closing the same gap [`run_upgradable_session_responder_verified`] closes on the responder
+/// side. No production caller exists for this specific variant yet (confirmed via grep of both
+/// this repo and `scimbe/ct-agent`'s pinned source) — free to take the stricter shape from the
+/// start.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_upgradable_session_initiator_verified<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    own_noise_private: &[u8; 32],
+    peer_noise_public: &[u8; 32],
+    coord: UpgradeCoordinator,
+    now: u64,
+    discover_direct: DF,
+    accept_and_establish: EF,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    DF: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Option<String>>,
+    EF: FnOnce([u8; 32]) -> EFut,
+    EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    run_upgradable_session_initiator_inner(
+        relay_send,
+        relay_recv,
+        local,
+        own_noise_private,
+        peer_noise_public,
+        coord,
+        now,
+        discover_direct,
+        accept_and_establish,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_upgradable_session_initiator_inner<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
     mut relay_send: RW,
     mut relay_recv: RR,
     local: P,
@@ -464,11 +556,12 @@ where
     DW: AsyncWrite + Unpin,
     DF: FnOnce() -> DFut,
     DFut: std::future::Future<Output = Option<String>>,
-    EF: FnOnce() -> EFut,
+    EF: FnOnce([u8; 32]) -> EFut,
     EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
 {
     let relay_ts =
         crate::a2a::a2a_initiate(&mut relay_send, &mut relay_recv, own_noise_private, peer_noise_public).await?;
+    let expected_peer = *peer_noise_public;
     let (plain_r, plain_w) = tokio::io::split(local);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -479,7 +572,7 @@ where
         if let Ok(Some(_ep)) =
             drive_initiator_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, discover_direct).await
         {
-            if let Some(session) = accept_and_establish().await {
+            if let Some(session) = accept_and_establish(expected_peer).await {
                 if let Some(tx) = dir_tx.take() {
                     let _ = tx.send(session);
                 }
@@ -556,6 +649,13 @@ where
 /// value already used to admit this pairing at the channel broker. Mirrors
 /// [`run_upgradable_session_initiator`]'s own `peer_noise_public` parameter, which the initiator
 /// side always had (via [`crate::a2a::a2a_initiate`]) — this was the missing responder half.
+///
+/// **#480**: `dial_and_establish` is called with the same `peer_noise_public` this function was
+/// given, so the callback can't compile without deciding what to pin (the plain
+/// [`run_upgradable_session_responder`] keeps its original single-argument callback shape for
+/// its cross-repo caller — see that function's own #416 doc note on why a signature change
+/// there breaks a pinned build immediately; this `_verified` variant has no such caller yet, so
+/// it's free to take the stricter shape from the start).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_upgradable_session_responder_verified<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
     relay_send: RW,
@@ -576,9 +676,10 @@ where
     DW: AsyncWrite + Unpin,
     DF: FnOnce(String) -> DFut,
     DFut: std::future::Future<Output = bool>,
-    EF: FnOnce(String) -> EFut,
+    EF: FnOnce(String, [u8; 32]) -> EFut,
     EFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
 {
+    let expected_peer = *peer_noise_public;
     run_upgradable_session_responder_inner(
         relay_send,
         relay_recv,
@@ -588,7 +689,7 @@ where
         coord,
         now,
         dial_probe,
-        dial_and_establish,
+        move |ep: String| dial_and_establish(ep, expected_peer),
     )
     .await
 }
@@ -633,11 +734,28 @@ where
         if let Ok(Some(ep)) =
             drive_responder_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, dial_probe).await
         {
-            if let Some(session) = dial_and_establish(ep).await {
-                if let Some(tx) = dir_tx.take() {
-                    let _ = tx.send(session);
+            // #480: the offered direct endpoint is peer-supplied and unauthenticated at this
+            // point in the exchange (the relay leg's Noise handshake proves identity, not
+            // that the endpoint it's now offering is safe to dial) -- gate it through the
+            // same global-unicast check every other admission path in this codebase already
+            // uses (crates/edge/src/channel_broker.rs::safe_endpoint), rather than trusting
+            // each future caller's own dial_and_establish to remember. A private/loopback/
+            // link-local/CGNAT target is refused here, before it ever reaches the caller's
+            // dial -- the Agent side of this exchange typically runs inside the customer's
+            // own private network, where an unfiltered dial could reach an internal service.
+            let is_safe = ep.parse::<std::net::SocketAddr>().is_ok_and(crate::channel::is_global_unicast);
+            if is_safe {
+                if let Some(session) = dial_and_establish(ep).await {
+                    if let Some(tx) = dir_tx.take() {
+                        let _ = tx.send(session);
+                    }
+                    let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
                 }
-                let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
+            } else {
+                eprintln!(
+                    "ct-common: relay->direct upgrade refused a non-global-unicast offered \
+                     endpoint {ep:?} (#480); staying on the relay leg"
+                );
             }
         }
         drop(dir_tx.take());
@@ -946,7 +1064,7 @@ mod tests {
             run_upgradable_session_responder_verified(
                 rb2a_w, ra2b_r, resp_app, &b_priv, &a_pub, coord_r, 5,
                 |ep| async move { ep == EP },
-                move |_ep| async move { Some((resp_ts, resp_dr, resp_dw)) },
+                move |_ep, _peer: [u8; 32]| async move { Some((resp_ts, resp_dr, resp_dw)) },
             )
             .await
         });
@@ -968,6 +1086,69 @@ mod tests {
         // The delivery is the assertion; tear the background sessions down without waiting on
         // graceful relay/direct shutdown (which is a live-teardown concern, covered by #134/H4).
         drop(resp_test_w);
+        init_task.abort();
+        resp_task.abort();
+    }
+
+    #[tokio::test]
+    async fn run_upgradable_session_initiator_verified_pins_the_expected_peer_key_for_the_direct_handshake_480() {
+        // #480: the plain run_upgradable_session_initiator's accept_and_establish callback
+        // takes no arguments at all -- a caller can only pin the expected direct-handshake peer
+        // by capturing it out-of-band, with nothing in the type system enforcing that it
+        // actually did. run_upgradable_session_initiator_verified closes that API-shape gap by
+        // threading peer_noise_public straight into the callback. Real proof: drive a genuine
+        // relay-leg Ready exchange (not a stub) and assert the callback actually receives the
+        // SAME key this function was given -- not a placeholder, not a default, the real value.
+        use crate::noise::generate_static_keypair;
+
+        let a = generate_static_keypair(); // initiator (channel role)
+        let b = generate_static_keypair(); // responder
+        let (a_priv, b_priv, b_pub) = (a.private, b.private, b.public);
+
+        let (ra2b_w, ra2b_r) = tokio::io::duplex(1 << 16);
+        let (rb2a_w, rb2a_r) = tokio::io::duplex(1 << 16);
+        let (ini_app, _ini_test) = tokio::io::duplex(64);
+        let (resp_app, _resp_test) = tokio::io::duplex(64);
+
+        let coord_i = UpgradeCoordinator::with_backoff(Role::Initiator, 0, 1, 100);
+        let coord_r = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+        const EP: &str = "203.0.113.9:7000";
+
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let mut received_tx = Some(received_tx);
+        let init_task = tokio::spawn(async move {
+            run_upgradable_session_initiator_verified(
+                ra2b_w, rb2a_r, ini_app, &a_priv, &b_pub, coord_i, 5,
+                || async { Some(EP.to_string()) },
+                move |received_peer: [u8; 32]| {
+                    if let Some(tx) = received_tx.take() {
+                        let _ = tx.send(received_peer);
+                    }
+                    async move { None::<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)> } // decline -- only the argument matters here
+                },
+            )
+            .await
+        });
+        // The plain (unverified) responder is enough to drive a real Ready exchange over the
+        // relay leg -- only the initiator's own callback argument is under test.
+        let resp_task = tokio::spawn(async move {
+            run_upgradable_session_responder(
+                rb2a_w, ra2b_r, resp_app, &b_priv, coord_r, 5,
+                |ep| async move { ep == EP },
+                move |_ep| async move { None::<(snow::TransportState, tokio::io::DuplexStream, tokio::io::DuplexStream)> },
+            )
+            .await
+        });
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), received_rx)
+            .await
+            .expect("accept_and_establish must be invoked within 10s of a real Ready exchange")
+            .expect("the oneshot sender wasn't dropped without sending");
+        assert_eq!(
+            received, b_pub,
+            "the callback must receive the exact peer_noise_public this function was given, not a placeholder"
+        );
+
         init_task.abort();
         resp_task.abort();
     }
