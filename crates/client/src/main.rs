@@ -32,8 +32,77 @@ fn via_label(rung: Rung) -> &'static str {
     }
 }
 
+/// The client's real, recognized `CT_CLIENT_MODE` values. `None` (the field being
+/// absent) is the documented default (single-tunnel mode) — distinct from an
+/// unrecognized *value* being present, which [`parse_client_mode`] rejects outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientMode {
+    Udp,
+    P2p,
+    Forward,
+}
+
+/// #489: `CT_CLIENT_MODE` used to be compared against `"udp"`/`"p2p"`/`"forward"` in
+/// three separate conditional blocks scattered through `main` — anything else (a typo,
+/// a renamed mode) silently fell past all three into the default single-tunnel path,
+/// with no error and no warning. `CT_CLIENT_MODE=forwrad` used to bind no listener,
+/// raise nothing, do one ordinary tunnel round-trip, and exit 0 — a false pass in an
+/// automated smoke test. Parsed once, here, into an explicit `Option<ClientMode>` (unset
+/// -> `Ok(None)`, a real mode -> `Ok(Some(_))`, anything else -> a real startup error).
+fn parse_client_mode() -> Result<Option<ClientMode>, String> {
+    parse_client_mode_value(std::env::var("CT_CLIENT_MODE").ok().as_deref())
+}
+
+/// The pure check behind [`parse_client_mode`], split out so it's testable without
+/// mutating real process env (which races across parallel test threads in the same
+/// binary) — mirrors this codebase's established `is_insecure_cp_url`/pure-helper
+/// pattern (`crates/edge/src/edge_mesh_client.rs`).
+fn parse_client_mode_value(raw: Option<&str>) -> Result<Option<ClientMode>, String> {
+    match raw {
+        None => Ok(None),
+        Some("udp") => Ok(Some(ClientMode::Udp)),
+        Some("p2p") => Ok(Some(ClientMode::P2p)),
+        Some("forward") => Ok(Some(ClientMode::Forward)),
+        Some(other) => Err(format!(
+            "unrecognized CT_CLIENT_MODE={other:?} -- expected one of \"udp\", \"p2p\", \"forward\", or unset \
+             for the default single-tunnel mode"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_client_mode_value_accepts_every_real_mode_and_unset_489() {
+        assert_eq!(parse_client_mode_value(None), Ok(None), "unset -> default single-tunnel mode");
+        assert_eq!(parse_client_mode_value(Some("udp")), Ok(Some(ClientMode::Udp)));
+        assert_eq!(parse_client_mode_value(Some("p2p")), Ok(Some(ClientMode::P2p)));
+        assert_eq!(parse_client_mode_value(Some("forward")), Ok(Some(ClientMode::Forward)));
+    }
+
+    #[test]
+    fn parse_client_mode_value_rejects_an_unrecognized_value_instead_of_silently_defaulting_489() {
+        // #489: the issue's own reproduction -- a typo that used to silently fall through
+        // to the default single-tunnel mode with no error and no warning.
+        let err = parse_client_mode_value(Some("forwrad")).unwrap_err();
+        assert!(err.contains("forwrad"), "the error names the actual bad value, not just \"invalid\"");
+
+        assert!(parse_client_mode_value(Some("")).is_err(), "empty string is not the same as unset");
+        assert!(parse_client_mode_value(Some("UDP")).is_err(), "case-sensitive -- not a silently-accepted alias");
+        assert!(
+            parse_client_mode_value(Some("single")).is_err(),
+            "naming the default explicitly is still an error, not a no-op"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // #489: validated once, up front -- an unrecognized value is a real startup error,
+    // not a silent fall-through to the default mode.
+    let client_mode = parse_client_mode()?;
     let config = ClientConfig::from_env();
     let payload = std::env::var("CT_CLIENT_PAYLOAD").unwrap_or_else(|_| "hello-tunnel".to_string());
     let iterations: usize = std::env::var("CT_CLIENT_ITERATIONS")
@@ -100,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // UDP mode: send one datagram through the tunnel to a UDP Origin and verify
     // the echo (the Agent must run with CT_AGENT_ORIGIN_PROTO=udp).
-    if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("udp") {
+    if client_mode == Some(ClientMode::Udp) {
         // #284: udp mode also dials the Edge directly, bypassing dial_rung's
         // per-rung timeout -- a blackholed/stalled Edge IP hung this forever.
         let conn = dial_edge_timed(edge_addr, edge_cert, Duration::from_secs(3)).await?;
@@ -128,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // P2P mode: auto-discover the Agent's direct endpoint and use the direct
     // path, falling back to the Edge relay. Retries briefly to win the startup
     // race where the Agent hasn't advertised its listener yet.
-    if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("p2p") {
+    if client_mode == Some(ClientMode::P2p) {
         let mut result = (false, Vec::new());
         for attempt in 0..5u32 {
             // #284: p2p mode dials the Edge directly, bypassing dial_rung's
@@ -171,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ride it — e.g. `CT_CLIENT_MODE=forward CT_CLIENT_LISTEN=127.0.0.1:8443`
     // then `curl --cacert origin-ca.pem https://127.0.0.1:8443/`. Runs until
     // stopped. TLS terminates at the Origin; the Edge stays provider-blind.
-    if std::env::var("CT_CLIENT_MODE").as_deref() == Ok("forward") {
+    if client_mode == Some(ClientMode::Forward) {
         let listen: SocketAddr = std::env::var("CT_CLIENT_LISTEN")
             .map_err(|_| "CT_CLIENT_LISTEN is required for forward mode (e.g. 127.0.0.1:8443)")?
             .parse()

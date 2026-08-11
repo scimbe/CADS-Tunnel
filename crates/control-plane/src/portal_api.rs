@@ -1411,7 +1411,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
     login_allowlist_list is already scoped per tunnel id -- the bug was purely
     that the boundary between tunnels wasn't visible). */
  .tunnel-card{{border:1px solid var(--border);border-radius:10px;padding:.2rem 1rem;margin:0 0 1rem;
-      background:#131820;max-height:640px;animation:cardIn .3s ease-out backwards;
+      background:#131820;max-height:640px;overflow-y:auto;animation:cardIn .3s ease-out backwards;
       transition:opacity .2s ease,transform .2s ease,max-height .25s ease,margin .25s ease,padding .25s ease}}
  .tunnel-card:nth-of-type(1){{animation-delay:0ms}} .tunnel-card:nth-of-type(2){{animation-delay:50ms}}
  .tunnel-card:nth-of-type(3){{animation-delay:100ms}} .tunnel-card:nth-of-type(n+4){{animation-delay:150ms}}

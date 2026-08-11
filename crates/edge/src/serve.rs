@@ -498,7 +498,28 @@ fn build_ws_channel_cert() -> Option<tokio_rustls::TlsAcceptor> {
 /// `http://<host>/…` is bounced to `https://<host>/…` on the unified `:443`
 /// gateway. Generic over the byte stream so it drives a real socket live and an
 /// in-memory duplex in tests. Reads only the request head (bounded), never a body.
-pub async fn serve_http_redirect<S>(mut inbound: S) -> Result<(), BoxError>
+/// #470: bounds the whole head-read below -- a real read deadline, not just the existing
+/// 16KB size cap. This is the cheapest entry point on the whole edge (plaintext, no TLS
+/// handshake, no PoW gate), so it's the easiest way to drain the shared connection cap
+/// this listener shares with the QUIC/TCP data planes: connect, send `GET / HTTP` and
+/// nothing more, and (before this) the task blocked forever holding its permit. A
+/// redirect response needs no more than a couple of seconds to receive its request.
+const HTTP_REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub async fn serve_http_redirect<S>(inbound: S) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(HTTP_REDIRECT_READ_TIMEOUT, serve_http_redirect_inner(inbound)).await {
+        Ok(res) => res,
+        Err(_) => Err(format!(
+            "http-redirect: no complete request head within {HTTP_REDIRECT_READ_TIMEOUT:?} (#470)"
+        )
+        .into()),
+    }
+}
+
+async fn serve_http_redirect_inner<S>(mut inbound: S) -> Result<(), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -906,9 +927,7 @@ pub async fn serve_front_door(
             // behavior below.
             if state.route_host(&host).is_none() {
                 if let Some(mesh) = mesh_relay {
-                    if let Some(peer_addr) =
-                        crate::edge_mesh_client::lookup_owner_by_host(&mesh.cp_url, &mesh.admin_token, &host).await
-                    {
+                    if let Some(peer_addr) = mesh_relay_lookup_cached(mesh, &host).await {
                         let target = safe_peer_edge_target(&peer_addr).ok_or(
                             "mesh-relay registry returned an invalid or non-global-unicast peer_addr — refusing to dial (#253)",
                         )?;
@@ -1514,6 +1533,53 @@ pub struct MeshRelayConfig {
     pub cp_url: String,
     pub admin_token: [u8; 32],
     pub edge_cert: rustls::pki_types::CertificateDer<'static>,
+    /// #471: short-TTL negative cache on `(hostname -> no owner found)` — mirrors
+    /// [`crate::channel_authorize::ChannelAuthorizer`]'s own negative-cache shape for the
+    /// same reason: with mesh-relay enabled, every `:443` connection whose
+    /// (attacker-controlled) SNI hostname has no local route triggered one authenticated
+    /// control-plane HTTP request, with no cache and no rate limit on this specific path —
+    /// roughly a 1:1 amplification from a cheap TCP connect + ClientHello into one
+    /// authenticated CP request. Constructed once at edge startup and shared across every
+    /// connection this edge serves, same lifetime as the rest of this config.
+    ///
+    /// `Arc`-wrapped (not a bare `Mutex`): `MeshRelayConfig` is `#[derive(Clone)]`d once per
+    /// accepted connection (see the accept loop in [`run_edge`]) so each connection's task
+    /// gets its own owned copy to move into its spawned future. Without the `Arc`, that
+    /// per-connection clone would deep-copy an empty `HashMap` every time, silently
+    /// defeating the cache entirely (every connection would see zero prior entries) while
+    /// still compiling and running without error.
+    negative_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>>,
+}
+
+/// How long an unrouted hostname's "nobody owns it" result is trusted before the next
+/// lookup for that same hostname is allowed to hit the control plane again — long enough
+/// to blunt a flood, short enough that a hostname provisioned moments ago (a real,
+/// legitimate race between provisioning and first traffic) isn't stuck failing.
+const MESH_RELAY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// #471: [`crate::edge_mesh_client::lookup_owner_by_host`], but skips the real CP
+/// round-trip entirely when `host`'s negative result is still fresh — see
+/// [`MeshRelayConfig::negative_cache`]'s own doc for the amplification this closes. A
+/// cache HIT still calls through (never cached — the whole point is that ownership is
+/// rare/one-time-provisioned and worth re-confirming live; only "nobody owns it" is
+/// cheap to trust for a short window).
+async fn mesh_relay_lookup_cached(mesh: &MeshRelayConfig, host: &str) -> Option<String> {
+    let cached_miss = mesh
+        .negative_cache
+        .lock()
+        .ok()
+        .and_then(|c| c.get(host).copied())
+        .is_some_and(|at| at.elapsed() < MESH_RELAY_NEGATIVE_CACHE_TTL);
+    if cached_miss {
+        return None;
+    }
+    let result = crate::edge_mesh_client::lookup_owner_by_host(&mesh.cp_url, &mesh.admin_token, host).await;
+    if result.is_none() {
+        if let Ok(mut c) = mesh.negative_cache.lock() {
+            c.insert(host.to_string(), tokio::time::Instant::now());
+        }
+    }
+    result
 }
 
 /// #253: validate a peer edge address from the control plane's ownership registry before
@@ -1998,7 +2064,12 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 eprintln!(
                                     "ct-edge: mesh-relay fallback ENABLED against {cp_url} (CT_EDGE_MESH_RELAY_ENABLED)"
                                 );
-                                Some(MeshRelayConfig { cp_url, admin_token, edge_cert: ca_root.clone() })
+                                Some(MeshRelayConfig {
+                                    cp_url,
+                                    admin_token,
+                                    edge_cert: ca_root.clone(),
+                                    negative_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                                })
                             }
                             _ => {
                                 eprintln!(
@@ -2500,6 +2571,61 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    #[tokio::test(start_paused = true)]
+    async fn mesh_relay_lookup_cached_suppresses_repeat_cp_calls_within_the_ttl_471() {
+        // #471: a flood of unrouted-SNI connections for the SAME hostname used to drive
+        // one authenticated control-plane request each -- real proof this is now capped
+        // to one CP call per hostname per TTL window, via a real mock CP counting hits.
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let app = axum::Router::new().route(
+            "/internal/edges/lookup",
+            get(move |Query(_q): Query<HashMap<String, String>>| {
+                let hits = hits2.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::NOT_FOUND, "no owner recorded").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mesh = MeshRelayConfig {
+            cp_url: format!("http://{addr}"),
+            admin_token: [0u8; 32],
+            edge_cert: rustls::pki_types::CertificateDer::from(vec![]),
+            negative_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        assert_eq!(mesh_relay_lookup_cached(&mesh, "evil.example").await, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the real first lookup hits the CP");
+
+        // A flood of repeats for the SAME hostname, still within the TTL: must not hit
+        // the CP again at all.
+        for _ in 0..20 {
+            assert_eq!(mesh_relay_lookup_cached(&mesh, "evil.example").await, None);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "20 repeats within the TTL cost zero extra CP calls");
+
+        // A DIFFERENT hostname is tracked independently -- the cache doesn't over-suppress.
+        assert_eq!(mesh_relay_lookup_cached(&mesh, "other.example").await, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "an unrelated hostname's own lookup is unaffected");
+
+        // Past the TTL, the same hostname is allowed to hit the CP again.
+        tokio::time::advance(MESH_RELAY_NEGATIVE_CACHE_TTL + Duration::from_secs(1)).await;
+        assert_eq!(mesh_relay_lookup_cached(&mesh, "evil.example").await, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "past the TTL, a fresh lookup is allowed through");
+    }
 
     #[test]
     fn front_door_cert_gap_flags_every_configured_but_unusable_tls_vhost() {
@@ -4325,6 +4451,31 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "tail-only scan should finish in well under a second for 16KB of one-byte reads, took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_redirect_drops_a_connection_that_never_sends_a_complete_head_470() {
+        // #470: the whole head-read had no timeout at all -- connect on :80, send
+        // nothing (or an incomplete request), and the task held its shared connection-cap
+        // permit forever. With the clock paused, tokio auto-advances virtual time to the
+        // deadline, so this is deterministic and fast, same style as #111's ClientHello
+        // timeout test above.
+        let (mut client, edge) = tokio::io::duplex(64);
+        // Send a partial request line -- no \r\n\r\n terminator ever arrives, and `client`
+        // stays alive (in scope) for the rest of the test, so the connection is held open
+        // (not closed) -- only the new read deadline can end this.
+        client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let res = serve_http_redirect(edge).await;
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "an incomplete request head must be dropped, not hang forever");
+        assert!(
+            elapsed >= HTTP_REDIRECT_READ_TIMEOUT,
+            "must wait for the real read deadline before dropping, elapsed {elapsed:?}"
         );
     }
 

@@ -205,6 +205,24 @@ impl SqliteEdgeMesh {
         Ok(true)
     }
 
+    /// Clear `id`'s bound identity key (#409, the #287 TOFU binding's missing recovery
+    /// path) — an operator-invoked escape hatch for a lost key (fresh volume, rotated
+    /// secret, restored-from-backup host) or a genuine race-to-bind lockout, neither of
+    /// which the TOFU model itself can recover from on its own. Deliberately admin-gated
+    /// at the HTTP layer (same shared admin token every other edge-mesh writer requires)
+    /// rather than self-service — clearing a key is exactly the "substitute a new
+    /// identity" action #287 exists to prevent an unauthenticated caller from doing.
+    /// `peer_addr`/`last_seen` are left untouched; only the binding itself is cleared, so
+    /// the NEXT heartbeat (with or without a proof) re-runs the normal TOFU first-bind
+    /// logic from a clean slate. Returns whether a row existed for `id` at all.
+    pub fn rebind(&self, id: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .conn
+            .lock_safe()
+            .execute("UPDATE mesh_edges SET pubkey = NULL WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
     /// Delete `mesh_edges` rows that haven't heartbeated since `since` (#290
     /// housekeeping); returns the count removed. A permanently decommissioned
     /// edge's row otherwise lives forever — `live_edges`/`assign_edge` already
@@ -521,6 +539,23 @@ async fn heartbeat(
     }
 }
 
+/// `POST /internal/edges/:id/rebind` (#409, admin-gated): clear `id`'s bound identity key
+/// so its next heartbeat can bind a fresh one. See [`SqliteEdgeMesh::rebind`]'s own doc for
+/// why this is a deliberate, admin-only operator action, not a self-service endpoint.
+async fn rebind(
+    State(st): State<MeshState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    crate::service::require_admin(&headers, &st.admin_token, "edge rebind requires the admin token")?;
+    let existed = st.store.rebind(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if existed {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, format!("no mesh_edges row for id {id:?}")))
+    }
+}
+
 async fn lookup(
     State(st): State<MeshState>,
     headers: HeaderMap,
@@ -566,6 +601,7 @@ pub fn edge_mesh_router(store: Arc<SqliteEdgeMesh>, admin_token: Option<[u8; 32]
         .route("/internal/edges/heartbeat", post(heartbeat))
         .route("/internal/edges/lookup", get(lookup))
         .route("/internal/edges/rehydrate/:edge_id", get(rehydrate))
+        .route("/internal/edges/:id/rebind", post(rebind))
         .with_state(MeshState { store, admin_token })
 }
 
@@ -683,6 +719,49 @@ mod tests {
             s.live_edges(now).unwrap(),
             vec!["edge-1".to_string()],
             "sanity: edge-1 row still present"
+        );
+    }
+
+    #[test]
+    fn rebind_clears_a_lost_key_so_a_fresh_key_can_bind_again_409() {
+        // #409: the #287 TOFU binding has no recovery path on its own -- an edge that
+        // lost its identity key (fresh volume, rotated secret, restored-from-backup host)
+        // can never heartbeat under its own id again without this. Real proof: bind a
+        // key, confirm a DIFFERENT key is rejected (matching #287's own test above),
+        // rebind, then confirm that SAME different key -- representing the edge's new,
+        // legitimately-generated identity -- now binds cleanly.
+        let s = store();
+        let now = now_secs();
+        let lost_key = signing_key(5);
+        let (pk_hex, sig_hex) = sign_heartbeat(&lost_key, "edge-1", "10.0.0.1:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        assert!(s.heartbeat("edge-1", "10.0.0.1:4437", Some((&pk, &sig)), now).unwrap());
+
+        let new_key = signing_key(6);
+        let (new_pk_hex, new_sig_hex) = sign_heartbeat(&new_key, "edge-1", "10.0.0.1:4437");
+        let new_pk = hex_decode_32(&new_pk_hex).unwrap();
+        let new_sig = hex_decode_64(&new_sig_hex).unwrap();
+        assert!(
+            !s.heartbeat("edge-1", "10.0.0.1:4437", Some((&new_pk, &new_sig)), now + 1).unwrap(),
+            "before rebind: the new key is correctly rejected, same as any other mismatched key"
+        );
+
+        assert!(s.rebind("edge-1").unwrap(), "a row existed for edge-1, so rebind reports true");
+        assert!(!s.rebind("no-such-edge").unwrap(), "an unknown id has nothing to clear");
+
+        assert!(
+            s.heartbeat("edge-1", "10.0.0.1:4437", Some((&new_pk, &new_sig)), now + 2).unwrap(),
+            "after rebind: the new key binds cleanly, as if this were a fresh id"
+        );
+        // And the OLD (lost) key is now correctly rejected -- the binding really moved,
+        // not just "anything goes now".
+        let (old_pk_hex2, old_sig_hex2) = sign_heartbeat(&lost_key, "edge-1", "10.0.0.1:4437");
+        let old_pk2 = hex_decode_32(&old_pk_hex2).unwrap();
+        let old_sig2 = hex_decode_64(&old_sig_hex2).unwrap();
+        assert!(
+            !s.heartbeat("edge-1", "10.0.0.1:4437", Some((&old_pk2, &old_sig2)), now + 3).unwrap(),
+            "the old, lost key is rejected once the new one is bound"
         );
     }
 
@@ -1070,6 +1149,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(miss.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rebind_endpoint_requires_admin_and_clears_an_existing_binding_409() {
+        let (app, store) = test_router(Some([9u8; 32]));
+        store.heartbeat("edge-1", "10.0.0.1:4437", None, now_secs()).unwrap();
+        // Legacy no-proof path -- give it a real bound key directly so there's something
+        // for rebind to clear (using the storage API to set up state, matching this
+        // file's own convention for HTTP-layer tests).
+        let sk = signing_key(9);
+        let (pk_hex, sig_hex) = sign_heartbeat(&sk, "edge-2", "10.0.0.2:4437");
+        let pk = hex_decode_32(&pk_hex).unwrap();
+        let sig = hex_decode_64(&sig_hex).unwrap();
+        store.heartbeat("edge-2", "10.0.0.2:4437", Some((&pk, &sig)), now_secs()).unwrap();
+
+        let no_auth = app
+            .clone()
+            .oneshot(Request::post("/internal/edges/edge-2/rebind").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED, "no admin token -> refused");
+
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::post("/internal/edges/no-such-edge/rebind")
+                    .header("x-ct-admin-token", hex32(&[9u8; 32]))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND, "unknown id -> 404, nothing to clear");
+
+        let ok = app
+            .oneshot(
+                Request::post("/internal/edges/edge-2/rebind")
+                    .header("x-ct-admin-token", hex32(&[9u8; 32]))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // Real proof the binding actually cleared: a fresh key now binds cleanly.
+        let new_sk = signing_key(10);
+        let (new_pk_hex, new_sig_hex) = sign_heartbeat(&new_sk, "edge-2", "10.0.0.2:4437");
+        let new_pk = hex_decode_32(&new_pk_hex).unwrap();
+        let new_sig = hex_decode_64(&new_sig_hex).unwrap();
+        assert!(
+            store.heartbeat("edge-2", "10.0.0.2:4437", Some((&new_pk, &new_sig)), now_secs() + 1).unwrap(),
+            "post-rebind, a fresh key binds as if this were a brand-new id"
+        );
     }
 
     #[tokio::test]

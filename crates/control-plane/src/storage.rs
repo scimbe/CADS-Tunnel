@@ -3258,7 +3258,15 @@ impl SqliteChannelStore {
     pub fn issue_challenge(&self, now: u64, ttl_secs: u64) -> rusqlite::Result<[u8; 32]> {
         let mut nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        self.conn.lock_safe().execute(
+        let conn = self.conn.lock_safe();
+        // #403: this endpoint is unauthenticated and only reached the `consume_challenge`
+        // prune after a valid invitation later verifies -- an idle deployment (nobody
+        // currently redeeming) never hit that path at all, so the table grew without
+        // bound under any flood of just this call. Pruning here too, on every issue, means
+        // it self-bounds regardless of redemption traffic (in addition to #403's
+        // per-IP rate limit on this path -- defense in depth, not a replacement for it).
+        conn.execute("DELETE FROM channel_challenges WHERE expires_at <= ?1", params![now as i64])?;
+        conn.execute(
             "INSERT INTO channel_challenges (nonce, expires_at) VALUES (?1, ?2)",
             params![&nonce[..], now.saturating_add(ttl_secs) as i64],
         )?;
@@ -5016,6 +5024,31 @@ mod tests {
         // An expired nonce is rejected (and pruned).
         let m = store.issue_challenge(1_000, 60).unwrap();
         assert!(!store.consume_challenge(&m, 1_061).unwrap(), "past TTL -> false");
+    }
+
+    #[test]
+    fn issue_challenge_prunes_expired_rows_so_a_flood_of_this_endpoint_alone_self_bounds_403() {
+        // #403: consume_challenge's own prune is only reached after a valid invitation
+        // later verifies -- an idle deployment (nobody currently redeeming) never hit
+        // that path, so a bare flood of just issue_challenge grew the table without
+        // bound. issue_challenge now prunes too, so it self-bounds on its own.
+        let store = SqliteChannelStore::open_in_memory().unwrap();
+        let count = |s: &SqliteChannelStore| -> i64 {
+            s.conn
+                .lock_safe()
+                .query_row("SELECT COUNT(*) FROM channel_challenges", [], |r| r.get(0))
+                .unwrap()
+        };
+        // 50 short-TTL nonces, all now expired.
+        for _ in 0..50 {
+            store.issue_challenge(1_000, 10).unwrap();
+        }
+        assert_eq!(count(&store), 50, "all 50 tracked before any prune-triggering call");
+        // A single later issue_challenge call, well past every prior nonce's expiry,
+        // must sweep all of them -- not just the caller's own new row.
+        let fresh = store.issue_challenge(1_000_000, 60).unwrap();
+        assert_eq!(count(&store), 1, "the 50 expired rows were pruned; only the fresh one remains");
+        assert!(store.consume_challenge(&fresh, 1_000_010).unwrap(), "the fresh nonce is still valid");
     }
 
     #[test]

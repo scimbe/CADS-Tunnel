@@ -58,12 +58,32 @@ impl From<reqwest::Error> for CpError {
 
 type CpResult<T> = Result<T, CpError>;
 
+/// #408: the same `OnceLock`-cached-client-with-timeout shape this codebase already
+/// established twice (`main.rs::jwks_fetch_client` for #295, `portal_api.rs::
+/// edge_admin_http_client`) -- a bare `reqwest::Client::new()` has no request or connect
+/// timeout, so every method on [`ControlPlaneClient`] could block indefinitely against a
+/// control plane that accepts the TCP connection and never answers. Bites hardest on the
+/// payment path: `buy_token_idempotent` exists precisely so a retry after a lost response
+/// is safe, but with no timeout the caller never reaches the retry in the first place.
+fn control_plane_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 impl ControlPlaneClient {
     /// Bind the client to a base URL. A trailing slash is trimmed.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base: base_url.into().trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            http: control_plane_http_client(),
             admin_token: None,
         }
     }
@@ -433,6 +453,36 @@ mod tests {
     use crate::http::{control_plane_router, BillingState};
     use crate::registry::TunnelRegistry;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn a_hung_control_plane_times_out_instead_of_blocking_forever_408() {
+        // #408: a bare `reqwest::Client::new()` has no request/connect timeout -- prove
+        // the real property, not just that the builder call compiles. A real listener
+        // that accepts the TCP connection but never writes a response is exactly the
+        // "control plane accepts the connection and never answers" scenario the issue
+        // describes; the request-level timeout (10s) must fire well before any real
+        // hang, not the connect-level one (this is a live loopback accept, not an
+        // unroutable address).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            // Hold the connection open forever -- never read the request or write a
+            // response. The client's request timeout is the only thing that can end this.
+            std::future::pending::<()>().await;
+        });
+
+        let client = ControlPlaneClient::new(format!("http://{addr}"));
+        let started = std::time::Instant::now();
+        let result = client.resolve(&RoutingToken([0x11u8; 32])).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a hung control plane must surface as an error, not hang forever");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "must time out around the configured 10s request timeout, not hang indefinitely (took {elapsed:?})"
+        );
+    }
 
     /// Spawn the full control-plane router on an ephemeral port; returns its base URL.
     async fn spawn_service() -> String {

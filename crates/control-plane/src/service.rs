@@ -1432,6 +1432,14 @@ async fn authorize_host_proxy(
     require_admin(&headers, &state.admin_token, "authorizing a hostname requires the admin token")?;
     let host = ct_common::normalize_hostname(&host)
         .ok_or((StatusCode::BAD_REQUEST, "invalid hostname".to_string()))?;
+    // #402: `token` used to go straight into the URL unvalidated -- Axum's `Path`
+    // percent-decodes the segment, so it could carry `/`, `..`, `?`, `#` and inject a
+    // query param (e.g. `channel_tier=gelb`) or path-traverse into a different edge
+    // admin route (e.g. `/admin/revoke/:token`). Constraining to well-formed hex loses
+    // no legitimate use -- the edge itself calls `parse_token_hex` on this value.
+    let token_bytes = hex_decode_32(&token)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid token".to_string()))?;
+    let token = hex_encode(&token_bytes);
     let endpoint = format!(
         "{}/admin/authorize-host/{}/{}",
         state.edge_admin_url.trim_end_matches('/'),
@@ -4843,6 +4851,11 @@ const UNAUTH_WRITE_PATHS: &[&str] = &[
     // #431: added after this list -- storage is idempotent per (hostname, email),
     // which bounds duplicates but not distinct emails flooding a gated hostname.
     "/gate/request-access",
+    // #403: added later still (#108) and missed here -- inserts a nonce row into
+    // channel_challenges on every call, pruned only inside consume_challenge (reached
+    // only after a valid invitation verifies), so an idle deployment's SQLite file grows
+    // without bound under a bare flood of this endpoint.
+    "/channel/invite/challenge",
 ];
 
 /// Per-client-IP fixed-window limiter state for the unauthenticated DB-writers.
@@ -5473,7 +5486,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    // #401: byte-length guard alone isn't a char-boundary guard -- a multi-byte UTF-8
+    // char can pass the length check and still land mid-char at a `s[i..j]` slice,
+    // panicking instead of returning `None` as this function's own contract promises.
+    if s.len() != 64 || !s.is_ascii() {
         return None;
     }
     let mut out = [0u8; 32];
@@ -5485,7 +5501,9 @@ pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 
 /// Decode an arbitrary-length lowercase/upper hex string to bytes (even length).
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    // #401: same char-boundary hazard as hex_decode_32 -- `len() % 2` alone doesn't
+    // guarantee every 2-byte slice below lands on ASCII hex digits.
+    if s.len() % 2 != 0 || !s.is_ascii() {
         return None;
     }
     (0..s.len() / 2)
@@ -5494,7 +5512,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
-    if s.len() != 128 {
+    // #401: same char-boundary hazard as hex_decode_32.
+    if s.len() != 128 || !s.is_ascii() {
         return None;
     }
     let mut out = [0u8; 64];
@@ -5508,6 +5527,29 @@ pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
 mod tests {
     use super::*;
     use crate::client::ControlPlaneClient;
+
+    #[test]
+    fn hex_decoders_reject_non_ascii_input_instead_of_panicking_401() {
+        // #401: a multi-byte UTF-8 char can pass the byte-length guard and still land
+        // mid-char at a later `s[i..j]` slice, which panics rather than returning `None`
+        // as each function's own `Option` contract promises. Verified empirically against
+        // the issue's own reproduction: "€" (3 UTF-8 bytes) + 61 'a's is 64 bytes / 62 chars.
+        let euro_64 = format!("{}{}", '€', "a".repeat(61));
+        assert_eq!(euro_64.len(), 64);
+        assert_eq!(hex_decode_32(&euro_64), None, "must reject, not panic");
+
+        let euro_128 = format!("{}{}", '€', "a".repeat(125));
+        assert_eq!(euro_128.len(), 128);
+        assert_eq!(hex_decode_64(&euro_128), None, "must reject, not panic");
+
+        let euro_even = format!("{}{}", '€', "a".repeat(3));
+        assert_eq!(euro_even.len(), 6);
+        assert_eq!(hex_decode(&euro_even), None, "must reject, not panic");
+
+        // Real valid hex still round-trips correctly (the fix must not reject legitimate input).
+        let real = "ab".repeat(32);
+        assert!(hex_decode_32(&real).is_some());
+    }
 
     #[test]
     fn admin_token_ok_is_the_one_extract_and_compare() {
@@ -7855,32 +7897,117 @@ mod tests {
         mesh_store.heartbeat("primary", "test", None, now_secs() as i64).unwrap();
         let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary"));
         let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
-        let call = |tok: Option<String>| {
-            let mut req = Request::post("/registry/authorize-host/deadbeef/flappy-demo.bunsenbrenner.org");
+        // #402: a real, well-formed 64-hex-char routing token -- the raw "deadbeef" this
+        // test used before the #402 fix is only 8 chars and is now correctly rejected as
+        // an invalid token.
+        let routing_token = hex_encode(&[0xde; 32]);
+        let call = |path_token: &str, tok: Option<String>| {
+            let mut req = Request::post(format!("/registry/authorize-host/{path_token}/flappy-demo.bunsenbrenner.org"));
             if let Some(t) = tok {
                 req = req.header("x-ct-admin-token", t);
             }
             app.clone().oneshot(req.body(Body::empty()).unwrap())
         };
 
-        assert_eq!(call(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no admin token → 401");
+        assert_eq!(call(&routing_token, None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no admin token → 401");
         assert_eq!(
-            call(Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
+            call(&routing_token, Some(hex_encode(&[0u8; 32]))).await.unwrap().status(),
             StatusCode::UNAUTHORIZED,
             "wrong admin token → 401"
         );
-        assert_eq!(call(Some(hex_encode(&admin))).await.unwrap().status(), StatusCode::OK, "admin token authorizes");
+        assert_eq!(
+            call(&routing_token, Some(hex_encode(&admin))).await.unwrap().status(),
+            StatusCode::OK,
+            "admin token authorizes"
+        );
         assert_eq!(
             hit.lock().unwrap().as_deref(),
-            Some("deadbeef/flappy-demo.bunsenbrenner.org"),
+            Some(format!("{routing_token}/flappy-demo.bunsenbrenner.org")).as_deref(),
             "forwarded to the edge with the exact token/host and its admin header"
         );
         // edge_mesh Phase 0: a successful proxy call records the local edge's ownership.
         assert_eq!(
-            mesh_store.lookup_by_token("deadbeef").unwrap().map(|(id, _)| id),
+            mesh_store.lookup_by_token(&routing_token).unwrap().map(|(id, _)| id),
             Some("primary".to_string()),
             "ownership recorded after a successful authorize-host proxy call"
         );
+    }
+
+    #[tokio::test]
+    async fn authorize_host_proxy_rejects_a_malformed_token_instead_of_forwarding_it_402() {
+        // #402: `token` used to go straight into the edge admin URL unvalidated -- a
+        // caller holding only the CP admin token (the actor this proxy exists to serve,
+        // who by design can't reach the loopback-only edge admin API directly) could
+        // inject a query param or path-traverse to a different edge admin route. Proves
+        // both concrete escapes from the issue are refused before ever reaching the edge.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x7bu8; 32];
+        let edge_admin_token = "edge-secret-402";
+        let hit = Arc::new(std::sync::Mutex::new(false));
+        let hit2 = hit.clone();
+        let mock_edge = Router::new()
+            .route(
+                "/admin/authorize-host/:token/:host",
+                post(move || {
+                    let hit = hit2.clone();
+                    async move {
+                        *hit.lock().unwrap() = true;
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route("/admin/revoke/:token", post(|| async { StatusCode::OK }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock_edge).await.unwrap() });
+
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store, Arc::from("primary"));
+        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
+
+        for malicious_token in [
+            // Query injection: would append `channel_tier=gelb` to the edge request.
+            "REALTOK/somehost?channel_tier=gelb&x=",
+            // Path traversal: would resolve (via URL normalization) to /admin/revoke/VICTIM.
+            "x/../revoke/VICTIM_TOKEN?y=",
+            // Too short to be a real 32-byte token.
+            "deadbeef",
+        ] {
+            let req = Request::post(format!(
+                "/registry/authorize-host/{}/flappy-demo.bunsenbrenner.org",
+                urlencoding_light(malicious_token)
+            ))
+            .header("x-ct-admin-token", hex_encode(&admin))
+            .body(Body::empty())
+            .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "malicious/malformed token {malicious_token:?} must be refused, not forwarded"
+            );
+        }
+        assert!(!*hit.lock().unwrap(), "the mock edge must never have been reached");
+    }
+
+    /// Minimal percent-encoding for this test's own malicious-token fixtures -- just enough
+    /// to route a `/` or `?` through Axum's `Path` extractor as literal bytes of the `token`
+    /// segment (matching what an attacker's raw HTTP request would send), not a real
+    /// general-purpose encoder.
+    fn urlencoding_light(s: &str) -> String {
+        s.chars()
+            .map(|c| match c {
+                '/' => "%2F".to_string(),
+                '?' => "%3F".to_string(),
+                '&' => "%26".to_string(),
+                '=' => "%3D".to_string(),
+                '.' => "%2E".to_string(),
+                c => c.to_string(),
+            })
+            .collect()
     }
 
     #[tokio::test]
