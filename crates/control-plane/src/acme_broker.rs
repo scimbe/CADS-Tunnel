@@ -40,6 +40,14 @@ use crate::storage::SqliteTunnelStore;
 
 /// How long a front-of-queue claim offer stays open before lapsing.
 const CLAIM_WINDOW_SECS: i64 = 48 * 3600;
+/// #467: the Gelb re-affirm sweep (step 2 of `sweep_once`) used to push every
+/// currently-Gelb hostname sequentially, one SQLite lookup plus one HTTP round
+/// trip (5s timeout) each, with no limit -- at a few thousand Gelb hostnames one
+/// tick becomes tens of seconds to minutes of pure I/O, stalling the admission
+/// steps that run after it in the same tick. Bounded, concurrent batches instead:
+/// each batch runs its pushes concurrently (`join_all`), and batches themselves
+/// run sequentially so total in-flight HTTP connections to the edge stay capped.
+const GELB_REAFFIRM_BATCH_SIZE: usize = 50;
 /// The rate-limit ledger's rolling window — matches Let's Encrypt's own
 /// "per 7 days" framing; every CA in the rotation is budgeted against the
 /// same window for simplicity, even where a CA's real limit isn't weekly.
@@ -431,9 +439,24 @@ async fn sweep_once(
     // the cases where that call failed or raced (edge admin unset, transient
     // error), and is also where a fresh admission-loop tick learns about any
     // hostname the synchronous path missed.
+    //
+    // #468: each hostname's own step used to propagate `?`, so one transient
+    // SQLITE_BUSY or one persistently malformed row aborted the ENTIRE tick --
+    // every remaining step (Gelb re-affirm, claim lapsing, new admissions) got
+    // skipped for every OTHER tenant too, not just the one hostname that
+    // errored. Fault-isolated per hostname now: log and continue, reserving
+    // `?` for the top-level list queries (`rot_hostnames()` etc.) that
+    // genuinely should abort the tick if THEY fail.
     for hostname in tunnels.rot_hostnames()? {
-        if edge_mesh.lookup_by_host(&hostname)?.is_some() && tunnels.enter_gelb_queue(&hostname, now)? {
-            push_channel_tier(edge_admin, tunnels, &hostname, true).await;
+        let promoted = edge_mesh
+            .lookup_by_host(&hostname)
+            .and_then(|owned| if owned.is_some() { tunnels.enter_gelb_queue(&hostname, now) } else { Ok(false) });
+        match promoted {
+            Ok(true) => {
+                push_channel_tier(edge_admin, tunnels, &hostname, true).await;
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("ct-cp: acme_broker: sweep step 1 (rot->gelb) for {hostname} failed: {e}"),
         }
     }
 
@@ -444,8 +467,18 @@ async fn sweep_once(
     // Gelb-tier's plain-HTTP origin, producing handshake failures downstream.
     // Re-pushing every tick is a cheap, idempotent no-op on the edge in the
     // steady state and self-heals within one tick of any restart.
-    for hostname in tunnels.gelb_hostnames()? {
-        push_channel_tier(edge_admin, tunnels, &hostname, true).await;
+    //
+    // #467: used to push sequentially, one SQLite lookup plus one HTTP round
+    // trip (5s timeout) per hostname, unbounded -- at a few thousand Gelb
+    // hostnames this alone could take tens of seconds to minutes, stalling
+    // the claim-lapsing and admission steps that run after it in this same
+    // tick. Bounded, concurrent batches instead (each `push_channel_tier` is
+    // already fire-and-forget/best-effort, no `?` to fault-isolate here).
+    for batch in tunnels.gelb_hostnames()?.chunks(GELB_REAFFIRM_BATCH_SIZE) {
+        futures::future::join_all(
+            batch.iter().map(|hostname| push_channel_tier(edge_admin, tunnels, hostname, true)),
+        )
+        .await;
     }
 
     // 2b. Retry the Gelb->Gruen revert push for any hostname it didn't confirm land
@@ -453,24 +486,39 @@ async fn sweep_once(
     // once the push succeeds, `clear_pending_revert` removes the hostname from
     // `pending_revert_hostnames` for good, so this never grows into an ever-larger
     // per-tick re-push of every Gruen hostname a deployment has ever issued.
+    // #468: `clear_pending_revert`'s own `?` fault-isolated per hostname, same
+    // reasoning as step 1.
     for hostname in tunnels.pending_revert_hostnames()? {
         if push_channel_tier(edge_admin, tunnels, &hostname, false).await {
-            tunnels.clear_pending_revert(&hostname)?;
+            if let Err(e) = tunnels.clear_pending_revert(&hostname) {
+                eprintln!("ct-cp: acme_broker: sweep step 2b clear_pending_revert for {hostname} failed: {e}");
+            }
         }
     }
 
     // 3. Lapse expired claims -- must run before the admission sweep below so
-    // a just-lapsed hostname's freed budget can be reused the same tick.
+    // a just-lapsed hostname's freed budget can be reused the same tick. A
+    // single bulk statement, not a per-hostname loop, so `?` here genuinely
+    // should abort the tick on failure (#468's own carve-out).
     tunnels.lapse_expired_claims(now)?;
 
     // 4. Admit as much of the FIFO queue as current CA headroom allows.
+    // #468: `pick_ca`/`offer_claim`'s own `?`s fault-isolated per hostname --
+    // a `None` (no CA has headroom) still correctly `break`s the queue scan;
+    // only a genuine per-hostname DB error is now logged-and-skipped instead
+    // of aborting the whole tick (leaving the rest of the queue unadmitted).
     for hostname in tunnels.gelb_queue_fifo()? {
         let domain = registered_domain(&hostname);
-        match pick_ca(tunnels, &domain, now)? {
-            Some(ca) => {
-                tunnels.offer_claim(&hostname, ca, now, now + CLAIM_WINDOW_SECS)?;
+        match pick_ca(tunnels, &domain, now) {
+            Ok(Some(ca)) => {
+                if let Err(e) = tunnels.offer_claim(&hostname, ca, now, now + CLAIM_WINDOW_SECS) {
+                    eprintln!("ct-cp: acme_broker: sweep step 4 offer_claim for {hostname} failed: {e}");
+                }
             }
-            None => break,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("ct-cp: acme_broker: sweep step 4 pick_ca for {hostname} failed: {e}");
+            }
         }
     }
     Ok(())

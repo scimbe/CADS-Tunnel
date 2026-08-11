@@ -3533,6 +3533,11 @@ pub struct StatusState {
     /// `STATUS_CACHE_TTL`; only the first request after expiry pays the real
     /// aggregation cost, every other request during that window clones this.
     status_cache: Arc<tokio::sync::RwLock<Option<(std::time::Instant, StatusResp)>>>,
+    /// #461: guards `maybe_spawn_refresh` so an expiry burst spawns exactly one
+    /// background refresh, not one per concurrent request. `compare_exchange`
+    /// (not a plain store) is what makes "claim the refresh" atomic across
+    /// concurrently-racing requests.
+    status_refreshing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// #346: how long a `/status` response is served from cache before the next
@@ -3593,6 +3598,7 @@ pub fn status_router(
         http: reqwest::Client::new(),
         oidc,
         status_cache: Arc::new(tokio::sync::RwLock::new(None)),
+        status_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -3653,30 +3659,62 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
     // restart and no tolerance for a multi-second cache delay. Caching
     // everything else while keeping this one field always-live preserves both
     // guarantees at once instead of trading one off against the other.
-    if let Some((cached_at, resp)) = s.status_cache.read().await.as_ref() {
-        if cached_at.elapsed() < STATUS_CACHE_TTL {
-            let mut resp = resp.clone();
+    let cached = s.status_cache.read().await.clone();
+    match cached {
+        Some((cached_at, resp)) if cached_at.elapsed() < STATUS_CACHE_TTL => {
+            let mut resp = resp;
             resp.oidc_enabled = s.oidc.is_ready();
-            return Json(resp);
+            Json(resp)
+        }
+        Some((_, stale)) => {
+            // #461: stale-while-revalidate. The write guard used to be held across
+            // `aggregate_status`'s real HTTP scrape (up to 2s) -- every concurrent
+            // `/status` request (readers included, since a pending writer excludes
+            // them) blocked on that lock for the duration, once per TTL window. Now:
+            // hand back the stale value immediately (this cache exists precisely
+            // because a few-seconds-old count is fine for this endpoint), and
+            // refresh in a detached background task that only ever runs the write
+            // lock around the cheap final store, never around the scrape itself.
+            maybe_spawn_status_refresh(s.clone());
+            let mut resp = stale;
+            resp.oidc_enabled = s.oidc.is_ready();
+            Json(resp)
+        }
+        None => {
+            // Never populated -- no stale value exists to fall back to, so this one
+            // request has no choice but to actually wait for the first real
+            // aggregation. Every subsequent expiry uses the stale-while-revalidate
+            // path above instead.
+            let fresh = aggregate_status(&s).await;
+            *s.status_cache.write().await = Some((std::time::Instant::now(), fresh.clone()));
+            Json(fresh)
         }
     }
-    // Stale (or never populated): acquire the write lock and re-check inside
-    // it (the standard check-lock-check pattern) -- if a concurrent request
-    // already refreshed it while this one was waiting for the lock, use that
-    // result instead of redundantly re-aggregating. Only the first stale
-    // request to actually win the write lock pays the real cost; every other
-    // concurrent stale request just observes the fresh result it produced.
-    let mut guard = s.status_cache.write().await;
-    if let Some((cached_at, resp)) = guard.as_ref() {
-        if cached_at.elapsed() < STATUS_CACHE_TTL {
-            let mut resp = resp.clone();
-            resp.oidc_enabled = s.oidc.is_ready();
-            return Json(resp);
-        }
+}
+
+/// Spawn a background refresh of the status cache unless one is already in
+/// flight (#461). `compare_exchange` makes "claim the refresh" atomic across
+/// concurrently-racing requests -- of an entire burst of expired-cache
+/// requests arriving at once, exactly one wins and spawns; the rest just see
+/// `status_refreshing` already `true` and return immediately, having already
+/// served their caller the stale value.
+fn maybe_spawn_status_refresh(s: StatusState) {
+    if s.status_refreshing
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return; // another request's refresh is already in flight
     }
-    let fresh = aggregate_status(&s).await;
-    *guard = Some((std::time::Instant::now(), fresh.clone()));
-    Json(fresh)
+    tokio::spawn(async move {
+        let fresh = aggregate_status(&s).await;
+        *s.status_cache.write().await = Some((std::time::Instant::now(), fresh));
+        s.status_refreshing.store(false, std::sync::atomic::Ordering::Release);
+    });
 }
 
 /// Resolve the operator "registered tunnels" count. The live tunnel registry
@@ -9463,6 +9501,84 @@ mod tests {
             1,
             "a request within STATUS_CACHE_TTL must still serve the cached count, not re-aggregate -- \
              proves the cache actually short-circuited the store call"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_serves_stale_without_waiting_on_a_slow_refresh_and_updates_after_461() {
+        // #461: the real property -- once the cache is stale, a caller must get an
+        // IMMEDIATE response (the last-known value) and never block on the edge
+        // scrape, but the cache must still actually become fresh shortly after via
+        // the detached background refresh. Both halves proven directly, not just
+        // "the numbers end up right eventually".
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        use tower::ServiceExt;
+
+        let tunnels = Arc::new(AtomicI64::new(1));
+        let slow = Arc::new(AtomicBool::new(false));
+        let (t2, s2) = (tunnels.clone(), slow.clone());
+        let edge = Router::new().route(
+            "/metrics",
+            get(move || {
+                let (t, s) = (t2.clone(), s2.clone());
+                async move {
+                    if s.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                    format!(
+                        "# TYPE ct_edge_active_tunnels gauge\nct_edge_active_tunnels {}\n",
+                        t.load(Ordering::Acquire)
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, edge).await.unwrap() });
+
+        let app = status_router(
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteRegistry::open_in_memory().unwrap()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            Arc::new(SqliteAgentDirectory::open_in_memory().unwrap()),
+            Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Some(format!("http://{addr}/metrics")),
+            OidcVerifierHandle::empty(),
+        );
+        let get_tunnels = |app: Router| async {
+            let resp = app.oneshot(Request::get("/status").body(Body::empty()).unwrap()).await.unwrap();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<StatusResp>(&body).unwrap().tunnels
+        };
+
+        // Populate the cache for real (edge is fast right now): tunnels=1.
+        assert_eq!(get_tunnels(app.clone()).await, 1, "first request aggregates for real");
+
+        // Now the edge count changes AND the scrape becomes slow (300ms), and the
+        // cache expires (STATUS_CACHE_TTL = 5s).
+        tunnels.store(2, Ordering::Release);
+        slow.store(true, Ordering::Release);
+        tokio::time::sleep(STATUS_CACHE_TTL + std::time::Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        let stale_reported = get_tunnels(app.clone()).await;
+        let elapsed = started.elapsed();
+        assert_eq!(stale_reported, 1, "must serve the STALE value immediately, not wait for the new one");
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "must not block on the 300ms scrape at all -- took {elapsed:?}"
+        );
+
+        // Give the detached background refresh time to actually finish (300ms
+        // scrape + margin), then confirm the cache really did update.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        slow.store(false, Ordering::Release); // so this final read is fast too
+        assert_eq!(
+            get_tunnels(app).await,
+            2,
+            "the background refresh must have actually landed the fresh value"
         );
     }
 

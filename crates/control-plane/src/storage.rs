@@ -247,14 +247,36 @@ impl SqliteEnrollment {
 
     /// Issue `count` fresh single-use join tokens for `tenant` in one call (#145 bulk provisioning):
     /// each is independently random + persisted + redeemable **exactly once**, so "provision N agents"
-    /// becomes one mint instead of N. On any failure the partial tokens already persisted stay valid
-    /// (each is standalone); the caller sees the error and can retry for the remainder.
+    /// becomes one mint instead of N.
+    ///
+    /// #465: previously N separate auto-committed statements (`(0..count).map(|_|
+    /// self.issue_join_token(tenant))`) -- N lock round-trips and N separate disk
+    /// commits for one logical bulk-provisioning operation. Now one transaction,
+    /// mirroring `issue_join_tokens_idempotent`'s own mint-loop body (that sibling
+    /// already documents at length why the crash-partway window matters). Unlike
+    /// the idempotent version this has no operation-identity record to roll back
+    /// to, so a mid-loop failure now aborts the whole batch (via the transaction's
+    /// own drop-without-commit) rather than leaving a partial, silently-smaller
+    /// set persisted for the caller to discover after the fact.
     pub fn issue_join_tokens(
         &self,
         tenant: &TenantId,
         count: usize,
     ) -> rusqlite::Result<Vec<JoinToken>> {
-        (0..count).map(|_| self.issue_join_token(tenant)).collect()
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let mut tokens = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            tx.execute(
+                "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
+                params![&bytes[..], tenant.0],
+            )?;
+            tokens.push(JoinToken(bytes));
+        }
+        tx.commit()?;
+        Ok(tokens)
     }
 
     /// Issue `count` join tokens **idempotently** keyed by `idempotency_key` (#145, Marq's provisioning
@@ -400,8 +422,19 @@ impl SqliteEnrollment {
                 |r| {
                     let tenant: String = r.get(0)?;
                     let pk: Vec<u8> = r.get(1)?;
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&pk);
+                    // #466: was `key.copy_from_slice(&pk)`, which panics on anything but
+                    // exactly 32 bytes -- every write path only ever inserts a well-formed
+                    // key, but a corrupt/hand-edited/partially-restored DB (the exact
+                    // scenario this codebase's migration machinery exists for) should get a
+                    // clean error here, not a panic, matching the `try_from` pattern already
+                    // used everywhere else in this file for this identical decode.
+                    let key = <[u8; 32]>::try_from(pk.as_slice()).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Blob,
+                            "agent_bindings.pubkey is not 32 bytes".into(),
+                        )
+                    })?;
                     Ok((TenantId(tenant), key))
                 },
             )
@@ -723,6 +756,21 @@ pub struct AgentDirectoryEntry {
     pub role_tags: Vec<String>,
     pub skill_ids: Vec<String>,
     pub registered_at: u64,
+}
+
+/// The registered domain (eTLD+1) a hostname falls under (#469). Duplicated rather
+/// than shared across modules on purpose, mirroring `acme_broker::registered_domain`
+/// (which mirrors `dns01_challenge::dns01_record_name`) — this fleet only ever mints
+/// single-level subdomains of its own configured zone(s), so "everything but the
+/// leftmost label, unless there is no leftmost label to strip" is exact today; a
+/// multi-zone future would make this a config lookup instead.
+fn registered_domain(hostname: &str) -> String {
+    let labels: Vec<&str> = hostname.split('.').collect();
+    if labels.len() <= 2 {
+        hostname.to_string()
+    } else {
+        labels[1..].join(".")
+    }
 }
 
 fn split_tokens(s: &str) -> Vec<String> {
@@ -1215,8 +1263,15 @@ impl SqliteLedger {
             )
             .optional()?;
         let account = if let Some(bytes) = existing {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&bytes);
+            // #466: was `a.copy_from_slice(&bytes)`, which panics on anything but
+            // exactly 32 bytes -- see the identical fix + reasoning on `binding` above.
+            let a = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                LedgerOpError::Db(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    "account_subjects.account is not 32 bytes".into(),
+                ))
+            })?;
             AccountId(a)
         } else {
             let mut bytes = [0u8; 32];
@@ -1326,12 +1381,19 @@ impl SqliteLedger {
                 |r| r.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .map(|opt| {
+            .and_then(|opt| {
+                // #466: was `t.copy_from_slice(&bytes)`, which panics on anything but
+                // exactly 32 bytes -- see the identical fix + reasoning on `binding` above.
                 opt.map(|bytes| {
-                    let mut t = [0u8; 32];
-                    t.copy_from_slice(&bytes);
-                    t
+                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            "token_issuances.token is not 32 bytes".into(),
+                        )
+                    })
                 })
+                .transpose()
             })
     }
 
@@ -1671,7 +1733,12 @@ impl SqliteTunnelStore {
                  tunnel_id TEXT NOT NULL,
                  grantee   TEXT NOT NULL,
                  PRIMARY KEY (tunnel_id, grantee)
-             );",
+             );
+             -- #463: PRIMARY KEY (tunnel_id, grantee) only helps queries constraining
+             -- the leading column; every /portal/tunnels page load filters on grantee
+             -- alone.
+             CREATE INDEX IF NOT EXISTS idx_tunnel_grants_grantee
+                 ON tunnel_grants (grantee);",
         )?;
         // #44: subject_tunnels gained `hostname` (#23) and `routing_token` (#27)
         // after its first release; add them to any pre-existing DB so schema-adding
@@ -2779,11 +2846,23 @@ impl SqliteTunnelStore {
             params![ca, domain, since],
             |r| r.get(0),
         )?;
-        let reserved: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM subject_tunnels WHERE assigned_ca = ?1 AND claim_state = 'offered'",
-            params![ca],
-            |r| r.get(0),
+        // #469: `used` is scoped by `domain`, but this was not -- both this function's
+        // own doc and its caller treat the two halves as equally per-domain, so they
+        // agreed by coincidence in a single-zone deployment. `subject_tunnels` has no
+        // `domain` column to filter by directly (only `hostname`), so -- mirroring this
+        // crate's own established pattern of a small pure helper duplicated per module
+        // rather than shared across one (`acme_broker::registered_domain`,
+        // `dns01_challenge::dns01_record_name`) -- fetch the hostnames of in-flight
+        // offers and filter in application code, same idea as #405/#464's approach for
+        // an unindexable predicate.
+        let mut stmt = conn.prepare(
+            "SELECT hostname FROM subject_tunnels WHERE assigned_ca = ?1 AND claim_state = 'offered'",
         )?;
+        let reserved = stmt
+            .query_map(params![ca], |r| r.get::<_, Option<String>>(0))?
+            .filter_map(|h| h.ok().flatten())
+            .filter(|h| registered_domain(h) == domain)
+            .count() as i64;
         Ok((used, reserved))
     }
 
@@ -2900,7 +2979,14 @@ impl SqliteChannelStore {
              CREATE TABLE IF NOT EXISTS channel_challenges (
                  nonce      BLOB PRIMARY KEY,
                  expires_at INTEGER NOT NULL
-             );",
+             );
+             -- #462: consume_invitation/consume_challenge each prune with
+             -- `WHERE expires_at <= ?1` on every call -- unindexed, that's a full
+             -- table scan (plus a write lock) growing linearly with accumulated rows.
+             CREATE INDEX IF NOT EXISTS idx_consumed_invitations_expires
+                 ON consumed_invitations (expires_at);
+             CREATE INDEX IF NOT EXISTS idx_channel_challenges_expires
+                 ON channel_challenges (expires_at);",
         )?;
         // #72 AF4 (registry carries the key): each member's X25519 Noise static key,
         // which the peer pins for the direct-path Noise_IK handshake. Additive,
@@ -2918,7 +3004,11 @@ impl SqliteChannelStore {
                  added_by  TEXT NOT NULL,
                  added_at  INTEGER NOT NULL,
                  PRIMARY KEY (channel, email)
-             );",
+             );
+             -- #463: PRIMARY KEY (channel, email) only helps queries constraining the
+             -- leading column; several queries filter on email alone.
+             CREATE INDEX IF NOT EXISTS idx_channel_allowlist_email
+                 ON channel_allowlist (email);",
         )?;
         // Self-service discoverability follow-up (2026-08-01): an allow-listed
         // person previously had no way to find out *which* channel they'd been
@@ -3602,6 +3692,10 @@ impl SqliteTopologyStore {
                  owner    TEXT NOT NULL,
                  topology TEXT
              );
+             -- #463: `agent` is the primary key, but queries filter by `topology`,
+             -- which has no index of its own.
+             CREATE INDEX IF NOT EXISTS idx_topology_agents_topology
+                 ON topology_agents (topology);
              CREATE TABLE IF NOT EXISTS topologies (
                  id       TEXT PRIMARY KEY,
                  owner    TEXT NOT NULL,
@@ -3613,6 +3707,11 @@ impl SqliteTopologyStore {
                  b        TEXT NOT NULL,
                  PRIMARY KEY (topology, a, b)
              );
+             -- #464: topology_authorizes runs on every channel admission, scanning
+             -- every edge across every topology -- these make the two rewritten
+             -- index-seekable branches below actually seekable.
+             CREATE INDEX IF NOT EXISTS idx_topology_edges_a ON topology_edges (a);
+             CREATE INDEX IF NOT EXISTS idx_topology_edges_b ON topology_edges (b);
              -- #107-complex: a topology is shared with another Keycloak account by e-mail
              -- (mirrors channel_allowlist's shape/semantics) -- the default stays owner-only
              -- (no rows here), sharing is a strictly additive grant. A shared subject may view
@@ -3626,7 +3725,11 @@ impl SqliteTopologyStore {
                  added_by  TEXT NOT NULL,
                  added_at  INTEGER NOT NULL,
                  PRIMARY KEY (topology, email)
-             );",
+             );
+             -- #463: PRIMARY KEY (topology, email) only helps queries constraining the
+             -- leading column; several queries filter on email alone.
+             CREATE INDEX IF NOT EXISTS idx_topology_shares_email
+                 ON topology_shares (email);",
         )?;
         // #107-ui-mode: the per-topology overlay mode (a RoutingApproach token) the owner
         // chooses — direct (`baseline`, the default) vs complex-adaptive (`smart-route`/
@@ -4029,12 +4132,26 @@ impl SqliteTopologyStore {
         channel: &ChannelId,
         holder: &[u8; 32],
     ) -> rusqlite::Result<Option<[u8; 32]>> {
+        // #464: `holder_hex` is already lowercase (`format!("{b:02x}")` always emits
+        // lowercase), and `add_edge`/`remove_edge` (#405) already lowercase every
+        // stored endpoint on write -- so this no longer needs `lower()` on read to
+        // match case-insensitively, which is what let this become a full scan of
+        // every edge across every topology in the first place (an `OR` spanning two
+        // different columns, one of them wrapped in a function, is unindexable no
+        // matter what index exists). Rewritten as a `UNION ALL` of two
+        // index-seekable branches instead -- see idx_topology_edges_a/_b above. `a`
+        // and `b` can never be equal for a stored edge (add_edge refuses that), so
+        // a real edge matches at most one branch: no risk of double-counting a row.
         let holder_hex: String = holder.iter().map(|b| format!("{b:02x}")).collect();
         let conn = self.conn.lock_safe();
         let mut stmt = conn.prepare(
             "SELECT t.operator_pubkey, e.a, e.b \
              FROM topology_edges e JOIN topologies t ON t.id = e.topology \
-             WHERE t.operator_pubkey IS NOT NULL AND (lower(e.a) = ?1 OR lower(e.b) = ?1)",
+             WHERE t.operator_pubkey IS NOT NULL AND e.a = ?1 \
+             UNION ALL \
+             SELECT t.operator_pubkey, e.a, e.b \
+             FROM topology_edges e JOIN topologies t ON t.id = e.topology \
+             WHERE t.operator_pubkey IS NOT NULL AND e.b = ?1",
         )?;
         let rows = stmt.query_map(params![holder_hex], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
@@ -5538,18 +5655,48 @@ mod tests {
 
     #[test]
     fn ca_budget_usage_counts_offered_reservations_as_real_headroom_consumption() {
+        // #469: `reserved` is now scoped through `registered_domain(hostname)`, so the
+        // hostnames here must actually resolve to the "example.com" domain being
+        // queried -- the original "a.example"/"b.example" placeholders (a synthetic
+        // single-label pseudo-TLD, not `example.com`) predate that scoping and never
+        // exercised it; `registered_domain` would strip them to bare "a.example"/
+        // "b.example", not "example.com", so the pre-fix accidental scope-free `reserved`
+        // count happened to still match this test's own assertions by coincidence.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
-        store.create("alice", "b", Some("b.example")).unwrap();
-        store.enter_gelb_queue("a.example", 100).unwrap();
-        store.enter_gelb_queue("b.example", 200).unwrap();
-        store.offer_claim("a.example", "zerossl", 300, 999_999).unwrap();
-        store.record_issuance_complete("a.example", "example.com", 400).unwrap();
-        store.offer_claim("b.example", "zerossl", 500, 999_999).unwrap();
+        store.create("alice", "a", Some("a.example.com")).unwrap();
+        store.create("alice", "b", Some("b.example.com")).unwrap();
+        store.enter_gelb_queue("a.example.com", 100).unwrap();
+        store.enter_gelb_queue("b.example.com", 200).unwrap();
+        store.offer_claim("a.example.com", "zerossl", 300, 999_999).unwrap();
+        store.record_issuance_complete("a.example.com", "example.com", 400).unwrap();
+        store.offer_claim("b.example.com", "zerossl", 500, 999_999).unwrap();
 
         let (used, reserved) = store.ca_budget_usage("zerossl", "example.com", 0).unwrap();
-        assert_eq!(used, 1, "a.example's completed issuance");
-        assert_eq!(reserved, 1, "b.example's still-open offer, not yet completed");
+        assert_eq!(used, 1, "a.example.com's completed issuance");
+        assert_eq!(reserved, 1, "b.example.com's still-open offer, not yet completed");
+    }
+
+    #[test]
+    fn ca_budget_usage_reserved_is_scoped_per_domain_469() {
+        // #469: before this fix, `reserved` counted every in-flight offer for the CA
+        // across ALL domains, unscoped -- so a second zone's open offers would silently
+        // consume the FIRST zone's budget headroom. Real proof: an open offer under
+        // "other-zone.org" must not count toward "example.com"'s reserved figure.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.create("alice", "a", Some("a.example.com")).unwrap();
+        store.create("bob", "z", Some("z.other-zone.org")).unwrap();
+        store.enter_gelb_queue("a.example.com", 100).unwrap();
+        store.enter_gelb_queue("z.other-zone.org", 200).unwrap();
+        store.offer_claim("a.example.com", "zerossl", 300, 999_999).unwrap();
+        store.offer_claim("z.other-zone.org", "zerossl", 300, 999_999).unwrap();
+
+        let (used_a, reserved_a) = store.ca_budget_usage("zerossl", "example.com", 0).unwrap();
+        assert_eq!(used_a, 0);
+        assert_eq!(reserved_a, 1, "only example.com's own open offer counts");
+
+        let (used_z, reserved_z) = store.ca_budget_usage("zerossl", "other-zone.org", 0).unwrap();
+        assert_eq!(used_z, 0);
+        assert_eq!(reserved_z, 1, "the other zone's own open offer, independently scoped");
     }
 
     #[test]
