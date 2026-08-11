@@ -1206,6 +1206,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     authorize: F,
     park_ttl: UnixSeconds,
     complete: C,
+    cap: Option<crate::state::ConnectionCap>,
 ) where
     N: Fn() -> UnixSeconds + Send + Sync + 'static,
     F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
@@ -1243,11 +1244,41 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 return;
             }
         };
+        // #450: every other public listener acquires a connection-cap permit before
+        // spawning its per-connection task; this loop spawned unbounded until now.
+        // Shed BEFORE spawning (cheaper than admitting then dropping mid-handshake),
+        // same posture as every other listener's cap. The permit is moved into the
+        // spawned task below and held through admission and (when this member is the
+        // one that completes a pair) through `complete(..).await`. NOTE (#451, found
+        // while adding this cap): on the `Parked` outcome the spawned task returns
+        // right after `offer`, so the permit is released even though the member's
+        // connection lives on inside the pairer until paired or swept by
+        // `drain_expired` -- this bounds *admission* concurrency, it does not yet
+        // account for a parked member's still-open socket. Carrying the permit on
+        // `WaitingMember`/`AdmittedMember` itself so it travels with the connection is
+        // the real fix, tracked under #451 together with the front-door/ws_channel
+        // instances of the same gap; not attempted in this pass.
+        let _permit = match &cap {
+            Some(c) => match c.try_admit() {
+                Some(p) => Some(p),
+                None => {
+                    let total = c.note_shed();
+                    if total.is_power_of_two() || total % 1000 == 0 {
+                        eprintln!(
+                            "ct-edge: channel-broker shedding — connection cap full, {total} connection(s) shed since start"
+                        );
+                    }
+                    continue;
+                }
+            },
+            None => None,
+        };
         let pairer = pairer.clone();
         let now_fn = now_fn.clone();
         let authorize = authorize.clone();
         let complete = complete.clone();
         tokio::spawn(async move {
+            let _permit = _permit; // held for the connection's whole admission+relay lifetime
             let now = now_fn();
             // Admit this one member (its join read is bounded by #105); on error, log and drop it —
             // a single bad connection must not affect any other channel.
@@ -2895,6 +2926,7 @@ mod tests {
                 },
                 10_000,
                 finish_relay_pair,
+            None,
             )
             .await;
         });
@@ -3013,6 +3045,7 @@ mod tests {
                 },
                 10_000,
                 finish_rendezvous_pair,
+            None,
             )
             .await;
         });
@@ -3095,6 +3128,7 @@ mod tests {
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan_y).then_some((pk, None, None)) },
                 10_000,
                 finish_rendezvous_pair,
+            None,
             )
             .await;
         });
@@ -3160,6 +3194,7 @@ mod tests {
                 },
                 park_ttl,
                 finish_rendezvous_pair,
+            None,
             )
             .await;
         });

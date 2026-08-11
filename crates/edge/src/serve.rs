@@ -1041,6 +1041,25 @@ pub async fn serve_front_door(
     }
 }
 
+/// #449: bounds the main data-plane path's own first-stream admission the same way
+/// the channel broker already bounds its own (`accept_bi_timeout` in
+/// `channel_broker.rs`) -- the Edge's QUIC transport keeps a connection's idle timer
+/// alive via automatic keepalive ACKs regardless of whether the peer ever sends an
+/// application byte, so a peer that completes the handshake and opens no stream
+/// (or opens one and never sends its role byte) held its connection-cap permit
+/// forever before this existed. `CLIENT_HELLO_READ_TIMEOUT`'s value (10s) is reused
+/// for consistency; a real Agent/Client's role byte follows immediately after
+/// `accept_bi`, so 10s is already generous slack, not a tight bound.
+const ROLE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// #449: the PoW-response read (role `'C'`) needs more slack than
+/// [`ROLE_DISPATCH_TIMEOUT`] -- unlike the other role-dispatch reads, the client is
+/// expected to spend real CPU time solving the challenge before it can respond, not
+/// just round-trip a fixed byte count. #413 already caps how much difficulty a
+/// client will *attempt*, bounding legitimate solve time; this bounds the wait on
+/// the Edge's side to something clearly larger than any legitimate capped solve.
+const POW_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Serve one connection by dispatching on its first stream's role byte. `'A'`
 /// registers an Agent tunnel (`token`); `'C'` runs a PoW-gated rendezvous, then
 /// routes and relays the same stream to the Agent. This is the unified
@@ -1050,14 +1069,20 @@ pub async fn serve_connection(
     state: &EdgeState<Connection>,
     challenge: &Challenge,
 ) -> Result<Option<(RoutingToken, u64)>, BoxError> {
-    let (mut send, mut recv) = conn.accept_bi().await?;
+    let (mut send, mut recv) = tokio::time::timeout(ROLE_DISPATCH_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| "serve_connection: no stream opened within the admission timeout (#449)")??;
     let mut role = [0u8; 1];
-    recv.read_exact(&mut role).await?;
+    tokio::time::timeout(ROLE_DISPATCH_TIMEOUT, recv.read_exact(&mut role))
+        .await
+        .map_err(|_| "serve_connection: role byte not received within the admission timeout (#449)")??;
 
     match role[0] {
         b'A' => {
             let mut token = [0u8; 32];
-            recv.read_exact(&mut token).await?;
+            tokio::time::timeout(ROLE_DISPATCH_TIMEOUT, recv.read_exact(&mut token))
+                .await
+                .map_err(|_| "serve_connection: token not received within the admission timeout (#449)")??;
             let token = RoutingToken(token);
             // #27 RB3 / #421: a revoked token stays down even though the agent
             // keeps reconnecting — refuse the registration instead of accepting
@@ -1095,7 +1120,9 @@ pub async fn serve_connection(
             send.write_all(&chal).await?;
 
             let mut req = [0u8; 40];
-            recv.read_exact(&mut req).await?;
+            tokio::time::timeout(POW_RESPONSE_TIMEOUT, recv.read_exact(&mut req))
+                .await
+                .map_err(|_| "serve_connection: PoW response not received within the timeout (#449)")??;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
             // #86 (ADR-0018): per-token rendezvous rate limit — PoW raises per-attempt
@@ -1805,6 +1832,17 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         eprintln!("ct-edge: max {n} concurrent ws-channel connections (CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS)");
         ConnectionCap::new(n as usize)
     });
+    // #450: the two QUIC Agent-Fabric channel-broker listeners (relay + rendezvous)
+    // spawned an unbounded task per accept, unlike every other public listener here.
+    // Same shed-cheaply posture, same default fraction of the general cap.
+    let channel_broker_cap = resolve_flood_limit(
+        std::env::var("CT_EDGE_MAX_CHANNEL_BROKER_CONNECTIONS").ok().as_deref(),
+        DEFAULT_MAX_CONNECTIONS / 2,
+    )
+    .map(|n| {
+        eprintln!("ct-edge: max {n} concurrent channel-broker connections (CT_EDGE_MAX_CHANNEL_BROKER_CONNECTIONS, #450)");
+        ConnectionCap::new(n as usize)
+    });
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
@@ -2386,6 +2424,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         match build_server_endpoint_from_ca(&ca, relay_addr, vec!["localhost".to_string()]) {
                             Ok((relay_ep, _)) => {
                                 let relay_az = authorizer.clone();
+                                let relay_cap = channel_broker_cap.clone();
                                 eprintln!("ct-edge: Agent-Fabric channel RELAY on {relay_addr} (#105/#72 AF4-relay, #109 concurrent)");
                                 tokio::spawn(async move {
                                     // #109-concurrent-b: drive the relay with a channel-keyed
@@ -2417,6 +2456,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         |a, b, now| {
                                             crate::channel_broker::finish_relay_pair(a, b, now)
                                         },
+                                        relay_cap,
                                     )
                                     .await;
                                 });
@@ -2429,6 +2469,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             "ct-edge: Agent-Fabric channel broker on {chan_addr} \
                              (authorize via {cp_url}, #81 SEC81c-c, #120 concurrent)"
                         );
+                        let rendezvous_cap = channel_broker_cap.clone();
                         tokio::spawn(async move {
                             // #120: drive the RENDEZVOUS endpoint with the same channel-keyed
                             // pairer that spawns each pair-completion on its own task, so a
@@ -2461,6 +2502,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 |a, b, now| {
                                     crate::channel_broker::finish_rendezvous_pair(a, b, now)
                                 },
+                                rendezvous_cap,
                             )
                             .await;
                         });

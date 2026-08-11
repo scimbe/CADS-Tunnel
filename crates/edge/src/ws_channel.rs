@@ -115,13 +115,19 @@ impl AsyncRead for WsByteStream {
         loop {
             if !self.read_buf.is_empty() {
                 let n = buf.remaining().min(self.read_buf.len());
-                for _ in 0..n {
-                    // `VecDeque::pop_front` is O(1); looping n times beats any extra
-                    // allocation for a `make_contiguous` + slice copy at this size.
-                    if let Some(b) = self.read_buf.pop_front() {
-                        buf.put_slice(&[b]);
-                    }
+                // #453: bulk-copy via `as_slices()` -- the two contiguous runs already
+                // backing the deque, zero allocation and zero extra copy (unlike
+                // `make_contiguous`, which WOULD copy to merge them into one). This is
+                // not "avoiding a copy the byte-at-a-time version didn't need" -- it's
+                // the same total bytes copied via few large `put_slice` calls instead of
+                // up to 16,384 single-byte ones per relayed chunk.
+                let (front, back) = self.read_buf.as_slices();
+                let from_front = n.min(front.len());
+                buf.put_slice(&front[..from_front]);
+                if from_front < n {
+                    buf.put_slice(&back[..n - from_front]);
                 }
+                self.read_buf.drain(..n);
                 return Poll::Ready(Ok(()));
             }
             if self.eof {

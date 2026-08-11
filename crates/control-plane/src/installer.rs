@@ -442,12 +442,30 @@ struct InstallerState {
 const CT_AGENT_SETUP_SH: &str = "https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh";
 const CT_AGENT_SETUP_PS1: &str = "https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1";
 
+/// #448: a self-hosting operator (this product's own stated audience) previously had
+/// no way to point this redirect at their own mirror without patching the crate --
+/// a single chokepoint on `raw.githubusercontent.com` for a censorship-resistant,
+/// explicitly self-hostable service. `CT_AGENT_SETUP_URL`/`CT_AGENT_SETUP_PS1_URL`
+/// override the default when set; unset behaves exactly as before (verified by the
+/// existing tests below, which set neither). Pinning to a release tag + publishing a
+/// SHA-256 for `channel.sh`/`channel.ps1` to verify (this issue's other half) is
+/// deliberately NOT done here -- it needs a real tagged `ct-agent` release to pin to,
+/// which doesn't exist yet (this workspace's other git-dependency pins are all by
+/// commit rev for the same reason); tracked separately, not attempted in this pass.
+fn ct_agent_setup_sh_url() -> String {
+    std::env::var("CT_AGENT_SETUP_URL").unwrap_or_else(|_| CT_AGENT_SETUP_SH.to_string())
+}
+
+fn ct_agent_setup_ps1_url() -> String {
+    std::env::var("CT_AGENT_SETUP_PS1_URL").unwrap_or_else(|_| CT_AGENT_SETUP_PS1.to_string())
+}
+
 async fn serve_install_sh() -> Redirect {
-    Redirect::temporary(CT_AGENT_SETUP_SH)
+    Redirect::temporary(&ct_agent_setup_sh_url())
 }
 
 async fn serve_install_ps1() -> Redirect {
-    Redirect::temporary(CT_AGENT_SETUP_PS1)
+    Redirect::temporary(&ct_agent_setup_ps1_url())
 }
 
 async fn serve_channel_sh(State(st): State<InstallerState>) -> Response {
@@ -637,6 +655,29 @@ mod tests {
         assert!(win.contains("$env:CT_CHANNEL_ROLE='accept';"), "responder -> accept");
         assert!(win.contains("$env:CT_CHANNEL_BROKER='45.133.9.145:4435';"), "ps broker env");
         assert!(win.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
+    }
+
+    #[test]
+    fn setup_script_urls_are_overridable_for_self_hosting_operators_448() {
+        // #448: a self-hosting operator must be able to point this at their own
+        // mirror without patching the crate. Unset -> today's exact default
+        // (matches install_routes_redirect_to_the_ct_agent_setup_scripts above,
+        // which sets neither and still asserts the raw.githubusercontent.com URL).
+        assert_eq!(ct_agent_setup_sh_url(), CT_AGENT_SETUP_SH);
+        assert_eq!(ct_agent_setup_ps1_url(), CT_AGENT_SETUP_PS1);
+
+        // SAFETY: this crate's test binary runs single-process; scoped strictly to
+        // this test's own two reads immediately below, restored before returning.
+        unsafe {
+            std::env::set_var("CT_AGENT_SETUP_URL", "https://mirror.example/setup.sh");
+            std::env::set_var("CT_AGENT_SETUP_PS1_URL", "https://mirror.example/setup.ps1");
+        }
+        assert_eq!(ct_agent_setup_sh_url(), "https://mirror.example/setup.sh");
+        assert_eq!(ct_agent_setup_ps1_url(), "https://mirror.example/setup.ps1");
+        unsafe {
+            std::env::remove_var("CT_AGENT_SETUP_URL");
+            std::env::remove_var("CT_AGENT_SETUP_PS1_URL");
+        }
     }
 
     #[test]
