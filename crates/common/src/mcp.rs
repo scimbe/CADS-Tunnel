@@ -12,6 +12,19 @@
 //! Envelope note: the frame envelope stays `noise::frame` (L2.1/L2.2) — JSON-RPC carries its own `id`
 //! for request/response correlation inside the body, so no richer wire envelope is required here; any
 //! version/type framing (the open L2.2 question) remains additive underneath this.
+//!
+//! **#476 — NOT YET WIRED into any production caller.** This module (and most of
+//! [`crate::a2a`] beyond [`crate::a2a::a2a_initiate`]/[`crate::a2a::a2a_respond`]) is reachable
+//! only from tests today — real, tested code, but nothing in this workspace's shipped binaries
+//! actually calls it yet. The security properties documented throughout this module (identity-
+//! keyed rate limiting, an input-size cap, schema-typed arguments, an idle timeout) describe what
+//! this dispatcher WILL enforce once wired up, not something protecting a live system right now
+//! — don't read a doc comment here as "this is happening in production today." Also worth noting
+//! for whoever wires this in: [`register_service_tools`]'s `MAX_SERVICE_INPUT_BYTES` (4 MiB) is
+//! currently unrepresentable on the `u16`-length-prefixed transport this module's own envelope
+//! note above describes (max ~64 KiB) — either that cap is dead policy sized for a different,
+//! not-yet-built transport, or the transport needs to change before this can carry real service
+//! input at that size. Resolve that mismatch as part of the wiring, not before.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

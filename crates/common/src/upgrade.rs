@@ -23,7 +23,7 @@
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Which transport an A2A session's data path is currently riding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,10 +286,11 @@ where
             return Ok(false);
         }
     };
-    send.write_all(&crate::noise::frame(
-        &UpgradeMsg::Offer { direct_endpoint: endpoint }.encode(),
-    ))
-    .await?;
+    // #481: routed through the guarded writer, not the bare `frame()` -- `endpoint` comes from
+    // a locally-sourced discovery function with no length check of its own; `frame()`'s
+    // `u16` length prefix silently truncates (and corrupts the stream) past 64 KiB, exactly
+    // the hazard `a2a::write_message` already exists to reject before writing anything.
+    crate::a2a::write_message(send, &UpgradeMsg::Offer { direct_endpoint: endpoint }.encode()).await?;
     let reply = crate::noise::read_frame(recv)
         .await
         .ok()
@@ -333,13 +334,14 @@ where
         _ => return Ok(false),
     };
     if dial(endpoint).await {
-        send.write_all(&crate::noise::frame(&UpgradeMsg::Ready.encode())).await?;
+        // #481: guarded writer, matching the Offer side -- these two payloads are tiny fixed
+        // encodings today, but routing every UpgradeMsg through the same guarded path means no
+        // future variant can silently reintroduce the truncation hazard by accident.
+        crate::a2a::write_message(send, &UpgradeMsg::Ready.encode()).await?;
         coord.confirm_upgraded(now);
         Ok(true)
     } else {
-        let _ = send
-            .write_all(&crate::noise::frame(&UpgradeMsg::Abort.encode()))
-            .await;
+        let _ = crate::a2a::write_message(send, &UpgradeMsg::Abort.encode()).await;
         Ok(false)
     }
 }
@@ -364,7 +366,7 @@ pub async fn drive_initiator_upgrade<F, Fut>(
     coord: &mut UpgradeCoordinator,
     now: u64,
     ctl: &tokio::sync::mpsc::UnboundedSender<crate::noise::PumpControl>,
-    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     discover_direct: F,
 ) -> io::Result<Option<String>>
 where
@@ -413,7 +415,7 @@ pub async fn drive_responder_upgrade<F, Fut>(
     coord: &mut UpgradeCoordinator,
     now: u64,
     ctl: &tokio::sync::mpsc::UnboundedSender<crate::noise::PumpControl>,
-    inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    inbound: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     dial: F,
 ) -> io::Result<Option<String>>
 where
@@ -564,7 +566,7 @@ where
     let expected_peer = *peer_noise_public;
     let (plain_r, plain_w) = tokio::io::split(local);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
     let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
 
     let coordinator = async move {
@@ -726,7 +728,7 @@ where
     };
     let (plain_r, plain_w) = tokio::io::split(local);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
     let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
 
     let coordinator = async move {
@@ -841,11 +843,11 @@ mod tests {
     // decodes into an inbound `Vec<u8>`). `Cutover` is not part of the negotiation, so it's ignored.
     async fn relay_control(
         mut ctl_rx: tokio::sync::mpsc::UnboundedReceiver<crate::noise::PumpControl>,
-        peer_inbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        peer_inbound: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) {
         while let Some(pc) = ctl_rx.recv().await {
             if let crate::noise::PumpControl::Send(bytes) = pc {
-                if peer_inbound.send(bytes).is_err() {
+                if peer_inbound.send(bytes).await.is_err() {
                     break;
                 }
             }
@@ -858,9 +860,9 @@ mod tests {
         // the multiplexed pump's control channels (no separate control stream) — the driver the
         // live wire-in uses. Two relay tasks stand in for the two pumps forwarding CONTROL frames.
         let (ctl_tx_i, ctl_rx_i) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_i, mut in_rx_i) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_i, mut in_rx_i) = tokio::sync::mpsc::channel(crate::noise::CONTROL_IN_CHANNEL_BOUND);
         let (ctl_tx_r, ctl_rx_r) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_r, mut in_rx_r) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_r, mut in_rx_r) = tokio::sync::mpsc::channel(crate::noise::CONTROL_IN_CHANNEL_BOUND);
         // initiator's outbound → responder's inbound, and vice versa.
         tokio::spawn(relay_control(ctl_rx_i, in_tx_r));
         tokio::spawn(relay_control(ctl_rx_r, in_tx_i));
@@ -895,9 +897,9 @@ mod tests {
         // The responder's direct dial fails → it sends Abort in-band; both stay on the relay and
         // the initiator records a failed attempt (backoff advances) — the negative of the above.
         let (ctl_tx_i, ctl_rx_i) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_i, mut in_rx_i) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_i, mut in_rx_i) = tokio::sync::mpsc::channel(crate::noise::CONTROL_IN_CHANNEL_BOUND);
         let (ctl_tx_r, ctl_rx_r) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_r, mut in_rx_r) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_r, mut in_rx_r) = tokio::sync::mpsc::channel(crate::noise::CONTROL_IN_CHANNEL_BOUND);
         tokio::spawn(relay_control(ctl_rx_i, in_tx_r));
         tokio::spawn(relay_control(ctl_rx_r, in_tx_i));
 

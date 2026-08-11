@@ -286,6 +286,12 @@ const PUMP_TAG_CUTOVER: u8 = 1;
 /// can still negotiate the cutover.
 const PUMP_TAG_CONTROL: u8 = 2;
 
+/// #457: `control_in`'s bound. The live driver reads exactly one control frame then stops
+/// reading for the rest of the session — generous headroom above that for legitimate
+/// coordination bursts, without letting a peer that keeps emitting CONTROL frames after the
+/// driver has moved on grow the queue without bound.
+pub const CONTROL_IN_CHANNEL_BOUND: usize = 32;
+
 /// An outbound instruction to [`noise_pump_multiplexed`], processed **in order** with the
 /// application byte stream. The ordering is the point: a driver that enqueues `Send(Ready)`
 /// then `Cutover` is guaranteed the `Ready` control frame lands on the wire *before* the
@@ -325,7 +331,7 @@ pub async fn noise_pump_multiplexed<RR, RW, DR, DW, PR, PW>(
     mut plain_read: PR,
     mut plain_write: PW,
     mut control_out: tokio::sync::mpsc::UnboundedReceiver<PumpControl>,
-    control_in: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    control_in: tokio::sync::mpsc::Sender<Vec<u8>>,
     direct: tokio::sync::oneshot::Receiver<(snow::TransportState, DR, DW)>,
 ) -> io::Result<()>
 where
@@ -478,16 +484,38 @@ where
             match pt[0] {
                 PUMP_TAG_CUTOVER => {
                     // Install the direct read side, then read subsequent frames from it. The peer
-                    // only sends CUTOVER after both sides handshaked direct, so this is present.
-                    if let Some(rx) = dir_in_rx.take() {
-                        if let Ok(entry) = rx.await {
-                            direct = Some(entry);
-                        }
+                    // only sends CUTOVER after both sides handshaked direct, so this is present --
+                    // but that's a PEER-behavior assumption, not something this side controls: if
+                    // the local direct dial actually failed, `dir_in_tx` was already dropped, `rx`
+                    // resolves `Err`, and falling through here used to leave `direct` unset while
+                    // the peer has already switched to writing on its own direct socket -- the
+                    // session silently stops making progress (still reading the now-abandoned
+                    // relay) with no error and nothing logged, until something else (the relay
+                    // closing) eventually surfaces it (#482). Fail loudly instead: this side can't
+                    // honor the cutover without a direct handle, so continuing would only stall.
+                    match dir_in_rx.take() {
+                        Some(rx) => match rx.await {
+                            Ok(entry) => direct = Some(entry),
+                            Err(_) => {
+                                return Err(io::Error::other(
+                                    "noise pump: peer signaled CUTOVER but this side's direct \
+                                     dial never completed (#482) -- cannot honor the cutover",
+                                ));
+                            }
+                        },
+                        // A second CUTOVER after the first already consumed dir_in_rx: harmless
+                        // (already on direct, or already errored above), not a protocol violation.
+                        None => {}
                     }
                 }
                 PUMP_TAG_CONTROL => {
-                    // Opaque to the pump — hand the payload to the driver (dropped receiver = no-op).
-                    let _ = control_in.send(pt[1..len].to_vec());
+                    // #457: bounded + try_send (drop-on-full/closed), not unbounded — the live
+                    // driver reads exactly once from this channel then stops for the rest of the
+                    // session, so a peer that keeps emitting CONTROL frames after that point must
+                    // not be able to grow this queue without bound (a post-handshake-authenticated
+                    // but not fully-trusted peer could otherwise memory-exhaust the other side).
+                    // Opaque to the pump either way — hand the payload to the driver, or drop it.
+                    let _ = control_in.try_send(pt[1..len].to_vec());
                 }
                 _ => {
                     plain_write.write_all(&pt[1..len]).await?;
@@ -531,7 +559,7 @@ where
     // Bridge the one-shot cutover into the ordered control channel (no other outbound control),
     // and drop the inbound-control receiver — this side never receives CONTROL frames.
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (in_tx, _in_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (in_tx, _in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
     // The direct session is known eagerly here — deliver it to the pump's late-bind channel
     // immediately, so a `Cutover` finds it already installed (this is the non-late-bound case).
     let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
@@ -760,9 +788,9 @@ mod tests {
 
         // Per-side in-band control channels: `ctl_*` = driver→pump (ordered), `in_*` = pump→driver.
         let (ctl_tx_a, ctl_rx_a) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_a, mut in_rx_a) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx_a, mut in_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
         let (ctl_tx_b, ctl_rx_b) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_b, mut in_rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx_b, mut in_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
 
         // Direct session known eagerly here — deliver it to each pump's late-bind channel up front.
         let (dir_tx_a, dir_rx_a) = tokio::sync::oneshot::channel();
@@ -852,9 +880,9 @@ mod tests {
         drop(b_pr_closed); // B outbound EOFs immediately (no B→A data)
 
         let (ctl_tx_a, ctl_rx_a) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_a, _in_rx_a) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx_a, _in_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
         let (_ctl_tx_b, ctl_rx_b) = tokio::sync::mpsc::unbounded_channel();
-        let (in_tx_b, _in_rx_b) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx_b, _in_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
 
         // The direct session is NOT delivered at start — the pumps run relay-only until we fire
         // these one-shots mid-stream (modeling the background dial+handshake finishing later).
@@ -896,6 +924,78 @@ mod tests {
         drop(ctl_tx_a);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), a).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), b).await;
+    }
+
+    #[tokio::test]
+    async fn noise_pump_multiplexed_errors_instead_of_silently_stalling_when_a_cutover_arrives_with_no_local_direct_handle_482() {
+        // #482: the peer only sends CUTOVER after ITS OWN direct handshake completed -- that's a
+        // peer-behavior assumption, not something this side controls. If THIS side's own direct
+        // dial actually failed (dir_in_tx dropped without ever sending), the old code fell through
+        // silently: `direct` stayed unset, this side kept reading the now-abandoned relay while the
+        // peer had already switched to writing on direct, and the session just stopped making
+        // progress with no error and nothing logged. Real proof: A has a genuine direct session and
+        // triggers a real Cutover; B's direct dial "failed" (its dir_tx is dropped, never sent) --
+        // B's pump must return a real Err naming this exact condition, not hang/stall silently.
+        let (relay_a, relay_b) = transport_pair();
+        let (direct_a, _direct_b) = transport_pair(); // B never gets a direct session
+
+        let (ar_w, ar_r) = tokio::io::duplex(1 << 16);
+        let (br_w, br_r) = tokio::io::duplex(1 << 16);
+        let (ad_w, ad_r) = tokio::io::duplex(1 << 16);
+        let (_bd_w, bd_r) = tokio::io::duplex(1 << 16);
+
+        let (mut a_plain_feed, a_plain_r) = tokio::io::duplex(1 << 16);
+        let (b_plain_w, _b_plain_out) = tokio::io::duplex(1 << 16);
+        let (a_pw, _a_pw_drain) = tokio::io::duplex(64);
+        let (b_pr_closed, b_pr) = tokio::io::duplex(64);
+        drop(b_pr_closed);
+
+        let (ctl_tx_a, ctl_rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_a, _in_rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(CONTROL_IN_CHANNEL_BOUND);
+        let (_ctl_tx_b, ctl_rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx_b, _in_rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(CONTROL_IN_CHANNEL_BOUND);
+
+        let (dir_tx_a, dir_rx_a) = tokio::sync::oneshot::channel();
+        // B's direct dial "fails" in this test (see below) -- `dir_tx_b` is dropped without ever
+        // sending, so nothing here constrains DR/DW by inference; annotate explicitly to match
+        // the concrete duplex-stream types this test actually wires up on the B side.
+        let (dir_tx_b, dir_rx_b) = tokio::sync::oneshot::channel::<(
+            snow::TransportState,
+            tokio::io::DuplexStream,
+            tokio::io::DuplexStream,
+        )>();
+
+        let a = tokio::spawn(noise_pump_multiplexed(
+            relay_a, br_r, ar_w, a_plain_r, a_pw, ctl_rx_a, in_tx_a, dir_rx_a,
+        ));
+        let b = tokio::spawn(noise_pump_multiplexed(
+            relay_b, ar_r, br_w, b_pr, b_plain_w, ctl_rx_b, in_tx_b, dir_rx_b,
+        ));
+
+        // A's own direct dial succeeded -- deliver it and trigger a real Cutover.
+        dir_tx_a.send((direct_a, bd_r, ad_w)).ok().unwrap();
+        // B's direct dial "failed": drop dir_tx_b without ever sending. B's `rx.await` on its own
+        // dir_in_rx resolves Err the moment this drops.
+        drop(dir_tx_b);
+        drop(ad_r); // unused (A writes direct outbound but nothing reads it in this test)
+
+        a_plain_feed.write_all(b"hello").await.unwrap();
+        a_plain_feed.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        ctl_tx_a.send(PumpControl::Cutover).unwrap(); // A writes a real CUTOVER frame on the relay
+
+        let b_result = tokio::time::timeout(std::time::Duration::from_secs(5), b)
+            .await
+            .expect("B's pump must terminate, not hang, on an unhonorable cutover")
+            .expect("task join");
+        let err = b_result.expect_err("B must return a real Err, not silently stall (#482)");
+        assert!(
+            err.to_string().contains("482"),
+            "error must name the actual condition, got: {err}"
+        );
+
+        drop(ctl_tx_a);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), a).await;
     }
 
     #[test]

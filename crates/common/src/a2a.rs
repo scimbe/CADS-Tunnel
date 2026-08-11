@@ -211,7 +211,13 @@ pub async fn a2a_send<W: AsyncWrite + Unpin>(
     }
     let mut ct = vec![0u8; plaintext.len() + 16];
     let n = session.write_message(plaintext, &mut ct).map_err(noise_io)?;
-    send.write_all(&frame(&ct[..n])).await?;
+    // #475: two writes (length prefix, then ciphertext) instead of `frame(&ct[..n])`, which
+    // would allocate a THIRD buffer and copy `ct[..n]` into it a second time just to prepend
+    // a 2-byte length -- `ct` is already sized exactly to `n`'s worth of real data plus the
+    // untouched AEAD-tag slack, so writing it directly avoids that redundant allocation+copy
+    // on every single send.
+    send.write_all(&(n as u16).to_be_bytes()).await?;
+    send.write_all(&ct[..n]).await?;
     Ok(())
 }
 
@@ -269,29 +275,67 @@ pub async fn a2a_recv_framed<R: AsyncRead + Unpin>(
     Ok((tag, m))
 }
 
+/// #477: [`a2a_drain_relay_until_cutover`] is a brief handoff seam (drain whatever arrived on
+/// the relay before the peer's already-in-flight cutover marker catches up), not a bulk
+/// transfer path — bound both its total bytes and its wall-clock so a peer that keeps
+/// streaming DATA and never sends [`A2A_TAG_CUTOVER`] can't drive the receiver toward
+/// unbounded memory growth or an unbounded wait.
+pub const DRAIN_UNTIL_CUTOVER_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DRAIN_UNTIL_CUTOVER_DEADLINE: Duration = Duration::from_secs(30);
+
 /// **Receiver side of the #104 cutover (H2).** Drain application DATA messages from the RELAY
 /// session **in order** until the [`A2A_TAG_CUTOVER`] marker arrives, returning them; after this
 /// the caller switches to reading the DIRECT session (`a2a_recv_framed`). Because the marker is
 /// in-order on the same reliable framed session, no application bytes are lost or duplicated at
 /// the seam. An unknown tag is a protocol error.
+///
+/// #477: bounded to [`DRAIN_UNTIL_CUTOVER_MAX_BYTES`] total and
+/// [`DRAIN_UNTIL_CUTOVER_DEADLINE`] wall-clock — this is meant to be a brief handoff, not a bulk
+/// transfer path; a peer that keeps streaming DATA past either bound is treated as a protocol
+/// error rather than allowed to grow the receiver's memory or hold it open indefinitely.
 pub async fn a2a_drain_relay_until_cutover<R: AsyncRead + Unpin>(
     relay_recv: &mut R,
     relay_session: &mut TransportState,
 ) -> io::Result<Vec<Vec<u8>>> {
-    let mut drained = Vec::new();
-    loop {
-        let (tag, payload) = a2a_recv_framed(relay_recv, relay_session).await?;
-        match tag {
-            A2A_TAG_DATA => drained.push(payload),
-            A2A_TAG_CUTOVER => return Ok(drained),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown a2a frame tag during cutover drain",
-                ))
+    tokio::time::timeout(DRAIN_UNTIL_CUTOVER_DEADLINE, async {
+        let mut drained = Vec::new();
+        let mut total = 0usize;
+        loop {
+            let (tag, payload) = a2a_recv_framed(relay_recv, relay_session).await?;
+            match tag {
+                A2A_TAG_DATA => {
+                    total += payload.len();
+                    if total > DRAIN_UNTIL_CUTOVER_MAX_BYTES {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "a2a: cutover drain exceeded {DRAIN_UNTIL_CUTOVER_MAX_BYTES} bytes \
+                                 without a CUTOVER marker (#477)"
+                            ),
+                        ));
+                    }
+                    drained.push(payload);
+                }
+                A2A_TAG_CUTOVER => return Ok(drained),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown a2a frame tag during cutover drain",
+                    ))
+                }
             }
         }
-    }
+    })
+    .await
+    .unwrap_or_else(|_elapsed| {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "a2a: cutover drain exceeded {DRAIN_UNTIL_CUTOVER_DEADLINE:?} without a CUTOVER \
+                 marker (#477)"
+            ),
+        ))
+    })
 }
 
 /// **#104 direct-P2P — bring a freshly-connected direct link up as an A2A Noise_IK session.**
