@@ -37,16 +37,30 @@ impl StaticKeypair {
 }
 
 /// Generate a fresh Noise static keypair.
+///
+/// #479: generates the raw X25519 bytes via `x25519_dalek::StaticSecret` (built with
+/// its own `zeroize` feature, so ITS internal storage is wiped on drop too) instead of
+/// `snow::Builder::generate_keypair()` -- vendored `snow` 0.9.6 has no zeroization
+/// anywhere in its source (confirmed: `grep -rn "zeroize\|impl Drop"` over its crate
+/// returns nothing), so the intermediate `snow::Keypair` that briefly held the raw
+/// private key during generation was freed un-wiped, before this function's own
+/// zeroizing `StaticKeypair` was even constructed. `StaticSecret`'s bytes are the same
+/// X25519 private scalar `snow`'s own generator would have produced (both are just 32
+/// CSPRNG bytes, clamped per RFC 7748) -- this changes nothing about the resulting
+/// key's cryptographic properties or wire compatibility, only how it's generated.
 pub fn generate_static_keypair() -> StaticKeypair {
-    let params: snow::params::NoiseParams =
-        NOISE_PARAMS.parse().expect("valid noise params");
-    let kp = snow::Builder::new(params)
-        .generate_keypair()
-        .expect("keypair generation");
+    // x25519-dalek's own "zeroize" feature only derives `Zeroize` (a manual, callable
+    // wipe), NOT `ZeroizeOnDrop` -- confirmed by reading its vendored source
+    // (`grep -rn "ZeroizeOnDrop" x25519-dalek-2.0.1/src/` finds nothing, only
+    // `derive(Zeroize)`). A bare `StaticSecret` would still leak on drop exactly like
+    // the old `snow::Keypair` did. `zeroize::Zeroizing<T>` (already a dependency)
+    // wraps any `Zeroize` type and calls `.zeroize()` for real when IT drops.
+    let secret = zeroize::Zeroizing::new(x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng));
+    let public_key = x25519_dalek::PublicKey::from(&*secret);
     let mut public = [0u8; 32];
     let mut private = [0u8; 32];
-    public.copy_from_slice(&kp.public);
-    private.copy_from_slice(&kp.private);
+    public.copy_from_slice(public_key.as_bytes());
+    private.copy_from_slice(&secret.to_bytes());
     StaticKeypair { public, private }
 }
 
@@ -587,6 +601,46 @@ mod tests {
         // actually ran, not a claim about safe access to freed memory in general.
         let after = unsafe { std::ptr::read(ptr) };
         assert_ne!(after, original_private, "private key bytes must be wiped, not left in freed memory");
+        assert_eq!(after, [0u8; 32], "zeroize overwrites with zero bytes");
+    }
+
+    #[test]
+    fn generate_static_keypairs_intermediate_secret_also_zeroizes_on_drop_479() {
+        // #479: the OLD generator (snow::Builder::generate_keypair()) left the raw private
+        // key sitting un-wiped in a freed snow::Keypair for a window before this crate's own
+        // StaticKeypair::private (proven zeroizing above) was even constructed. The NEW
+        // generator wraps its intermediate x25519_dalek::StaticSecret in
+        // zeroize::Zeroizing -- x25519-dalek's own "zeroize" feature only derives
+        // `Zeroize` (a manual, callable wipe), confirmed by reading its vendored source
+        // (`derive(Zeroize)`, no `ZeroizeOnDrop` anywhere) -- a bare `StaticSecret` does
+        // NOT wipe itself on drop, so `Zeroizing` (which DOES run `.zeroize()` in its own
+        // real `Drop` impl) is load-bearing here, not decorative.
+        //
+        // Wrapped in a struct with a leading `[u8; 32]` pad field, matching
+        // static_keypair_zeroizes_the_private_key_on_drop's own layout (`public` before
+        // `private`) -- an EARLIER version of this test put the target at the very start
+        // of its own heap allocation and got spurious garbage in the first ~16 bytes on
+        // read-after-free: the global allocator's own free-list bookkeeping writes
+        // pointer-sized data into the START of a freed small block immediately on
+        // `dealloc`, which can run right after (and clobber) a correct zeroize. Padding
+        // keeps the target away from that allocator-owned region, the same way the
+        // sibling test already (accidentally) does by having `public` first.
+        struct Padded {
+            _pad: [u8; 32],
+            secret: zeroize::Zeroizing<x25519_dalek::StaticSecret>,
+        }
+        let boxed = Box::new(Padded {
+            _pad: [0u8; 32],
+            secret: zeroize::Zeroizing::new(x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng)),
+        });
+        let original = boxed.secret.to_bytes();
+        assert_ne!(original, [0u8; 32], "sanity: a freshly generated secret is not all-zero");
+        let ptr = std::ptr::addr_of!(*boxed.secret) as *const [u8; 32];
+        drop(boxed);
+        // SAFETY: same freed-memory-read pattern as the sibling test above -- reading memory
+        // this process just freed, before any other allocation can reuse it.
+        let after = unsafe { std::ptr::read(ptr) };
+        assert_ne!(after, original, "the intermediate Zeroizing<StaticSecret>'s bytes must be wiped too, not just this crate's own copy");
         assert_eq!(after, [0u8; 32], "zeroize overwrites with zero bytes");
     }
 

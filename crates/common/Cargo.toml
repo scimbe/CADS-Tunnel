@@ -9,6 +9,11 @@ license-file.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = "2"
+# #479: generate the Noise static keypair's raw X25519 bytes ourselves, in a type whose
+# own private-key storage zeroizes on drop, instead of trusting snow::Builder's internal
+# keygen path (whose intermediate structures are never zeroized -- see noise.rs).
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+rand = "0.8"
 snow = "0.9"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
