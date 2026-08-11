@@ -297,6 +297,13 @@ impl<H: Clone> EdgeState<H> {
         // teardown for this token can't observe "not yet bound" and wipe this
         // bind out from under it a moment later -- see registration_lock's doc.
         let _guard = self.registration_lock.lock_safe();
+        // #411: checked inside the same lock hold, not by each caller separately
+        // -- neither the QUIC 'H' bind arm nor the TCP-fallback 'B' arm checked
+        // revocation before calling this, so a revoked token could still claim a
+        // public hostname. Fixed once, here, so no caller can forget it.
+        if self.is_revoked(&token) {
+            return false;
+        }
         let mut hosts = self.hosts.write_safe();
         match hosts.get(&key) {
             Some(existing) if *existing != token => false,
@@ -328,8 +335,15 @@ impl<H: Clone> EdgeState<H> {
             return;
         };
         let mut hosts = self.hosts.write_safe();
+        // #426: `gelb_hosts` is keyed purely by hostname (Gelb/Grün is a property
+        // of the hostname's own cert tier, not of any one token), so it was never
+        // cleared here -- a hostname re-bound to a different tenant after revoke
+        // silently inherited whatever tier flag the PREVIOUS tenant's token left
+        // behind, independent of the new tenant's own actual cert state.
+        let mut gelb_hosts = self.gelb_hosts.write_safe();
         for host in owned {
             hosts.remove(&host);
+            gelb_hosts.remove(&host);
         }
     }
 
@@ -745,6 +759,13 @@ impl<H: Clone> EdgeState<H> {
     /// [`remove_registration`](Self::remove_registration).
     pub fn remove(&self, token: &RoutingToken) {
         let _guard = self.registration_lock.lock_safe();
+        self.remove_locked(token);
+    }
+
+    /// Shared by [`remove`](Self::remove) and [`revoke_token`](Self::revoke_token)
+    /// -- assumes `registration_lock` is already held by the caller (it is NOT
+    /// reentrant, so this must never call back into `remove`).
+    fn remove_locked(&self, token: &RoutingToken) {
         // #359: unlike remove_registration's single-id retain, this always
         // drops the token's *entire* entry -- gauges move by however many
         // registrations it actually held, not by a flat 1, and only if it
@@ -768,12 +789,22 @@ impl<H: Clone> EdgeState<H> {
     /// is what makes a customer's "revoke" actually stop the tunnel — without the
     /// revoked set, the Agent's reconnect loop would simply register again.
     pub fn revoke_token(&self, token: &RoutingToken) {
+        // #421: hold registration_lock across BOTH the revoked-insert and the
+        // teardown -- otherwise a concurrent register call could read
+        // `is_revoked() == false` before the insert below, then complete its
+        // own (separately locked) registration AFTER this function's teardown
+        // has already run, leaving the token both revoked and registered,
+        // permanently (nothing else ever sweeps it again). See
+        // `register_with_candidate_unless_revoked`'s own doc for the
+        // registration-side half of this fix.
+        let _guard = self.registration_lock.lock_safe();
         self.revoked.write_safe().insert(token.clone());
-        self.remove(token); // also clears the token's hostname routes (#23 BP4a)
+        self.remove_locked(token); // also clears the token's hostname routes (#23 BP4a)
         // #281: also drop any host_auth grant(s) for this token, so a revoked
         // token can never re-authorize a hostname bind on a later reconnect --
-        // clear_hosts_for (inside remove()) only wipes the *active* routing
-        // table, not the separate, otherwise-permanent authorization grant.
+        // clear_hosts_for (inside remove_locked()) only wipes the *active*
+        // routing table, not the separate, otherwise-permanent authorization
+        // grant.
         self.clear_host_auth_for(token);
     }
 
@@ -813,11 +844,62 @@ impl<H: Clone> EdgeState<H> {
     /// Returns the registration id, or `None` if the token is revoked — the
     /// registration path the serve loop uses so a revoked token stays down even
     /// as its Agent keeps reconnecting.
+    ///
+    /// #421: checked and registered under ONE `registration_lock` hold, not a
+    /// separate `is_revoked` read followed by a separately-locked `register`
+    /// call — see [`register_with_candidate_unless_revoked`]'s doc for the
+    /// exact TOCTOU that split shape allowed.
     pub fn register_unless_revoked(&self, token: RoutingToken, handle: H) -> Option<u64> {
+        let _guard = self.registration_lock.lock_safe();
         if self.is_revoked(&token) {
             return None;
         }
-        Some(self.register(token, handle))
+        Some(self.register_locked(token, handle))
+    }
+
+    /// [`register_with_candidate`], but atomically refuses a revoked token
+    /// (#411, #421): holds `registration_lock` across the revocation check AND
+    /// the register itself, so a concurrent [`revoke_token`](Self::revoke_token)
+    /// can't complete inside the gap between a separate check and a separate
+    /// register call. Before this, `is_revoked` and the register were two
+    /// independent lock acquisitions — a revoke that ran entirely between them
+    /// left the token both revoked and registered, permanently (nothing else
+    /// ever sweeps it again, since `revoke_token`'s own teardown had already
+    /// run). Proved with a real multi-threaded stress test
+    /// (`revoke_and_register_race_never_leaves_a_revoked_token_registered_421`),
+    /// not just that the functions look right in isolation.
+    pub fn register_with_candidate_unless_revoked(
+        &self,
+        token: RoutingToken,
+        handle: H,
+        candidate: SocketAddr,
+    ) -> Option<u64> {
+        let _guard = self.registration_lock.lock_safe();
+        if self.is_revoked(&token) {
+            return None;
+        }
+        let id = self.register_locked(token.clone(), handle);
+        self.candidates.write_safe().insert(token, candidate);
+        Some(id)
+    }
+
+    /// [`park_tcp_agent`], but atomically refuses a revoked token (#411): the
+    /// TCP-fallback registration path previously had no revocation check at
+    /// all, so a revoked token could still be queued as a waiting agent
+    /// forever. Holds `registration_lock` across the check for the same reason
+    /// as [`register_with_candidate_unless_revoked`].
+    pub fn park_tcp_agent_unless_revoked(
+        &self,
+        token: RoutingToken,
+    ) -> Option<oneshot::Receiver<BoxedStream>> {
+        let _guard = self.registration_lock.lock_safe();
+        if self.is_revoked(&token) {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.tcp_agents.lock_safe().entry(token).or_default().push_back(tx);
+        self.tcp_agent_parked.notify_one();
+        Some(rx)
     }
 
     /// Whether `token` currently has at least one live Agent tunnel.
