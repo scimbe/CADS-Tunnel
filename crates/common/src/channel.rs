@@ -1314,7 +1314,13 @@ mod card_hex {
         s
     }
     fn from_hex(s: &str) -> Option<Vec<u8>> {
-        if s.len() % 2 != 0 {
+        // #417: the old `s.len() % 2 != 0` guard only bounded *byte* length, not char
+        // boundaries -- a multi-byte UTF-8 character (fully attacker-controlled, this is
+        // reached straight from untrusted JSON) can leave `&s[i..i+2]` slicing mid-character,
+        // which panics rather than returning an error. Requiring every byte to be an ASCII
+        // hex digit first guarantees the string is single-byte-per-char, so byte indexing
+        // can never land off a char boundary.
+        if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         (0..s.len())
@@ -1343,6 +1349,26 @@ mod card_hex {
                 .ok_or_else(|| serde::de::Error::custom("invalid hex"))?;
             let a: [u8; 64] = v.try_into().map_err(|_| serde::de::Error::custom("expected 64 bytes"))?;
             Ok(a)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::from_hex;
+
+        #[test]
+        fn from_hex_rejects_non_ascii_input_without_panicking_417() {
+            // #417: a multi-byte UTF-8 char used to slice mid-character and panic, even
+            // though the total *byte* length was even. Real attacker-controlled input --
+            // this is reached straight from untrusted JSON via b32::deserialize/b64::deserialize.
+            assert_eq!(from_hex("é0"), None, "2-byte char first, even byte length");
+            assert_eq!(from_hex("0é"), None, "2-byte char second");
+            assert_eq!(from_hex("€aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), None, "3-byte char");
+            assert_eq!(from_hex("🦀aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), None, "4-byte char");
+            // Still correctly accepts and rejects plain ASCII as before.
+            assert_eq!(from_hex("ab"), Some(vec![0xab]));
+            assert_eq!(from_hex("zz"), None, "non-hex ASCII still rejected");
+            assert_eq!(from_hex("a"), None, "odd length still rejected");
         }
     }
 }

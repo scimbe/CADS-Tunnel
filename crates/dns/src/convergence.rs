@@ -291,6 +291,31 @@ impl ConvergenceCoalescer {
 
         match existing_or_new_rx {
             Ok(tx) => {
+                // #418: the map entry is removed by an RAII guard, not just after
+                // `poll().await` returns -- `poll().await` is a real cancellation point
+                // (the whole `coalesce` future can be dropped mid-poll if ITS caller times
+                // out or is itself cancelled), and a plain post-await `remove` never runs
+                // in that case. Without the guard, the stale `inflight` entry outlives the
+                // poller forever: every later caller for the same key sees `Some(rx)`,
+                // subscribes to a channel whose sender is already gone, and immediately
+                // gets `NoNodesReachable` from the "sender dropped" fail-safe below --
+                // permanently, since no real poll for that key is ever attempted again.
+                struct RemoveOnDrop<'a> {
+                    inflight: &'a std::sync::Mutex<
+                        std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<Convergence>>>,
+                    >,
+                    key: &'a str,
+                }
+                impl Drop for RemoveOnDrop<'_> {
+                    fn drop(&mut self) {
+                        self.inflight
+                            .lock()
+                            .expect("convergence coalescer mutex poisoned")
+                            .remove(self.key);
+                    }
+                }
+                let _guard = RemoveOnDrop { inflight: &self.inflight, key };
+
                 // This caller is the poller -- bounded by `poll_slots` (#265): only
                 // subscribers (the `Err` arm below) skip this, since they don't run
                 // `poll` themselves and would otherwise wait on both this permit AND
@@ -304,7 +329,6 @@ impl ConvergenceCoalescer {
                     _ => Convergence::Saturated,
                 };
                 let _ = tx.send(Some(result.clone()));
-                self.inflight.lock().expect("convergence coalescer mutex poisoned").remove(key);
                 result
             }
             Err(mut rx) => {
@@ -603,6 +627,62 @@ mod tests {
                 .await;
         }
         assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 3, "three sequential calls, three fresh polls");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_poller_does_not_permanently_poison_its_key_418() {
+        // #418: before the RAII guard, the `inflight` map entry was only removed
+        // AFTER `poll().await` returned -- if the poller's own task is aborted
+        // mid-poll (a real scenario: its caller timed out, or the task was itself
+        // cancelled), that cleanup never ran. Every LATER call for the same key
+        // would then see the stale entry, subscribe to a channel whose sender is
+        // already gone, and immediately get NoNodesReachable from the
+        // sender-dropped fail-safe -- permanently, since no real poll for that key
+        // is ever attempted again. Real proof: abort an in-flight poller, then
+        // confirm a fresh call for the SAME key actually runs its own poll (not a
+        // fail-safe echo of the aborted one).
+        let coalescer = Arc::new(ConvergenceCoalescer::new());
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        let c = coalescer.clone();
+        let pc = poll_count.clone();
+        let s = started.clone();
+        let handle = tokio::spawn(async move {
+            c.coalesce("zone/name/expected", || {
+                let pc = pc.clone();
+                let s = s.clone();
+                async move {
+                    pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    s.notify_one();
+                    // Never resolves on its own -- only abort() ends this poller.
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+            })
+            .await
+        });
+        started.notified().await; // the poller has genuinely started (registered the key)
+        handle.abort();
+        let _ = handle.await; // reap the aborted task
+
+        // The key must be usable again -- a fresh, real poll, not a permanently
+        // poisoned entry.
+        let result = coalescer
+            .coalesce("zone/name/expected", || {
+                let poll_count = poll_count.clone();
+                async move {
+                    poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Convergence::NoNodesReachable
+                }
+            })
+            .await;
+        assert_eq!(result, Convergence::NoNodesReachable, "the fresh poll's own real result, not a fail-safe echo");
+        assert_eq!(
+            poll_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the aborted poller's one increment, plus a genuine second poll after cleanup -- not stuck at 1"
+        );
     }
 
     #[tokio::test(start_paused = true)]

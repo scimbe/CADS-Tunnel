@@ -629,10 +629,12 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
  "tower",
+ "x509-parser",
  "zeroize",
 ]
 

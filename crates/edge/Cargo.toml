@@ -8,6 +8,7 @@ license-file.workspace = true
 [dependencies]
 ct-common = { path = "../common" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 # TCP keepalive (#229) -- see ct-agent's Cargo.toml (github.com/scimbe/ct-agent)
 # for the matching comment; applied on the Edge's side of the TLS-TCP fallback too,
@@ -47,6 +48,10 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["test-util"] }
 ct-control-plane = { path = "../control-plane" }
 tower = { version = "0.5", features = ["util"] }
+# #425: real DER parsing to verify issued certs' actual not_before/not_after fields
+# against parsed output, not just that the code compiles. Already in the workspace's
+# transitive dependency tree (rcgen/quinn), pinned here as a direct test-only dep.
+x509-parser = "0.17"
 http-body-util = "0.1"
 ed25519-dalek = "2"
 serde_json = "1"

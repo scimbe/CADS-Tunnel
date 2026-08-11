@@ -55,6 +55,11 @@ fn edge_server_transport() -> Result<Arc<quinn::TransportConfig>, BoxError> {
 pub struct Ca {
     cert: rcgen::Certificate,
     key: KeyPair,
+    /// #425: the CA root's own `not_after`, kept alongside the built `cert` so
+    /// `issue` can clamp every leaf's validity to stay inside it -- a leaf
+    /// certificate outliving the root that signed it would be trusted right up
+    /// until the (already-expired) root fails its own check, not a real bound.
+    not_after: time::OffsetDateTime,
 }
 
 /// #278: without this, `key`'s serialized DER (the root-of-trust private key,
@@ -119,15 +124,50 @@ impl Ca {
     /// and lives on the Edge's runtime volume, never in the repo.
     pub fn load_or_create(key_pem_path: &str, common_name: &str) -> Result<Self, BoxError> {
         match std::fs::read_to_string(key_pem_path) {
-            Ok(pem) => Self::from_key(KeyPair::from_pem(&pem)?, common_name),
+            Ok(pem) => {
+                // #424: `Drop for Ca` (above) zeroizes the final `KeyPair`'s own internal
+                // representation, but `pem` here is a separate, ordinary `String` holding
+                // the same root-of-trust key material -- it sat unzeroized on the heap
+                // after this function returned until #278's own gap (before this fix)
+                // reappeared one level up the call stack. `Zeroizing<String>` wipes it on
+                // drop regardless of which branch below returns.
+                let pem = zeroize::Zeroizing::new(pem);
+                // #424: re-assert the restrictive mode on every load too, not just at
+                // creation -- `write_owner_only`'s atomic 0600 only guarantees the mode at
+                // the moment of creation; nothing previously re-checked it on a later load
+                // (e.g. after a misconfigured deploy/volume mount widened it).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o600);
+                    std::fs::set_permissions(key_pem_path, perms)?;
+                }
+                Self::from_key(KeyPair::from_pem(&pem)?, common_name)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = KeyPair::generate()?;
-                write_owner_only(key_pem_path, key.serialize_pem().as_bytes())?;
+                // #424: same zeroizing treatment for the create path's own intermediate
+                // PEM string.
+                let pem = zeroize::Zeroizing::new(key.serialize_pem());
+                write_owner_only(key_pem_path, pem.as_bytes())?;
                 Self::from_key(key, common_name)
             }
             Err(e) => Err(e.into()),
         }
     }
+
+    /// #425: the CA root's own validity window -- long-lived (this is the
+    /// root-of-trust every Client pins, meant to outlive many leaf rotations), but
+    /// bounded rather than rcgen's effectively-unbounded default. 10 years matches
+    /// common internal-CA practice; the signing key itself is what actually rotates
+    /// (a fresh `load_or_create` call with a new path), not this certificate.
+    const CA_VALIDITY_DAYS: i64 = 3652; // ~10 years
+    /// #425: leaf certificate validity -- short-lived by design (frequent rotation
+    /// bounds the blast radius of a compromised leaf key), matching this project's
+    /// own external-ACME precedent (Let's Encrypt's ~90-day leaves) rather than
+    /// rcgen's effectively-unbounded default. Always inside the CA root's own
+    /// window (enforced in `issue`, below).
+    const LEAF_VALIDITY_DAYS: i64 = 90;
 
     /// Build the CA certificate deterministically from an existing signing key,
     /// so a reloaded key yields a root that still validates previously issued
@@ -143,8 +183,12 @@ impl Ca {
         params
             .distinguished_name
             .push(DnType::CommonName, common_name);
+        let now = time::OffsetDateTime::now_utc();
+        let not_after = now + time::Duration::days(Self::CA_VALIDITY_DAYS);
+        params.not_before = now;
+        params.not_after = not_after;
         let cert = params.self_signed(&key)?;
-        Ok(Self { cert, key })
+        Ok(Self { cert, key, not_after })
     }
 
     /// The CA root certificate (DER) that Clients must trust.
@@ -159,7 +203,13 @@ impl Ca {
         sans: Vec<String>,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), BoxError> {
         let leaf_key = KeyPair::generate()?;
-        let params = CertificateParams::new(sans)?;
+        let mut params = CertificateParams::new(sans)?;
+        // #425: bounded, short-lived validity (see LEAF_VALIDITY_DAYS's own doc) --
+        // clamped to never outlive the CA root that signs it (`self.not_after`), so a
+        // near-end-of-life root can't mint a leaf that outlives the root's own trust.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = (now + time::Duration::days(Self::LEAF_VALIDITY_DAYS)).min(self.not_after);
         let leaf = params.signed_by(&leaf_key, &self.cert, &self.key)?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         Ok((leaf.der().clone(), key))
@@ -446,6 +496,44 @@ mod tests {
         assert_eq!(mode, 0o600, "CA key file must be owner-read/write only, got {mode:o}");
 
         let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn ca_root_and_issued_leaves_have_bounded_real_validity_windows_425() {
+        // #425: before this fix, rcgen's own default (effectively unbounded --
+        // spanning centuries) applied to both the CA root and every issued leaf.
+        // Real proof against actual parsed certificate fields, not just that the
+        // code compiles: both windows are real, bounded, start at-or-before now,
+        // and the leaf's window sits entirely inside the CA root's own window.
+        use x509_parser::prelude::FromDer;
+
+        let ca = Ca::new("ct-edge-ca-425").unwrap();
+        let (leaf_der, _key) = ca.issue(vec!["example.test".into()]).unwrap();
+
+        let root_der_bytes = ca.root_der();
+        let (_, root_cert) = x509_parser::certificate::X509Certificate::from_der(&root_der_bytes).unwrap();
+        let (_, leaf_cert) = x509_parser::certificate::X509Certificate::from_der(&leaf_der).unwrap();
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let root_not_before = root_cert.validity().not_before.timestamp();
+        let root_not_after = root_cert.validity().not_after.timestamp();
+        let leaf_not_before = leaf_cert.validity().not_before.timestamp();
+        let leaf_not_after = leaf_cert.validity().not_after.timestamp();
+
+        assert!(root_not_before <= now, "CA root's own not_before must not be in the future");
+        assert!(
+            root_not_after < now + Ca::CA_VALIDITY_DAYS * 86_400 + 3600,
+            "CA root must NOT have rcgen's effectively-unbounded default validity"
+        );
+        assert!(leaf_not_before <= now, "leaf's not_before must not be in the future");
+        assert!(
+            leaf_not_after < now + Ca::LEAF_VALIDITY_DAYS * 86_400 + 3600,
+            "leaf must NOT have rcgen's effectively-unbounded default validity"
+        );
+        assert!(
+            leaf_not_after <= root_not_after,
+            "a leaf must never outlive the CA root that signed it"
+        );
     }
 
     /// The dual-transport Edge with a CA-issued leaf is trusted over QUIC by a
