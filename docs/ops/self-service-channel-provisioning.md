@@ -135,24 +135,37 @@ per `docs/agent-onboarding.md`'s handler I/O contract).
 `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` accept a `host:port` directly since #214
 (`6d85644`) — a bare IP is no longer required.
 
-## Known gap: no CLI to mint a cross-account `SignedChannelInvitation` (#234)
+## Cross-account invitations: `ct-agent channel invite` (was #234, now scimbe/ct-agent#9)
 
 Everything above (`operator-init`, `channel init`, `provision-link-channel.sh`) provisions a
-channel between two sides that already coordinate their key material directly — it's not the
-same mechanism as a `SignedChannelInvitation` (the cross-account invitation type documented in
-`docs/reference` — the API endpoint shapes are real and verified, but there is currently no
-`ct-agent` CLI subcommand to actually *issue* one, only the `ct_common::channel` library
-primitives). If you need to invite an account you don't otherwise coordinate with directly, there
-is no tool for that today; see #234.
+channel between two sides that already coordinate their key material directly. For a genuinely
+cross-account case — inviting an identity you don't otherwise coordinate holder/noise material
+with — use `ct-agent channel invite` (fixed in `scimbe/ct-agent@2bbdd2e`, released `v0.4.1`+):
 
-## Known open issue: "edge broker refused the channel join"
+```bash
+CT_CHANNEL_OPERATOR_KEY=<operator private key, from channel operator-init> \
+CT_INVITE_CHANNEL=<64-hex channel id> \
+CT_INVITE_IDENTITY=<64-hex invitee IDENTITY pubkey — not a holder key you already have> \
+CT_INVITE_DIRECTION=initiate|accept|both \
+CT_INVITE_RIGHTS=read|write|readwrite   # optional, default readwrite \
+CT_INVITE_DELEGABLE=true|false          # optional, default false \
+CT_INVITE_EXPIRES=<unix seconds> \
+  ct-agent channel invite
+```
 
-At the time of writing, steps 1–3 above are verified working end-to-end against
-the live deployment (both `POST`s return 2xx, both sides derive the same
-`channel_id`). **Step 4 currently fails** — the edge broker refuses the join
-immediately, in a tight retry loop, for a freshly-provisioned channel. Root cause
-not yet identified from the client side; see `CADS-Tunnel#214` for the live
-repro (exact commands, channel ids, and the working/non-working pieces isolated)
-— needs core-side investigation (likely somewhere between the public
-`POST /me/channels/:channel/members` write path and the edge's internal
-`/internal/channel/authorize` read path). Update this doc once resolved.
+Pure local compute, same shape as `channel grant` — no network call, no private key leaves the
+box. Prints the signed invitation hex; the invitee redeems it against
+`ct_common::channel::redeem_invitation` (receiving-side flow, already real and unchanged).
+
+## Known open issue: "edge broker refused the channel join" — fixed (CADS-Tunnel#231)
+
+Historically, step 4 above failed with the edge broker refusing the join immediately in a tight
+retry loop for a freshly-provisioned channel (originally tracked as `CADS-Tunnel#214` in this
+doc — that issue number was later repurposed for something unrelated; the actual fix landed
+under `CADS-Tunnel#231`). Root-caused and fixed 2026-08-10: exponential backoff on definitive
+refusals, a negative-cache for repeated refusals, and a timeout-budget-mismatch fix in
+`channel_authorize`. Live-verified against the real deployment with a freshly-built `ct-agent`
+client. **If you hit this today, first confirm you're on a client built past that fix** — a
+client built against an older attestation-format pin (anything before `ct-agent` v0.4.0) fails
+differently, with `POST /me/channels/:channel/members` itself returning `noise_attestation does
+not verify against the holder key` rather than reaching step 4 at all; see `scimbe/ct-agent#12`.
