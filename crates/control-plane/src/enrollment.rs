@@ -59,6 +59,17 @@ pub fn verify_join_proof(token: &JoinToken, pubkey: &AgentPublicKey, proof: &[u8
 }
 
 /// In-memory enrollment service.
+///
+/// **#447: test-only scaffolding, not a production path** — confirmed via
+/// `grep -rn "Enrollment::new"` across this crate: every call site is inside a
+/// `#[cfg(test)]` module (`client.rs`, `http.rs`, `issuance.rs`'s own tests).
+/// The real, durable enrollment path is [`crate::storage::SqliteEnrollment`],
+/// whose [`redeem_with_proof`](crate::storage::SqliteEnrollment::redeem_with_proof)
+/// DOES verify proof-of-possession. [`Self::redeem`] below deliberately takes no
+/// `proof` argument and never calls [`verify_join_proof`] — that's fine as long
+/// as this stays test-only; if this module is ever reused for a real production
+/// path, `redeem` must gain a `proof` parameter and call `verify_join_proof`
+/// first, matching `SqliteEnrollment`'s own contract.
 #[derive(Default)]
 pub struct Enrollment {
     /// token bytes -> (owning tenant, consumed?)

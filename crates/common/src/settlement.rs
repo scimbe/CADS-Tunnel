@@ -679,6 +679,16 @@ impl Escrow {
     /// the held record's `to`/`from` — the receipt is what authorizes moving the money, so a forged
     /// or mismatched one can't drain the escrow. Idempotency: the hold is removed on release, so a
     /// replayed receipt hits [`EscrowError::UnknownHold`] rather than paying twice.
+    ///
+    /// **#484: release is deliberately all-or-nothing** — the full held amount pays out
+    /// regardless of `receipt.units_consumed`, which is carried for external accounting
+    /// only and is not load-bearing here. Not a security bug (release still requires the
+    /// paying party's own signature on the receipt, so no payout happens without their
+    /// consent) — a design/semantics point worth stating explicitly, since [`Hold`]'s own
+    /// doc describes the held amount as "a guaranteed floor (roughly a cap)," language
+    /// that could otherwise read as though partial release were implemented. Whether
+    /// partial release (crediting only `units_consumed`'s worth, refunding the remainder)
+    /// should actually be implemented is a real payout-semantics decision, not made here.
     pub fn release(&mut self, receipt: &UsageReceipt) -> Result<(), EscrowError> {
         let rec = self
             .held

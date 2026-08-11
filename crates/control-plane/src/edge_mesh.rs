@@ -277,16 +277,23 @@ impl SqliteEdgeMesh {
         edge_id: &str,
         now: i64,
     ) -> rusqlite::Result<()> {
-        let conn = self.conn.lock_safe();
+        // #446: the delete-then-insert wasn't wrapped in a real SQL transaction --
+        // both ran on the same locked connection (safe against a CONCURRENT writer
+        // in this same process), but a crash between the two (power loss, OOM-kill)
+        // could still persist the delete without the insert, losing this token's
+        // ownership row entirely. A transaction makes the pair atomic against that.
+        let mut conn = self.conn.lock_safe();
+        let tx = conn.transaction()?;
         if let Some(h) = hostname {
-            conn.execute("DELETE FROM mesh_ownership WHERE hostname = ?1 AND token != ?2", params![h, token])?;
+            tx.execute("DELETE FROM mesh_ownership WHERE hostname = ?1 AND token != ?2", params![h, token])?;
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO mesh_ownership (token, hostname, edge_id, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(token) DO UPDATE SET
                  hostname = excluded.hostname, edge_id = excluded.edge_id, updated_at = excluded.updated_at",
             params![token, hostname, edge_id, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
