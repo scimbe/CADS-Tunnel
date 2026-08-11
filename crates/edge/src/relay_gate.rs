@@ -418,8 +418,8 @@ mod tests {
     async fn copy_bidirectional_with_idle_timeout_forwards_bytes_correctly_both_directions_427() {
         // #427: the idle-timeout wrapper must not change the actual relay behavior --
         // real bytes in both directions still arrive intact.
-        let (mut a, mut a_peer) = tokio::io::duplex(64);
-        let (mut b, mut b_peer) = tokio::io::duplex(64);
+        let (a, mut a_peer) = tokio::io::duplex(64);
+        let (b, mut b_peer) = tokio::io::duplex(64);
 
         let relay_task = tokio::spawn(async move {
             let mut a = a;
