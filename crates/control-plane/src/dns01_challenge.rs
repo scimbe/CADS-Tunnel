@@ -162,14 +162,27 @@ async fn publish(
             Convergence::NoNodesReachable => {
                 eprintln!("ct-cp: dns01-challenge: could not reach any deSEC node to confirm convergence for {record_name}; proceeding anyway");
             }
-            Convergence::TimedOut { lagging } => {
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!(
-                        "published, but not yet converged across all deSEC nodes after {DEFAULT_TIMEOUT:?} -- still lagging: {}",
-                        lagging.join(", ")
-                    ),
-                ));
+            // #488: `lagging` (resolved and answered, just doesn't have the value
+            // yet -- ordinary deSEC replication delay) and `unreachable`
+            // (resolved but never answered anything at all -- a reachability
+            // fault specific to THIS control plane, e.g. a firewall rule or
+            // routing black hole) used to be one conflated list, reading as "the
+            // DNS provider is slow to converge" even when the real fault was one
+            // specific path being unreachable from here -- a materially
+            // different thing for an operator to go fix. Report both, clearly
+            // separated, so the message actually points at the right cause.
+            Convergence::TimedOut { lagging, unreachable } => {
+                let mut detail = format!("published, but not yet converged across all deSEC nodes after {DEFAULT_TIMEOUT:?}");
+                if !lagging.is_empty() {
+                    detail.push_str(&format!(" -- still lagging (resolved and reachable, not yet updated): {}", lagging.join(", ")));
+                }
+                if !unreachable.is_empty() {
+                    detail.push_str(&format!(
+                        " -- unreachable from this control plane (resolved but never answered at all -- check network/firewall to these nodes specifically, not deSEC's own propagation): {}",
+                        unreachable.join(", ")
+                    ));
+                }
+                return Err((StatusCode::GATEWAY_TIMEOUT, detail));
             }
             // #265: distinct from TimedOut -- this control plane, not deSEC, is the
             // bottleneck (too many distinct hostnames publishing concurrently). The

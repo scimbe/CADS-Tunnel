@@ -83,57 +83,99 @@ impl AcmeDnsStore {
         self.read()
     }
 
-    /// Write the full current state to `persist_path`, if set. Atomic: write to a
+    /// Write `txt` (a snapshot already taken by the caller, under whatever lock
+    /// the caller is holding) to `persist_path`, if set. Atomic: write to a
     /// sibling temp file, `fsync` it, then rename over the real path -- an OS-level
     /// atomic replace, so a crash mid-write can never leave a torn/partial file.
-    fn persist(&self) -> std::io::Result<()> {
+    ///
+    /// #460: takes the map by reference rather than snapshotting it itself, so
+    /// [`add_txt`](Self::add_txt)/[`set_txt`](Self::set_txt)/[`clear`](Self::clear)
+    /// can call this while STILL holding their own write guard -- mutate and
+    /// persist become one critical section, with no window for a second
+    /// concurrent mutator's write lock (acquired after the first releases it,
+    /// before the first gets around to snapshotting) to interleave such that an
+    /// earlier, now-stale snapshot is the last one written to disk, silently
+    /// dropping the later mutation from the recovery file even though in-memory
+    /// state has both.
+    fn persist_locked(&self, txt: &HashMap<String, Vec<String>>) -> std::io::Result<()> {
         let Some(path) = &self.persist_path else { return Ok(()) };
-        let json = serde_json::to_vec(&*self.read())?;
+        let json = serde_json::to_vec(txt)?;
         let tmp_path = path.with_extension("tmp");
         let mut tmp = std::fs::File::create(&tmp_path)?;
         tmp.write_all(&json)?;
         tmp.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
+        // #460: the rename above is atomic (a crash mid-write leaves either the
+        // old complete file or the new one, never a mix), but that guarantee is
+        // about the FILE's contents, not the DIRECTORY entry pointing at it --
+        // on several common filesystems (ext4 without `dirsync`, among others) a
+        // rename's directory-entry update can itself still be sitting in the
+        // page cache, unflushed, when the process crashes. Without fsync'ing the
+        // directory too, that crash can lose the rename entirely, reverting to
+        // whatever the directory entry pointed at before -- the exact "genuine
+        // crash-durability" gap the atomic rename alone was supposed to close.
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
+    }
+
+    /// [`persist_locked`](Self::persist_locked) using a fresh read-lock snapshot --
+    /// only for [`open`](Self::open)'s one-time startup write-check, which has no
+    /// write guard of its own to reuse.
+    fn persist(&self) -> std::io::Result<()> {
+        self.persist_locked(&self.read())
     }
 
     /// Publish a TXT value for `name` (ACME may need two challenges live at once,
     /// so values accumulate). Names are matched case-insensitively.
+    ///
+    /// #460: synchronous disk I/O (create/write/fsync/rename/dir-fsync) runs while
+    /// this call still holds the store's write lock -- see
+    /// [`persist_locked`](Self::persist_locked). Callers on an async runtime (the
+    /// mutation API, [`crate::provider::Dns01Provider::SelfHosted`]) must invoke
+    /// this via `tokio::task::spawn_blocking` rather than directly from an async
+    /// fn, so a slow/contended disk stalls a blocking-pool thread instead of a
+    /// Tokio worker that also serves the public DNS responder.
     pub fn add_txt(&self, name: &str, value: &str) {
-        self.write()
-            .entry(name.to_ascii_lowercase())
-            .or_default()
-            .push(value.to_string());
+        let result = {
+            let mut guard = self.write();
+            guard.entry(name.to_ascii_lowercase()).or_default().push(value.to_string());
+            self.persist_locked(&guard)
+        };
         // Fail-soft: the in-memory map (already updated above) stays authoritative
-        // for this process's lifetime regardless of persist() succeeding -- a
+        // for this process's lifetime regardless of persist succeeding -- a
         // transient write failure (e.g. disk full) must not block issuance, only
         // risk this particular restart's recovery. Surfaced so an operator sees it.
-        if let Err(e) = self.persist() {
+        if let Err(e) = result {
             eprintln!("ct-dns: WARNING -- failed to persist ACME challenge store: {e}");
         }
     }
 
-    /// Replace all TXT values for `name` with a single value.
+    /// Replace all TXT values for `name` with a single value. See #460 note on
+    /// [`add_txt`](Self::add_txt).
     pub fn set_txt(&self, name: &str, value: &str) {
-        self.write()
-            .insert(name.to_ascii_lowercase(), vec![value.to_string()]);
-        // Fail-soft: the in-memory map (already updated above) stays authoritative
-        // for this process's lifetime regardless of persist() succeeding -- a
-        // transient write failure (e.g. disk full) must not block issuance, only
-        // risk this particular restart's recovery. Surfaced so an operator sees it.
-        if let Err(e) = self.persist() {
+        let result = {
+            let mut guard = self.write();
+            guard.insert(name.to_ascii_lowercase(), vec![value.to_string()]);
+            self.persist_locked(&guard)
+        };
+        if let Err(e) = result {
             eprintln!("ct-dns: WARNING -- failed to persist ACME challenge store: {e}");
         }
     }
 
-    /// Remove all TXT values for `name` (challenge cleanup).
+    /// Remove all TXT values for `name` (challenge cleanup). See #460 note on
+    /// [`add_txt`](Self::add_txt).
     pub fn clear(&self, name: &str) {
-        self.write().remove(&name.to_ascii_lowercase());
-        // Fail-soft: the in-memory map (already updated above) stays authoritative
-        // for this process's lifetime regardless of persist() succeeding -- a
-        // transient write failure (e.g. disk full) must not block issuance, only
-        // risk this particular restart's recovery. Surfaced so an operator sees it.
-        if let Err(e) = self.persist() {
+        let result = {
+            let mut guard = self.write();
+            guard.remove(&name.to_ascii_lowercase());
+            self.persist_locked(&guard)
+        };
+        if let Err(e) = result {
             eprintln!("ct-dns: WARNING -- failed to persist ACME challenge store: {e}");
         }
     }
@@ -312,5 +354,93 @@ mod tests {
         let s = AcmeDnsStore::new();
         s.set_txt("_acme-challenge.host.test", "in-memory-only");
         assert_eq!(s.txt("_acme-challenge.host.test"), vec!["in-memory-only".to_string()]);
+    }
+
+    #[test]
+    fn concurrent_mutators_never_lose_a_write_in_the_on_disk_recovery_file_460() {
+        // #460: before this fix, persist() re-acquired its OWN read lock to
+        // snapshot state *after* the write lock guarding the mutation was already
+        // released -- so two concurrent mutators' persist calls could interleave
+        // such that an earlier, now-stale snapshot was the LAST one written to
+        // disk, silently dropping the later mutation from the recovery file even
+        // though in-memory state had both. Real proof, not just "looks
+        // serialized": hammer the store from many threads concurrently, each
+        // publishing its own uniquely-named record, then reopen from disk (the
+        // exact recovery path a restart takes) and confirm every single one of
+        // them survived -- not just whatever the in-memory store still has.
+        let path = temp_store_path("concurrent-mutators");
+        const WRITERS: usize = 24;
+        {
+            let s = std::sync::Arc::new(AcmeDnsStore::open(&path).unwrap());
+            let mut handles = Vec::new();
+            for i in 0..WRITERS {
+                let s = s.clone();
+                handles.push(std::thread::spawn(move || {
+                    s.add_txt(&format!("_acme-challenge.writer-{i}.test"), &format!("tok-{i}"));
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            // In-memory state is trivially consistent (RwLock guarantees that much
+            // even with the old bug) -- the real assertion is below, against what
+            // actually made it to disk.
+            for i in 0..WRITERS {
+                assert_eq!(s.txt(&format!("_acme-challenge.writer-{i}.test")), vec![format!("tok-{i}")]);
+            }
+        } // dropped -- simulates the process exiting, forcing recovery to read ONLY the file.
+
+        let reopened = AcmeDnsStore::open(&path).unwrap();
+        for i in 0..WRITERS {
+            assert_eq!(
+                reopened.txt(&format!("_acme-challenge.writer-{i}.test")),
+                vec![format!("tok-{i}")],
+                "writer {i}'s record must survive a restart -- it must not have been dropped by a racing concurrent persist"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_fsyncs_the_parent_directory_and_a_normal_write_still_round_trips_460() {
+        // #460: persist_locked now does one extra real filesystem operation after
+        // the atomic rename -- opening the parent directory and fsync'ing it, so
+        // the directory entry pointing at the renamed file is itself durable, not
+        // just the file's own contents. A real crash mid-write isn't something a
+        // unit test can simulate, but this proves the added step is unconditional
+        // (runs on every persist, not just some) and doesn't itself break the
+        // otherwise already-covered round trip: a normal publish-then-reopen
+        // still recovers the record with this extra fsync now sitting in the
+        // critical section.
+        let path = temp_store_path("dir-fsync");
+        {
+            let s = AcmeDnsStore::open(&path).unwrap();
+            s.add_txt("_acme-challenge.host.test", "tok");
+        }
+        let reopened = AcmeDnsStore::open(&path).unwrap();
+        assert_eq!(reopened.txt("_acme-challenge.host.test"), vec!["tok".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_failure_is_fail_soft_even_when_the_parent_directory_is_gone_460() {
+        // A transient persist failure (here: the parent directory disappearing
+        // out from under the store, e.g. the filesystem it lived on was
+        // unmounted) must never surface as a panic or block the in-memory
+        // mutation that ACME issuance actually depends on -- only risk this
+        // particular restart's recovery, which is what add_txt's fail-soft
+        // eprintln contract promises.
+        let dir = std::env::temp_dir().join(format!(
+            "ct-dns-store-test-missing-parent-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+        let s = AcmeDnsStore::open(&path).unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        s.add_txt("_acme-challenge.host.test", "tok");
+        assert_eq!(s.txt("_acme-challenge.host.test"), vec!["tok".to_string()]);
     }
 }

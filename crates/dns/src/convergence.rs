@@ -76,8 +76,19 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum Convergence {
     /// Every node that answered is serving the expected value.
     Converged { nodes: usize, took: Duration },
-    /// Ran out of time; these nodes were still behind.
-    TimedOut { lagging: Vec<String> },
+    /// Ran out of time. #488: split into two separately-tracked sets that used
+    /// to be conflated into one ambiguous `lagging` list --
+    /// `lagging` is nodes that DID resolve and respond (a TXT miss the node's
+    /// own SOA proved was answered by a live server) but simply don't have the
+    /// expected value yet -- ordinary replication delay, "the provider is
+    /// slow". `unreachable` is nodes that resolved but never answered ANY
+    /// query (TXT or SOA) on ANY of their addresses -- something on the path
+    /// between here and that one specific node is broken (a firewall rule, a
+    /// routing black hole), a materially different fault from provider lag,
+    /// and one the caller/operator needs to know about separately since it is
+    /// a fact about reachability from THIS vantage point, not about the
+    /// provider's own propagation.
+    TimedOut { lagging: Vec<String>, unreachable: Vec<String> },
     /// Not one node could be reached — this says something about *our* network,
     /// not about propagation, so the caller must not read it as failure.
     NoNodesReachable,
@@ -103,7 +114,16 @@ pub async fn wait_for_convergence(
 ) -> Convergence {
     let started = Instant::now();
     let deadline = started + timeout;
-    let addrs = resolve_nodes(nodes).await;
+    // #485: resolve_nodes itself now resolves every hostname concurrently (see
+    // its own doc comment), but this outer timeout is a second, independent
+    // safety net -- even a fully concurrent resolution phase is still one
+    // round-trip per host to a resolver that could, in principle, hang past
+    // this call's own deadline before the first probe round ever starts.
+    // Bounding it to `timeout` means resolution can never itself eat MORE than
+    // the caller's whole stated budget; a resolution phase that blows through
+    // it is treated exactly like every host failing to resolve (fail-open, not
+    // a hang).
+    let addrs = tokio::time::timeout(timeout, resolve_nodes(nodes)).await.unwrap_or_default();
     if addrs.is_empty() {
         return Convergence::NoNodesReachable;
     }
@@ -120,32 +140,42 @@ pub async fn wait_for_convergence(
         for (host, ips) in &addrs {
             set.spawn(probe_node(host.clone(), ips.clone(), zone.to_string(), name.to_string(), expected.to_string()));
         }
-        let mut lagging = Vec::new();
-        let mut answered = 0usize;
-        while let Some(res) = set.join_next().await {
-            let (node_answered, lag) = res.expect("probe_node task panicked");
-            if node_answered {
-                answered += 1;
-            }
-            if let Some(l) = lag {
-                lagging.push(l);
-            }
-        }
+        let (answered, mut lagging, mut unreachable) = drain_probe_round(set).await;
         if answered == 0 {
             return Convergence::NoNodesReachable;
         }
-        if lagging.is_empty() {
+        if lagging.is_empty() && unreachable.is_empty() {
             return Convergence::Converged { nodes: answered, took: started.elapsed() };
         }
         if Instant::now() >= deadline {
             // Concurrent probes finish in arbitrary order -- sort so the
-            // operator-facing lagging list is stable/reproducible, not an
-            // artifact of which task happened to resolve first.
+            // operator-facing lists are stable/reproducible, not an artifact of
+            // which task happened to resolve first.
             lagging.sort();
-            return Convergence::TimedOut { lagging };
+            unreachable.sort();
+            return Convergence::TimedOut { lagging, unreachable };
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// #488: the outcome of probing one node, kept as three explicit cases rather
+/// than the ambiguous `(bool, Option<String>)` this replaced -- a node that
+/// resolved and answered but simply doesn't have the expected value YET
+/// ([`Lagging`](Self::Lagging)) is a materially different fault from a node
+/// that never answered anything at all ([`Unreachable`](Self::Unreachable)):
+/// the first is ordinary provider replication lag, the second is a fact about
+/// reachability from this specific vantage point (a firewall rule, a routing
+/// black hole) that an operator needs to go fix somewhere entirely different.
+#[derive(Debug, Clone, PartialEq)]
+enum ProbeOutcome {
+    /// The node is serving the expected value.
+    Converged,
+    /// The node resolved and answered (a TXT miss whose SOA probe proved the
+    /// server is live), but not yet with the expected value.
+    Lagging(String),
+    /// Every address for this node failed even the SOA liveness probe.
+    Unreachable(String),
 }
 
 /// Probe one node -- try each of its resolved addresses in turn (typically one
@@ -156,25 +186,20 @@ pub async fn wait_for_convergence(
 /// outbound UDP/53 over IPv6 stalled while IPv4 to the very same node answered
 /// immediately. That would have reintroduced this module's own root cause (a
 /// check quietly covering fewer nodes than it claims to) one layer down.
-///
-/// Returns `(answered, lagging_entry)`: `answered` is whether ANY address for
-/// this node responded at all (TXT or SOA); `lagging_entry` is `Some(host)` (or
-/// an "(unreachable...)" note) when this node should count as lagging/unclear,
-/// `None` when it's confirmed converged.
 async fn probe_node(
     host: String,
     ips: Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>,
     zone: String,
     name: String,
     expected: String,
-) -> (bool, Option<String>) {
+) -> ProbeOutcome {
     for (_ip, resolver) in &ips {
         match txt_at(resolver, &name).await {
             Ok(values) => {
                 return if values.iter().any(|v| v == &expected) {
-                    (true, None)
+                    ProbeOutcome::Converged
                 } else {
-                    (true, Some(host))
+                    ProbeOutcome::Lagging(host)
                 };
             }
             // This cannot be read off the TXT query's own error: hickory renders
@@ -188,16 +213,52 @@ async fn probe_node(
             // real lag; no SOA answer means we could not reach this node at all.
             Err(_) => {
                 if soa_reachable(resolver, &zone).await {
-                    return (true, Some(host));
+                    return ProbeOutcome::Lagging(host);
                 }
             }
         }
     }
     // Every address for this node failed even the SOA probe -- that IS a real
-    // gap in this check's coverage, unlike a single-address miss. Surface it as
-    // lagging (conservative: keep waiting) rather than quietly dropping the
-    // node from consideration.
-    (false, Some(format!("{host} (unreachable on all {} address(es))", ips.len())))
+    // gap in this check's coverage, unlike a single-address miss.
+    ProbeOutcome::Unreachable(format!("{host} (unreachable on all {} address(es))", ips.len()))
+}
+
+/// Drain a round of [`probe_node`] tasks, tallying reachable-and-converged
+/// nodes, reachable-but-lagging nodes, and unreachable nodes.
+///
+/// #490: a panicked probe task is treated exactly like a node whose every
+/// address failed the SOA probe -- conservatively "unreachable this round" --
+/// rather than propagating the panic (what `res.expect("probe_node task
+/// panicked")` used to do) out of the whole convergence wait. `probe_node`
+/// itself has no unwrap of its own, so triggering this needs a genuine panic
+/// inside the DNS resolution library, but the blast radius of letting it
+/// propagate was disproportionate: it would take down the WHOLE wait, not
+/// just that one node's probe.
+async fn drain_probe_round(mut set: tokio::task::JoinSet<ProbeOutcome>) -> (usize, Vec<String>, Vec<String>) {
+    let mut answered = 0usize;
+    let mut lagging = Vec::new();
+    let mut unreachable = Vec::new();
+    while let Some(res) = set.join_next().await {
+        let outcome = match res {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                eprintln!(
+                    "ct-dns: WARNING -- a convergence probe task panicked ({join_err}); treating that \
+                     node as unreachable this round rather than aborting the whole convergence wait"
+                );
+                ProbeOutcome::Unreachable("(a probe task panicked)".to_string())
+            }
+        };
+        match outcome {
+            ProbeOutcome::Converged => answered += 1,
+            ProbeOutcome::Lagging(host) => {
+                answered += 1;
+                lagging.push(host);
+            }
+            ProbeOutcome::Unreachable(host) => unreachable.push(host),
+        }
+    }
+    (answered, lagging, unreachable)
 }
 
 /// #301: coalesce concurrent [`wait_for_convergence`] calls for the same
@@ -358,6 +419,14 @@ impl ConvergenceCoalescer {
 /// every single probe call -- a long convergence wait (12 nodes, up to 60 poll
 /// rounds over 300s) previously meant up to ~720 identical Resolver
 /// constructions for the same, unchanging set of (node, ip) pairs.
+///
+/// #485: this used to be a strictly sequential `for host in nodes` loop -- 12
+/// sequential DNS lookups, run BEFORE [`wait_for_convergence`]'s own deadline
+/// was ever checked, so a resolver that's slow or partly unreachable could by
+/// itself take on the order of minutes before the first probe round even
+/// started, potentially exceeding the caller's whole stated timeout. Now
+/// delegates to [`resolve_concurrently`], the same JoinSet-per-host construct
+/// probing already uses (#354).
 async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>)> {
     let Ok(system) = Resolver::builder_tokio() else {
         return Vec::new();
@@ -365,16 +434,50 @@ async fn resolve_nodes(nodes: &[&str]) -> Vec<(String, Vec<(std::net::IpAddr, st
     let Ok(system) = system.build() else {
         return Vec::new();
     };
-    let mut out = Vec::new();
-    for host in nodes {
-        if let Ok(lookup) = system.lookup_ip(format!("{host}.")).await {
+    let system = std::sync::Arc::new(system);
+    resolve_concurrently(nodes, move |host| {
+        let system = system.clone();
+        async move {
+            let lookup = system.lookup_ip(format!("{host}.")).await.ok()?;
             let ips: Vec<_> = lookup
                 .iter()
                 .filter_map(|ip| build_resolver(ip).map(|r| (ip, std::sync::Arc::new(r))))
                 .collect();
-            if !ips.is_empty() {
-                out.push((host.to_string(), ips));
+            if ips.is_empty() {
+                None
+            } else {
+                Some(ips)
             }
+        }
+    })
+    .await
+}
+
+/// #485: resolve every host in `nodes` concurrently (one task per host, joined
+/// as they complete) by awaiting `lookup` for each -- generic/injectable
+/// purely so a test can prove the concurrency itself with a synthetic,
+/// controlled delay, no real DNS involved, exactly as
+/// [`ConvergenceCoalescer::coalesce`] already does for its own concurrency
+/// claim. A host whose `lookup` returns `None` (fails to resolve) or whose
+/// task panics is simply dropped from the result -- same fail-open philosophy
+/// as a stale node hostname elsewhere in this module: resolution trouble for
+/// one host degrades the check rather than blocking or crashing the rest.
+async fn resolve_concurrently<F, Fut, T>(nodes: &[&str], lookup: F) -> Vec<(String, T)>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut set = tokio::task::JoinSet::new();
+    for host in nodes {
+        let host = host.to_string();
+        let fut = lookup(host.clone());
+        set.spawn(async move { (host, fut.await) });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok((host, Some(value))) = res {
+            out.push((host, value));
         }
     }
     out
@@ -493,6 +596,107 @@ mod tests {
         assert_eq!(count, NODES);
         assert_eq!(sequential, DELAY * NODES as u32, "sequential really did sum the delays");
         assert_eq!(concurrent, DELAY, "concurrent (JoinSet) ran every node's delay in parallel, not summed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_concurrently_resolves_every_host_in_parallel_not_sequentially_485() {
+        // #485: hostname resolution ahead of the poll loop used to be a strict
+        // sequential for-loop over resolve_nodes' hosts -- 12 sequential DNS
+        // lookups could by themselves exceed wait_for_convergence's own
+        // deadline before the first probe round even started. resolve_nodes now
+        // delegates to resolve_concurrently, the exact JoinSet-per-host
+        // construct probing itself already used (#354, proved above) -- prove
+        // resolve_concurrently the same way: a controlled, in-process delay
+        // under tokio's paused virtual clock, no real DNS involved (see #354's
+        // own comment for why a real-network timing comparison isn't a sound
+        // basis for a hermetic assertion).
+        const DELAY: Duration = Duration::from_millis(100);
+        let hosts: Vec<&str> = DESEC_NODES.to_vec();
+
+        let started = tokio::time::Instant::now();
+        let out = resolve_concurrently(&hosts, |host| async move {
+            tokio::time::sleep(DELAY).await;
+            Some(host)
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.len(), hosts.len(), "every host resolved");
+        assert_eq!(
+            elapsed, DELAY,
+            "all {} lookups ran concurrently (one DELAY total), not summed to {} * DELAY",
+            hosts.len(),
+            hosts.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_concurrently_skips_hosts_that_fail_to_resolve_or_whose_lookup_panics_485() {
+        // Fail-open per host, same philosophy as a stale node hostname
+        // elsewhere in this module: one host's resolution trouble (a lookup
+        // returning nothing, or -- defensively -- even a genuine panic inside
+        // it) must not take the other hosts down with it or drop them from the
+        // result.
+        let hosts = ["resolves-fine", "resolves-to-nothing", "lookup-panics"];
+        let out = resolve_concurrently(&hosts, |host| async move {
+            match host.as_str() {
+                "resolves-fine" => Some("addr-for-resolves-fine"),
+                "resolves-to-nothing" => None,
+                _ => panic!("simulated resolver panic for {host}"),
+            }
+        })
+        .await;
+        assert_eq!(out, vec![("resolves-fine".to_string(), "addr-for-resolves-fine")]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_probe_task_is_folded_in_as_unreachable_not_propagated_490() {
+        // #490: `res.expect("probe_node task panicked")` used to propagate a
+        // panicked probe task's panic out of the WHOLE convergence wait -- one
+        // node's probe panicking took every other node's probe down with it.
+        // drain_probe_round is the exact mechanism wait_for_convergence's poll
+        // loop now uses to join a round of probes; spawn a genuinely panicking
+        // task alongside normal Converged/Lagging outcomes (real panics, not a
+        // simulated JoinError -- JoinSet has no public way to construct one) and
+        // confirm the round still completes with a real, usable result instead
+        // of propagating the panic. Also doubles as an #488 proof: Converged and
+        // Lagging are tallied into `answered`/`lagging` while the panicked task
+        // lands in `unreachable`, not merged into `lagging`.
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async { ProbeOutcome::Converged });
+        set.spawn(async { panic!("simulated probe_node panic") });
+        set.spawn(async { ProbeOutcome::Lagging("lagging-node".to_string()) });
+
+        let (answered, lagging, unreachable) = drain_probe_round(set).await;
+
+        assert_eq!(answered, 2, "the converged node and the reachable-but-lagging node both counted as answered; the panicked task did not");
+        assert_eq!(lagging, vec!["lagging-node".to_string()], "the panicked task must not be merged into the lagging list");
+        assert_eq!(
+            unreachable,
+            vec!["(a probe task panicked)".to_string()],
+            "the panicked task is folded in as unreachable, not lost or propagated out of this function"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reachable_but_lagging_node_and_a_genuinely_unreachable_node_are_tracked_separately_488() {
+        // #488: before this fix, Convergence::TimedOut carried one ambiguous
+        // `lagging` list that conflated "resolved and answered, just doesn't
+        // have the value yet" (ordinary provider replication lag) with
+        // "resolved but never answered anything at all" (a reachability fault
+        // specific to this vantage point). drain_probe_round is the real
+        // aggregation wait_for_convergence's TimedOut branch is built from --
+        // prove the two outcomes land in their own separately-tracked sets.
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async { ProbeOutcome::Converged });
+        set.spawn(async { ProbeOutcome::Lagging("slow-but-reachable.desec.io".to_string()) });
+        set.spawn(async { ProbeOutcome::Unreachable("firewalled.desec.io (unreachable on all 2 address(es))".to_string()) });
+
+        let (answered, lagging, unreachable) = drain_probe_round(set).await;
+
+        assert_eq!(answered, 2, "Converged and Lagging both counted as answered -- Unreachable did not");
+        assert_eq!(lagging, vec!["slow-but-reachable.desec.io".to_string()]);
+        assert_eq!(unreachable, vec!["firewalled.desec.io (unreachable on all 2 address(es))".to_string()]);
     }
 
     #[tokio::test]

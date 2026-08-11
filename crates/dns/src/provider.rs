@@ -16,8 +16,41 @@
 //! deSEC token is read from the environment at startup and never logged.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::store::AcmeDnsStore;
+
+/// #486: neither HTTP client below used to set any timeout at all -- a provider
+/// endpoint that accepts the TCP connection and then stalls left the awaited
+/// call pending indefinitely (a publish handler stalled forever on the operator
+/// side; certificate issuance stalled with no diagnostic on the agent side).
+/// Both well under the overall issuance/convergence budget
+/// ([`crate::convergence::DEFAULT_TIMEOUT`] is 300s), and matching the same
+/// `10s request / 5s connect` shape this codebase already uses for its other
+/// bare-`reqwest::Client` HTTP callers (`ControlPlaneClient`, #408): a single
+/// request that hasn't even connected in 5s, or hasn't completed in 10s once
+/// connected, is not "briefly slow" -- something is genuinely wrong, and
+/// failing fast lets a caller (including the throttle/transport retry loop in
+/// [`DesecClient::patch_rrset`]) actually retry within the real budget instead
+/// of the whole call being eaten by one hung connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Shared client construction for both HTTP-backed DNS-01 clients (#486): an
+/// explicit connect timeout and overall request timeout, so a stalling
+/// provider endpoint can never hang an awaited call forever.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        // `build()` only fails for a malformed static config (e.g. a bad TLS
+        // backend setup) -- never a runtime condition -- so a fixed, always-valid
+        // builder falling back to the crate default is unreachable in practice;
+        // the fallback exists purely so a future config change here can never
+        // panic a whole daemon over client construction.
+        .unwrap_or_default()
+}
 
 /// A configured DNS-01 backend the ACME client drives via `set_txt`/`clear_txt`.
 pub enum Dns01Provider {
@@ -40,8 +73,16 @@ impl Dns01Provider {
     pub async fn set_txt(&self, name: &str, value: &str) -> Result<(), String> {
         match self {
             Dns01Provider::SelfHosted(store) => {
-                store.set_txt(name, value);
-                Ok(())
+                // #460: AcmeDnsStore::set_txt does synchronous mutate+persist file
+                // I/O (see store.rs) -- run it on the blocking thread pool rather
+                // than inline in this async fn, which is reached from an async
+                // control-plane handler that must stay responsive.
+                let store = store.clone();
+                let name = name.to_string();
+                let value = value.to_string();
+                tokio::task::spawn_blocking(move || store.set_txt(&name, &value))
+                    .await
+                    .map_err(|e| format!("ACME DNS store write task panicked: {e}"))
             }
             Dns01Provider::Desec(client) => client.set_txt(name, value).await,
             Dns01Provider::RemoteAgent(client) => client.publish(name, value).await,
@@ -52,8 +93,12 @@ impl Dns01Provider {
     pub async fn clear_txt(&self, name: &str) -> Result<(), String> {
         match self {
             Dns01Provider::SelfHosted(store) => {
-                store.clear(name);
-                Ok(())
+                // #460: same rationale as set_txt above.
+                let store = store.clone();
+                let name = name.to_string();
+                tokio::task::spawn_blocking(move || store.clear(&name))
+                    .await
+                    .map_err(|e| format!("ACME DNS store clear task panicked: {e}"))
             }
             Dns01Provider::Desec(client) => client.clear_txt(name).await,
             Dns01Provider::RemoteAgent(client) => client.clear(name).await,
@@ -78,7 +123,7 @@ impl RemoteAgentDns01Client {
     /// hostname via host-authorization, so the control plane's ownership
     /// check (`edge_mesh::token_owns_hostname`) accepts it.
     pub fn new(cp_url: impl Into<String>, routing_token: impl Into<String>) -> Self {
-        Self { cp_url: cp_url.into(), routing_token: routing_token.into(), http: reqwest::Client::new() }
+        Self { cp_url: cp_url.into(), routing_token: routing_token.into(), http: http_client() }
     }
 
     /// Recover the bare hostname from a full `_acme-challenge.<hostname>`
@@ -143,7 +188,7 @@ impl DesecClient {
             token,
             domain,
             base,
-            http: reqwest::Client::new(),
+            http: http_client(),
         })
     }
 
@@ -216,14 +261,31 @@ impl DesecClient {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let resp = self
+            let send_result = self
                 .http
                 .patch(&url)
                 .header("Authorization", format!("Token {}", self.token))
                 .json(&body)
                 .send()
-                .await
-                .map_err(|e| e.to_string())?;
+                .await;
+            let resp = match send_result {
+                Ok(resp) => resp,
+                // #486: a transport-level failure (connection reset, DNS failure
+                // resolving the provider, a TLS handshake failure) is at least as
+                // transient as the throttle case just below it -- retry it under
+                // the exact same cap/backoff rather than giving up on the first
+                // hiccup. Deliberately does NOT cover our own request timeout
+                // firing -- see `is_transient_transport_error`'s doc comment for
+                // why retrying that specifically would make things worse, not
+                // better. A non-transient send error (e.g. a malformed request)
+                // would keep failing identically on retry and simply exhausts the
+                // same bounded attempts before surfacing, same as today.
+                Err(e) if attempt <= THROTTLE_RETRIES && is_transient_transport_error(&e) => {
+                    tokio::time::sleep(THROTTLE_BACKOFF * attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e.to_string()),
+            };
             let status = resp.status();
             if status.is_success() {
                 return Ok(());
@@ -261,6 +323,24 @@ const THROTTLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 /// case that behaves the same from a caller's point of view.
 fn is_throttled(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+}
+
+/// #486: whether a `send()` failure is a transient transport problem worth a
+/// bounded retry (a connect failure -- refused/reset/unreachable/DNS failure
+/// resolving the provider -- or a connection reset/TLS handshake failure while
+/// the request was in flight) rather than something a retry would never fix (a
+/// malformed request, a redirect-policy violation) or something a retry would
+/// only make WORSE: deliberately excludes `is_timeout()`. Our own
+/// [`CONNECT_TIMEOUT`]/[`REQUEST_TIMEOUT`] firing already means this specific
+/// endpoint failed to answer within a generous bound -- retrying the identical
+/// request against the identical unresponsive target under the identical
+/// timeout would just stack another full timeout's wait on top for a target
+/// that already showed no sign of ever answering, eating deep into the
+/// issuance budget for no realistic chance of success. Also excludes
+/// `is_body()`/`is_decode()` -- those mean the response we DID get back
+/// couldn't be parsed, which a retry of the exact same request cannot help.
+fn is_transient_transport_error(e: &reqwest::Error) -> bool {
+    !e.is_timeout() && (e.is_connect() || e.is_request())
 }
 
 /// Honour a `Retry-After` (delta-seconds form) when the server sends one --
@@ -463,6 +543,129 @@ mod tests {
         assert!(is_throttled(reqwest::StatusCode::SERVICE_UNAVAILABLE));
         assert!(!is_throttled(reqwest::StatusCode::BAD_REQUEST));
         assert!(!is_throttled(reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn a_hung_desec_endpoint_times_out_instead_of_blocking_forever_486() {
+        // #486: before this fix, DesecClient's `reqwest::Client::new()` had no
+        // request or connect timeout at all -- a deSEC endpoint that accepted
+        // the connection and then never answered left `set_txt` pending
+        // indefinitely, stalling issuance with no diagnostic. Real proof, same
+        // shape as #408's control-plane-client test: a real listener that
+        // accepts the TCP connection but never writes a response, and the call
+        // must still surface an error well within the configured request
+        // timeout (10s), not hang.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = client.set_txt("_acme-challenge.bunsenbrenner.org", "v").await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a hung deSEC endpoint must surface as an error, not hang forever");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "must time out around the configured 10s request timeout -- and NOT be retried (a timeout \
+             is deliberately excluded from the transport-error retry, since retrying it would just \
+             stack another full wait on a target that already showed no sign of answering) -- not \
+             hang indefinitely (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_control_plane_times_out_for_the_agent_side_client_too_486() {
+        // #486: the second of the two HTTP clients this issue names --
+        // RemoteAgentDns01Client -- had exactly the same gap. Same proof shape.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = RemoteAgentDns01Client::new(format!("http://{addr}"), "deadbeef");
+        let provider = Dns01Provider::RemoteAgent(client);
+
+        let started = std::time::Instant::now();
+        let result = provider.set_txt("_acme-challenge.app.example.com", "tok").await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a hung control plane must surface as an error, not hang forever");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "must time out around the configured 10s request timeout, not hang indefinitely (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_level_send_failure_is_retried_the_same_as_a_throttle_486() {
+        // #486: the throttle-retry loop only used to cover a throttle STATUS --
+        // a transport-level failure (here: the server closing the connection
+        // without answering at all, so `send()` itself errors) got zero
+        // retries even though it is at least as transient as a throttle. Real
+        // proof: a server that resets the connection on its first N requests,
+        // then answers normally -- the write must still succeed, meaning the
+        // send-error path retried rather than surfacing the first reset as a
+        // final failure.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let calls = Arc::new(AtomicU32::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                        // Let the client finish sending its request, then close
+                        // the connection without ever writing a response -- a
+                        // deterministic "connection closed before any response"
+                        // transport failure (unlike racing a bare-drop-on-accept
+                        // against the OS's own RST-on-unread-data timing, this
+                        // doesn't depend on exactly how much of the request had
+                        // arrived when the socket closed).
+                        let mut buf = [0u8; 4096];
+                        let _ = tokio::time::timeout(Duration::from_millis(500), socket.read(&mut buf)).await;
+                        drop(socket);
+                        continue;
+                    }
+                    // From here on, actually answer -- a minimal hand-rolled
+                    // response is enough; this is a raw-socket mock, not a real
+                    // HTTP server, so it doesn't need a full request parse.
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buf)).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+        }
+
+        let client = DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("t".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        let result = client.set_txt("_acme-challenge.bunsenbrenner.org", "v").await;
+        assert!(result.is_ok(), "the transport-level failures must have been retried, not surfaced: {result:?}");
+        assert!(calls.load(Ordering::SeqCst) >= 3, "at least the two resets plus the accepted attempt");
     }
 
     #[tokio::test]

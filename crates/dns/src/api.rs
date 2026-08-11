@@ -71,14 +71,24 @@ async fn put_txt(
     if !authorized(&st, &headers) {
         return StatusCode::UNAUTHORIZED;
     }
-    let value = body.trim();
+    let value = body.trim().to_string();
     if name.is_empty() || value.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
     if value.len() > MAX_TXT_VALUE_BYTES {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
-    st.store.set_txt(&name, value);
+    // #460: AcmeDnsStore::set_txt does synchronous file I/O (create/write/fsync/
+    // rename/dir-fsync) while holding its own write lock for the whole
+    // mutate+persist critical section (needed for correctness -- see store.rs).
+    // Run it on the blocking thread pool rather than inline in this async
+    // handler, so a slow or contended disk stalls a blocking-pool thread instead
+    // of the Tokio worker also serving the public `:53` DNS responder.
+    let store = st.store.clone();
+    let name_for_log = name.clone();
+    if tokio::task::spawn_blocking(move || store.set_txt(&name, &value)).await.is_err() {
+        eprintln!("ct-dns: WARNING -- set_txt blocking task panicked for {name_for_log}");
+    }
     StatusCode::OK
 }
 
@@ -91,7 +101,13 @@ async fn delete_txt(
     if !authorized(&st, &headers) {
         return StatusCode::UNAUTHORIZED;
     }
-    st.store.clear(&name);
+    // #460: see put_txt -- clear() does the same synchronous mutate+persist
+    // critical section and must not run inline on this Tokio worker either.
+    let store = st.store.clone();
+    let name_for_log = name.clone();
+    if tokio::task::spawn_blocking(move || store.clear(&name)).await.is_err() {
+        eprintln!("ct-dns: WARNING -- clear blocking task panicked for {name_for_log}");
+    }
     StatusCode::OK
 }
 
