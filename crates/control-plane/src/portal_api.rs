@@ -471,8 +471,12 @@ page (while still signed in elsewhere) if you also want to remove your Keycloak 
     resp
 }
 
-/// A new tunnel from the (defense-in-depth; not linked from the UI in the
-/// Standard tier — see [`tunnels_page`]) create form.
+/// A new tunnel from the create form. #439 follow-up: linked from the UI
+/// (`tunnels_html`'s create-another-tunnel form) whenever the caller's owned
+/// tunnel count is under their account's real `max_tunnels` — see
+/// [`tunnels_page`]. Server-side enforcement (`create_tunnel`'s own
+/// owned-count-vs-limit check) stays authoritative either way, so a direct
+/// POST past a stale/cached page is still rejected.
 #[derive(Deserialize)]
 struct CreateTunnelForm {
     name: String,
@@ -515,11 +519,14 @@ fn auto_hostname(zone: &str, name: &str, subject: &str) -> String {
 }
 
 /// `GET /portal/tunnels` (#27): the caller's tunnel(s). Standard tier: exactly
-/// one tunnel per account, auto-provisioned right here on first view (with an
-/// auto-assigned hostname when DNS is configured) — there is no manual create
-/// step to onboard with; see the tunnel's Install link for its tokens.
-/// Additional tunnels and custom hostnames are a planned paid tier (shown,
-/// disabled, in [`tunnels_html`]).
+/// one tunnel per account by default, auto-provisioned right here on first
+/// view (with an auto-assigned hostname when DNS is configured) — see the
+/// tunnel's Install link for its tokens. #439 follow-up: an account's real
+/// `max_tunnels` (default 1, admin-raisable via `POST
+/// /admin/accounts/:subject/max-tunnels`) governs whether [`tunnels_html`]'s
+/// create-another-tunnel form is real/enabled or disabled-with-quota-copy —
+/// custom/vanity hostnames stay a planned paid tier either way (see
+/// [`auto_hostname`]).
 /// Live per-tunnel status pulled from the edge's `GET /admin/tunnel-status/:token`
 /// (`crates/edge/src/admin.rs`) -- monitoring feature v1's connection flag
 /// plus the byte-counter follow-up (both 2026-08-01).
@@ -565,6 +572,19 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     if !owns_one {
         provision_tunnel(&st, &subject, "site").await;
     }
+    // #439 follow-up (operator instruction): the "create another tunnel" form
+    // must reflect the account's REAL quota (owned-tunnel count vs. its real
+    // max_tunnels, admin-raisable via POST /admin/accounts/:subject/max-tunnels)
+    // instead of always being hard-disabled -- so a revoke really does free up
+    // a slot for self-service creation. Same account/limit lookup create_tunnel
+    // itself already gates on.
+    let max_tunnels = match st.ledger.account_for_subject(&subject) {
+        Ok(account) => match st.ledger.max_tunnels(&account) {
+            Ok(m) => m,
+            Err(e) => return internal_error("tunnels_page/max_tunnels", e).into_response(),
+        },
+        Err(e) => return internal_error("tunnels_page/account_for_subject", e).into_response(),
+    };
     match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(tunnels) => {
             // #233/#437: fetch each hostname's Rot/Gelb/Grün admission state, and
@@ -594,7 +614,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     allow_and_pending.get(&t.id).cloned().unwrap_or_default();
                 rows.push((t, owned, admission, status, require_login, login_allowlist, pending_requests));
             }
-            Html(tunnels_html(&rows)).into_response()
+            Html(tunnels_html(&rows, max_tunnels)).into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
@@ -700,11 +720,15 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
     }
 }
 
-/// `POST /portal/tunnels`: kept as a server-side-enforced safety net, not
-/// linked from the Standard-tier UI (which auto-provisions the one included
-/// tunnel — see [`tunnels_page`]). Rejects a second tunnel even if posted
-/// directly: "not enabled in the free tier" is enforced here, not just by
-/// hiding the form.
+/// `POST /portal/tunnels`: the caller's own included tunnel is
+/// auto-provisioned elsewhere (see [`tunnels_page`]) — this handler is for
+/// self-service creation of ADDITIONAL tunnels, once the account's owned
+/// count is under its real `max_tunnels`. #439 follow-up: now genuinely
+/// linked from the UI (`tunnels_html`'s create-another-tunnel form) whenever
+/// that's true, rather than only reachable by a direct POST. Still the sole
+/// enforcement point either way: rejects a request over the limit even if
+/// posted directly, so a stale/cached page can never bypass the real quota
+/// check.
 async fn create_tunnel(
     State(st): State<ApiState>,
     headers: HeaderMap,
@@ -1203,7 +1227,13 @@ type TunnelRow = (
     Vec<(String, String, i64)>,
 );
 
-fn tunnels_html(tunnels: &[TunnelRow]) -> String {
+fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32) -> String {
+    // #439 follow-up: owned_count is derived from the SAME rows the page just
+    // fetched live from the store (list_authorized_for_subject), not a cached
+    // value -- so a revoke that already committed (delete_tunnel -> revoke())
+    // before this render is reflected immediately: revoke frees a slot on the
+    // very next GET /portal/tunnels.
+    let owned_count = tunnels.iter().filter(|(_, owned, ..)| *owned).count() as u32;
     let rows = tunnels
         .iter()
         .map(|(t, owned, admission, status, require_login, login_allowlist, pending_requests)| {
@@ -1275,21 +1305,46 @@ fn tunnels_html(tunnels: &[TunnelRow]) -> String {
             )
         })
         .collect::<String>();
+    // #439 follow-up: the create-another-tunnel form now reflects the
+    // account's REAL quota state instead of always being hard-disabled.
+    // `create_tunnel` (POST /portal/tunnels) already enforces the same
+    // owned_count < max_tunnels check server-side (#432's atomic
+    // create_if_under_owned_limit) -- this form is what makes that real,
+    // already-working endpoint actually discoverable/usable, not a new
+    // creation path. `CreateTunnelForm { name: String }` is exactly the
+    // `<input name="name">` shape posted below.
+    let create_form = if owned_count < max_tunnels {
+        format!(
+            r#"<h2>Create another tunnel</h2>
+<p class="help">You're using {owned_count} of {max_tunnels} tunnels included in your plan.</p>
+<form method="post" action="/portal/tunnels">
+ <label>Name
+  <input type="text" name="name" placeholder="e.g. my-api" required>
+ </label>
+ <button type="submit">Create</button>
+</form>"#
+        )
+    } else {
+        format!(
+            r#"<h2>Create another tunnel</h2>
+<p class="help">You've used all {max_tunnels} tunnel{plural} included in your plan. More tunnels
+may become available for your account &mdash; contact the operator if you need another one now.</p>
+<form aria-disabled="true">
+ <label>Name
+  <input type="text" placeholder="e.g. my-api" disabled>
+ </label>
+ <button type="submit" disabled>Create</button>
+</form>"#,
+            plural = if max_tunnels == 1 { "" } else { "s" }
+        )
+    };
     let body = format!(
         r#"<h1>Your tunnels</h1>
 {rows}
 <p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
 assigned hostname (e.g. <code>site-a1b2c3d4.bunsenbrenner.org</code>) &mdash; already set up for
 you above, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
-<h2>Create another tunnel</h2>
-<p class="help">Additional tunnels and custom/vanity hostnames are a planned paid tier, coming
-later.</p>
-<form aria-disabled="true">
- <label>Name
-  <input type="text" placeholder="e.g. my-api" disabled>
- </label>
- <button type="submit" disabled>Create</button>
-</form>
+{create_form}
 <h2>Next steps</h2>
 <ol class="steps">
  <li>Click <strong>Install</strong> on your tunnel above to get its tokens.</li>
@@ -2592,20 +2647,21 @@ mod tests {
     async fn tunnels_page_explains_the_standard_tier_and_shows_share_disabled() {
         // #69 T69.1 (updated for the Standard-tier auto-provision policy): a
         // first-time customer must understand, without reading the architecture
-        // docs, that their one tunnel is already set up, that Sharing exists but
-        // is a paid-tier feature, and that "Create another" is visible-but-disabled
-        // rather than silently missing.
+        // docs, that their one tunnel is already set up and that Sharing exists
+        // but is a paid-tier feature. The account is at its default limit (1
+        // owned, max_tunnels=1) here, so "Create another" is expected
+        // visible-but-disabled -- see
+        // tunnels_page_at_limit_shows_a_disabled_create_form_with_real_quota_copy
+        // for that form's own assertions, and
+        // tunnels_page_under_limit_shows_a_real_enabled_create_form for the
+        // enabled case (#439 follow-up).
         let app = test_app();
         let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("automatically\nassigned hostname") || html.contains("automatically assigned hostname"),
             "explains the auto-assigned hostname");
         assert!(html.contains("disabled") && html.contains(">Share<"), "Share is shown but disabled");
-        assert!(html.contains("paid tier") || html.contains("paid-tier"), "names the paid-tier gate");
-        assert!(
-            html.contains("disabled") && html.contains("Create another tunnel"),
-            "the second-tunnel form is visible but disabled, not hidden"
-        );
+        assert!(html.contains("paid tier") || html.contains("paid-tier"), "names Share's paid-tier gate");
         assert!(
             html.to_lowercase().contains("hostname"),
             "gives hostname guidance"
@@ -2615,6 +2671,209 @@ mod tests {
             !html.contains("http://") && !html.contains("https://cdn"),
             "no external assets"
         );
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_at_limit_shows_a_disabled_create_form_with_real_quota_copy() {
+        // #439 follow-up (operator instruction): an account at its real
+        // max_tunnels limit still sees a visually-disabled create form (not
+        // hidden), but the copy must state the REAL quota reason -- not the
+        // old hardcoded "planned paid tier, coming later" framing, since an
+        // admin-raised max_tunnels can make that framing untrue for other
+        // accounts. No unfounded payment/pricing promise either.
+        let app = test_app();
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Create another tunnel"), "the second-tunnel section is visible, not hidden");
+        assert!(
+            html.contains(r#"<form aria-disabled="true">"#),
+            "the create form itself is visually disabled at the limit: {html}"
+        );
+        assert!(
+            html.contains("You've used all 1 tunnel included in your plan"),
+            "states the REAL quota reason with the real numbers: {html}"
+        );
+        assert!(
+            !html.contains("planned paid tier, coming later"),
+            "no longer claims a fixed, unconditional paid-tier-not-built-yet story"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_under_limit_shows_a_real_enabled_create_form() {
+        // #439 follow-up: once an account's max_tunnels is raised above its
+        // owned count, the create form must become REAL -- a working
+        // <form method="post" action="/portal/tunnels"> with a non-disabled
+        // name input and submit button (matching CreateTunnelForm's
+        // `{ name: String }` shape), not just less-disabled-looking markup.
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x99u8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels,
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            Some(secret),
+        );
+
+        // First view auto-provisions alice's one included tunnel (owned=1).
+        assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK);
+
+        // Raise alice's account limit to 2 -- now 1 owned < 2 max.
+        let req = Request::post("/admin/accounts/alice/max-tunnels")
+            .header("content-type", "application/json")
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from(r#"{"max":2}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(r#"<form method="post" action="/portal/tunnels">"#),
+            "a real, working, non-disabled form posting to the real create_tunnel handler: {html}"
+        );
+        assert!(
+            html.contains(r#"<input type="text" name="name""#) && !html.contains(r#"name="name" placeholder="e.g. my-api" disabled"#),
+            "a real, non-disabled name input matching CreateTunnelForm's shape: {html}"
+        );
+        assert!(
+            html.contains("You're using 1 of 2 tunnels included in your plan"),
+            "accurate real-numbers copy: {html}"
+        );
+    }
+
+    /// #439 follow-up, full end-to-end proof (not just at the handler level,
+    /// which `admin_set_max_tunnels_unlocks_self_service_creation_for_one_specific_account`
+    /// already covers): raising an account's quota makes GET /portal/tunnels
+    /// render the real enabled form, and POSTing through that exact form shape
+    /// (not a hand-crafted request bypassing the UI) really creates a second
+    /// tunnel.
+    #[tokio::test]
+    async fn tunnels_page_enabled_create_form_actually_creates_a_second_tunnel_end_to_end() {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0xaau8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            Some(secret),
+        );
+
+        assert_eq!(get(&app, "/portal/tunnels", Some("remote")).await.0, StatusCode::OK);
+
+        let req = Request::post("/admin/accounts/remote/max-tunnels")
+            .header("content-type", "application/json")
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from(r#"{"max":2}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        let (_, html) = get(&app, "/portal/tunnels", Some("remote")).await;
+        assert!(
+            html.contains(r#"<form method="post" action="/portal/tunnels">"#),
+            "UI now discoverably offers a real create form"
+        );
+
+        // Post exactly what that form posts: name=<value> to /portal/tunnels.
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "remote", "name=second-tunnel").await,
+            StatusCode::SEE_OTHER,
+            "the discoverable form's own POST shape succeeds"
+        );
+        assert_eq!(tunnels.list_for_subject("remote").unwrap().len(), 2, "really owns 2 real tunnel rows");
+
+        // At the (now-reached) limit again, the form goes back to disabled.
+        let (_, html_after) = get(&app, "/portal/tunnels", Some("remote")).await;
+        assert!(
+            html_after.contains(r#"<form aria-disabled="true">"#),
+            "back at the limit, the form is disabled again: {html_after}"
+        );
+    }
+
+    /// #439 follow-up: confirms the Revoke scenario the operator specifically
+    /// asked about end-to-end -- revoking a tunnel at the limit really frees a
+    /// slot (owned_count is read live from the store on every GET, not
+    /// cached), and self-service creation of a replacement then succeeds
+    /// through the same discoverable form.
+    #[tokio::test]
+    async fn revoking_a_tunnel_at_the_limit_reenables_the_create_form_and_creation_succeeds() {
+        // #439 follow-up: the specific Revoke scenario the operator asked
+        // about -- revoking a tunnel at the limit really frees a slot
+        // (owned_count is read live from the store on every GET, never
+        // cached), and self-service creation of a replacement then succeeds
+        // through the same discoverable, now-enabled form.
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x11u8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels.clone(),
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            Some(secret),
+        );
+
+        // Raise alice's limit to 2, then use up both slots.
+        let req = Request::post("/admin/accounts/alice/max-tunnels")
+            .header("content-type", "application/json")
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from(r#"{"max":2}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK); // auto-provision #1
+        assert_eq!(post_form(&app, "/portal/tunnels", "alice", "name=second").await, StatusCode::SEE_OTHER); // #2, now at the limit
+
+        let (_, at_limit_html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(at_limit_html.contains(r#"<form aria-disabled="true">"#), "at 2/2, the form is disabled");
+
+        // Revoke ONE of the two -> owned_count drops from 2 to 1 -- the create
+        // form must become enabled again on the very next GET, live, not stale.
+        let revoke_id = first_id(&at_limit_html);
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{revoke_id}/delete"), "alice", "").await,
+            StatusCode::SEE_OTHER
+        );
+        let (_, after_revoke_html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(
+            after_revoke_html.contains(r#"<form method="post" action="/portal/tunnels">"#),
+            "revoke freed a slot -> the real create form is enabled again: {after_revoke_html}"
+        );
+
+        // And creation through that now-enabled form succeeds.
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "alice", "name=replacement").await,
+            StatusCode::SEE_OTHER,
+            "the freed slot really accepts a new tunnel"
+        );
+        assert_eq!(tunnels.list_for_subject("alice").unwrap().len(), 2, "back to 2 real owned tunnel rows");
     }
 
     #[tokio::test]
