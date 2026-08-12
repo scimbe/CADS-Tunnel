@@ -38,6 +38,86 @@ pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
+/// Shared accept-loop policy for every plain-TCP public listener (#452): admission
+/// (acquire-or-shed against a [`crate::state::ConnectionCap`], with a uniform occasional
+/// shed-event log), TCP keepalive ([`apply_tcp_keepalive`]), and spawning — the steps
+/// every one of this crate's hand-rolled TCP accept loops was independently reimplementing
+/// with its own small divergence (one had a cap but never called the keepalive helper,
+/// another logged shed events and another didn't, ...). `label` names the listener in its
+/// shed/accept-error/handshake-timeout logs.
+///
+/// `handshake_timeout`, when `Some`, bounds the ENTIRE `handler` future — correct for a
+/// listener whose whole connection is meant to be short-lived end to end (e.g. the `:80`
+/// redirect: connect, read a request, write a redirect, done). A listener whose connection
+/// is meant to stay open for a long-lived tunnel/session (the `:443` front door, the TCP
+/// fallback, the ws-channel listener's post-upgrade phase) must pass `None` here and keep
+/// applying its OWN finer-grained timeout(s) to just its handshake/admission-read phase
+/// internally, same as before this helper existed — wrapping the WHOLE handler in one
+/// timeout for those would incorrectly bound the long-lived phase, not just the handshake.
+///
+/// `handler` receives the accepted [`TcpStream`], its peer address, and the OWNED permit
+/// (`None` when `cap` is `None`) so it can be moved into whatever value ends up owning the
+/// connection for its true lifetime (#451) rather than just held as a task-local binding —
+/// necessary whenever the connection can outlive this one task (e.g. a channel member that
+/// parks in a `ChannelPairer` and is later handed to a different, freshly spawned task).
+///
+/// Never returns (mirrors every accept loop it replaces): a per-connection `accept()` error
+/// is transient and logged, not fatal to the listener.
+pub(crate) async fn serve_listener<F, Fut>(
+    listener: TcpListener,
+    cap: Option<crate::state::ConnectionCap>,
+    label: &'static str,
+    handshake_timeout: Option<std::time::Duration>,
+    handler: F,
+) where
+    F: Fn(TcpStream, SocketAddr, Option<tokio::sync::OwnedSemaphorePermit>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    loop {
+        let (stream, addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ct-edge: {label} accept error: {e}");
+                continue;
+            }
+        };
+        let permit = match &cap {
+            Some(cap) => match cap.try_admit() {
+                Some(p) => Some(p),
+                None => {
+                    // Shed BEFORE spawning (cheaper than admitting then dropping
+                    // mid-handshake); logged occasionally (powers of two, then every
+                    // 1000) so a sustained shed streak is visible without spamming
+                    // stdout under a real flood.
+                    let total = cap.note_shed();
+                    if total.is_power_of_two() || total % 1000 == 0 {
+                        eprintln!(
+                            "ct-edge: {label} shedding — connection cap full, {total} connection(s) shed since start"
+                        );
+                    }
+                    drop(stream);
+                    continue;
+                }
+            },
+            None => None,
+        };
+        apply_tcp_keepalive(&stream);
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            let fut = handler(stream, addr, permit);
+            match handshake_timeout {
+                Some(d) => {
+                    if tokio::time::timeout(d, fut).await.is_err() {
+                        eprintln!("ct-edge: {label} handshake timed out from {addr}");
+                    }
+                }
+                None => fut.await,
+            }
+        });
+    }
+}
+
 fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), BoxError> {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert = certified.cert.der().clone();
@@ -357,5 +437,127 @@ mod tests {
         let loaded = load_cert(&path).expect("load");
         assert_eq!(loaded, cert, "cert round-trips through the shared file");
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- serve_listener (#452 shared accept-loop helper) ---------------------------------
+
+    #[tokio::test]
+    async fn serve_listener_enforces_its_cap_and_admits_again_once_a_slot_frees_452() {
+        // The core policy #452's shared helper exists to apply consistently everywhere: a
+        // full `ConnectionCap` sheds (the connection never reaches `handler` at all), and a
+        // freed slot admits again -- proven directly against `serve_listener` itself so
+        // every migrated call site (the `:443` front door, TCP fallback, `:80` redirect,
+        // Browser-Plane SNI, ws-channel) inherits this from one tested place.
+        let cap = crate::state::ConnectionCap::new(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admitted_h = admitted.clone();
+        // The handler holds the connection open (never returns) until told to, so the cap's
+        // one slot stays occupied for as long as the test needs it to.
+        let (hold_tx, hold_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, move |_s, _addr, permit| {
+            let admitted_h = admitted_h.clone();
+            let mut hold_rx = hold_rx.clone();
+            async move {
+                admitted_h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _permit = permit;
+                let _ = hold_rx.changed().await; // block until released
+            }
+        }));
+
+        // First connection: admitted, takes the cap's only slot.
+        let first = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1, "first connection admitted");
+        assert_eq!(cap.available(), 0, "the cap's only slot is now in use");
+
+        // Second connection: the cap is full -- shed, never reaches the handler. Proven by
+        // the peer closing the socket immediately (a real client sees EOF/reset, not a
+        // hanging connection) and the admitted counter staying at 1.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), second.read(&mut buf))
+            .await
+            .expect("a shed connection is closed promptly, not left hanging");
+        assert!(matches!(read, Ok(0) | Err(_)), "shed connection closes without any handler bytes: {read:?}");
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1, "the shed connection never reached the handler");
+        assert_eq!(cap.shed_total(), 1, "the shed was recorded");
+
+        // Free the slot: a third connection is admitted again.
+        drop(first);
+        let _ = hold_tx.send(true);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(cap.available(), 1, "the freed slot is available again");
+        let _third = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 2, "a THIRD connection is admitted once a slot frees");
+    }
+
+    #[tokio::test]
+    async fn serve_listener_applies_tcp_keepalive_to_every_admitted_connection_452() {
+        // #452: "only some listeners call the shared TCP-keepalive helper" -- `serve_listener`
+        // now calls it unconditionally for every admitted connection, closing that gap for
+        // every migrated loop at once. Proven directly: the accepted stream's SO_KEEPALIVE
+        // option is set once the handler runs (readable back via socket2, the same crate
+        // `apply_tcp_keepalive` itself uses to set it).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(1);
+        tokio::spawn(serve_listener(listener, None, "test-listener", None, move |stream, _addr, _permit| {
+            let tx = tx.clone();
+            async move {
+                let sock = socket2::SockRef::from(&stream);
+                let ka = sock.keepalive().unwrap_or(false);
+                let _ = tx.send(ka).await;
+            }
+        }));
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let ka = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("handler ran")
+            .expect("keepalive flag sent");
+        assert!(ka, "serve_listener must apply TCP keepalive before handing the connection to its handler");
+    }
+
+    #[tokio::test]
+    async fn serve_listener_times_out_a_stalled_handler_when_a_handshake_timeout_is_set_452() {
+        // #452 (closing #451 gap 3's general form): when a caller supplies a
+        // `handshake_timeout`, a handler that never completes (a stalled/hostile
+        // pre-upgrade client) is abandoned within that bound instead of holding its cap
+        // permit -- and the task slot -- forever. Proven by a handler that blocks forever
+        // and a short timeout: the cap's permit must be back to available soon after,
+        // without the handler itself ever completing normally.
+        let cap = crate::state::ConnectionCap::new(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let completed_normally = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_h = completed_normally.clone();
+        tokio::spawn(serve_listener(
+            listener,
+            Some(cap.clone()),
+            "test-listener",
+            Some(std::time::Duration::from_millis(150)),
+            move |_s, _addr, permit| {
+                let completed_h = completed_h.clone();
+                async move {
+                    let _permit = permit;
+                    std::future::pending::<()>().await; // stalled -- never completes on its own
+                    completed_h.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        ));
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(cap.available(), 0, "the permit is held while the (stalled) handler is in flight");
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(cap.available(), 1, "the handshake timeout gives the permit back once it fires");
+        assert!(
+            !completed_normally.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler was abandoned by the timeout, not allowed to run to completion"
+        );
     }
 }

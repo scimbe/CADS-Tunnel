@@ -16,6 +16,7 @@ use ct_common::channel::{
 use quinn::Endpoint;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::OwnedSemaphorePermit;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -508,6 +509,17 @@ where
 /// wedge the broker's serial round loop, so it is dropped and the loop moves on.
 const JOIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// #452: bound completing the QUIC handshake itself on an already-accepted incoming
+/// connection (`admit_incoming_member`'s `incoming.await`) -- the channel-broker analog of
+/// [`crate::serve::FRONT_DOOR_TLS_ACCEPT_TIMEOUT`]/`TCP_FALLBACK_ADMISSION_TIMEOUT`. Without
+/// this a peer that starts but never completes the handshake held its #450 cap permit (now
+/// carried on the spawned admission task's [`AdmittedMember`]) forever, one of the "QUIC
+/// channel endpoints have neither a cap nor a timeout" gaps #452 identified (the cap landed in
+/// #450; this is the matching timeout). Same 10s value as the other public listeners' handshake
+/// bounds for consistency -- a real QUIC handshake is a handful of round trips, not a long-lived
+/// exchange.
+const QUIC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Accept one QUIC connection from `endpoint` and read its channel-join via
 /// [`read_join_on_connection`]. The standalone entrypoint used by the broker's own
 /// tests and by any dedicated channel-rendezvous endpoint; the live edge instead calls
@@ -566,19 +578,34 @@ where
 /// [`accept_and_read_join`] so [`run_channel_broker_loop`] can `spawn` it per connection — the slow
 /// part (grant verification + possession-proof challenge-response) then runs OFF the accept loop, so
 /// one in-flight admission can't serialize every other channel's admission on this edge (#203).
+///
+/// `permit` (#451) is the [`crate::state::ConnectionCap`] permit `run_channel_broker_loop` already
+/// acquired at accept time — it is moved onto the returned [`AdmittedMember`] (not just held as a
+/// task-local binding) so it travels with the connection through however long it actually lives:
+/// parked in the [`ChannelPairer`] awaiting a partner, handed to the pair completer, or dropped here
+/// on an admission failure. `None` on an error path (this function's own early returns) is correct —
+/// the connection is being torn down either way, so releasing its permit immediately is right.
 async fn admit_incoming_member<F, Fut>(
     incoming: quinn::Incoming,
     now: UnixSeconds,
     authorize: &F,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<AdmittedMember, BoxError>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
-    let conn = incoming.await.map_err(|e| format!("[quic-handshake] {e}"))?;
+    // #452 parity: bound the QUIC handshake itself, same as the front door's/TCP-fallback's TLS
+    // accept -- previously unbounded here (a peer that opens the TCP 5-tuple / initial UDP
+    // datagram but never completes the handshake held its accept-loop task, and its #450 cap
+    // permit, forever).
+    let conn = tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming)
+        .await
+        .map_err(|_| -> BoxError { "[quic-handshake] handshake not completed within the timeout".into() })?
+        .map_err(|e| format!("[quic-handshake] {e}"))?;
     match read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await {
         Ok((send, req, operator, noise, attest, observed)) => {
-            Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed })
+            Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed, _permit: permit })
         }
         Err(e) => {
             // #129-follow: keep the connection alive briefly so the peer reads the `NO` refusal
@@ -665,6 +692,15 @@ pub(crate) struct AdmittedMember {
     /// on the admitted connection — echoed back to the member as the `r=<addr>` ack token so
     /// it learns its punch address during live rendezvous pairing (the B1-follow slice).
     observed: std::net::SocketAddr,
+    /// #451: the [`crate::state::ConnectionCap`] permit admitting this connection, carried on
+    /// the value that OWNS the live socket rather than a task-local binding that drops when
+    /// whichever function happens to return — so it stays held for as long as the connection
+    /// genuinely does: through a park in the [`ChannelPairer`], through `complete(..).await`
+    /// once paired, or released here immediately when there is no cap (`None`) or a test
+    /// constructs a member directly (`accept_member`, used only by this module's own legacy
+    /// serial-broker tests, always passes `None`). Never read, only held for its `Drop` --
+    /// leading underscore so `-D dead_code` doesn't flag that as unused.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Accept one QUIC connection and admit its channel-join, returning it as an
@@ -686,7 +722,7 @@ where
     // pairing (not only at the isolated admission seam).
     let (conn, send, req, operator, noise, attest, observed) =
         accept_and_read_join(endpoint, now, authorize).await?;
-    Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed })
+    Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed, _permit: None })
 }
 
 /// Complete a **rendezvous** pairing for two already-admitted members: authorize the
@@ -917,6 +953,15 @@ pub struct AdmittedStreamMember<S> {
     operator: [u8; 32],
     noise: Option<[u8; 32]>,
     attest: Option<[u8; 64]>,
+    /// #451: the [`crate::state::ConnectionCap`] permit admitting this connection, carried on
+    /// the value that owns the live stream (same rationale as [`AdmittedMember::_permit`]) —
+    /// `admit_and_pair_on_stream`'s caller (the `:443` front door's `ChannelBroker` arm,
+    /// `ws_channel.rs`'s upgrade handler) acquires it before/at accept and passes it in, so it
+    /// stays held through a park in the `ChannelPairer`, through the relay splice once paired,
+    /// and drops on whichever exit path actually closes the connection. `None` for every
+    /// unbounded caller (`cap: None`) and every direct test construction in this module. Never
+    /// read, only held for its `Drop` -- leading underscore so `-D dead_code` doesn't flag it.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Which member of a relay pair a **mid-handoff** failure struck (#148). A completer ack-writes each
@@ -1085,6 +1130,15 @@ where
 /// offer stays parked (`Ok(None)`). The lock is held only for the synchronous `offer`,
 /// never across `.await`. This is the transport-generic core the front-door accept loop
 /// drives; wiring it into `serve_front_door` is the follow slice.
+///
+/// `permit` (#451) is the caller's already-acquired [`crate::state::ConnectionCap`] permit for
+/// this connection (`None` when uncapped); on success it is moved onto the constructed
+/// [`AdmittedStreamMember`] so it travels with the stream through however long it actually
+/// lives — parked in `pairer` until matched or TTL-swept, or straight into the relay splice
+/// once paired — instead of dropping the instant this function returns (which, for the
+/// `Parked`/immediately-`Ok(None)` case, used to happen while the live socket was still very
+/// much open inside `pairer`). Dropped here on an admission failure, which is correct: the
+/// connection is being torn down either way.
 pub async fn admit_and_pair_on_stream<S, F, Fut>(
     stream: S,
     observed: std::net::SocketAddr,
@@ -1093,6 +1147,7 @@ pub async fn admit_and_pair_on_stream<S, F, Fut>(
     authorize: &F,
     deadline: UnixSeconds,
     pairer: &std::sync::Mutex<ChannelPairer<AdmittedStreamMember<S>>>,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1109,7 +1164,7 @@ where
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let channel = req.grant.grant.channel;
     let holder = req.grant.grant.holder;
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
     let outcome = pairer
         .lock()
         .unwrap()
@@ -1247,18 +1302,13 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         // #450: every other public listener acquires a connection-cap permit before
         // spawning its per-connection task; this loop spawned unbounded until now.
         // Shed BEFORE spawning (cheaper than admitting then dropping mid-handshake),
-        // same posture as every other listener's cap. The permit is moved into the
-        // spawned task below and held through admission and (when this member is the
-        // one that completes a pair) through `complete(..).await`. NOTE (#451, found
-        // while adding this cap): on the `Parked` outcome the spawned task returns
-        // right after `offer`, so the permit is released even though the member's
-        // connection lives on inside the pairer until paired or swept by
-        // `drain_expired` -- this bounds *admission* concurrency, it does not yet
-        // account for a parked member's still-open socket. Carrying the permit on
-        // `WaitingMember`/`AdmittedMember` itself so it travels with the connection is
-        // the real fix, tracked under #451 together with the front-door/ws_channel
-        // instances of the same gap; not attempted in this pass.
-        let _permit = match &cap {
+        // same posture as every other listener's cap. #451: the permit is moved onto
+        // the [`AdmittedMember`] itself (inside `admit_incoming_member`), not just held
+        // as a task-local binding here — so it now stays held for exactly as long as
+        // the connection actually lives: through a park in the pairer (released only
+        // when TTL-swept below or superseded), through `complete(..).await` once
+        // paired, or dropped immediately on an admission failure.
+        let permit = match &cap {
             Some(c) => match c.try_admit() {
                 Some(p) => Some(p),
                 None => {
@@ -1278,11 +1328,12 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         let authorize = authorize.clone();
         let complete = complete.clone();
         tokio::spawn(async move {
-            let _permit = _permit; // held for the connection's whole admission+relay lifetime
             let now = now_fn();
             // Admit this one member (its join read is bounded by #105); on error, log and drop it —
-            // a single bad connection must not affect any other channel.
-            let member = match admit_incoming_member(incoming, now, &*authorize).await {
+            // a single bad connection must not affect any other channel. The permit travels with
+            // `incoming` into `admit_incoming_member` and is set on the returned `AdmittedMember`
+            // (or simply dropped here, correctly, on an admission failure).
+            let member = match admit_incoming_member(incoming, now, &*authorize, permit).await {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("ct-edge: channel admit failed: {e}");
@@ -1627,6 +1678,25 @@ mod tests {
         recv.read_to_end(512).await.unwrap_or_default()
     }
 
+    /// Like [`present_join`], but returns as soon as the possession signature is sent —
+    /// does NOT wait for an ack. A successfully-admitted-but-PARKED member gets no ack at
+    /// all until it's matched or TTL-swept (silence, not a reply — see e.g.
+    /// `ws_channel.rs`'s "a lone member with no partner parks" test), so `present_join`'s
+    /// trailing `recv.read_to_end` would block for however long that takes. Used by tests
+    /// that need to observe the parked state itself (e.g. permit accounting, #451) rather
+    /// than wait through to a pairing/eviction outcome.
+    async fn present_join_no_ack(conn: &quinn::Connection, req_bytes: &[u8], holder: &SigningKey) {
+        let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+        send.write_all(&(req_bytes.len() as u16).to_be_bytes())
+            .await
+            .expect("write length");
+        send.write_all(req_bytes).await.expect("write request");
+        let mut challenge = [0u8; 32];
+        recv.read_exact(&mut challenge).await.expect("challenge");
+        let sig = holder.sign(&challenge).to_bytes();
+        send.write_all(&sig).await.expect("write signature");
+    }
+
     fn join_request(channel: [u8; 32], holder: u8, endpoint: &str) -> ChannelJoinRequest {
         ChannelJoinRequest {
             grant: grant(channel, holder, Direction::Initiate, 1_000),
@@ -1662,6 +1732,7 @@ mod tests {
             operator: op,
             noise: None,
             attest: None,
+            _permit: None,
         };
         let b = AdmittedStreamMember {
             stream: b_stream,
@@ -1672,6 +1743,7 @@ mod tests {
             operator: op,
             noise: None,
             attest: None,
+            _permit: None,
         };
 
         let err = finish_relay_pair_over_streams(a, b, now)
@@ -2158,8 +2230,8 @@ mod tests {
                     .await
                     .expect("admit 2");
             finish_relay_pair_over_streams(
-                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None },
-                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None },
+                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, _permit: None },
+                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, _permit: None },
                 500,
             )
             .await
@@ -2287,14 +2359,14 @@ mod tests {
         let obs2: std::net::SocketAddr = "203.0.113.2:8002".parse().unwrap();
 
         // First holder → parked (no partner yet).
-        let r1 = admit_and_pair_on_stream(s1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+        let r1 = admit_and_pair_on_stream(s1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
             .await
             .expect("admit 1");
         assert!(r1.is_none(), "first holder of the channel parks in the pairer");
         assert_eq!(pairer.lock().unwrap().len(), 1, "one member waiting");
 
         // Second holder → paired with exactly the parked first.
-        let r2 = admit_and_pair_on_stream(s2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+        let r2 = admit_and_pair_on_stream(s2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
             .await
             .expect("admit 2");
         let (a, b) = r2.expect("second holder pairs with the parked first");
@@ -2400,14 +2472,14 @@ mod tests {
         let obs2: std::net::SocketAddr = "203.0.113.2:8002".parse().unwrap();
 
         let boxed1: BoxedChannelStream = Box::pin(s1);
-        let r1 = admit_and_pair_on_stream(boxed1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+        let r1 = admit_and_pair_on_stream(boxed1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
             .await
             .expect("admit 1 (transport A: a plain DuplexStream)");
         assert!(r1.is_none(), "first holder parks");
         assert_eq!(pairer.lock().unwrap().len(), 1);
 
         let boxed2: BoxedChannelStream = Box::pin(s2);
-        let r2 = admit_and_pair_on_stream(boxed2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+        let r2 = admit_and_pair_on_stream(boxed2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
             .await
             .expect("admit 2 (transport B: a DIFFERENT concrete stream type)");
         let (a, b) = r2.expect("second holder pairs with the parked first, across the type boundary");
@@ -2506,7 +2578,7 @@ mod tests {
             pairer: SharedChannelPairer,
         ) -> Option<(AdmittedStreamMember<BoxedChannelStream>, AdmittedStreamMember<BoxedChannelStream>)> {
             let boxed: BoxedChannelStream = Box::pin(stream);
-            admit_and_pair_on_stream(boxed, obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer)
+            admit_and_pair_on_stream(boxed, obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
                 .await
                 .expect("admission")
         }
@@ -3437,6 +3509,7 @@ mod tests {
             operator: pk,
             noise: None,
             attest: None,
+            _permit: None,
         };
         let b = AdmittedStreamMember {
             stream: broker_b,
@@ -3447,6 +3520,7 @@ mod tests {
             operator: pk,
             noise: None,
             attest: None,
+            _permit: None,
         };
 
         let splice = tokio::spawn(async move {
@@ -3644,5 +3718,328 @@ mod tests {
         assert_eq!(ack, b"OK", "a member (per the mock CP) is admitted via ChannelAuthorizer");
         conn.close(0u32.into(), b"done");
         server_task.await.expect("join").expect("admitted");
+    }
+
+    // ---- #451: connection-cap permit accounting ----------------------------------------
+
+    #[test]
+    fn a_parked_members_permit_is_held_by_the_pairer_not_released_on_offer_451() {
+        // The core structural claim #451's fix rests on: `WaitingMember<T>`'s payload T now
+        // carries the cap permit (on `AdmittedMember`/`AdmittedStreamMember`), so parking a
+        // member (`PairOutcome::Parked`) must NOT release its permit — the permit is only
+        // dropped when the `WaitingMember` itself is dropped (matched, superseded, or swept).
+        // Proven here against the pure, socket-free `ChannelPairer`/`WaitingMember` machinery
+        // with a lightweight fake payload standing in for the real member types, independent
+        // of QUIC/TLS — the fastest, most direct proof of the pattern the real fix relies on.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = std::sync::Arc::clone(&sem).try_acquire_owned().unwrap();
+        struct FakeMember {
+            _permit: OwnedSemaphorePermit,
+        }
+        let mut pairer = ChannelPairer::<FakeMember>::new();
+
+        let outcome = pairer.offer(WaitingMember {
+            channel: ChannelId([1u8; 32]),
+            holder: [1u8; 32],
+            deadline: 100,
+            payload: FakeMember { _permit: p1 },
+        });
+        assert!(matches!(outcome, PairOutcome::Parked), "first offer parks");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the parked member's permit must still be held — `offer` returning must not release it"
+        );
+
+        // Swept past its deadline: the permit releases only once the returned WaitingMember
+        // (and its payload) is actually dropped by the caller (mirroring `run_channel_broker_loop`
+        // closing the connection then letting the value drop).
+        let expired = pairer.drain_expired(101);
+        assert_eq!(expired.len(), 1, "one lone waiter past its deadline");
+        assert_eq!(sem.available_permits(), 1, "still held — drain_expired returns it, doesn't drop it");
+        drop(expired);
+        assert_eq!(sem.available_permits(), 2, "released once the swept member is actually torn down");
+    }
+
+    #[test]
+    fn a_matched_members_permit_travels_into_paired_not_dropped_on_offer_451() {
+        // The other structural claim: when a SECOND holder arrives and `offer` returns
+        // `Paired(a, b)`, BOTH members' permits travel out inside the returned pair (not just
+        // the second, freshly-offered one) — so a caller that hands `Paired(a, b)` to a
+        // completer (e.g. `finish_relay_pair_over_streams`) is holding 2 permits for the 2
+        // live sockets about to be relay-spliced, matching #451's "N pairs, 2N sockets, 2N
+        // permits" requirement instead of the pre-fix "0 permits" for N pairs.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let p1 = std::sync::Arc::clone(&sem).try_acquire_owned().unwrap();
+        let p2 = std::sync::Arc::clone(&sem).try_acquire_owned().unwrap();
+        #[derive(Debug)]
+        struct FakeMember {
+            _permit: OwnedSemaphorePermit,
+        }
+        let mut pairer = ChannelPairer::<FakeMember>::new();
+        let _ = pairer.offer(WaitingMember {
+            channel: ChannelId([2u8; 32]),
+            holder: [1u8; 32],
+            deadline: 100,
+            payload: FakeMember { _permit: p1 },
+        });
+        assert_eq!(sem.available_permits(), 0, "both permits are outstanding: 1 parked, 1 about to offer");
+
+        let outcome = pairer.offer(WaitingMember {
+            channel: ChannelId([2u8; 32]),
+            holder: [2u8; 32],
+            deadline: 100,
+            payload: FakeMember { _permit: p2 },
+        });
+        let (a, b) = match outcome {
+            PairOutcome::Paired(a, b) => (a, b),
+            other => panic!("expected Paired, got {other:?}"),
+        };
+        assert_eq!(sem.available_permits(), 0, "both permits still held, now inside the Paired pair");
+        drop(a);
+        drop(b);
+        assert_eq!(sem.available_permits(), 2, "both release once the pair (e.g. after its relay ends) is dropped");
+    }
+
+    #[tokio::test]
+    async fn run_channel_broker_loop_holds_a_parked_members_permit_until_ttl_sweep_451() {
+        // The real, end-to-end version of the two unit tests above: drive
+        // `run_channel_broker_loop` over a real QUIC endpoint with a real `ConnectionCap`, park
+        // ONE lone member (no partner ever arrives), and prove the cap's available-permit count
+        // stays down by 1 the whole time it's parked — not just for the brief admission window —
+        // then that it's returned once the periodic TTL sweep evicts it. Before the #451 fix the
+        // permit released the instant the spawned admission task returned from `offer` (i.e.
+        // almost immediately after connecting), so `cap.available()` would have already read 2
+        // long before this test ever advances the clock.
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let pk = operator_pubkey();
+        let chan = [0x51u8; 32];
+        let chan2 = [0x52u8; 32];
+        let clock = std::sync::Arc::new(AtomicU64::new(100));
+        let park_ttl = 5u64;
+        let cap = crate::state::ConnectionCap::new(2);
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let clock_loop = clock.clone();
+        let cap_loop = cap.clone();
+        let driver = tokio::spawn(async move {
+            run_channel_broker_loop(
+                &server,
+                move || clock_loop.load(Ordering::Relaxed),
+                move |c: ChannelId, _h: [u8; 32]| async move {
+                    (c.0 == chan || c.0 == chan2).then_some((pk, None, None))
+                },
+                park_ttl,
+                finish_rendezvous_pair,
+                Some(cap_loop),
+            )
+            .await;
+        });
+
+        assert_eq!(cap.available(), 2, "nothing admitted yet");
+
+        // One lone member connects and parks — no partner ever shows up. Held open in scope
+        // (not closed) so its socket genuinely stays live while parked, exactly the #451
+        // scenario ("the member's TLS/WebSocket stream lives on inside the pairer... uncounted
+        // against the cap").
+        let client = build_client_endpoint(cert.clone()).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let req = ChannelJoinRequest {
+            grant: grant_h(chan, &holder_sk(0xa1), Direction::Initiate, 1_000),
+            endpoint: "203.0.113.1:9101".to_string(),
+        };
+        // Drive admission up through the possession signature only -- NOT `present_join`,
+        // which then blocks on `read_to_end` waiting for the stream to finish/EOF. A parked
+        // member is never ack'd (silence, same as `ws_channel.rs`'s "a lone member... parks"
+        // test) until it's matched or TTL-swept, so `read_to_end` would block for however
+        // long THAT takes, which is exactly the state transition this test drives from the
+        // outside -- awaiting it here would deadlock the test against itself.
+        present_join_no_ack(&conn, &req.encode(), &holder_sk(0xa1)).await;
+
+        // Give the spawned admission task a moment to finish admitting + park in the pairer.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            cap.available(),
+            1,
+            "the parked member's permit must still be held while its connection is live and \
+             uncounted-for in the pairer — the #451 gap"
+        );
+
+        // Jump the clock well past the park TTL, then wake the accept loop (which samples
+        // `now` and sweeps `drain_expired` at the TOP of every iteration) with a throwaway
+        // second connection on an unrelated channel.
+        clock.store(1_000, Ordering::Relaxed);
+        let client2 = build_client_endpoint(cert).expect("client 2");
+        let conn2 = client2.connect(addr, "localhost").expect("cfg").await.expect("conn2");
+        // A different channel so it parks too, rather than pairing with the first (which would
+        // otherwise also release its permit via the Paired path, muddying the TTL assertion).
+        let req2 = ChannelJoinRequest {
+            grant: grant_h([0x52u8; 32], &holder_sk(0xb2), Direction::Initiate, 10_000),
+            endpoint: "203.0.113.2:9102".to_string(),
+        };
+        present_join_no_ack(&conn2, &req2.encode(), &holder_sk(0xb2)).await;
+        // Let this second admission complete AND the loop's next iteration (which samples the
+        // now-jumped clock and sweeps) run.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            cap.available(),
+            1,
+            "the first (TTL-swept) member's permit was released; the second (still-parked, not \
+             yet expired under its OWN fresh deadline) member's permit is still held"
+        );
+
+        drop(conn);
+        drop(conn2);
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn run_channel_broker_loop_holds_two_permits_for_a_matched_relay_pair_451() {
+        // The relay-side companion to the park test: two members of the SAME channel connect,
+        // pair, and their relay is spliced on a freshly spawned `complete(..)` task. Before the
+        // #451 fix that spawned task held NO permit (both callers' own permits had already
+        // dropped when their `offer`-calling tasks returned) — "N concurrent relayed pairs hold
+        // 2N live sockets against 0 counted permits". Prove the fixed behaviour: while the pair
+        // is actively relaying (held open by both ends), the cap shows exactly 2 permits in use.
+        let pk = operator_pubkey();
+        let chan = [0x61u8; 32];
+        let cap = crate::state::ConnectionCap::new(2);
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let cap_loop = cap.clone();
+        let driver = tokio::spawn(async move {
+            run_channel_broker_loop(
+                &server,
+                || 500u64,
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
+                10_000,
+                finish_relay_pair,
+                Some(cap_loop),
+            )
+            .await;
+        });
+
+        assert_eq!(cap.available(), 2);
+
+        // Both members connect and hold their relay open (never send their post-pairing byte)
+        // until released, so the splice stays live while we sample the cap.
+        let (rel1_tx, rel1_rx) = tokio::sync::oneshot::channel::<()>();
+        let (rel2_tx, rel2_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(2);
+        let m1 = tokio::spawn(run_relay_member(
+            cert.clone(), addr, chan, holder_sk(0xc1), Direction::Initiate, 0x01,
+            Some(ready_tx.clone()), Some(rel1_rx),
+        ));
+        let m2 = tokio::spawn(run_relay_member(
+            cert.clone(), addr, chan, holder_sk(0xd2), Direction::Accept, 0x02,
+            Some(ready_tx.clone()), Some(rel2_rx),
+        ));
+        drop(ready_tx);
+        ready_rx.recv().await.expect("member 1 relaying");
+        ready_rx.recv().await.expect("member 2 relaying");
+
+        assert_eq!(
+            cap.available(),
+            0,
+            "both live sockets of the matched, actively-relaying pair are counted against the \
+             cap — not 0, per #451"
+        );
+
+        let _ = rel1_tx.send(());
+        let _ = rel2_tx.send(());
+        let _ = m1.await;
+        let _ = m2.await;
+
+        // Give the completer's task a moment to actually return (releasing both permits) after
+        // the relay ends.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(cap.available(), 2, "both permits release once the relay (and the pair) end");
+
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn admit_and_pair_on_stream_holds_the_permit_while_parked_and_moves_both_into_a_pair_451() {
+        // The stream-generic (front-door / ws-channel) sibling of the QUIC-native tests above:
+        // `admit_and_pair_on_stream` is the shared core both `serve.rs`'s `:443` ChannelBroker
+        // arm and `ws_channel.rs` drive. Proves the same two properties directly against it: a
+        // parked member's permit is NOT released when the function returns `Ok(None)`, and a
+        // matched pair's `Ok(Some((a, b)))` carries BOTH permits.
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x71u8; 32];
+        let src = holder_sk(0xe1);
+        let snk = holder_sk(0xf2);
+        let req_src = ChannelJoinRequest {
+            grant: grant_h(channel, &src, Direction::Initiate, 1_000),
+            endpoint: "relay-only".to_string(),
+        };
+        let req_snk = ChannelJoinRequest {
+            grant: grant_h(channel, &snk, Direction::Accept, 1_000),
+            endpoint: "relay-only".to_string(),
+        };
+
+        let (c1, s1) = tokio::io::duplex(4096);
+        let (c2, s2) = tokio::io::duplex(4096);
+
+        let src_task = tokio::spawn(async move {
+            let mut c = c1;
+            let rb = req_src.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&src.sign(&ch).to_bytes()).await.expect("sig");
+            let _ = read_relay_ack_line(&mut c).await;
+        });
+        let snk_task = tokio::spawn(async move {
+            let mut c = c2;
+            let rb = req_snk.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&snk.sign(&ch).to_bytes()).await.expect("sig");
+            let _ = read_relay_ack_line(&mut c).await;
+        });
+
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<tokio::io::DuplexStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize = move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs1: std::net::SocketAddr = "203.0.113.1:8001".parse().unwrap();
+        let obs2: std::net::SocketAddr = "203.0.113.2:8002".parse().unwrap();
+
+        let cap = crate::state::ConnectionCap::new(2);
+        let permit1 = cap.try_admit().expect("permit 1");
+        let r1 = admit_and_pair_on_stream(
+            s1, obs1, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, Some(permit1),
+        )
+        .await
+        .expect("admit 1");
+        assert!(r1.is_none(), "first holder parks");
+        assert_eq!(cap.available(), 1, "the parked member's permit must still be held, not dropped on return");
+
+        let permit2 = cap.try_admit().expect("permit 2");
+        let r2 = admit_and_pair_on_stream(
+            s2, obs2, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, Some(permit2),
+        )
+        .await
+        .expect("admit 2");
+        assert_eq!(cap.available(), 0, "both permits outstanding: one just acquired, one still parked");
+        let (a, b) = r2.expect("second holder pairs with the parked first");
+
+        // Both permits travelled into the pair (not dropped by either `offer` call).
+        drop(a);
+        drop(b);
+        assert_eq!(cap.available(), 2, "both permits release once the paired members are dropped");
+
+        drop(src_task);
+        drop(snk_task);
     }
 }

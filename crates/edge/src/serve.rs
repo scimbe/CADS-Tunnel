@@ -840,6 +840,18 @@ pub async fn serve_front_door(
     mesh_relay: Option<&MeshRelayConfig>,
     relay_gate: Option<&crate::relay_gate::RelayGateContext>,
     browser_tunnel_cap: Option<&ConnectionCap>,
+    // #451: this connection's own accept-loop `ConnectionCap` permit (`None` when
+    // uncapped), OWNED by this call rather than held in a wrapping `let _permit = ..;`
+    // by the caller. Every arm except `ChannelBroker` already blocks for the
+    // connection's whole real lifetime inside this function, so simply letting Rust
+    // drop it when this function returns reproduces the caller's old behavior exactly.
+    // The `ChannelBroker` arm is the one that DOESN'T block for the connection's real
+    // lifetime (it can return the instant a lone member parks, or after merely
+    // spawning the relay for a matched pair) -- so it explicitly moves `permit` into
+    // `admit_and_pair_on_stream`, which carries it on the constructed member so it
+    // travels with the connection instead of dropping early. See #451's issue for the
+    // "0 permits for 2N live sockets" gap this closes.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), BoxError> {
     // #121 Phase B1: the member's reflexive (post-NAT) source, captured from the accepted TCP
     // socket before `inbound` is consumed, so a `:443`/front-door channel join can observe it
@@ -976,10 +988,14 @@ pub async fn serve_front_door(
             // #127: a TLS-handshake failure at the dedicated channel-ALPN acceptor happens
             // BEFORE admission, so #124/#125's per-checkpoint logs never run — tag it so a
             // silent `Refused` (e.g. #103's) surfaces under `grep 'channel-join NO'`.
-            let tls: FrontDoorChannelStream = ctx
-                .acceptor
-                .accept(joined)
+            // #452: this TLS accept was the one front-door arm with a cap but no handshake
+            // timeout (the `EdgeRelay`/`Proxy` arms already wrap theirs in
+            // `FRONT_DOOR_TLS_ACCEPT_TIMEOUT`, see #422) -- a peer that opens the TCP
+            // connection, sends a valid ClientHello (so it classifies to this arm), then
+            // stalls mid-handshake held this connection's cap permit forever.
+            let tls: FrontDoorChannelStream = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, ctx.acceptor.accept(joined))
                 .await
+                .map_err(|_| -> BoxError { "front door: channel TLS handshake not completed within the timeout (#422/#452)".into() })?
                 .map_err(|e| { eprintln!("ct-edge: channel-join NO [tls-accept]: {e}"); e })?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -996,6 +1012,14 @@ pub async fn serve_front_door(
             // member correlates through the SAME pairer a browser member
             // (ws_channel.rs) offers itself to -- either can now be the partner.
             let boxed: crate::channel_broker::BoxedChannelStream = Box::pin(tls);
+            // #451: `permit` (this connection's own accept-loop cap permit) is moved into
+            // admission here rather than merely held by the caller's task wrapper -- this
+            // is the one arm where that distinction matters: a lone member parks (`Ok(None)`)
+            // and this whole function returns while the live TLS stream stays open inside
+            // `ctx.pairer`, or a matched pair's relay is handed to a freshly spawned task
+            // below. Carrying the permit on the constructed `AdmittedStreamMember` (inside
+            // `admit_and_pair_on_stream`) means it now travels with the connection through
+            // either path instead of releasing the moment this function returns.
             let paired = crate::channel_broker::admit_and_pair_on_stream(
                 boxed,
                 observed,
@@ -1004,6 +1028,7 @@ pub async fn serve_front_door(
                 &authorize,
                 now + CHANNEL_PARK_TTL_SECS,
                 &ctx.pairer,
+                permit,
             )
             .await?;
             if let Some((a, b)) = paired {
@@ -2008,38 +2033,35 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // the QUIC/TCP-fallback/:443 loops sharing one budget) and the
                     // BrowserTunnel-specific `browser_tunnel_cap` (#254), same shed-cheaply
                     // posture as everywhere else.
-                    let conn_cap_bl = conn_cap.clone();
+                    //
+                    // #452: migrated onto the shared `serve_listener` helper for the FIRST
+                    // (`conn_cap`) admission + keepalive (previously missing here) + spawn;
+                    // this listener's own SECOND, BrowserTunnel-specific cap is applied inside
+                    // the handler itself (a genuine second budget the shared helper has no
+                    // concept of), same shed-cheaply posture as before.
                     let browser_tunnel_cap_bl = browser_tunnel_cap.clone();
-                    tokio::spawn(async move {
-                        while let Ok((tcp, _)) = bl.accept().await {
-                            let permit = match &conn_cap_bl {
-                                Some(cap) => match cap.try_admit() {
-                                    Some(p) => Some(p),
-                                    None => {
-                                        drop(tcp);
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            };
-                            let sub_permit = match &browser_tunnel_cap_bl {
-                                Some(cap) => match cap.try_admit() {
-                                    Some(p) => Some(p),
-                                    None => {
-                                        drop(tcp);
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            };
+                    tokio::spawn(crate::transport::serve_listener(
+                        bl,
+                        conn_cap.clone(),
+                        "Browser-Plane SNI listener",
+                        None,
+                        move |tcp, _addr, permit| {
                             let state = bstate.clone();
-                            tokio::spawn(async move {
+                            let browser_tunnel_cap = browser_tunnel_cap_bl.clone();
+                            async move {
+                                let sub_permit = match &browser_tunnel_cap {
+                                    Some(cap) => match cap.try_admit() {
+                                        Some(p) => Some(p),
+                                        None => return,
+                                    },
+                                    None => None,
+                                };
                                 let _permit = permit;
                                 let _sub_permit = sub_permit;
                                 let _ = serve_sni_passthrough(tcp, &state).await;
-                            });
-                        }
-                    });
+                            }
+                        },
+                    ));
                     eprintln!("ct-edge: Browser-Plane SNI listener on {listen}");
                 }
                 Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_BROWSER_LISTEN {listen}: {e}"),
@@ -2244,38 +2266,22 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // (each connection reaching the un-timed TLS handshake) before the PoW /
                     // grant / membership gates run. Was missing here — the cap was cloned to
                     // the TCP-fallback and QUIC loops but never to this one.
-                    let conn_cap_fd = conn_cap.clone();
+                    //
+                    // #452: migrated onto the shared `serve_listener` helper (admission,
+                    // keepalive, shed logging, spawning). No helper-level `handshake_timeout`
+                    // — every arm this dispatches into already applies its OWN internal
+                    // timeout to just its handshake/admission-read phase (`EdgeRelay`/`Proxy`
+                    // via `FRONT_DOOR_TLS_ACCEPT_TIMEOUT`, `ChannelBroker` now too per #452's
+                    // fix above, `BrowserTunnel`/`RelayGate` via their own paths) — this
+                    // connection is meant to stay open for the tunnel's/session's whole real
+                    // lifetime, which a whole-handler timeout here would incorrectly bound.
                     let browser_tunnel_cap_fd = browser_tunnel_cap.clone();
-                    tokio::spawn(async move {
-                        while let Ok((tcp, _)) = fl.accept().await {
-                            let permit = match &conn_cap_fd {
-                                Some(cap) => match cap.try_admit() {
-                                    Some(p) => Some(p),
-                                    None => {
-                                        // #119's shed path previously left no trace anywhere in
-                                        // the edge's own logs -- indistinguishable, from here,
-                                        // from any other closed socket. A client sees this as a
-                                        // bare TCP-connect-then-EOF with no TLS bytes exchanged
-                                        // at all (the ClientHello it sends lands on an already-
-                                        // dropped socket), which is otherwise easy to misdiagnose
-                                        // as a TLS-layer bug rather than "the cap is full". Log
-                                        // occasionally (powers of two, then every 1000) so a
-                                        // sustained shed streak is visible without spamming
-                                        // stdout under a real flood -- the shed itself stays as
-                                        // cheap as before, this is just a counter + rare eprintln.
-                                        let total = cap.note_shed();
-                                        if total.is_power_of_two() || total % 1000 == 0 {
-                                            eprintln!(
-                                                "ct-edge: :443 front door shedding — CT_EDGE_MAX_CONNECTIONS cap full, {total} connection(s) shed since start"
-                                            );
-                                        }
-                                        drop(tcp); // shed: over the cap, close cheaply
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            };
-                            crate::transport::apply_tcp_keepalive(&tcp);
+                    tokio::spawn(crate::transport::serve_listener(
+                        fl,
+                        conn_cap.clone(),
+                        ":443 front door",
+                        None,
+                        move |tcp, _addr, permit| {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
                             let proxies = proxies.clone();
@@ -2285,8 +2291,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let mesh_relay_config = mesh_relay_config.clone();
                             let relay_gate_ctx = relay_gate_ctx.clone();
                             let browser_tunnel_cap = browser_tunnel_cap_fd.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit; // held for the connection's lifetime
+                            async move {
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                                 let challenge = Challenge { nonce, difficulty };
@@ -2306,14 +2311,15 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     mesh_relay_config.as_ref(),
                                     relay_gate_ctx.as_ref(),
                                     browser_tunnel_cap.as_ref(),
+                                    permit,
                                 )
                                 .await
                                 {
                                     eprintln!("ct-edge: :443 front-door connection error: {e}");
                                 }
-                            });
-                        }
-                    });
+                            }
+                        },
+                    ));
                     eprintln!("ct-edge: unified :443 front door on {listen} ({n_proxies} proxy host(s), CT_FRONT_DOOR)");
                 }
                 Err(e) => eprintln!("ct-edge: cannot bind CT_FRONT_DOOR {listen}: {e}"),
@@ -2334,25 +2340,24 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // spawned an unbounded task per accepted connection, so a flood here
                     // could exhaust FDs/tasks for the whole edge process regardless of the
                     // caps already enforced everywhere else.
-                    let conn_cap_redirect = conn_cap.clone();
-                    tokio::spawn(async move {
-                        while let Ok((tcp, _)) = rl.accept().await {
-                            let permit = match &conn_cap_redirect {
-                                Some(cap) => match cap.try_admit() {
-                                    Some(p) => Some(p),
-                                    None => {
-                                        drop(tcp); // shed: over the cap, close cheaply
-                                        continue;
-                                    }
-                                },
-                                None => None,
-                            };
-                            tokio::spawn(async move {
-                                let _permit = permit; // held for the connection's lifetime
-                                let _ = serve_http_redirect(tcp).await;
-                            });
-                        }
-                    });
+                    //
+                    // #452: migrated onto the shared `serve_listener` helper — this whole
+                    // connection is short-lived by design (connect, read one request, write
+                    // one redirect, done), so unlike the other migrated loops it's correct to
+                    // let the helper bound the WHOLE handler (`serve_http_redirect` already
+                    // has its own internal `HTTP_REDIRECT_READ_TIMEOUT` too — #470 — so this
+                    // is redundant-but-harmless belt and suspenders, and closes the
+                    // "cap-vs-timeout divergence" #452 flagged for this specific loop).
+                    tokio::spawn(crate::transport::serve_listener(
+                        rl,
+                        conn_cap.clone(),
+                        ":80 redirect",
+                        Some(HTTP_REDIRECT_READ_TIMEOUT),
+                        move |tcp, _addr, permit| async move {
+                            let _permit = permit; // held for the connection's lifetime
+                            let _ = serve_http_redirect(tcp).await;
+                        },
+                    ));
                     eprintln!("ct-edge: HTTP->HTTPS redirect on {listen} (CT_EDGE_HTTP_REDIRECT)");
                 }
                 Err(e) => eprintln!("ct-edge: cannot bind CT_EDGE_HTTP_REDIRECT {listen}: {e}"),
@@ -2365,24 +2370,20 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     let state_tcp = state.clone();
     // #86 SEC86c: the TCP fallback is the same rendezvous surface as QUIC, so it
     // shares the one connection cap (a clone — the budget is global, not per-loop).
-    let conn_cap_tcp = conn_cap.clone();
-    tokio::spawn(async move {
-        while let Ok((tcp, _)) = tcp_listener.accept().await {
-            // Shed over the cap by dropping the socket (closes it), as on QUIC.
-            let permit = match &conn_cap_tcp {
-                Some(cap) => match cap.try_admit() {
-                    Some(p) => Some(p),
-                    None => {
-                        drop(tcp);
-                        continue;
-                    }
-                },
-                None => None,
-            };
-            crate::transport::apply_tcp_keepalive(&tcp);
+    //
+    // #452: migrated onto the shared `serve_listener` helper (admission, keepalive,
+    // shed logging, spawning). No helper-level `handshake_timeout` — this connection
+    // stays open for the tunnel's whole life; only the TLS handshake itself is bounded,
+    // via `TCP_FALLBACK_ADMISSION_TIMEOUT` inside the handler, unchanged from before.
+    tokio::spawn(crate::transport::serve_listener(
+        tcp_listener,
+        conn_cap.clone(),
+        "TCP fallback",
+        None,
+        move |tcp, _addr, permit| {
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
-            tokio::spawn(async move {
+            async move {
                 let _permit = permit; // held for the connection's lifetime
                 // #258: bound the handshake too, not just the admission reads inside
                 // serve_tcp_connection -- a slow-drip TLS handshake holds the cap
@@ -2394,9 +2395,9 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 let challenge = Challenge { nonce, difficulty };
                 let _ = serve_tcp_connection(tls, &state, &challenge).await;
-            });
-        }
-    });
+            }
+        },
+    ));
 
     // #81 SEC81c-c c-iii-3b: mount the Agent-Fabric broker on a DEDICATED channel-
     // rendezvous QUIC endpoint (a fresh leaf under the same CA, so agents already trust
@@ -4080,7 +4081,7 @@ mod tests {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
             serve_front_door(
-                tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None, None, None,
+                tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None, None, None, None,
             )
             .await
         });
@@ -4305,7 +4306,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None)
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None)
                 .await
         });
 
@@ -4358,7 +4359,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, None).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, None, None).await
         });
 
         // Real client: TCP connect, real TLS handshake offering ONLY the ct-edge
@@ -4422,7 +4423,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, Some(&cap)).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, Some(&cap), None).await
         });
 
         let mut client = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
@@ -4653,7 +4654,7 @@ mod tests {
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
             serve_front_door(
-                tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None,
+                tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None,
             )
             .await
         });
@@ -4742,7 +4743,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None, None)
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None)
                 .await
         });
 
@@ -4881,7 +4882,7 @@ mod tests {
                         std::collections::HashMap::new();
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
-                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None,
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None, None,
                     )
                     .await;
                 });
@@ -4962,6 +4963,188 @@ mod tests {
         let got_snk = snk_task.await.expect("snk task");
         assert_eq!(got_src, 0x22, "source got the sink's byte through the wired :443 front door");
         assert_eq!(got_snk, 0x11, "sink got the source's byte through the wired :443 front door");
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
+    #[tokio::test]
+    async fn front_door_channel_arm_holds_the_connection_caps_permit_while_parked_and_relaying_451() {
+        // #451, end to end through `serve_front_door`'s own accept-loop wiring (production
+        // shape, not just the lower-level `channel_broker` unit): a real `ConnectionCap`
+        // permit, acquired the way `run_edge`'s `:443` front-door loop does, is passed all
+        // the way into `serve_front_door`'s new `permit` parameter. Before the fix,
+        // `serve_front_door` returned (dropping the caller's permit) the instant a lone
+        // `:443` channel member parked -- even though its live TLS stream stayed open inside
+        // `ChannelFrontDoor`'s pairer -- and a matched pair's relay ran on a freshly spawned
+        // task holding NO permit at all. Proves both are now fixed: the cap's available-permit
+        // count drops and STAYS down while a member is parked (not released the instant
+        // `serve_front_door` returns), and while a matched pair actively relays, both
+        // permits are accounted for.
+        use ct_common::channel::{
+            ChannelGrant, ChannelId, ChannelJoinRequest, Direction, Rights, SignedChannelGrant,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+
+        crate::transport::install_crypto_provider();
+
+        let operator = SigningKey::from_bytes(&[0x39u8; 32]);
+        let operator_pk = operator.verifying_key().to_bytes();
+        let channel = ChannelId([0x39u8; 32]);
+
+        struct MockResolver {
+            operator: [u8; 32],
+            channel: ChannelId,
+        }
+        impl ChannelMemberResolver for MockResolver {
+            fn resolve_member<'a>(
+                &'a self,
+                channel: ChannelId,
+                _holder: [u8; 32],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let op = self.operator;
+                let ok = channel == self.channel;
+                Box::pin(async move { ok.then_some((op, None, None)) })
+            }
+        }
+
+        let ca = crate::pki::Ca::new("ct-edge-ca").unwrap();
+        let channel_acceptor =
+            crate::pki::build_channel_front_door_acceptor(&ca, vec!["edge.test".to_string()])
+                .await
+                .unwrap();
+        let (shared_leaf, shared_key) = ca.issue(vec!["edge.test".to_string()]).unwrap();
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![shared_leaf], shared_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+
+        let ctx = ChannelFrontDoor::standalone(
+            Arc::new(MockResolver { operator: operator_pk, channel }),
+            channel_acceptor,
+        );
+        let cap = ConnectionCap::new(2);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let cap_loop = cap.clone();
+        let fd_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = fd.accept().await.unwrap();
+                // Mirrors `run_edge`'s real front-door accept loop: acquire the cap permit
+                // BEFORE dispatching, pass it into `serve_front_door`.
+                let permit = cap_loop.try_admit().expect("cap has room");
+                let ctx = ctx.clone();
+                let acceptor = acceptor.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let proxies: std::collections::HashMap<String, ProxyTarget> =
+                        std::collections::HashMap::new();
+                    let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                    let _ = serve_front_door(
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None,
+                        Some(permit),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        async fn connect_and_admit(
+            addr: SocketAddr,
+            cert: rustls::pki_types::CertificateDer<'static>,
+            req: ChannelJoinRequest,
+            holder: SigningKey,
+        ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let mut ccfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            ccfg.alpn_protocols = vec![b"ct-edge-channel".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let sni = rustls::pki_types::ServerName::try_from("edge.test").unwrap();
+            let mut tls = connector.connect(sni, tcp).await.expect("channel TLS terminates at :443");
+            let rb = req.encode();
+            tls.write_all(&(rb.len() as u16).to_be_bytes()).await.unwrap();
+            tls.write_all(&rb).await.unwrap();
+            let mut ch = [0u8; 32];
+            tls.read_exact(&mut ch).await.unwrap();
+            tls.write_all(&holder.sign(&ch).to_bytes()).await.unwrap();
+            tls
+        }
+
+        let ca_root = ca.root_der();
+        assert_eq!(cap.available(), 2, "nothing admitted yet");
+
+        // Member 1 connects and admits, then parks (no partner yet) -- held open (not
+        // dropped) so its live TLS stream genuinely stays open, exactly the #451 scenario.
+        let src = SigningKey::from_bytes(&[0x40u8; 32]);
+        let req_src = ChannelJoinRequest {
+            grant: {
+                let g = ChannelGrant {
+                    channel,
+                    holder: src.verifying_key().to_bytes(),
+                    direction: Direction::Initiate,
+                    rights: Rights::ReadWrite,
+                    delegable: false,
+                    expires_at: 4_000_000_000,
+                };
+                let signature = operator.sign(&g.signing_bytes()).to_bytes();
+                SignedChannelGrant { grant: g, signature }
+            },
+            endpoint: "relay-only".to_string(),
+        };
+        let member1 = connect_and_admit(fd_addr, ca_root.clone(), req_src, src).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            cap.available(),
+            1,
+            "the parked member's permit must still be held — the connection is live and \
+             uncounted-for in the pairer, the #451 gap"
+        );
+
+        // Member 2 joins the SAME channel: pairs with member 1, and the arm spawns the relay
+        // splice. Both members' streams are held open (not dropped), so the relay is actively
+        // live while we sample the cap.
+        let snk = SigningKey::from_bytes(&[0x41u8; 32]);
+        let req_snk = ChannelJoinRequest {
+            grant: {
+                let g = ChannelGrant {
+                    channel,
+                    holder: snk.verifying_key().to_bytes(),
+                    direction: Direction::Accept,
+                    rights: Rights::ReadWrite,
+                    delegable: false,
+                    expires_at: 4_000_000_000,
+                };
+                let signature = operator.sign(&g.signing_bytes()).to_bytes();
+                SignedChannelGrant { grant: g, signature }
+            },
+            endpoint: "relay-only".to_string(),
+        };
+        let member2 = connect_and_admit(fd_addr, ca_root, req_snk, snk).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            cap.available(),
+            0,
+            "both live sockets of the matched, actively-relaying pair are counted against the \
+             cap — not 0, per #451"
+        );
+
+        drop(member1);
+        drop(member2);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(cap.available(), 2, "both permits release once the relay (and the pair) end");
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }

@@ -297,33 +297,70 @@ pub fn ws_channel_router(state: WsChannelState) -> Router {
 /// worst case by roughly 1000x (64 MiB -> 64 KiB).
 const WS_MAX_MESSAGE_BYTES: usize = ct_common::a2a::MAX_MESSAGE_BYTES;
 
-async fn ws_upgrade_handler(ws: WebSocketUpgrade, State(state): State<WsChannelState>) -> Response {
-    let ws = ws.max_message_size(WS_MAX_MESSAGE_BYTES).max_frame_size(WS_MAX_MESSAGE_BYTES);
-    // Shed BEFORE upgrading (cheaper than admitting then dropping mid-handshake),
-    // same posture as every other public listener's `ConnectionCap` -- see
-    // WsChannelState::cap's doc comment.
-    let permit = match &state.cap {
-        Some(cap) => match cap.try_admit() {
-            Some(p) => Some(p),
-            None => {
-                let total = cap.note_shed();
-                if total.is_power_of_two() || total % 1000 == 0 {
-                    eprintln!(
-                        "ct-edge: ws-channel shedding — CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS cap full, {total} connection(s) shed since start"
-                    );
-                }
-                return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "too many concurrent connections").into_response();
-            }
-        },
-        None => None,
-    };
-    ws.on_upgrade(move |socket| async move {
-        let _permit = permit; // held for the connection's lifetime, released on drop
-        handle_ws_channel_join(socket, state).await
-    })
+/// A `ConnectionCap` permit acquired at raw-TCP-accept time (before the TLS/HTTP-upgrade
+/// handshake even starts), threaded into this ONE connection's axum service via a request
+/// extension layered per-connection in `serve_with_optional_tls` (#451 gap 3 / #452): the
+/// admission decision moves from "after the WS upgrade, inside the axum handler" to "at
+/// accept, before any TLS/HTTP work" — `ws_upgrade_handler` takes over this SAME permit
+/// instead of acquiring a second one, so one live connection costs exactly one cap slot,
+/// end to end, from before its first byte to after its last.
+#[derive(Clone)]
+struct AcceptPermit(Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
+
+impl AcceptPermit {
+    fn new(permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(permit)))
+    }
+
+    /// Take the permit out. `None` either because there was no cap configured (an
+    /// unbounded listener) or (defensively) because it was already taken.
+    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.lock().unwrap().take()
+    }
 }
 
-async fn handle_ws_channel_join(socket: WebSocket, state: WsChannelState) {
+async fn ws_upgrade_handler(
+    ws: WebSocketUpgrade,
+    accept_permit: Option<axum::extract::Extension<AcceptPermit>>,
+    State(state): State<WsChannelState>,
+) -> Response {
+    let ws = ws.max_message_size(WS_MAX_MESSAGE_BYTES).max_frame_size(WS_MAX_MESSAGE_BYTES);
+    let permit = match accept_permit {
+        // `serve_with_optional_tls` already admitted this connection against `state.cap`
+        // (the SAME `ConnectionCap`, shared -- see `serve_ws_channel_with_pairer`) at raw
+        // TCP-accept time (#451/#452): take over that permit instead of acquiring a second
+        // one here, so a real connection consumes exactly one cap slot for its whole life,
+        // not a slot at accept that's released the instant the upgrade handshake completes
+        // PLUS a separate one from here on.
+        Some(axum::extract::Extension(slot)) => slot.take(),
+        // No accept-loop permit slot on this connection -- e.g. `WsChannelState` served
+        // directly via plain `axum::serve` (this module's own standalone tests,
+        // `serve_ws_channel`), which never layers the extension. Fall back to acquiring
+        // directly from `state.cap`, unchanged from before this fix.
+        None => match &state.cap {
+            Some(cap) => match cap.try_admit() {
+                Some(p) => Some(p),
+                None => {
+                    let total = cap.note_shed();
+                    if total.is_power_of_two() || total % 1000 == 0 {
+                        eprintln!(
+                            "ct-edge: ws-channel shedding — CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS cap full, {total} connection(s) shed since start"
+                        );
+                    }
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "too many concurrent connections").into_response();
+                }
+            },
+            None => None,
+        },
+    };
+    ws.on_upgrade(move |socket| handle_ws_channel_join(socket, state, permit))
+}
+
+async fn handle_ws_channel_join(
+    socket: WebSocket,
+    state: WsChannelState,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) {
     // Boxed into the shared cross-transport stream type so this browser member
     // correlates through the SAME pairer a `:443`/QUIC member offers itself to --
     // either can now be the partner.
@@ -344,6 +381,13 @@ async fn handle_ws_channel_join(socket: WebSocket, state: WsChannelState) {
         let resolver = resolver.clone();
         async move { resolver.resolve_member(c, h).await }
     };
+    // #451: `permit` (this connection's cap permit, `None` when uncapped) is moved into
+    // admission here, not held as a task-local binding -- it ends up on the constructed
+    // `AdmittedStreamMember` so it stays held for exactly as long as this connection
+    // actually lives: through a park in `state.pairer` (until matched or TTL-swept), and
+    // through the relay splice below once paired -- instead of releasing the instant this
+    // function's caller task returns, which for the (very common) "parked, no partner yet"
+    // case used to happen almost immediately, while the live socket stayed open uncounted.
     let paired = crate::channel_broker::admit_and_pair_on_stream(
         stream,
         observed,
@@ -352,6 +396,7 @@ async fn handle_ws_channel_join(socket: WebSocket, state: WsChannelState) {
         &authorize,
         now + WS_CHANNEL_PARK_TTL_SECS,
         &state.pairer,
+        permit,
     )
     .await;
     match paired {
@@ -380,6 +425,16 @@ pub async fn serve_ws_channel(
     Ok(())
 }
 
+/// #451/#452: bound on the raw-TCP-accept loop's own TLS-accept-through-WS-upgrade
+/// handshake phase, applied by [`crate::transport::serve_listener`] around the whole
+/// `serve_with_optional_tls` per-connection handler below. A legitimate WS client
+/// completes TLS (if any) and the HTTP upgrade request/response in one quick round
+/// trip; the long-lived POST-upgrade WS session itself runs on a SEPARATE task axum's
+/// own `WebSocketUpgrade::on_upgrade` spawns internally (decoupled from this
+/// handler, which returns once the upgrade handoff completes) -- so this timeout
+/// never bounds a real, live call session, only a stalled/hostile pre-upgrade client.
+const WS_CHANNEL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Serve `router` on `inner`, optionally TLS-wrapping each accepted connection first
 /// (`tls: None` = plain `ws://`, `Some(acceptor)` = native `wss://` termination).
 /// axum 0.7's `axum::serve` only accepts a concrete [`tokio::net::TcpListener`] --
@@ -390,49 +445,58 @@ pub async fn serve_ws_channel(
 /// directly -- the same low-level approach axum's own examples use for exactly this
 /// case. `.with_upgrades()` is required for the WebSocket `Connection: Upgrade`
 /// handshake this listener exists for.
+///
+/// #451/#452: admission (`cap`), TCP keepalive, and spawning are now owned by the
+/// SHARED [`crate::transport::serve_listener`] helper -- the fix for both "the cap was
+/// only consulted inside the axum handler AFTER the WebSocket upgrade, so pre-upgrade
+/// connections were entirely unbounded" (#451 gap 3) and "only some listeners call the
+/// shared TCP-keepalive helper" (#452). The permit `serve_listener` hands this
+/// per-connection handler is threaded into the per-connection router via an
+/// [`AcceptPermit`] request extension, so `ws_upgrade_handler` can take over the SAME
+/// permit rather than acquiring its own second one.
 async fn serve_with_optional_tls(
     inner: tokio::net::TcpListener,
     tls: Option<tokio_rustls::TlsAcceptor>,
     router: Router,
+    cap: Option<crate::state::ConnectionCap>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        let (stream, addr) = match inner.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                // A transient per-connection accept error must not take down the
-                // whole listener -- log and keep serving.
-                eprintln!("ct-edge: ws-channel accept error: {e}");
-                continue;
-            }
-        };
-        let router = router.clone();
-        let tls = tls.clone();
-        tokio::spawn(async move {
-            let service = hyper_util::service::TowerToHyperService::new(router);
-            let result = match tls {
-                None => {
-                    let io = hyper_util::rt::TokioIo::new(stream);
-                    hyper::server::conn::http1::Builder::new().serve_connection(io, service).with_upgrades().await
-                }
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
-                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+    crate::transport::serve_listener(
+        inner,
+        cap,
+        "ws-channel",
+        Some(WS_CHANNEL_HANDSHAKE_TIMEOUT),
+        move |stream, addr, permit| {
+            let router = router.clone().layer(axum::Extension(AcceptPermit::new(permit)));
+            let tls = tls.clone();
+            async move {
+                let service = hyper_util::service::TowerToHyperService::new(router);
+                let result = match tls {
+                    None => {
+                        let io = hyper_util::rt::TokioIo::new(stream);
                         hyper::server::conn::http1::Builder::new().serve_connection(io, service).with_upgrades().await
                     }
-                    Err(e) => {
-                        // One failed TLS handshake (e.g. a plain-HTTP probe hitting a
-                        // wss:// port) must not kill the listener -- log and drop just
-                        // this connection.
-                        eprintln!("ct-edge: ws-channel TLS handshake failed from {addr}: {e}");
-                        return;
-                    }
-                },
-            };
-            if let Err(e) = result {
-                eprintln!("ct-edge: ws-channel connection from {addr} ended: {e}");
+                    Some(acceptor) => match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            let io = hyper_util::rt::TokioIo::new(tls_stream);
+                            hyper::server::conn::http1::Builder::new().serve_connection(io, service).with_upgrades().await
+                        }
+                        Err(e) => {
+                            // One failed TLS handshake (e.g. a plain-HTTP probe hitting a
+                            // wss:// port) must not kill the listener -- log and drop just
+                            // this connection.
+                            eprintln!("ct-edge: ws-channel TLS handshake failed from {addr}: {e}");
+                            return;
+                        }
+                    },
+                };
+                if let Err(e) = result {
+                    eprintln!("ct-edge: ws-channel connection from {addr} ended: {e}");
+                }
             }
-        });
-    }
+        },
+    )
+    .await;
+    Ok(())
 }
 
 /// Like [`serve_ws_channel`], but joins the shared cross-transport `pairer` (the
@@ -450,9 +514,9 @@ pub async fn serve_ws_channel_with_pairer(
     cap: Option<crate::state::ConnectionCap>,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = WsChannelState::new(resolver, pairer, cap);
+    let state = WsChannelState::new(resolver, pairer, cap.clone());
     let inner = tokio::net::TcpListener::bind(listen).await?;
-    serve_with_optional_tls(inner, tls, ws_channel_router(state)).await
+    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap).await
 }
 
 #[cfg(test)]
