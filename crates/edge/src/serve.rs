@@ -802,6 +802,63 @@ const CLIENT_HELLO_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// unbounded, same as everywhere else in this file.
 const TCP_FALLBACK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// ct-agent#15 flap follow-up: how often the Edge sends a real-payload PING
+/// frame (see [`send_ping_and_await_pong`]) into a **parked** TCP-fallback
+/// registration (role `'K'`, the ping-capable variant of `'A'`) while it
+/// waits for a Client. Deliberately shorter than the 10s TCP keepalive
+/// interval ([`crate::transport::apply_tcp_keepalive`]) so this fires FIRST:
+/// keepalive is a bare ACK-only segment some enterprise firewalls/DPI/SASE
+/// gateways don't count as "activity" for their own idle-timeout bookkeeping
+/// (only real payload traffic does) -- this frame is real payload traffic on
+/// both legs of the round trip (PING edge->agent, PONG agent->edge), closing
+/// that gap. Pre-Noise, below the end-to-end-encrypted payload entirely (the
+/// edge legitimately originates and observes it) -- see the module doc on
+/// [`serve_tcp_connection`]'s `'K'` arm for the full wire format and the
+/// race-free handoff design.
+const TCP_PING_INTERVAL: Duration = Duration::from_secs(8);
+
+/// Bound on one PING/PONG round trip ([`send_ping_and_await_pong`]) during the
+/// parked-ping loop. A missed/slow PONG is NOT treated as a hard failure --
+/// TCP keepalive (tightened in ct-agent#15) remains the authoritative
+/// liveness/failure-detection mechanism; this frame is a pure best-effort
+/// activity-generation enhancement layered on top of it, never a replacement.
+/// Only a genuine I/O error (EOF/reset/broken pipe) while writing the PING or
+/// reading the PONG is propagated as fatal, since that means the connection
+/// itself is dead, not merely that one probe was slow.
+const TCP_PING_PONG_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// First byte of a parked-registration PING frame (Edge -> ping-capable
+/// Agent): `0xF9 | counter(8 BE)`, 9 bytes total. Chosen from the unused
+/// 0xF0-0xFF range so it can never collide with a role byte (`'A'`..`'Z'`,
+/// ASCII) or an `OK`/`NO` ack.
+const TCP_PING_MAGIC: u8 = 0xF9;
+
+/// First byte of the matching PONG reply (ping-capable Agent -> Edge):
+/// `0xFA | counter(8 BE)` echoing the PING's counter, 9 bytes total.
+const TCP_PONG_MAGIC: u8 = 0xFA;
+
+/// Single-byte STOP sentinel, written by the Edge into a ping-capable (`'K'`)
+/// parked stream EXACTLY ONCE, strictly before it hands the stream to
+/// [`relay`]'s `copy_bidirectional` for a real Client.
+///
+/// Why this is needed (not just "read until you don't see 0xF9 anymore"):
+/// once a real Client is spliced in, the very next bytes on this stream are
+/// the start of a genuine Noise handshake -- effectively-random-looking
+/// ciphertext/DH-public-key material from the Agent's point of view. A ping-
+/// capable Agent that tried to distinguish "still in ping phase" from "real
+/// data started" purely by checking whether the first byte equals
+/// [`TCP_PING_MAGIC`] would have a real (~1/256) chance of misreading a
+/// genuine Noise byte as a spurious PING and corrupting/hanging the
+/// handshake. `TCP_PING_STOP` removes that ambiguity entirely: the Agent's
+/// ping-phase reader never has to guess from byte content, because the Edge
+/// -- which is the sole authority on "has a Client actually arrived" (an
+/// internal state transition on `parked`, never inferred from stream bytes)
+/// -- explicitly announces the transition. TCP's in-order, single-connection
+/// delivery guarantees the Agent sees this byte strictly before any relayed
+/// byte, since the Edge only ever calls `relay` (which is the first point
+/// real Client bytes can reach this stream) AFTER this write completes.
+const TCP_PING_STOP: u8 = 0xFB;
+
 /// #422: bound on completing the TLS handshake itself (`TlsAcceptor::accept`) on the
 /// three `:443` front-door legs that terminate TLS at the edge -- `EdgeRelay`, `Proxy`,
 /// and Gelb-terminate ([`serve_gelb_terminated`]). [`CLIENT_HELLO_READ_TIMEOUT`] only
@@ -1353,12 +1410,171 @@ pub async fn serve_agent_connection(
     registered
 }
 
+/// Write one [`TCP_PING_MAGIC`] frame carrying `counter`, then read back
+/// exactly 9 bytes and check the first is [`TCP_PONG_MAGIC`] -- one full
+/// PING/PONG round trip against a **ping-capable** (role `'K'`) parked Agent
+/// stream. Bounded by [`TCP_PING_PONG_TIMEOUT`].
+///
+/// The reply's 8 counter bytes are deliberately NOT compared against
+/// `counter`: the whole point of this frame is to put real payload bytes on
+/// the wire so middleboxes see activity, and a reply that is well-formed but
+/// carries a stale counter still proves exactly that (it just means an
+/// in-flight probe crossed with a new one). Enforcing an exact echo would
+/// turn a harmless crossing into a spurious dead-connection verdict. The
+/// counter is still sent, and Agents are still specified to echo it (see
+/// [`TCP_PONG_MAGIC`]), so it stays available for diagnostics and for any
+/// future stricter check.
+///
+/// Returns `Ok(())` on a clean round trip. Returns `Err` ONLY on a genuine
+/// I/O failure (write failed, or the read hit EOF/reset before 9 bytes
+/// arrived), a reply whose magic byte is wrong (a peer that is not speaking
+/// this protocol at all), or the round trip timing out -- all cases the
+/// caller ([`park_and_ping`]) treats as the parked connection being dead,
+/// same as any other relay I/O error.
+async fn send_ping_and_await_pong<S>(stream: &mut S, counter: u64) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(TCP_PING_PONG_TIMEOUT, async {
+        let mut frame = [0u8; 9];
+        frame[0] = TCP_PING_MAGIC;
+        frame[1..9].copy_from_slice(&counter.to_be_bytes());
+        stream.write_all(&frame).await?;
+        stream.flush().await?;
+
+        let mut reply = [0u8; 9];
+        stream.read_exact(&mut reply).await?;
+        if reply[0] != TCP_PONG_MAGIC {
+            return Err::<(), BoxError>("malformed PONG (bad magic byte)".into());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_: tokio::time::error::Elapsed| -> BoxError { "PING/PONG round trip timed out".into() })?
+}
+
+/// Park a **ping-capable** (role `'K'`) TCP-fallback registration and, while
+/// waiting for a real Client to arrive, keep real payload bytes flowing over
+/// the still-idle connection every [`TCP_PING_INTERVAL`] (ct-agent#15
+/// follow-up: closes the gap left by TCP keepalive alone, whose bare ACK-only
+/// probes some middleboxes don't count as "activity").
+///
+/// **Race-free handoff by construction**: the `select!` below only ever polls
+/// `parked` OR runs one full, sequentially-awaited PING/PONG round trip via
+/// [`send_ping_and_await_pong`] -- never both at once. A round trip is never
+/// left half-finished when the loop yields back to `select!`, so there is
+/// never a PING outstanding (and therefore never an unsolicited PONG that
+/// could still be in flight) at the instant `parked` is observed to resolve.
+/// `biased` additionally prefers delivering an already-arrived Client over
+/// starting one more probe. The result: by the time this function returns
+/// `Ok`, the connection is quiescent (no ping-protocol bytes pending on
+/// either side), so the caller can hand `stream` straight to
+/// [`relay`]'s `copy_bidirectional` with zero risk of a stray ping/pong byte
+/// leaking into the real Client's Noise-encrypted payload. The only cost is a
+/// bounded delivery delay (at most [`TCP_PING_PONG_TIMEOUT`]) if a Client
+/// happens to arrive mid-round-trip.
+/// Shared admission body for `serve_tcp_connection`'s `'A'` and `'K'` arms
+/// (identical wire behavior up to and including the `OK`/`NO` ack -- they
+/// differ only in what happens AFTER admission, which each arm handles
+/// itself). Reads `token(32)`, admits against `tcp_agent_cap` (#410), parks
+/// via `park_tcp_agent_unless_revoked` (#411), and acks. Returns `Ok(None)`
+/// when admission was refused inline (`NO` already sent, nothing left to do)
+/// or `Ok(Some((parked, sub_permit)))` on success. `role_label` is only used
+/// in the timeout error message so each arm's diagnostics stay
+/// distinguishable.
+///
+/// **The `#410` sub-cap permit is returned, not held here, and the caller MUST
+/// keep it alive for as long as it keeps the connection** (parked, then
+/// relaying). That is the whole point of the sub-cap: it bounds how many
+/// TCP-fallback Agent registrations can sit parked at once, so an
+/// unauthenticated flood exhausts at most this dedicated sub-budget instead of
+/// the OUTER, shared connection cap that every other listener draws from. If
+/// this helper dropped the permit on return, the cap would be released the
+/// instant admission finished and would bound nothing at all -- see the two
+/// `_410` regression tests, which assert `tcp_agent_cap.in_use()` while the
+/// registration is still parked.
+async fn admit_tcp_agent_a<S>(
+    stream: &mut S,
+    state: &EdgeState<Connection>,
+    tcp_agent_cap: Option<&ConnectionCap>,
+    role_label: &'static str,
+) -> Result<
+    Option<(
+        tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    )>,
+    BoxError,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (_token, parked, sub_permit) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+        let mut token_buf = [0u8; 32];
+        stream.read_exact(&mut token_buf).await?;
+        let token = RoutingToken(token_buf);
+        let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
+        if tcp_agent_cap.is_some() && sub_permit.is_none() {
+            stream.write_all(b"NO").await?;
+            stream.flush().await?;
+            return Ok::<_, BoxError>((token, None, None));
+        }
+        let parked = state.park_tcp_agent_unless_revoked(token.clone());
+        if parked.is_some() {
+            stream.write_all(b"OK").await?;
+        } else {
+            stream.write_all(b"NO").await?;
+        }
+        stream.flush().await?;
+        Ok::<_, BoxError>((token, parked, sub_permit))
+    })
+    .await
+    .map_err(|_| format!("tcp-fallback: role '{role_label}' admission timed out"))??;
+    Ok(parked.map(|parked| (parked, sub_permit)))
+}
+
+async fn park_and_ping<S>(
+    stream: &mut S,
+    parked: tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
+) -> Result<crate::state::BoxedStream, BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::pin!(parked);
+    let mut counter: u64 = 0;
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut parked => {
+                return res.map_err(|_| "tcp-fallback: parked registration superseded/dropped before a Client arrived".into());
+            }
+            _ = tokio::time::sleep(TCP_PING_INTERVAL) => {
+                send_ping_and_await_pong(stream, counter).await?;
+                counter = counter.wrapping_add(1);
+            }
+        }
+    }
+}
+
 /// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
 /// by dispatching on the first byte's role:
 ///
 /// * `'A'` — an Agent registers over TCP (UDP/QUIC blocked): read the token, ack
 ///   `OK`, park in the rendezvous, and relay this stream to the first Client that
 ///   arrives (single-tunnel — a TCP agent has one stream, no QUIC-style muxing).
+/// * `'K'` (ct-agent#15 follow-up; "K" for Keepalive-ping-capable -- `'P'` was
+///   already taken by [`serve_connection`]'s QUIC-side direct-endpoint query,
+///   a wholly separate protocol/transport but avoided here to keep role-byte
+///   letters non-confusing at a glance across the file) — the ping-capable
+///   variant of `'A'`: byte-identical admission (`'K' | token(32)` instead of
+///   `'A' | token(32)`, same `OK`/`NO` ack), but while parked waiting for a
+///   Client, the Edge keeps real payload traffic flowing every
+///   [`TCP_PING_INTERVAL`] via [`park_and_ping`]/[`send_ping_and_await_pong`]
+///   -- a pre-Noise, transport-level PING/PONG the Edge legitimately
+///   originates and observes, carrying no application data. A legacy Agent
+///   (which only ever sends `'A'`) is completely unaffected: it never
+///   receives a single ping-protocol byte. Opt-in only -- see those
+///   functions' docs for the exact wire format and the race-free hand-off to
+///   [`relay`] once a Client arrives.
 /// * `'C'` — a Client runs the `'C'` rendezvous (challenge → PoW) and is delivered
 ///   to a parked TCP agent if one exists, else relayed to a QUIC-registered agent.
 ///
@@ -1403,28 +1619,13 @@ where
             // connection. The sub-permit is then held for the SAME lifetime the
             // connection itself already gets (parked, then relaying) -- it is simply
             // never acquired at all when `tcp_agent_cap` is unconfigured (uncapped).
-            let (_token, parked, _sub_permit) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
-                let mut token_buf = [0u8; 32];
-                stream.read_exact(&mut token_buf).await?;
-                let token = RoutingToken(token_buf);
-                let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
-                if tcp_agent_cap.is_some() && sub_permit.is_none() {
-                    stream.write_all(b"NO").await?;
-                    stream.flush().await?;
-                    return Ok::<_, BoxError>((token, None, None));
-                }
-                let parked = state.park_tcp_agent_unless_revoked(token.clone());
-                if parked.is_some() {
-                    stream.write_all(b"OK").await?;
-                } else {
-                    stream.write_all(b"NO").await?;
-                }
-                stream.flush().await?;
-                Ok::<_, BoxError>((token, parked, sub_permit))
-            })
-            .await
-            .map_err(|_| "tcp-fallback: role 'A' admission timed out")??;
-            let Some(parked) = parked else {
+            // `_sub_permit` is deliberately bound HERE, in the arm that owns the
+            // connection for its whole life, not inside `admit_tcp_agent_a` --
+            // #410's bound only means anything while the registration is still
+            // parked, so the permit has to outlive admission.
+            let Some((parked, _sub_permit)) =
+                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "A").await?
+            else {
                 let _ = stream.shutdown().await;
                 return Ok(());
             };
@@ -1441,6 +1642,48 @@ where
                 // TLS client saw an abrupt close and misreported it as a
                 // connection failure. Shut down gracefully (sends a TLS
                 // close_notify) so it reads as a clean, expected disconnect.
+                Err(_) => {
+                    let _ = stream.shutdown().await;
+                    Ok(())
+                }
+            }
+        }
+        b'K' => {
+            // ct-agent#15 follow-up: byte-identical admission to 'A' (same
+            // token/cap/revoke checks, same OK/NO ack) -- the ONLY difference
+            // is that once parked, this arm keeps real payload traffic
+            // flowing over the idle connection via `park_and_ping` instead of
+            // just awaiting the Client oneshot directly. A legacy Agent never
+            // sends 'K' (it only ever sends 'A'), so it can never reach this
+            // arm -- zero behavior change for any already-deployed client.
+            // Held for the whole parked-and-relaying life of this connection,
+            // exactly as in the 'A' arm -- see `admit_tcp_agent_a`'s doc.
+            let Some((parked, _sub_permit)) =
+                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "K").await?
+            else {
+                let _ = stream.shutdown().await;
+                return Ok(());
+            };
+            match park_and_ping(&mut stream, parked).await {
+                Ok(mut client) => {
+                    // Clean, unambiguous hand-off boundary (see TCP_PING_STOP's
+                    // doc): announce the ping-phase's end BEFORE any real
+                    // relayed byte can reach this stream. Written sequentially,
+                    // strictly before `relay` starts -- TCP ordering guarantees
+                    // the Agent sees it first.
+                    stream.write_all(&[TCP_PING_STOP]).await?;
+                    stream.flush().await?;
+                    relay(&mut stream, &mut client).await?;
+                    Ok(())
+                }
+                // Same graceful-shutdown treatment as 'A' for a superseded/
+                // never-delivered registration (#229 follow-up) -- see that
+                // arm's comment. A genuine ping/pong I/O failure (the parked
+                // Agent's connection actually died) also lands here via
+                // `park_and_ping`'s Err path and gets the same clean shutdown
+                // rather than propagating as a hard error, since "the Agent
+                // went away while parked" is an ordinary, expected outcome on
+                // this path, not a bug.
                 Err(_) => {
                     let _ = stream.shutdown().await;
                     Ok(())
@@ -4306,6 +4549,710 @@ mod tests {
         assert_eq!(&buf, b"A", "first registration got the first delivery");
         second_stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"B", "second registration got the second delivery, not evicted");
+    }
+
+    // ---- ct-agent#15 follow-up: the ping-capable TCP-fallback role 'K' -------
+    //
+    // Context (see 5e3dd3c's commit message, which deliberately deferred this):
+    // tightening TCP keepalive to 10s/10s cut sort.bunsenbrenner.org's parked
+    // TCP-fallback flapping but did not eliminate it, because a keepalive probe
+    // is a bare ACK-only segment that some enterprise firewalls/DPI/SASE
+    // gateways do not count as "activity" for their own idle-timeout
+    // bookkeeping -- only real payload traffic does. Role 'K' puts real payload
+    // bytes on the otherwise-idle parked connection. The timing-dependent
+    // tests below run on paused virtual time, so the real 8s cadence is
+    // exercised end to end without any test actually sleeping 8 seconds.
+
+    /// Build the well-formed PONG that a ping-capable Agent replies with,
+    /// echoing the PING frame's counter bytes verbatim.
+    fn pong_echoing(ping: &[u8; 9]) -> [u8; 9] {
+        let mut pong = [0u8; 9];
+        pong[0] = TCP_PONG_MAGIC;
+        pong[1..9].copy_from_slice(&ping[1..9]);
+        pong
+    }
+
+    #[test]
+    fn the_ping_interval_stays_strictly_below_the_tcp_keepalive_interval() {
+        // The whole point of TCP_PING_INTERVAL is that it fires BEFORE the
+        // keepalive timer, so the connection's next activity is real payload
+        // (which every middlebox counts) rather than an ACK-only keepalive
+        // probe (which some do not). `apply_tcp_keepalive` (transport.rs) sets
+        // both time and interval to 10s; if anyone ever raises the ping
+        // interval to or past that, the design silently stops working -- the
+        // keepalive would win the race and we would be back to the flapping
+        // this whole change exists to fix. Guard it here rather than trusting
+        // a doc comment.
+        assert!(
+            TCP_PING_INTERVAL < Duration::from_secs(10),
+            "TCP_PING_INTERVAL ({TCP_PING_INTERVAL:?}) must stay strictly below the 10s \
+             keepalive time/interval set by apply_tcp_keepalive, so real payload beats the \
+             ACK-only probe to the wire"
+        );
+        assert!(
+            TCP_PING_PONG_TIMEOUT < TCP_PING_INTERVAL,
+            "one round trip ({TCP_PING_PONG_TIMEOUT:?}) must be bounded well inside one ping \
+             period ({TCP_PING_INTERVAL:?}), so probes can never pile up on top of each other"
+        );
+    }
+
+    #[test]
+    fn the_ping_protocol_bytes_can_never_collide_with_a_role_byte_or_an_ack() {
+        // The three ping-protocol bytes live in the 0xF0-0xFF range precisely
+        // so they are outside ASCII: a role byte ('A'/'B'/'C'/'K'...) and the
+        // 'OK'/'NO' ack are all ASCII, so no reader on either side can ever
+        // confuse the two framings even though they share one TCP stream.
+        for b in [TCP_PING_MAGIC, TCP_PONG_MAGIC, TCP_PING_STOP] {
+            assert!(
+                !b.is_ascii(),
+                "ping-protocol byte {b:#04x} must stay out of ASCII so it cannot collide with a \
+                 role byte or an OK/NO ack"
+            );
+        }
+        assert_ne!(TCP_PING_MAGIC, TCP_PONG_MAGIC);
+        assert_ne!(TCP_PING_MAGIC, TCP_PING_STOP);
+        assert_ne!(TCP_PONG_MAGIC, TCP_PING_STOP);
+    }
+
+    #[tokio::test]
+    async fn send_ping_and_await_pong_writes_a_9_byte_big_endian_frame_and_accepts_the_echo() {
+        // Happy path + the exact wire format, asserted against hardcoded bytes
+        // rather than against `to_be_bytes()` (which would just restate the
+        // implementation): a ping-capable Agent in another repo has to parse
+        // this, so the encoding is a real contract, not an internal detail.
+        let (mut agent, mut edge) = tokio::io::duplex(64);
+
+        let agent_task = tokio::spawn(async move {
+            let mut ping = [0u8; 9];
+            agent.read_exact(&mut ping).await.unwrap();
+            agent.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent.flush().await.unwrap();
+            ping
+        });
+
+        send_ping_and_await_pong(&mut edge, 0x0102_0304_0506_0708)
+            .await
+            .expect("a well-formed echoed PONG is a clean round trip");
+
+        let ping = agent_task.await.unwrap();
+        assert_eq!(ping[0], TCP_PING_MAGIC, "frame starts with the PING magic byte 0xF9");
+        assert_eq!(
+            &ping[1..9],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+            "the 8 counter bytes are big-endian, most-significant byte first"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_ping_and_await_pong_rejects_a_reply_carrying_the_wrong_magic_byte() {
+        // A peer that answers with 9 bytes of something that is not a PONG is
+        // not speaking this protocol at all -- treat it as a dead/garbage
+        // connection rather than silently accepting whatever arrived, since
+        // accepting it would leave those bytes to be misread later.
+        let (mut agent, mut edge) = tokio::io::duplex(64);
+
+        let agent_task = tokio::spawn(async move {
+            let mut ping = [0u8; 9];
+            agent.read_exact(&mut ping).await.unwrap();
+            // Right length, wrong magic -- notably the PING magic itself, the
+            // most plausible way a buggy Agent could get this wrong (reflecting
+            // the frame verbatim instead of rewriting the first byte).
+            let mut bad = pong_echoing(&ping);
+            bad[0] = TCP_PING_MAGIC;
+            agent.write_all(&bad).await.unwrap();
+            agent.flush().await.unwrap();
+            // Hold the stream open so this is unambiguously a magic-byte
+            // rejection and not an EOF/timeout in disguise.
+            std::future::pending::<()>().await;
+        });
+
+        let err = send_ping_and_await_pong(&mut edge, 0)
+            .await
+            .expect_err("a reply with a bad magic byte must be an error");
+        assert!(
+            err.to_string().contains("malformed PONG"),
+            "the error names the real cause (bad magic), got: {err}"
+        );
+        agent_task.abort();
+    }
+
+    #[tokio::test]
+    async fn send_ping_and_await_pong_accepts_a_well_formed_but_stale_counter_echo() {
+        // Deliberate, documented behavior: the counter is NOT compared. A
+        // well-formed PONG carrying a stale counter still proves the one thing
+        // this frame exists to prove -- real payload bytes crossed the wire in
+        // both directions, so every middlebox on the path saw genuine activity.
+        // Enforcing an exact echo would turn a harmless crossing of an
+        // in-flight probe with a new one into a spurious dead-connection
+        // verdict, which is exactly the flapping we are trying to stop.
+        let (mut agent, mut edge) = tokio::io::duplex(64);
+
+        let agent_task = tokio::spawn(async move {
+            let mut ping = [0u8; 9];
+            agent.read_exact(&mut ping).await.unwrap();
+            let mut stale = [0u8; 9];
+            stale[0] = TCP_PONG_MAGIC;
+            stale[1..9].copy_from_slice(&7u64.to_be_bytes()); // not the 4242 we sent
+            agent.write_all(&stale).await.unwrap();
+            agent.flush().await.unwrap();
+        });
+
+        send_ping_and_await_pong(&mut edge, 4242)
+            .await
+            .expect("a well-formed PONG with a stale counter is still a successful round trip");
+        agent_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_ping_and_await_pong_times_out_when_the_peer_never_replies() {
+        // The middlebox-stall case: the connection is still open (no reset, no
+        // EOF) but nothing ever comes back. Must be bounded by
+        // TCP_PING_PONG_TIMEOUT rather than hanging the parked loop forever.
+        let (mut agent, mut edge) = tokio::io::duplex(64);
+
+        let agent_task = tokio::spawn(async move {
+            let mut ping = [0u8; 9];
+            agent.read_exact(&mut ping).await.unwrap();
+            // Never reply, but keep the stream open (holding `agent` alive is
+            // what makes this a stall rather than an EOF).
+            std::future::pending::<()>().await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let err = send_ping_and_await_pong(&mut edge, 0)
+            .await
+            .expect_err("a never-answered PING must time out, not hang");
+        let waited = start.elapsed();
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "the error names the timeout, got: {err}"
+        );
+        assert!(
+            waited >= TCP_PING_PONG_TIMEOUT && waited < TCP_PING_PONG_TIMEOUT + Duration::from_secs(1),
+            "the round trip is bounded by TCP_PING_PONG_TIMEOUT ({TCP_PING_PONG_TIMEOUT:?}), waited {waited:?}"
+        );
+        agent_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_ping_and_await_pong_fails_fast_when_the_connection_is_already_dead() {
+        // A genuinely dead connection (peer gone) must surface immediately as
+        // an I/O error, NOT sit out the full timeout -- the parked loop's whole
+        // value as a dead-connection signal depends on this being prompt.
+        let (agent, mut edge) = tokio::io::duplex(64);
+        drop(agent);
+
+        let start = tokio::time::Instant::now();
+        let err = send_ping_and_await_pong(&mut edge, 0)
+            .await
+            .expect_err("writing a PING into a dead connection must error");
+        let waited = start.elapsed();
+
+        assert!(
+            !err.to_string().contains("timed out"),
+            "a dead connection is an I/O error, not a timeout, got: {err}"
+        );
+        assert!(
+            waited < TCP_PING_PONG_TIMEOUT,
+            "a dead connection surfaces immediately ({waited:?}), it does not burn the full \
+             {TCP_PING_PONG_TIMEOUT:?} timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_and_ping_keeps_pinging_on_the_interval_cadence_while_no_client_arrives() {
+        // The core behavior: an idle parked registration must keep generating
+        // real payload traffic, forever, on the TCP_PING_INTERVAL cadence, with
+        // a counter that advances each time.
+        let (mut agent, edge_side) = tokio::io::duplex(64);
+        // Held for the whole test: while this sender is alive the registration
+        // is neither superseded nor delivered, i.e. genuinely parked and idle.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<crate::state::BoxedStream>();
+
+        let start = tokio::time::Instant::now();
+        let edge_task = tokio::spawn(async move {
+            let mut edge = edge_side;
+            park_and_ping(&mut edge, rx).await.map(|_| ())
+        });
+
+        let mut arrivals = Vec::new();
+        let mut counters = Vec::new();
+        for _ in 0..3 {
+            let mut ping = [0u8; 9];
+            agent.read_exact(&mut ping).await.unwrap();
+            arrivals.push(start.elapsed());
+            assert_eq!(ping[0], TCP_PING_MAGIC, "every parked-phase frame is a PING");
+            counters.push(u64::from_be_bytes(ping[1..9].try_into().unwrap()));
+            agent.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent.flush().await.unwrap();
+        }
+
+        assert_eq!(counters, vec![0, 1, 2], "the counter advances by one per probe");
+        for (i, at) in arrivals.iter().enumerate() {
+            let expected = TCP_PING_INTERVAL * (i as u32 + 1);
+            let skew = if *at > expected { *at - expected } else { expected - *at };
+            assert!(
+                skew < Duration::from_millis(100),
+                "ping #{i} must land one TCP_PING_INTERVAL after the previous one \
+                 (expected ~{expected:?}, got {at:?})"
+            );
+        }
+
+        edge_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_and_ping_delivers_a_promptly_arriving_client_without_writing_one_ping_byte() {
+        // `biased` in the select! means an already-arrived Client always wins
+        // over starting another probe. Proven in the strongest available form:
+        // the Agent side is read to EOF and must have received LITERALLY zero
+        // bytes -- not "no ping frames", but no bytes at all.
+        let (mut agent, edge_side) = tokio::io::duplex(64);
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::state::BoxedStream>();
+        let (mut client_peer, client_edge) = tokio::io::duplex(64);
+
+        let edge_task = tokio::spawn(async move {
+            let mut edge = edge_side;
+            let mut client = park_and_ping(&mut edge, rx)
+                .await
+                .expect("a promptly delivered Client is a successful park");
+            // Prove the receiver handed back the REAL delivered stream, not
+            // some other one, by writing through it.
+            client.write_all(b"delivered").await.unwrap();
+            client.flush().await.unwrap();
+            // Closing the edge side gives the agent's read_to_end below an EOF.
+            drop(edge);
+        });
+
+        tx.send(Box::new(client_edge) as crate::state::BoxedStream)
+            .map_err(|_| "the parked receiver was already gone")
+            .unwrap();
+
+        let mut via_client = [0u8; 9];
+        client_peer.read_exact(&mut via_client).await.unwrap();
+        assert_eq!(&via_client, b"delivered", "park_and_ping returned the delivered Client stream");
+
+        edge_task.await.unwrap();
+
+        let mut seen = Vec::new();
+        agent.read_to_end(&mut seen).await.unwrap();
+        assert!(
+            seen.is_empty(),
+            "a Client that arrives before the first interval elapses must be delivered with no \
+             probe at all -- the Agent saw {seen:02x?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_and_ping_propagates_a_dead_parked_connection_as_an_error() {
+        // The dead-connection signal: when the parked Agent's connection has
+        // actually died, the next probe must fail and surface as Err so the 'K'
+        // arm tears the registration down instead of parking on a corpse.
+        let (agent, edge_side) = tokio::io::duplex(64);
+        drop(agent);
+        let (_tx, rx) = tokio::sync::oneshot::channel::<crate::state::BoxedStream>();
+
+        let mut edge = edge_side;
+        let err = park_and_ping(&mut edge, rx)
+            .await
+            .err()
+            .expect("a ping I/O failure on a dead parked connection must surface as Err");
+        assert!(
+            !err.to_string().contains("superseded"),
+            "this is a ping/IO failure, not a superseded registration, got: {err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_and_ping_reports_a_superseded_registration_distinctly_from_a_ping_failure() {
+        // The other way a park ends without a Client (#229 follow-up): the
+        // registration was superseded/dropped. Must be distinguishable from a
+        // dead connection so the two are not conflated in diagnostics.
+        let (_agent, edge_side) = tokio::io::duplex(64);
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::state::BoxedStream>();
+        drop(tx);
+
+        let mut edge = edge_side;
+        let err = park_and_ping(&mut edge, rx)
+            .await
+            .err()
+            .expect("a dropped registration must surface as Err");
+        assert!(
+            err.to_string().contains("superseded"),
+            "the error names the real cause (superseded/dropped registration), got: {err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_role_k_admits_exactly_like_a_then_pings_then_relays_end_to_end() {
+        // The full 'K' lifecycle through the real `serve_tcp_connection`
+        // dispatch: identical admission to 'A', REAL ping/pong cycles over the
+        // wire while parked, then a real bidirectional relay once a Client
+        // arrives. The relayed payload is deliberately packed with the three
+        // ping-protocol magic bytes (0xF9/0xFA/0xFB) because a real Noise
+        // handshake is effectively-random bytes and WILL contain them -- this
+        // is the property that makes the TCP_PING_STOP sentinel necessary, so
+        // it is asserted here rather than assumed.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x4b; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
+        let state_k = state.clone();
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(agent_edge, &state_k, &challenge, None).await
+        });
+
+        let mut hdr = vec![b'K'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(
+            &ok, b"OK",
+            "'K' admission is byte-identical to 'A': role byte + 32-byte token in, OK out"
+        );
+
+        // Two real ping/pong round trips over the actual wire, before any
+        // Client exists -- this is the traffic that keeps the middlebox's idle
+        // timer from expiring.
+        for expected in 0..2u64 {
+            let mut ping = [0u8; 9];
+            agent_peer.read_exact(&mut ping).await.unwrap();
+            assert_eq!(ping[0], TCP_PING_MAGIC);
+            assert_eq!(
+                u64::from_be_bytes(ping[1..9].try_into().unwrap()),
+                expected,
+                "the parked loop's counter advances across real round trips"
+            );
+            agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        }
+
+        // Now a real Client arrives.
+        assert!(state.has_tcp_agent(&token), "the 'K' registration is parked and routable");
+        let (mut client_peer, client_edge) = tokio::io::duplex(4096);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        // Drain the ping phase exactly the way a real ping-capable Agent must:
+        // never guess from byte content, just consume well-formed PING frames
+        // until the unambiguous STOP sentinel arrives. (Extra pings are legal
+        // here -- a Client can arrive mid-cadence -- but every pre-STOP byte
+        // must still be part of a well-formed PING frame.)
+        let mut extra_pings = 0;
+        loop {
+            let mut lead = [0u8; 1];
+            agent_peer.read_exact(&mut lead).await.unwrap();
+            if lead[0] == TCP_PING_STOP {
+                break;
+            }
+            assert_eq!(
+                lead[0], TCP_PING_MAGIC,
+                "every byte before the STOP sentinel belongs to a well-formed PING frame, got {:#04x}",
+                lead[0]
+            );
+            let mut rest = [0u8; 8];
+            agent_peer.read_exact(&mut rest).await.unwrap();
+            let mut ping = [0u8; 9];
+            ping[0] = lead[0];
+            ping[1..9].copy_from_slice(&rest);
+            agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent_peer.flush().await.unwrap();
+            extra_pings += 1;
+        }
+        assert!(extra_pings <= 1, "at most one probe can straddle the delivery, saw {extra_pings}");
+
+        // Client -> Agent, byte-exact, magic bytes and all.
+        const FROM_CLIENT: &[u8] = &[0xf9, 0xfa, 0xfb, 0x00, 0xf9, 0xf9, 0xfb, 0xfa, 0x42, 0xff];
+        client_peer.write_all(FROM_CLIENT).await.unwrap();
+        client_peer.flush().await.unwrap();
+        let mut got = [0u8; 10];
+        agent_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(
+            &got[..],
+            FROM_CLIENT,
+            "post-STOP Client->Agent bytes relay verbatim; ping-protocol magic bytes inside the \
+             real (Noise handshake) payload are ordinary data, never framing"
+        );
+
+        // Agent -> Client, byte-exact. A 0xFA lead byte here is the sharp case:
+        // if the edge were still reading PONGs it would swallow this instead of
+        // relaying it.
+        const FROM_AGENT: &[u8] = &[0xfa, 0xfb, 0xf9, 0x01, 0xfa];
+        agent_peer.write_all(FROM_AGENT).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut back = [0u8; 5];
+        client_peer.read_exact(&mut back).await.unwrap();
+        assert_eq!(
+            &back[..],
+            FROM_AGENT,
+            "post-STOP Agent->Client bytes relay verbatim; the edge is no longer consuming PONGs"
+        );
+
+        drop(client_peer);
+        drop(agent_peer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_role_k_hands_off_cleanly_when_a_client_arrives_mid_ping_round_trip() {
+        // THE race the TCP_PING_STOP design exists to make impossible: a Client
+        // is delivered while a PING is still outstanding, so the Agent's PONG
+        // and the Client's first real bytes are in flight at the same time on
+        // the same connection. Proven here by forcing exactly that interleaving
+        // rather than hoping to hit it by chance:
+        //   1. the edge sends a PING; the Agent reads it but does NOT reply yet
+        //   2. the Client is delivered RIGHT NOW, mid-round-trip
+        //   3. only then does the Agent send its PONG
+        // The PONG must be consumed by the edge's own ping reader (never
+        // relayed into the Client's stream), and the Client's payload must
+        // reach the Agent byte-exact, after exactly one STOP byte.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x4c; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
+        let state_k = state.clone();
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(agent_edge, &state_k, &challenge, None).await
+        });
+
+        let mut hdr = vec![b'K'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK");
+
+        // 1. A PING goes out and is read, but deliberately left unanswered.
+        let mut ping = [0u8; 9];
+        agent_peer.read_exact(&mut ping).await.unwrap();
+        assert_eq!(ping[0], TCP_PING_MAGIC);
+
+        // 2. The Client arrives while that probe is still outstanding.
+        assert!(state.has_tcp_agent(&token));
+        let (mut client_peer, client_edge) = tokio::io::duplex(4096);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        // The Client speaks first, as a real Client does (a Noise handshake's
+        // opening message), while the edge is still awaiting the PONG. These
+        // bytes must queue behind the handoff, not race ahead of it.
+        const FROM_CLIENT: &[u8] = &[0xfa, 0xfa, 0xf9, 0xfb, 0x11];
+        client_peer.write_all(FROM_CLIENT).await.unwrap();
+        client_peer.flush().await.unwrap();
+
+        // 3. Only now the PONG, completing the straddling round trip.
+        agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+        agent_peer.flush().await.unwrap();
+
+        // The very next byte the Agent sees must be STOP: the round trip
+        // completed, `biased` then picked the already-delivered Client over
+        // starting another probe, and the arm wrote the sentinel before relay.
+        let mut stop = [0u8; 1];
+        agent_peer.read_exact(&mut stop).await.unwrap();
+        assert_eq!(
+            stop[0], TCP_PING_STOP,
+            "after the straddling round trip the ping phase ends with STOP, not another PING"
+        );
+
+        let mut got = [0u8; 5];
+        agent_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(
+            &got[..],
+            FROM_CLIENT,
+            "the Client's first real bytes arrive intact and byte-exact after the STOP boundary, \
+             even though they were written while a PING was still outstanding"
+        );
+
+        // And the decisive half of the race: the Agent's PONG was consumed by
+        // the edge's ping reader and never leaked into the Client's stream. If
+        // it had leaked, the Client's next bytes would start with 0xFA.
+        const FROM_AGENT: &[u8] = &[0x77, 0x88];
+        agent_peer.write_all(FROM_AGENT).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut back = [0u8; 2];
+        client_peer.read_exact(&mut back).await.unwrap();
+        assert_eq!(
+            &back[..],
+            FROM_AGENT,
+            "the straddling PONG was consumed by the edge, never relayed -- the Client's stream \
+             starts at the Agent's first REAL byte"
+        );
+
+        drop(client_peer);
+        drop(agent_peer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_role_k_sheds_once_the_tcp_agent_cap_is_full_just_like_a() {
+        // Admission parity (#410): 'K' shares `admit_tcp_agent_a` with 'A', so
+        // the new role must not become a way around the dedicated sub-cap.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x4d; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let cap = ConnectionCap::new(1);
+        let _held = cap.try_admit().unwrap();
+
+        let (mut attacker, edge_side) = tokio::io::duplex(64);
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(edge_side, &state, &challenge, Some(&cap)).await
+        });
+
+        let mut hdr = vec![b'K'];
+        hdr.extend_from_slice(&token.0);
+        attacker.write_all(&hdr).await.unwrap();
+        attacker.flush().await.unwrap();
+
+        let mut ack = [0u8; 2];
+        attacker.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"NO", "'K' sheds on a full sub-cap exactly as 'A' does, never parks");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), edge)
+            .await
+            .expect("a shed 'K' registration returns promptly, it never starts the ping loop")
+            .unwrap();
+        assert!(result.is_ok(), "a sub-cap shed is a clean close, not an error: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_role_k_holds_its_tcp_agent_cap_permit_for_the_whole_parked_lifetime() {
+        // #410's sub-cap only bounds anything if the permit is HELD for as long
+        // as the registration occupies a parked slot. Refusing when full is not
+        // enough on its own: if every admitted registration handed its permit
+        // straight back and then parked forever, the cap would read empty while
+        // an unbounded number of registrations sat parked -- precisely the
+        // unbounded-park blast radius #410 exists to prevent. Asserted here at
+        // three distinct points in the 'K' lifecycle (freshly parked, after a
+        // real ping round trip, and while actually relaying) because the ping
+        // loop is new code between admission and relay, and it is exactly the
+        // stretch where a mislaid permit would go unnoticed.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x4e; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+        let cap = ConnectionCap::new(2);
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
+        let state_k = state.clone();
+        let cap_k = cap.clone();
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(agent_edge, &state_k, &challenge, Some(&cap_k)).await
+        });
+
+        let mut hdr = vec![b'K'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK");
+        assert_eq!(cap.in_use(), 1, "a freshly parked 'K' registration holds exactly one sub-cap permit");
+
+        // Still held across a real ping round trip.
+        let mut ping = [0u8; 9];
+        agent_peer.read_exact(&mut ping).await.unwrap();
+        agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        assert_eq!(cap.in_use(), 1, "the permit survives the ping loop, it is not released per probe");
+
+        // Still held once a Client is spliced in and bytes are actually moving.
+        let (mut client_peer, client_edge) = tokio::io::duplex(4096);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+        loop {
+            let mut lead = [0u8; 1];
+            agent_peer.read_exact(&mut lead).await.unwrap();
+            if lead[0] == TCP_PING_STOP {
+                break;
+            }
+            assert_eq!(lead[0], TCP_PING_MAGIC);
+            let mut rest = [0u8; 8];
+            agent_peer.read_exact(&mut rest).await.unwrap();
+            let mut extra = [0u8; 9];
+            extra[0] = lead[0];
+            extra[1..9].copy_from_slice(&rest);
+            agent_peer.write_all(&pong_echoing(&extra)).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        }
+        client_peer.write_all(b"payload").await.unwrap();
+        client_peer.flush().await.unwrap();
+        let mut got = [0u8; 7];
+        agent_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"payload");
+        assert_eq!(cap.in_use(), 1, "the permit is still held while the connection is relaying");
+
+        drop(client_peer);
+        drop(agent_peer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_legacy_role_a_never_receives_a_single_ping_protocol_byte() {
+        // Backward-compatibility guarantee, stated as a test rather than as a
+        // comment: every already-deployed Agent only ever sends 'A'. Such a
+        // registration must stay byte-for-byte what it was before this change
+        // -- it parks silently and the first byte it EVER receives after the
+        // OK ack is the Client's own first byte. Here the registration sits
+        // parked for four full ping intervals (virtual time) before the Client
+        // arrives: more than long enough for any stray probe to show up.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x41; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
+        let state_a = state.clone();
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(agent_edge, &state_a, &challenge, None).await
+        });
+
+        let mut hdr = vec![b'A'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK");
+
+        tokio::time::sleep(TCP_PING_INTERVAL * 4).await;
+
+        assert!(state.has_tcp_agent(&token), "the legacy 'A' registration is still parked");
+        let (mut client_peer, client_edge) = tokio::io::duplex(4096);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        // No STOP sentinel either: 'A' never enters the ping phase, so there is
+        // no phase to end. The Client's very first byte is the Agent's very
+        // first post-ack byte -- and it is 0xF9, the PING magic, precisely to
+        // catch any implementation that starts pinging legacy registrations.
+        const FROM_CLIENT: &[u8] = &[0xf9, 0xfb, 0xfa, 0x05];
+        client_peer.write_all(FROM_CLIENT).await.unwrap();
+        client_peer.flush().await.unwrap();
+        let mut got = [0u8; 4];
+        agent_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(
+            &got[..],
+            FROM_CLIENT,
+            "a legacy 'A' Agent's first post-ack bytes are the Client's, with no PING and no STOP \
+             sentinel spliced in front of them"
+        );
+
+        drop(client_peer);
+        drop(agent_peer);
+        let _ = edge.await;
     }
 
     #[tokio::test]
