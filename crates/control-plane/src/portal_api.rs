@@ -1230,8 +1230,8 @@ fn tunnels_html(tunnels: &[TunnelRow]) -> String {
                     r#"<div class="actions">
  <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
  <button type="button" class="btn sec" disabled title="Sharing tunnels is a planned paid-tier feature">Share</button>
- <form class="inline fade-out-submit" method="post" action="/portal/tunnels/{id}/delete">
-  <button class="btn danger" type="submit">Revoke</button></form>
+ <form class="inline fade-out-submit confirm-revoke" method="post" action="/portal/tunnels/{id}/delete">
+  <button class="btn danger" type="submit" title="Permanently deletes this tunnel. This cannot be undone via self-service today.">Revoke</button></form>
 </div>"#
                 )
             } else {
@@ -1478,6 +1478,17 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  // motion requested, the form submits immediately -- nothing here is load-bearing.
  document.addEventListener('submit', function(ev){{
   var form = ev.target;
+  // #439 (part 2 only -- whether Revoke should step down to a shared Gelb
+  // certificate instead of deleting is an unresolved product decision, left
+  // alone here): make the destructive, irreversible-via-self-service nature
+  // of tunnel Revoke explicit before the request goes out, since the button
+  // itself otherwise reads like any other action.
+  if(form.classList && form.classList.contains('confirm-revoke')){{
+   if(!window.confirm('Revoke this tunnel? This permanently deletes it right now. There is no self-service way to undo this or get it back.')){{
+    ev.preventDefault();
+    return;
+   }}
+  }}
   if(!form.classList || !form.classList.contains('fade-out-submit')){{ return; }}
   if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){{ return; }}
   // Most-specific ancestor first: a login-allowlist Remove form sits inside a
@@ -2531,6 +2542,19 @@ mod tests {
         // First view auto-provisions exactly one tunnel each — no create step.
         let (_s, alice_html) = get(&app, "/portal/tunnels", Some("alice")).await;
         assert_eq!(count(&alice_html), 1, "alice's one Standard-tier tunnel was auto-provisioned");
+        // #439 (part 2): the Revoke button/form must make its destructive,
+        // irreversible-via-self-service nature explicit -- both for JS (the
+        // page's `confirm-revoke` submit-time window.confirm) and as a plain
+        // HTML fallback (the button's own `title`), so this holds regardless
+        // of whether the page's own <script> ran.
+        assert!(
+            alice_html.contains("confirm-revoke"),
+            "the tunnel Revoke form must opt into the destructive-action confirm dialog"
+        );
+        assert!(
+            alice_html.contains("cannot be undone via self-service"),
+            "the Revoke button must say plainly that this can't be undone via self-service today"
+        );
         assert_eq!(
             count(&get(&app, "/portal/tunnels", Some("bob")).await.1),
             1,

@@ -431,6 +431,18 @@ impl<H: Clone> EdgeState<H> {
         *self.rendezvous_limiter.lock_safe() = Some(RateLimiter::new(max_per_window));
     }
 
+    /// Number of distinct routing tokens currently occupying a slot in the
+    /// rendezvous rate limiter's per-window counter map (0 if the limit is
+    /// off). Exposed for tests (#472): proves an unresolvable token was
+    /// rejected before ever reaching [`Self::rendezvous_allowed`], i.e. it
+    /// never occupies a limiter slot.
+    pub fn rendezvous_tracked_keys(&self) -> usize {
+        match self.rendezvous_limiter.lock_safe().as_ref() {
+            None => 0,
+            Some(rl) => rl.tracked_keys(),
+        }
+    }
+
     /// Whether `token` may drive another rendezvous in `window` (#86): always true
     /// when the limit is off; otherwise consults the fixed-window counter. `window`
     /// is a caller-supplied window index (e.g. `unix_secs / window_secs`), so this
@@ -908,6 +920,20 @@ impl<H: Clone> EdgeState<H> {
             .read_safe()
             .get(token)
             .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Whether `token` resolves to *any* registered Agent -- QUIC
+    /// ([`Self::is_known`]) or TCP-fallback ([`Self::has_tcp_agent`]) (#472).
+    /// This is the admission gate the rendezvous ('C') paths must run
+    /// **before** [`Self::rendezvous_allowed`]: the rate limiter is keyed on
+    /// the routing token the Client itself supplies, so a flooder rotating
+    /// random tokens got a fresh limiter budget and a fresh map entry on
+    /// every attempt when the limiter was checked first -- the per-token cap
+    /// never actually engaged against that attack shape. Gating on this
+    /// first means only tokens that resolve to a real tunnel ever occupy a
+    /// limiter slot; an unresolvable token is rejected outright.
+    pub fn is_resolvable(&self, token: &RoutingToken) -> bool {
+        self.is_known(token) || self.has_tcp_agent(token)
     }
 }
 
@@ -1586,6 +1612,58 @@ mod tests {
         .await
         .expect("wait_for_tcp_agent must respect its own timeout");
         assert!(!waited);
+    }
+
+    #[test]
+    fn is_resolvable_covers_both_quic_and_tcp_fallback_agents_but_not_unknown_tokens() {
+        // #472: `is_resolvable` is the known-token gate that must run before
+        // the rendezvous rate limiter -- it has to recognize a token
+        // registered on EITHER transport, not just QUIC (`is_known` alone),
+        // or a legitimate TCP-fallback-only Client would be wrongly rejected.
+        let state: EdgeState<u32> = EdgeState::new();
+
+        let quic_token = token(20);
+        state.register(quic_token.clone(), 1u32);
+        assert!(state.is_resolvable(&quic_token), "known via a live QUIC agent");
+
+        let tcp_token = token(21);
+        let _rx = state.park_tcp_agent_unless_revoked(tcp_token.clone());
+        assert!(state.is_resolvable(&tcp_token), "known via a parked TCP-fallback agent");
+
+        let unknown_token = token(22);
+        assert!(
+            !state.is_resolvable(&unknown_token),
+            "a token with no registration on either transport is not resolvable"
+        );
+    }
+
+    #[test]
+    fn unknown_token_never_occupies_a_rate_limiter_slot() {
+        // #472: the fix's core invariant, isolated from the QUIC/TCP wire
+        // protocol -- serve_connection's 'C' arms must check `is_resolvable`
+        // before `rendezvous_allowed`, so an unresolvable token never reaches
+        // (and never occupies a slot in) the limiter.
+        let state: EdgeState<u32> = EdgeState::new();
+        state.set_rendezvous_limit(1_000_000); // isolate the gate from the cap itself
+        let unknown = token(23);
+
+        for _ in 0..5 {
+            if state.is_resolvable(&unknown) {
+                state.rendezvous_allowed(&unknown, 0);
+            }
+        }
+        assert_eq!(
+            state.rendezvous_tracked_keys(),
+            0,
+            "an unresolvable token must never touch the rate limiter"
+        );
+
+        // A known token, by contrast, does occupy a slot -- confirms the
+        // limiter itself still engages normally for tokens that pass the gate.
+        state.register(unknown.clone(), 9u32);
+        assert!(state.is_resolvable(&unknown));
+        assert!(state.rendezvous_allowed(&unknown, 0));
+        assert_eq!(state.rendezvous_tracked_keys(), 1);
     }
 
     #[test]

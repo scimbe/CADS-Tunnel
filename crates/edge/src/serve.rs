@@ -1125,6 +1125,17 @@ pub async fn serve_connection(
                 .map_err(|_| "serve_connection: PoW response not received within the timeout (#449)")??;
             let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
 
+            // #472: reject a token that resolves to no registered Agent (QUIC
+            // or TCP-fallback) before it ever reaches the rate limiter --
+            // otherwise a flooder rotating random tokens gets a fresh
+            // per-token budget and a fresh limiter-map entry on every
+            // attempt, and the per-token cap below never actually engages
+            // against that attack shape. Only resolvable tokens occupy a
+            // limiter slot.
+            if !state.is_resolvable(&token) {
+                return Err("unknown routing token".into());
+            }
+
             // #86 (ADR-0018): per-token rendezvous rate limit — PoW raises per-attempt
             // cost, this caps how many rendezvous a single token drives per window.
             if !state.rendezvous_allowed(&token, rendezvous_window()) {
@@ -1445,6 +1456,12 @@ where
                 let mut req = [0u8; 40];
                 stream.read_exact(&mut req).await?;
                 let token = check_request(challenge, &req).map_err(|_| "proof of work rejected")?;
+
+                // #472: same known-token-before-rate-limit ordering as the QUIC
+                // 'C' arm above -- see `EdgeState::is_resolvable`'s doc for why.
+                if !state.is_resolvable(&token) {
+                    return Err("unknown routing token".into());
+                }
 
                 // #86 (ADR-0018): per-token rendezvous rate limit (same as the QUIC path).
                 if !state.rendezvous_allowed(&token, rendezvous_window()) {
@@ -3706,6 +3723,63 @@ mod tests {
         agent.await.unwrap();
         quic_edge.abort();
         tcp_edge.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_token_is_rejected_before_touching_the_rate_limiter() {
+        // #472: the rendezvous rate limiter is keyed on the routing token a
+        // Client supplies in its own PoW response, so before this fix it was
+        // consulted BEFORE any known-token lookup -- a flooder rotating
+        // random tokens got a fresh limiter budget and a fresh map entry on
+        // every attempt, and the per-token cap never actually engaged
+        // against that attack shape. Proves the fix: a token that resolves
+        // to no registered Agent (QUIC or TCP-fallback) is rejected outright
+        // and never occupies a limiter slot.
+        use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        use ct_common::pow::build_request;
+
+        let unknown_token = RoutingToken([0x99; 32]);
+        let challenge = Challenge { nonce: [0x33; 16], difficulty: 8 };
+        let state = Arc::new(EdgeState::<Connection>::new());
+        // Effectively unlimited -- isolates the known-token gate from the
+        // per-window cap itself; a limiter slot consumed by the unknown
+        // token would still be observable via `rendezvous_tracked_keys`.
+        state.set_rendezvous_limit(1_000_000);
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("quic edge");
+        let addr = server.local_addr().unwrap();
+
+        let state_q = state.clone();
+        let chal_q = challenge.clone();
+        let edge = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let result = serve_connection(&conn, &state_q, &chal_q).await;
+            conn.close(0u32.into(), b"done");
+            result
+        });
+
+        let client_ep = build_client_endpoint(cert).expect("client ep");
+        let conn = client_ep.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut cs, mut cr) = conn.open_bi().await.unwrap();
+        cs.write_all(b"C").await.unwrap();
+        let mut chal = [0u8; 17];
+        cr.read_exact(&mut chal).await.unwrap();
+        let ch = Challenge {
+            nonce: chal[..16].try_into().unwrap(),
+            difficulty: chal[16],
+        };
+        cs.write_all(&build_request(&ch, &unknown_token).unwrap())
+            .await
+            .unwrap();
+        let _ = cs.finish();
+
+        let result = edge.await.unwrap();
+        assert!(result.is_err(), "an unresolvable routing token must be rejected");
+        assert_eq!(
+            state.rendezvous_tracked_keys(),
+            0,
+            "an unresolvable token must never occupy a rate-limiter slot (#472)"
+        );
     }
 
     #[tokio::test]
