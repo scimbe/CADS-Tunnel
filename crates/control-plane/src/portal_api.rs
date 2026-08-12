@@ -1818,12 +1818,50 @@ pub fn channel_claim_router(
         .route("/portal/channels", get(channels_page))
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
         .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
+        .route("/portal/static/ct_agent_wasm.js", get(serve_ct_agent_wasm_js))
+        .route("/portal/static/ct_agent_wasm_bg.wasm", get(serve_ct_agent_wasm_bg))
         .with_state(ClaimState {
             session_key: Arc::from(session_key.to_vec()),
             channels,
             portal_base: Arc::from(portal_base),
             edge_cert_path: Arc::from(edge_cert_path),
         })
+}
+
+/// The compiled `ct-agent-wasm` bundle (in-browser Agent-Fabric channel identity generation +
+/// attestation signing -- see [`claim_html`]'s `<script type="module">`), embedded at compile
+/// time via `include_bytes!` so the control plane ships as one self-contained binary with no
+/// separate static-file directory to manage -- matches this crate's existing "every page is an
+/// inline-HTML-string handler" architecture (there is no `ServeDir`/tower-http static-file
+/// setup anywhere in this crate; this is deliberately NOT the exception that introduces one).
+///
+/// These bytes come from `$OUT_DIR` (populated by `crates/control-plane/build.rs`, NOT this
+/// crate's own `wasm-pkg/` directly) -- see that build script's doc comment for the full
+/// picture: the REAL bundle is produced by `scripts/build-ct-agent-wasm.sh` or automatically by
+/// `docker/Dockerfile`'s `wasm-builder` stage; a plain `cargo build`/`cargo test` with neither
+/// of those having run falls back to an inert placeholder, so the workspace gate never depends
+/// on Docker or network access. A deployment that skips the real wasm build ships a portal
+/// claim page whose in-browser identity generation simply doesn't work (a clear, loud JS error,
+/// not a silent/incorrect one -- see the placeholder's own `throw`) rather than failing to
+/// compile.
+const CT_AGENT_WASM_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ct_agent_wasm.js"));
+const CT_AGENT_WASM_BG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ct_agent_wasm_bg.wasm"));
+
+/// `GET /portal/static/ct_agent_wasm.js` -- the wasm-bindgen `--target web` JS glue module
+/// [`claim_html`]'s script `import`s. `application/javascript` (not `text/javascript`; both are
+/// valid per the WHATWG HTML spec's "JavaScript MIME type" list, but `application/javascript`
+/// matches what every other example in this ecosystem -- CADS-webconference-demo,
+/// CADS-DEMO-sort -- already serves it as).
+async fn serve_ct_agent_wasm_js() -> impl IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "application/javascript")], CT_AGENT_WASM_JS)
+}
+
+/// `GET /portal/static/ct_agent_wasm_bg.wasm` -- the compiled wasm binary itself.
+/// `application/wasm` is required (not merely conventional): browsers only take the
+/// streaming-compilation fast path (`WebAssembly.instantiateStreaming`, which wasm-bindgen's
+/// `--target web` glue calls internally) when the response's `Content-Type` is exactly this.
+async fn serve_ct_agent_wasm_bg() -> impl IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "application/wasm")], CT_AGENT_WASM_BG)
 }
 
 /// Shared state for the Topology Editor's portal discoverability shell (#237-follow):
@@ -2440,12 +2478,151 @@ this server generated neither and cannot generate them; they came from your own 
     )
 }
 
-/// The self-serve claim form (#248-follow): a portal user pastes the three values
-/// [`ct-agent channel member-material`] (or whatever locally produced them) prints,
-/// and the claim runs -- no manual out-of-band exchange with the channel owner.
-/// `claimed_holder_hex`/`deployment` are `Some` only right after a successful
-/// claim (see [`channel_onboarding_html`]) -- `None` otherwise (a fresh `GET`, or
-/// a failed attempt), in which case no onboarding block is shown.
+/// The client-side identity-generation + attestation-signing script for [`claim_html`] --
+/// brings the SAME in-browser WASM pattern `join.js` (CADS-DEMO-sort) and
+/// `CADS-webconference-demo`'s own `join.js` already use, adapted to this page's plain
+/// `<form method=post>`-reload style (every other portal form in this file works this way;
+/// unlike those two demos' own fetch()+JSON SPA flow, there is no reason to introduce one
+/// here) -- so a member no longer needs to run `ct-agent channel member-material` locally
+/// just to get a holder/Noise keypair and a signature to paste in.
+///
+/// `__CHANNEL_HEX__` is substituted (not run through `format!`, to keep this template's own
+/// `{`/`}` literal -- see [`claim_html`]) with the already hex-validated channel id; the
+/// preimage this builds MUST stay byte-identical to
+/// [`ct_common::channel::member_noise_attest_bytes`] (`crates/common/src/channel.rs`) /
+/// [`ct_common::preimage::Preimage`] (`crates/common/src/preimage.rs`) -- see
+/// `member_noise_attest_bytes_js_reimplementation_matches_the_server_side_byte_layout` in this
+/// module's tests for the check that they actually agree.
+const CLAIM_SCRIPT_TEMPLATE: &str = r#"<script type="module">
+import init, * as wasm from "/portal/static/ct_agent_wasm.js";
+
+const STORAGE_KEY = "ct-portal-channel-identity";
+const CHANNEL_HEX = "__CHANNEL_HEX__";
+const identityBox = document.getElementById("identity-box");
+const noteEl = document.getElementById("claim-note");
+const submitBtn = document.getElementById("claim-submit");
+const fHolder = document.getElementById("f-holder");
+const fNoisePub = document.getElementById("f-noise-pubkey");
+const fAttest = document.getElementById("f-noise-attestation");
+
+let wasmInitPromise = null;
+function ensureWasmInit() {
+  return wasmInitPromise || (wasmInitPromise = init({ module_or_path: "/portal/static/ct_agent_wasm_bg.wasm" }));
+}
+
+function loadOrCreateIdentity() {
+  const existing = localStorage.getItem(STORAGE_KEY);
+  if (existing) return JSON.parse(existing);
+  const holder = wasm.generate_holder_identity();
+  const noise = wasm.generate_noise_identity();
+  const identity = {
+    holderPub: holder.public_hex,
+    holderPriv: holder.private_hex,
+    noisePub: noise.public_hex,
+    noisePriv: noise.private_hex,
+    createdAt: Date.now(),
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(identity));
+  return identity;
+}
+
+// member_noise_attest_bytes (crates/common/src/{channel.rs,preimage.rs}) -- domain-separated,
+// length-prefixed: u32-LE(domain.len()) || domain || channel(32) || holder(32) ||
+// noise_pubkey(32). Kept independent here (client-side JS has no access to the Rust crate)
+// but must stay byte-identical -- see this file's own Rust test for the vector this was
+// checked against.
+function hexToBytes(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+    throw new Error("hexToBytes: not a valid even-length hex string");
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function concatBytes(...arrs) {
+  const total = arrs.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of arrs) {
+    out.set(a, off);
+    off += a.length;
+  }
+  return out;
+}
+function memberNoiseAttestBytes(channelHex, holderHex, noisePubHex) {
+  const domain = new TextEncoder().encode("ct-a2a-noise-attest-v1");
+  const lenPrefix = new Uint8Array(4);
+  new DataView(lenPrefix.buffer).setUint32(0, domain.length, true);
+  return concatBytes(lenPrefix, domain, hexToBytes(channelHex), hexToBytes(holderHex), hexToBytes(noisePubHex));
+}
+
+function renderIdentity(identity) {
+  identityBox.innerHTML =
+    '<p class="k">Holder public key <span class="v"><code>' + identity.holderPub + "</code></span></p>" +
+    '<div class="warn">Save your PRIVATE keys below now -- they never leave this browser and are never ' +
+    "submitted anywhere; this page only ever sends your PUBLIC keys + a signature. You'll need them for " +
+    "your own <code>ct-agent channel --serve</code> process once you're a member.</div>" +
+    '<div class="code-block"><div class="code-block-head"><span>your private keys -- save now</span>' +
+    '<button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>' +
+    "<pre><code>CT_CHANNEL_HOLDER_KEY=" + identity.holderPriv + "\n" +
+    "CT_CHANNEL_NOISE_KEY=" + identity.noisePriv + "\n" +
+    "CT_CHANNEL_NOISE_PUBKEY=" + identity.noisePub + "</code></pre></div>" +
+    '<button type="button" id="regen-identity" class="btn sec">Generate a different identity</button>';
+  document.getElementById("regen-identity").addEventListener("click", () => {
+    if (!confirm("This replaces the identity stored in this browser. Only do this before you've claimed with the old one.")) return;
+    localStorage.removeItem(STORAGE_KEY);
+    boot();
+  });
+}
+
+function showNote(text, kind) {
+  if (!noteEl) return;
+  noteEl.textContent = text;
+  noteEl.dataset.kind = kind || "";
+}
+
+async function boot() {
+  submitBtn.disabled = true;
+  identityBox.innerHTML = '<p class="help">generating your channel identity…</p>';
+  showNote("", "");
+  try {
+    await ensureWasmInit();
+    const identity = loadOrCreateIdentity();
+    renderIdentity(identity);
+    const preimage = memberNoiseAttestBytes(CHANNEL_HEX, identity.holderPub, identity.noisePub);
+    const signature = wasm.holderSign(identity.holderPriv, preimage);
+    fHolder.value = identity.holderPub;
+    fNoisePub.value = identity.noisePub;
+    fAttest.value = bytesToHex(signature);
+    submitBtn.disabled = false;
+  } catch (e) {
+    showNote("Could not generate your channel identity: " + e.message, "error");
+  }
+}
+
+boot();
+</script>"#;
+
+/// The self-serve claim form (#248-follow, in-browser-WASM follow-up): a portal user's holder
+/// + Noise keypair is generated ENTIRELY in this browser (via [`CLAIM_SCRIPT_TEMPLATE`],
+/// loading the same `ct-agent-wasm` bundle [`serve_ct_agent_wasm_js`]/[`serve_ct_agent_wasm_bg`]
+/// serve) and the claim runs from that -- no `ct-agent channel member-material` CLI step, no
+/// manual out-of-band exchange with the channel owner. `claimed_holder_hex`/`deployment` are
+/// `Some` only right after a successful claim (see [`channel_onboarding_html`]) -- `None`
+/// otherwise (a fresh `GET`, or a failed attempt), in which case no onboarding block is shown.
+///
+/// `channel_hex` is validated (`ascii-hexdigit, len 64`, the same bar
+/// [`crate::service::hex_decode_32`] enforces) BEFORE it is spliced into
+/// [`CLAIM_SCRIPT_TEMPLATE`]'s `<script>` body -- unlike every other use of `channel_hex` in
+/// this file (which only ever lands in an HTML-escaped attribute/text context via [`escape`]),
+/// a value embedded straight into a `<script>` block is not made safe by HTML-escaping alone
+/// (`&lt;` isn't valid hex either, so HTML-escaping the value would just break the script
+/// without closing the injection). A malformed channel id (only reachable via a hand-crafted
+/// URL; every real link into this page always carries a real channel hex) gets a plain error
+/// card instead of the form, with no script emitted at all.
 fn claim_html(
     channel_hex: &str,
     result: Option<Result<(), String>>,
@@ -2458,36 +2635,47 @@ fn claim_html(
         Some(Err(msg)) => format!(r#"<div class="warn">Could not claim: {}</div>"#, escape(msg)),
         None => String::new(),
     };
+
+    if crate::service::hex_decode_32(channel_hex).is_none() {
+        let body = format!(
+            r#"<h1>Join a channel</h1>
+{banner}
+<div class="warn">Malformed channel id.</div>
+<a class="btn sec" href="/portal">Back to account</a>"#
+        );
+        return page("join channel", &body, email);
+    }
+
     let onboarding = match (claimed_holder_hex, deployment) {
         (Some(holder_hex), Some(dep)) => channel_onboarding_html(channel_hex, holder_hex, dep),
         _ => String::new(),
     };
+    let script = CLAIM_SCRIPT_TEMPLATE.replace("__CHANNEL_HEX__", channel_hex);
     let body = format!(
         r#"<h1>Join a channel</h1>
 <p class="k">Your signed-in e-mail must already be on this channel's allow-list (ask its owner to add
 you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it isn't yet).</p>
 {banner}
 {onboarding}
-<form method="post" action="/portal/channels/{channel}/claim-form">
- <label>Channel<input type="text" value="{channel}" disabled></label>
- <label>Holder public key
-  <input type="text" name="holder" placeholder="64 hex chars" required pattern="[0-9a-fA-F]{{64}}">
-  <span class="help">Your member holder public key.</span></label>
- <label>Noise public key
-  <input type="text" name="noise_pubkey" placeholder="64 hex chars" required pattern="[0-9a-fA-F]{{64}}">
-  <span class="help">Your member Noise static public key.</span></label>
- <label>Noise attestation
-  <input type="text" name="noise_attestation" placeholder="128 hex chars" required pattern="[0-9a-fA-F]{{128}}">
-  <span class="help">Your holder key's signature over (channel, holder, noise_pubkey) -- #101.</span></label>
- <button type="submit">Claim membership</button>
+<label>Channel<input type="text" value="{channel}" disabled></label>
+<div id="identity-box" class="help">generating your channel identity…</div>
+<form method="post" action="/portal/channels/{channel}/claim-form" id="claim-form">
+ <input type="hidden" name="holder" id="f-holder">
+ <input type="hidden" name="noise_pubkey" id="f-noise-pubkey">
+ <input type="hidden" name="noise_attestation" id="f-noise-attestation">
+ <button type="submit" id="claim-submit" disabled>Claim membership</button>
 </form>
+<span id="claim-note" class="help"></span>
 <details>
- <summary>Where do these come from?</summary>
- <p class="help">Run <code>ct-agent channel member-material</code> locally (never paste a private key here) --
- it derives your holder public key and signs the Noise-key attestation from your own holder private key,
- without sending anything over the network. Paste its three printed values above.</p>
+ <summary>How does this work?</summary>
+ <p class="help">Your holder and Noise keypairs are generated entirely IN THIS BROWSER (a real
+ compiled copy of <code>ct-agent</code>'s own cryptography, run as WebAssembly) -- the private
+ keys never leave this page and are never submitted anywhere; only your public keys and a
+ signature over them are sent when you click "Claim membership". No local CLI install needed
+ for this step.</p>
 </details>
-<a class="btn sec" href="/portal">Back to account</a>"#,
+<a class="btn sec" href="/portal">Back to account</a>
+{script}"#,
         channel = escape(channel_hex),
     );
     page("join channel", &body, email)
@@ -4273,6 +4461,139 @@ mod tests {
         let s = post(Some(allowed_cookie), body(&other_holder, &noise, &[0u8; 64])).await.unwrap().status();
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(!channels.is_member(&ch, &other_holder).unwrap());
+    }
+
+    /// Proves the CLIENT-SIDE JS preimage builder in [`CLAIM_SCRIPT_TEMPLATE`]'s
+    /// `memberNoiseAttestBytes` is byte-identical to the server-side
+    /// [`ct_common::channel::member_noise_attest_bytes`] a browser-generated claim signature
+    /// must match to verify. A real browser can't run inside this test suite, so this mirrors
+    /// the JS algorithm in Rust byte-for-byte -- domain length-prefixed `u32-LE` || domain ||
+    /// channel(32) || holder(32) || noise_pubkey(32), read straight off `CLAIM_SCRIPT_TEMPLATE`'s
+    /// `memberNoiseAttestBytes`/`hexToBytes`/`concatBytes` above -- and checks it against
+    /// [`ct_common::channel::member_noise_attest_bytes`] (`crates/common/src/channel.rs:760-771`)
+    /// built via [`ct_common::preimage::Preimage`] (`crates/common/src/preimage.rs:39-58` for the
+    /// `u32-LE length || domain` seed, `:91-95` for `var_bytes`, though this preimage only uses
+    /// `.fixed()` after the domain since channel/holder/noise_pubkey are all fixed-32-byte
+    /// fields). Then signs the JS-computed preimage with a real ed25519 key and confirms the
+    /// SAME verifier `do_claim` calls, [`ct_common::channel::verify_member_noise_attestation`],
+    /// accepts it -- proving a browser-generated signature really does verify server-side, not
+    /// just that the byte builder happens to match in isolation. A byte-layout drift here would
+    /// be a SILENT correctness bug (every browser-generated claim would fail verification with
+    /// no clear error, since `holderSign` itself can't tell it signed the "wrong" bytes) -- this
+    /// is the regression guard for that.
+    #[test]
+    fn member_noise_attest_bytes_js_reimplementation_matches_the_server_side_byte_layout() {
+        use ct_common::channel::{verify_member_noise_attestation, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Byte-for-byte port of CLAIM_SCRIPT_TEMPLATE's memberNoiseAttestBytes (JS
+        // reimplemented in Rust here, since the test suite can't execute browser JS).
+        fn js_member_noise_attest_bytes(channel: &[u8; 32], holder: &[u8; 32], noise_pubkey: &[u8; 32]) -> Vec<u8> {
+            let domain = b"ct-a2a-noise-attest-v1";
+            let mut out = Vec::new();
+            out.extend_from_slice(&(domain.len() as u32).to_le_bytes());
+            out.extend_from_slice(domain);
+            out.extend_from_slice(channel);
+            out.extend_from_slice(holder);
+            out.extend_from_slice(noise_pubkey);
+            out
+        }
+
+        let channel = ChannelId([0x11u8; 32]);
+        let holder_sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let holder_pub = holder_sk.verifying_key().to_bytes();
+        let noise_pubkey = [0x33u8; 32];
+
+        let js_bytes = js_member_noise_attest_bytes(&channel.0, &holder_pub, &noise_pubkey);
+        let server_bytes = ct_common::channel::member_noise_attest_bytes(&channel, &holder_pub, &noise_pubkey);
+        assert_eq!(js_bytes, server_bytes, "the JS reimplementation's preimage bytes must match the server's exactly");
+
+        // Sign the JS-computed preimage with a real holder key -- exactly what wasm.holderSign
+        // does in the browser -- and confirm the real server-side verifier accepts it.
+        let signature: [u8; 64] = holder_sk.sign(&js_bytes).to_bytes();
+        assert!(
+            verify_member_noise_attestation(&channel, &holder_pub, &noise_pubkey, &signature),
+            "a signature over the JS-computed preimage must verify against the real server-side verifier"
+        );
+
+        // A signature over a DIFFERENT noise_pubkey must NOT verify against the original --
+        // proves this check isn't accidentally too weak to catch a real byte-layout mismatch.
+        let wrong_noise = [0x44u8; 32];
+        let wrong_bytes = js_member_noise_attest_bytes(&channel.0, &holder_pub, &wrong_noise);
+        let wrong_sig: [u8; 64] = holder_sk.sign(&wrong_bytes).to_bytes();
+        assert!(!verify_member_noise_attestation(&channel, &holder_pub, &noise_pubkey, &wrong_sig));
+    }
+
+    /// A malformed channel id (only reachable via a hand-crafted URL) must render a plain error
+    /// card with NO `<script>` emitted at all -- `claim_html` splices `channel_hex` straight into
+    /// a `<script>` body for a valid one, so an attacker-controlled value must never reach that
+    /// path unvalidated (see `claim_html`'s own doc comment on why HTML-escaping alone isn't
+    /// sufficient there).
+    #[tokio::test]
+    async fn claim_page_rejects_a_malformed_channel_id_before_ever_emitting_the_identity_script() {
+        use crate::storage::SqliteChannelStore;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let app = channel_claim_router(KEY, channels, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+
+        let (status, html) = get(&app, "/portal/channels/not-hex-and-also-not-64-chars/claim", Some("nat-subject")).await;
+        assert_eq!(status, StatusCode::OK, "renders an error page, not a raw error status");
+        assert!(html.contains("Malformed channel id"));
+        assert!(!html.contains("<script type=\"module\">"), "no identity-generation script for a malformed channel id");
+        assert!(!html.contains("ct_agent_wasm.js"), "never references the wasm bundle for a malformed channel id");
+    }
+
+    /// The claim page's in-browser identity-generation script: present for a real channel,
+    /// loads the SAME `ct-agent-wasm` bundle [`serve_ct_agent_wasm_js`]/[`serve_ct_agent_wasm_bg`]
+    /// serve, and has the real (hex-validated) channel id spliced in -- not the CLI-paste form
+    /// this replaced.
+    #[tokio::test]
+    async fn claim_page_embeds_the_in_browser_identity_script_with_the_real_channel_hex() {
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::ChannelId;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x6bu8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        let app = channel_claim_router(KEY, channels, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let ch_hex = hex(&ch.0);
+
+        let (status, html) = get(&app, &format!("/portal/channels/{ch_hex}/claim"), Some("nat-subject")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(r#"<script type="module">"#), "the identity-generation script is present");
+        assert!(html.contains(r#"import init, * as wasm from "/portal/static/ct_agent_wasm.js""#));
+        assert!(html.contains(&format!(r#"const CHANNEL_HEX = "{ch_hex}""#)), "the real channel hex is spliced in");
+        assert!(!html.contains("ct-agent channel member-material"), "the old CLI-paste instructions are gone");
+        assert!(html.contains(r#"id="f-holder""#) && html.contains(r#"id="f-noise-pubkey""#) && html.contains(r#"id="f-noise-attestation""#));
+        assert!(html.contains(r#"id="claim-submit" disabled"#), "submit starts disabled until identity generation finishes");
+    }
+
+    /// The two static routes the in-browser script depends on: present, and served with the
+    /// exact `Content-Type`s a browser needs (`application/javascript` for the glue module,
+    /// `application/wasm` for the binary -- the latter is what gates
+    /// `WebAssembly.instantiateStreaming`'s fast path).
+    #[tokio::test]
+    async fn ct_agent_wasm_static_routes_serve_with_the_correct_content_types() {
+        use crate::storage::SqliteChannelStore;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let app = channel_claim_router(KEY, channels, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/portal/static/ct_agent_wasm.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(), "application/javascript");
+
+        let resp = app
+            .oneshot(Request::get("/portal/static/ct_agent_wasm_bg.wasm").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(), "application/wasm");
     }
 
     #[tokio::test]

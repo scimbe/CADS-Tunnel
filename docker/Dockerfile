@@ -17,12 +17,19 @@
 # mounts are not part of the built image layer, so the binaries are copied out to
 # /build/bin for the runtime stage to COPY --from.
 #
-# ct-agent itself was extracted to its own repo (scimbe/ct-agent) and is NOT built
-# here -- no self-host compose service ever ran it ("customers run their own agents,
-# outbound-only"). What stayed behind in crates/agent-tools (metrics_probe, udp_echo)
+# The native ct-agent binary itself was extracted to its own repo (scimbe/ct-agent) and is
+# NOT built here -- no self-host compose service ever ran it ("customers run their own
+# agents, outbound-only"). What stayed behind in crates/agent-tools (metrics_probe, udp_echo)
 # is still built as part of this workspace, same as before. ct-crew-bridge/
 # ct-cookbook-bridge were removed in #232: both demos migrated to their own thin
 # Node.js bridges weeks before this image's side of the cleanup landed.
+#
+# ct-agent-WASM is a narrow exception to the above (see the `wasm-builder` stage below): the
+# BROWSER build of scimbe/ct-agent's shared crypto core, embedded into ct-control-plane so the
+# portal's self-service channel-claim page can generate a real holder/Noise identity and sign
+# its join attestation entirely client-side -- no ct-agent CLI install needed for that one
+# step. This does not change the "customers run their own agent" model above; it only moves
+# ONE onboarding step (identity generation + attestation signing) into the browser.
 #
 # #165: the builder is pinned to `-bookworm` explicitly, matching the runtime's
 # `debian:bookworm-slim` glibc (2.36). The unsuffixed `rust:1-slim` tag floats to
@@ -32,9 +39,38 @@
 # below is ever bumped to a newer Debian release, bump this tag's `-bookworm` suffix
 # to match in the same change — the two stages' glibc must never drift apart again.
 
+# ct-agent-wasm build stage: the compiled `ct-agent-wasm` bundle (in-browser Agent-Fabric
+# channel identity generation + attestation signing) the portal's self-service channel-claim
+# page (`GET /portal/channels/:channel/claim`, `claim_html` in
+# crates/control-plane/src/portal_api.rs) loads client-side and the control plane serves back
+# out at `GET /portal/static/ct_agent_wasm{.js,_bg.wasm}` -- built from a pinned
+# scimbe/ct-agent commit's own wasm/ workspace member via `wasm-bindgen --target web`. Same
+# recipe as scripts/build-ct-agent-wasm.sh (used for a manual/local rebuild outside Docker);
+# duplicated here rather than shelled out to, since a nested `docker run` doesn't work inside
+# a Docker build -- this way a plain `docker build` produces a fully self-contained image with
+# no separate pre-build step required. A SEPARATE stage (not folded into `builder` below) so
+# BuildKit can build it in parallel and cache it independently of the much-larger native
+# workspace compile. Bump CT_AGENT_REF here AND in scripts/build-ct-agent-wasm.sh together.
+FROM rust:1-slim-bookworm AS wasm-builder
+ARG CT_AGENT_REF=9b42d9e63501f494ccabfd1a221adf12306e73d6
+RUN apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
+RUN rustup target add wasm32-unknown-unknown
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install wasm-bindgen-cli --version 0.2.126
+RUN git clone https://github.com/scimbe/ct-agent /agent-src \
+    && git -C /agent-src checkout "$CT_AGENT_REF"
+WORKDIR /agent-src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/agent-src/target \
+    cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown \
+    && mkdir -p /out \
+    && wasm-bindgen --target web --out-dir /out target/wasm32-unknown-unknown/release/ct_agent_wasm.wasm
+
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
 COPY . .
+COPY --from=wasm-builder /out/ct_agent_wasm.js crates/control-plane/wasm-pkg/ct_agent_wasm.js
+COPY --from=wasm-builder /out/ct_agent_wasm_bg.wasm crates/control-plane/wasm-pkg/ct_agent_wasm_bg.wasm
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --workspace --bins \
