@@ -3171,101 +3171,126 @@ async fn channel_invite_redeem(
     State(channels): State<Arc<SqliteChannelStore>>,
     Json(req): Json<InviteRedeemReq>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    use ct_common::channel::{verify_member_noise_attestation, SignedChannelInvitation};
+    // #399: this whole body interleaves sync `SqliteChannelStore` calls (rusqlite is
+    // synchronous) with early-return proof/auth checks across security-sensitive control
+    // flow (channel membership grants) -- the exact pattern #348 (this crate's earlier,
+    // narrower spawn_blocking fix) explicitly declined to touch because piecemeal wrapping
+    // (spawn_blocking only around individual store calls) would let async code interleave
+    // BETWEEN blocking segments, e.g. between `consume_invitation` succeeding and
+    // `add_member` running -- reintroducing exactly the kind of TOCTOU gap this function's
+    // own single-use enforcement exists to prevent, just moved into the tokio scheduler's
+    // hands instead of a genuine race. So the entire sequence -- decode, all three proof
+    // checks, the challenge/invitation consumption writes, the owner lookup, and the final
+    // `add_member` write -- runs in ONE `spawn_blocking` closure, atomically with respect to
+    // any other async task on this process: nothing outside this closure can observe or act
+    // on this request's channel state between the closure's steps. The closure's return
+    // value is the exact same `Result<StatusCode, (StatusCode, String)>` the un-wrapped
+    // function used to produce directly -- same early-return points, same status codes, same
+    // error strings -- so every existing test on this handler needs no behavioral change.
+    tokio::task::spawn_blocking(move || -> Result<StatusCode, (StatusCode, String)> {
+        use ct_common::channel::{verify_member_noise_attestation, SignedChannelInvitation};
 
-    let inv_bytes = hex_decode(&req.invitation)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed invitation".to_string()))?;
-    let signed = SignedChannelInvitation::decode(&inv_bytes)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invitation: {e}")))?;
-    let redeem_sig = hex_decode_64(&req.redeem_sig)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed redeem_sig".to_string()))?;
-    let holder = hex_decode_32(&req.holder)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
-    let noise_pubkey = hex_decode_32(&req.noise_pubkey)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
-    let noise_attestation = hex_decode_64(&req.noise_attestation)
-        .ok_or((StatusCode::BAD_REQUEST, "malformed noise_attestation".to_string()))?;
+        let inv_bytes = hex_decode(&req.invitation)
+            .ok_or((StatusCode::BAD_REQUEST, "malformed invitation".to_string()))?;
+        let signed = SignedChannelInvitation::decode(&inv_bytes)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invitation: {e}")))?;
+        let redeem_sig = hex_decode_64(&req.redeem_sig)
+            .ok_or((StatusCode::BAD_REQUEST, "malformed redeem_sig".to_string()))?;
+        let holder = hex_decode_32(&req.holder)
+            .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+        let noise_pubkey = hex_decode_32(&req.noise_pubkey)
+            .ok_or((StatusCode::BAD_REQUEST, "malformed noise_pubkey".to_string()))?;
+        let noise_attestation = hex_decode_64(&req.noise_attestation)
+            .ok_or((StatusCode::BAD_REQUEST, "malformed noise_attestation".to_string()))?;
 
-    let channel = signed.invitation.channel;
-    // The operator authority is the channel's registered signing key; an unknown
-    // channel has no operator, so a redemption for it is a 404.
-    let operator = channels
-        .operator_pubkey(&channel)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
+        let channel = signed.invitation.channel;
+        // The operator authority is the channel's registered signing key; an unknown
+        // channel has no operator, so a redemption for it is a 404.
+        let operator = channels
+            .operator_pubkey(&channel)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
 
-    // Proof 1: the operator-signed invitation is authentic + current.
-    let now = now_secs();
-    ct_common::channel::verify_invitation(&operator, &signed, now).map_err(|e| {
-        let code = match e {
-            ct_common::channel::GrantError::Expired => StatusCode::GONE,
-            _ => StatusCode::FORBIDDEN,
-        };
-        (code, format!("invitation: {e}"))
-    })?;
-    // Proof 2: the intended invitee accepted + bound this holder key. Two variants:
-    // - with a fresh CP `challenge` (#108 defense-in-depth): the redemption is bound to a
-    //   single-use nonce we consume here, so a captured signature is non-replayable even
-    //   independent of the invitation single-use record below;
-    // - without one: the static v1 redemption (still protected by single-use consumption).
-    let invitee = signed.invitation.invitee_identity;
-    let redemption_ok = match &req.challenge {
-        Some(ch) => {
-            let nonce = hex_decode_32(ch)
-                .ok_or((StatusCode::BAD_REQUEST, "malformed challenge".to_string()))?;
-            if !channels
-                .consume_challenge(&nonce, now)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            {
-                return Err((StatusCode::FORBIDDEN, "stale or unknown challenge".to_string()));
+        // Proof 1: the operator-signed invitation is authentic + current.
+        let now = now_secs();
+        ct_common::channel::verify_invitation(&operator, &signed, now).map_err(|e| {
+            let code = match e {
+                ct_common::channel::GrantError::Expired => StatusCode::GONE,
+                _ => StatusCode::FORBIDDEN,
+            };
+            (code, format!("invitation: {e}"))
+        })?;
+        // Proof 2: the intended invitee accepted + bound this holder key. Two variants:
+        // - with a fresh CP `challenge` (#108 defense-in-depth): the redemption is bound to a
+        //   single-use nonce we consume here, so a captured signature is non-replayable even
+        //   independent of the invitation single-use record below;
+        // - without one: the static v1 redemption (still protected by single-use consumption).
+        let invitee = signed.invitation.invitee_identity;
+        let redemption_ok = match &req.challenge {
+            Some(ch) => {
+                let nonce = hex_decode_32(ch)
+                    .ok_or((StatusCode::BAD_REQUEST, "malformed challenge".to_string()))?;
+                if !channels
+                    .consume_challenge(&nonce, now)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                {
+                    return Err((StatusCode::FORBIDDEN, "stale or unknown challenge".to_string()));
+                }
+                ct_common::channel::verify_invitation_redemption_challenge(
+                    &channel, &invitee, &holder, &nonce, &redeem_sig,
+                )
             }
-            ct_common::channel::verify_invitation_redemption_challenge(
-                &channel, &invitee, &holder, &nonce, &redeem_sig,
-            )
+            None => ct_common::channel::verify_invitation_redemption(&channel, &invitee, &holder, &redeem_sig),
+        };
+        if !redemption_ok {
+            return Err((StatusCode::FORBIDDEN, "invitation redemption proof invalid".to_string()));
         }
-        None => ct_common::channel::verify_invitation_redemption(&channel, &invitee, &holder, &redeem_sig),
-    };
-    if !redemption_ok {
-        return Err((StatusCode::FORBIDDEN, "invitation redemption proof invalid".to_string()));
-    }
-    // Proof 3 (#101): the Noise key is attested by the holder, so a substituted key
-    // (e.g. by a DB-controlling operator) is rejected before it can MITM the A2A path.
-    if !verify_member_noise_attestation(&channel, &holder, &noise_pubkey, &noise_attestation) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "noise_attestation does not verify against the holder key".to_string(),
-        ));
-    }
-    // #108: enforce single-use. The invitation is a static signed object with a static
-    // redemption proof, so without this a **revoked** member could replay the identical
-    // redemption to restore membership until expiry (bypassing remove_member). Consume it
-    // by its operator signature *after* the proofs verify (a bad proof burns nothing) and
-    // *before* add_member; a replay is a 409. Mirrors verify_fresh/ReplayCache for grants.
-    let fresh = channels
-        .consume_invitation(&signed.signature, signed.invitation.expires_at, now)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if !fresh {
-        return Err((
-            StatusCode::CONFLICT,
-            "invitation already redeemed (single-use)".to_string(),
-        ));
-    }
-    // The invitation is the owner's authorization, so add the member on the owner's
-    // behalf (add_member is owner-scoped; look up the channel's owner to satisfy it).
-    let owner = channels
-        .channel_owner(&channel)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
-    let ok = channels
-        .add_member(&channel, &owner, &holder, &noise_pubkey, &noise_attestation)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if ok {
-        Ok(StatusCode::OK)
-    } else {
-        // The owner was looked up from the same channel row, so a false here means the
-        // channel vanished between reads — treat as gone.
-        Err((StatusCode::NOT_FOUND, "channel no longer registered".to_string()))
-    }
+        // Proof 3 (#101): the Noise key is attested by the holder, so a substituted key
+        // (e.g. by a DB-controlling operator) is rejected before it can MITM the A2A path.
+        if !verify_member_noise_attestation(&channel, &holder, &noise_pubkey, &noise_attestation) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "noise_attestation does not verify against the holder key".to_string(),
+            ));
+        }
+        // #108: enforce single-use. The invitation is a static signed object with a static
+        // redemption proof, so without this a **revoked** member could replay the identical
+        // redemption to restore membership until expiry (bypassing remove_member). Consume it
+        // by its operator signature *after* the proofs verify (a bad proof burns nothing) and
+        // *before* add_member; a replay is a 409. Mirrors verify_fresh/ReplayCache for grants.
+        let fresh = channels
+            .consume_invitation(&signed.signature, signed.invitation.expires_at, now)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !fresh {
+            return Err((
+                StatusCode::CONFLICT,
+                "invitation already redeemed (single-use)".to_string(),
+            ));
+        }
+        // The invitation is the owner's authorization, so add the member on the owner's
+        // behalf (add_member is owner-scoped; look up the channel's owner to satisfy it).
+        let owner = channels
+            .channel_owner(&channel)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
+        let ok = channels
+            .add_member(&channel, &owner, &holder, &noise_pubkey, &noise_attestation)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if ok {
+            Ok(StatusCode::OK)
+        } else {
+            // The owner was looked up from the same channel row, so a false here means the
+            // channel vanished between reads — treat as gone.
+            Err((StatusCode::NOT_FOUND, "channel no longer registered".to_string()))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blocking task panicked: {e}"),
+        ))
+    })
 }
 
 /// Extract + verify the `Authorization: Bearer` token against `handle`'s current
@@ -3415,77 +3440,96 @@ async fn me_issue(
     headers: HeaderMap,
     Json(req): Json<MeIssueReq>,
 ) -> Result<Json<TokenResp>, (StatusCode, String)> {
-    let sub = authed_subject(&state, &headers)?;
-    // Per-subject rate limit (M23.1): reject over-limit callers before touching
-    // the ledger, so a throttled request spends no credit.
-    let window = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / ISSUE_WINDOW_SECS)
-        .unwrap_or(0);
-    if !state.issue_limiter.lock_safe().allow(&sub, window) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "issue rate limit exceeded".to_string(),
-        ));
-    }
-    // #87 SEC87a: reject an underpayment (notably price:0) before the ledger, so a
-    // funded, in-rate subject still cannot mint a token for less than TOKEN_PRICE.
-    if !crate::billing::issuance_price_ok(req.price) {
-        return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            format!("a routing token costs at least {} credit(s)", crate::billing::TOKEN_PRICE),
-        ));
-    }
-    let idempotency_key = match req.idempotency_key.as_deref() {
-        Some(s) => Some(
-            hex_decode_32(s).ok_or((StatusCode::BAD_REQUEST, "malformed idempotency_key".to_string()))?,
-        ),
-        None => None,
-    };
-    let account = state
-        .ledger
-        .account_for_subject(&sub)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // #441: a retry with the same key gets back the same token, no new debit --
-    // same pattern as buy_token (#272/#440).
-    if let Some(key) = &idempotency_key {
-        if let Some(existing) = state
-            .ledger
-            .issuance_for_key(&account, key)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        {
-            return Ok(Json(TokenResp { token: hex_encode(&existing) }));
+    // #399: same reasoning as `channel_invite_redeem` above -- this body interleaves sync
+    // `SqliteLedger` calls with early-return auth/rate-limit/payment checks across
+    // security-sensitive control flow (credential/token issuance against a real credit
+    // balance). Piecemeal spawn_blocking around individual store calls would let async code
+    // interleave between them (e.g. between the idempotency-key lookup and the debit),
+    // which is exactly the bug class this restructuring avoids. The auth check
+    // (`authed_subject`, JWT verification) is included too, since it's also synchronous CPU
+    // work and the issue asks for the whole sequence of proof/auth checks + sync store calls
+    // in one closure. Same `Result<Json<TokenResp>, (StatusCode, String)>` return value, same
+    // early-return points, same status codes and error strings as before this restructuring.
+    tokio::task::spawn_blocking(move || -> Result<Json<TokenResp>, (StatusCode, String)> {
+        let sub = authed_subject(&state, &headers)?;
+        // Per-subject rate limit (M23.1): reject over-limit callers before touching
+        // the ledger, so a throttled request spends no credit.
+        let window = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / ISSUE_WINDOW_SECS)
+            .unwrap_or(0);
+        if !state.issue_limiter.lock_safe().allow(&sub, window) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "issue rate limit exceeded".to_string(),
+            ));
         }
-    }
-    let mut token = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
-    let ledger_err_code = |e: &LedgerOpError| match e {
-        LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => StatusCode::PAYMENT_REQUIRED,
-        LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
-        LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => StatusCode::CONFLICT,
-        LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    match &idempotency_key {
-        Some(key) => {
-            state
+        // #87 SEC87a: reject an underpayment (notably price:0) before the ledger, so a
+        // funded, in-rate subject still cannot mint a token for less than TOKEN_PRICE.
+        if !crate::billing::issuance_price_ok(req.price) {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                format!("a routing token costs at least {} credit(s)", crate::billing::TOKEN_PRICE),
+            ));
+        }
+        let idempotency_key = match req.idempotency_key.as_deref() {
+            Some(s) => Some(
+                hex_decode_32(s).ok_or((StatusCode::BAD_REQUEST, "malformed idempotency_key".to_string()))?,
+            ),
+            None => None,
+        };
+        let account = state
+            .ledger
+            .account_for_subject(&sub)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // #441: a retry with the same key gets back the same token, no new debit --
+        // same pattern as buy_token (#272/#440).
+        if let Some(key) = &idempotency_key {
+            if let Some(existing) = state
                 .ledger
-                .debit_and_record_issuance(&account, req.price, key, &token, now_secs())
-                .map_err(|e| {
+                .issuance_for_key(&account, key)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            {
+                return Ok(Json(TokenResp { token: hex_encode(&existing) }));
+            }
+        }
+        let mut token = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
+        let ledger_err_code = |e: &LedgerOpError| match e {
+            LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => StatusCode::PAYMENT_REQUIRED,
+            LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
+            LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => StatusCode::CONFLICT,
+            LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        match &idempotency_key {
+            Some(key) => {
+                state
+                    .ledger
+                    .debit_and_record_issuance(&account, req.price, key, &token, now_secs())
+                    .map_err(|e| {
+                        let code = ledger_err_code(&e);
+                        (code, e.to_string())
+                    })?;
+            }
+            // No key supplied: unchanged legacy behavior, no idempotency protection.
+            None => {
+                state.ledger.debit(&account, req.price).map_err(|e| {
                     let code = ledger_err_code(&e);
                     (code, e.to_string())
                 })?;
+            }
         }
-        // No key supplied: unchanged legacy behavior, no idempotency protection.
-        None => {
-            state.ledger.debit(&account, req.price).map_err(|e| {
-                let code = ledger_err_code(&e);
-                (code, e.to_string())
-            })?;
-        }
-    }
-    Ok(Json(TokenResp {
-        token: hex_encode(&token),
-    }))
+        Ok(Json(TokenResp {
+            token: hex_encode(&token),
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blocking task panicked: {e}"),
+        ))
+    })
 }
 
 /// Build the health/readiness router (M21.1a): `GET /healthz` (liveness, always
@@ -6179,6 +6223,255 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_invite_redeem_bad_proofs_never_mutate_the_store_before_returning_399() {
+        // #399: the whole proof-check + store-write sequence now runs inside ONE
+        // spawn_blocking closure -- this proves the early-return/error semantics from
+        // BEFORE that restructuring are preserved exactly: a proof that fails must still
+        // return before `consume_invitation`/`add_member` ever run, even now that the
+        // whole sequence executes on the blocking pool instead of directly on the async
+        // fn's body. Proven by showing the SAME invitation (single-use) can still be
+        // redeemed successfully AFTER each rejected attempt -- if the rejected attempt had
+        // (even partially) consumed the invitation or added the member, a subsequent valid
+        // redemption would fail with 409 (already redeemed) or observe stale state.
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let operator_sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let operator_pk = operator_sk.verifying_key().to_bytes();
+        let chan = ChannelId([0xa1u8; 32]);
+        channels.register_channel(&chan, &operator_pk, "alice").unwrap();
+
+        let invitee_sk = SigningKey::from_bytes(&[0x62u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder_sk = SigningKey::from_bytes(&[0x73u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let nk = [0xd4u8; 32];
+
+        let invitation = ct_common::channel::ChannelInvitation {
+            channel: chan,
+            invitee_identity: invitee,
+            direction: ct_common::channel::Direction::Both,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000_000_000,
+        };
+        let inv_sig = operator_sk.sign(&invitation.signing_bytes()).to_bytes();
+        let signed = ct_common::channel::SignedChannelInvitation { invitation, signature: inv_sig };
+        let inv_hex = hex_encode(&signed.encode());
+        let good_redeem = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_bytes(&chan, &invitee, &holder))
+                .to_bytes(),
+        );
+        let good_attest = hex_encode(
+            &holder_sk
+                .sign(&ct_common::channel::member_noise_attest_bytes(&chan, &holder, &nk))
+                .to_bytes(),
+        );
+
+        let app = channel_invite_router(channels.clone());
+        let post = |body: String| {
+            app.clone().oneshot(
+                Request::post("/channel/invite/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        // Attempt 1: a BAD noise attestation (proof 3) -- rejected with 403, at a point in
+        // the sequence AFTER consume_invitation would already have run had it not still been
+        // gated correctly behind the earlier checks in this now-single closure.
+        let bad_attest_body = format!(
+            r#"{{"invitation":"{inv_hex}","redeem_sig":"{good_redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{bad}"}}"#,
+            h = hex_encode(&holder), n = hex_encode(&nk), bad = hex_encode(&[0u8; 64]),
+        );
+        assert_eq!(post(bad_attest_body).await.unwrap().status(), StatusCode::FORBIDDEN, "bad attestation -> 403");
+        assert!(
+            !channels.is_member(&chan, &holder).unwrap(),
+            "a rejected attestation must not have added the member"
+        );
+
+        // Attempt 2 (the SAME invitation, still fresh): now with a valid attestation, the
+        // full sequence succeeds -- proving the earlier rejected attempt truly consumed
+        // nothing (consume_invitation is single-use; a partial mutation from attempt 1 would
+        // make THIS attempt fail with 409 instead of succeeding).
+        let good_body = format!(
+            r#"{{"invitation":"{inv_hex}","redeem_sig":"{good_redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{good_attest}"}}"#,
+            h = hex_encode(&holder), n = hex_encode(&nk),
+        );
+        assert_eq!(
+            post(good_body.clone()).await.unwrap().status(),
+            StatusCode::OK,
+            "a valid redemption after a rejected attempt must still succeed -- proves attempt 1 mutated nothing"
+        );
+        assert!(channels.is_member(&chan, &holder).unwrap());
+
+        // Attempt 3: replaying the same (now consumed) invitation -> 409, same single-use
+        // semantics as before this restructuring.
+        assert_eq!(post(good_body).await.unwrap().status(), StatusCode::CONFLICT, "single-use still enforced");
+    }
+
+    #[tokio::test]
+    async fn piecemeal_spawn_blocking_would_expose_a_real_gap_that_the_single_closure_shape_closes_399() {
+        // #399: the concrete mechanism property `channel_invite_redeem`/`me_issue` now rely
+        // on, demonstrated against the actual anti-pattern the issue calls out. Wrapping a
+        // multi-step sequence PIECEMEAL -- `spawn_blocking(step_1).await;
+        // spawn_blocking(step_2).await;` -- leaves a real await boundary between the two
+        // blocking calls where a concurrent async task is scheduled and can observe (or, for
+        // a real handler, act on) an intermediate state ("step_1's write landed, step_2's
+        // hasn't yet"). This test proves that gap is real and reliably observable for the
+        // piecemeal shape -- the exact shape both handlers now deliberately avoid by running
+        // their whole sequence inside ONE spawn_blocking closure (a single `.await`
+        // surrounding the entire sequence, not one per step, so there is no await boundary
+        // for the scheduler to reclaim control at between the sequence's internal steps).
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        const BETWEEN: u8 = 1;
+        const DONE: u8 = 2;
+
+        async fn piecemeal(state: Arc<AtomicU8>) {
+            tokio::task::spawn_blocking({
+                let state = state.clone();
+                move || {
+                    state.store(BETWEEN, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            })
+            .await
+            .unwrap();
+            // <- a real await boundary right here: the interloper task below is guaranteed a
+            // real chance to run and observe `state == BETWEEN` in this gap.
+            tokio::task::spawn_blocking({
+                let state = state.clone();
+                move || state.store(DONE, Ordering::SeqCst)
+            })
+            .await
+            .unwrap();
+        }
+
+        let state = Arc::new(AtomicU8::new(0));
+        let saw_between = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interloper_state = state.clone();
+        let interloper_saw = saw_between.clone();
+        let interloper = tokio::spawn(async move {
+            for _ in 0..80 {
+                if interloper_state.load(Ordering::SeqCst) == BETWEEN {
+                    interloper_saw.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        piecemeal(state.clone()).await;
+        interloper.await.unwrap();
+        assert!(
+            saw_between.load(Ordering::SeqCst),
+            "the piecemeal shape (two separately-awaited spawn_blocking calls) really does \
+             expose an observable intermediate state in the gap between them -- exactly the \
+             interleaving risk #399's single-closure restructuring exists to close, since both \
+             `channel_invite_redeem` and `me_issue` now use one spawn_blocking call with no \
+             internal await point instead of this shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_invite_redeem_concurrent_duplicate_requests_admit_the_member_exactly_once_399() {
+        // #399: a real concurrency correctness proof on the actual production handler --
+        // many concurrent requests all racing to redeem the SAME single-use invitation must
+        // yield exactly one 200 (member admitted) and every other request a 409 (already
+        // redeemed), with the store's durable end state showing the member added exactly
+        // once. This is the property a regression that reintroduced the piecemeal
+        // spawn_blocking anti-pattern (a real await boundary between `consume_invitation`
+        // and `add_member`) could break -- a concurrent request slipping into that gap could
+        // observe "invitation consumed, member not yet added" and take an inconsistent
+        // action. The single-closure shape this test exercises makes that gap structurally
+        // impossible.
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let operator_sk = SigningKey::from_bytes(&[0x51u8; 32]);
+        let operator_pk = operator_sk.verifying_key().to_bytes();
+        let chan = ChannelId([0xa1u8; 32]);
+        channels.register_channel(&chan, &operator_pk, "alice").unwrap();
+
+        let invitee_sk = SigningKey::from_bytes(&[0x62u8; 32]);
+        let invitee = invitee_sk.verifying_key().to_bytes();
+        let holder_sk = SigningKey::from_bytes(&[0x73u8; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let nk = [0xd4u8; 32];
+
+        let invitation = ct_common::channel::ChannelInvitation {
+            channel: chan,
+            invitee_identity: invitee,
+            direction: ct_common::channel::Direction::Both,
+            rights: ct_common::channel::Rights::ReadWrite,
+            delegable: false,
+            expires_at: 10_000_000_000,
+        };
+        let inv_sig = operator_sk.sign(&invitation.signing_bytes()).to_bytes();
+        let signed = ct_common::channel::SignedChannelInvitation { invitation, signature: inv_sig };
+        let inv_hex = hex_encode(&signed.encode());
+        let redeem = hex_encode(
+            &invitee_sk
+                .sign(&ct_common::channel::invitation_redeem_bytes(&chan, &invitee, &holder))
+                .to_bytes(),
+        );
+        let attest = hex_encode(
+            &holder_sk
+                .sign(&ct_common::channel::member_noise_attest_bytes(&chan, &holder, &nk))
+                .to_bytes(),
+        );
+        let body = format!(
+            r#"{{"invitation":"{inv_hex}","redeem_sig":"{redeem}","holder":"{h}","noise_pubkey":"{n}","noise_attestation":"{attest}"}}"#,
+            h = hex_encode(&holder), n = hex_encode(&nk),
+        );
+
+        let app = channel_invite_router(channels.clone());
+        const CONCURRENT: usize = 12;
+        let handles: Vec<_> = (0..CONCURRENT)
+            .map(|_| {
+                let app = app.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    app.oneshot(
+                        Request::post("/channel/invite/redeem")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+                })
+            })
+            .collect();
+
+        let mut ok = 0;
+        let mut conflict = 0;
+        for h in handles {
+            match h.await.unwrap() {
+                StatusCode::OK => ok += 1,
+                StatusCode::CONFLICT => conflict += 1,
+                other => panic!("unexpected status {other} from a concurrent redemption race"),
+            }
+        }
+        assert_eq!(ok, 1, "exactly one concurrent redemption of a single-use invitation must succeed");
+        assert_eq!(conflict, CONCURRENT - 1, "every other concurrent redemption must see the single-use conflict");
+        assert!(channels.is_member(&chan, &holder).unwrap(), "the member was admitted");
+        assert_eq!(
+            channels.members_of(&chan, "alice").unwrap().unwrap().len(),
+            1,
+            "the member was admitted exactly once, not once per racing request"
+        );
+    }
+
+    #[tokio::test]
     async fn unauthenticated_writers_are_rate_limited_per_ip() {
         // #87 SEC87b-rl: a per-IP fixed-window cap on the unauthenticated
         // DB-writers. One address that floods a metered POST is `429`'d past the
@@ -8060,6 +8353,128 @@ mod tests {
             issue().await.unwrap().status(),
             StatusCode::TOO_MANY_REQUESTS,
             "3rd over the per-subject cap is throttled"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_issue_rate_limited_request_never_debits_the_ledger_399() {
+        // #399: `me_issue`'s whole sequence (auth, rate limit, price floor, idempotency
+        // lookup, debit) now runs inside ONE spawn_blocking closure -- this proves the
+        // early-return semantics from BEFORE that restructuring are preserved exactly: a
+        // request that's over the per-subject rate limit must still return 429 BEFORE the
+        // ledger is ever touched, even now that the whole sequence executes on the blocking
+        // pool instead of directly on the async fn's body.
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+
+        let acct = ledger.account_for_subject("user-1").unwrap();
+        ledger.credit(&acct, 10).unwrap();
+        // Cap issuance at 1 per window, so the 2nd request is the one under test.
+        let app = authed_billing_router(ledger.clone(), OidcVerifierHandle::new(Some(verifier)), 1);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "user-1", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let issue = || {
+            app.clone().oneshot(
+                Request::post("/me/issue")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"price":1}"#))
+                    .unwrap(),
+            )
+        };
+
+        assert_eq!(issue().await.unwrap().status(), StatusCode::OK, "1st allowed, debits 1");
+        assert_eq!(ledger.balance(&acct).unwrap(), 9, "the 1st issuance debited exactly its price");
+
+        assert_eq!(
+            issue().await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "2nd over the per-subject cap is throttled"
+        );
+        assert_eq!(
+            ledger.balance(&acct).unwrap(),
+            9,
+            "a rate-limited request must not touch the ledger -- the early return in the \
+             single spawn_blocking closure happens before account_for_subject/debit ever run"
+        );
+    }
+
+    #[tokio::test]
+    async fn me_issue_concurrent_duplicate_idempotency_key_requests_debit_exactly_once_399() {
+        // #399: real concurrency correctness proof on the actual production handler, mirroring
+        // `channel_invite_redeem_concurrent_duplicate_requests_admit_the_member_exactly_once_399`
+        // above -- many concurrent requests with the SAME idempotency key must all resolve to
+        // the SAME minted token with exactly one real debit against the ledger, never one debit
+        // per racing request. This is the property a regression that split `me_issue`'s
+        // idempotency-lookup-then-debit sequence into separately-awaited spawn_blocking calls
+        // could break (a concurrent request slipping into that gap could double-debit before
+        // the first request's issuance record lands).
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+
+        let acct = ledger.account_for_subject("user-1").unwrap();
+        ledger.credit(&acct, 100).unwrap();
+        // High rate cap: this test isolates idempotency/debit races, not the rate limiter.
+        let app = authed_billing_router(ledger.clone(), OidcVerifierHandle::new(Some(verifier)), 1000);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "user-1", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let idem_key = "ab".repeat(32); // 32 bytes hex, matches hex_decode_32's expected shape.
+        let body = format!(r#"{{"price":3,"idempotency_key":"{idem_key}"}}"#);
+
+        const CONCURRENT: usize = 10;
+        let handles: Vec<_> = (0..CONCURRENT)
+            .map(|_| {
+                let app = app.clone();
+                let jwt = jwt.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let resp = app
+                        .oneshot(
+                            Request::post("/me/issue")
+                                .header("authorization", format!("Bearer {jwt}"))
+                                .header("content-type", "application/json")
+                                .body(Body::from(body))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK, "every racing request with a valid idempotency key succeeds");
+                    let bytes = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+                    let parsed: TokenResp = serde_json::from_slice(&bytes).unwrap();
+                    parsed.token
+                })
+            })
+            .collect();
+
+        let mut tokens = std::collections::HashSet::new();
+        for h in handles {
+            tokens.insert(h.await.unwrap());
+        }
+        assert_eq!(tokens.len(), 1, "every racing request with the same idempotency key must get the SAME token");
+        assert_eq!(
+            ledger.balance(&acct).unwrap(),
+            97,
+            "the price was debited exactly once across all CONCURRENT racing requests, not once per request"
         );
     }
 
