@@ -12,16 +12,19 @@
 //! a Postgres backend for the hosted deployment can follow behind the same
 //! surface.
 //!
-//! #344: every `Sqlite*` store here still uses that single `Mutex<Connection>`
-//! shape *except* [`SqliteTunnelStore`], which also pools extra read-only
-//! connections via `r2d2`/`r2d2_sqlite` (see its own struct doc for the full
-//! read/write-contention reasoning). That's a deliberate, bounded first slice,
-//! not a full migration -- every other store below (`SqliteEnrollment`,
-//! `SqliteServiceAccountStore`, `SqliteBootstrap`, `SqliteAgentDirectory`,
-//! `SqlitePipelineRegistry`, `SqliteRegistry`, `SqliteLedger`,
-//! `SqliteChannelStore`, `SqliteNetworkStore`, `SqliteTopologyStore`, plus
-//! `SqliteEdgeMesh` in `edge_mesh.rs`) is tracked, real, unattempted follow-up
-//! work, deliberately left out of scope here (see the issue for why).
+//! #344/#398: every `Sqlite*` store here still uses that single `Mutex<Connection>`
+//! shape *except* [`SqliteTunnelStore`] (#344), [`SqliteAgentDirectory`],
+//! [`SqlitePipelineRegistry`], [`SqliteChannelStore`] and [`SqliteTopologyStore`] (#398),
+//! which also pool extra read-only connections via `r2d2`/`r2d2_sqlite` (see each store's own
+//! struct doc for its specific read/write-contention reasoning). This is a deliberate,
+//! per-store judgment call, not a uniform migration: #344 explicitly declined
+//! [`SqliteEdgeMesh`] (its hot path is write-heavy, not read-heavy) rather than migrating it
+//! just to hit a round number, and #398 re-verified that call plus made the same read/write
+//! call-pattern judgment for every other store here. Migrated only where a real, hit,
+//! read-heavy hot path justified it: `SqliteEnrollment`, `SqliteServiceAccountStore`,
+//! `SqliteBootstrap`, `SqliteRegistry`, `SqliteLedger`, `SqliteNetworkStore` (all below) and
+//! `SqliteEdgeMesh` (`edge_mesh.rs`) stay on the plain `Mutex<Connection>` shape -- see #398's
+//! closing comment for the honest per-store reasoning on each.
 
 use std::sync::Mutex;
 
@@ -821,13 +824,49 @@ impl From<rusqlite::Error> for AgentDirectoryError {
 /// card URL + the roles/skills they advertise, and peers query `role`/`skill` to discover whom to
 /// fetch + verify. Distinct from [`SqliteRegistry`] (tunnels). Can share the same DB file as the
 /// other stores — it owns its `agent_cards` table + its own connection.
+///
+/// #398: this store follows the #344 hybrid pooled-reads-single-writer pattern (see
+/// [`SqliteTunnelStore`]'s struct doc for the full read/write-contention reasoning). Its
+/// [`search`](Self::search) backs the public `GET /registry/agents` discovery scan — genuinely
+/// read-heavy, hit by every peer doing role/skill discovery — while [`register`](Self::register)
+/// (self-(re)registration) is comparatively rare. Only [`register`] writes; [`search`] and
+/// [`count`] are pooled.
 pub struct SqliteAgentDirectory {
-    conn: Mutex<Connection>,
+    /// The one connection [`Self::register`] uses, unchanged in shape from every other
+    /// non-migrated store's `conn` field.
+    writer: Mutex<Connection>,
+    /// Extra read-only connections for [`Self::search`]/[`Self::count`] (see [`Self::read`]).
+    /// `None` for an in-memory store (see [`SqliteTunnelStore::readers`]'s doc for why).
+    readers: Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>,
 }
 
-sqlite_store_ctors!(SqliteAgentDirectory);
-
 impl SqliteAgentDirectory {
+    /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
+    /// connections (#398; see the struct doc). Hand-written rather than [`sqlite_store_ctors!`]
+    /// for the same reason as [`SqliteTunnelStore::open`]: `open` now does genuinely more than
+    /// `open_in_memory` (builds the pool too).
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let mut store = Self::from_connection(open_tuned(path)?)?;
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
+        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        Ok(store)
+    }
+
+    /// Open an ephemeral in-memory store (tests / stateless runs). No reader pool (#398) —
+    /// every method, read or write, goes through `writer`, exactly like before this migration.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// A connection for a READ-only method (#398; same shape as [`SqliteTunnelStore::read`]).
+    fn read(&self) -> ReadConn<'_> {
+        match self.readers.as_ref().and_then(|pool| pool.get().ok()) {
+            Some(pooled) => ReadConn::Pooled(pooled),
+            None => ReadConn::Direct(self.writer.lock_safe()),
+        }
+    }
+
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agent_cards (
@@ -839,7 +878,8 @@ impl SqliteAgentDirectory {
              );",
         )?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers: None,
         })
     }
 
@@ -863,7 +903,7 @@ impl SqliteAgentDirectory {
                 return Err(AgentDirectoryError::InvalidToken(t.clone()));
             }
         }
-        self.conn.lock_safe().execute(
+        self.writer.lock_safe().execute(
             "INSERT OR REPLACE INTO agent_cards
                  (holder_pubkey, card_url, role_tags, skill_ids, registered_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -892,7 +932,7 @@ impl SqliteAgentDirectory {
         role: Option<&str>,
         skill: Option<&str>,
     ) -> rusqlite::Result<Vec<AgentDirectoryEntry>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut sql = String::from(
             "SELECT holder_pubkey, card_url, role_tags, skill_ids, registered_at
              FROM agent_cards WHERE 1=1",
@@ -927,8 +967,7 @@ impl SqliteAgentDirectory {
     /// Directory size without deserializing a single row (#347) — `status_handler`'s aggregate
     /// count only ever needed `COUNT(*)`, not every row's token-split facets.
     pub fn count(&self) -> rusqlite::Result<i64> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row("SELECT COUNT(*) FROM agent_cards", [], |r| r.get(0))
     }
 }
@@ -938,13 +977,47 @@ impl SqliteAgentDirectory {
 /// the pipeline analogue of the #144 agent directory. The spec is stored as its canonical JSON,
 /// keyed by the spec's own `id`; publishing is owner-scoped so one designer can't overwrite
 /// another's spec.
+///
+/// #398: hybrid pooled-reads-single-writer store (#344 pattern; see [`SqliteTunnelStore`]'s
+/// struct doc). [`get`](Self::get)/[`list`](Self::list) back the public `GET /registry/pipelines`
+/// + `GET /registry/pipelines/:id` discovery routes — genuinely read-heavy, hit by every agent
+/// scanning for workflows to join — while [`publish`](Self::publish)/[`unpublish`](Self::unpublish)
+/// (designer-initiated) are comparatively rare. Only `publish`/`unpublish` write; `get`/`list` are
+/// pooled.
 pub struct SqlitePipelineRegistry {
-    conn: Mutex<Connection>,
+    /// The one connection [`Self::publish`]/[`Self::unpublish`] use, unchanged in shape from
+    /// every other non-migrated store's `conn` field.
+    writer: Mutex<Connection>,
+    /// Extra read-only connections for [`Self::get`]/[`Self::list`] (see [`Self::read`]). `None`
+    /// for an in-memory store (see [`SqliteTunnelStore::readers`]'s doc for why).
+    readers: Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>,
 }
 
-sqlite_store_ctors!(SqlitePipelineRegistry);
-
 impl SqlitePipelineRegistry {
+    /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
+    /// connections (#398; see the struct doc).
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let mut store = Self::from_connection(open_tuned(path)?)?;
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
+        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        Ok(store)
+    }
+
+    /// Open an ephemeral in-memory store (tests / stateless runs). No reader pool (#398) —
+    /// every method, read or write, goes through `writer`, exactly like before this migration.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// A connection for a READ-only method (#398; same shape as [`SqliteTunnelStore::read`]).
+    fn read(&self) -> ReadConn<'_> {
+        match self.readers.as_ref().and_then(|pool| pool.get().ok()) {
+            Some(pooled) => ReadConn::Pooled(pooled),
+            None => ReadConn::Direct(self.writer.lock_safe()),
+        }
+    }
+
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pipelines (
@@ -954,7 +1027,7 @@ impl SqlitePipelineRegistry {
                  published_at INTEGER NOT NULL
              );",
         )?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { writer: Mutex::new(conn), readers: None })
     }
 
     /// Publish (upsert) a workflow pipeline spec, keyed by its `id`. Re-publishing the same id by
@@ -969,7 +1042,7 @@ impl SqlitePipelineRegistry {
     ) -> rusqlite::Result<bool> {
         let json = serde_json::to_string(spec)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let existing_owner: Option<String> = conn
             .query_row("SELECT owner FROM pipelines WHERE id = ?1", params![spec.id], |r| r.get(0))
             .optional()?;
@@ -1008,8 +1081,7 @@ impl SqlitePipelineRegistry {
     /// parses — a forward-incompatible spec never crashes a reader).
     pub fn get(&self, id: &str) -> rusqlite::Result<Option<ct_common::pipeline::PipelineSpec>> {
         let json: Option<String> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row("SELECT spec_json FROM pipelines WHERE id = ?1", params![id], |r| r.get(0))
             .optional()?;
         Ok(json.and_then(|j| serde_json::from_str(&j).ok()))
@@ -1018,7 +1090,7 @@ impl SqlitePipelineRegistry {
     /// List every published pipeline as `(id, owner)`, sorted by id — the discovery surface a
     /// scanning agent reads to find workflows to join.
     pub fn list(&self) -> rusqlite::Result<Vec<(String, String)>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT id, owner FROM pipelines ORDER BY id")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -1029,7 +1101,7 @@ impl SqlitePipelineRegistry {
     /// Un-publish `id`, owner-scoped (account-deletion cascade's per-pipeline teardown).
     /// Returns whether a row was removed.
     pub fn unpublish(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
-        let n = self.conn.lock_safe().execute(
+        let n = self.writer.lock_safe().execute(
             "DELETE FROM pipelines WHERE id = ?1 AND owner = ?2",
             params![id, owner],
         )?;
@@ -2953,13 +3025,54 @@ impl SqliteTunnelStore {
 /// the edge the operator pubkey for a channel (the same role host-auth plays for
 /// hostnames). Never stores a channel signing key. Owner-scoped: only the subject
 /// that registered a channel may re-key it or manage its members.
+///
+/// #398: hybrid pooled-reads-single-writer store (#344 pattern; see [`SqliteTunnelStore`]'s
+/// struct doc for the full read/write-contention reasoning). [`authorize_holder`]/
+/// [`operator_pubkey`] back `POST /internal/channel/authorize` (already wrapped in its own
+/// `spawn_blocking`, #140/#231, after a real lock-wait-stall incident under concurrent load) --
+/// the per-connection channel-admission gate every Agent-Fabric WS/A2A join hits. Pooling this
+/// store's reads attacks the root cause that earlier fix only mitigated (it moved the blocking
+/// work off the async worker but didn't stop the store's own `Mutex<Connection>` from
+/// serializing every concurrent admission check). Write volume (register/add/remove
+/// member/consume invitation/challenge) is comparatively rare -- admin/redemption events, not
+/// per-connection -- so every WRITE method still keeps going through `writer`, unchanged.
+///
+/// [`authorize_holder`]: Self::authorize_holder
+/// [`operator_pubkey`]: Self::operator_pubkey
 pub struct SqliteChannelStore {
-    conn: Mutex<Connection>,
+    /// The one connection every WRITE method uses, unchanged in shape from every other
+    /// non-migrated store's `conn` field (see the struct doc for why writes stay serialized).
+    writer: Mutex<Connection>,
+    /// Extra read-only connections for every READ-only method (see [`Self::read`]). `None` for
+    /// an in-memory store (see [`SqliteTunnelStore::readers`]'s doc for why).
+    readers: Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>,
 }
 
-sqlite_store_ctors!(SqliteChannelStore);
-
 impl SqliteChannelStore {
+    /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
+    /// connections (#398; see the struct doc).
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let mut store = Self::from_connection(open_tuned(path)?)?;
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
+        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        Ok(store)
+    }
+
+    /// Open an ephemeral in-memory store (tests / stateless runs). No reader pool (#398) --
+    /// every method, read or write, goes through `writer`, exactly like before this migration.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// A connection for a READ-only method (#398; same shape as [`SqliteTunnelStore::read`]).
+    fn read(&self) -> ReadConn<'_> {
+        match self.readers.as_ref().and_then(|pool| pool.get().ok()) {
+            Some(pooled) => ReadConn::Pooled(pooled),
+            None => ReadConn::Direct(self.writer.lock_safe()),
+        }
+    }
+
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channels (
@@ -3019,7 +3132,8 @@ impl SqliteChannelStore {
         // to guess a not-yet-known holder key. Additive, nullable -- #44 pattern.
         ensure_column(&conn, "channel_allowlist", "claimed_at", "INTEGER")?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers: None,
         })
     }
 
@@ -3032,7 +3146,7 @@ impl SqliteChannelStore {
         operator_pubkey: &[u8; 32],
         owner: &str,
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let existing: Option<String> = conn
             .query_row(
                 "SELECT owner FROM channels WHERE channel = ?1",
@@ -3053,8 +3167,7 @@ impl SqliteChannelStore {
     /// The operator public key for `channel`, if registered (the edge's lookup).
     pub fn operator_pubkey(&self, channel: &ChannelId) -> rusqlite::Result<Option<[u8; 32]>> {
         let raw: Option<Vec<u8>> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT operator FROM channels WHERE channel = ?1",
                 params![&channel.0[..]],
@@ -3077,8 +3190,7 @@ impl SqliteChannelStore {
         holder: &[u8; 32],
     ) -> rusqlite::Result<Option<[u8; 32]>> {
         let raw: Option<Vec<u8>> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT c.operator FROM channels c \
                  JOIN channel_members m ON m.channel = c.channel \
@@ -3093,7 +3205,7 @@ impl SqliteChannelStore {
     /// Every channel `owner` registered, sorted (account-deletion cascade's discovery
     /// step — the reverse of [`channel_owner`](Self::channel_owner)).
     pub fn channels_owned_by(&self, owner: &str) -> rusqlite::Result<Vec<ChannelId>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT channel FROM channels WHERE owner = ?1 ORDER BY channel")?;
         let rows = stmt
             .query_map(params![owner], |r| r.get::<_, Vec<u8>>(0))?
@@ -3108,7 +3220,7 @@ impl SqliteChannelStore {
     /// its allow-list — the account-deletion cascade's per-channel teardown. Returns
     /// `false` (no-op) if `owner` doesn't own `channel`.
     pub fn delete_channel(&self, owner: &str, channel: &ChannelId) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let n = conn.execute(
             "DELETE FROM channels WHERE channel = ?1 AND owner = ?2",
             params![&channel.0[..], owner],
@@ -3124,7 +3236,7 @@ impl SqliteChannelStore {
     /// (account-deletion cascade: a deleted account's e-mail shouldn't keep sitting
     /// on other owners' pending-invite lists). Returns rows removed.
     pub fn remove_allowlist_entries_for_email(&self, email: &str) -> rusqlite::Result<usize> {
-        Ok(self.conn.lock_safe().execute(
+        Ok(self.writer.lock_safe().execute(
             "DELETE FROM channel_allowlist WHERE email = ?1",
             params![email.to_ascii_lowercase()],
         )?)
@@ -3132,8 +3244,7 @@ impl SqliteChannelStore {
 
     /// The subject that owns `channel`, if registered.
     pub fn channel_owner(&self, channel: &ChannelId) -> rusqlite::Result<Option<String>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT owner FROM channels WHERE channel = ?1",
                 params![&channel.0[..]],
@@ -3154,7 +3265,7 @@ impl SqliteChannelStore {
         noise_pubkey: &[u8; 32],
         noise_attestation: &[u8; 64],
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let is_owner: bool = conn
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
@@ -3182,7 +3293,7 @@ impl SqliteChannelStore {
     /// route at all before this -- an operator could register a channel + add
     /// members but never list what they'd already registered.
     pub fn members_of(&self, channel: &ChannelId, owner: &str) -> rusqlite::Result<Option<Vec<([u8; 32], Option<[u8; 32]>)>>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let is_owner: bool = conn
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
@@ -3236,7 +3347,7 @@ impl SqliteChannelStore {
         expires_at: u64,
         now: u64,
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         conn.execute(
             "DELETE FROM consumed_invitations WHERE expires_at <= ?1",
             params![now as i64],
@@ -3258,7 +3369,7 @@ impl SqliteChannelStore {
     pub fn issue_challenge(&self, now: u64, ttl_secs: u64) -> rusqlite::Result<[u8; 32]> {
         let mut nonce = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         // #403: this endpoint is unauthenticated and only reached the `consume_challenge`
         // prune after a valid invitation later verifies -- an idle deployment (nobody
         // currently redeeming) never hit that path at all, so the table grew without
@@ -3277,7 +3388,7 @@ impl SqliteChannelStore {
     /// (then deletes it, so a replay of the same nonce fails), `false` otherwise. Prunes
     /// expired nonces so the table stays bounded.
     pub fn consume_challenge(&self, nonce: &[u8; 32], now: u64) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         conn.execute(
             "DELETE FROM channel_challenges WHERE expires_at <= ?1",
             params![now as i64],
@@ -3299,8 +3410,7 @@ impl SqliteChannelStore {
         holder: &[u8; 32],
     ) -> rusqlite::Result<Option<[u8; 64]>> {
         let raw: Option<Option<Vec<u8>>> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT noise_attestation FROM channel_members WHERE channel = ?1 AND holder = ?2",
                 params![&channel.0[..], &holder[..]],
@@ -3321,8 +3431,7 @@ impl SqliteChannelStore {
         holder: &[u8; 32],
     ) -> rusqlite::Result<Option<[u8; 32]>> {
         let raw: Option<Option<Vec<u8>>> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT noise_pubkey FROM channel_members WHERE channel = ?1 AND holder = ?2",
                 params![&channel.0[..], &holder[..]],
@@ -3335,8 +3444,7 @@ impl SqliteChannelStore {
     /// Whether `holder` is a member of `channel`.
     pub fn is_member(&self, channel: &ChannelId, holder: &[u8; 32]) -> rusqlite::Result<bool> {
         Ok(self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT 1 FROM channel_members WHERE channel = ?1 AND holder = ?2",
                 params![&channel.0[..], &holder[..]],
@@ -3354,7 +3462,7 @@ impl SqliteChannelStore {
         owner: &str,
         holder: &[u8; 32],
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let is_owner: bool = conn
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
@@ -3386,7 +3494,7 @@ impl SqliteChannelStore {
         email: &str,
         now: u64,
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let is_owner: bool = conn
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
@@ -3411,7 +3519,7 @@ impl SqliteChannelStore {
     /// membership — that's still [`remove_member`](Self::remove_member); this only
     /// stops a *future* claim.
     pub fn allowlist_remove(&self, channel: &ChannelId, owner: &str, email: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let is_owner: bool = conn
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
@@ -3434,7 +3542,7 @@ impl SqliteChannelStore {
     /// own `channel` (or it's unknown), `Some(emails)` otherwise (empty when no
     /// entries).
     pub fn allowlist_list(&self, channel: &ChannelId, owner: &str) -> rusqlite::Result<Option<Vec<String>>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let is_owner: bool = conn
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
@@ -3460,8 +3568,7 @@ impl SqliteChannelStore {
     /// session email. Deliberately **not** owner-scoped: the claimant isn't the owner.
     pub fn allowlist_contains(&self, channel: &ChannelId, email: &str) -> rusqlite::Result<bool> {
         Ok(self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT 1 FROM channel_allowlist WHERE channel = ?1 AND email = ?2",
                 params![&channel.0[..], email.to_ascii_lowercase()],
@@ -3493,7 +3600,7 @@ impl SqliteChannelStore {
         noise_attestation: &[u8; 64],
         now: u64,
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let allowed: bool = conn
             .query_row(
                 "SELECT 1 FROM channel_allowlist WHERE channel = ?1 AND email = ?2",
@@ -3528,7 +3635,7 @@ impl SqliteChannelStore {
     /// invitee, not the owner) and deliberately scoped to exactly the caller's own
     /// verified email — never call this with an email the session doesn't own.
     pub fn channels_for_email(&self, email: &str) -> rusqlite::Result<Vec<(ChannelId, Option<u64>)>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT channel, claimed_at FROM channel_allowlist WHERE email = ?1 ORDER BY added_at DESC",
         )?;
@@ -3681,8 +3788,27 @@ impl From<crate::topology::AssignError> for TopologyError {
 /// owner and, if shared, the single topology it belongs to; the pure state machine
 /// enforces every transition. (The `Topology` entity + edge-list are follow packets; this
 /// is the membership core.)
+/// #398: hybrid pooled-reads-single-writer store (#344 pattern; see [`SqliteTunnelStore`]'s
+/// struct doc for the full read/write-contention reasoning). [`topology_authorizes`] is the
+/// fallback branch of the same `/internal/channel/authorize` hot path [`SqliteChannelStore`]'s
+/// own struct doc describes (a JOIN across `topology_edges`/`topologies`, previously a full
+/// table scan per #464), and [`topology_by_uuid`] + [`agents_in`]/[`edges`] back the public
+/// `GET /net/:uuid` live-status page — pure sequential reads on every load. Many other methods
+/// here do an internal read-check-then-write under one held lock (e.g. `can_collaborate`/
+/// `owns_topology` gating `add_edge_collab`) and stay on `writer` as a single unit — only
+/// methods that are genuinely READ-ONLY end to end move to the pool.
+///
+/// [`topology_authorizes`]: Self::topology_authorizes
+/// [`topology_by_uuid`]: Self::topology_by_uuid
+/// [`agents_in`]: Self::agents_in
+/// [`edges`]: Self::edges
 pub struct SqliteTopologyStore {
-    conn: Mutex<Connection>,
+    /// The one connection every WRITE method uses, unchanged in shape from every other
+    /// non-migrated store's `conn` field (see the struct doc for why writes stay serialized).
+    writer: Mutex<Connection>,
+    /// Extra read-only connections for every READ-only method (see [`Self::read`]). `None` for
+    /// an in-memory store (see [`SqliteTunnelStore::readers`]'s doc for why).
+    readers: Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>,
 }
 
 /// Decode a topology node id — a 32-byte agent holder key as 64 hex chars (#107-enforce unified
@@ -3702,9 +3828,31 @@ fn topo_node_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-sqlite_store_ctors!(SqliteTopologyStore);
-
 impl SqliteTopologyStore {
+    /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
+    /// connections (#398; see the struct doc).
+    pub fn open(path: &str) -> rusqlite::Result<Self> {
+        let mut store = Self::from_connection(open_tuned(path)?)?;
+        let manager =
+            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
+        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        Ok(store)
+    }
+
+    /// Open an ephemeral in-memory store (tests / stateless runs). No reader pool (#398) --
+    /// every method, read or write, goes through `writer`, exactly like before this migration.
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// A connection for a READ-only method (#398; same shape as [`SqliteTunnelStore::read`]).
+    fn read(&self) -> ReadConn<'_> {
+        match self.readers.as_ref().and_then(|pool| pool.get().ok()) {
+            Some(pooled) => ReadConn::Pooled(pooled),
+            None => ReadConn::Direct(self.writer.lock_safe()),
+        }
+    }
+
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS topology_agents (
@@ -3802,7 +3950,8 @@ impl SqliteTopologyStore {
              DROP TABLE topology_edges_405_dedup;",
         )?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            writer: Mutex::new(conn),
+            readers: None,
         })
     }
 
@@ -3816,7 +3965,7 @@ impl SqliteTopologyStore {
         id: &str,
         mode: ct_common::overlay::RoutingApproach,
     ) -> rusqlite::Result<bool> {
-        let n = self.conn.lock_safe().execute(
+        let n = self.writer.lock_safe().execute(
             "UPDATE topologies SET overlay_mode = ?3 WHERE id = ?1 AND owner = ?2",
             params![id, owner, mode.as_str()],
         )?;
@@ -3831,8 +3980,7 @@ impl SqliteTopologyStore {
         id: &str,
     ) -> rusqlite::Result<Option<ct_common::overlay::RoutingApproach>> {
         let raw: Option<String> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT overlay_mode FROM topologies WHERE id = ?1",
                 params![id],
@@ -3871,7 +4019,7 @@ impl SqliteTopologyStore {
         if !ct_common::channel::verify_topology_operator_binding(id, operator_pubkey, proof) {
             return Ok(false);
         }
-        let n = self.conn.lock_safe().execute(
+        let n = self.writer.lock_safe().execute(
             "UPDATE topologies SET operator_pubkey = ?3 WHERE id = ?1 AND owner = ?2",
             params![id, owner, &operator_pubkey[..]],
         )?;
@@ -3883,8 +4031,7 @@ impl SqliteTopologyStore {
     /// wrong length degrades to `None` rather than failing the read.
     pub fn operator(&self, id: &str) -> rusqlite::Result<Option<[u8; 32]>> {
         let raw: Option<Option<Vec<u8>>> = self
-            .conn
-            .lock_safe()
+            .read()
             .query_row(
                 "SELECT operator_pubkey FROM topologies WHERE id = ?1",
                 params![id],
@@ -3898,7 +4045,7 @@ impl SqliteTopologyStore {
     /// Returns `false` (no-op) if the `id` is already taken or the `net_uuid` collides —
     /// so ids and subdomains stay unique.
     pub fn create_topology(&self, owner: &str, id: &str, net_uuid: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let clash: bool = conn
             .query_row(
                 "SELECT 1 FROM topologies WHERE id = ?1 OR net_uuid = ?2",
@@ -3923,8 +4070,7 @@ impl SqliteTopologyStore {
 
     /// The topology with `id`, if it exists.
     pub fn topology(&self, id: &str) -> rusqlite::Result<Option<crate::topology::Topology>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT id, owner, net_uuid FROM topologies WHERE id = ?1",
                 params![id],
@@ -3936,8 +4082,7 @@ impl SqliteTopologyStore {
     /// Resolve a topology by its `net_uuid` — the lookup the `<net_uuid>.<zone>`
     /// live-status subdomain uses (UUID-only access for now, #107).
     pub fn topology_by_uuid(&self, net_uuid: &str) -> rusqlite::Result<Option<crate::topology::Topology>> {
-        self.conn
-            .lock_safe()
+        self.read()
             .query_row(
                 "SELECT id, owner, net_uuid FROM topologies WHERE net_uuid = ?1",
                 params![net_uuid],
@@ -3948,7 +4093,7 @@ impl SqliteTopologyStore {
 
     /// Every topology `owner` owns (by id, sorted).
     pub fn list_topologies(&self, owner: &str) -> rusqlite::Result<Vec<crate::topology::Topology>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT id, owner, net_uuid FROM topologies WHERE owner = ?1 ORDER BY id")?;
         let rows = stmt
@@ -3962,7 +4107,7 @@ impl SqliteTopologyStore {
     /// Delete `owner`'s topology `id` (owner-scoped); returns whether a row was removed.
     /// A non-owner's delete is a no-op (`false`), so one subject can't drop another's.
     pub fn delete_topology(&self, owner: &str, id: &str) -> rusqlite::Result<bool> {
-        let mut guard = self.conn.lock_safe();
+        let mut guard = self.writer.lock_safe();
         let tx = guard.transaction()?;
         let removed = Self::delete_topology_tx(&tx, owner, id)?;
         tx.commit()?;
@@ -4011,7 +4156,7 @@ impl SqliteTopologyStore {
     /// lands or none of it does, and no concurrent writer can observe or create a
     /// half-deleted state.
     pub fn delete_all_owned_by(&self, owner: &str) -> rusqlite::Result<usize> {
-        let mut guard = self.conn.lock_safe();
+        let mut guard = self.writer.lock_safe();
         let tx = guard.transaction()?;
         let ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM topologies WHERE owner = ?1")?;
@@ -4036,7 +4181,7 @@ impl SqliteTopologyStore {
     /// regardless of owner (account-deletion cascade: a deleted account should stop
     /// showing up in other people's "shared with" lists too). Returns rows removed.
     pub fn remove_shares_by_email(&self, email: &str) -> rusqlite::Result<usize> {
-        Ok(self.conn.lock_safe().execute(
+        Ok(self.writer.lock_safe().execute(
             "DELETE FROM topology_shares WHERE email = ?1",
             params![email.to_ascii_lowercase()],
         )?)
@@ -4070,7 +4215,7 @@ impl SqliteTopologyStore {
             return Ok(false);
         }
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::owns_topology(&conn, owner, topology)? {
             return Ok(false);
         }
@@ -4090,7 +4235,7 @@ impl SqliteTopologyStore {
         let a = a.to_ascii_lowercase();
         let b = b.to_ascii_lowercase();
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::owns_topology(&conn, owner, topology)? {
             return Ok(false);
         }
@@ -4104,7 +4249,7 @@ impl SqliteTopologyStore {
     /// The undirected edges wired into `topology`, each canonical `(a, b)` with `a <= b`,
     /// sorted. This is the topology's adjacency the optimizer / renderer consume.
     pub fn edges(&self, topology: &str) -> rusqlite::Result<Vec<(String, String)>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT a, b FROM topology_edges WHERE topology = ?1 ORDER BY a, b",
         )?;
@@ -4163,7 +4308,7 @@ impl SqliteTopologyStore {
         // and `b` can never be equal for a stored edge (add_edge refuses that), so
         // a real edge matches at most one branch: no risk of double-counting a row.
         let holder_hex: String = holder.iter().map(|b| format!("{b:02x}")).collect();
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT t.operator_pubkey, e.a, e.b \
              FROM topology_edges e JOIN topologies t ON t.id = e.topology \
@@ -4238,7 +4383,7 @@ impl SqliteTopologyStore {
             return Err(format!("unrecognized agent kind {kind:?} (expected \"peer\" or \"super-peer\")"));
         }
         let n = self
-            .conn
+            .writer
             .lock_safe()
             .execute(
                 "UPDATE topology_agents SET kind = ?3 WHERE agent = ?1 AND owner = ?2",
@@ -4250,7 +4395,7 @@ impl SqliteTopologyStore {
 
     /// The current assignment for `agent`, if it has ever been touched.
     pub fn assignment(&self, agent: &str) -> rusqlite::Result<Option<crate::topology::AgentAssignment>> {
-        Self::load(&self.conn.lock_safe(), agent)
+        Self::load(&self.read(), agent)
     }
 
     /// Share `agent` into `topology` on behalf of `by`. First touch registers the agent
@@ -4258,7 +4403,7 @@ impl SqliteTopologyStore {
     /// (exclusivity — [`crate::topology::AssignError::AlreadyAssigned`] otherwise). The
     /// transition is enforced by the pure state machine and persisted.
     pub fn assign(&self, by: &str, agent: &str, topology: &str) -> Result<(), TopologyError> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let mut a = Self::load(&conn, agent)?.unwrap_or_else(|| crate::topology::AgentAssignment::new(by));
         a.assign(by, topology)?;
         Self::persist(&conn, agent, &a)?;
@@ -4269,7 +4414,7 @@ impl SqliteTopologyStore {
     /// releases), returning it to its owner's control. Persisted so exclusivity survives
     /// a restart. [`crate::topology::AssignError::NotAssigned`] if it is not in a topology.
     pub fn revoke(&self, by: &str, agent: &str) -> Result<(), TopologyError> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         let mut a = Self::load(&conn, agent)?.ok_or(crate::topology::AssignError::NotAssigned)?;
         a.revoke(by)?;
         Self::persist(&conn, agent, &a)?;
@@ -4278,7 +4423,7 @@ impl SqliteTopologyStore {
 
     /// The agents currently assigned to `topology` (sorted).
     pub fn agents_in(&self, topology: &str) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT agent FROM topology_agents WHERE topology = ?1 ORDER BY agent")?;
         let agents = stmt
@@ -4292,7 +4437,7 @@ impl SqliteTopologyStore {
     /// needs; `agents_in` stays as-is for the (kind-indifferent) optimizer/authorization
     /// call sites.
     pub fn agents_with_kind(&self, topology: &str) -> rusqlite::Result<Vec<(String, String)>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT agent, kind FROM topology_agents WHERE topology = ?1 ORDER BY agent")?;
         let agents = stmt
@@ -4305,7 +4450,7 @@ impl SqliteTopologyStore {
     /// id**, if any (#107-complex link info). `None` means the edge relies purely on the
     /// implicit, derived `channel_id_for_link` (the common case).
     pub fn edges_with_channel(&self, topology: &str) -> rusqlite::Result<Vec<(String, String, Option<[u8; 32]>)>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT a, b, channel_id FROM topology_edges WHERE topology = ?1 ORDER BY a, b",
         )?;
@@ -4367,7 +4512,7 @@ impl SqliteTopologyStore {
             return Ok(false);
         }
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
             return Ok(false);
         }
@@ -4392,7 +4537,7 @@ impl SqliteTopologyStore {
         let a = a.to_ascii_lowercase();
         let b = b.to_ascii_lowercase();
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
             return Ok(false);
         }
@@ -4423,7 +4568,7 @@ impl SqliteTopologyStore {
         let a = a.to_ascii_lowercase();
         let b = b.to_ascii_lowercase();
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::can_collaborate(&conn, subject, subject_email, topology)? {
             return Ok(false);
         }
@@ -4439,7 +4584,7 @@ impl SqliteTopologyStore {
     /// owner-scoped (the caller here is the invitee checking their own access, not the
     /// owner browsing their share list).
     pub fn is_shared_with(&self, topology: &str, email: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         Ok(conn
             .query_row(
                 "SELECT 1 FROM topology_shares WHERE topology = ?1 AND email = ?2",
@@ -4454,7 +4599,7 @@ impl SqliteTopologyStore {
     /// insensitive e-mail (matches `channel_allowlist`'s convention). `false` (no-op) if the
     /// caller doesn't own `topology`.
     pub fn share_add(&self, owner: &str, topology: &str, email: &str, now: i64) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::owns_topology(&conn, owner, topology)? {
             return Ok(false);
         }
@@ -4468,7 +4613,7 @@ impl SqliteTopologyStore {
     /// De-list `email` from `topology`'s share list (#107-complex) — owner-scoped. Returns
     /// whether a row was actually removed.
     pub fn share_remove(&self, owner: &str, topology: &str, email: &str) -> rusqlite::Result<bool> {
-        let conn = self.conn.lock_safe();
+        let conn = self.writer.lock_safe();
         if !Self::owns_topology(&conn, owner, topology)? {
             return Ok(false);
         }
@@ -4482,7 +4627,7 @@ impl SqliteTopologyStore {
     /// The e-mails `topology` is currently shared with (#107-complex) — owner-scoped
     /// (empty for a non-owner, never another owner's share list).
     pub fn shares_for(&self, owner: &str, topology: &str) -> rusqlite::Result<Vec<String>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         if !Self::owns_topology(&conn, owner, topology)? {
             return Ok(Vec::new());
         }
@@ -4499,7 +4644,7 @@ impl SqliteTopologyStore {
     /// (keyed on the INVITEE's own verified e-mail), the "topologies shared with me" portal
     /// view's data source, mirroring `SqliteChannelStore::channels_for_email`.
     pub fn topologies_shared_with_email(&self, email: &str) -> rusqlite::Result<Vec<crate::topology::Topology>> {
-        let conn = self.conn.lock_safe();
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.owner, t.net_uuid FROM topologies t
              JOIN topology_shares s ON s.topology = t.id
@@ -4520,17 +4665,19 @@ mod tests {
 
     #[test]
     fn every_sqlite_store_constructs_via_the_shared_ctor_macro() {
-        // #192 (frozen): sqlite_store_ctors! generates open/open_in_memory for 9 of these 10
-        // stores, each delegating to its own from_connection. The regression the macro could
-        // introduce is "a store no longer opens / its schema isn't applied", so construct every
-        // one — a failure here (a store dropped from the macro, a broken from_connection) fails
-        // loudly, not silently at boot.
+        // #192 (frozen): sqlite_store_ctors! generates open/open_in_memory for the stores below
+        // that still use it, each delegating to its own from_connection. The regression the macro
+        // could introduce is "a store no longer opens / its schema isn't applied", so construct
+        // every one — a failure here (a store dropped from the macro, a broken from_connection)
+        // fails loudly, not silently at boot.
         //
-        // #344: SqliteTunnelStore is the one exception — it now has its own hand-written
-        // open/open_in_memory (see its struct doc) instead of the macro, because its `open` also
-        // builds a reader connection pool that the macro's shared shape has no parameter for.
-        // Its `open_in_memory` still exists with the identical signature, so it belongs in this
-        // same "every store constructs" regression net regardless of which ctor wrote it.
+        // #344/#398: SqliteTunnelStore, SqliteAgentDirectory, SqlitePipelineRegistry,
+        // SqliteChannelStore and SqliteTopologyStore are the five exceptions — each has its own
+        // hand-written open/open_in_memory (see each struct's own doc) instead of the macro,
+        // because their `open` also builds a reader connection pool that the macro's shared shape
+        // has no parameter for. Every one's `open_in_memory` still exists with the identical
+        // signature, so each belongs in this same "every store constructs" regression net
+        // regardless of which ctor wrote it.
         SqliteEnrollment::open_in_memory().unwrap();
         SqliteBootstrap::open_in_memory().unwrap();
         SqliteAgentDirectory::open_in_memory().unwrap();
@@ -4581,6 +4728,132 @@ mod tests {
         assert!(!reg.unpublish("mallory", "flappy").unwrap(), "non-owner unpublish -> no-op");
         assert!(reg.unpublish("alice", "flappy").unwrap());
         assert_eq!(reg.get("flappy").unwrap(), None);
+    }
+
+    #[test]
+    fn pipeline_registry_pooled_lists_run_concurrently_while_unpooled_serializes_398() {
+        // #398: same proof shape as #344's cda587a test -- `list` (the `GET
+        // /registry/pipelines` discovery surface) now takes a connection from `readers`
+        // instead of `writer`, so N concurrent slow lists should overlap instead of
+        // queuing. File-backed `open()` store (pooled) vs. in-memory (`readers: None`,
+        // falls back to `writer`) proves the speedup is attributable to the pool.
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const N: usize = 8;
+        const SLEEP: Duration = Duration::from_millis(100);
+
+        fn run_n_concurrent_slow_reads(reg: &Arc<SqlitePipelineRegistry>, n: usize) -> Duration {
+            let started = Instant::now();
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let reg = Arc::clone(reg);
+                    std::thread::spawn(move || {
+                        let _conn = reg.read();
+                        std::thread::sleep(SLEEP);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            started.elapsed()
+        }
+
+        let path = temp_db_path();
+        let pooled = Arc::new(SqlitePipelineRegistry::open(&path).unwrap());
+        let pooled_elapsed = run_n_concurrent_slow_reads(&pooled, N);
+
+        let unpooled = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+        let unpooled_elapsed = run_n_concurrent_slow_reads(&unpooled, N);
+
+        assert!(
+            pooled_elapsed < SLEEP * 3,
+            "pooled reads should run concurrently (~1x SLEEP), not serialize: {pooled_elapsed:?} for \
+             {N} reads of {SLEEP:?} each"
+        );
+        assert!(
+            unpooled_elapsed >= SLEEP * (N as u32) / 2,
+            "unpooled (in-memory) reads should still serialize through the writer mutex \
+             (~{N}x SLEEP): got only {unpooled_elapsed:?} for {N} reads of {SLEEP:?} each"
+        );
+
+        drop(pooled);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn pipeline_registry_concurrent_publishes_and_lists_all_succeed_398() {
+        // #398: real concurrent `list`/`get` reads (the pool) mixed with a real concurrent
+        // `publish` write workload -- distinct ids per writer, so no ownership clash --
+        // asserting neither errors and the durable end state has exactly the specs every
+        // writer thread published.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WRITERS: usize = 4;
+        const PUBLISHES_PER_WRITER: usize = 25;
+        const READERS: usize = 4;
+
+        let path = temp_db_path();
+        let reg = Arc::new(SqlitePipelineRegistry::open(&path).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader_handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let reg = Arc::clone(&reg);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        reg.list().expect("a concurrent list must not error while publishes are landing");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        let writer_handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let reg = Arc::clone(&reg);
+                std::thread::spawn(move || {
+                    for i in 0..PUBLISHES_PER_WRITER {
+                        let spec = ct_common::pipeline::PipelineSpec {
+                            id: format!("writer-{w}-pipeline-{i}"),
+                            roles: vec![],
+                            operator_pubkey_hex: None,
+                            selection_policy: ct_common::pipeline::SelectionPolicy::LowestFloor,
+                        };
+                        assert!(
+                            reg.publish(&format!("writer-{w}"), &spec, 100)
+                                .expect("a concurrent publish must succeed within the 5s busy_timeout"),
+                            "distinct ids per writer never clash on ownership"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total_reads: u32 = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total_reads > 0, "readers actually ran concurrently with the writers, not sequentially after");
+
+        assert_eq!(
+            reg.list().unwrap().len(),
+            WRITERS * PUBLISHES_PER_WRITER,
+            "every concurrent publish() across every writer thread landed exactly once"
+        );
+
+        drop(reg);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
     #[test]
@@ -4726,6 +4999,138 @@ mod tests {
         assert_eq!(store.topology_authorizes(&chan_ab, &c).unwrap(), None, "c is not an endpoint of a—b");
         // An undeclared channel (a—c edge was never drawn) is refused for a real member.
         assert_eq!(store.topology_authorizes(&chan_ac, &a).unwrap(), None, "a—c channel is not declared");
+    }
+
+    #[test]
+    fn topology_pooled_authorizes_run_concurrently_while_unpooled_serializes_398() {
+        // #398: same proof shape as #344's cda587a test -- `topology_authorizes` (the
+        // `/internal/channel/authorize` admission fallback's per-connection hot path) now
+        // takes a connection from `readers` instead of `writer`, so N concurrent slow
+        // lookups should overlap instead of queuing. File-backed `open()` store (pooled) vs.
+        // in-memory (`readers: None`, falls back to `writer`) proves the speedup is
+        // attributable to the pool.
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const N: usize = 8;
+        const SLEEP: Duration = Duration::from_millis(100);
+
+        fn run_n_concurrent_slow_reads(store: &Arc<SqliteTopologyStore>, n: usize) -> Duration {
+            let started = Instant::now();
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let store = Arc::clone(store);
+                    std::thread::spawn(move || {
+                        let _conn = store.read();
+                        std::thread::sleep(SLEEP);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            started.elapsed()
+        }
+
+        let path = temp_db_path();
+        let pooled = Arc::new(SqliteTopologyStore::open(&path).unwrap());
+        let pooled_elapsed = run_n_concurrent_slow_reads(&pooled, N);
+
+        let unpooled = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let unpooled_elapsed = run_n_concurrent_slow_reads(&unpooled, N);
+
+        assert!(
+            pooled_elapsed < SLEEP * 3,
+            "pooled reads should run concurrently (~1x SLEEP), not serialize: {pooled_elapsed:?} for \
+             {N} reads of {SLEEP:?} each"
+        );
+        assert!(
+            unpooled_elapsed >= SLEEP * (N as u32) / 2,
+            "unpooled (in-memory) reads should still serialize through the writer mutex \
+             (~{N}x SLEEP): got only {unpooled_elapsed:?} for {N} reads of {SLEEP:?} each"
+        );
+
+        drop(pooled);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn topology_concurrent_edge_writes_and_authorizes_reads_all_succeed_398() {
+        // #398: real concurrent `topology_authorizes` reads (the pool) mixed with a real
+        // concurrent `add_edge` write workload against distinct topologies (so no ownership
+        // clash), asserting neither errors and every concurrently-added edge is durably
+        // present at the end.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WRITERS: usize = 4;
+        const EDGES_PER_WRITER: usize = 20;
+        const READERS: usize = 4;
+
+        let path = temp_db_path();
+        let store = Arc::new(SqliteTopologyStore::open(&path).unwrap());
+        // One shared topology every writer wires distinct node pairs into, and every reader
+        // polls with `topology_authorizes` -- a channel that's never actually declared, so
+        // every read is a real miss lookup exercised against a live, growing edge table.
+        store.create_topology("owner-0", "shared", "uuid-shared").unwrap();
+        let never_declared = ChannelId([0x77u8; 32]);
+        let probe_holder = [0x01u8; 32];
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader_handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        store
+                            .topology_authorizes(&never_declared, &probe_holder)
+                            .expect("a concurrent topology_authorizes must not error while edges are landing");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        let writer_handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for i in 0..EDGES_PER_WRITER {
+                        let a = format!("{:064x}", w * 1000 + i * 2);
+                        let b = format!("{:064x}", w * 1000 + i * 2 + 1);
+                        assert!(
+                            store
+                                .add_edge("owner-0", "shared", &a, &b)
+                                .expect("a concurrent add_edge must succeed within the 5s busy_timeout"),
+                            "distinct node pairs per writer never clash"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total_reads: u32 = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total_reads > 0, "readers actually ran concurrently with the writers, not sequentially after");
+
+        assert_eq!(
+            store.edges("shared").unwrap().len(),
+            WRITERS * EDGES_PER_WRITER,
+            "every concurrent add_edge() across every writer thread landed exactly once"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
     fn tenant() -> TenantId {
@@ -5058,7 +5463,7 @@ mod tests {
 
         // A legacy/garbage stored value degrades to Baseline (direct) — never a read error.
         store
-            .conn
+            .writer
             .lock_safe()
             .execute("UPDATE topologies SET overlay_mode = 'legacy-nonsense' WHERE id = 't1'", [])
             .unwrap();
@@ -5087,7 +5492,7 @@ mod tests {
         // bound. issue_challenge now prunes too, so it self-bounds on its own.
         let store = SqliteChannelStore::open_in_memory().unwrap();
         let count = |s: &SqliteChannelStore| -> i64 {
-            s.conn
+            s.writer
                 .lock_safe()
                 .query_row("SELECT COUNT(*) FROM channel_challenges", [], |r| r.get(0))
                 .unwrap()
@@ -6595,6 +7000,139 @@ mod tests {
     }
 
     #[test]
+    fn channel_pooled_authorize_holder_runs_concurrently_while_unpooled_serializes_398() {
+        // #398: same proof shape as #344's cda587a test -- `authorize_holder` (the
+        // production source for `/internal/channel/authorize`'s per-connection admission
+        // gate, already wrapped in its own spawn_blocking after the #140/#231 lock-wait-
+        // stall incident) now takes a connection from `readers` instead of `writer`, so N
+        // concurrent slow lookups should overlap instead of queuing. File-backed `open()`
+        // store (pooled) vs. in-memory (`readers: None`, falls back to `writer`) proves the
+        // speedup is attributable to the pool.
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const N: usize = 8;
+        const SLEEP: Duration = Duration::from_millis(100);
+
+        fn run_n_concurrent_slow_reads(store: &Arc<SqliteChannelStore>, n: usize) -> Duration {
+            let started = Instant::now();
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let store = Arc::clone(store);
+                    std::thread::spawn(move || {
+                        let _conn = store.read();
+                        std::thread::sleep(SLEEP);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            started.elapsed()
+        }
+
+        let path = temp_db_path();
+        let pooled = Arc::new(SqliteChannelStore::open(&path).unwrap());
+        let pooled_elapsed = run_n_concurrent_slow_reads(&pooled, N);
+
+        let unpooled = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let unpooled_elapsed = run_n_concurrent_slow_reads(&unpooled, N);
+
+        assert!(
+            pooled_elapsed < SLEEP * 3,
+            "pooled reads should run concurrently (~1x SLEEP), not serialize: {pooled_elapsed:?} for \
+             {N} reads of {SLEEP:?} each"
+        );
+        assert!(
+            unpooled_elapsed >= SLEEP * (N as u32) / 2,
+            "unpooled (in-memory) reads should still serialize through the writer mutex \
+             (~{N}x SLEEP): got only {unpooled_elapsed:?} for {N} reads of {SLEEP:?} each"
+        );
+
+        drop(pooled);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn channel_concurrent_member_adds_and_authorize_reads_all_succeed_398() {
+        // #398: real concurrent `authorize_holder` reads (the pool) mixed with a real
+        // concurrent `add_member` write workload on one shared, already-registered channel
+        // (distinct holder keys per writer thread, so no row clash), asserting neither
+        // errors and every concurrently-added member is durably present at the end.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WRITERS: usize = 4;
+        const MEMBERS_PER_WRITER: usize = 25;
+        const READERS: usize = 4;
+
+        let path = temp_db_path();
+        let store = Arc::new(SqliteChannelStore::open(&path).unwrap());
+        let ch = ChannelId([0x9au8; 32]);
+        let op = [0x1cu8; 32];
+        store.register_channel(&ch, &op, "owner-0").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader_handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    let probe = [0x00u8; 32];
+                    while !stop.load(Ordering::Relaxed) {
+                        store
+                            .authorize_holder(&ch, &probe)
+                            .expect("a concurrent authorize_holder must not error while members are landing");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        let writer_handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                let ch = ch;
+                std::thread::spawn(move || {
+                    for i in 0..MEMBERS_PER_WRITER {
+                        let mut holder = [0u8; 32];
+                        holder[0] = w as u8;
+                        holder[1..5].copy_from_slice(&(i as u32).to_be_bytes());
+                        assert!(
+                            store
+                                .add_member(&ch, "owner-0", &holder, &[0xd4u8; 32], &[0u8; 64])
+                                .expect("a concurrent add_member must succeed within the 5s busy_timeout"),
+                            "the shared channel stays owned by owner-0 throughout"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total_reads: u32 = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total_reads > 0, "readers actually ran concurrently with the writers, not sequentially after");
+
+        assert_eq!(
+            store.members_of(&ch, "owner-0").unwrap().unwrap().len(),
+            WRITERS * MEMBERS_PER_WRITER,
+            "every concurrent add_member() across every writer thread landed exactly once"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
     fn channel_member_noise_key_round_trips_and_reflects_revocation() {
         // #72 AF4: the registry carries each member's X25519 Noise static key so a
         // peer can pin it for the direct-path handshake. It is set on add, updated on
@@ -6705,5 +7243,137 @@ mod tests {
         assert!(dir.search(Some("roleXwild"), None).unwrap().iter().all(|e| e.holder_pubkey == "bb"));
 
         assert_eq!(dir.count().unwrap(), 2, "count() matches the real row count");
+    }
+
+    #[test]
+    fn agent_directory_pooled_searches_run_concurrently_while_unpooled_serializes_398() {
+        // #398: same proof shape as #344's cda587a test for SqliteTunnelStore -- `search`
+        // (the `GET /registry/agents` discovery scan) now takes a connection from `readers`
+        // via `Self::read` instead of the single `writer` `Mutex<Connection>` every
+        // non-migrated store still uses, so N concurrent slow searches should overlap
+        // instead of queuing. Proven two ways in one test, identical workload: a file-backed
+        // `open()` store (pooled, ~1x SLEEP) vs. an in-memory store (`readers: None`, per its
+        // own struct doc -- falls back to `writer`) that still serializes every search
+        // (~N x SLEEP) -- so the speedup is attributable to the pool, not test noise.
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const N: usize = 8;
+        const SLEEP: Duration = Duration::from_millis(100);
+
+        fn run_n_concurrent_slow_reads(dir: &Arc<SqliteAgentDirectory>, n: usize) -> Duration {
+            let started = Instant::now();
+            let handles: Vec<_> = (0..n)
+                .map(|_| {
+                    let dir = Arc::clone(dir);
+                    std::thread::spawn(move || {
+                        // Hold a real connection from `Self::read` for the sleep duration --
+                        // exercises the exact guard `search`/`count` actually use.
+                        let _conn = dir.read();
+                        std::thread::sleep(SLEEP);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            started.elapsed()
+        }
+
+        let path = temp_db_path();
+        let pooled = Arc::new(SqliteAgentDirectory::open(&path).unwrap());
+        let pooled_elapsed = run_n_concurrent_slow_reads(&pooled, N);
+
+        let unpooled = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        let unpooled_elapsed = run_n_concurrent_slow_reads(&unpooled, N);
+
+        assert!(
+            pooled_elapsed < SLEEP * 3,
+            "pooled reads should run concurrently (~1x SLEEP), not serialize: {pooled_elapsed:?} for \
+             {N} reads of {SLEEP:?} each"
+        );
+        assert!(
+            unpooled_elapsed >= SLEEP * (N as u32) / 2,
+            "unpooled (in-memory) reads should still serialize through the writer mutex \
+             (~{N}x SLEEP): got only {unpooled_elapsed:?} for {N} reads of {SLEEP:?} each"
+        );
+
+        drop(pooled);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn agent_directory_concurrent_registers_and_searches_all_succeed_398() {
+        // #398: the correctness question the migration raises -- pooled reader connections
+        // now run against the SAME on-disk file WHILE `writer` is actively landing
+        // `register` writes. `register` still funnels through the single `writer`
+        // connection unchanged, so concurrent registers can never race EACH OTHER; what
+        // this test exercises is real concurrent `search` reads (the pool) mixed with a
+        // real concurrent `register` write workload, asserting neither errors and the
+        // durable end state has exactly the rows every writer thread registered.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WRITERS: usize = 4;
+        const REGISTERS_PER_WRITER: usize = 25;
+        const READERS: usize = 4;
+
+        let path = temp_db_path();
+        let dir = Arc::new(SqliteAgentDirectory::open(&path).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let reader_handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let dir = Arc::clone(&dir);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        dir.search(None, None)
+                            .expect("a concurrent search must not error while registers are landing");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        let writer_handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let dir = Arc::clone(&dir);
+                std::thread::spawn(move || {
+                    for i in 0..REGISTERS_PER_WRITER {
+                        dir.register(
+                            &format!("writer-{w}-agent-{i}"),
+                            "https://example.invalid/.well-known/agent-card.json",
+                            &["peer".to_string()],
+                            &[],
+                            100,
+                        )
+                        .expect("a concurrent register must succeed within the 5s busy_timeout");
+                    }
+                })
+            })
+            .collect();
+
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total_reads: u32 = reader_handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total_reads > 0, "readers actually ran concurrently with the writers, not sequentially after");
+
+        assert_eq!(
+            dir.search(None, None).unwrap().len(),
+            WRITERS * REGISTERS_PER_WRITER,
+            "every concurrent register() across every writer thread landed exactly once"
+        );
+
+        drop(dir);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 }
