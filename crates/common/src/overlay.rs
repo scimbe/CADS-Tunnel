@@ -175,40 +175,47 @@ pub fn add_shortcuts(
 
     let inf = u64::MAX / 4;
     let mut plan = base;
-    for _ in 0..budget {
-        // All-pairs shortest paths over the currently-chosen links (Floyd–Warshall).
-        let mut dist = vec![vec![inf; n]; n];
-        for (d, di) in dist.iter_mut().enumerate() {
-            di[d] = 0;
-        }
-        for &(a, b) in &chosen {
-            // #274: `chosen` seeds from `base.links`, a caller-supplied plan that
-            // isn't guaranteed to be built from THIS function's own `links` slice
-            // -- a base-link pair with no matching entry in `cost` must never
-            // panic a public fn on untrusted/inconsistent input (this ran inside
-            // the control-plane's own request path). Treat an unknown cost as
-            // `inf`: Floyd-Warshall still runs correctly, it just can't use that
-            // pair's real (unknown) weight to discover a cheaper shortcut through
-            // it -- a safe, non-panicking degradation, not a correctness bug for
-            // any caller whose `base` actually IS derived from `links` (the only
-            // supported use today), where every pair already has a cost.
-            let c = cost.get(&(a, b)).copied().unwrap_or(inf);
-            dist[a][b] = dist[a][b].min(c);
-            dist[b][a] = dist[b][a].min(c);
-        }
-        for k in 0..n {
-            for i in 0..n {
-                if dist[i][k] == inf {
-                    continue;
-                }
-                for j in 0..n {
-                    let via = dist[i][k].saturating_add(dist[k][j]);
-                    if via < dist[i][j] {
-                        dist[i][j] = via;
-                    }
+
+    // All-pairs shortest paths over the currently-chosen (base MST) links (Floyd–Warshall) —
+    // computed ONCE, outside the budget loop (#483). The old code redid this full O(n³) pass,
+    // including a fresh matrix allocation, on EVERY iteration of the budget loop even though
+    // exactly one edge changes per iteration; adding one edge to an already-computed
+    // shortest-path matrix only needs an O(n²) incremental relaxation (below), so the real cost
+    // is O(n³ + budget·n²), not O(budget·n³).
+    let mut dist = vec![vec![inf; n]; n];
+    for (d, di) in dist.iter_mut().enumerate() {
+        di[d] = 0;
+    }
+    for &(a, b) in &chosen {
+        // #274: `chosen` seeds from `base.links`, a caller-supplied plan that isn't guaranteed
+        // to be built from THIS function's own `links` slice -- a base-link pair with no
+        // matching entry in `cost` must never panic a public fn on untrusted/inconsistent input
+        // (this ran inside the control-plane's own request path). Treat an unknown cost as
+        // `inf`: Floyd-Warshall still runs correctly, it just can't use that pair's real
+        // (unknown) weight to discover a cheaper shortcut through it -- a safe, non-panicking
+        // degradation, not a correctness bug for any caller whose `base` actually IS derived
+        // from `links` (the only supported use today), where every pair already has a cost.
+        let c = cost.get(&(a, b)).copied().unwrap_or(inf);
+        dist[a][b] = dist[a][b].min(c);
+        dist[b][a] = dist[b][a].min(c);
+    }
+    for k in 0..n {
+        for i in 0..n {
+            if dist[i][k] == inf {
+                continue;
+            }
+            for j in 0..n {
+                let via = dist[i][k].saturating_add(dist[k][j]);
+                if via < dist[i][j] {
+                    dist[i][j] = via;
                 }
             }
         }
+    }
+    #[cfg(test)]
+    tests::FULL_APSP_PASSES.with(|c| c.set(c.get() + 1));
+
+    for _ in 0..budget {
         // Pick the candidate link that most reduces its endpoints' current path latency.
         let mut best: Option<((usize, usize), u64)> = None;
         for (&(a, b), &c) in &cost {
@@ -232,9 +239,42 @@ pub fn add_shortcuts(
         match best {
             Some(((a, b), _)) => {
                 chosen.insert((a, b));
+                let w = cost[&(a, b)];
+
+                // O(n²) incremental relaxation (#483): fold the newly chosen edge (a, b, w) into
+                // the existing all-pairs matrix without recomputing Floyd–Warshall from scratch.
+                // With non-negative weights, any shortest path affected by a single new edge uses
+                // it at most once (revisiting it never helps), so for every pair (i, j):
+                //   new_dist[i][j] = min(old_dist[i][j],
+                //                         old_dist[i][a] + w + old_dist[b][j],
+                //                         old_dist[i][b] + w + old_dist[a][j])
+                // `row_a`/`row_b` freeze the OLD rows for a/b before any in-place write below, so
+                // the formula always reads pre-update distances, matching a from-scratch
+                // Floyd-Warshall over the extended edge set exactly.
+                let row_a = dist[a].clone();
+                let row_b = dist[b].clone();
+                for i in 0..n {
+                    if row_a[i] == inf && row_b[i] == inf {
+                        continue; // i can't reach either endpoint -> this edge changes nothing for it
+                    }
+                    let via_a = row_a[i].saturating_add(w); // i -[old]-> a -[w]-> b
+                    let via_b = row_b[i].saturating_add(w); // i -[old]-> b -[w]-> a
+                    let row_i = &mut dist[i];
+                    for j in 0..n {
+                        let cand1 = via_a.saturating_add(row_b[j]);
+                        if cand1 < row_i[j] {
+                            row_i[j] = cand1;
+                        }
+                        let cand2 = via_b.saturating_add(row_a[j]);
+                        if cand2 < row_i[j] {
+                            row_i[j] = cand2;
+                        }
+                    }
+                }
+
                 let (ca, cb) = canon(&nodes[a], &nodes[b]);
                 plan.links.push((ca, cb));
-                plan.total_cost = plan.total_cost.saturating_add(cost[&(a, b)]);
+                plan.total_cost = plan.total_cost.saturating_add(w);
             }
             None => break, // no shortcut improves any path
         }
@@ -270,8 +310,9 @@ where
 }
 
 /// Why a topology was rejected before optimization (#113 preventive). The overlay optimizer is
-/// **O(`shortcut_budget` · n³)** — `add_shortcuts` runs Floyd–Warshall over the n agents once
-/// per shortcut round — so an unbounded topology is a DoS vector against the control plane.
+/// **O(n³ + shortcut_budget · n²)** — `add_shortcuts` runs Floyd–Warshall over the n agents
+/// once, then an O(n²) incremental relaxation per shortcut round (#483) — so an unbounded
+/// topology is still a DoS vector against the control plane at either factor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopologyTooLarge {
     /// More agents than the caller's `max_agents` policy allows.
@@ -297,12 +338,12 @@ impl std::error::Error for TopologyTooLarge {}
 
 /// **Size-checked entry point** to [`plan_network_overlay`] (#113 precondition). A live handler
 /// MUST call this — not the raw optimizer — so an oversized request can't wedge the control
-/// plane: planning is O(`shortcut_budget` · n³), so a large agent count or budget is a DoS
-/// vector. Rejects a topology whose agent count exceeds `max_agents`, or whose `shortcut_budget`
-/// exceeds `max_shortcut_budget`, **before** any O(n³) work; on acceptance it delegates to
-/// [`plan_network_overlay`]. The limits are **parameters** — the caller supplies them as a
-/// product policy decided in its request-auth context, deliberately not hardcoded into the pure
-/// library fn (both bounds are inclusive).
+/// plane: planning is O(n³ + shortcut_budget · n²) (#483), so a large agent count or budget is
+/// still a DoS vector. Rejects a topology whose agent count exceeds `max_agents`, or whose
+/// `shortcut_budget` exceeds `max_shortcut_budget`, **before** any O(n³) work; on acceptance it
+/// delegates to [`plan_network_overlay`]. The limits are **parameters** — the caller supplies
+/// them as a product policy decided in its request-auth context, deliberately not hardcoded into
+/// the pure library fn (both bounds are inclusive).
 pub fn plan_network_overlay_bounded<F>(
     network: &crate::policy::Network,
     latency: F,
@@ -445,15 +486,27 @@ impl std::error::Error for UnknownRoutingApproach {}
 mod tests {
     use super::*;
 
+    // #483: counts how many times `add_shortcuts` runs its full O(n³) Floyd–Warshall pass, so
+    // tests can prove it happens once per call regardless of `budget`.
+    thread_local! {
+        pub(super) static FULL_APSP_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn reset_full_apsp_passes() {
+        FULL_APSP_PASSES.with(|c| c.set(0));
+    }
+    fn full_apsp_passes() -> usize {
+        FULL_APSP_PASSES.with(|c| c.get())
+    }
+
     fn nodes(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn plan_network_overlay_bounded_rejects_oversized_topologies_before_optimizing() {
-        // #113 (frozen): the optimizer is O(budget·n³), so the live entry point must reject an
-        // oversized topology BEFORE running it. `plan_network_overlay_bounded` enforces
-        // caller-supplied inclusive limits on agent count and shortcut budget.
+        // #113 (frozen): the optimizer is O(n³ + budget·n²) (#483), so the live entry point must
+        // still reject an oversized topology BEFORE running it. `plan_network_overlay_bounded`
+        // enforces caller-supplied inclusive limits on agent count and shortcut budget.
         use crate::policy::{Agent, AllowRule, Levels, Network, Policy, Selector};
 
         // A network of `n` all-`dev` agents (dev↔dev permitted, so links exist).
@@ -587,6 +640,74 @@ mod tests {
         // Only candidate not chosen would be... none improving (no a-c candidate exists).
         let out = add_shortcuts(&ns, &links, base.clone(), 5);
         assert_eq!(out, base, "no improving candidate -> unchanged");
+    }
+
+    #[test]
+    fn add_shortcuts_runs_the_full_apsp_pass_once_per_call_not_once_per_budget_round_483() {
+        // #483: the O(n³) Floyd–Warshall pass must run exactly once per `add_shortcuts` call —
+        // each subsequent budget round should fold its chosen edge in with an O(n²) incremental
+        // relaxation instead of recomputing all-pairs-shortest-paths from scratch. Use a graph
+        // where the budget is actually spent across multiple rounds, so the loop body really
+        // executes more than once.
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let links = vec![
+            WeightedLink::new("a", "b", 1),
+            WeightedLink::new("b", "c", 1),
+            WeightedLink::new("c", "d", 1),
+            WeightedLink::new("d", "e", 1),
+            WeightedLink::new("a", "c", 1), // shortcut candidate #1
+            WeightedLink::new("c", "e", 1), // shortcut candidate #2
+        ];
+        let base = min_latency_overlay(&ns, &links);
+
+        reset_full_apsp_passes();
+        let out = add_shortcuts(&ns, &links, base.clone(), 5);
+        assert!(out.links.len() > base.links.len() + 1, "sanity: more than one shortcut round actually ran");
+        assert_eq!(
+            full_apsp_passes(),
+            1,
+            "the O(n^3) all-pairs-shortest-path pass must run once per call, not once per budget round"
+        );
+    }
+
+    #[test]
+    fn add_shortcuts_incremental_relaxation_correctly_chains_across_rounds_483() {
+        // #483 regression: a line a-b-c-d-e (each hop cost 1, MST cost 4). Two genuine
+        // shortcuts exist: a-c (cost 1, beats the 2-hop path of cost 2) and c-e (cost 1, same).
+        // A third candidate a-e (cost 3) is NOT an improvement on its own (the 4-hop path is
+        // already cost 4 -> improvement 1, tied with the other two) but MUST show ZERO
+        // improvement once a-c and c-e are both chosen (a-c-e = 1+1 = 2 < 3). An incremental
+        // update that fails to correctly propagate distances through newly-added shortcuts
+        // (e.g. one that only patches the endpoints touched directly, or reads a stale/partly
+        // updated matrix) would keep crediting a-e with an improvement it no longer has, and
+        // wrongly spend a third shortcut on it.
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let links = vec![
+            WeightedLink::new("a", "b", 1),
+            WeightedLink::new("b", "c", 1),
+            WeightedLink::new("c", "d", 1),
+            WeightedLink::new("d", "e", 1),
+            WeightedLink::new("a", "c", 1),
+            WeightedLink::new("c", "e", 1),
+            WeightedLink::new("a", "e", 3),
+        ];
+        let base = min_latency_overlay(&ns, &links);
+        assert_eq!(base.links.len(), 4, "MST is the 4-hop line");
+
+        let out = add_shortcuts(&ns, &links, base.clone(), 3);
+        assert_eq!(out.links.len(), 6, "exactly two shortcuts chosen (a-c and c-e), a-e never improves");
+        assert!(out.links.contains(&("a".to_string(), "c".to_string())), "a-c shortcut chosen");
+        assert!(out.links.contains(&("c".to_string(), "e".to_string())), "c-e shortcut chosen");
+        assert!(
+            !out.links.contains(&("a".to_string(), "e".to_string())),
+            "a-e must never be chosen: once a-c and c-e are in, the path a-c-e (cost 2) already \
+             beats a-e's own direct cost (3), so it offers zero improvement"
+        );
+        assert_eq!(out.total_cost, base.total_cost + 2, "base(4) + a-c(1) + c-e(1)");
+
+        // A larger budget doesn't change the outcome — no candidate is left to improve anything.
+        let maxed = add_shortcuts(&ns, &links, base, 100);
+        assert_eq!(maxed, out, "budget beyond what's useful is a no-op, same as before #483");
     }
 
     #[test]

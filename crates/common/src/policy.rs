@@ -137,43 +137,86 @@ impl Decision {
     }
 }
 
+/// The bare accept/reject outcome of [`Policy::evaluate`], with no reason text attached — the
+/// shared logic both [`Policy::evaluate`] (which turns it into a [`Decision`] with an allocated
+/// reason) and [`Policy::allows`] (which discards it into a plain `bool`) are built from, so the
+/// two can never drift (#474: the hot boolean path and the explain/debug path share one truth).
+enum Verdict {
+    MacWriteDown,
+    MacUnknownLevel,
+    RuleAllowed,
+    DefaultDeny,
+}
+
+impl Verdict {
+    fn allowed(&self) -> bool {
+        matches!(self, Verdict::RuleAllowed)
+    }
+}
+
 impl Policy {
+    /// The verdict logic shared by [`Self::evaluate`] and [`Self::allows`] — no string
+    /// allocation happens in here, only the RBAC/MAC decision itself (#474).
+    fn decide(&self, from: &Agent, to: &Agent) -> Verdict {
+        if self.mac_flow_control {
+            match (self.levels.rank(&from.label), self.levels.rank(&to.label)) {
+                (Some(rf), Some(rt)) => {
+                    if rf > rt {
+                        return Verdict::MacWriteDown;
+                    }
+                }
+                _ => return Verdict::MacUnknownLevel,
+            }
+        }
+        if self.rules.iter().any(|r| r.from.matches(from) && r.to.matches(to)) {
+            Verdict::RuleAllowed
+        } else {
+            Verdict::DefaultDeny
+        }
+    }
+
     /// Decide whether `from` may establish a **directed** flow to `to`.
     ///
     /// Mandatory access control is checked first and overrides RBAC: with
     /// `mac_flow_control` on, a write-down (`rank(from) > rank(to)`) is denied even if
     /// an allow-rule matches, and an unknown label fails closed. Otherwise the flow is
     /// allowed iff at least one [`AllowRule`] matches (default-deny).
+    ///
+    /// This always builds and allocates the human/AI-legible `reason` string — for a hot path
+    /// that only needs the boolean (e.g. a reconcile pass over every agent pair), use
+    /// [`Self::allows`] instead (#474): it shares the exact same decision logic via
+    /// [`Self::decide`] but never formats a reason nobody reads.
     pub fn evaluate(&self, from: &Agent, to: &Agent) -> Decision {
-        if self.mac_flow_control {
-            match (self.levels.rank(&from.label), self.levels.rank(&to.label)) {
-                (Some(rf), Some(rt)) => {
-                    if rf > rt {
-                        return Decision::deny(format!(
-                            "MAC write-down blocked: {} ({}) may not initiate a flow to lower level {} ({})",
-                            from.id, from.label, to.id, to.label
-                        ));
-                    }
-                }
-                _ => {
-                    return Decision::deny(format!(
-                        "MAC enabled but a label is not a known level (from={}, to={})",
-                        from.label, to.label
-                    ));
-                }
-            }
-        }
-        if self.rules.iter().any(|r| r.from.matches(from) && r.to.matches(to)) {
-            Decision::allow(format!(
+        #[cfg(test)]
+        tests::EVALUATE_CALLS.with(|c| c.set(c.get() + 1));
+        match self.decide(from, to) {
+            Verdict::MacWriteDown => Decision::deny(format!(
+                "MAC write-down blocked: {} ({}) may not initiate a flow to lower level {} ({})",
+                from.id, from.label, to.id, to.label
+            )),
+            Verdict::MacUnknownLevel => Decision::deny(format!(
+                "MAC enabled but a label is not a known level (from={}, to={})",
+                from.label, to.label
+            )),
+            Verdict::RuleAllowed => Decision::allow(format!(
                 "allowed: an allow-rule permits {} ({}/{}) -> {} ({}/{})",
                 from.id, from.group, from.label, to.id, to.group, to.label
-            ))
-        } else {
-            Decision::deny(format!(
+            )),
+            Verdict::DefaultDeny => Decision::deny(format!(
                 "default-deny: no allow-rule permits {} ({}/{}) -> {} ({}/{})",
                 from.id, from.group, from.label, to.id, to.group, to.label
-            ))
+            )),
         }
+    }
+
+    /// Cheap boolean-only counterpart to [`Self::evaluate`] (#474): whether `from` may establish
+    /// a directed flow to `to`, with **no reason string ever formatted or allocated**. Exactly the
+    /// same RBAC/MAC decision as `evaluate(from, to).allowed` (both run through [`Self::decide`]),
+    /// just without paying for the explanation. This is the path a hot reconcile loop over every
+    /// agent pair (e.g. [`Network::desired_channels`]) should take; keep using `evaluate` at
+    /// actual explain/debug call sites where the reason is the product.
+    pub fn allows(&self, from: &Agent, to: &Agent) -> bool {
+        self.decide(from, to).allowed()
     }
 
     /// Decide whether `a` and `b` may **establish a channel** — a bidirectional flow,
@@ -191,6 +234,14 @@ impl Policy {
             return ba;
         }
         Decision::allow(format!("allowed: {} and {} may establish a channel (both directions permitted)", a.id, b.id))
+    }
+
+    /// Cheap boolean-only counterpart to [`Self::may_establish_channel`] (#474): whether `a` and
+    /// `b` may establish a channel (both directions permitted), with no reason ever formatted.
+    /// Exactly `may_establish_channel(a, b).allowed`, just without the allocation — the path
+    /// [`Network::desired_channels`] takes over every agent pair in a reconcile pass.
+    pub fn may_establish_channel_allows(&self, a: &Agent, b: &Agent) -> bool {
+        self.allows(a, b) && self.allows(b, a)
     }
 }
 
@@ -265,6 +316,10 @@ impl Network {
     /// desired connectivity. A pair is included iff
     /// [`Policy::may_establish_channel`] allows it (bidirectional). Self-pairs are
     /// excluded; the result is canonicalized (each pair once, order-independent).
+    ///
+    /// O(n²) over `agents`, and only the allow/deny boolean is ever consulted — so this takes
+    /// [`Policy::may_establish_channel_allows`] (#474), not `may_establish_channel`, to avoid
+    /// formatting and immediately discarding a `reason` string for every one of those pairs.
     pub fn desired_channels(&self) -> BTreeSet<Pair> {
         let mut out = BTreeSet::new();
         for (i, a) in self.agents.iter().enumerate() {
@@ -272,7 +327,7 @@ impl Network {
                 if a.id == b.id {
                     continue;
                 }
-                if self.policy.may_establish_channel(a, b).allowed {
+                if self.policy.may_establish_channel_allows(a, b) {
                     out.insert(Pair::new(&a.id, &b.id));
                 }
             }
@@ -313,6 +368,18 @@ pub fn reconcile(desired: &BTreeSet<Pair>, current: &BTreeSet<Pair>) -> Reconcil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #474: counts calls to `Policy::evaluate` — the reason-formatting entry point — so tests
+    // can prove a hot reconcile pass (`desired_channels`) never takes it.
+    thread_local! {
+        pub(super) static EVALUATE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn reset_evaluate_calls() {
+        EVALUATE_CALLS.with(|c| c.set(0));
+    }
+    fn evaluate_calls() -> usize {
+        EVALUATE_CALLS.with(|c| c.get())
+    }
 
     /// The "verteilte Firma" fixture from #102: segments dev/ops/finance at levels
     /// internal/secret, default-deny with a small allow-list and MAC on.
@@ -503,5 +570,85 @@ mod tests {
 
         // Reconciling the desired state against itself is a no-op.
         assert!(reconcile(&desired, &desired).is_empty(), "converged mesh needs no changes");
+    }
+
+    #[test]
+    fn allows_agrees_with_evaluate_allowed_474() {
+        // #474: `allows`/`may_establish_channel_allows` must be exactly the same decision as
+        // `evaluate`/`may_establish_channel`, just without the reason string — verify agreement
+        // across every combination the fixture policy actually decides differently on.
+        let p = company_policy();
+        let dev = Agent::new("dev-1", "dev", "internal");
+        let ops = Agent::new("ops-1", "ops", "internal");
+        let fin_i = Agent::new("fin-i", "finance", "internal");
+        let fin_s = Agent::new("fin-s", "finance", "secret");
+        let unknown = Agent::new("x", "dev", "top-secret");
+
+        for (a, b) in [
+            (&dev, &ops),   // RBAC-allowed, MAC-satisfied
+            (&dev, &fin_i), // default-deny
+            (&fin_s, &fin_i), // MAC write-down
+            (&fin_i, &fin_s), // MAC write-up + rule match -> allowed
+            (&dev, &unknown), // MAC unknown level -> fail closed
+        ] {
+            assert_eq!(
+                p.allows(a, b),
+                p.evaluate(a, b).allowed,
+                "allows() must agree with evaluate().allowed for {} -> {}",
+                a.id,
+                b.id
+            );
+            assert_eq!(
+                p.may_establish_channel_allows(a, b),
+                p.may_establish_channel(a, b).allowed,
+                "may_establish_channel_allows() must agree with may_establish_channel().allowed for {} <-> {}",
+                a.id,
+                b.id
+            );
+        }
+    }
+
+    #[test]
+    fn desired_channels_never_formats_a_reason_474() {
+        // #474: `desired_channels` is O(n^2) over agents and only ever reads the allowed
+        // boolean, but `evaluate` used to unconditionally `format!` a human-readable reason for
+        // every pair — thousands of throwaway allocations per reconcile pass. After the fix,
+        // `desired_channels` must go through the cheap `allows` path and never call `evaluate`
+        // (the reason-formatting entry point) at all.
+        let net = Network {
+            agents: vec![
+                Agent::new("dev-1", "dev", "internal"),
+                Agent::new("dev-2", "dev", "internal"),
+                Agent::new("ops-1", "ops", "internal"),
+                Agent::new("fin-i", "finance", "internal"),
+                Agent::new("fin-s", "finance", "secret"),
+            ],
+            policy: company_policy(),
+        };
+        reset_evaluate_calls();
+        let desired = net.desired_channels();
+        assert!(!desired.is_empty(), "sanity: the fixture policy does permit some pairs");
+        assert_eq!(
+            evaluate_calls(),
+            0,
+            "desired_channels must never call evaluate() (the reason-formatting path) — it should \
+             use allows()/may_establish_channel_allows() exclusively"
+        );
+
+        // And the result is unchanged from the pre-#474 (Decision-based) computation — same
+        // membership as `reconcile_diffs_desired_against_the_live_mesh`'s expectations, cross-
+        // checked directly against `may_establish_channel(...).allowed` on every pair.
+        for (i, a) in net.agents.iter().enumerate() {
+            for b in &net.agents[i + 1..] {
+                let via_decision = net.policy.may_establish_channel(a, b).allowed;
+                assert_eq!(
+                    desired.contains(&Pair::new(&a.id, &b.id)),
+                    via_decision,
+                    "desired_channels membership for {} <-> {} must match the Decision-based check",
+                    a.id,
+                    b.id
+                );
+            }
+        }
     }
 }

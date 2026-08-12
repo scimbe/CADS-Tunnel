@@ -3595,7 +3595,17 @@ impl SqliteNetworkStore {
 
     /// Load `owner`'s network `id`, or `None` if they own no such network (so another
     /// subject's network id is invisible — owner isolation). A stored blob that no longer
-    /// deserializes is treated as absent rather than erroring the caller.
+    /// deserializes, OR that fails [`ct_common::policy::Network::validate`] (#478), is treated
+    /// as absent rather than erroring the caller.
+    ///
+    /// `validate()` is opt-in and today only ever invoked by the authenticated `PUT` handler
+    /// (`network_put`, `service.rs`) before a `put()` here — nothing enforces it at the storage
+    /// layer itself, so a row written before the validator existed, or by any future write path
+    /// that forgets to call it, would otherwise deserialize straight back out with no
+    /// revalidation. `min_latency_overlay`/`Network::explain` degrade silently on an
+    /// invalid/partitioned network rather than erroring, which is exactly the failure mode the
+    /// validator exists to prevent — so re-check it here too, on every read, closing that gap
+    /// for every current AND future caller of `get()` in one place.
     pub fn get(&self, owner: &str, id: &str) -> rusqlite::Result<Option<ct_common::policy::Network>> {
         let json: Option<String> = self
             .conn
@@ -3606,7 +3616,9 @@ impl SqliteNetworkStore {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(json.and_then(|j| serde_json::from_str(&j).ok()))
+        Ok(json
+            .and_then(|j| serde_json::from_str::<ct_common::policy::Network>(&j).ok())
+            .filter(|network| network.validate().is_ok()))
     }
 
     /// Delete `owner`'s network `id`; returns whether a row was removed.
@@ -4756,6 +4768,47 @@ mod tests {
         assert!(store.delete("alice", "corp").unwrap());
         assert!(!store.delete("alice", "corp").unwrap(), "already gone");
         assert_eq!(store.list("alice").unwrap(), vec!["team".to_string()]);
+    }
+
+    #[test]
+    fn network_store_get_revalidates_on_read_and_hides_an_invalid_stored_network_478() {
+        // #478: `Network::validate()` is opt-in -- `SqliteNetworkStore::put` itself does not
+        // enforce it (only the authenticated REST `PUT` handler does, one call site). A row
+        // written before the validator existed, by a migration, or by any future write path
+        // that forgets to call `validate()`, must not be handed back to a caller unrevalidated
+        // -- `get()` has to close that gap itself, on every read, not rely on every writer
+        // getting it right.
+        use ct_common::policy::{Agent, Network, Policy};
+
+        let store = SqliteNetworkStore::open_in_memory().unwrap();
+        let invalid = Network {
+            agents: vec![
+                Agent::new("worker", "dev", "internal"),
+                Agent::new("worker", "dev", "internal"), // typo'd duplicate id
+            ],
+            policy: Policy::default(),
+        };
+        assert!(invalid.validate().is_err(), "sanity: this Network really is invalid");
+
+        // put() has no validation of its own -- simulates a write path that forgot to call
+        // Network::validate() (or a row that predates the validator).
+        store.put("alice", "corp", &invalid).unwrap();
+
+        assert_eq!(
+            store.get("alice", "corp").unwrap(),
+            None,
+            "get() must revalidate on read and refuse to hand back an invalid stored network, \
+             exactly as it already does for a blob that fails to deserialize at all"
+        );
+
+        // A subsequent valid write for the same (owner, id) is visible again -- the read-path
+        // check only ever suppresses invalid rows, it doesn't wedge the slot.
+        let valid = Network {
+            agents: vec![Agent::new("worker", "dev", "internal")],
+            policy: Policy::default(),
+        };
+        store.put("alice", "corp", &valid).unwrap();
+        assert_eq!(store.get("alice", "corp").unwrap(), Some(valid), "a valid overwrite is visible again");
     }
 
     #[test]

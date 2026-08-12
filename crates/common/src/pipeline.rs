@@ -342,6 +342,18 @@ impl PipelineSpec {
         self.convene_roles(offers, now, |role| role.selection_policy.unwrap_or(policy), state)
     }
 
+    /// Compute the currently-valid subset of `offers` at `now` — the single point where each
+    /// offer's ed25519 signature gets verified (not a cheap check). Any caller that needs to
+    /// consult validity more than once while handling one request (e.g. [`auction_view`]
+    /// (Self::auction_view), which both convenes AND lists every qualifying bid) MUST compute
+    /// this ONCE and reuse the result, rather than calling [`CapacityOffer::is_valid`] again per
+    /// offer per role — see #473 (this used to cost `2 * roles * offers` verifications per call).
+    fn valid_offers<'o>(offers: &'o [CapacityOffer], now: UnixSeconds) -> Vec<&'o CapacityOffer> {
+        #[cfg(test)]
+        tests::VALID_OFFERS_CALLS.with(|c| c.set(c.get() + 1));
+        offers.iter().filter(|o| o.is_valid(now)).collect()
+    }
+
     /// Shared convene core: `policy_for` maps each role to the [`SelectionPolicy`] that clears it, so
     /// [`convene`](Self::convene) can pin `LowestFloor` (legacy, byte-identical) while
     /// [`convene_with_policy`](Self::convene_with_policy) resolves per-role overrides. Eligibility
@@ -350,6 +362,19 @@ impl PipelineSpec {
         &self,
         offers: &[CapacityOffer],
         now: UnixSeconds,
+        policy_for: impl Fn(&RequiredRole) -> SelectionPolicy,
+        state: &mut SelectionState,
+    ) -> Result<Vec<RoleAssignment>, PipelineError> {
+        let valid = Self::valid_offers(offers, now);
+        self.convene_valid(&valid, policy_for, state)
+    }
+
+    /// Shared convene core operating on an ALREADY-validated offer set (see [`Self::valid_offers`])
+    /// — no signature verification happens in here, so a caller that already holds a valid set
+    /// (e.g. [`auction_view`](Self::auction_view)) can reuse it without re-verifying (#473).
+    fn convene_valid(
+        &self,
+        valid: &[&CapacityOffer],
         policy_for: impl Fn(&RequiredRole) -> SelectionPolicy,
         state: &mut SelectionState,
     ) -> Result<Vec<RoleAssignment>, PipelineError> {
@@ -365,13 +390,13 @@ impl PipelineSpec {
         // guarantee. With it, N same-typed roles genuinely need N distinct online providers.
         let mut assigned: Vec<[u8; 32]> = Vec::with_capacity(self.roles.len());
         for role in &self.roles {
-            // Eligibility is policy-independent: valid + declares the service + enough units + not
-            // already assigned this convene. The policy only ranks whoever survives this filter.
-            let qualifying: Vec<&CapacityOffer> = offers
+            // Eligibility is policy-independent: already-valid + declares the service + enough
+            // units + not already assigned this convene. The policy only ranks whoever survives.
+            let qualifying: Vec<&CapacityOffer> = valid
                 .iter()
+                .copied()
                 .filter(|o| {
-                    o.is_valid(now)
-                        && o.services.contains(&role.service)
+                    o.services.contains(&role.service)
                         && o.units_available >= role.units
                         && !assigned.contains(&o.holder_pubkey)
                 })
@@ -413,18 +438,24 @@ impl PipelineSpec {
         state: &mut SelectionState,
         label: impl Fn(&[u8; 32]) -> String,
     ) -> Result<Vec<RoleAuctionView>, PipelineError> {
+        // #473: verify every offer's signature ONCE for this call, then reuse the already-valid
+        // set for both the real clear below AND the per-role bid listing — this used to run
+        // `is_valid` a second full `roles * offers` pass after `convene_with_policy` had already
+        // paid that cost internally (`2 * roles * offers` ed25519 verifications per call on a
+        // browser-facing endpoint).
+        let valid = Self::valid_offers(offers, now);
         // Clear for real first: winners honor policy + #172 cross-role exclusivity + state.
-        let assignments = self.convene_with_policy(offers, now, policy, state)?;
+        let assignments =
+            self.convene_valid(&valid, |role| role.selection_policy.unwrap_or(policy), state)?;
         let views = self
             .roles
             .iter()
             .zip(&assignments)
             .map(|(role, assignment)| {
-                let mut bids: Vec<RoleBidView> = offers
+                let mut bids: Vec<RoleBidView> = valid
                     .iter()
-                    .filter(|o| {
-                        o.is_valid(now) && o.services.contains(&role.service) && o.units_available >= role.units
-                    })
+                    .copied()
+                    .filter(|o| o.services.contains(&role.service) && o.units_available >= role.units)
                     .map(|o| RoleBidView {
                         who: label(&o.holder_pubkey),
                         units: o.units_available,
@@ -549,6 +580,19 @@ mod tests {
     use super::*;
     use crate::channel::{CapacityKind, ServiceType::*};
     use ed25519_dalek::SigningKey;
+
+    // #473: counts calls to `PipelineSpec::valid_offers` — the single choke point where offer
+    // signatures are verified — so tests can prove a whole `auction_view`/`convene_*` call
+    // verifies each offer's signature exactly once, never once per role.
+    thread_local! {
+        pub(super) static VALID_OFFERS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn reset_valid_offers_calls() {
+        VALID_OFFERS_CALLS.with(|c| c.set(0));
+    }
+    fn valid_offers_calls() -> usize {
+        VALID_OFFERS_CALLS.with(|c| c.get())
+    }
 
     fn offer(seed: u8, services: Vec<ServiceType>, units: u64, price: u64, expires: UnixSeconds) -> CapacityOffer {
         let sk = SigningKey::from_bytes(&[seed; 32]);
@@ -1138,5 +1182,81 @@ mod tests {
             spec.auction_view(&[], 100, SelectionPolicy::LowestFloor, &mut SelectionState::default(), who_label),
             Err(PipelineError::UnfilledRole { service: TextGeneration }),
         );
+    }
+
+    #[test]
+    fn auction_view_verifies_each_offer_signature_exactly_once_473() {
+        // #473: `auction_view` used to call `convene_with_policy` (which validated every offer
+        // once per role internally) and THEN re-validate every offer again per role in its own
+        // bid-listing loop — `2 * roles * offers` ed25519 verifications per call. After the fix,
+        // validity is computed exactly once per call (via `valid_offers`) and reused for both the
+        // convene step and the bid listing, regardless of how many roles the pipeline has.
+        let spec = physics_spec(); // one role
+        let offers = [
+            offer(1, vec![TextGeneration], 20, 50, 1000),
+            offer(2, vec![TextGeneration], 20, 40, 1000),
+            offer(3, vec![TextGeneration], 20, 60, 1000),
+        ];
+        reset_valid_offers_calls();
+        let view = spec
+            .auction_view(&offers, 100, SelectionPolicy::LowestFloor, &mut SelectionState::default(), who_label)
+            .unwrap();
+        assert_eq!(view[0].bids.len(), 3, "sanity: all three offers are real bids");
+        assert_eq!(
+            valid_offers_calls(),
+            1,
+            "auction_view must compute the valid offer set exactly once per call, not once per role \
+             for the clear plus once again for the bid listing"
+        );
+    }
+
+    #[test]
+    fn auction_view_signature_check_count_does_not_scale_with_role_count_473() {
+        // Same guarantee as above, but with TWO roles: before the fix this cost scaled with
+        // `roles * offers` inside convene alone, so a naive partial fix could still leave the
+        // per-call `valid_offers` count growing with the role count. It must not.
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into(), selection_policy: None },
+            ],
+            operator_pubkey_hex: None,
+            selection_policy: SelectionPolicy::LowestFloor,
+        };
+        let offers = [
+            offer(1, vec![TextGeneration], 20, 50, 1000),
+            offer(2, vec![SafetyCheck], 20, 50, 1000),
+        ];
+        reset_valid_offers_calls();
+        spec.auction_view(&offers, 100, SelectionPolicy::LowestFloor, &mut SelectionState::default(), who_label)
+            .unwrap();
+        assert_eq!(valid_offers_calls(), 1, "two roles must not double the signature-verification pass");
+    }
+
+    #[test]
+    fn convene_with_policy_also_verifies_each_offer_signature_exactly_once_473() {
+        // The hoist benefits `convene`/`convene_with_policy` directly too: before the fix,
+        // `convene_roles`' per-role loop called `is_valid` once per (role, offer) pair, i.e. the
+        // verification pass itself scaled with role count. Now it is computed once per call.
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: SafetyCheck, units: 1, tag: "guard".into(), selection_policy: None },
+                RequiredRole { service: CodeGeneration, units: 1, tag: "critic".into(), selection_policy: None },
+            ],
+            operator_pubkey_hex: None,
+            selection_policy: SelectionPolicy::LowestFloor,
+        };
+        let offers = [
+            offer(1, vec![TextGeneration], 20, 50, 1000),
+            offer(2, vec![SafetyCheck], 20, 50, 1000),
+            offer(3, vec![CodeGeneration], 20, 50, 1000),
+        ];
+        reset_valid_offers_calls();
+        spec.convene_with_policy(&offers, 100, SelectionPolicy::LowestFloor, &mut SelectionState::default())
+            .unwrap();
+        assert_eq!(valid_offers_calls(), 1, "convene_with_policy must verify each offer's signature exactly once");
     }
 }
