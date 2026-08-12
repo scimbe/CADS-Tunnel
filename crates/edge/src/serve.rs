@@ -2555,7 +2555,15 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let mut nonce = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 let challenge = Challenge { nonce, difficulty };
-                let _ = serve_tcp_connection(tls, &state, &challenge, tcp_agent_cap.as_ref()).await;
+                // Mirrors the ":443 front door" arm above (#127): log any raw-listener
+                // failure instead of discarding it -- a client connecting directly to
+                // :4433 (not routed through the unified :443 front door) whose connection
+                // fails for any reason, including a NAT/firewall silently dropping an
+                // idle TCP-fallback connection mid-session, previously left zero log
+                // output explaining why.
+                if let Err(e) = serve_tcp_connection(tls, &state, &challenge, tcp_agent_cap.as_ref()).await {
+                    eprintln!("ct-edge: TCP fallback (:4433) connection error: {e}");
+                }
             }
         },
     ));
