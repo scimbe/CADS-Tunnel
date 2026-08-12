@@ -22,19 +22,32 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Enable TCP keepalive on `stream` (#229) -- see the matching helper in
-/// `ct-agent`'s `transport.rs` for the full rationale: a parked TLS-TCP
-/// fallback registration is a plain, silent TCP connection with nothing to
-/// refresh it, so an idle NAT/firewall mapping between the Agent and this
-/// Edge can be dropped without either side noticing until a Client is
-/// delivered onto the now-dead connection. Applied here on the Edge's own
-/// accept side too, for the same reason and for symmetry with any
-/// intermediate stateful device on this leg of the path. Best-effort.
+/// Enable TCP keepalive on `stream` (#229, tightened for the ct-agent#15 flap
+/// investigation) -- see the matching helper in `ct-agent`'s `transport.rs`
+/// for the full rationale: a parked TLS-TCP fallback registration is a
+/// plain, silent TCP connection with nothing to refresh it, so an idle
+/// NAT/firewall mapping between the Agent and this Edge can be dropped
+/// without either side noticing until a Client is delivered onto the
+/// now-dead connection. Applied here on the Edge's own accept side too, for
+/// the same reason and for symmetry with any intermediate stateful device on
+/// this leg of the path. Best-effort.
+///
+/// `time`/`interval` were originally 20s/20s with the OS-default retry count
+/// (typically 9 on Linux), so a genuinely dead connection could take up to
+/// ~200s (20 + 9*20) to surface as an error -- long enough that a parked
+/// Agent registration sits silently broken for minutes before either side
+/// notices. Tightened to 10s/10s with an explicit `with_retries(3)` bound:
+/// worst case is now 10 + 3*10 = 40s, roughly a 5x cut to the detection
+/// blind spot, while keeping probe traffic light (one 0-byte ACK-only
+/// segment every 10s while idle -- negligible bandwidth/battery cost, and
+/// still well above what would meaningfully drain a mobile `ct-agent`
+/// client sitting parked).
 pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(20))
-        .with_interval(std::time::Duration::from_secs(20));
+        .with_time(std::time::Duration::from_secs(10))
+        .with_interval(std::time::Duration::from_secs(10))
+        .with_retries(3);
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
@@ -534,6 +547,43 @@ mod tests {
             .expect("handler ran")
             .expect("keepalive flag sent");
         assert!(ka, "serve_listener must apply TCP keepalive before handing the connection to its handler");
+    }
+
+    #[tokio::test]
+    async fn apply_tcp_keepalive_uses_the_tightened_10s_10s_3_retry_parameters() {
+        // ct-agent#15 flap investigation: the parked TLS-TCP fallback connection was
+        // still flapping under the old 20s/20s + OS-default-retries (~9) keepalive,
+        // whose worst-case dead-connection-detection time was ~200s (20 + 9*20). This
+        // proves the tightened values actually land on the wire (not just that
+        // `apply_tcp_keepalive` compiles): SO_KEEPALIVE on, TCP_KEEPIDLE=10s,
+        // TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 -- worst case now 10 + 3*10 = 40s.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            apply_tcp_keepalive(&stream);
+            stream
+        });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let stream = accept.await.unwrap();
+
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap_or(false), "SO_KEEPALIVE must be enabled");
+        assert_eq!(
+            sock.keepalive_time().unwrap(),
+            std::time::Duration::from_secs(10),
+            "TCP_KEEPIDLE must be tightened to 10s (was 20s)"
+        );
+        assert_eq!(
+            sock.keepalive_interval().unwrap(),
+            std::time::Duration::from_secs(10),
+            "TCP_KEEPINTVL must be tightened to 10s (was 20s)"
+        );
+        assert_eq!(
+            sock.keepalive_retries().unwrap(),
+            3,
+            "TCP_KEEPCNT must be explicitly bounded to 3 (was the OS default, ~9 on Linux)"
+        );
     }
 
     #[tokio::test]

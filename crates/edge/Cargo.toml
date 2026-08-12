@@ -12,8 +12,11 @@ time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "signal"] }
 # TCP keepalive (#229) -- see ct-agent's Cargo.toml (github.com/scimbe/ct-agent)
 # for the matching comment; applied on the Edge's side of the TLS-TCP fallback too,
-# for the same reason.
-socket2 = "0.5"
+# for the same reason. `features = ["all"]` is required for `TcpKeepalive::with_retries`
+# (ct-agent#15 flap investigation: bounds the keepalive-probe retry count explicitly
+# instead of relying on the OS default) -- without it the method doesn't exist on this
+# platform/feature combination.
+socket2 = { version = "0.5", features = ["all"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = { version = "0.13", features = ["zeroize"] }
