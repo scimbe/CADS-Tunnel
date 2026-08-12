@@ -880,12 +880,19 @@ async fn reclaim_cert_slot(State(st): State<ApiState>, headers: HeaderMap, Path(
 /// Plane both serve) plus this deployment's real mesh edge port (`/network-info`,
 /// [`crate::service::NetworkInfoResp`]), so the Install page never hardcodes or
 /// guesses a port that could drift from the actual deployment.
-pub(crate) fn edge_host_port(portal_base: &str) -> String {
-    let host = portal_base
+/// Strip the scheme + any trailing slash from a portal base URL down to a bare
+/// `host[:port]` -- the common first step for deriving any Mesh-Plane/Agent-Fabric
+/// rendezvous address from the portal's own public origin (shared by
+/// [`edge_host_port`] and [`channel_deployment`]).
+fn portal_host(portal_base: &str) -> &str {
+    portal_base
         .trim_start_matches("https://")
         .trim_start_matches("http://")
-        .trim_end_matches('/');
-    format!("{host}:{}", crate::service::NetworkInfoResp::from_env().mesh_edge_port)
+        .trim_end_matches('/')
+}
+
+pub(crate) fn edge_host_port(portal_base: &str) -> String {
+    format!("{}:{}", portal_host(portal_base), crate::service::NetworkInfoResp::from_env().mesh_edge_port)
 }
 
 async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
@@ -1776,20 +1783,37 @@ existing tunnels/channels or anyone else's data.</p>
 }
 
 /// Shared state for the self-service channel-allowlist **claim** route (#248-follow):
-/// just the session key + the channel store, kept deliberately separate from the
-/// much larger [`ApiState`] so this addition doesn't have to thread a new param
-/// through every existing `portal_api_router` call site.
+/// the session key + the channel store, plus (as of the post-claim onboarding
+/// follow-up) what [`channel_deployment`] needs to render a real `.env` after a
+/// successful claim -- kept deliberately separate from the much larger [`ApiState`]
+/// so this addition doesn't have to thread a new param through every existing
+/// `portal_api_router` call site.
 #[derive(Clone)]
 struct ClaimState {
     session_key: Arc<[u8]>,
     channels: Arc<crate::storage::SqliteChannelStore>,
+    /// Public portal origin -- same value/purpose as [`ApiState::portal_base`],
+    /// duplicated here rather than merging the two states (see the struct doc).
+    portal_base: Arc<str>,
+    /// Where the edge CA root DER lives on disk -- the SAME file/value `GET /pki/ca`
+    /// serves (`CT_CP_EDGE_CERT_PATH`), reused as the `:443` channel front door's
+    /// trust anchor. See [`channel_deployment`]'s doc for why this is the live
+    /// source of truth instead of a value baked in at build time.
+    edge_cert_path: Arc<str>,
 }
 
 /// Build the channel-allowlist claim router (#248-follow): a `GET`/`POST` page for
 /// people to self-serve their claim from a browser, plus the pre-existing `POST
 /// .../claim` JSON API for programmatic callers, session-cookie authed either way.
 /// Mount alongside [`portal_api_router`] wherever the channel store is already in scope.
-pub fn channel_claim_router(session_key: &[u8], channels: Arc<crate::storage::SqliteChannelStore>) -> Router {
+/// `portal_base`/`edge_cert_path` are the same values `install_page`/`pki_router`
+/// already use elsewhere (see [`ApiState::portal_base`], `pki_router`'s `cert_path`).
+pub fn channel_claim_router(
+    session_key: &[u8],
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    portal_base: &str,
+    edge_cert_path: &str,
+) -> Router {
     Router::new()
         .route("/portal/channels", get(channels_page))
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
@@ -1797,6 +1821,8 @@ pub fn channel_claim_router(session_key: &[u8], channels: Arc<crate::storage::Sq
         .with_state(ClaimState {
             session_key: Arc::from(session_key.to_vec()),
             channels,
+            portal_base: Arc::from(portal_base),
+            edge_cert_path: Arc::from(edge_cert_path),
         })
 }
 
@@ -2226,7 +2252,7 @@ async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(chann
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    Html(claim_html(&channel_hex, None, claims.email.as_deref())).into_response()
+    Html(claim_html(&channel_hex, None, claims.email.as_deref(), None, None)).into_response()
 }
 
 async fn claim_page_submit(
@@ -2239,25 +2265,209 @@ async fn claim_page_submit(
         return Redirect::to("/portal").into_response();
     };
     match do_claim(&st, &headers, &channel_hex, &req).await {
-        Ok(()) => Html(claim_html(&channel_hex, Some(Ok(())), claims.email.as_deref())).into_response(),
-        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)), claims.email.as_deref())).into_response(),
+        // Live onboarding material only ever computed on the SUCCESS path -- an
+        // extra disk read for every failed/retried attempt would be wasted work,
+        // and `req.holder` is only proven-valid hex once `do_claim` has actually
+        // accepted it (malformed input already errored out above).
+        Ok(()) => {
+            let deployment = channel_deployment(&st.portal_base, &st.edge_cert_path).await;
+            Html(claim_html(
+                &channel_hex,
+                Some(Ok(())),
+                claims.email.as_deref(),
+                Some(&req.holder),
+                Some(&deployment),
+            ))
+            .into_response()
+        }
+        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)), claims.email.as_deref(), None, None)).into_response(),
     }
+}
+
+/// A deployment's Agent-Fabric channel connection info -- the SAME broker/relay/
+/// front-door values for every member of a given channel (never secret, unlike a
+/// member's own keys or an owner-issued grant). Computed fresh per request from
+/// [`crate::service::NetworkInfoResp::from_env`] + the portal's own base URL/edge
+/// CA cert file -- the exact same sources [`install_page`]'s `edge_host_port`/
+/// `CT_AGENT_EDGE_CERT_URL` already use for the Mesh-Plane tunnel path, so this
+/// can never drift from the real deployment either.
+struct ChannelDeployment {
+    broker: String,
+    relay: String,
+    front_door: Option<FrontDoor>,
+}
+
+/// The `:443` TLS-TCP fallback (#106, `ct-edge-channel` ALPN) for a network that
+/// blocks the direct broker/relay ports (`4435`/`4436`) -- the exact fix the live
+/// support case behind this feature needed. `cert_hex` is the edge CA root DER,
+/// hex-encoded: the SAME bytes `GET /pki/ca` publishes, not a value that goes
+/// stale on the edge's next Let's-Encrypt leaf rotation (the front-door acceptor's
+/// leaf and the shared edge leaf are issued by the same `Ca`, so a client that
+/// trusts the CA root trusts either -- see `pki::build_channel_front_door_acceptor`'s
+/// doc comment on the edge side). Present only once the edge has actually
+/// published that root (checked live, not assumed) -- absent on a deployment that
+/// hasn't started an edge yet, matching [`install_page`]'s own "absent -> omitted"
+/// convention (e.g. its `hostname_line`).
+struct FrontDoor {
+    addr: String,
+    cert_hex: String,
+}
+
+/// Read live, once per request: cheap (a small file, an infrequent page render --
+/// nothing like the broker/relay's own per-connection admission path, which is why
+/// `GET /pki/ca` bothers caching), and freshness matters more than the save here.
+async fn channel_deployment(portal_base: &str, edge_cert_path: &str) -> ChannelDeployment {
+    let info = crate::service::NetworkInfoResp::from_env();
+    let host = portal_host(portal_base);
+    let front_door = match tokio::fs::read(edge_cert_path).await {
+        Ok(der) if !der.is_empty() => Some(FrontDoor {
+            addr: format!("{host}:{}", info.channel_relay_gate_port),
+            cert_hex: hex(&der),
+        }),
+        _ => None,
+    };
+    ChannelDeployment {
+        broker: format!("{host}:{}", info.channel_broker_port),
+        relay: format!("{host}:{}", info.channel_relay_port),
+        front_door,
+    }
+}
+
+/// Post-claim onboarding (live support case: a Windows client's network blocked
+/// the channel broker/relay ports outright, ports 4435/4436, requiring the
+/// operator to hand-assemble the `:443` fallback env by hand -- this closes that
+/// gap the same way [`install_page`] already closes it for tunnels). Renders the
+/// `.env` + the same bash/PowerShell "Run it" tab toggle [`install_page`] uses
+/// (identical CSS classes / `showTab`/`copyCode` JS, both from [`page`]).
+///
+/// SECURITY BOUNDARY -- read before touching this function: `CT_CHANNEL_HOLDER_KEY`
+/// / `CT_CHANNEL_NOISE_KEY` are the member's own PRIVATE keys. This server has
+/// NEVER seen either (the claim form only ever submitted the public holder key +
+/// a signature, #101 SEC101b) and must not try to -- they stay clearly-labeled
+/// placeholders the member fills in from their own local
+/// `ct-agent channel member-material` run. `CT_CHANNEL_GRANT` is the same kind of
+/// boundary for a DIFFERENT key: it is signed by the channel OPERATOR's PRIVATE
+/// key, which this control plane has also never held (only the operator's PUBLIC
+/// key -- `SqliteChannelStore::register_channel`'s doc: "Never stores a channel
+/// signing key"). By the grant design's own invariant #6
+/// (`OperatorIdentity::compile_overlay_grants`'s doc: "the operator mints every
+/// grant locally with its own key -- no central round-trip"), no server -- this
+/// one included -- can ever synthesize a `CT_CHANNEL_GRANT`. What this function
+/// DOES add over the bare allow-list claim that existed before it: the exact
+/// command the channel's owner needs to run (`ct-agent channel grant`),
+/// pre-filled with the now-known channel id and this member's just-submitted
+/// holder key, so the owner only has to paste one value back instead of
+/// hand-assembling a whole onboarding bundle from scratch.
+fn channel_onboarding_html(channel_hex: &str, holder_hex: &str, dep: &ChannelDeployment) -> String {
+    let channel_hex = escape(channel_hex);
+    let holder_hex = escape(holder_hex);
+    let (front_door_env, front_door_note) = match &dep.front_door {
+        Some(fd) => (
+            format!("\nCT_CHANNEL_FRONT_DOOR={}\nCT_CHANNEL_FRONT_DOOR_CERT={}", fd.addr, fd.cert_hex),
+            r#"<p class="help">Includes the <code>:443</code> fallback (#106) for networks that block the
+ direct broker/relay ports (<code>4435</code>/<code>4436</code>) outright -- <code>ct-agent</code> tries
+ the direct ports first, then this. The cert is this deployment's real, live edge CA root (the same one
+ <code>GET /pki/ca</code> publishes), not a value that goes stale when the edge's certificate rotates.</p>"#,
+        ),
+        None => (
+            String::new(),
+            r#"<p class="help">This deployment hasn't published its edge CA root yet, so the <code>:443</code>
+ fallback for a restrictive network isn't available here -- only the direct broker/relay ports below.</p>"#,
+        ),
+    };
+    let env_block = format!(
+        "CT_CHANNEL_BROKER={broker}\n\
+         CT_CHANNEL_RELAY={relay}{front_door_env}\n\
+         CT_CHANNEL_ROLE=PASTE_INITIATE_OR_ACCEPT   # ask your channel owner which side you are\n\
+         CT_CHANNEL_GRANT=PASTE_YOUR_CT_CHANNEL_GRANT_HERE   # your channel owner signs this, see \"Get your grant\" below -- this server never holds the operator key and cannot issue it\n\
+         CT_CHANNEL_HOLDER_KEY=PASTE_YOUR_PRIVATE_HOLDER_KEY_HERE   # from 'ct-agent channel member-material' -- never share this, never sent to or stored by this server\n\
+         CT_CHANNEL_NOISE_KEY=PASTE_YOUR_PRIVATE_NOISE_KEY_HERE   # from 'ct-agent channel member-material' -- never share this, never sent to or stored by this server\n\
+         CT_CHANNEL_RELAY_ONLY=1   # safe default behind a restrictive network; unset and set CT_CHANNEL_LISTEN=host:port instead if you can accept inbound connections",
+        broker = dep.broker,
+        relay = dep.relay,
+    );
+    let grant_cmd = format!(
+        "CT_CHANNEL_OPERATOR_KEY=THEIR_OPERATOR_PRIVATE_KEY \\\n\
+         CT_GRANT_CHANNEL={channel_hex} \\\n\
+         CT_GRANT_MEMBER_HOLDER={holder_hex} \\\n\
+         CT_GRANT_DIRECTION=PASTE_INITIATE_OR_ACCEPT \\\n\
+         CT_GRANT_EXPIRES=UNIX_TIMESTAMP   # e.g. output of: date -d +90days +%s\n\
+         ct-agent channel grant",
+    );
+    let run_cmd = "set -a; source .env; set +a\nct-agent channel";
+    let run_cmd_ps = "Get-Content .env | ForEach-Object {\n  if ($_ -match '^\\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {\n    $value = $matches[2] -replace '\\s+#.*$', ''\n    [System.Environment]::SetEnvironmentVariable($matches[1], $value.Trim(), 'Process')\n  }\n}\n.\\ct-agent.exe channel";
+    format!(
+        r#"<h2>Connect as this member</h2>
+<p class="help">This deployment's broker/relay/front-door addresses are the same for every member (not
+secret) and are filled in for real below. Save this now -- reopening this page later won't show it again.</p>
+<div class="warn">Never share <code>CT_CHANNEL_HOLDER_KEY</code> or <code>CT_CHANNEL_NOISE_KEY</code> --
+this server generated neither and cannot generate them; they came from your own local
+<code>ct-agent channel member-material</code> run and were never sent here.</div>
+<div class="code-block">
+ <div class="code-block-head"><span>.env</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <pre><code>{env_block}</code></pre>
+</div>
+{front_door_note}
+<details open>
+ <summary>Get your grant</summary>
+ <p class="help"><code>CT_CHANNEL_GRANT</code> is signed by your channel owner's own OPERATOR private
+ key, which this server has never held either (only the operator's PUBLIC key) -- the same
+ never-store-a-private-key boundary as your own holder/Noise keys above. Send your channel owner your
+ holder public key (<code>{holder_hex}</code>, already captured from your claim above) and ask them to
+ run this locally, then paste back what it prints as your <code>CT_CHANNEL_GRANT</code>:</p>
+ <div class="code-block">
+  <div class="code-block-head"><span>owner runs this</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{grant_cmd}</code></pre>
+ </div>
+</details>
+<details>
+ <summary>Run it</summary>
+ <div class="tab-row">
+  <button type="button" class="tab-btn active" onclick="showTab(this,'channel-run-bash')">bash</button>
+  <button type="button" class="tab-btn" onclick="showTab(this,'channel-run-powershell')">PowerShell</button>
+ </div>
+ <div class="code-block" id="channel-run-bash" data-tab="bash">
+  <div class="code-block-head"><span>bash</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{run_cmd}</code></pre>
+ </div>
+ <div class="code-block" id="channel-run-powershell" data-tab="powershell" style="display:none">
+  <div class="code-block-head"><span>PowerShell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{run_cmd_ps}</code></pre>
+ </div>
+ <p class="help">Fill in every placeholder above first. Get <code>ct-agent</code> the same way as a tunnel
+ install (see your Install page's Docker build step) if you don't already have the binary.</p>
+</details>"#
+    )
 }
 
 /// The self-serve claim form (#248-follow): a portal user pastes the three values
 /// [`ct-agent channel member-material`] (or whatever locally produced them) prints,
 /// and the claim runs -- no manual out-of-band exchange with the channel owner.
-fn claim_html(channel_hex: &str, result: Option<Result<(), String>>, email: Option<&str>) -> String {
+/// `claimed_holder_hex`/`deployment` are `Some` only right after a successful
+/// claim (see [`channel_onboarding_html`]) -- `None` otherwise (a fresh `GET`, or
+/// a failed attempt), in which case no onboarding block is shown.
+fn claim_html(
+    channel_hex: &str,
+    result: Option<Result<(), String>>,
+    email: Option<&str>,
+    claimed_holder_hex: Option<&str>,
+    deployment: Option<&ChannelDeployment>,
+) -> String {
     let banner = match &result {
         Some(Ok(())) => r#"<div class="warn" style="border-color:#238636;background:#0d2818;color:#3fb950">Claimed -- you're now a member of this channel.</div>"#.to_string(),
         Some(Err(msg)) => format!(r#"<div class="warn">Could not claim: {}</div>"#, escape(msg)),
         None => String::new(),
+    };
+    let onboarding = match (claimed_holder_hex, deployment) {
+        (Some(holder_hex), Some(dep)) => channel_onboarding_html(channel_hex, holder_hex, dep),
+        _ => String::new(),
     };
     let body = format!(
         r#"<h1>Join a channel</h1>
 <p class="k">Your signed-in e-mail must already be on this channel's allow-list (ask its owner to add
 you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it isn't yet).</p>
 {banner}
+{onboarding}
 <form method="post" action="/portal/channels/{channel}/claim-form">
  <label>Channel<input type="text" value="{channel}" disabled></label>
  <label>Holder public key
@@ -4004,7 +4214,7 @@ mod tests {
         let ch = ChannelId([0x5cu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone());
+        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let holder_sk = SigningKey::from_bytes(&[0xc3u8; 32]);
@@ -4076,7 +4286,7 @@ mod tests {
         let ch = ChannelId([0x7au8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone());
+        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
 
@@ -4139,6 +4349,168 @@ mod tests {
         assert!(channels.is_member(&ch, &holder_bytes).unwrap());
     }
 
+    /// Post-claim onboarding follow-up (live support case: a Windows client whose
+    /// network blocked the channel broker/relay ports outright, 4435/4436). A
+    /// successful claim must now hand the member a real, ready-to-fill `.env`
+    /// (broker/relay/front-door filled in for real, exactly like `install_page`'s
+    /// tunnel `.env`) -- but the two PRIVATE keys AND the operator-signed grant
+    /// must never be anything but clearly-labeled placeholders, since this server
+    /// has never held any of the three private keys involved (the member's holder
+    /// key, the member's Noise key, or the channel operator's key).
+    #[tokio::test]
+    async fn successful_claim_shows_a_real_onboarding_env_with_private_material_as_placeholders() {
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x5eu8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
+
+        // A real edge CA root DER on disk -- the front door must be live-fetched
+        // from here, never hardcoded/baked in (the whole point of #345/GET /pki/ca
+        // being the live source of truth this reuses).
+        let der: &[u8] = b"\x30\x82\x01\x0a-fake-edge-ca-root-der";
+        let cert_path = std::env::temp_dir().join(format!("ct-cp-claim-onboarding-ca-{}.der", std::process::id()));
+        std::fs::write(&cert_path, der).unwrap();
+        let cert_path_str = cert_path.to_string_lossy().into_owned();
+
+        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", &cert_path_str);
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let ch_hex = hex(&ch.0);
+        let holder_sk = SigningKey::from_bytes(&[0xc7u8; 32]);
+        let holder_bytes = holder_sk.verifying_key().to_bytes();
+        let holder_hex = hex(&holder_bytes);
+        let noise = [0xd8u8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder_bytes, &noise)).to_bytes();
+        let form = format!("holder={}&noise_pubkey={}&noise_attestation={}", holder_hex, hex(&noise), hex(&attest));
+
+        let allowed_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "nat-subject", "nat@example.com"));
+        let resp = app
+            .oneshot(
+                Request::post(format!("/portal/channels/{ch_hex}/claim-form"))
+                    .header("cookie", allowed_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        let _ = std::fs::remove_file(&cert_path);
+
+        assert!(html.contains("Claimed"));
+
+        // Real, filled-in deployment-wide values -- broker/relay always real; the
+        // front door real too since the CA root file existed above.
+        assert!(html.contains("CT_CHANNEL_BROKER=portal.example:4435"), "real broker host:port");
+        assert!(html.contains("CT_CHANNEL_RELAY=portal.example:4436"), "real relay host:port");
+        assert!(html.contains("CT_CHANNEL_FRONT_DOOR=portal.example:443"), "real front-door host:port");
+        assert!(
+            html.contains(&format!("CT_CHANNEL_FRONT_DOOR_CERT={}", hex(der))),
+            "the front-door cert is the REAL edge CA root DER read live from disk, hex-encoded -- \
+             the same bytes GET /pki/ca serves, not a hardcoded value that goes stale on rotation"
+        );
+
+        // The grant command is pre-filled with the REAL channel id + the member's
+        // just-claimed holder key, so the owner only pastes one command.
+        assert!(html.contains(&format!("CT_GRANT_CHANNEL={ch_hex}")), "grant command carries the real channel id");
+        assert!(
+            html.contains(&format!("CT_GRANT_MEMBER_HOLDER={holder_hex}")),
+            "grant command carries the member's real just-claimed holder key"
+        );
+        assert!(html.contains("ct-agent channel grant"), "the real ct-agent CLI invocation the owner runs");
+
+        // SECURITY: never a real private key, never a real grant -- both are
+        // categorically impossible for this server to produce, and must stay
+        // obvious, unmistakable placeholders. Assert the placeholder text is
+        // present and that neither of the member's actually-generated SECRET
+        // values (which this test never even submits to the server) could
+        // possibly appear.
+        assert!(
+            html.contains("CT_CHANNEL_HOLDER_KEY=PASTE_YOUR_PRIVATE_HOLDER_KEY_HERE"),
+            "holder private key stays an unmistakable placeholder"
+        );
+        assert!(
+            html.contains("CT_CHANNEL_NOISE_KEY=PASTE_YOUR_PRIVATE_NOISE_KEY_HERE"),
+            "Noise private key stays an unmistakable placeholder"
+        );
+        assert!(
+            html.contains("CT_CHANNEL_GRANT=PASTE_YOUR_CT_CHANNEL_GRANT_HERE"),
+            "the grant stays an unmistakable placeholder -- this server never held the operator \
+             key and categorically cannot issue one"
+        );
+        assert!(
+            html.contains("this server has never held either") || html.contains("this server never holds the operator key"),
+            "explains WHY these stay placeholders, not just that they do"
+        );
+
+        // Both bash and PowerShell "Run it" tabs, same toggle mechanism as install_page.
+        assert!(html.contains(r#"onclick="showTab(this,'channel-run-bash')""#));
+        assert!(html.contains(r#"onclick="showTab(this,'channel-run-powershell')""#));
+        assert!(html.contains("set -a; source .env; set +a") && html.contains("ct-agent channel"), "bash run command");
+        assert!(html.contains(".\\ct-agent.exe channel"), "PowerShell run command");
+        assert!(
+            html.matches("CT_CHANNEL_BROKER=").count() == 1,
+            "the .env block itself is not duplicated for the PowerShell tab"
+        );
+    }
+
+    /// Graceful "absent -> omitted" behavior (matching `install_page`'s own
+    /// convention, e.g. its `hostname_line`): a deployment that hasn't published
+    /// its edge CA root yet must cleanly omit the `:443` front-door lines, not
+    /// error the whole onboarding block.
+    #[tokio::test]
+    async fn onboarding_omits_the_front_door_cleanly_when_the_edge_hasnt_published_its_cert_yet() {
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x5fu8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
+
+        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let ch_hex = hex(&ch.0);
+        let holder_sk = SigningKey::from_bytes(&[0xc9u8; 32]);
+        let holder_bytes = holder_sk.verifying_key().to_bytes();
+        let noise = [0xdau8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder_bytes, &noise)).to_bytes();
+        let form = format!("holder={}&noise_pubkey={}&noise_attestation={}", hex(&holder_bytes), hex(&noise), hex(&attest));
+
+        let allowed_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "nat-subject", "nat@example.com"));
+        let resp = app
+            .oneshot(
+                Request::post(format!("/portal/channels/{ch_hex}/claim-form"))
+                    .header("cookie", allowed_cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+
+        assert!(html.contains("Claimed"));
+        assert!(html.contains("CT_CHANNEL_BROKER=portal.example:4435"), "broker/relay stay real+present");
+        assert!(html.contains("CT_CHANNEL_RELAY=portal.example:4436"));
+        assert!(!html.contains("CT_CHANNEL_FRONT_DOOR="), "front-door lines cleanly absent, not an error");
+        assert!(!html.contains("CT_CHANNEL_FRONT_DOOR_CERT="));
+        assert!(
+            html.contains("hasn't published its edge CA root yet"),
+            "explains WHY the fallback is unavailable on this deployment"
+        );
+    }
+
     #[tokio::test]
     async fn channels_page_lists_only_the_sessions_own_invitations_with_claim_status() {
         // Self-service discoverability (2026-08-01): GET /portal/channels is the
@@ -4164,7 +4536,7 @@ mod tests {
             .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000)
             .unwrap());
 
-        let app = channel_claim_router(KEY, channels.clone());
+        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         // Logged out -> bounced, not a raw 401/500.

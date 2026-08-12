@@ -5114,10 +5114,16 @@ pub fn persistent_control_plane_router(
     );
     // Publish the edge CA root (#11): read from the path the edge writes it to,
     // co-located on the central host (CT_CP_EDGE_CERT_PATH, default matches the
-    // edge's CT_EDGE_CERT_OUT).
-    let pki = pki_router(
-        std::env::var("CT_CP_EDGE_CERT_PATH").unwrap_or_else(|_| "/shared/edge-cert.der".to_string()),
-    );
+    // edge's CT_EDGE_CERT_OUT). Also handed to `channel_claim_router` below (#106
+    // channel-onboarding follow-up) -- the SAME file/bytes `GET /pki/ca` serves
+    // ARE the trust anchor the `:443` channel front door's leaf chains to (the
+    // front-door acceptor and the shared edge leaf are issued by the same `Ca`,
+    // `pki::build_channel_front_door_acceptor`'s doc comment), so the post-claim
+    // onboarding page can hand a member a real, live `CT_CHANNEL_FRONT_DOOR_CERT`
+    // instead of a value that goes stale whenever the edge's leaf cert rotates.
+    let edge_cert_path =
+        std::env::var("CT_CP_EDGE_CERT_PATH").unwrap_or_else(|_| "/shared/edge-cert.der".to_string());
+    let pki = pki_router(edge_cert_path.clone());
     // #87 SEC87b-auth: gate the machine/operator durable-writer surfaces behind the
     // shared admin token when the CP has one configured (the same CT_CP_EDGE_ADMIN_TOKEN
     // the edge/operator hold), so a public deployment can't have anyone mint join tokens
@@ -5237,7 +5243,12 @@ pub fn persistent_control_plane_router(
             // #248-follow: the session-authed channel-allowlist self-service claim —
             // same session key as the portal login above, so a claim just works right
             // after a portal login with no separate auth step.
-            .merge(crate::portal_api::channel_claim_router(session_key, channels.clone()))
+            .merge(crate::portal_api::channel_claim_router(
+                session_key,
+                channels.clone(),
+                &portal_base_url,
+                &edge_cert_path,
+            ))
             // #237-follow: the Topology Editor's portal discoverability shell — same
             // session key, so the editor (already dual-auth via subject_of_topology)
             // is reachable and linked from the portal nav, not just a bare URL.
