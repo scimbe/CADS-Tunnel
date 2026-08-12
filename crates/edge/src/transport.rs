@@ -61,13 +61,21 @@ pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
 /// necessary whenever the connection can outlive this one task (e.g. a channel member that
 /// parks in a `ChannelPairer` and is later handed to a different, freshly spawned task).
 ///
-/// Never returns (mirrors every accept loop it replaces): a per-connection `accept()` error
-/// is transient and logged, not fatal to the listener.
+/// `shutdown` (#400): checked before every `accept()`, raced against it via `tokio::select!`
+/// so a pending `accept()` doesn't stop this from noticing shutdown promptly. Once triggered,
+/// this function returns instead of accepting further connections — it does NOT touch any
+/// connection already admitted (those keep running in their own already-spawned task exactly
+/// as before); bounding how long already-admitted connections are given to finish is
+/// `run_edge`'s job ([`crate::shutdown::wait_for_drain`]), not this loop's.
+///
+/// Otherwise never returns (mirrors every accept loop it replaces): a per-connection
+/// `accept()` error is transient and logged, not fatal to the listener.
 pub(crate) async fn serve_listener<F, Fut>(
     listener: TcpListener,
     cap: Option<crate::state::ConnectionCap>,
     label: &'static str,
     handshake_timeout: Option<std::time::Duration>,
+    shutdown: crate::shutdown::ShutdownSignal,
     handler: F,
 ) where
     F: Fn(TcpStream, SocketAddr, Option<tokio::sync::OwnedSemaphorePermit>) -> Fut + Send + Sync + 'static,
@@ -75,12 +83,19 @@ pub(crate) async fn serve_listener<F, Fut>(
 {
     let handler = Arc::new(handler);
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("ct-edge: {label} accept error: {e}");
-                continue;
+        let (stream, addr) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                eprintln!("ct-edge: {label} stopping new accepts (shutdown)");
+                return;
             }
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ct-edge: {label} accept error: {e}");
+                    continue;
+                }
+            },
         };
         let permit = match &cap {
             Some(cap) => match cap.try_admit() {
@@ -456,7 +471,7 @@ mod tests {
         // The handler holds the connection open (never returns) until told to, so the cap's
         // one slot stays occupied for as long as the test needs it to.
         let (hold_tx, hold_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, move |_s, _addr, permit| {
+        tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, crate::shutdown::ShutdownSignal::never(), move |_s, _addr, permit| {
             let admitted_h = admitted_h.clone();
             let mut hold_rx = hold_rx.clone();
             async move {
@@ -504,7 +519,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(1);
-        tokio::spawn(serve_listener(listener, None, "test-listener", None, move |stream, _addr, _permit| {
+        tokio::spawn(serve_listener(listener, None, "test-listener", None, crate::shutdown::ShutdownSignal::never(), move |stream, _addr, _permit| {
             let tx = tx.clone();
             async move {
                 let sock = socket2::SockRef::from(&stream);
@@ -539,6 +554,7 @@ mod tests {
             Some(cap.clone()),
             "test-listener",
             Some(std::time::Duration::from_millis(150)),
+            crate::shutdown::ShutdownSignal::never(),
             move |_s, _addr, permit| {
                 let completed_h = completed_h.clone();
                 async move {
@@ -559,5 +575,48 @@ mod tests {
             !completed_normally.load(std::sync::atomic::Ordering::SeqCst),
             "the handler was abandoned by the timeout, not allowed to run to completion"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_listener_stops_accepting_promptly_once_shutdown_is_triggered_400() {
+        // #400 property (a): once shutdown fires, `serve_listener` must stop admitting NEW
+        // connections promptly -- a client dialing after the trigger sees the listener socket
+        // closed (connection refused), not silently queued/hanging. Existing in-flight
+        // handlers are untouched by this loop; that's proven separately by the
+        // wait_for_drain tests in `shutdown.rs`.
+        let cap = crate::state::ConnectionCap::new(4);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admitted_h = admitted.clone();
+        let (ctl, shutdown) = crate::shutdown::ShutdownController::new();
+        let task = tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, shutdown, move |_s, _addr, _permit| {
+            let admitted_h = admitted_h.clone();
+            async move {
+                admitted_h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+
+        // Before shutdown: a connection is admitted normally.
+        let _first = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1, "admits normally before shutdown");
+
+        ctl.trigger();
+        // The accept loop must return promptly (not on some later spurious wakeup) --
+        // proven by the spawned task itself joining quickly.
+        tokio::time::timeout(std::time::Duration::from_millis(300), task)
+            .await
+            .expect("serve_listener returns promptly once shutdown is triggered")
+            .expect("task joined without panicking");
+
+        // The OS listener socket is now closed (serve_listener owned it and dropped it on
+        // return) -- a fresh dial fails fast rather than hanging or being silently accepted.
+        let dialed = tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(addr)).await;
+        match dialed {
+            Ok(Ok(_)) => panic!("no new connection should be admitted once shutdown has fired"),
+            _ => {} // connection refused (Err) or the timeout itself firing are both fine here
+        }
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1, "no further connection reached the handler after shutdown");
     }
 }

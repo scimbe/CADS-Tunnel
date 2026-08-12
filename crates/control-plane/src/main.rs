@@ -234,12 +234,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("ct-control-plane: listening on {listen}, db={db}");
     // Serve with connection info so the per-IP unauthenticated-writer rate limit
     // (#87 SEC87b-rl) can key on the client address.
-    axum::serve(
+    //
+    // #400 (follow-up to #350/#376): #350 wired `.with_graceful_shutdown` but left the
+    // drain UNBOUNDED -- "bounded by axum's own default per-connection idle limits and
+    // server operators' own pod termination grace period", i.e. not actually bounded by
+    // this process at all. `shutdown_fired` is a second, independently-observable copy of
+    // the same shutdown event (the `shutdown_signal()` future itself can only be awaited
+    // once, by `with_graceful_shutdown`) so `serve_with_bounded_grace` can start its own
+    // grace clock at the exact moment shutdown was requested, not at process start.
+    let (shutdown_tx, shutdown_fired) = tokio::sync::watch::channel(false);
+    let with_shutdown = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    // axum 0.7's `Serve`/`WithGracefulShutdown` only implement `IntoFuture`, not `Future`
+    // directly (their `IntoFuture::IntoFuture` associated type is a crate-private,
+    // unnameable wrapper) -- so a raw value can't be passed generically as `impl Future`
+    // without first driving it through a real `.await` point. Wrapping it in this async
+    // block does exactly that: the block itself is a genuine, nameable-as-`impl Future` type.
+    let serve_fut = async move { with_shutdown.await };
+    serve_with_bounded_grace(serve_fut, shutdown_fired, shutdown_grace()).await?;
     Ok(())
 }
 
@@ -249,8 +267,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// to the IdP, an edge revoke already in flight after the DB row is gone, a payment
 /// webhook that already credited the ledger but hasn't finished responding). Waiting on
 /// this future before `axum::serve` returns makes it drain in-flight connections instead
-/// of cutting them off; still bounded by axum's own default per-connection idle limits and
-/// server operators' own pod termination grace period, not an unbounded wait.
+/// of cutting them off. #400: the wait is now explicitly bounded by
+/// `serve_with_bounded_grace`, not left to axum's own defaults / the operator's own pod
+/// termination grace period.
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -272,6 +291,73 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     eprintln!("ct-control-plane: shutdown signal received, draining in-flight requests");
+}
+
+/// Default bound (#400) on how long the drain in `serve_with_bounded_grace` is given
+/// once shutdown is requested before it forces an exit regardless of what's still in
+/// flight. 30s: generous for a real in-flight request (even one with a side-channel HTTP
+/// call to an IdP/payment provider) to finish, short enough to stay under common
+/// container/pod termination grace periods (e.g. Kubernetes' 30s default
+/// `terminationGracePeriodSeconds`) so this process exits on its own rather than being
+/// SIGKILLed by the orchestrator.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// Resolve `CT_CP_SHUTDOWN_GRACE_SECS` (#400): unset or unparseable falls back to
+/// [`DEFAULT_SHUTDOWN_GRACE_SECS`] (fail-safe -- a typo must not silently produce an
+/// unbounded or zero-length drain).
+fn shutdown_grace() -> std::time::Duration {
+    let secs = match std::env::var("CT_CP_SHUTDOWN_GRACE_SECS") {
+        Err(_) => DEFAULT_SHUTDOWN_GRACE_SECS,
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!(
+                    "ct-control-plane: invalid CT_CP_SHUTDOWN_GRACE_SECS '{s}' -- using default {DEFAULT_SHUTDOWN_GRACE_SECS}s"
+                );
+                DEFAULT_SHUTDOWN_GRACE_SECS
+            }
+        },
+    };
+    std::time::Duration::from_secs(secs)
+}
+
+/// Drives `serve_fut` (an already-constructed `axum::serve(...).with_graceful_shutdown(..)`,
+/// or anything with the same `Future<Output = io::Result<()>>` shape) to completion, but
+/// never waits more than `grace` PAST THE MOMENT shutdown was actually requested (observed
+/// via `shutdown_fired`, a `watch` receiver that turns `true` at the exact instant the
+/// signal future given to `with_graceful_shutdown` resolves) -- #400's bounded half of
+/// #350's graceful-shutdown wiring, so a request that never finishes (a hung downstream
+/// call, a slow/stalled client) can't hang shutdown forever. Before shutdown is requested,
+/// the grace timer has not started, so normal request-serving is never itself bounded by
+/// `grace`. Returns whichever of "served/drained cleanly" or "grace elapsed" happens
+/// first; the caller (`main`) returning either way lets the process exit, which force-closes
+/// anything `serve_fut` hadn't finished draining.
+async fn serve_with_bounded_grace<F>(
+    serve_fut: F,
+    mut shutdown_fired: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(serve_fut);
+    tokio::select! {
+        biased;
+        res = &mut serve_fut => res,
+        _ = async {
+            if !*shutdown_fired.borrow() {
+                let _ = shutdown_fired.changed().await;
+            }
+            tokio::time::sleep(grace).await;
+        } => {
+            eprintln!(
+                "ct-control-plane: shutdown grace period ({}s) elapsed with requests still in \
+                 flight -- forcing exit (#400, CT_CP_SHUTDOWN_GRACE_SECS)",
+                grace.as_secs()
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +415,119 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "ok");
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_with_bounded_grace_lets_a_request_finish_within_the_grace_window_400() {
+        // #400 property (b): a request that completes WITHIN the grace window must be
+        // served normally -- the bounded wrapper must not cut it short just because a
+        // grace bound exists at all.
+        use axum::routing::get;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_fired) = tokio::sync::watch::channel(false);
+        let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<()>();
+        let with_shutdown = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = sig_rx.await;
+            let _ = shutdown_tx.send(true);
+        });
+        // See main()'s own comment: `WithGracefulShutdown` only implements `IntoFuture`,
+        // not `Future` -- wrap it in an async block so it can be passed generically.
+        let serve_fut = async move { with_shutdown.await };
+
+        // Generous grace -- well longer than the 150ms the request actually takes, so a
+        // pass here proves the request wasn't force-closed, not just that the grace window
+        // happened to outlast it by luck.
+        let server = tokio::spawn(super::serve_with_bounded_grace(
+            serve_fut,
+            shutdown_fired,
+            std::time::Duration::from_secs(5),
+        ));
+
+        let url = format!("http://{addr}/slow");
+        let req = tokio::spawn(async move { reqwest::get(&url).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sig_tx.send(()).unwrap();
+
+        let resp = req.await.unwrap().unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "a request finishing within the grace window must be served normally, not force-closed"
+        );
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        // serve_with_bounded_grace itself must return promptly once drained -- not wait out
+        // the whole (generous) grace window it was given.
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("returns promptly once the drain is actually complete")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_with_bounded_grace_forces_exit_when_a_request_outlives_the_grace_window_400() {
+        // #400 property (c): a request that does NOT finish within the grace window must
+        // not hang shutdown forever -- serve_with_bounded_grace must return once the grace
+        // bound elapses, regardless of what's still in flight, so the caller (main) can
+        // proceed to exit and force-close it.
+        use axum::routing::get;
+        use axum::Router;
+
+        let app = Router::new().route(
+            "/hangs",
+            get(|| async {
+                // Far longer than the grace window below -- this handler is never allowed
+                // to finish naturally within the test's bound.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                "ok"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_fired) = tokio::sync::watch::channel(false);
+        let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<()>();
+        let with_shutdown = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = sig_rx.await;
+            let _ = shutdown_tx.send(true);
+        });
+        // See main()'s own comment: `WithGracefulShutdown` only implements `IntoFuture`,
+        // not `Future` -- wrap it in an async block so it can be passed generically.
+        let serve_fut = async move { with_shutdown.await };
+
+        let grace = std::time::Duration::from_millis(150);
+        let server = tokio::spawn(super::serve_with_bounded_grace(serve_fut, shutdown_fired, grace));
+
+        let url = format!("http://{addr}/hangs");
+        let _req = tokio::spawn(async move { reqwest::get(&url).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let start = tokio::time::Instant::now();
+        sig_tx.send(()).unwrap();
+
+        // Must return close to `grace` after the signal fires -- NOT after the request's
+        // own 10s duration. The 2s bound below is generous slack above `grace` (150ms)
+        // while staying far short of the 10s the stuck request would otherwise force.
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("serve_with_bounded_grace must return within a bounded time, not hang on the stuck request")
+            .unwrap()
+            .unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must not wait anywhere near the stuck request's own duration: {:?}",
+            start.elapsed()
+        );
     }
 }

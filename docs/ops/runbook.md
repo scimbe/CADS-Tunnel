@@ -112,6 +112,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 |----------|-----------|---------|
 | `CT_CONTROL_PLANE_LISTEN` | control plane | bind address (default `0.0.0.0:8090`) |
 | `CT_CONTROL_PLANE_DB` | control plane | SQLite path (put it on durable storage) |
+| `CT_CP_SHUTDOWN_GRACE_SECS` | control plane | on SIGTERM/Ctrl-C, how long (seconds) in-flight HTTP requests are given to finish before the process force-exits regardless; **default 30** (#400). Stops accepting new connections immediately; a stuck/slow request past this bound is cut off rather than hanging shutdown forever |
 | `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL; **alone** enables OIDC — the realm JWKS is fetched at startup to mount `/me/*` (#42) |
 | `CT_OIDC_PUBKEY_PATH` | control plane | PEM of the realm's RSA public key; an **offline override** of the JWKS fetch (takes precedence when set) |
 | `CT_OIDC_ACCESS_AUD` | control plane | **opt-in** access-token `aud` enforcement for `/me/*` (#82); set to your realm's field-checked access-token audience so a token whose `aud` omits it is rejected. Unset ⇒ audience not checked |
@@ -124,6 +125,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_EDGE_POW_DIFFICULTY` | edge | rendezvous PoW cost |
 | `CT_EDGE_RENDEZVOUS_MAX_PER_MIN` | edge | per-token rendezvous rate limit (rendezvous attempts per routing token per minute); **on by default at 600/min** (#95) — set a positive value to tune, or `0`/`off` to disable (#86/#95) |
 | `CT_EDGE_MAX_CONNECTIONS` | edge | cap on concurrent connections, shared globally across the QUIC + TCP accept loops; **on by default at 8192** (#95) — set a positive value to tune, or `0`/`off` to disable (#86/#95) |
+| `CT_EDGE_SHUTDOWN_GRACE_SECS` | edge | on SIGTERM/Ctrl-C, how long (seconds) already-admitted connections/tunnels are given to finish before the process force-exits regardless; **default 30** (#400). Every listener (QUIC front door, TCP fallback, `:443` front door, `:80` redirect, Browser-Plane SNI, ws-channel, both Agent-Fabric channel-broker endpoints) stops accepting new connections immediately; a still-open connection past this bound is force-closed rather than hanging shutdown forever |
 | `CT_EDGE_CERT_OUT` | edge | path the edge writes its CA root to |
 | `CT_EDGE_METRICS_LISTEN` | edge | bind address for `GET /metrics` (unset ⇒ off, issue #10) |
 | `CT_FRONT_DOOR` | edge | bind address for the unified :443 front door (SNI/ALPN-multiplexed relay + Portal + browser tunnels); unset ⇒ off, additive to `:4433`/`:8090` (#31) |

@@ -1808,6 +1808,59 @@ pub(crate) fn resolve_flood_limit(raw: Option<&str>, default: u32) -> Option<u32
     }
 }
 
+/// Default bound (#400) on how long `run_edge` waits, after a shutdown signal, for
+/// already-admitted connections to drain before it force-closes whatever's still open
+/// and returns. 30s: generous enough for a real in-flight tunnel request/relay hop to
+/// finish, short enough that an operator's own pod/container termination grace period
+/// (commonly 30s, e.g. Kubernetes' default `terminationGracePeriodSeconds`) isn't
+/// exceeded before this process would exit on its own anyway.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+
+/// Resolve `CT_EDGE_SHUTDOWN_GRACE_SECS` (#400): unset or unparseable falls back to
+/// [`DEFAULT_SHUTDOWN_GRACE_SECS`] (fail-safe -- a typo must not silently produce an
+/// unbounded or zero-length drain), a valid non-negative integer is used as-is (`0` is
+/// honored literally: no drain grace at all, immediate force-close on shutdown).
+fn shutdown_grace_secs_from_env() -> u64 {
+    match std::env::var("CT_EDGE_SHUTDOWN_GRACE_SECS") {
+        Err(_) => DEFAULT_SHUTDOWN_GRACE_SECS,
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!(
+                    "ct-edge: invalid CT_EDGE_SHUTDOWN_GRACE_SECS '{s}' -- using default {DEFAULT_SHUTDOWN_GRACE_SECS}s"
+                );
+                DEFAULT_SHUTDOWN_GRACE_SECS
+            }
+        },
+    }
+}
+
+/// Resolves once a shutdown has been requested via SIGTERM (the real-world trigger: a
+/// container/pod termination -- #376 made sure this actually reaches the process) or
+/// Ctrl-C/SIGINT (a developer running the daemon directly). Mirrors the control plane's
+/// own `shutdown_signal()` (`crates/control-plane/src/main.rs`, #350).
+async fn wait_for_shutdown_request() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            std::future::pending::<()>().await;
+            unreachable!();
+        };
+        sig.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 /// Resolve the Agent-Fabric channel **relay** listen address from the rendezvous
 /// `chan_addr` and an optional `CT_EDGE_CHANNEL_RELAY_LISTEN` override — refusing a
 /// collision with the rendezvous port. The relay MUST be a distinct endpoint: if the relay
@@ -1838,6 +1891,32 @@ fn resolve_channel_relay_addr(
 }
 
 pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxError> {
+    // #400 (follow-up to #376): #376 fixed signal *delivery* (tini as PID 1, `STOPSIGNAL
+    // SIGTERM`) so a SIGTERM/Ctrl-C actually reaches this process; this is the missing
+    // application-level graceful-drain half. `shutdown` is cloned into every listener
+    // spawned below (front door, TCP fallback, `:80` redirect, Browser-Plane SNI,
+    // ws-channel, both QUIC channel-broker endpoints) and raced into the main QUIC accept
+    // loop at the bottom of this function, so every accept point stops admitting new
+    // connections the moment shutdown fires -- but does not touch any connection already
+    // admitted. Once the main loop returns, this function waits (bounded by
+    // `CT_EDGE_SHUTDOWN_GRACE_SECS`) for every configured `ConnectionCap` to drain to zero
+    // in-use before returning -- see the SIGTERM/Ctrl-C task spawned right below and the
+    // drain wait at the bottom of this function, and `crate::shutdown`'s module doc for
+    // the full design writeup.
+    let (shutdown_ctl, shutdown) = crate::shutdown::ShutdownController::new();
+    {
+        let shutdown_ctl = shutdown_ctl.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown_request().await;
+            eprintln!(
+                "ct-edge: shutdown signal received -- stopping new accepts, draining in-flight \
+                 connections for up to {}s (#400, CT_EDGE_SHUTDOWN_GRACE_SECS)",
+                shutdown_grace_secs_from_env()
+            );
+            shutdown_ctl.trigger();
+        });
+    }
+
     // Issue the Edge's leaf from an internal CA (M20.3b) and listen on both QUIC
     // (primary) and TLS-TCP (fallback) with that one shared leaf. Persist the CA
     // signing key beside the published root so a redeploy reloads the SAME CA
@@ -2107,6 +2186,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         conn_cap.clone(),
                         "Browser-Plane SNI listener",
                         None,
+                        shutdown.clone(),
                         move |tcp, _addr, permit| {
                             let state = bstate.clone();
                             let browser_tunnel_cap = browser_tunnel_cap_bl.clone();
@@ -2144,6 +2224,17 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // present, so a `:443`/QUIC member and a browser member of the same channel
     // correlate through one pairer and can pair with each other.
     let mut shared_channel_pairer: Option<crate::channel_broker::SharedChannelPairer> = None;
+    // #400: kept alive here (in `run_edge`'s own stack frame, which does not drop until
+    // `run_edge` itself returns -- i.e. not until AFTER the bounded shutdown-drain wait
+    // completes) so the QUIC channel-broker relay/rendezvous pairers -- constructed just
+    // below, one each, never shared with each other -- survive their OWN
+    // `run_channel_broker_loop`'s early return on shutdown. Without this, that loop
+    // returning would drop the last `Arc` reference to its pairer and force-close every
+    // parked member immediately on shutdown, instead of letting it survive the grace
+    // period like every other in-flight connection. See `SharedQuicChannelPairer`'s and
+    // `run_channel_broker_loop`'s own doc comments for the full story.
+    let mut _relay_pairer_keepalive: Option<crate::channel_broker::SharedQuicChannelPairer> = None;
+    let mut _rendezvous_pairer_keepalive: Option<crate::channel_broker::SharedQuicChannelPairer> = None;
     if let Ok(addr) = std::env::var("CT_FRONT_DOOR") {
         match addr.parse::<SocketAddr>() {
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
@@ -2344,6 +2435,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         conn_cap.clone(),
                         ":443 front door",
                         None,
+                        shutdown.clone(),
                         move |tcp, _addr, permit| {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
@@ -2418,6 +2510,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         conn_cap.clone(),
                         ":80 redirect",
                         Some(HTTP_REDIRECT_READ_TIMEOUT),
+                        shutdown.clone(),
                         move |tcp, _addr, permit| async move {
                             let _permit = permit; // held for the connection's lifetime
                             let _ = serve_http_redirect(tcp).await;
@@ -2446,6 +2539,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         conn_cap.clone(),
         "TCP fallback",
         None,
+        shutdown.clone(),
         move |tcp, _addr, permit| {
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
@@ -2510,6 +2604,15 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             Ok((relay_ep, _)) => {
                                 let relay_az = authorizer.clone();
                                 let relay_cap = channel_broker_cap.clone();
+                                let shutdown_relay = shutdown.clone();
+                                // #400: constructed here (not inside `run_channel_broker_loop`) so
+                                // `run_edge` can keep its own clone alive independently of the
+                                // loop's lifetime -- see `_relay_pairer_keepalive`'s own comment above.
+                                let relay_pairer: crate::channel_broker::SharedQuicChannelPairer =
+                                    std::sync::Arc::new(std::sync::Mutex::new(
+                                        crate::channel_broker::ChannelPairer::new(),
+                                    ));
+                                _relay_pairer_keepalive = Some(relay_pairer.clone());
                                 eprintln!("ct-edge: Agent-Fabric channel RELAY on {relay_addr} (#105/#72 AF4-relay, #109 concurrent)");
                                 tokio::spawn(async move {
                                     // #109-concurrent-b: drive the relay with a channel-keyed
@@ -2542,6 +2645,8 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                             crate::channel_broker::finish_relay_pair(a, b, now)
                                         },
                                         relay_cap,
+                                        shutdown_relay,
+                                        relay_pairer,
                                     )
                                     .await;
                                 });
@@ -2555,6 +2660,15 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                              (authorize via {cp_url}, #81 SEC81c-c, #120 concurrent)"
                         );
                         let rendezvous_cap = channel_broker_cap.clone();
+                        let shutdown_rendezvous = shutdown.clone();
+                        // #400: same reasoning as the relay pairer above -- constructed here so
+                        // `run_edge` can keep its own clone alive independently of the loop's
+                        // own lifetime.
+                        let rendezvous_pairer: crate::channel_broker::SharedQuicChannelPairer =
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                crate::channel_broker::ChannelPairer::new(),
+                            ));
+                        _rendezvous_pairer_keepalive = Some(rendezvous_pairer.clone());
                         tokio::spawn(async move {
                             // #120: drive the RENDEZVOUS endpoint with the same channel-keyed
                             // pairer that spawns each pair-completion on its own task, so a
@@ -2588,6 +2702,8 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     crate::channel_broker::finish_rendezvous_pair(a, b, now)
                                 },
                                 rendezvous_cap,
+                                shutdown_rendezvous,
+                                rendezvous_pairer,
                             )
                             .await;
                         });
@@ -2637,6 +2753,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 );
                 let ws_channel_cap = ws_channel_cap.clone();
                 let ws_channel_tls = build_ws_channel_cert();
+                let shutdown_ws = shutdown.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::ws_channel::serve_ws_channel_with_pairer(
                         ws_addr,
@@ -2644,6 +2761,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         pairer,
                         ws_channel_cap,
                         ws_channel_tls,
+                        shutdown_ws,
                     )
                     .await
                     {
@@ -2655,8 +2773,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         }
     }
 
-    // QUIC accept loop (primary).
-    while let Some(incoming) = endpoint.accept().await {
+    // QUIC accept loop (primary). #400: raced against `shutdown` so a pending
+    // `endpoint.accept()` doesn't stop this from noticing shutdown promptly -- once
+    // triggered, this breaks out (stops admitting new Agent connections) instead of
+    // looping forever; already-admitted connections are untouched here (each runs to
+    // completion on its own already-spawned task, same as before this change).
+    loop {
+        let incoming = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                eprintln!("ct-edge: QUIC front door stopping new accepts (shutdown)");
+                break;
+            }
+            accepted = endpoint.accept() => match accepted {
+                Some(i) => i,
+                None => break,
+            },
+        };
         // #86 SEC86b: when a connection cap is configured and full, shed this
         // connection cheaply (no handshake response) rather than spawning unbounded.
         let permit = match &conn_cap {
@@ -2690,6 +2823,45 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
             }
         });
     }
+
+    // #400: bounded grace-drain. Every accept point above has already stopped admitting
+    // (the SIGTERM/Ctrl-C task triggered `shutdown`, which every listener spawned in this
+    // function selects against); this waits for the connections THEY ALREADY ADMITTED to
+    // finish, up to `CT_EDGE_SHUTDOWN_GRACE_SECS` (default 30s), before returning. Every
+    // public accept path in this daemon is gated by one of these five caps, so "every cap
+    // reports zero in-use" is this process's actual "fully drained" signal -- a cap an
+    // operator explicitly disabled (`CT_EDGE_MAX_*=off`) can't be waited on (no permit to
+    // observe), so that specific listener's connections are simply not represented in the
+    // drain wait; see `wait_for_drain`'s own doc comment. Once this returns, `run_edge`
+    // returns, `main()` returns, and the Tokio runtime drop aborts anything still
+    // running -- the actual "force-close" for whatever didn't finish in time.
+    if shutdown.is_cancelled() {
+        let grace = std::time::Duration::from_secs(shutdown_grace_secs_from_env());
+        let caps = [
+            conn_cap.clone(),
+            browser_tunnel_cap.clone(),
+            tcp_agent_cap.clone(),
+            ws_channel_cap.clone(),
+            channel_broker_cap.clone(),
+        ];
+        let still_open = crate::shutdown::wait_for_drain(&caps, grace).await;
+        if still_open == 0 {
+            eprintln!("ct-edge: shutdown drain complete -- every in-flight connection finished cleanly");
+        } else {
+            eprintln!(
+                "ct-edge: shutdown grace period ({}s) elapsed with {still_open} connection(s) \
+                 still open -- force-closing and exiting",
+                grace.as_secs()
+            );
+        }
+    }
+    // #400: explicit, not merely incidental to scope end -- this is the precise point the
+    // relay/rendezvous channel-broker pairers' extra keep-alive references (see
+    // `_relay_pairer_keepalive`'s own comment near the top of this function) are meant to
+    // survive UNTIL: after the drain wait above, together with every other still-open
+    // connection this function was already about to drop by returning anyway.
+    drop(_relay_pairer_keepalive);
+    drop(_rendezvous_pairer_keepalive);
     Ok(())
 }
 

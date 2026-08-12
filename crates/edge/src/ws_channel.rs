@@ -459,12 +459,14 @@ async fn serve_with_optional_tls(
     tls: Option<tokio_rustls::TlsAcceptor>,
     router: Router,
     cap: Option<crate::state::ConnectionCap>,
+    shutdown: crate::shutdown::ShutdownSignal,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::transport::serve_listener(
         inner,
         cap,
         "ws-channel",
         Some(WS_CHANNEL_HANDSHAKE_TIMEOUT),
+        shutdown,
         move |stream, addr, permit| {
             let router = router.clone().layer(axum::Extension(AcceptPermit::new(permit)));
             let tls = tls.clone();
@@ -513,10 +515,11 @@ pub async fn serve_ws_channel_with_pairer(
     pairer: crate::channel_broker::SharedChannelPairer,
     cap: Option<crate::state::ConnectionCap>,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    shutdown: crate::shutdown::ShutdownSignal,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = WsChannelState::new(resolver, pairer, cap.clone());
     let inner = tokio::net::TcpListener::bind(listen).await?;
-    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap).await
+    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap, shutdown).await
 }
 
 #[cfg(test)]
@@ -725,7 +728,7 @@ mod tests {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe); // free the port for serve_ws_channel_with_pairer to bind for real
-        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor)));
+        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor), crate::shutdown::ShutdownSignal::never()));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         async fn join_tls(

@@ -9,7 +9,7 @@ license-file.workspace = true
 ct-common = { path = "../common" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 time = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "signal"] }
 # TCP keepalive (#229) -- see ct-agent's Cargo.toml (github.com/scimbe/ct-agent)
 # for the matching comment; applied on the Edge's side of the TLS-TCP fallback too,
 # for the same reason.

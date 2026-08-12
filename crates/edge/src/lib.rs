@@ -13,6 +13,7 @@ pub mod relay;
 pub mod relay_gate;
 pub mod rendezvous;
 pub mod serve;
+pub mod shutdown;
 pub mod sni;
 pub mod state;
 pub mod transport;

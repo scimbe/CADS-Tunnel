@@ -711,6 +711,17 @@ pub(crate) struct AdmittedMember {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+/// The QUIC-native analog of [`SharedChannelPairer`] (which is stream-generic, for the
+/// `:443`/ws-channel front doors): one `Arc` per QUIC channel-broker endpoint (relay,
+/// rendezvous -- each gets its OWN, they are never shared with each other), constructed
+/// by [`crate::serve::run_edge`] and passed into [`run_channel_broker_loop`] rather than
+/// built internally, so `run_edge` can keep its own clone alive independently of the
+/// loop's own lifetime (#400 -- see `run_channel_broker_loop`'s doc comment for why that
+/// matters: an internally-constructed pairer would be dropped, force-closing every
+/// parked member, the instant the loop returns on shutdown).
+pub(crate) type SharedQuicChannelPairer =
+    std::sync::Arc<std::sync::Mutex<ChannelPairer<AdmittedMember>>>;
+
 /// Accept one QUIC connection and admit its channel-join, returning it as an
 /// [`AdmittedMember`] ready to pair. Thin wrapper over `accept_and_read_join` that
 /// packs the admitted tuple into the pairing unit both `broker_channel_*` functions
@@ -1262,7 +1273,29 @@ where
 /// `offer`/`drain_expired`, never across an `.await`; the spawned `complete` future must be
 /// `Send + 'static` ([`AdmittedMember`] is).
 ///
-/// Never returns: it *is* the endpoint's accept loop, spawned by `run_edge`.
+/// `shutdown` (#400): raced against `endpoint.accept()` via `tokio::select!` each
+/// iteration, so a pending accept doesn't stop this loop from noticing shutdown
+/// promptly. Once triggered, this returns (stops admitting new channel members)
+/// instead of accepting further connections. The park-TTL sweep also stops running at
+/// that point -- a member already parked, waiting for a partner that may never arrive,
+/// is no longer proactively closed by this loop.
+///
+/// `pairer` (#400): passed in by the CALLER rather than constructed internally --
+/// deliberately, not cosmetically. This function's own local variables (including a
+/// self-constructed pairer) are dropped the instant it returns, which happens
+/// immediately on shutdown; a parked member's `AdmittedMember` (and the connection +
+/// cap permit it carries) lives inside the pairer's map, so if this function's return
+/// dropped the LAST `Arc` reference to it, every parked member would be force-closed
+/// the moment shutdown fires -- defeating the whole point of the bounded grace period
+/// (a real bug caught by this crate's own `run_channel_broker_loop_stops_accepting_
+/// promptly_once_shutdown_is_triggered_400` test). By taking the pairer as a parameter,
+/// the caller (`run_edge`) can keep its OWN clone alive in its own stack frame for the
+/// whole bounded drain window ([`crate::shutdown::wait_for_drain`]) -- this function's
+/// return no longer drops the last reference, so a parked member survives exactly as
+/// long as every other still-open connection does, and is force-closed together with
+/// them only when `run_edge` itself finally returns.
+///
+/// Otherwise never returns: it *is* the endpoint's accept loop, spawned by `run_edge`.
 pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     endpoint: &Endpoint,
     now_fn: N,
@@ -1270,6 +1303,8 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     park_ttl: UnixSeconds,
     complete: C,
     cap: Option<crate::state::ConnectionCap>,
+    shutdown: crate::shutdown::ShutdownSignal,
+    pairer: SharedQuicChannelPairer,
 ) where
     N: Fn() -> UnixSeconds + Send + Sync + 'static,
     F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
@@ -1277,11 +1312,11 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     C: Fn(AdmittedMember, AdmittedMember, UnixSeconds) -> CFut + Send + Sync + 'static,
     CFut: std::future::Future<Output = Result<ChannelPairing, BoxError>> + Send + 'static,
 {
-    // #203: the pairer + closures are shared into each per-connection admission task, so admission
+    // #203: the closures are shared into each per-connection admission task, so admission
     // (the slow grant-verify + possession-proof handshake) runs concurrently across channels instead
     // of serialized in the accept loop — the admission analog of #120/#1's already-spawned pair
-    // COMPLETION. Arc so each spawned task can hold them.
-    let pairer = std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::<AdmittedMember>::new()));
+    // COMPLETION. Arc so each spawned task can hold them. (The pairer itself is now a parameter --
+    // see this function's own doc comment, #400.)
     let now_fn = std::sync::Arc::new(now_fn);
     let authorize = std::sync::Arc::new(authorize);
     let complete = std::sync::Arc::new(complete);
@@ -1300,12 +1335,19 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         // SPAWNED task, so ONE in-flight admission can't serialize every other channel's admission on
         // this edge (#203: the loop awaited accept_member — the whole handshake — inline; `structure`
         // / `review`, dialed last in a multi-stage pipeline, lost most to that contention).
-        let incoming = match endpoint.accept().await {
-            Some(i) => i,
-            None => {
-                eprintln!("ct-edge: channel broker endpoint closed with no incoming");
+        let incoming = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                eprintln!("ct-edge: channel broker stopping new accepts (shutdown)");
                 return;
             }
+            accepted = endpoint.accept() => match accepted {
+                Some(i) => i,
+                None => {
+                    eprintln!("ct-edge: channel broker endpoint closed with no incoming");
+                    return;
+                }
+            },
         };
         // #450: every other public listener acquires a connection-cap permit before
         // spawning its per-connection task; this loop spawned unbounded until now.
@@ -3007,6 +3049,8 @@ mod tests {
                 10_000,
                 finish_relay_pair,
             None,
+            crate::shutdown::ShutdownSignal::never(),
+            std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
             )
             .await;
         });
@@ -3126,6 +3170,8 @@ mod tests {
                 10_000,
                 finish_rendezvous_pair,
             None,
+            crate::shutdown::ShutdownSignal::never(),
+            std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
             )
             .await;
         });
@@ -3209,6 +3255,8 @@ mod tests {
                 10_000,
                 finish_rendezvous_pair,
             None,
+            crate::shutdown::ShutdownSignal::never(),
+            std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
             )
             .await;
         });
@@ -3275,6 +3323,8 @@ mod tests {
                 park_ttl,
                 finish_rendezvous_pair,
             None,
+            crate::shutdown::ShutdownSignal::never(),
+            std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
             )
             .await;
         });
@@ -3843,6 +3893,8 @@ mod tests {
                 park_ttl,
                 finish_rendezvous_pair,
                 Some(cap_loop),
+                crate::shutdown::ShutdownSignal::never(),
+                std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
             )
             .await;
         });
@@ -3906,6 +3958,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_channel_broker_loop_stops_accepting_promptly_once_shutdown_is_triggered_400() {
+        // #400 property (a), for the QUIC channel-broker accept loop specifically (it does
+        // NOT go through `crate::transport::serve_listener` -- `endpoint.accept()` has a
+        // different shape than `TcpListener::accept()`, per #452's own doc comment -- so its
+        // shutdown wiring is separately proven here rather than inherited from
+        // `transport.rs`'s test). Once triggered, the loop must stop calling
+        // `endpoint.accept()` and return promptly -- proven by the driving task joining
+        // within a bounded time -- without touching a member ALREADY admitted and parked
+        // (that member's permit stays held; force-closing it is `run_edge`'s
+        // `wait_for_drain` job, not this loop's, exactly as its own doc comment says).
+        let pk = operator_pubkey();
+        let chan = [0x53u8; 32];
+        let cap = crate::state::ConnectionCap::new(2);
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let (ctl, shutdown) = crate::shutdown::ShutdownController::new();
+        let cap_loop = cap.clone();
+        // #400: the pairer is constructed HERE, outside the spawned driver task, and this
+        // test keeps its own clone (`pairer`) alive in its own scope for the whole test --
+        // exactly mirroring the real fix in `run_edge` (which keeps its own clone alive for
+        // the whole bounded drain window). Without this, `run_channel_broker_loop` itself
+        // would own the only reference and drop it (force-closing the parked member) the
+        // instant it returns on shutdown, which is the real bug this test exists to catch.
+        let pairer = std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new()));
+        let pairer_loop = pairer.clone();
+        let driver = tokio::spawn(async move {
+            run_channel_broker_loop(
+                &server,
+                || 500u64,
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
+                10_000,
+                finish_rendezvous_pair,
+                Some(cap_loop),
+                shutdown,
+                pairer_loop,
+            )
+            .await;
+        });
+
+        // A member connects and parks BEFORE shutdown -- admitted normally.
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let req = ChannelJoinRequest {
+            grant: grant_h(chan, &holder_sk(0xc1), Direction::Initiate, 1_000),
+            endpoint: "203.0.113.3:9103".to_string(),
+        };
+        present_join_no_ack(&conn, &req.encode(), &holder_sk(0xc1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(cap.available(), 1, "the member admitted before shutdown holds its permit");
+
+        ctl.trigger();
+        tokio::time::timeout(std::time::Duration::from_millis(500), driver)
+            .await
+            .expect("run_channel_broker_loop returns promptly once shutdown is triggered")
+            .expect("task joined without panicking");
+
+        // The already-parked member from before shutdown is untouched by the loop's own
+        // return -- its permit is still held (force-closing it is `wait_for_drain`'s job,
+        // exercised separately in `shutdown.rs`'s tests).
+        assert_eq!(cap.available(), 1, "shutdown does not itself force-close an already-parked member");
+        drop(conn);
+    }
+
+    #[tokio::test]
     async fn run_channel_broker_loop_holds_two_permits_for_a_matched_relay_pair_451() {
         // The relay-side companion to the park test: two members of the SAME channel connect,
         // pair, and their relay is spliced on a freshly spawned `complete(..)` task. Before the
@@ -3929,6 +4047,8 @@ mod tests {
                 10_000,
                 finish_relay_pair,
                 Some(cap_loop),
+                crate::shutdown::ShutdownSignal::never(),
+                std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
             )
             .await;
         });
