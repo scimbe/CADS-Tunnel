@@ -1114,7 +1114,7 @@ mod tests {
         let tcp_edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_t, &chal_t).await;
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
         });
 
         // Client over TLS-TCP: Noise tunnel to the Origin.

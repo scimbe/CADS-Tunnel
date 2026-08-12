@@ -840,6 +840,11 @@ pub async fn serve_front_door(
     mesh_relay: Option<&MeshRelayConfig>,
     relay_gate: Option<&crate::relay_gate::RelayGateContext>,
     browser_tunnel_cap: Option<&ConnectionCap>,
+    // #410: the TCP-fallback Agent-registration sub-cap -- threaded through to the
+    // `EdgeRelay` arm's `serve_tcp_connection` call so a `:443` front-door connection
+    // that ends up in role 'A'/'B' gets the SAME protection as the dedicated TCP
+    // fallback listener (see `tcp_agent_cap`'s doc in `run_edge`).
+    tcp_agent_cap: Option<&ConnectionCap>,
     // #451: this connection's own accept-loop `ConnectionCap` permit (`None` when
     // uncapped), OWNED by this call rather than held in a wrapping `let _permit = ..;`
     // by the caller. Every arm except `ChannelBroker` already blocks for the
@@ -874,7 +879,7 @@ pub async fn serve_front_door(
             let tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, acceptor.accept(joined))
                 .await
                 .map_err(|_| -> BoxError { "front door: TLS handshake not completed within the timeout (#422)".into() })??;
-            serve_tcp_connection(tls, state, challenge).await
+            serve_tcp_connection(tls, state, challenge, tcp_agent_cap).await
         }
         crate::sni::FrontDoorRoute::Proxy(host) => {
             let (addr, tls) = proxies
@@ -1359,10 +1364,16 @@ pub async fn serve_agent_connection(
 ///
 /// The relay is transport-agnostic, so any Client (TCP or QUIC) bridges to either
 /// a TCP-registered or a QUIC-registered agent.
+///
+/// `tcp_agent_cap` (#410) is a dedicated sub-cap admitted against for role 'A'/'B'
+/// ONLY, before the connection parks -- see its doc in `run_edge` for why a park
+/// TTL / known-token check isn't the right shape here, and `browser_tunnel_cap`
+/// (#254) for the precedent this mirrors.
 pub async fn serve_tcp_connection<S>(
     mut stream: S,
     state: &EdgeState<Connection>,
     challenge: &Challenge,
+    tcp_agent_cap: Option<&ConnectionCap>,
 ) -> Result<(), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1383,10 +1394,25 @@ where
             // `register_with_candidate_unless_revoked`), and the ack now
             // reflects the real outcome (`NO` on revoked, matching the QUIC
             // arm's wire behavior) instead of always claiming `OK` up front.
-            let (_token, parked) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+            //
+            // #410: admitted against the dedicated `tcp_agent_cap` sub-cap right
+            // after the token is read, BEFORE `park_tcp_agent_unless_revoked` queues
+            // anything in `tcp_agents` -- so a flood that finds the sub-cap already
+            // full is shed with nothing to clean back up, and never touches the
+            // caller's own (shared, long-held-elsewhere) `conn_cap` permit for this
+            // connection. The sub-permit is then held for the SAME lifetime the
+            // connection itself already gets (parked, then relaying) -- it is simply
+            // never acquired at all when `tcp_agent_cap` is unconfigured (uncapped).
+            let (_token, parked, _sub_permit) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
                 let mut token_buf = [0u8; 32];
                 stream.read_exact(&mut token_buf).await?;
                 let token = RoutingToken(token_buf);
+                let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
+                if tcp_agent_cap.is_some() && sub_permit.is_none() {
+                    stream.write_all(b"NO").await?;
+                    stream.flush().await?;
+                    return Ok::<_, BoxError>((token, None, None));
+                }
                 let parked = state.park_tcp_agent_unless_revoked(token.clone());
                 if parked.is_some() {
                     stream.write_all(b"OK").await?;
@@ -1394,7 +1420,7 @@ where
                     stream.write_all(b"NO").await?;
                 }
                 stream.flush().await?;
-                Ok::<_, BoxError>((token, parked))
+                Ok::<_, BoxError>((token, parked, sub_permit))
             })
             .await
             .map_err(|_| "tcp-fallback: role 'A' admission timed out")??;
@@ -1428,10 +1454,21 @@ where
             // `'B' | token(32) | host_len(2 BE) | host`.
             // #258: bound the admission exchange, same as arm 'A'. `None` means
             // admission was refused inline (NO already sent) -- just return.
+            // #410: admitted against `tcp_agent_cap` right after the token is known,
+            // BEFORE the hostname is even read -- same rationale as arm 'A' (see that
+            // arm's comment and `tcp_agent_cap`'s own doc in `run_edge`). Checked
+            // ahead of `host_bind_allowed`/`register_host` so a flood that finds the
+            // sub-cap full never touches the hostname-routing table at all.
             let admitted = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
                 let mut token_buf = [0u8; 32];
                 stream.read_exact(&mut token_buf).await?;
                 let token = RoutingToken(token_buf);
+                let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
+                if tcp_agent_cap.is_some() && sub_permit.is_none() {
+                    stream.write_all(b"NO").await?;
+                    stream.flush().await?;
+                    return Ok::<_, BoxError>(None);
+                }
                 let mut hl = [0u8; 2];
                 stream.read_exact(&mut hl).await?;
                 let hlen = u16::from_be_bytes(hl) as usize;
@@ -1449,11 +1486,11 @@ where
                 }
                 stream.write_all(b"OK").await?;
                 stream.flush().await?;
-                Ok(Some(token))
+                Ok(Some((token, sub_permit)))
             })
             .await
             .map_err(|_| "tcp-fallback: role 'B' admission timed out")??;
-            let Some(token) = admitted else { return Ok(()) };
+            let Some((token, _sub_permit)) = admitted else { return Ok(()) };
             match state.park_tcp_agent(token).await {
                 Ok(mut client) => {
                     relay(&mut stream, &mut client).await?;
@@ -1855,6 +1892,31 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     )
     .map(|n| {
         eprintln!("ct-edge: max {n} concurrent BrowserTunnel connections (CT_EDGE_MAX_BROWSER_TUNNEL_CONNECTIONS, #254)");
+        ConnectionCap::new(n as usize)
+    });
+    // #410: a SEPARATE, smaller cap for the TCP-fallback Agent-registration park
+    // (`serve_tcp_connection`'s role 'A'/'B' -> `park_tcp_agent`/`park_tcp_agent_unless_revoked`).
+    // Reaching that park requires only a bare 32-byte token in the clear -- no PoW, and
+    // (unlike role 'B''s hostname bind, gated by `host_bind_allowed` whenever host-auth
+    // is required) role 'A' has no equivalent registry to check the token against: a
+    // `RoutingToken` is an opaque bearer secret the control plane hands a tunnel owner
+    // out of band, so the Edge genuinely cannot distinguish "a legitimate Agent's
+    // first-ever registration for a brand-new token" from "an attacker's 32 random
+    // bytes" -- refusing anything the Edge doesn't already recognize would break every
+    // legitimate Agent's very first connect. A legitimate Agent is also intentionally
+    // allowed to sit parked indefinitely waiting for a Client (same as the QUIC 'A'
+    // arm), so this deliberately does NOT add a TTL that could kill a real, low-traffic
+    // tunnel's registration. Instead, exactly like `browser_tunnel_cap` (#254) already
+    // does for the OTHER no-PoW, attacker-reachable arm sharing the same `conn_cap`: an
+    // attacker flooding bare 'A'/'B' registrations can now exhaust at most this
+    // dedicated sub-budget, never cascading into the shared `conn_cap` that Portal/
+    // auth/QUIC/`:80`-redirect all depend on (#410).
+    let tcp_agent_cap = resolve_flood_limit(
+        std::env::var("CT_EDGE_MAX_TCP_AGENT_CONNECTIONS").ok().as_deref(),
+        DEFAULT_MAX_CONNECTIONS / 2,
+    )
+    .map(|n| {
+        eprintln!("ct-edge: max {n} concurrent TCP-fallback Agent registrations (CT_EDGE_MAX_TCP_AGENT_CONNECTIONS, #410)");
         ConnectionCap::new(n as usize)
     });
     // Video-conferencing feature: every OTHER public listener sheds cheaply under a
@@ -2276,6 +2338,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // connection is meant to stay open for the tunnel's/session's whole real
                     // lifetime, which a whole-handler timeout here would incorrectly bound.
                     let browser_tunnel_cap_fd = browser_tunnel_cap.clone();
+                    let tcp_agent_cap_fd = tcp_agent_cap.clone();
                     tokio::spawn(crate::transport::serve_listener(
                         fl,
                         conn_cap.clone(),
@@ -2291,6 +2354,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let mesh_relay_config = mesh_relay_config.clone();
                             let relay_gate_ctx = relay_gate_ctx.clone();
                             let browser_tunnel_cap = browser_tunnel_cap_fd.clone();
+                            let tcp_agent_cap = tcp_agent_cap_fd.clone();
                             async move {
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -2311,6 +2375,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     mesh_relay_config.as_ref(),
                                     relay_gate_ctx.as_ref(),
                                     browser_tunnel_cap.as_ref(),
+                                    tcp_agent_cap.as_ref(),
                                     permit,
                                 )
                                 .await
@@ -2375,6 +2440,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // shed logging, spawning). No helper-level `handshake_timeout` — this connection
     // stays open for the tunnel's whole life; only the TLS handshake itself is bounded,
     // via `TCP_FALLBACK_ADMISSION_TIMEOUT` inside the handler, unchanged from before.
+    let tcp_agent_cap_loop = tcp_agent_cap.clone();
     tokio::spawn(crate::transport::serve_listener(
         tcp_listener,
         conn_cap.clone(),
@@ -2383,6 +2449,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         move |tcp, _addr, permit| {
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
+            let tcp_agent_cap = tcp_agent_cap_loop.clone();
             async move {
                 let _permit = permit; // held for the connection's lifetime
                 // #258: bound the handshake too, not just the admission reads inside
@@ -2394,7 +2461,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let mut nonce = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 let challenge = Challenge { nonce, difficulty };
-                let _ = serve_tcp_connection(tls, &state, &challenge).await;
+                let _ = serve_tcp_connection(tls, &state, &challenge, tcp_agent_cap.as_ref()).await;
             }
         },
     ));
@@ -3055,7 +3122,7 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let start = tokio::time::Instant::now();
-            let res = serve_tcp_connection(edge_side, &state, &challenge).await;
+            let res = serve_tcp_connection(edge_side, &state, &challenge, None).await;
             (res, start.elapsed())
         });
 
@@ -3086,7 +3153,7 @@ mod tests {
         let state_srv = state.clone();
         tokio::spawn(async move {
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            let _ = serve_tcp_connection(edge_side, &state_srv, &challenge).await;
+            let _ = serve_tcp_connection(edge_side, &state_srv, &challenge, None).await;
         });
 
         let host = "help.bunsenbrenner.org";
@@ -3141,7 +3208,7 @@ mod tests {
                 tokio::spawn(async move {
                     if let Ok(tls) = acceptor.accept(tcp).await {
                         let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-                        let _ = serve_tcp_connection(tls, &state, &challenge).await;
+                        let _ = serve_tcp_connection(tls, &state, &challenge, None).await;
                     }
                 });
             }
@@ -3219,7 +3286,7 @@ mod tests {
             let (tcp, _) = listener_b.accept().await.unwrap();
             if let Ok(tls) = acceptor_b.accept(tcp).await {
                 let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-                let _ = serve_tcp_connection(tls, &state_b, &challenge).await;
+                let _ = serve_tcp_connection(tls, &state_b, &challenge, None).await;
             }
         });
 
@@ -3550,7 +3617,7 @@ mod tests {
         let tcp_edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_t, &chal_t).await;
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
         });
 
         // Client over TLS-TCP: 'C' rendezvous + 15 bytes, read the 15-byte echo.
@@ -3674,7 +3741,7 @@ mod tests {
         let tcp_edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_t, &chal_t).await;
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
         });
 
         // Agent over TLS-TCP: register 'A', then echo the relayed client bytes.
@@ -3795,7 +3862,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(1024);
         let state_a = state.clone();
         let chal_a = challenge.clone();
-        let edge = tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_a, &chal_a).await });
+        let edge = tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_a, &chal_a, None).await });
 
         // Agent peer: register 'A' | token, read OK, then echo (origin-relay sim).
         let mut hdr = vec![b'A'];
@@ -3830,6 +3897,190 @@ mod tests {
         echo.await.unwrap();
         drop(client_peer);
         let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_role_a_sheds_once_the_tcp_agent_cap_is_full_410() {
+        // #410: role 'A' must admit against the dedicated `tcp_agent_cap` sub-cap
+        // BEFORE parking -- proven the same way #254's own sibling sub-cap is proven
+        // (`front_door_sheds_a_browser_tunnel_connection_once_its_own_sub_cap_is_full_254`):
+        // hold the sub-cap's only permit BEFORE the connection arrives, then confirm
+        // `serve_tcp_connection` refuses (NO, prompt return) instead of queuing the
+        // token into `tcp_agents` and parking forever.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x41; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let cap = ConnectionCap::new(1);
+        let _held = cap.try_admit().unwrap(); // the sub-cap's only permit is already taken
+
+        let (mut attacker, edge_side) = tokio::io::duplex(64);
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(edge_side, &state, &challenge, Some(&cap)).await
+        });
+
+        let mut hdr = vec![b'A'];
+        hdr.extend_from_slice(&token.0);
+        attacker.write_all(&hdr).await.unwrap();
+        attacker.flush().await.unwrap();
+
+        let mut ack = [0u8; 2];
+        attacker.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"NO", "shed once the tcp-agent sub-cap is full, not parked forever");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), edge)
+            .await
+            .expect("serve_tcp_connection returns promptly when shed by the sub-cap, it never blocks waiting on it")
+            .unwrap();
+        assert!(result.is_ok(), "a sub-cap shed is a clean close, not an error: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_role_a_still_parks_and_relays_when_the_tcp_agent_cap_has_room_410() {
+        // #410 regression guard: the new `tcp_agent_cap` sub-cap must not break a
+        // legitimate registration + delivery when it has room -- same shape as
+        // `tcp_agent_registers_and_relays_a_delivered_client` above, just with the
+        // cap configured, so a fresh/first-ever token (no pre-existing registration
+        // record -- there IS none to check, see `tcp_agent_cap`'s doc) still parks
+        // and relays exactly as before.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x44; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+        let cap = ConnectionCap::new(2);
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(1024);
+        let state_a = state.clone();
+        let cap_a = cap.clone();
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(agent_edge, &state_a, &challenge, Some(&cap_a)).await
+        });
+
+        let mut hdr = vec![b'A'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK", "a legitimate registration is still acked OK with the sub-cap configured");
+        assert_eq!(cap.in_use(), 1, "the successful park holds exactly one tcp_agent_cap permit");
+
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 5];
+            agent_peer.read_exact(&mut buf).await.unwrap();
+            agent_peer.write_all(&buf).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        });
+
+        while !state.has_tcp_agent(&token) {
+            tokio::task::yield_now().await;
+        }
+        let (mut client_peer, client_edge) = tokio::io::duplex(1024);
+        state
+            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        client_peer.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 5];
+        client_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello", "round-trip relayed through the TCP-registered agent, cap configured");
+
+        echo.await.unwrap();
+        drop(client_peer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test]
+    async fn tcp_fallback_flood_of_unauthenticated_role_a_registrations_never_exhausts_the_shared_conn_cap_410() {
+        // #410 core regression: before this fix, ANY 32-byte value sent as role 'A'
+        // parked forever holding the connection's OUTER, SHARED connection cap
+        // permit -- the exact cap the QUIC loop / `:443` front door / `:80` redirect
+        // all share (`DEFAULT_MAX_CONNECTIONS` in production, `conn_cap` in
+        // `run_edge`). A flood of one-shot, never-delivered, garbage-token
+        // registrations -- exactly the attack #410 describes ("8192 TLS connections
+        // sending 33 bytes each, once") -- must now exhaust at most the dedicated
+        // `tcp_agent_cap` sub-budget, leaving the shared cap mostly free for every
+        // other listener. Mirrors the real accept loop's own permit-holding shape
+        // (`let _permit = permit;` around the whole `serve_tcp_connection` call, see
+        // `run_edge`'s TCP-fallback loop) plus the stress-test style of state.rs's
+        // `revoke_and_register_race_never_leaves_a_revoked_token_registered_421`:
+        // real concurrent tasks, not a single-threaded simulation.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // Mirrors run_edge's real shape (one large shared conn_cap, one smaller
+        // dedicated tcp_agent_cap), scaled down for a fast test.
+        let conn_cap = ConnectionCap::new(50);
+        let tcp_agent_cap = ConnectionCap::new(4);
+
+        let mut attacker_streams = Vec::new();
+        let mut tasks = Vec::new();
+        for i in 0..20u8 {
+            let (attacker_side, edge_side) = tokio::io::duplex(64);
+            let state_i = state.clone();
+            let chal_i = challenge.clone();
+            let tcp_agent_cap_i = tcp_agent_cap.clone();
+            // Mirror the REAL TCP-fallback accept loop exactly: acquire the shared
+            // conn_cap permit BEFORE dispatching, hold it for `serve_tcp_connection`'s
+            // whole call (`let _permit = permit;` in `run_edge`).
+            let permit = conn_cap.try_admit().expect("conn_cap has room for every one of these");
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                let _ = serve_tcp_connection(edge_side, &state_i, &chal_i, Some(&tcp_agent_cap_i)).await;
+            });
+            tasks.push(task);
+            attacker_streams.push((i, attacker_side));
+        }
+
+        // Every "attacker" connection sends a DIFFERENT garbage 32-byte token and
+        // never sends anything else, never reads its own ack, never delivers a
+        // Client -- exactly issue #410's one-shot attack shape. Kept alive in
+        // `_attackers` for the rest of the test: dropping a `DuplexStream` closes
+        // it, and the edge side's own ack write would then fail (broken pipe) --
+        // a real attacker keeps its TCP socket open exactly the same way.
+        let mut _attackers = Vec::new();
+        for (i, mut attacker) in attacker_streams {
+            let mut hdr = vec![b'A'];
+            hdr.extend_from_slice(&[i; 32]);
+            attacker.write_all(&hdr).await.unwrap();
+            attacker.flush().await.unwrap();
+            _attackers.push(attacker);
+        }
+
+        // Let every task reach its steady state: the ones admitted by
+        // tcp_agent_cap (at most its capacity, 4) park forever; the rest are shed
+        // (NO, prompt return), releasing their conn_cap permit.
+        for _ in 0..200 {
+            if conn_cap.in_use() <= tcp_agent_cap.max() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            tcp_agent_cap.in_use(),
+            tcp_agent_cap.max(),
+            "the flood saturates its OWN dedicated sub-cap (an accepted, bounded blast radius)"
+        );
+        assert!(
+            conn_cap.in_use() <= tcp_agent_cap.max(),
+            "the shared conn_cap must NOT be driven down by the flood beyond the sub-cap's own \
+             bound (#410) -- got {} of {} in use, expected at most {}",
+            conn_cap.in_use(),
+            conn_cap.max(),
+            tcp_agent_cap.max(),
+        );
+        assert!(
+            conn_cap.available() >= conn_cap.max() - tcp_agent_cap.max(),
+            "the shared conn_cap must stay overwhelmingly free for every OTHER listener \
+             (Portal/auth/QUIC/:80-redirect) even under a sustained, 4x-over-sub-cap role-'A' \
+             flood -- available {} of {}",
+            conn_cap.available(),
+            conn_cap.max(),
+        );
+
+        for task in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]
@@ -4082,6 +4333,7 @@ mod tests {
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
             serve_front_door(
                 tcp, &state, &dummy_acceptor, &proxies, None, &challenge, None, Some(&wildcard_tls), None, None, None, None,
+                None,
             )
             .await
         });
@@ -4306,7 +4558,7 @@ mod tests {
             let mut proxies: std::collections::HashMap<String, ProxyTarget> =
                 std::collections::HashMap::new();
             proxies.insert("portal.test".into(), (portal_addr, None));
-            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None)
+            serve_front_door(tcp, &state, &acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None, None)
                 .await
         });
 
@@ -4359,7 +4611,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, None, None).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, None, None, None).await
         });
 
         // Real client: TCP connect, real TLS handshake offering ONLY the ct-edge
@@ -4423,7 +4675,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, Some(&cap), None).await
+            serve_front_door(tcp, &state, &acceptor, &proxies, None, &challenge, None, None, None, None, Some(&cap), None, None).await
         });
 
         let mut client = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
@@ -4655,6 +4907,7 @@ mod tests {
             proxies.insert("portal.test".into(), (cp_addr, Some(portal_tls)));
             serve_front_door(
                 tcp, &state, &dummy_acceptor, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None,
+                None,
             )
             .await
         });
@@ -4743,7 +4996,7 @@ mod tests {
         let fd_task = tokio::spawn(async move {
             let (tcp, _) = fd.accept().await.unwrap();
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None)
+            serve_front_door(tcp, &state, &dummy, &proxies, Some("portal.test"), &challenge, None, None, None, None, None, None, None)
                 .await
         });
 
@@ -4883,6 +5136,7 @@ mod tests {
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
                         tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None, None,
+                        None,
                     )
                     .await;
                 });
@@ -5049,7 +5303,7 @@ mod tests {
                     let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
                     let _ = serve_front_door(
                         tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None,
-                        Some(permit),
+                        None, Some(permit),
                     )
                     .await;
                 });
