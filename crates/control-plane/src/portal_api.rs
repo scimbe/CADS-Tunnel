@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::accounts::AccountId;
 use crate::edge_mesh::EdgeMeshHandle;
-use crate::portal::{escape, session_subject_for};
+use crate::portal::{escape, session_claims_for, session_subject_for};
 use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
@@ -275,22 +275,26 @@ async fn admin_set_max_tunnels(
 }
 
 /// Resolve the caller's account from the session, or an early response
-/// (redirect to the shell when unauthenticated, 500 on a store error).
-fn account_for_session(st: &ApiState, headers: &HeaderMap) -> Result<(String, AccountId), Response> {
-    let subject = session_subject_for(&st.session_key, headers)
+/// (redirect to the shell when unauthenticated, 500 on a store error). Also
+/// returns the session's verified email (#492), if any -- `None` when this
+/// deployment's OIDC IdP never asserted one (or `CT_PORTAL_REQUIRE_VERIFIED_EMAIL`
+/// is on and it wasn't verified); callers degrade gracefully by simply not
+/// showing it, same as [`page`]'s own `email` parameter.
+fn account_for_session(st: &ApiState, headers: &HeaderMap) -> Result<(String, AccountId, Option<String>), Response> {
+    let claims = session_claims_for(&st.session_key, headers)
         .ok_or_else(|| Redirect::to("/portal").into_response())?;
     let account = st
         .ledger
-        .account_for_subject(&subject)
+        .account_for_subject(&claims.subject)
         .map_err(|e| internal_error("account_for_session", e).into_response())?;
-    Ok((subject, account))
+    Ok((claims.subject, account, claims.email))
 }
 
 /// `GET /portal/account` (#26 PP2): the logged-in customer's account page —
 /// account id, credit balance (Guthaben) and subject. Self-scoped: the subject
 /// comes from the session, so a caller only ever sees their own account.
 async fn account_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
-    let (subject, account) = match account_for_session(&st, &headers) {
+    let (subject, account, email) = match account_for_session(&st, &headers) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -300,6 +304,7 @@ async fn account_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
         &hex(&account.0),
         balance,
         st.account_console_url.as_deref(),
+        email.as_deref(),
     ))
     .into_response()
 }
@@ -319,7 +324,7 @@ async fn buy_credits(
     headers: HeaderMap,
     Form(form): Form<BuyCreditsForm>,
 ) -> Response {
-    let (_subject, account) = match account_for_session(&st, &headers) {
+    let (_subject, account, email) = match account_for_session(&st, &headers) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -341,7 +346,7 @@ provider's signed webhook confirms the payment.</p>
         credits = form.credits,
         intent = escape(&hex(&intent.0)),
     );
-    Html(page("buy credits", &body)).into_response()
+    Html(page("buy credits", &body, email.as_deref())).into_response()
 }
 
 /// Shared state for the account-deletion cascade (Keycloak/account overhaul): every
@@ -417,7 +422,7 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
         let body = r#"<h1>Confirmation text didn't match</h1>
 <p class="help">Type <code>DELETE</code> exactly to confirm account deletion.</p>
 <a class="btn sec" href="/portal/account">Back to account</a>"#;
-        return (StatusCode::BAD_REQUEST, Html(page("account deletion", body))).into_response();
+        return (StatusCode::BAD_REQUEST, Html(page("account deletion", body, claims.email.as_deref()))).into_response();
     }
     let subject = claims.subject.as_str();
     let now = std::time::SystemTime::now()
@@ -464,7 +469,7 @@ along with your e-mail on anyone else's allow-list or share list. Your sign-in i
 managed by Keycloak, not this page -- use <strong>Open Account Console</strong> from the account
 page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
 <a class="btn" href="/portal/logout">Sign out</a>"#;
-    let mut resp = Html(page("account deleted", body)).into_response();
+    let mut resp = Html(page("account deleted", body, claims.email.as_deref())).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie()) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
@@ -562,9 +567,10 @@ async fn edge_tunnel_status(st: &ApiState, routing_token_hex: &str) -> Option<Ed
 }
 
 async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
-    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
+    let subject = claims.subject;
     let owns_one = match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(rows) => rows.iter().any(|(_, owned)| *owned),
         Err(e) => return internal_error("tunnels_page/list(owns_one)", e).into_response(),
@@ -614,7 +620,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     allow_and_pending.get(&t.id).cloned().unwrap_or_default();
                 rows.push((t, owned, admission, status, require_login, login_allowlist, pending_requests));
             }
-            Html(tunnels_html(&rows, max_tunnels)).into_response()
+            Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref())).into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
@@ -883,9 +889,10 @@ pub(crate) fn edge_host_port(portal_base: &str) -> String {
 }
 
 async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
+    let subject = claims.subject;
     // Authorized = owner OR grantee (#29): a shared-with subject may also install
     // an agent for the tunnel. `None` when unknown or the caller isn't authorized.
     let routing_token = match st.tunnels.routing_token_if_authorized(&subject, &id) {
@@ -982,7 +989,7 @@ as <code>.env</code> <strong>next to the binary, on the machine you want to expo
 
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
     );
-    Html(page("install", &body)).into_response()
+    Html(page("install", &body, claims.email.as_deref())).into_response()
 }
 
 /// A subject to grant tunnel access to.
@@ -1003,11 +1010,11 @@ fn grant_err(e: GrantError) -> Response {
 /// `GET /portal/tunnels/:id/grants` (#29): list the subjects a tunnel is shared
 /// with + an add form. Owner-only.
 async fn grants_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    match st.tunnels.list_grants(&subject, &id) {
-        Ok(grantees) => Html(grants_html(&id, &grantees)).into_response(),
+    match st.tunnels.list_grants(&claims.subject, &id) {
+        Ok(grantees) => Html(grants_html(&id, &grantees, claims.email.as_deref())).into_response(),
         Err(e) => grant_err(e),
     }
 }
@@ -1047,7 +1054,7 @@ async fn delete_grant(
     }
 }
 
-fn grants_html(id: &str, grantees: &[String]) -> String {
+fn grants_html(id: &str, grantees: &[String], email: Option<&str>) -> String {
     let rows = if grantees.is_empty() {
         "<p class=\"k\">Not shared with anyone yet.</p>".to_string()
     } else {
@@ -1077,7 +1084,7 @@ fn grants_html(id: &str, grantees: &[String]) -> String {
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
         id = escape(id),
     );
-    page("share tunnel", &body)
+    page("share tunnel", &body, email)
 }
 
 /// Rot/Gelb/Grün status badge + (when applicable) the persistent private-key
@@ -1246,7 +1253,7 @@ type TunnelRow = (
     Vec<(String, String, i64)>,
 );
 
-fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32) -> String {
+fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) -> String {
     // #439 follow-up: owned_count is derived from the SAME rows the page just
     // fetched live from the store (list_authorized_for_subject), not a cached
     // value -- so a revoke that already committed (delete_tunnel -> revoke())
@@ -1374,7 +1381,7 @@ you above, nothing to configure. Click <strong>Install</strong> to get its token
  encrypted; the operator never sees your payload.</li>
 </ol>"#,
     );
-    page("your tunnels", &body)
+    page("your tunnels", &body, email)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1420,7 +1427,19 @@ fn redact_routing_tokens(s: &str) -> String {
 /// `--accent`, teal `--accent2`, serif headings, the pulsing live-dot motif) --
 /// so the "unified" result was still just generic dark-mode blue/green,
 /// disconnected from the one surface with a real brand. Fixed here.
-pub(crate) fn page(title: &str, body: &str) -> String {
+/// #492: the signed-in session's e-mail, shown in the nav next to "Sign out" so
+/// it's never ambiguous which account a page is acting as -- easy to lose track
+/// of when switching between several test/demo accounts. `email` comes straight
+/// from the session cookie's own verified-email claim ([`crate::portal::SessionClaims`]),
+/// never a fresh lookup, so this can never fail or block: `None` (no verified
+/// email on this session, or OIDC not configured in this deployment mode) simply
+/// omits the line entirely, same "absent renders nothing rather than a
+/// misleading state" rule the connection-status badge already follows
+/// ([`tunnels_html`]).
+pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
+    let signed_in_as = email
+        .map(|e| format!(r#"<span class="signed-in-as">Signed in as <strong>{}</strong></span>"#, escape(e)))
+        .unwrap_or_default();
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -1453,6 +1472,8 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  .k{{color:var(--muted);flex-shrink:0}} .v{{word-break:break-all;min-width:0}}
  nav a{{color:var(--accent2);text-decoration:none;margin-right:1rem;font-size:.9rem;transition:color .15s ease}}
  nav a:hover{{color:var(--accent2-hover)}} nav{{margin-bottom:1.2rem}}
+ nav .signed-in-as{{color:var(--muted);margin-right:1rem;font-size:.9rem}}
+ nav .signed-in-as strong{{color:var(--text);font-weight:600}}
  a.btn,button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;padding:.5rem 1rem;
       font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;position:relative;overflow:hidden;
       transition:background .15s ease,transform .08s ease,opacity .15s ease,box-shadow .2s ease}}
@@ -1553,7 +1574,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/logout">Sign out</a></nav>
+<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a>{signed_in_as}<a href="/portal/logout">Sign out</a></nav>
 {body}
 </div>
 <script>
@@ -1611,7 +1632,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
     )
 }
 
-fn account_html(subject: &str, account_hex: &str, balance: u64, account_console_url: Option<&str>) -> String {
+fn account_html(subject: &str, account_hex: &str, balance: u64, account_console_url: Option<&str>, email: Option<&str>) -> String {
     // Password change, active sessions, and 2FA (TOTP) live in Keycloak's own
     // Account Console -- correct, since those are identity concerns Keycloak
     // already handles well; not reimplemented here. Account deletion is split the
@@ -1669,7 +1690,7 @@ this cannot be undone.{danger_kc_note}</p>
         service_accounts_section = service_accounts_section_html(),
         danger_kc_note = danger_kc_note,
     );
-    page("your account", &body)
+    page("your account", &body, email)
 }
 
 /// Real self-service M2M credentials (2026-08-04): a fetch()-driven section on
@@ -1996,16 +2017,16 @@ async fn login_allowlist_list_route(
 }
 
 async fn topologies_page(State(st): State<TopologyPortalState>, headers: HeaderMap) -> Response {
-    if crate::portal::session_claims_for(&st.session_key, &headers).is_none() {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
-    }
-    Html(topologies_html()).into_response()
+    };
+    Html(topologies_html(claims.email.as_deref())).into_response()
 }
 
 /// A static shell: `#list` and the "New topology" button are filled/wired entirely by the
 /// inline script below via `fetch()` against `/me/topologies*` -- no server-side topology
 /// read here, matching [`TopologyPortalState`]'s doc comment.
-fn topologies_html() -> String {
+fn topologies_html(email: Option<&str>) -> String {
     let body = r#"<h1>Your topologies</h1>
 <p class="help">Compose overlay networks by assigning agents and wiring links in the
 <strong>Topology Editor</strong> -- a draggable node graph. A topology authorizes real
@@ -2044,7 +2065,7 @@ to compose it together -- they wire in their own agents, never yours.</p>
  });}
 })();
 </script>"#;
-    page("your topologies", body)
+    page("your topologies", body, email)
 }
 
 /// `GET /portal/channels` (self-service discoverability, 2026-08-01): the account
@@ -2067,6 +2088,7 @@ async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Resp
             r#"<h1>Your channels</h1><p class="help">Your session has no verified e-mail, so channel
 invitations (which are matched by e-mail) can't be shown. Log in again with an identity
 provider that verifies e-mail.</p>"#,
+            None,
         ))
         .into_response();
     };
@@ -2074,13 +2096,13 @@ provider that verifies e-mail.</p>"#,
         Ok(v) => v,
         Err(e) => return internal_error("channels_page/channels_for_email", e).into_response(),
     };
-    Html(channels_html(&entries)).into_response()
+    Html(channels_html(&entries, Some(&email))).into_response()
 }
 
 /// Render the "Your Channels" list: each row is a channel id (the only stable,
 /// non-secret identifier a channel has in this schema -- there's no separate
 /// human name) plus a status badge, and a Claim link for anything pending.
-fn channels_html(entries: &[(ct_common::channel::ChannelId, Option<u64>)]) -> String {
+fn channels_html(entries: &[(ct_common::channel::ChannelId, Option<u64>)], email: Option<&str>) -> String {
     let rows = if entries.is_empty() {
         r#"<p class="help">No channel invitations yet. A channel owner adds your e-mail to their
 allow-list (<code>ct-agent channel allowlist add &lt;your-email&gt;</code> or the owner's own
@@ -2114,7 +2136,7 @@ sign-in e-mail) -- claim a pending one to add yourself as a member, no manual
 exchange with the owner needed.</p>
 {rows}"#
     );
-    page("your channels", &body)
+    page("your channels", &body, email)
 }
 
 #[derive(Deserialize)]
@@ -2201,10 +2223,10 @@ async fn claim_channel(
 /// browser form and the JSON API client above never contend over the same
 /// method+extractor on the same route.
 async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(channel_hex): Path<String>) -> Response {
-    if crate::portal::session_subject_for(&st.session_key, &headers).is_none() {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
-    }
-    Html(claim_html(&channel_hex, None)).into_response()
+    };
+    Html(claim_html(&channel_hex, None, claims.email.as_deref())).into_response()
 }
 
 async fn claim_page_submit(
@@ -2213,19 +2235,19 @@ async fn claim_page_submit(
     Path(channel_hex): Path<String>,
     Form(req): Form<ClaimReq>,
 ) -> Response {
-    if crate::portal::session_subject_for(&st.session_key, &headers).is_none() {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
-    }
+    };
     match do_claim(&st, &headers, &channel_hex, &req).await {
-        Ok(()) => Html(claim_html(&channel_hex, Some(Ok(())))).into_response(),
-        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)))).into_response(),
+        Ok(()) => Html(claim_html(&channel_hex, Some(Ok(())), claims.email.as_deref())).into_response(),
+        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)), claims.email.as_deref())).into_response(),
     }
 }
 
 /// The self-serve claim form (#248-follow): a portal user pastes the three values
 /// [`ct-agent channel member-material`] (or whatever locally produced them) prints,
 /// and the claim runs -- no manual out-of-band exchange with the channel owner.
-fn claim_html(channel_hex: &str, result: Option<Result<(), String>>) -> String {
+fn claim_html(channel_hex: &str, result: Option<Result<(), String>>, email: Option<&str>) -> String {
     let banner = match &result {
         Some(Ok(())) => r#"<div class="warn" style="border-color:#238636;background:#0d2818;color:#3fb950">Claimed -- you're now a member of this channel.</div>"#.to_string(),
         Some(Err(msg)) => format!(r#"<div class="warn">Could not claim: {}</div>"#, escape(msg)),
@@ -2258,7 +2280,7 @@ you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it is
 <a class="btn sec" href="/portal">Back to account</a>"#,
         channel = escape(channel_hex),
     );
-    page("join channel", &body)
+    page("join channel", &body, email)
 }
 
 #[cfg(test)]
@@ -2313,7 +2335,7 @@ mod tests {
     // must be unchanged for every OTHER input type.
     #[test]
     fn label_input_css_scopes_the_block_layout_rule_away_from_checkboxes() {
-        let full_page = page("t", "");
+        let full_page = page("t", "", None);
         assert!(
             full_page.contains("label input:not([type=checkbox]):not([type=radio]){display:block"),
             "the full-width block-below-label-text rule must now exclude checkboxes/radios"
@@ -2332,7 +2354,7 @@ mod tests {
     // no longer also clip/scroll its own content.
     #[test]
     fn only_the_access_list_scrolls_internally_not_the_whole_tunnel_card() {
-        let full_page = page("t", "");
+        let full_page = page("t", "", None);
         // Isolate just the `.tunnel-card{...}` rule body (up to its closing
         // brace) rather than a brittle exact-whitespace substring match, so
         // this survives incidental reformatting of the surrounding CSS.
@@ -2408,6 +2430,16 @@ mod tests {
         format!("ct_portal_session={}", sign_session_for_test(KEY, subject))
     }
 
+    /// #492: like [`session_header`], but the session also carries a verified
+    /// email -- for asserting the signed-in email actually shows up on real
+    /// portal pages.
+    fn session_header_with_email(subject: &str, email: &str) -> String {
+        format!(
+            "ct_portal_session={}",
+            crate::portal::sign_session_with_email_for_test(KEY, subject, email)
+        )
+    }
+
     fn test_edge_mesh() -> EdgeMeshHandle {
         EdgeMeshHandle::new(
             Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()),
@@ -2481,6 +2513,53 @@ mod tests {
             !html.contains("Account Console"),
             "no account-console link when OIDC/account_console_url isn't configured"
         );
+    }
+
+    /// #492: no page in the portal showed which account (email) was currently
+    /// signed in -- the nav never surfaced it. Fixed by threading the session's
+    /// verified email (already carried in the signed session cookie, see
+    /// `crate::portal::SessionClaims`) into the shared `page()` nav. Checked on
+    /// `/portal/tunnels` (not just `/portal/account`) since the fix is meant to
+    /// show on every real portal page, not just one.
+    #[tokio::test]
+    async fn tunnels_page_shows_the_signed_in_email_in_the_nav_492() {
+        let app = test_app();
+        let resp = app
+            .oneshot(
+                Request::get("/portal/tunnels")
+                    .header("cookie", session_header_with_email("alice", "alice@example.com"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("alice@example.com"), "the signed-in email appears somewhere in the page: {html}");
+        assert!(html.contains("Signed in as"), "labeled, not a bare unexplained address: {html}");
+        // Lives in the nav, next to Sign out, on every page -- not buried in the body.
+        let nav_start = html.find("<nav>").expect("page has a nav");
+        let nav_end = html.find("</nav>").expect("nav closes");
+        let nav = &html[nav_start..nav_end];
+        assert!(nav.contains("alice@example.com"), "email is in the shared nav, not just the page body: {nav}");
+    }
+
+    /// #492 follow-up: a session with no resolvable/verified email (this
+    /// deployment's OIDC not configured, or the IdP never asserted one) must
+    /// degrade gracefully -- omit the line entirely, same as the connection-status
+    /// badge's existing "absent renders nothing rather than a misleading state"
+    /// rule -- never panic, error, or show a broken lookup inline.
+    #[tokio::test]
+    async fn account_page_degrades_cleanly_when_the_session_has_no_email_492() {
+        let app = test_app();
+        // session_header() (unlike session_header_with_email()) signs a session
+        // with no email at all -- exactly the "OIDC not configured"/"IdP never
+        // asserted an email" case.
+        let (status, html) = get(&app, "/portal/account", Some("bob-no-email")).await;
+        assert_eq!(status, StatusCode::OK, "must still render, not error: {html}");
+        assert!(!html.contains("Signed in as"), "no email to show, so the line is omitted entirely: {html}");
+        assert!(html.contains("bob-no-email"), "the page still renders its normal content");
     }
 
     #[tokio::test]
