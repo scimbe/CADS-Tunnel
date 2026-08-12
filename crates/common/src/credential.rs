@@ -129,8 +129,19 @@ impl SignedCredential {
     }
 }
 
-/// Verify a signed credential against `issuer_pubkey` at time `now`.
-pub fn verify(
+/// Verify a signed credential against `issuer_pubkey` at time `now` — signature and
+/// expiry only, with **no replay protection** (#415): a captured credential verifies
+/// successfully *every* time it is presented, until it expires. The name is explicit
+/// about that tradeoff so it reads as a deliberate choice at the call site rather than
+/// an oversight next to [`verify_fresh`] — this and `verify_fresh` have identical
+/// signatures apart from the cache, so picking the wrong one for a new bearer-style
+/// admission path would otherwise silently drop replay protection with nothing to
+/// flag it. Prefer [`verify_fresh`] for any *new* admission point; use this one only
+/// where the caller already has its own independent replay/possession defense (e.g.
+/// the Edge's grant admission pairs [`crate::channel::verify_stateless`] with a
+/// fresh-challenge holder-possession proof, which is strictly stronger than a
+/// seen-nonce cache) or is deliberately stateless for a documented reason.
+pub fn verify_stateless(
     issuer_pubkey: &[u8; 32],
     signed: &SignedCredential,
     now: UnixSeconds,
@@ -145,21 +156,22 @@ pub fn verify(
     Ok(())
 }
 
-/// Like [`verify`], but additionally rejects a **replay** (#88 SEC88b). A captured
-/// credential is otherwise valid until `expires_at` *any number of times*; `cache`
-/// records the credential's 64-byte signature (unique per token — a replay carries
-/// the identical bytes) until that expiry, so the first presentation of a valid,
-/// unexpired credential succeeds and any later presentation of the same signature
-/// fails with [`CredError::Replayed`]. Call this at the single admission point that
-/// owns `cache`; the cache evicts on expiry so it stays bounded. Signature/expiry
-/// are checked first, so an invalid or expired credential never populates the cache.
+/// Like [`verify_stateless`], but additionally rejects a **replay** (#88 SEC88b). A
+/// captured credential is otherwise valid until `expires_at` *any number of times*;
+/// `cache` records the credential's 64-byte signature (unique per token — a replay
+/// carries the identical bytes) until that expiry, so the first presentation of a
+/// valid, unexpired credential succeeds and any later presentation of the same
+/// signature fails with [`CredError::Replayed`]. Call this at the single admission
+/// point that owns `cache`; the cache evicts on expiry so it stays bounded.
+/// Signature/expiry are checked first, so an invalid or expired credential never
+/// populates the cache.
 pub fn verify_fresh(
     issuer_pubkey: &[u8; 32],
     signed: &SignedCredential,
     now: UnixSeconds,
     cache: &mut crate::replay::ReplayCache,
 ) -> Result<(), CredError> {
-    verify(issuer_pubkey, signed, now)?;
+    verify_stateless(issuer_pubkey, signed, now)?;
     if !cache.check_and_record(&signed.signature, signed.credential.expires_at, now) {
         return Err(CredError::Replayed);
     }
@@ -204,26 +216,26 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
         let sig_a = sk.sign(&a.signing_bytes());
         let signed_as_b = SignedCredential { credential: b, signature: sig_a.to_bytes() };
-        assert_eq!(verify(&pk, &signed_as_b, 50), Err(CredError::BadSignature));
+        assert_eq!(verify_stateless(&pk, &signed_as_b, 50), Err(CredError::BadSignature));
     }
 
     #[test]
     fn verify_ok_before_expiry() {
         let (pk, signed) = signed_cred(1_000);
-        assert_eq!(verify(&pk, &signed, 999), Ok(()));
+        assert_eq!(verify_stateless(&pk, &signed, 999), Ok(()));
     }
 
     #[test]
     fn verify_rejects_expired() {
         let (pk, signed) = signed_cred(1_000);
-        assert_eq!(verify(&pk, &signed, 1_000), Err(CredError::Expired));
+        assert_eq!(verify_stateless(&pk, &signed, 1_000), Err(CredError::Expired));
     }
 
     #[test]
     fn verify_rejects_tampered_claims() {
         let (pk, mut signed) = signed_cred(1_000);
         signed.credential.expires_at = 9_999;
-        assert_eq!(verify(&pk, &signed, 500), Err(CredError::BadSignature));
+        assert_eq!(verify_stateless(&pk, &signed, 500), Err(CredError::BadSignature));
     }
 
     #[test]

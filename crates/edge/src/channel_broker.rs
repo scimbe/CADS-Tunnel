@@ -10,8 +10,8 @@
 //! two agents) and where the operator key comes from are later sub-packets.
 
 use ct_common::channel::{
-    verify, verify_holder_possession, ChannelId, ChannelJoinRequest, Direction, GrantError,
-    SignedChannelGrant, UnixSeconds,
+    verify_holder_possession, verify_stateless, ChannelId, ChannelJoinRequest, Direction,
+    GrantError, SignedChannelGrant, UnixSeconds,
 };
 use quinn::Endpoint;
 use rand::RngCore;
@@ -63,14 +63,19 @@ impl std::error::Error for BrokerError {}
 /// compatible direction split (one may Initiate, the other may Accept). When both
 /// sides permit either direction, `a` is chosen as the initiator (a stable, caller-
 /// independent convention).
+///
+/// #415: `verify_stateless` (not `verify_fresh`) is deliberate — every caller in this
+/// crate pairs both `a` and `b` here with a grant that already passed the join
+/// endpoint's own [`verify_holder_possession`] challenge/response before reaching
+/// this pairing step, an independent defense stronger than a seen-nonce cache.
 pub fn authorize_channel_pair(
     operator_pubkey: &[u8; 32],
     a: &SignedChannelGrant,
     b: &SignedChannelGrant,
     now: UnixSeconds,
 ) -> Result<ChannelPairing, BrokerError> {
-    verify(operator_pubkey, a, now).map_err(BrokerError::GrantInvalid)?;
-    verify(operator_pubkey, b, now).map_err(BrokerError::GrantInvalid)?;
+    verify_stateless(operator_pubkey, a, now).map_err(BrokerError::GrantInvalid)?;
+    verify_stateless(operator_pubkey, b, now).map_err(BrokerError::GrantInvalid)?;
 
     if a.grant.channel != b.grant.channel {
         return Err(BrokerError::ChannelMismatch);
@@ -430,7 +435,10 @@ where
                 return Err(refuse(&mut send, "not-member", &grant_ctx, "unknown channel or holder not a member".into(), observed).await);
             }
         };
-    if let Err(e) = verify(&operator, &req.grant, now) {
+    // #415: `verify_stateless` here is deliberate, not an oversight -- the fresh
+    // challenge + `verify_holder_possession` immediately below independently
+    // defeats replay, stronger than a seen-nonce cache.
+    if let Err(e) = verify_stateless(&operator, &req.grant, now) {
         return Err(refuse(&mut send, "grant-verify", &grant_ctx, format!("channel grant rejected: {e}").into(), observed).await);
     }
     // #81 gap 1: a signed grant is bearer bytes until the presenter proves it holds

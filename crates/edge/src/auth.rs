@@ -2,8 +2,15 @@
 //!
 //! The Edge trusts the control plane's issuer public key and verifies presented
 //! credentials statelessly — without contacting the control plane. P1.4c.
+//!
+//! #415: this module's public API currently has no caller anywhere in the workspace
+//! (flagged separately; not this fix's scope). It deliberately uses
+//! [`verify_stateless`](ct_common::credential::verify_stateless) rather than
+//! `verify_fresh` — no `ReplayCache` is threaded through here, so wiring the fresh
+//! variant in without an admission-point design decision (who owns the cache, what
+//! happens on a cache-miss under load) would be a bigger, separately-scoped change.
 
-use ct_common::credential::{verify, CredError, SignedCredential, UnixSeconds};
+use ct_common::credential::{verify_stateless, CredError, SignedCredential, UnixSeconds};
 use quinn::{Connection, Endpoint};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -15,7 +22,7 @@ pub fn verify_presented_credential(
     presented: &SignedCredential,
     now: UnixSeconds,
 ) -> Result<(), CredError> {
-    verify(issuer_pubkey, presented, now)
+    verify_stateless(issuer_pubkey, presented, now)
 }
 
 /// Accept one connection, read the credential the Agent presents on a
@@ -34,7 +41,7 @@ pub async fn accept_and_authenticate(
     let (mut send, mut recv) = conn.accept_bi().await?;
     let bytes = recv.read_to_end(64 * 1024).await?;
     let signed = SignedCredential::decode(&bytes)?;
-    match verify(issuer_pubkey, &signed, now) {
+    match verify_stateless(issuer_pubkey, &signed, now) {
         Ok(()) => {
             send.write_all(b"OK").await?;
             send.finish()?;

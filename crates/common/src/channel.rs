@@ -631,7 +631,18 @@ pub fn elect_superpeers(
 /// Confirms the operator signature over the claims and that the grant has not
 /// expired. Does NOT check holder possession — that is a connect-time proof in a
 /// later sub-packet; this establishes the grant is authentic and current.
-pub fn verify(
+///
+/// This is **stateless**: no [`ReplayCache`](crate::replay::ReplayCache), so a
+/// captured grant verifies successfully *every* time it is presented until it
+/// expires (#415). The name is explicit about that tradeoff so it reads as a
+/// deliberate choice at the call site rather than an oversight next to
+/// [`verify_fresh`], which has an identical signature apart from the cache. Prefer
+/// [`verify_fresh`] for any *new* admission path; the existing callers of this
+/// function pair it with an independent defense instead — e.g. the Edge's grant
+/// admission (`relay_gate.rs`) immediately follows this with a fresh-random
+/// challenge + [`verify_holder_possession`], which independently defeats replay and
+/// is strictly stronger than a seen-nonce cache.
+pub fn verify_stateless(
     operator_pubkey: &[u8; 32],
     signed: &SignedChannelGrant,
     now: UnixSeconds,
@@ -646,23 +657,38 @@ pub fn verify(
     Ok(())
 }
 
-/// Like [`verify`], but additionally rejects a **replay** (#88 SEC88b). A captured
-/// grant is otherwise valid until `expires_at` *any number of times*; `cache` records
-/// the grant's 64-byte signature (unique per grant — a replay carries the identical
-/// bytes) until that expiry, so the first presentation of an authentic, unexpired
-/// grant succeeds and any later presentation of the same signature fails with
-/// [`GrantError::Replayed`]. Call this at the single admission point (the broker) that
-/// owns `cache`; the cache evicts on expiry so it stays bounded. Signature/expiry are
-/// checked first, so an invalid or expired grant never populates the cache. This is
-/// orthogonal to holder-possession (#81) and membership/revocation — all three gate
-/// admission together.
+/// #415: pre-rename compatibility alias for [`verify_stateless`], kept only because
+/// an external crate ([`ct-agent`](https://github.com/scimbe/ct-agent), pinned by tag
+/// in this workspace's own dependents) still calls this by its old name. No code in
+/// *this* workspace calls it anymore — every in-tree caller was updated to
+/// `verify_stateless` directly. Do not add new callers; use [`verify_stateless`] (or,
+/// better, [`verify_fresh`] if you're wiring up a new admission path).
+#[deprecated(note = "renamed to verify_stateless to make its lack of replay protection explicit (#415); this alias exists only for external/pre-rename callers")]
+pub fn verify(
+    operator_pubkey: &[u8; 32],
+    signed: &SignedChannelGrant,
+    now: UnixSeconds,
+) -> Result<(), GrantError> {
+    verify_stateless(operator_pubkey, signed, now)
+}
+
+/// Like [`verify_stateless`], but additionally rejects a **replay** (#88 SEC88b). A
+/// captured grant is otherwise valid until `expires_at` *any number of times*;
+/// `cache` records the grant's 64-byte signature (unique per grant — a replay
+/// carries the identical bytes) until that expiry, so the first presentation of an
+/// authentic, unexpired grant succeeds and any later presentation of the same
+/// signature fails with [`GrantError::Replayed`]. Call this at the single admission
+/// point (the broker) that owns `cache`; the cache evicts on expiry so it stays
+/// bounded. Signature/expiry are checked first, so an invalid or expired grant never
+/// populates the cache. This is orthogonal to holder-possession (#81) and
+/// membership/revocation — all three gate admission together.
 pub fn verify_fresh(
     operator_pubkey: &[u8; 32],
     signed: &SignedChannelGrant,
     now: UnixSeconds,
     cache: &mut crate::replay::ReplayCache,
 ) -> Result<(), GrantError> {
-    verify(operator_pubkey, signed, now)?;
+    verify_stateless(operator_pubkey, signed, now)?;
     if !cache.check_and_record(&signed.signature, signed.grant.expires_at, now) {
         return Err(GrantError::Replayed);
     }
@@ -2617,7 +2643,7 @@ impl SignedChannelInvitation {
 }
 
 /// Verify a signed invitation against the channel `operator_pubkey` at time `now`
-/// (mirrors [`verify`]): confirms the operator signature over the claims and that the
+/// (mirrors [`verify_stateless`]): confirms the operator signature over the claims and that the
 /// invitation has not expired. Does NOT check the invitee's acceptance — that is the
 /// redemption proof ([`verify_invitation_redemption`]); this establishes the invitation
 /// is authentic and current.
@@ -2734,10 +2760,10 @@ pub fn verify_invitation_redemption_challenge(
 /// records as membership. **No operator private key is needed at redeem time**: the
 /// operator authority already rides in the signed invitation, so a provider-blind CP can
 /// admit the member from the two public-key proofs alone. Errors mirror
-/// [`verify`]: `BadKey`/`BadSignature`/`Expired` (a failed redemption proof surfaces as
+/// [`verify_stateless`]: `BadKey`/`BadSignature`/`Expired` (a failed redemption proof surfaces as
 /// `BadSignature`).
 ///
-/// This is **pure verification** — like [`verify`] vs [`verify_fresh`], it does NOT
+/// This is **pure verification** — like [`verify_stateless`] vs [`verify_fresh`], it does NOT
 /// enforce single-use. The caller MUST record consumption of the invitation (by its
 /// operator signature) and reject a replay, or a revoked member can replay this to
 /// restore membership until expiry (#108). The live redeem endpoint does so via
@@ -3143,20 +3169,29 @@ mod tests {
     #[test]
     fn verify_ok_before_expiry() {
         let (pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
-        assert_eq!(verify(&pk, &signed, 999), Ok(()));
+        assert_eq!(verify_stateless(&pk, &signed, 999), Ok(()));
     }
 
     #[test]
     fn verify_rejects_expired() {
         let (pk, signed) = signed_grant(Direction::Initiate, Rights::Read, false, 1_000);
-        assert_eq!(verify(&pk, &signed, 1_000), Err(GrantError::Expired));
+        assert_eq!(verify_stateless(&pk, &signed, 1_000), Err(GrantError::Expired));
     }
 
     #[test]
     fn verify_rejects_wrong_operator_key() {
         let (_pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
         let other = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
-        assert_eq!(verify(&other, &signed, 500), Err(GrantError::BadSignature));
+        assert_eq!(verify_stateless(&other, &signed, 500), Err(GrantError::BadSignature));
+    }
+
+    /// #415: the pre-rename `verify` alias still exists (external/back-compat callers)
+    /// and must keep behaving identically to `verify_stateless`.
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_verify_alias_still_works() {
+        let (pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
+        assert_eq!(verify(&pk, &signed, 999), Ok(()));
     }
 
     #[test]
@@ -3203,7 +3238,7 @@ mod tests {
                 _ => signed.grant.holder = [0xffu8; 32],
             }
             assert_eq!(
-                verify(&pk, &signed, 500),
+                verify_stateless(&pk, &signed, 500),
                 Err(GrantError::BadSignature),
                 "tamper case {tamper} must fail verification"
             );

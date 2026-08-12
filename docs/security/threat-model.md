@@ -68,8 +68,8 @@ silently forces this same rotation-and-re-pin path on every reschedule).
 2. **Control-plane metadata** — the operator sees account id, routing and billing
    metadata (not payload). Minimize retention; document in the privacy policy.
 3. **Jurisdiction / lawful-floor process** — operational, not code (SPEC §9.2–9.3).
-4. **Trust-primitive clock skew (#88 SEC88d)** — `credential::verify`/`verify_fresh`
-   and `channel::verify`/`verify_fresh` (`SignedCredential`, `ChannelGrant`) take a
+4. **Trust-primitive clock skew (#88 SEC88d)** — `credential::verify_stateless`/`verify_fresh`
+   and `channel::verify_stateless`/`verify_fresh` (`SignedCredential`, `ChannelGrant`) take a
    caller-supplied `now`, so a **backwards-skewed edge clock extends a token's
    validity window** beyond its `expires_at`. There is no fix inside `ct-common` —
    the verifying host owns its clock — so this is an operational control: run edge

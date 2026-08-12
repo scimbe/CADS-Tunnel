@@ -46,7 +46,7 @@ pub fn mint_for_enrolled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::verify;
+    use crate::credential::verify_stateless;
     use ct_common::TenantId;
 
     #[test]
@@ -61,7 +61,7 @@ mod tests {
         let signed = mint_for_enrolled(&issuer, &enrollment, &agent, 1_000).expect("mint");
         assert_eq!(signed.credential.tenant, tenant);
         assert_eq!(signed.credential.agent, agent);
-        assert_eq!(verify(&issuer.public_key_bytes(), &signed, 500), Ok(()));
+        assert_eq!(verify_stateless(&issuer.public_key_bytes(), &signed, 500), Ok(()));
     }
 
     #[test]

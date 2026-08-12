@@ -13,17 +13,22 @@
 //! protocol it forwards (invariant #2 of the wider Agent-Fabric design: this layer only
 //! ever sees our own grant/challenge wire bytes, then ciphertext-equivalent relay
 //! traffic it cannot interpret). Authorization is the same primitives the QUIC/`:443`
-//! channel broker already uses (`verify`, `verify_holder_possession`) — a requester
+//! channel broker already uses (`verify_stateless`, `verify_holder_possession`) — a requester
 //! proves it holds an authentic, unexpired, CP-registered grant AND the private key
 //! behind it, exactly as channel admission does, before a single byte reaches the
 //! internal relay-node. The relay-node itself stays intentionally simple (unguarded,
 //! `ct-agent relay-node`) because network isolation IS its gate: it is never reachable
 //! except through this pre-auth splice, never bound to a public address.
+//!
+//! #415: `verify_stateless` (not `verify_fresh`) is a deliberate choice here, not an
+//! oversight — the fresh-random challenge + [`verify_holder_possession`] immediately
+//! below independently defeats replay and is strictly stronger than a seen-nonce
+//! cache, so this gate needs no `ReplayCache` of its own.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ct_common::channel::{verify, verify_holder_possession, SignedChannelGrant};
+use ct_common::channel::{verify_holder_possession, verify_stateless, SignedChannelGrant};
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -173,7 +178,7 @@ where
         let Some((operator, _noise, _attest)) = resolver.resolve_member(channel, holder).await else {
             return Err(refuse(&mut stream, "not-member", &ctx, "unknown channel or holder not a member".into()).await);
         };
-        if let Err(e) = verify(&operator, &grant, now) {
+        if let Err(e) = verify_stateless(&operator, &grant, now) {
             return Err(refuse(&mut stream, "grant-verify", &ctx, format!("grant rejected: {e}").into()).await);
         }
 

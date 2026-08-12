@@ -5,7 +5,9 @@
 //! **minting** side — the issuer signing key, which is held only by the control
 //! plane.
 
-pub use ct_common::credential::{Credential, CredError, SignedCredential, UnixSeconds, verify};
+pub use ct_common::credential::{
+    verify_stateless, Credential, CredError, SignedCredential, UnixSeconds,
+};
 
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -54,7 +56,7 @@ mod tests {
     fn mint_then_verify_ok_before_expiry() {
         let issuer = CredentialIssuer::generate();
         let signed = issuer.mint(cred(1_000));
-        assert_eq!(verify(&issuer.public_key_bytes(), &signed, 999), Ok(()));
+        assert_eq!(verify_stateless(&issuer.public_key_bytes(), &signed, 999), Ok(()));
     }
 
     #[test]
@@ -62,7 +64,7 @@ mod tests {
         let issuer = CredentialIssuer::generate();
         let signed = issuer.mint(cred(1_000));
         assert_eq!(
-            verify(&issuer.public_key_bytes(), &signed, 1_000),
+            verify_stateless(&issuer.public_key_bytes(), &signed, 1_000),
             Err(CredError::Expired)
         );
     }
@@ -73,7 +75,7 @@ mod tests {
         let other = CredentialIssuer::generate();
         let signed = issuer.mint(cred(1_000));
         assert_eq!(
-            verify(&other.public_key_bytes(), &signed, 500),
+            verify_stateless(&other.public_key_bytes(), &signed, 500),
             Err(CredError::BadSignature)
         );
     }
