@@ -923,6 +923,17 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
         edge = edge_host,
     );
     let run_cmd = "set -a; source .env; set +a\n./target/release/ct-agent onboard";
+    // Windows/PowerShell has no `source` concept, so `.env` isn't picked up on
+    // its own -- ct-agent has no built-in dotenv support (only reads live
+    // process env vars, confirmed: no dotenv-family crate in this workspace),
+    // so the bash step's `source .env` is doing real, necessary work of
+    // exporting each line into the shell that PowerShell needs an equivalent
+    // for. The `.env` file content itself stays the SAME single source of
+    // truth above (not duplicated here) -- only this run step gets a second,
+    // OS-appropriate form. `.exe` under `target\release\` is the standard
+    // Cargo cross-compile convention (this repo has no Windows CI/build docs
+    // that say otherwise).
+    let run_cmd_ps = "Get-Content .env | ForEach-Object {\n  if ($_ -match '^\\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {\n    $value = $matches[2] -replace '\\s+#.*$', ''\n    [System.Environment]::SetEnvironmentVariable($matches[1], $value.Trim(), 'Process')\n  }\n}\n.\\target\\release\\ct-agent.exe onboard";
     let body = format!(
         r#"<h1>Install an agent</h1>
 <p class="help">Save this <strong>on the machine you want to expose</strong> &mdash;
@@ -950,9 +961,17 @@ as <code>.env</code> <strong>next to the binary, on the machine you want to expo
   <pre><code>{build_cmd}</code></pre>
  </div>
  <h3>2. Run it</h3>
- <div class="code-block">
-  <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <div class="tab-row">
+  <button type="button" class="tab-btn active" onclick="showTab(this,'run-bash')">bash</button>
+  <button type="button" class="tab-btn" onclick="showTab(this,'run-powershell')">PowerShell</button>
+ </div>
+ <div class="code-block" id="run-bash" data-tab="bash">
+  <div class="code-block-head"><span>bash</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
   <pre><code>{run_cmd}</code></pre>
+ </div>
+ <div class="code-block" id="run-powershell" data-tab="powershell" style="display:none">
+  <div class="code-block-head"><span>PowerShell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{run_cmd_ps}</code></pre>
  </div>
  <p class="help">That's it &mdash; <code>ct-agent</code> redeems the join token, binds your tunnel's
  routing token, and starts serving your origin through the relay end-to-end encrypted. A one-line
@@ -1466,7 +1485,7 @@ pub(crate) fn page(title: &str, body: &str) -> String {
     login_allowlist_list is already scoped per tunnel id -- the bug was purely
     that the boundary between tunnels wasn't visible). */
  .tunnel-card{{border:1px solid var(--border);border-radius:10px;padding:.2rem 1rem;margin:0 0 1rem;
-      background:#131820;max-height:640px;overflow-y:auto;animation:cardIn .3s ease-out backwards;
+      background:#131820;max-height:640px;animation:cardIn .3s ease-out backwards;
       transition:opacity .2s ease,transform .2s ease,max-height .25s ease,margin .25s ease,padding .25s ease}}
  .tunnel-card:nth-of-type(1){{animation-delay:0ms}} .tunnel-card:nth-of-type(2){{animation-delay:50ms}}
  .tunnel-card:nth-of-type(3){{animation-delay:100ms}} .tunnel-card:nth-of-type(n+4){{animation-delay:150ms}}
@@ -1478,6 +1497,12 @@ pub(crate) fn page(title: &str, body: &str) -> String {
     just submits immediately, same as before. */
  .leaving{{opacity:0!important;transform:translateX(8px) scale(.98)!important;max-height:0!important;
       padding-top:0!important;padding-bottom:0!important;margin:0!important;overflow:hidden;pointer-events:none}}
+ /* Only the access-list itself scrolls internally when it gets long -- not the
+    whole .tunnel-card (that used to have its own overflow-y:auto, which
+    clipped/scrolled the entire card, tokens/buttons and all, instead of just
+    this list). 220px comfortably shows ~3-4 rows (each <li> caps at 60px)
+    before it starts scrolling. */
+ .login-allowlist{{max-height:220px;overflow-y:auto}}
  .login-allowlist li{{animation:rowIn .22s ease-out backwards;max-height:60px;
       transition:opacity .2s ease,transform .2s ease,max-height .2s ease,padding .2s ease,margin .2s ease}}
  .login-allowlist li:nth-child(1){{animation-delay:0ms}} .login-allowlist li:nth-child(2){{animation-delay:25ms}}
@@ -1489,7 +1514,12 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.15rem .4rem}}
  form.inline{{display:inline}}
  label{{display:block;margin:.85rem 0;font-size:.9rem}}
- label input{{display:block;margin-top:.3rem;width:100%;max-width:360px}}
+ label input:not([type=checkbox]):not([type=radio]){{display:block;margin-top:.3rem;width:100%;max-width:360px}}
+ /* Checkboxes/radios must stay inline with their label text (e.g. "Require
+    login to access this tunnel") -- the block-level rule above was written
+    for text inputs nested `<label>Name<input></label>`-style and previously
+    matched checkboxes too, forcing them onto their own line above the text. */
+ label input[type=checkbox],label input[type=radio]{{width:auto;margin:0 .4rem 0 0;vertical-align:middle}}
  .help{{color:#8b949e;font-size:.82rem;display:block}} label .help{{margin-top:.35rem}}
  p.help{{margin:.2rem 0 1rem}} .opt{{color:#8b949e;font-weight:400}}
  ol.steps{{color:#8b949e;font-size:.86rem;margin:.2rem 0;padding-left:1.2rem}}
@@ -1509,6 +1539,13 @@ pub(crate) fn page(title: &str, body: &str) -> String {
  .copy-btn{{background:#21262d;border:1px solid #30363d;color:#e6edf3;flex-shrink:0;border-radius:6px;
   padding:.3rem .65rem;font-size:.76rem;font-weight:600;cursor:pointer}}
  .copy-btn:hover{{background:#30363d}}
+ /* bash/PowerShell (or any other OS-specific step) toggle: two labeled tab
+    buttons switching which sibling .code-block is shown -- see showTab() below. */
+ .tab-row{{display:flex;gap:.4rem;margin:.6rem 0 -.2rem}}
+ .tab-btn{{background:#161b22;border:1px solid #30363d;color:#8b949e;border-radius:6px 6px 0 0;
+  padding:.35rem .8rem;font-size:.78rem;font-weight:600;cursor:pointer}}
+ .tab-btn:hover{{color:#e6edf3}}
+ .tab-btn.active{{background:#0d1117;color:#e6edf3;border-bottom-color:#0d1117}}
  details{{margin:1.1rem 0;border:1px solid #30363d;border-radius:8px;padding:.7rem .9rem}}
  summary{{cursor:pointer;color:#58a6ff;font-weight:600}}
  summary:hover{{color:#79c0ff}}
@@ -1525,6 +1562,19 @@ pub(crate) fn page(title: &str, body: &str) -> String {
   const text = code ? code.textContent : '';
   const done = () => {{ const orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(()=>{{ btn.textContent = orig; }}, 1600); }};
   if(navigator.clipboard && navigator.clipboard.writeText){{ navigator.clipboard.writeText(text).then(done).catch(()=>{{}}); }}
+ }}
+ // Generic OS/shell tab toggle (e.g. install page's bash vs PowerShell "Run it"
+ // step): switches which sibling .code-block is visible and which .tab-btn is
+ // marked active, all within the same .tab-row's parent -- no new JS framework,
+ // same inline-<script> style as copyCode above.
+ function showTab(btn, showId){{
+  var row = btn.closest('.tab-row');
+  if(!row) return;
+  var group = row.parentElement;
+  var buttons = row.querySelectorAll('.tab-btn');
+  for(var i=0;i<buttons.length;i++){{ buttons[i].classList.toggle('active', buttons[i] === btn); }}
+  var blocks = group.querySelectorAll('.code-block[data-tab]');
+  for(var j=0;j<blocks.length;j++){{ blocks[j].style.display = (blocks[j].id === showId) ? '' : 'none'; }}
  }}
  // Progressive enhancement for any `form.fade-out-submit` (tunnel Revoke,
  // login-allowlist Remove): fade/collapse the enclosing .tunnel-card or <li>
@@ -2231,6 +2281,78 @@ mod tests {
         assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(human_bytes(u64::MAX), "16777216.0 TB", "never panics/overflows at the top of the range");
+    }
+
+    // Screenshot bug report: the "Require login" checkbox rendered on its own
+    // line above its label text instead of inline before it. The markup was
+    // never wrong (input already precedes the text) -- the regression was a
+    // too-broad `label input{{display:block;...}}` CSS rule (written for text
+    // inputs like the "Create another tunnel" name field) that unintentionally
+    // also matched the checkbox and forced it onto its own block-level line.
+    #[test]
+    fn require_login_checkbox_markup_has_input_before_its_label_text() {
+        let html = login_gate_html("tun1", false, &[], &[]);
+        let input_pos = html.find(r#"<input type="checkbox" name="enabled" value="1">"#).expect("checkbox present");
+        let text_pos = html.find("Require login to access this tunnel").expect("label text present");
+        assert!(input_pos < text_pos, "checkbox markup must precede its label text");
+        // Both must live inside the SAME <label>...</label> for the browser to
+        // treat them as one inline unit -- not just present somewhere on the
+        // page: the nearest preceding "<label>" to the input, and the nearest
+        // following "</label>" after the text, must bracket both.
+        let label_open = html[..input_pos].rfind("<label>").expect("a <label> opens before the checkbox");
+        let label_close = html[text_pos..].find("</label>").map(|p| p + text_pos).expect("a </label> closes after the text");
+        assert!(label_open < input_pos && input_pos < label_close, "checkbox is inside the label");
+        assert!(label_open < text_pos && text_pos < label_close, "label text is inside the label");
+    }
+
+    // Regression guard for the CSS fix itself: the block-level `label input`
+    // rule must exclude checkbox/radio (so they stay inline with their label
+    // text), and a dedicated inline rule must exist to size/space them
+    // correctly -- while the original text-input behavior (full-width input
+    // dropped below the label text, e.g. "Create another tunnel"'s name field)
+    // must be unchanged for every OTHER input type.
+    #[test]
+    fn label_input_css_scopes_the_block_layout_rule_away_from_checkboxes() {
+        let full_page = page("t", "");
+        assert!(
+            full_page.contains("label input:not([type=checkbox]):not([type=radio]){display:block"),
+            "the full-width block-below-label-text rule must now exclude checkboxes/radios"
+        );
+        assert!(
+            full_page.contains("label input[type=checkbox]") && full_page.contains("vertical-align:middle"),
+            "a dedicated inline rule must keep the checkbox itself sized/spaced correctly"
+        );
+    }
+
+    // Screenshot bug report: the whole tunnel card scrolled internally
+    // (clipping rows/buttons/login-gate) instead of just the access list. Only
+    // `.login-allowlist` (the <ul> of granted emails) should get its own
+    // scroll container; `.tunnel-card` keeps its max-height (load-bearing for
+    // the existing collapse-to-0 removal animation, see `.leaving`) but must
+    // no longer also clip/scroll its own content.
+    #[test]
+    fn only_the_access_list_scrolls_internally_not_the_whole_tunnel_card() {
+        let full_page = page("t", "");
+        // Isolate just the `.tunnel-card{...}` rule body (up to its closing
+        // brace) rather than a brittle exact-whitespace substring match, so
+        // this survives incidental reformatting of the surrounding CSS.
+        let rule_start = full_page.find(".tunnel-card{").expect(".tunnel-card rule present");
+        let rule_body_start = rule_start + ".tunnel-card{".len();
+        let rule_end = full_page[rule_body_start..].find('}').map(|p| p + rule_body_start).expect("rule closes");
+        let tunnel_card_rule = &full_page[rule_start..rule_end];
+        assert!(
+            !tunnel_card_rule.contains("overflow-y:auto"),
+            ".tunnel-card must no longer clip/scroll its own content: {tunnel_card_rule}"
+        );
+        assert!(
+            tunnel_card_rule.contains("max-height:640px"),
+            "tunnel-card keeps its generous cap (load-bearing for the .leaving collapse-to-0 removal animation): {tunnel_card_rule}"
+        );
+        assert!(
+            full_page.contains(".login-allowlist{max-height:220px;overflow-y:auto}"),
+            "the access list itself must get its own scroll container"
+        );
+        assert!(full_page.contains(".leaving{"), "the removal-animation class is unaffected");
     }
 
     // #112 (frozen): a hung edge admin endpoint must NOT block the portal path.
@@ -3654,6 +3776,35 @@ mod tests {
             html.find("Save your tunnel's tokens").unwrap() < html.find("<details>").unwrap(),
             "the tokens are the first thing shown, ahead of the collapsible how-to"
         );
+
+        // Windows/PowerShell users previously had no working "Run it" equivalent
+        // at all (bash-only `source .env` + a forward-slash, extension-less
+        // binary path). Both the bash and PowerShell variants must now be
+        // present -- as a tab toggle, not a second full page -- and the .env
+        // block itself must stay a single, unduplicated source of truth.
+        assert!(html.contains(">bash<") && html.contains(">PowerShell<"), "both a bash and PowerShell tab are present");
+        assert!(
+            html.contains("set -a; source .env; set +a") && html.contains("./target/release/ct-agent onboard"),
+            "the original bash run command is unchanged"
+        );
+        assert!(
+            html.contains(".\\target\\release\\ct-agent.exe onboard"),
+            "the PowerShell run command uses the Windows binary extension and backslash path"
+        );
+        assert!(
+            html.contains("SetEnvironmentVariable") && html.contains("Get-Content .env"),
+            "the PowerShell step does the same real work as bash's `source .env` -- parses \
+             the file and exports each var into the process, since ct-agent only reads live \
+             process env vars (no dotenv support)"
+        );
+        assert!(!html.contains("irm "), "no non-functional PowerShell one-liner shown (#75 still applies)");
+        assert!(
+            html.contains(r#"onclick="showTab(this,'run-bash')""#) && html.contains(r#"onclick="showTab(this,'run-powershell')""#),
+            "the tabs actually toggle via the shared showTab() inline script, same style as copyCode()"
+        );
+        // The .env block itself is OS-agnostic and must appear exactly once,
+        // not duplicated in a PowerShell-specific rendering.
+        assert_eq!(html.matches("CT_AGENT_JOIN_TOKEN=").count(), 1, ".env content is not duplicated for PowerShell");
     }
 
     #[tokio::test]
