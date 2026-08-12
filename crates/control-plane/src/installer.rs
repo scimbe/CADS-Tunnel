@@ -487,6 +487,44 @@ async fn serve_channel_ps1(State(st): State<InstallerState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn setup_script_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct SetupScriptEnvGuard {
+        sh: Option<String>,
+        ps1: Option<String>,
+    }
+
+    impl SetupScriptEnvGuard {
+        fn override_urls(sh: &str, ps1: &str) -> Self {
+            let sh_prev = std::env::var("CT_AGENT_SETUP_URL").ok();
+            let ps1_prev = std::env::var("CT_AGENT_SETUP_PS1_URL").ok();
+            unsafe {
+                std::env::set_var("CT_AGENT_SETUP_URL", sh);
+                std::env::set_var("CT_AGENT_SETUP_PS1_URL", ps1);
+            }
+            Self { sh: sh_prev, ps1: ps1_prev }
+        }
+    }
+
+    impl Drop for SetupScriptEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.sh {
+                    Some(v) => std::env::set_var("CT_AGENT_SETUP_URL", v),
+                    None => std::env::remove_var("CT_AGENT_SETUP_URL"),
+                }
+                match &self.ps1 {
+                    Some(v) => std::env::set_var("CT_AGENT_SETUP_PS1_URL", v),
+                    None => std::env::remove_var("CT_AGENT_SETUP_PS1_URL"),
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn channel_scripts_are_served_and_exec_ct_agent_channel() {
@@ -659,6 +697,7 @@ mod tests {
 
     #[test]
     fn setup_script_urls_are_overridable_for_self_hosting_operators_448() {
+        let _lock = setup_script_env_lock().lock().unwrap();
         // #448: a self-hosting operator must be able to point this at their own
         // mirror without patching the crate. Unset -> today's exact default
         // (matches install_routes_redirect_to_the_ct_agent_setup_scripts above,
@@ -666,14 +705,29 @@ mod tests {
         assert_eq!(ct_agent_setup_sh_url(), CT_AGENT_SETUP_SH);
         assert_eq!(ct_agent_setup_ps1_url(), CT_AGENT_SETUP_PS1);
 
-        // SAFETY: this crate's test binary runs single-process; scoped strictly to
-        // this test's own two reads immediately below, restored before returning.
-        unsafe {
-            std::env::set_var("CT_AGENT_SETUP_URL", "https://mirror.example/setup.sh");
-            std::env::set_var("CT_AGENT_SETUP_PS1_URL", "https://mirror.example/setup.ps1");
-        }
+        let _guard =
+            SetupScriptEnvGuard::override_urls("https://mirror.example/setup.sh", "https://mirror.example/setup.ps1");
         assert_eq!(ct_agent_setup_sh_url(), "https://mirror.example/setup.sh");
         assert_eq!(ct_agent_setup_ps1_url(), "https://mirror.example/setup.ps1");
+    }
+
+    #[test]
+    fn setup_script_env_guard_restores_previous_values() {
+        let _lock = setup_script_env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("CT_AGENT_SETUP_URL", "https://before.example/setup.sh");
+            std::env::set_var("CT_AGENT_SETUP_PS1_URL", "https://before.example/setup.ps1");
+        }
+
+        {
+            let _guard =
+                SetupScriptEnvGuard::override_urls("https://mirror.example/setup.sh", "https://mirror.example/setup.ps1");
+            assert_eq!(ct_agent_setup_sh_url(), "https://mirror.example/setup.sh");
+            assert_eq!(ct_agent_setup_ps1_url(), "https://mirror.example/setup.ps1");
+        }
+
+        assert_eq!(ct_agent_setup_sh_url(), "https://before.example/setup.sh");
+        assert_eq!(ct_agent_setup_ps1_url(), "https://before.example/setup.ps1");
         unsafe {
             std::env::remove_var("CT_AGENT_SETUP_URL");
             std::env::remove_var("CT_AGENT_SETUP_PS1_URL");
@@ -698,6 +752,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
+        let _lock = setup_script_env_lock().lock().unwrap();
         let app = installer_router(
             "https://portal.example".to_string(),
             "http://release.invalid/base".to_string(),
