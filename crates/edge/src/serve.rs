@@ -1532,6 +1532,73 @@ where
     Ok(parked.map(|parked| (parked, sub_permit)))
 }
 
+/// The Browser-Plane counterpart to [`admit_tcp_agent_a`]: the admission body
+/// shared by roles `'B'` and `'L'`, byte-identical between them so the only
+/// difference between those two arms is what happens *after* parking (plain
+/// await vs [`park_and_ping`]).
+///
+/// Browser register (#41 FB1): registers the tunnel AND binds a public hostname in
+/// ONE message, because the TLS-TCP fallback has a single stream and cannot carry
+/// a separate `'H'` bind like the QUIC path. Wire:
+/// `<role> | token(32) | host_len(2 BE) | host`.
+///
+/// `None` means admission was refused inline (`NO` already sent) -- the caller just
+/// returns. #258: the whole exchange is bounded. #410: admitted against
+/// `tcp_agent_cap` right after the token is known, BEFORE the hostname is even
+/// read, and ahead of `host_bind_allowed`/`register_host`, so a flood that finds
+/// the sub-cap full never touches the hostname-routing table at all.
+async fn admit_tcp_agent_b<S>(
+    stream: &mut S,
+    state: &EdgeState<Connection>,
+    tcp_agent_cap: Option<&ConnectionCap>,
+    role_label: &'static str,
+) -> Result<
+    Option<(
+        tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    )>,
+    BoxError,
+>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let admitted = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+        let mut token_buf = [0u8; 32];
+        stream.read_exact(&mut token_buf).await?;
+        let token = RoutingToken(token_buf);
+        let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
+        if tcp_agent_cap.is_some() && sub_permit.is_none() {
+            stream.write_all(b"NO").await?;
+            stream.flush().await?;
+            return Ok::<_, BoxError>(None);
+        }
+        let mut hl = [0u8; 2];
+        stream.read_exact(&mut hl).await?;
+        let hlen = u16::from_be_bytes(hl) as usize;
+        if hlen == 0 || hlen > 253 {
+            return Err("invalid Browser-Plane hostname length".into());
+        }
+        let mut host = vec![0u8; hlen];
+        stream.read_exact(&mut host).await?;
+        let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?.to_string();
+        // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
+        if !state.host_bind_allowed(&host, &token) || !state.register_host(&host, token.clone()) {
+            stream.write_all(b"NO").await?;
+            stream.flush().await?;
+            return Ok::<_, BoxError>(None);
+        }
+        stream.write_all(b"OK").await?;
+        stream.flush().await?;
+        Ok(Some((token, sub_permit)))
+    })
+    .await
+    .map_err(|_| format!("tcp-fallback: role '{role_label}' admission timed out"))??;
+    let Some((token, sub_permit)) = admitted else { return Ok(None) };
+    // Returned UN-awaited: the caller decides whether to await it plainly ('B') or
+    // to keep the idle connection alive with `park_and_ping` while waiting ('L').
+    Ok(Some((state.park_tcp_agent(token), sub_permit)))
+}
+
 async fn park_and_ping<S>(
     stream: &mut S,
     parked: tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
@@ -1691,50 +1758,12 @@ where
             }
         }
         b'B' => {
-            // Browser register (#41 FB1): register the tunnel AND bind a public
-            // hostname in ONE message — the TLS-TCP fallback has a single stream,
-            // so it can't carry a separate 'H' bind like the QUIC path. Wire:
-            // `'B' | token(32) | host_len(2 BE) | host`.
-            // #258: bound the admission exchange, same as arm 'A'. `None` means
-            // admission was refused inline (NO already sent) -- just return.
-            // #410: admitted against `tcp_agent_cap` right after the token is known,
-            // BEFORE the hostname is even read -- same rationale as arm 'A' (see that
-            // arm's comment and `tcp_agent_cap`'s own doc in `run_edge`). Checked
-            // ahead of `host_bind_allowed`/`register_host` so a flood that finds the
-            // sub-cap full never touches the hostname-routing table at all.
-            let admitted = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
-                let mut token_buf = [0u8; 32];
-                stream.read_exact(&mut token_buf).await?;
-                let token = RoutingToken(token_buf);
-                let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
-                if tcp_agent_cap.is_some() && sub_permit.is_none() {
-                    stream.write_all(b"NO").await?;
-                    stream.flush().await?;
-                    return Ok::<_, BoxError>(None);
-                }
-                let mut hl = [0u8; 2];
-                stream.read_exact(&mut hl).await?;
-                let hlen = u16::from_be_bytes(hl) as usize;
-                if hlen == 0 || hlen > 253 {
-                    return Err("invalid Browser-Plane hostname length".into());
-                }
-                let mut host = vec![0u8; hlen];
-                stream.read_exact(&mut host).await?;
-                let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?.to_string();
-                // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
-                if !state.host_bind_allowed(&host, &token) || !state.register_host(&host, token.clone()) {
-                    stream.write_all(b"NO").await?;
-                    stream.flush().await?;
-                    return Ok::<_, BoxError>(None);
-                }
-                stream.write_all(b"OK").await?;
-                stream.flush().await?;
-                Ok(Some((token, sub_permit)))
-            })
-            .await
-            .map_err(|_| "tcp-fallback: role 'B' admission timed out")??;
-            let Some((token, _sub_permit)) = admitted else { return Ok(()) };
-            match state.park_tcp_agent(token).await {
+            let Some((parked, _sub_permit)) =
+                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "B").await?
+            else {
+                return Ok(());
+            };
+            match parked.await {
                 Ok(mut client) => {
                     relay(&mut stream, &mut client).await?;
                     Ok(())
@@ -1742,6 +1771,50 @@ where
                 // See the 'A' arm above (#229 follow-up): graceful shutdown
                 // instead of an abrupt drop when a later registration for the
                 // same token supersedes this one.
+                Err(_) => {
+                    let _ = stream.shutdown().await;
+                    Ok(())
+                }
+            }
+        }
+        b'L' => {
+            // The ping-capable Browser-Plane register: exactly what 'K' is to 'A',
+            // but for 'B'. Byte-identical admission to 'B' (same token/cap/hostname
+            // gates, same OK/NO ack); the ONLY difference is that once parked, this
+            // arm keeps real payload traffic flowing over the idle connection via
+            // `park_and_ping` instead of awaiting the Client oneshot directly.
+            //
+            // Why this exists (live incident, 2026-08-13, sort.bunsenbrenner.org):
+            // 'K' only ever covered the Noise/mesh path. A Browser-Plane agent
+            // (`CT_AGENT_MODE=browser`) registers over the fallback with 'B', so it
+            // could not benefit from the ping treatment at all -- upgrading such an
+            // agent to the release carrying 'K' changed nothing for it, which is
+            // exactly what was observed. Measured on that deployment: a parked
+            // fallback connection dies after ~10-15s idle (5s request spacing ->
+            // 4/4 OK, 20s spacing -> 1/4), because the middlebox on that path
+            // ignores ACK-only keepalive segments. Real payload traffic is the only
+            // thing that keeps it alive, and that is what this arm sends.
+            //
+            // A legacy Browser-Plane agent never sends 'L' (it only ever sends 'B'),
+            // so it can never reach this arm -- zero behavior change for any
+            // already-deployed client.
+            let Some((parked, _sub_permit)) =
+                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "L").await?
+            else {
+                return Ok(());
+            };
+            match park_and_ping(&mut stream, parked).await {
+                Ok(mut client) => {
+                    // Clean, unambiguous hand-off boundary, same as 'K': announce the
+                    // ping phase's end BEFORE any relayed byte can reach this stream.
+                    stream.write_all(&[TCP_PING_STOP]).await?;
+                    stream.flush().await?;
+                    relay(&mut stream, &mut client).await?;
+                    Ok(())
+                }
+                // Same graceful shutdown as 'B'/'K' -- a superseded registration or
+                // a parked agent that genuinely went away is an ordinary outcome
+                // here, not an error to propagate.
                 Err(_) => {
                     let _ = stream.shutdown().await;
                     Ok(())
