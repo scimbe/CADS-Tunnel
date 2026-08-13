@@ -32,22 +32,42 @@ pub(crate) fn install_crypto_provider() {
 /// the same reason and for symmetry with any intermediate stateful device on
 /// this leg of the path. Best-effort.
 ///
-/// `time`/`interval` were originally 20s/20s with the OS-default retry count
-/// (typically 9 on Linux), so a genuinely dead connection could take up to
-/// ~200s (20 + 9*20) to surface as an error -- long enough that a parked
-/// Agent registration sits silently broken for minutes before either side
-/// notices. Tightened to 10s/10s with an explicit `with_retries(3)` bound:
-/// worst case is now 10 + 3*10 = 40s, roughly a 5x cut to the detection
-/// blind spot, while keeping probe traffic light (one 0-byte ACK-only
-/// segment every 10s while idle -- negligible bandwidth/battery cost, and
-/// still well above what would meaningfully drain a mobile `ct-agent`
-/// client sitting parked).
+/// `time`/`interval` are 20s/20s with the OS-default retry count (typically 9 on
+/// Linux), so a genuinely dead connection surfaces after ~200s (20 + 9*20).
+///
+/// **These were briefly tightened to 10s/10s + `with_retries(3)` (worst case 40s)
+/// on 2026-08-12 and reverted the next day.** The reasoning for tightening was
+/// that a parked Agent registration sits silently broken for minutes before
+/// either side notices. Both halves of that reasoning turned out to be wrong for
+/// this knob:
+///
+/// 1. **It did not fix what it was for.** The parked-registration flapping it
+///    targeted continued at exactly the same rate afterwards, because the real
+///    cause is a middlebox that ignores ACK-only segments entirely — no keepalive
+///    *timing* helps against that, which is precisely why the ping-capable `'K'`
+///    role (real payload traffic on parked connections) exists.
+/// 2. **Its blast radius is every accepted TCP connection, not just parked
+///    registrations.** `serve_listener` applies this to every socket it accepts,
+///    including browser connections to the `:443` front door. Cutting the
+///    tolerance 5x therefore also cut how long *any* legitimately-idle connection
+///    may stay quiet — and when the probes themselves are the thing being
+///    dropped, retries add nothing. Live symptom after the tightening: a
+///    long-running request (an LLM call taking 15-20s, during which its
+///    connection is genuinely idle) started dying mid-flight, with ~52
+///    `ETIMEDOUT` per 30 minutes across `:443` and the fallback listener where
+///    there had been none.
+///
+/// Detecting a dead peer faster is not worth killing live-but-quiet connections:
+/// a dead registration is already covered by the `open_bi` failover path (#8 R2),
+/// whereas a killed in-flight request is an outright user-visible failure. Do not
+/// re-tighten this without a mechanism that distinguishes "idle" from "dead" —
+/// which is what the `'K'` ping role does, at the protocol level, where it
+/// belongs.
 pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let ka = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(10))
-        .with_interval(std::time::Duration::from_secs(10))
-        .with_retries(3);
+        .with_time(std::time::Duration::from_secs(20))
+        .with_interval(std::time::Duration::from_secs(20));
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
@@ -550,13 +570,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_tcp_keepalive_uses_the_tightened_10s_10s_3_retry_parameters() {
-        // ct-agent#15 flap investigation: the parked TLS-TCP fallback connection was
-        // still flapping under the old 20s/20s + OS-default-retries (~9) keepalive,
-        // whose worst-case dead-connection-detection time was ~200s (20 + 9*20). This
-        // proves the tightened values actually land on the wire (not just that
-        // `apply_tcp_keepalive` compiles): SO_KEEPALIVE on, TCP_KEEPIDLE=10s,
-        // TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 -- worst case now 10 + 3*10 = 40s.
+    async fn apply_tcp_keepalive_stays_tolerant_enough_for_a_legitimately_idle_connection() {
+        // Regression guard for a real production incident (2026-08-13). These values
+        // were briefly tightened to 10s/10s + retries(3) -- worst case 40s instead of
+        // ~200s -- to surface dead parked registrations faster. That was wrong twice
+        // over: it did not reduce the flapping it targeted (the cause is a middlebox
+        // dropping ACK-only segments, which no keepalive *timing* can fix), and
+        // `serve_listener` applies this to EVERY accepted socket, including browser
+        // connections to the :443 front door. So it also cut how long any
+        // legitimately-quiet connection may stay quiet, and a long-running request
+        // (an LLM call taking 15-20s, idle on the wire while it thinks) started
+        // dying mid-flight -- ~52 ETIMEDOUT per 30 min where there had been none.
+        //
+        // Pin the tolerant values, and pin the property that actually matters: the
+        // window must stay comfortably above the tens-of-seconds an ordinary slow
+        // request can legitimately be idle. Killing a live-but-quiet connection is a
+        // user-visible failure; a dead registration is already covered by the
+        // `open_bi` failover path (#8 R2). Distinguishing idle from dead belongs in
+        // the protocol (the 'K' ping role), not in a socket timeout.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move {
@@ -569,21 +600,35 @@ mod tests {
 
         let sock = socket2::SockRef::from(&stream);
         assert!(sock.keepalive().unwrap_or(false), "SO_KEEPALIVE must be enabled");
-        assert_eq!(
-            sock.keepalive_time().unwrap(),
-            std::time::Duration::from_secs(10),
-            "TCP_KEEPIDLE must be tightened to 10s (was 20s)"
-        );
+        let idle = sock.keepalive_time().unwrap();
+        assert_eq!(idle, std::time::Duration::from_secs(20), "TCP_KEEPIDLE");
         assert_eq!(
             sock.keepalive_interval().unwrap(),
-            std::time::Duration::from_secs(10),
-            "TCP_KEEPINTVL must be tightened to 10s (was 20s)"
+            std::time::Duration::from_secs(20),
+            "TCP_KEEPINTVL"
         );
-        assert_eq!(
-            sock.keepalive_retries().unwrap(),
-            3,
-            "TCP_KEEPCNT must be explicitly bounded to 3 (was the OS default, ~9 on Linux)"
+
+        // The load-bearing assertion: probing must not even BEGIN until well past the
+        // idle stretch of an ordinary slow request. A 15-20s LLM call is the concrete
+        // case that broke; require real margin over it rather than pinning a number
+        // whose purpose is easy to lose.
+        assert!(
+            idle >= std::time::Duration::from_secs(20),
+            "keepalive probing starts after {idle:?} -- too soon: a request that is \
+             legitimately idle for 15-20s (an LLM call) must not be treated as dead"
         );
+
+        // Retries are deliberately left at the OS default (~9 on Linux) rather than
+        // bounded: an explicit low bound only shortens the window further, and when
+        // the probes themselves are what a middlebox drops, more retries cost nothing
+        // while fewer retries kill live connections sooner.
+        if let Ok(retries) = sock.keepalive_retries() {
+            assert!(
+                retries >= 5,
+                "TCP_KEEPCNT={retries} is too aggressive; leave the OS default so the \
+                 total window stays long enough for a legitimately idle connection"
+            );
+        }
     }
 
     #[tokio::test]
