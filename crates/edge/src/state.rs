@@ -213,6 +213,28 @@ pub struct EdgeState<H> {
     relays: Counter,
     relay_bytes: Counter,
     failovers: Counter,
+    /// TLS-TCP **fallback** observability. The counters above only ever see the
+    /// QUIC path: `register_locked` increments `registrations`/the gauges below,
+    /// but [`park_tcp_agent`](Self::park_tcp_agent) writes to a completely
+    /// separate `tcp_agents` map and historically touched no metric at all. An
+    /// Agent reachable only over `:4433` — the normal case when a network blocks
+    /// the QUIC ports — was therefore **invisible in every single edge metric**:
+    /// `active_tunnels`, `active_agents` and `registrations_total` all stayed
+    /// flat no matter how often it connected, reconnected, or served traffic.
+    ///
+    /// That cost real debugging time in a live incident (2026-08-13,
+    /// sort.bunsenbrenner.org): flat counters were read as "the agent never even
+    /// tries to connect" while the agent was in fact reconnecting continuously
+    /// over the fallback (~737 cycles in 17.5h, measured agent-side) and serving
+    /// a fraction of requests. Two independent observers reached opposite,
+    /// equally-wrong conclusions from the same metrics.
+    ///
+    /// `tcp_parks` counts every park (each is one reconnect/pool slot, so its
+    /// rate IS the churn rate); `tcp_deliveries` counts slots actually consumed
+    /// by a Client; `tcp_parked_gauge` is how many are waiting right now.
+    tcp_parks: Counter,
+    tcp_deliveries: Counter,
+    tcp_parked_gauge: AtomicU64,
     /// #359: live gauges maintained incrementally at every real mutation of
     /// `agents` (`register_locked`/`remove_registration`/`remove`, the only
     /// three call sites that ever insert into or remove from that map -- all
@@ -274,6 +296,9 @@ impl<H: Clone> EdgeState<H> {
             rendezvous_limiter: Mutex::new(None),
             registrations: Counter::default(),
             relays: Counter::default(),
+            tcp_parks: Counter::default(),
+            tcp_deliveries: Counter::default(),
+            tcp_parked_gauge: AtomicU64::new(0),
             relay_bytes: Counter::default(),
             failovers: Counter::default(),
             tunnel_bytes: Mutex::new(HashMap::new()),
@@ -528,6 +553,26 @@ impl<H: Clone> EdgeState<H> {
     pub fn failovers_total(&self) -> u64 {
         self.failovers.get()
     }
+    /// TLS-TCP fallback parks since start. Its **rate is the fallback pool's churn
+    /// rate**: each park is one Agent-side connection joining the pool, so a
+    /// steadily climbing counter on an otherwise-idle tunnel means the Agent's
+    /// parked connections keep dying and being re-established — the signal that
+    /// was completely unavailable before, and whose absence made a fallback-only
+    /// Agent indistinguishable from one that never connects at all.
+    pub fn tcp_parks_total(&self) -> u64 {
+        self.tcp_parks.get()
+    }
+    /// TLS-TCP fallback parks actually consumed by a Client.
+    pub fn tcp_deliveries_total(&self) -> u64 {
+        self.tcp_deliveries.get()
+    }
+    /// TLS-TCP fallback registrations parked right now, across all tokens — the
+    /// fallback counterpart to [`active_tunnels`](Self::active_tunnels). Zero here
+    /// while requests fail means the pool is momentarily empty (churn), which is a
+    /// different failure from "no registration exists".
+    pub fn tcp_parked(&self) -> u64 {
+        self.tcp_parked_gauge.load(Ordering::Relaxed)
+    }
 
     /// Park a TCP-fallback agent for `token`: returns a receiver that resolves to
     /// a Client's stream once one rendezvouses for this token. Additive -- an
@@ -537,6 +582,9 @@ impl<H: Clone> EdgeState<H> {
     pub fn park_tcp_agent(&self, token: RoutingToken) -> oneshot::Receiver<BoxedStream> {
         let (tx, rx) = oneshot::channel();
         self.tcp_agents.lock_safe().entry(token).or_default().push_back(tx);
+        // Instrumented so a fallback-only Agent is visible at all (see `tcp_parks`).
+        self.tcp_parks.inc();
+        self.tcp_parked_gauge.fetch_add(1, Ordering::Relaxed);
         // `notify_one` (not `notify_waiters`): it stores a permit when nobody is
         // currently waiting, so a park() that races ahead of a concurrent
         // `wait_for_tcp_agent`'s has_tcp_agent-then-notified() check is never
@@ -567,7 +615,14 @@ impl<H: Clone> EdgeState<H> {
             agents.remove(token);
         }
         drop(agents);
-        tx.send(stream)
+        // One parked slot consumed, whether or not the Agent is still there to
+        // receive it (a dropped receiver means that slot is gone either way).
+        self.tcp_parked_gauge.fetch_sub(1, Ordering::Relaxed);
+        let sent = tx.send(stream);
+        if sent.is_ok() {
+            self.tcp_deliveries.inc();
+        }
+        sent
     }
 
     /// Whether at least one TCP-fallback agent is currently parked for `token`.
@@ -1545,6 +1600,67 @@ mod tests {
         );
         assert!(rx.await.is_ok(), "the agent receives the client stream");
         assert!(!state.has_tcp_agent(&token(7)), "registration consumed (single-use)");
+    }
+
+    #[tokio::test]
+    async fn the_tcp_fallback_path_is_visible_in_metrics_not_silently_invisible() {
+        // Live incident, 2026-08-13 (sort.bunsenbrenner.org): the TLS-TCP fallback
+        // path used to touch NO metric at all -- park_tcp_agent writes to its own
+        // `tcp_agents` map, while only the QUIC `register_locked` bumped
+        // registrations/active_tunnels/total_registrations. An Agent reachable only
+        // over :4433 (the normal case when a network blocks the QUIC ports) was
+        // therefore indistinguishable, in every metric, from an Agent that never
+        // connected at all: the counters stayed flat no matter how often it
+        // reconnected or served traffic. Two independent observers read those flat
+        // counters and drew opposite, equally-wrong conclusions. Pin the fix.
+        let state: EdgeState<u32> = EdgeState::new();
+        assert_eq!(state.tcp_parks_total(), 0);
+        assert_eq!(state.tcp_parked(), 0);
+        assert_eq!(state.tcp_deliveries_total(), 0);
+
+        let rx = state.park_tcp_agent(token(21));
+        assert_eq!(state.tcp_parks_total(), 1, "a park is counted -- this is the churn signal");
+        assert_eq!(state.tcp_parked(), 1, "and is visible as currently-waiting");
+
+        // The QUIC-only metrics stay flat, exactly as before -- that is correct
+        // (no QUIC registration happened) and is precisely why the fallback needs
+        // its own series rather than being folded into theirs.
+        assert_eq!(state.active_tunnels(), 0, "fallback parks are not QUIC registrations");
+        assert_eq!(state.registrations_total(), 0);
+
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(state.deliver_to_tcp_agent(&token(21), client).is_ok());
+        assert!(rx.await.is_ok());
+        assert_eq!(state.tcp_deliveries_total(), 1, "a consumed slot is counted");
+        assert_eq!(state.tcp_parked(), 0, "and no longer counted as waiting");
+        assert_eq!(state.tcp_parks_total(), 1, "the cumulative park count does not decrease");
+
+        // Churn is legible: a pool that keeps re-parking drives parks_total up while
+        // the gauge oscillates -- the signal that was missing during the incident.
+        for _ in 0..3 {
+            let _rx = state.park_tcp_agent(token(21));
+            let c: BoxedStream = Box::new(tokio::io::duplex(16).0);
+            let _ = state.deliver_to_tcp_agent(&token(21), c);
+        }
+        assert_eq!(state.tcp_parks_total(), 4, "every re-park is visible");
+        assert_eq!(state.tcp_parked(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_parked_slot_whose_agent_vanished_still_leaves_the_gauge_consistent() {
+        // The receiver being dropped (agent gone) must not leak the gauge: the slot
+        // is consumed either way, otherwise tcp_parked drifts upward forever and
+        // becomes as misleading as the missing metric it replaced.
+        let state: EdgeState<u32> = EdgeState::new();
+        let rx = state.park_tcp_agent(token(22));
+        assert_eq!(state.tcp_parked(), 1);
+        drop(rx); // the agent went away before a client arrived
+
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        let res = state.deliver_to_tcp_agent(&token(22), client);
+        assert!(res.is_err(), "a vanished agent hands the stream back");
+        assert_eq!(state.tcp_parked(), 0, "the slot is still released -- no gauge leak");
+        assert_eq!(state.tcp_deliveries_total(), 0, "but it is NOT counted as a delivery");
     }
 
     #[tokio::test]

@@ -47,13 +47,27 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          ct_edge_relay_bytes_total {relay_bytes}\n\
          # HELP ct_edge_failovers_total Relays that failed over to a non-primary agent.\n\
          # TYPE ct_edge_failovers_total counter\n\
-         ct_edge_failovers_total {failovers}\n",
+         ct_edge_failovers_total {failovers}\n\
+         # HELP ct_edge_tcp_fallback_parked TLS-TCP fallback registrations parked right now \
+         (the fallback counterpart to ct_edge_active_tunnels).\n\
+         # TYPE ct_edge_tcp_fallback_parked gauge\n\
+         ct_edge_tcp_fallback_parked {tcp_parked}\n\
+         # HELP ct_edge_tcp_fallback_parks_total TLS-TCP fallback parks since start; its RATE is \
+         the fallback pool's churn rate (each park is one agent-side connection joining the pool).\n\
+         # TYPE ct_edge_tcp_fallback_parks_total counter\n\
+         ct_edge_tcp_fallback_parks_total {tcp_parks}\n\
+         # HELP ct_edge_tcp_fallback_deliveries_total TLS-TCP fallback parks consumed by a client.\n\
+         # TYPE ct_edge_tcp_fallback_deliveries_total counter\n\
+         ct_edge_tcp_fallback_deliveries_total {tcp_deliveries}\n",
         tunnels = state.active_tunnels(),
         agents = state.total_registrations(),
         registrations = state.registrations_total(),
         relays = state.relays_total(),
         relay_bytes = state.relay_bytes_total(),
         failovers = state.failovers_total(),
+        tcp_parked = state.tcp_parked(),
+        tcp_parks = state.tcp_parks_total(),
+        tcp_deliveries = state.tcp_deliveries_total(),
     );
     if let Some(cap) = ws_channel_cap {
         out.push_str(&format!(
