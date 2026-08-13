@@ -735,6 +735,18 @@ fn unix_now() -> ct_common::channel::UnixSeconds {
         .unwrap_or(0)
 }
 
+/// Lowercase hex of arbitrary bytes — for logging the PUBLIC channel/holder grant
+/// fields in the pairer reapers here and in `ws_channel.rs` (the channel broker has
+/// its own private equivalent, `hex_of`).
+pub(crate) fn hex_of_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// #256: periodically evict `:443` channel members parked past their park TTL with no
 /// partner. Dropping the drained `WaitingMember`s closes their `TlsStream` (and the
 /// underlying `TcpStream`) via `Drop` — no explicit shutdown call needed, unlike the QUIC
@@ -759,10 +771,17 @@ fn spawn_front_door_pairer_reaper<T, N>(
         loop {
             ticker.tick().await;
             let expired = pairer.lock().unwrap().drain_expired(now_fn());
-            if !expired.is_empty() {
+            // One line PER member, naming the public grant fields (channel/holder hex --
+            // never a secret) plus the count: a live operator watching repeated lone-member
+            // reaps (a client whose PARTNER never arrives, e.g. still stuck on a blocked
+            // QUIC rung while this side came in via :443) could previously see only that it
+            // was happening, never WHICH channel kept half-joining. Same identification
+            // fields the admission refusals already log (#124/#248-follow).
+            for m in &expired {
                 eprintln!(
-                    "ct-edge: front-door channel pairer reaped {} member(s) parked past their TTL with no partner",
-                    expired.len()
+                    "ct-edge: front-door channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
+                    hex_of_bytes(&m.channel.0),
+                    hex_of_bytes(&m.holder),
                 );
             }
         }
