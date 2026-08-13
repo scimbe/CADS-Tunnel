@@ -37,6 +37,7 @@ use futures_util::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::serve::ChannelMemberResolver;
+use ct_common::sync::MutexExt;
 
 /// Adapts an [`axum::extract::ws::WebSocket`] (message-framed: `Stream<Item = Message>` +
 /// `Sink<Message>`) into a plain [`AsyncRead`] + [`AsyncWrite`] byte stream, so the
@@ -265,7 +266,7 @@ impl WsChannelState {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let expired = reaper_pairer.lock().unwrap().drain_expired(now);
+                let expired = reaper_pairer.lock_safe().drain_expired(now); // #497: poison-resilient
                 // Same per-member identification as the front-door reaper (serve.rs):
                 // channel/holder hex are public grant fields, and a repeated lone-member
                 // reap is only diagnosable if the operator can see WHO keeps half-joining.
@@ -319,7 +320,7 @@ impl AcceptPermit {
     /// Take the permit out. `None` either because there was no cap configured (an
     /// unbounded listener) or (defensively) because it was already taken.
     fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.0.lock().unwrap().take()
+        self.0.lock_safe().take() // #497: poison-resilient
     }
 }
 

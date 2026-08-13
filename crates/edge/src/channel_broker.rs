@@ -9,6 +9,7 @@
 //! The socket-level QUIC brokering (generalising `rendezvous.rs` to relay between
 //! two agents) and where the operator key comes from are later sub-packets.
 
+use ct_common::sync::MutexExt;
 use ct_common::channel::{
     verify_holder_possession, verify_stateless, ChannelId, ChannelJoinRequest, Direction,
     GrantError, SignedChannelGrant, UnixSeconds,
@@ -1228,9 +1229,10 @@ where
     let channel = req.grant.grant.channel;
     let holder = req.grant.grant.holder;
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
+    // #497: lock_safe -- a panic in some other critical section must not permanently wedge
+    // every later offer (the 2026-08-13 broker-outage class).
     let outcome = pairer
-        .lock()
-        .unwrap()
+        .lock_safe()
         .offer(WaitingMember { channel, holder, deadline, payload: member });
     match outcome {
         PairOutcome::Parked => Ok(None),
@@ -1370,7 +1372,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
 
         // Sweep lone waiters past their park deadline (#3) before accepting the next connection,
         // so a first-comer with no partner is bounded instead of wedging the endpoint.
-        let expired = pairer.lock().unwrap().drain_expired(now);
+        let expired = pairer.lock_safe().drain_expired(now); // #497: poison-resilient
         for m in expired {
             m.payload.conn.close(0u32.into(), b"channel park timeout");
         }
@@ -1472,7 +1474,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             let holder = member.req.grant.grant.holder;
 
             // Offer to the channel-keyed pairer; the lock is held only for the sync `offer`.
-            let outcome = pairer.lock().unwrap().offer(WaitingMember {
+            let outcome = pairer.lock_safe().offer(WaitingMember { // #497: poison-resilient
                 channel,
                 holder,
                 deadline: now.saturating_add(park_ttl),
@@ -2188,6 +2190,37 @@ mod tests {
                 assert_ne!(reasons[i], reasons[j], "checkpoint reasons must be distinct");
             }
         }
+    }
+
+    #[test]
+    fn pairer_survives_a_poisoned_mutex_497() {
+        // #497 (the 2026-08-13 broker-wedge class): a panic while holding the pairer mutex used
+        // to poison it permanently -- every later `.lock().unwrap()` then panicked too, killing
+        // the accept loop / reapers while the process stayed "healthy". All production locks now
+        // go through ct_common's poison-recovering `lock_safe`; this proves offer + drain still
+        // work through a mutex that a panicking thread genuinely poisoned.
+        let pairer: std::sync::Arc<std::sync::Mutex<ChannelPairer<()>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new()));
+
+        // Genuinely poison it: panic in another thread while holding the lock.
+        let poisoner = pairer.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("deliberate poison (#497 test)");
+        })
+        .join();
+        assert!(pairer.lock().is_err(), "the mutex is really poisoned -- the precondition holds");
+
+        // The production paths' idiom still works: offer parks, the sweep drains.
+        let outcome = pairer.lock_safe().offer(WaitingMember {
+            channel: ChannelId([0x97u8; 32]),
+            holder: [0x11u8; 32],
+            deadline: 100,
+            payload: (),
+        });
+        assert!(matches!(outcome, PairOutcome::Parked), "offer works through the poisoned lock");
+        let expired = pairer.lock_safe().drain_expired(500);
+        assert_eq!(expired.len(), 1, "the TTL sweep works through the poisoned lock too");
     }
 
     #[tokio::test]

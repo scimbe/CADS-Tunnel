@@ -16,6 +16,7 @@ use crate::pki::{build_dual_edge_from_ca, build_server_endpoint_from_ca, Ca};
 use crate::transport::save_cert;
 use ct_common::pow::{check_request, Challenge};
 use ct_common::RoutingToken;
+use ct_common::sync::MutexExt;
 use quinn::{Connection, RecvStream, SendStream};
 use rand::RngCore;
 use tokio::io::{join, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -770,7 +771,7 @@ fn spawn_front_door_pairer_reaper<T, N>(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            let expired = pairer.lock().unwrap().drain_expired(now_fn());
+            let expired = pairer.lock_safe().drain_expired(now_fn()); // #497: poison-resilient
             // One line PER member, naming the public grant fields (channel/holder hex --
             // never a secret) plus the count: a live operator watching repeated lone-member
             // reaps (a client whose PARTNER never arrives, e.g. still stuck on a blocked
