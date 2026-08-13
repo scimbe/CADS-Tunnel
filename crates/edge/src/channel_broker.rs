@@ -432,7 +432,9 @@ where
         match authorize(req.grant.grant.channel, req.grant.grant.holder).await {
             Some(t) => t,
             None => {
-                return Err(refuse(&mut send, "not-member", &grant_ctx, "unknown channel or holder not a member".into(), observed).await);
+                return Err(DefinitiveJoinRefusal::boxed(
+                    refuse(&mut send, "not-member", &grant_ctx, "unknown channel or holder not a member".into(), observed).await,
+                ));
             }
         };
     // #415: `verify_stateless` here is deliberate, not an oversight -- the fresh
@@ -455,7 +457,9 @@ where
     if recv.read_exact(&mut sig).await.is_err()
         || !verify_holder_possession(&req.grant.grant.holder, &challenge, &sig)
     {
-        return Err(refuse(&mut send, "possession", &grant_ctx, "holder possession proof failed".into(), observed).await);
+        return Err(DefinitiveJoinRefusal::boxed(
+            refuse(&mut send, "possession", &grant_ctx, "holder possession proof failed".into(), observed).await,
+        ));
     }
     Ok((send, recv, req, operator, member_noise, member_attest, observed))
     };
@@ -647,6 +651,46 @@ where
     send.finish()?;
     conn.closed().await; // hold the connection so the peer reads the ack
     Ok(req)
+}
+
+/// Marker wrapper for a **definitive** channel-join refusal -- one the presenting
+/// client can never turn into a success by retrying (`[not-member]`: the channel or
+/// holder no longer exists; `[possession]`: it cannot prove it holds the holder key).
+/// Everything else (timeouts, malformed frames, I/O drops, grant-verify, which clock
+/// skew can trip transiently) stays a plain error.
+///
+/// This is the typed seam the per-IP penalty (`crate::state::JoinRefusalPenalty`)
+/// keys on: the accept loops downcast the admission error to decide whether to count
+/// it, instead of string-matching log text. Calibrated against the 2026-08-13 storm,
+/// where one stale client retried two `[not-member]` channels at 25-75ms cadence for
+/// ~10 hours through a NAT shared with innocent tenants.
+#[derive(Debug)]
+pub struct DefinitiveJoinRefusal(BoxError);
+
+impl DefinitiveJoinRefusal {
+    /// Wrap `reason` for returning from admission -- kept as a helper so the refusal
+    /// sites stay one-liners.
+    fn boxed(reason: BoxError) -> BoxError {
+        Box::new(DefinitiveJoinRefusal(reason))
+    }
+}
+
+impl std::fmt::Display for DefinitiveJoinRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for DefinitiveJoinRefusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Whether `e` is a [`DefinitiveJoinRefusal`] -- the predicate the accept-path
+/// penalty call sites share (QUIC broker loop, `:443` front-door arm).
+pub fn is_definitive_join_refusal(e: &BoxError) -> bool {
+    e.downcast_ref::<DefinitiveJoinRefusal>().is_some()
 }
 
 fn hex_of(bytes: &[u8]) -> String {
@@ -1305,6 +1349,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     cap: Option<crate::state::ConnectionCap>,
     shutdown: crate::shutdown::ShutdownSignal,
     pairer: SharedQuicChannelPairer,
+    penalty: std::sync::Arc<crate::state::JoinRefusalPenalty>,
 ) where
     N: Fn() -> UnixSeconds + Send + Sync + 'static,
     F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
@@ -1349,6 +1394,25 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 }
             },
         };
+        // Per-IP definitive-refusal penalty (2026-08-13 storm): an IP that exhausted its
+        // definitive-refusal budget this window gets its join connections dropped HERE --
+        // before the QUIC handshake, before a cap permit, before a spawned task -- because
+        // the storm's actual damage was ~29 handshakes/s of doomed admissions congesting
+        // the shared accept path, not broker CPU. `ignore()` (no response datagram at all)
+        // rather than `refuse()`: a penalized storm client's retry loop gets nothing to
+        // react to, and the edge spends nothing answering it. Deliberately silent per shed
+        // (logged on power-of-two totals below), or the log flood would just move here.
+        let peer_ip = incoming.remote_address().ip();
+        if penalty.penalized(peer_ip, now_fn()) {
+            incoming.ignore();
+            let total = penalty.note_shed();
+            if total.is_power_of_two() || total % 1000 == 0 {
+                eprintln!(
+                    "ct-edge: channel-join penalty shedding {peer_ip} pre-handshake — {total} connection(s) shed since start"
+                );
+            }
+            continue;
+        }
         // #450: every other public listener acquires a connection-cap permit before
         // spawning its per-connection task; this loop spawned unbounded until now.
         // Shed BEFORE spawning (cheaper than admitting then dropping mid-handshake),
@@ -1377,6 +1441,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         let now_fn = now_fn.clone();
         let authorize = authorize.clone();
         let complete = complete.clone();
+        let penalty = penalty.clone();
         tokio::spawn(async move {
             let now = now_fn();
             // Admit this one member (its join read is bounded by #105); on error, log and drop it —
@@ -1386,6 +1451,16 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             let member = match admit_incoming_member(incoming, now, &*authorize, permit).await {
                 Ok(m) => m,
                 Err(e) => {
+                    // Feed the per-IP penalty on DEFINITIVE refusals only (typed via
+                    // [`DefinitiveJoinRefusal`], never string-matched) -- timeouts and I/O
+                    // drops from flaky-but-honest networks must not count toward a shed.
+                    if is_definitive_join_refusal(&e)
+                        && penalty.note_definitive_refusal(peer_ip, now_fn())
+                    {
+                        eprintln!(
+                            "ct-edge: channel-join penalty engaged for {peer_ip} — definitive-refusal budget exhausted; shedding its joins pre-handshake for the rest of the window"
+                        );
+                    }
                     eprintln!("ct-edge: channel admit failed: {e}");
                     return;
                 }
@@ -2113,6 +2188,97 @@ mod tests {
                 assert_ne!(reasons[i], reasons[j], "checkpoint reasons must be distinct");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn only_not_member_and_possession_refusals_classify_as_definitive() {
+        // The per-IP penalty's typed contract (2026-08-13 storm): exactly the two
+        // refusals a client can never retry into a success -- `[not-member]` and
+        // `[possession]` -- are wrapped as [`DefinitiveJoinRefusal`]; every other
+        // checkpoint (framing, endpoint, grant-verify, which clock skew can trip
+        // transiently) must NOT be, or a flaky-but-honest client could be shed.
+        use std::future::Future;
+        use std::time::Duration;
+        use tokio::io::{split, AsyncWriteExt, DuplexStream};
+
+        // Same harness as `channel_join_refusal_reason_is_distinct_per_checkpoint`,
+        // returning the RAW error so the classification (not the message) is asserted.
+        async fn refusal_err<F, Fut, C, CFut>(now: UnixSeconds, authorize: F, client: C) -> BoxError
+        where
+            F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send,
+            C: FnOnce(DuplexStream) -> CFut,
+            CFut: Future<Output = ()>,
+        {
+            let (client_end, server_end) = tokio::io::duplex(4096);
+            let (srv_r, srv_w) = split(server_end);
+            let observed: std::net::SocketAddr = "203.0.113.50:40001".parse().unwrap();
+            let server = tokio::spawn(async move {
+                read_channel_join_on_stream(srv_w, srv_r, observed, now, Duration::from_secs(5), &authorize)
+                    .await
+            });
+            client(client_end).await;
+            server
+                .await
+                .expect("server task")
+                .err()
+                .expect("admission must be refused")
+        }
+
+        async fn present(mut c: DuplexStream, req_bytes: Vec<u8>, sig: Option<[u8; 64]>) {
+            use tokio::io::AsyncReadExt;
+            c.write_all(&(req_bytes.len() as u16).to_be_bytes()).await.unwrap();
+            c.write_all(&req_bytes).await.unwrap();
+            if let Some(sig) = sig {
+                let mut challenge = [0u8; 32];
+                if c.read_exact(&mut challenge).await.is_ok() {
+                    c.write_all(&sig).await.unwrap();
+                }
+            }
+        }
+
+        let channel = [0x7Bu8; 32];
+        let holder = holder_sk(0x0b);
+        let pk = operator_pubkey();
+        let good = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6021".to_string(),
+        };
+        let member = move |c: ChannelId, _h: [u8; 32]| async move {
+            (c.0 == channel).then_some((pk, None, None))
+        };
+        let non_member = move |_c: ChannelId, _h: [u8; 32]| async move { None };
+
+        // DEFINITIVE: not-member.
+        let bytes = good.encode();
+        let e = refusal_err(500, non_member, move |c| present(c, bytes, None)).await;
+        assert!(is_definitive_join_refusal(&e), "[not-member] must be definitive, got: {e}");
+
+        // DEFINITIVE: possession (wrong signature over the challenge).
+        let bytes = good.encode();
+        let e = refusal_err(500, member, move |c| present(c, bytes, Some([0u8; 64]))).await;
+        assert!(is_definitive_join_refusal(&e), "[possession] must be definitive, got: {e}");
+
+        // NOT definitive: malformed framing.
+        let e = refusal_err(500, member, |mut c: DuplexStream| async move {
+            let junk = [0xFFu8; 4];
+            c.write_all(&(junk.len() as u16).to_be_bytes()).await.unwrap();
+            c.write_all(&junk).await.unwrap();
+        })
+        .await;
+        assert!(!is_definitive_join_refusal(&e), "[malformed] must NOT be definitive, got: {e}");
+
+        // NOT definitive: grant-verify (expired grant -- clock-skew-sensitive).
+        let bytes = good.encode();
+        let e = refusal_err(2_000, member, move |c| present(c, bytes, None)).await;
+        assert!(!is_definitive_join_refusal(&e), "[grant-verify] must NOT be definitive, got: {e}");
+
+        // NOT definitive: unsafe advertised endpoint.
+        let mut bad_ep = good.clone();
+        bad_ep.endpoint = "10.0.0.5:22".to_string();
+        let bytes = bad_ep.encode();
+        let e = refusal_err(500, member, move |c| present(c, bytes, None)).await;
+        assert!(!is_definitive_join_refusal(&e), "[endpoint] must NOT be definitive, got: {e}");
     }
 
     #[tokio::test]
@@ -3051,6 +3217,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });
@@ -3172,6 +3339,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });
@@ -3257,6 +3425,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });
@@ -3325,6 +3494,7 @@ mod tests {
             None,
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });
@@ -3895,6 +4065,7 @@ mod tests {
                 Some(cap_loop),
                 crate::shutdown::ShutdownSignal::never(),
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });
@@ -3995,6 +4166,7 @@ mod tests {
                 Some(cap_loop),
                 shutdown,
                 pairer_loop,
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });
@@ -4049,6 +4221,7 @@ mod tests {
                 Some(cap_loop),
                 crate::shutdown::ShutdownSignal::never(),
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
             )
             .await;
         });

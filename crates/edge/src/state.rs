@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use ct_common::metrics::Counter;
-use ct_common::ratelimit::RateLimiter;
+use ct_common::ratelimit::{KeyedRateLimiter, RateLimiter};
 use ct_common::RoutingToken;
 use ct_common::sync::{MutexExt, RwLockExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -93,6 +93,96 @@ impl ConnectionCap {
 pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
 pub type BoxedStream = Box<dyn DuplexStream>;
+
+/// Budget of **definitive** channel-join refusals per source IP per window before new
+/// join connections from that IP are shed pre-handshake (see `join_refusal_limiter`).
+/// Calibration from the 2026-08-13 incident: the storm produced 1,500-2,500 definitive
+/// refusals/min from one IP (trips this in ~1s of each window); a well-behaved client
+/// with a genuinely dead grant retries with exponential backoff (ct-agent #231) and
+/// produces single-digit refusals/min. The two are three orders of magnitude apart, so
+/// 30 leaves enormous headroom for NAT-shared IPs with several legitimate clients.
+const JOIN_REFUSALS_PER_MINUTE: u32 = 30;
+/// Window length for [`JOIN_REFUSALS_PER_MINUTE`], in seconds. A penalty therefore
+/// self-clears within at most one minute of the offender stopping -- deliberate: the
+/// goal is absorbing storms cheaply, not durably banning an IP that other, innocent
+/// tenants may share.
+const JOIN_REFUSAL_WINDOW_SECS: u64 = 60;
+/// Capacity bound on distinct IPs tracked at once (#414-style FIFO eviction). 4096 IPs
+/// x ~24 bytes is trivially small, yet far above any plausible number of *distinct*
+/// definitively-refused sources per minute.
+const JOIN_REFUSAL_MAX_TRACKED_IPS: usize = 4096;
+
+/// The per-source-IP definitive-refusal tracker behind [`EdgeState::join_penalized`] --
+/// a standalone, `Arc`-shareable type (rather than a private `EdgeState` field only)
+/// because TWO accept paths must consult the SAME budget: the `:443` front door's
+/// `ChannelBroker` arm (which has `&EdgeState` in scope) and the QUIC channel broker's
+/// accept loop (`run_channel_broker_loop`, a generic free function that deliberately
+/// does not know about `EdgeState`). See the field doc on `EdgeState::join_refusal`
+/// for the incident rationale.
+pub struct JoinRefusalPenalty {
+    limiter: Mutex<KeyedRateLimiter<std::net::IpAddr>>,
+    /// Running total of connections shed by the penalty, mirroring
+    /// [`ConnectionCap`]'s shed counter: callers log occasionally (powers of two),
+    /// never per shed -- under a real storm, per-shed logging would reintroduce the
+    /// very log flood the penalty exists to end.
+    sheds: std::sync::atomic::AtomicU64,
+}
+
+impl JoinRefusalPenalty {
+    pub fn new() -> Self {
+        Self {
+            limiter: Mutex::new(KeyedRateLimiter::with_max_tracked_keys(
+                JOIN_REFUSALS_PER_MINUTE,
+                JOIN_REFUSAL_MAX_TRACKED_IPS,
+            )),
+            sheds: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record one **definitive** channel-join refusal (not-member / possession-proof
+    /// failure) from `ip` at `now_secs` (Unix seconds). Returns `true` exactly when
+    /// this refusal is the one that pushes the IP over its per-window budget -- so the
+    /// caller logs the escalation once per (ip, window) instead of once per storm
+    /// packet.
+    ///
+    /// Transient failures (timeouts, malformed frames, TLS errors, I/O drops) must NOT
+    /// be recorded here: they can hit well-behaved clients on bad networks, and
+    /// shedding on them would turn a flaky link into a lockout.
+    pub fn note_definitive_refusal(&self, ip: std::net::IpAddr, now_secs: u64) -> bool {
+        let window = now_secs / JOIN_REFUSAL_WINDOW_SECS;
+        let mut limiter = self.limiter.lock_safe();
+        // The escalation is the over-limit TRANSITION (this refusal makes the count
+        // reach the budget), detected as a before/after `over_limit` edge -- not
+        // `!allow`, which first reports false one refusal LATER than `over_limit`
+        // starts shedding ("strictly under" vs ">= budget"), so keying the log on it
+        // would report the escalation a beat after enforcement already began.
+        let was_over = limiter.over_limit(&ip, window);
+        let _ = limiter.allow(&ip, window);
+        limiter.over_limit(&ip, window) && !was_over
+    }
+
+    /// Whether new channel-join connections from `ip` should be shed *before* the
+    /// TLS/QUIC handshake, because the IP exhausted its definitive-refusal budget in
+    /// the current window. Read-only: checking never consumes budget, so the
+    /// enforcement path can't penalize an IP by itself.
+    pub fn penalized(&self, ip: std::net::IpAddr, now_secs: u64) -> bool {
+        let window = now_secs / JOIN_REFUSAL_WINDOW_SECS;
+        self.limiter.lock_safe().over_limit(&ip, window)
+    }
+
+    /// Count one pre-handshake shed; returns the new running total. Callers log only
+    /// when the total is a power of two (or a round thousand), same posture as
+    /// [`ConnectionCap::note_shed`].
+    pub fn note_shed(&self) -> u64 {
+        self.sheds.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+}
+
+impl Default for JoinRefusalPenalty {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Thread-safe registry of live Agent tunnels keyed by Routing Token, plus each
 /// Agent's Edge-observed peer candidate (its reflexive address) for P2P
@@ -208,6 +298,28 @@ pub struct EdgeState<H> {
     /// drive per window — the second half of the layered rendezvous-flood defense
     /// (PoW raises per-attempt cost; this caps per-token volume even for a solver).
     rendezvous_limiter: Mutex<Option<RateLimiter>>,
+    /// Per-source-IP counter of **definitive** channel-join refusals (not-member /
+    /// possession-proof failures) -- the offenses a client can never turn into a success
+    /// by retrying, only an operator can. Live incident, 2026-08-13 (#494): one stale
+    /// client behind a NAT retried two dead channels at 25-75ms cadence for ~10 hours
+    /// (~1,500-2,500 refusals/min). The edge itself absorbed it (2.5% CPU, zero sheds),
+    /// but ~29 TLS/QUIC handshakes per second on the shared front door degraded
+    /// connection ESTABLISHMENT for every other tenant of this IP -- measured externally
+    /// as time-clustered setup failures, and every co-hosted service healed within two
+    /// minutes of the storm's source going away.
+    ///
+    /// Keyed by IP, counting refusals in fixed 60s windows via the same bounded
+    /// [`KeyedRateLimiter`] the rendezvous limit uses. Once an IP exceeds the per-window
+    /// budget, new CHANNEL-JOIN connections from it are shed before the TLS/QUIC
+    /// handshake for the remainder of the window -- cheap for the edge, invisible to
+    /// every other protocol (tunnels, web, ws) from the same possibly-NAT-shared IP,
+    /// and self-clearing on the next window. A well-behaved client with a genuinely
+    /// refused grant retries with exponential backoff (ct-agent's #231 fix, a handful
+    /// per minute at worst) and never comes near the budget.
+    ///
+    /// `Arc`-shared (see [`JoinRefusalPenalty`]) because the QUIC broker loop enforces
+    /// the SAME budget without holding an `EdgeState`.
+    join_refusal: std::sync::Arc<JoinRefusalPenalty>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -294,6 +406,7 @@ impl<H: Clone> EdgeState<H> {
             host_auth: RwLock::new(None),
             gelb_hosts: RwLock::new(HashSet::new()),
             rendezvous_limiter: Mutex::new(None),
+            join_refusal: std::sync::Arc::new(JoinRefusalPenalty::new()),
             registrations: Counter::default(),
             relays: Counter::default(),
             tcp_parks: Counter::default(),
@@ -477,6 +590,25 @@ impl<H: Clone> EdgeState<H> {
             None => true,
             Some(rl) => rl.allow(token, window),
         }
+    }
+
+    /// The shared per-IP definitive-refusal penalty (see [`JoinRefusalPenalty`] and the
+    /// `join_refusal` field doc): the `:443` front-door arm records/enforces through
+    /// [`Self::note_definitive_join_refusal`]/[`Self::join_penalized`]; `run_edge` hands
+    /// a clone of this `Arc` to the QUIC broker loop so BOTH accept paths share one
+    /// budget per IP -- a storm that alternates transports can't double its allowance.
+    pub fn join_refusal_penalty(&self) -> std::sync::Arc<JoinRefusalPenalty> {
+        self.join_refusal.clone()
+    }
+
+    /// [`JoinRefusalPenalty::note_definitive_refusal`] on the shared penalty.
+    pub fn note_definitive_join_refusal(&self, ip: std::net::IpAddr, now_secs: u64) -> bool {
+        self.join_refusal.note_definitive_refusal(ip, now_secs)
+    }
+
+    /// [`JoinRefusalPenalty::penalized`] on the shared penalty.
+    pub fn join_penalized(&self, ip: std::net::IpAddr, now_secs: u64) -> bool {
+        self.join_refusal.penalized(ip, now_secs)
     }
 
     /// Resolve a public hostname (from the TLS SNI) to its routing token.
@@ -1816,5 +1948,60 @@ mod tests {
         assert!(clone.try_admit().is_none(), "the clone sees the shared budget exhausted");
         drop(p);
         assert!(clone.try_admit().is_some(), "releasing frees the slot for the clone too");
+    }
+
+    #[test]
+    fn join_refusal_penalty_engages_at_the_budget_and_self_clears_next_window() {
+        // The 2026-08-13 storm contract: an IP stays unpenalized through its whole
+        // per-window budget of definitive refusals, the budget-exceeding refusal
+        // reports the escalation exactly ONCE (the caller's one log line), the IP is
+        // then shed for the rest of the window, and the penalty self-clears in the
+        // next window -- it is storm absorption, not a durable ban on a NAT IP.
+        let p = JoinRefusalPenalty::new();
+        let ip: std::net::IpAddr = "89.56.48.254".parse().unwrap();
+        let t0 = 1_000_000; // an arbitrary window start (windows are t/60 buckets)
+
+        for i in 0..JOIN_REFUSALS_PER_MINUTE - 1 {
+            assert!(!p.penalized(ip, t0), "not penalized before the budget, refusal {i}");
+            assert!(
+                !p.note_definitive_refusal(ip, t0),
+                "an in-budget refusal is not the escalation, refusal {i}"
+            );
+        }
+        assert!(!p.penalized(ip, t0), "one refusal of budget left — still unpenalized");
+        assert!(
+            p.note_definitive_refusal(ip, t0),
+            "the refusal that reaches the budget reports the escalation exactly once"
+        );
+        assert!(p.penalized(ip, t0), "now shed for the rest of the window");
+        assert!(
+            !p.note_definitive_refusal(ip, t0),
+            "further storm refusals in the same window never re-report the escalation"
+        );
+
+        // A different IP behind a different line is completely unaffected.
+        let other: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        assert!(!p.penalized(other, t0), "an unrelated IP shares no budget");
+
+        // The next minute self-clears the penalty.
+        let t1 = t0 + JOIN_REFUSAL_WINDOW_SECS;
+        assert!(!p.penalized(ip, t1), "the penalty self-clears in the next window");
+        assert!(!p.note_definitive_refusal(ip, t1), "and the budget is genuinely fresh");
+    }
+
+    #[test]
+    fn join_refusal_penalty_is_shared_between_edge_state_and_the_broker_loop_handle() {
+        // `EdgeState::join_refusal_penalty()` and the state's own record/enforce
+        // methods must act on ONE budget -- the QUIC broker loop holds the Arc, the
+        // `:443` arm goes through the state, and a storm that alternates transports
+        // must not get double the allowance.
+        let state: EdgeState<()> = EdgeState::new();
+        let handle = state.join_refusal_penalty();
+        let ip: std::net::IpAddr = "89.56.48.254".parse().unwrap();
+        for _ in 0..=JOIN_REFUSALS_PER_MINUTE {
+            let _ = state.note_definitive_join_refusal(ip, 60);
+        }
+        assert!(state.join_penalized(ip, 60), "recorded via the state...");
+        assert!(handle.penalized(ip, 60), "...and enforced via the broker loop's Arc handle");
     }
 }

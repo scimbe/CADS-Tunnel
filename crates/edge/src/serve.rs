@@ -1039,6 +1039,28 @@ pub async fn serve_front_door(
                         .into(),
                 );
             };
+            // Per-IP definitive-refusal penalty (2026-08-13 storm), enforced BEFORE the
+            // TLS handshake -- same budget the QUIC broker loops consult, so a storm
+            // client that falls back to the `:443` leg (exactly what ct-agent's dial
+            // ladder does when UDP fails) is shed just as cheaply here. Silent per shed
+            // (power-of-two logging), and scoped to the ChannelBroker arm only: every
+            // other front-door route from the same possibly-NAT-shared IP is untouched.
+            {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if state.join_penalized(observed.ip(), now) {
+                    let total = state.join_refusal_penalty().note_shed();
+                    if total.is_power_of_two() || total % 1000 == 0 {
+                        eprintln!(
+                            "ct-edge: channel-join penalty shedding {} pre-handshake (:443) — {total} connection(s) shed since start",
+                            observed.ip()
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             let joined = Prepend {
                 pre: hello,
                 pos: 0,
@@ -1082,7 +1104,7 @@ pub async fn serve_front_door(
             // below. Carrying the permit on the constructed `AdmittedStreamMember` (inside
             // `admit_and_pair_on_stream`) means it now travels with the connection through
             // either path instead of releasing the moment this function returns.
-            let paired = crate::channel_broker::admit_and_pair_on_stream(
+            let paired = match crate::channel_broker::admit_and_pair_on_stream(
                 boxed,
                 observed,
                 now,
@@ -1092,7 +1114,23 @@ pub async fn serve_front_door(
                 &ctx.pairer,
                 permit,
             )
-            .await?;
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    // Feed the shared per-IP penalty on DEFINITIVE refusals only (typed,
+                    // never string-matched) -- mirror of the QUIC broker loop's recording.
+                    if crate::channel_broker::is_definitive_join_refusal(&e)
+                        && state.note_definitive_join_refusal(observed.ip(), now)
+                    {
+                        eprintln!(
+                            "ct-edge: channel-join penalty engaged for {} — definitive-refusal budget exhausted; shedding its joins pre-handshake for the rest of the window",
+                            observed.ip()
+                        );
+                    }
+                    return Err(e);
+                }
+            };
             if let Some((a, b)) = paired {
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -1650,6 +1688,32 @@ enum ParkAndPingError {
     /// within the last ping interval. The Client's stream is rescued for re-delivery to
     /// the next parked slot for the same token.
     AgentDead { client: crate::state::BoxedStream, source: BoxError },
+}
+
+/// Hand-written (the rescued `client` stream is not `Debug`/`Display`; only the
+/// underlying cause is shown, verbatim, so existing diagnostics that match on the
+/// inner message -- e.g. "superseded" -- keep working).
+impl std::fmt::Display for ParkAndPingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParkAndPingError::NoClient(e) => write!(f, "{e}"),
+            ParkAndPingError::AgentDead { source, .. } => {
+                write!(f, "parked agent died at delivery verification: {source}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ParkAndPingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParkAndPingError::NoClient(e) => f.debug_tuple("NoClient").field(e).finish(),
+            ParkAndPingError::AgentDead { source, .. } => f
+                .debug_struct("AgentDead")
+                .field("source", source)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
@@ -2988,6 +3052,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 let relay_az = authorizer.clone();
                                 let relay_cap = channel_broker_cap.clone();
                                 let shutdown_relay = shutdown.clone();
+                                // Per-IP definitive-refusal penalty, SHARED with the
+                                // rendezvous loop and the `:443` front-door arm via
+                                // `EdgeState` -- one budget per IP across all three
+                                // channel-join transports (2026-08-13 storm).
+                                let relay_penalty = state.join_refusal_penalty();
                                 // #400: constructed here (not inside `run_channel_broker_loop`) so
                                 // `run_edge` can keep its own clone alive independently of the
                                 // loop's lifetime -- see `_relay_pairer_keepalive`'s own comment above.
@@ -3030,6 +3099,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         relay_cap,
                                         shutdown_relay,
                                         relay_pairer,
+                                        relay_penalty,
                                     )
                                     .await;
                                 });
@@ -3044,6 +3114,9 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         );
                         let rendezvous_cap = channel_broker_cap.clone();
                         let shutdown_rendezvous = shutdown.clone();
+                        // Same shared penalty as the relay loop above (one per-IP budget
+                        // across every channel-join transport).
+                        let rendezvous_penalty = state.join_refusal_penalty();
                         // #400: same reasoning as the relay pairer above -- constructed here so
                         // `run_edge` can keep its own clone alive independently of the loop's
                         // own lifetime.
@@ -3087,6 +3160,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 rendezvous_cap,
                                 shutdown_rendezvous,
                                 rendezvous_pairer,
+                                rendezvous_penalty,
                             )
                             .await;
                         });
@@ -4935,11 +5009,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn park_and_ping_delivers_a_promptly_arriving_client_without_writing_one_ping_byte() {
-        // `biased` in the select! means an already-arrived Client always wins
-        // over starting another probe. Proven in the strongest available form:
-        // the Agent side is read to EOF and must have received LITERALLY zero
-        // bytes -- not "no ping frames", but no bytes at all.
+    async fn park_and_ping_delivers_a_prompt_client_after_exactly_one_verify_ping() {
+        // `biased` in the select! means an already-arrived Client always wins over
+        // starting another cadence probe -- but verify-at-delivery (ct-agent#15
+        // follow-up) still runs ONE final PING/PONG round trip before handing the
+        // Client over, proving the parked agent is alive *now*, not "as of up to an
+        // interval ago". Proven in the strongest available form: the Agent side is
+        // read to EOF and must have received exactly that one 9-byte PING frame --
+        // no cadence pings, no other bytes.
         let (mut agent, edge_side) = tokio::io::duplex(64);
         let (tx, rx) = tokio::sync::oneshot::channel::<crate::state::BoxedStream>();
         let (mut client_peer, client_edge) = tokio::io::duplex(64);
@@ -4948,7 +5025,7 @@ mod tests {
             let mut edge = edge_side;
             let mut client = park_and_ping(&mut edge, rx)
                 .await
-                .expect("a promptly delivered Client is a successful park");
+                .expect("a promptly delivered Client is a successful park once the agent PONGs");
             // Prove the receiver handed back the REAL delivered stream, not
             // some other one, by writing through it.
             client.write_all(b"delivered").await.unwrap();
@@ -4961,6 +5038,16 @@ mod tests {
             .map_err(|_| "the parked receiver was already gone")
             .unwrap();
 
+        // Agent: answer the single verify-at-delivery ping.
+        let mut ping = [0u8; 9];
+        agent.read_exact(&mut ping).await.unwrap();
+        assert_eq!(ping[0], TCP_PING_MAGIC, "the delivery is preceded by one verify PING");
+        let mut pong = [0u8; 9];
+        pong[0] = TCP_PONG_MAGIC;
+        pong[1..].copy_from_slice(&ping[1..]);
+        agent.write_all(&pong).await.unwrap();
+        agent.flush().await.unwrap();
+
         let mut via_client = [0u8; 9];
         client_peer.read_exact(&mut via_client).await.unwrap();
         assert_eq!(&via_client, b"delivered", "park_and_ping returned the delivered Client stream");
@@ -4971,8 +5058,8 @@ mod tests {
         agent.read_to_end(&mut seen).await.unwrap();
         assert!(
             seen.is_empty(),
-            "a Client that arrives before the first interval elapses must be delivered with no \
-             probe at all -- the Agent saw {seen:02x?}"
+            "a prompt Client is delivered after EXACTLY one verify ping -- the Agent additionally \
+             saw {seen:02x?}"
         );
     }
 

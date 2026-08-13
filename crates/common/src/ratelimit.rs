@@ -107,6 +107,22 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
     pub fn tracked_keys(&self) -> usize {
         self.counters.len()
     }
+
+    /// Whether `key` has already exhausted its budget for `window`, WITHOUT recording an
+    /// attempt. For split record/enforce call sites: one path counts events via
+    /// [`allow`](Self::allow) (e.g. every definitive admission refusal), a different, earlier
+    /// path merely asks "is this key currently over the line?" to shed cheaply before doing any
+    /// expensive work (TLS/QUIC handshake). A read must not consume budget, or the enforcement
+    /// check itself would push a borderline key over the limit it is checking.
+    ///
+    /// A key from a strictly-earlier window is never over-limit (its count would reset on the
+    /// next [`allow`] anyway); an unknown key never is.
+    pub fn over_limit(&self, key: &K, window: u64) -> bool {
+        match self.counters.get(key) {
+            Some((w, count)) => *w == window && *count >= self.max_per_window,
+            None => false,
+        }
+    }
 }
 
 /// Per-Routing-Token fixed-window limiter (ADR-0018): rendezvous-attempt cap
@@ -212,6 +228,35 @@ mod tests {
         assert!(rl.allow(&1, 0), "evicted key 1 starts over with a clean budget");
         assert!(rl.allow(&1, 0));
         assert!(!rl.allow(&1, 0), "and is still correctly capped going forward");
+    }
+
+    #[test]
+    fn over_limit_reads_without_consuming_budget() {
+        // The split record/enforce contract: `over_limit` must never advance the
+        // counter, or the enforcement check would itself push a borderline key over
+        // the limit it is checking.
+        let mut rl: KeyedRateLimiter<u64> = KeyedRateLimiter::new(2);
+        assert!(!rl.over_limit(&1, 0), "an unknown key is never over-limit");
+        assert!(rl.allow(&1, 0));
+        // Any number of reads between attempts changes nothing.
+        for _ in 0..10 {
+            assert!(!rl.over_limit(&1, 0), "1 of 2 used — still under");
+        }
+        assert!(rl.allow(&1, 0), "the second attempt is still allowed after the reads");
+        assert!(rl.over_limit(&1, 0), "budget exhausted — now over");
+        assert!(!rl.allow(&1, 0));
+        assert!(rl.over_limit(&1, 0), "a rejected attempt keeps it over, not double-over");
+    }
+
+    #[test]
+    fn over_limit_clears_in_a_new_window() {
+        let mut rl: KeyedRateLimiter<u64> = KeyedRateLimiter::new(1);
+        assert!(rl.allow(&1, 0));
+        assert!(rl.over_limit(&1, 0));
+        // The same key in a LATER window is not over-limit even before any `allow`
+        // sweeps or resets it — the stale count is dead by definition.
+        assert!(!rl.over_limit(&1, 1), "a new window clears the penalty on read");
+        assert!(rl.allow(&1, 1), "and the budget is genuinely fresh");
     }
 
     #[test]
