@@ -111,6 +111,14 @@ trap 'rm -f "$RUNTIME_ENV"' EXIT
   printf 'CT_AGENT_SERVICE_HANDLER_CMD=%s\n' "$HANDLER_CMD_IN_CONTAINER"
   printf 'CT_AGENT_SERVICES=%s\n' "$SERVICE"
   printf 'HOME=%s\n' "$RUNTIME_HOME"
+  # Optional (ct-agent v0.4.7+): pin channel sessions onto the :443 TLS-TCP front door
+  # instead of QUIC, for deployments hitting the QUIC idle-timeout signature (a session
+  # dies ~10-15s after admission even mid-traffic, because a quiet in-flight LLM call
+  # sends no QUIC packets -- see ct-agent v0.4.7's own changelog and CADS-Tunnel#494).
+  # Backward compatible: passthrough only, no-op unless the caller sets these.
+  [ -n "${CT_CHANNEL_FRONT_DOOR:-}" ] && printf 'CT_CHANNEL_FRONT_DOOR=%s\n' "$CT_CHANNEL_FRONT_DOOR"
+  [ -n "${CT_CHANNEL_FRONT_DOOR_CERT:-}" ] && printf 'CT_CHANNEL_FRONT_DOOR_CERT=%s\n' "$CT_CHANNEL_FRONT_DOOR_CERT"
+  [ -n "${CT_CHANNEL_FRONT_DOOR_ONLY:-}" ] && printf 'CT_CHANNEL_FRONT_DOOR_ONLY=%s\n' "$CT_CHANNEL_FRONT_DOOR_ONLY"
 } > "$RUNTIME_ENV"
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
