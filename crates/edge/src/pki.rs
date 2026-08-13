@@ -270,6 +270,17 @@ pub async fn build_dual_edge_from_ca(
 /// The resulting stream type is identical to the shared acceptor's
 /// (`tokio_rustls::server::TlsStream<Prepend<TcpStream>>`), so the front-door pairer
 /// keying is unchanged.
+///
+/// The list also carries `h2`, for the low-DPI-visibility channel route
+/// (`sni::CT_EDGE_CHANNEL_FALLBACK_SNI`): that client deliberately offers an ordinary
+/// web ALPN so its plaintext ClientHello carries no tunnel fingerprint, and rustls
+/// answers an ALPN *mismatch* with a fatal `no_application_protocol` alert — with a
+/// single-value list such a client would be killed at the TLS layer even though
+/// `classify_front_door` had correctly routed its peeked hello here by SNI. rustls
+/// negotiates whichever entry the client actually offers, so both the pre-existing
+/// `ct-edge-channel` clients and the new `h2` ones complete the handshake against this
+/// same acceptor. Nothing here is a *routing* decision: which leg a connection reaches
+/// was already settled by `classify_front_door` before this acceptor ever sees it.
 pub async fn build_channel_front_door_acceptor(
     ca: &Ca,
     sans: Vec<String>,
@@ -279,7 +290,10 @@ pub async fn build_channel_front_door_acceptor(
     let mut tls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
-    tls_cfg.alpn_protocols = vec![crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec()];
+    tls_cfg.alpn_protocols = vec![
+        crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec(),
+        b"h2".to_vec(),
+    ];
     Ok(TlsAcceptor::from(Arc::new(tls_cfg)))
 }
 
@@ -533,6 +547,130 @@ mod tests {
         assert!(
             leaf_not_after <= root_not_after,
             "a leaf must never outlive the CA root that signed it"
+        );
+    }
+
+    /// Run one real, in-process TLS handshake against `acceptor`: a client trusting
+    /// `ca_root` presents `server_name` and offers `client_alpn`. Returns the ALPN both
+    /// sides negotiated (`None` when the client offered none), or the client's error.
+    async fn handshake_against(
+        acceptor: TlsAcceptor,
+        ca_root: CertificateDer<'static>,
+        server_name: &'static str,
+        client_alpn: Vec<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, BoxError> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.ok()?;
+            acceptor.accept(tcp).await.ok()
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_root)?;
+        let mut ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        ccfg.alpn_protocols = client_alpn;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from(server_name)?;
+        let client = connector.connect(name, tcp).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), srv).await;
+        Ok(client?.get_ref().1.alpn_protocol().map(|p| p.to_vec()))
+    }
+
+    /// The channel front door's acceptor must complete a handshake for BOTH channel
+    /// clients: the pre-existing one advertising the distinctive `ct-edge-channel`
+    /// ALPN, and the low-DPI-visibility one that deliberately offers only an ordinary
+    /// `h2` (or nothing) and identifies itself by the reserved
+    /// `sni::CT_EDGE_CHANNEL_FALLBACK_SNI` hostname instead. With the previous
+    /// single-value ALPN list the latter was killed by rustls' fatal
+    /// `no_application_protocol` alert before it could speak to the broker at all,
+    /// even though the front door had routed its peeked ClientHello here correctly.
+    #[tokio::test]
+    async fn channel_front_door_acceptor_serves_both_the_channel_alpn_and_a_plain_h2_client() {
+        let ca = Ca::new("ct-edge-ca").unwrap();
+        let ca_root = ca.root_der();
+        // The production SAN list (see `serve.rs`'s call site): the reserved fallback
+        // hostname is included so a client presenting it as its SNI validates the leaf
+        // under ordinary rustls name verification, with no custom verifier.
+        let sans = vec![
+            "localhost".to_string(),
+            crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI.to_string(),
+        ];
+        let acceptor = build_channel_front_door_acceptor(&ca, sans).await.unwrap();
+
+        // The low-visibility route: plain `h2`, reserved SNI. This is the case the
+        // multi-value ALPN list exists for.
+        assert_eq!(
+            handshake_against(
+                acceptor.clone(),
+                ca_root.clone(),
+                crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI,
+                vec![b"h2".to_vec()],
+            )
+            .await
+            .expect("a plain-h2 client must complete the handshake, not get no_application_protocol"),
+            Some(b"h2".to_vec()),
+            "the acceptor negotiates h2 with a client that offers only h2"
+        );
+
+        // Regression: the pre-existing `ct-edge-channel` client is completely
+        // unaffected -- same acceptor, same negotiated ALPN as before.
+        assert_eq!(
+            handshake_against(
+                acceptor.clone(),
+                ca_root.clone(),
+                "localhost",
+                vec![crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec()],
+            )
+            .await
+            .expect("the ct-edge-channel client still handshakes"),
+            Some(crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec()),
+            "an existing channel client still negotiates ct-edge-channel (#118's readiness probe)"
+        );
+
+        // A client offering both resolves by SERVER preference (rustls picks the first
+        // entry of its own list the client also offers), so `ct-edge-channel` keeps
+        // winning -- adding `h2` cannot downgrade an existing client.
+        assert_eq!(
+            handshake_against(
+                acceptor.clone(),
+                ca_root.clone(),
+                "localhost",
+                vec![crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec(), b"h2".to_vec()],
+            )
+            .await
+            .unwrap(),
+            Some(crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec()),
+            "server-preference order keeps ct-edge-channel ahead of h2"
+        );
+
+        // A client offering NO ALPN extension at all also completes (rustls only alerts
+        // on a genuine mismatch), matching `classify_front_door`'s acceptance of a
+        // reserved-SNI hello with no ALPN.
+        assert_eq!(
+            handshake_against(acceptor, ca_root, crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI, Vec::new())
+                .await
+                .expect("a client offering no ALPN still handshakes"),
+            None
+        );
+    }
+
+    /// The relay-gate acceptor is deliberately NOT widened: it stays single-valued on
+    /// `ct-edge-relay`, so a stray `h2` client is still refused there. Guards against a
+    /// future change copying the channel acceptor's multi-value list across.
+    #[tokio::test]
+    async fn relay_gate_acceptor_still_refuses_a_plain_h2_client() {
+        let ca = Ca::new("ct-edge-ca").unwrap();
+        let ca_root = ca.root_der();
+        let acceptor = build_relay_gate_front_door_acceptor(&ca, vec!["localhost".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            handshake_against(acceptor, ca_root, "localhost", vec![b"h2".to_vec()]).await.is_err(),
+            "the relay gate must keep answering an ALPN mismatch with a fatal alert"
         );
     }
 

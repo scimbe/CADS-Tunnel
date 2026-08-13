@@ -34,7 +34,13 @@ run the script for the *how*.
 (`help.<zone>`), the tunnel data-plane relay, and the **Agent-Fabric channel
 fallback** (ALPN `ct-edge-channel`) for members whose network blocks the
 `:4435`/`:4436` channel ports (#106), all SNI/ALPN-multiplexed, plus a
-redirect-only `:80` that 308-bounces plain `http://<zone>/` to `https` (#66). Point
+redirect-only `:80` that 308-bounces plain `http://<zone>/` to `https` (#66). The
+channel fallback has a second, low-visibility route to the same broker for members
+behind DPI that drops the distinctive `ct-edge-channel` ALPN: SNI
+`edge-cdn.invalid` with an ordinary `h2` ALPN, so the handshake looks like any
+other HTTPS connection on the wire. That hostname is an RFC 2606 `.invalid` name —
+never resolved via DNS, identical on every deployment, and impossible to collide
+with a real tunnel or terminate host. Point
 the Portal hostname's DNS at the edge, get a BYO cert for it (LE via deSEC DNS-01),
 then set these in `.env`:
 

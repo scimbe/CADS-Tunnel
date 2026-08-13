@@ -2580,9 +2580,16 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             // (a CA-signed leaf; the same `ca` that issued the shared edge
                             // leaf) so the `:443` channel leg negotiates the ALPN. The shared
                             // `acceptor` keeps its empty ALPN for the `EdgeRelay` leg.
+                            // The reserved fallback hostname joins "localhost" in the
+                            // leaf's SANs: the low-DPI-visibility route's client presents
+                            // it as its SNI, so without a matching SAN an ordinary rustls
+                            // name verification would reject the leaf.
                             let channel_acceptor = crate::pki::build_channel_front_door_acceptor(
                                 &ca,
-                                vec!["localhost".to_string()],
+                                vec![
+                                    "localhost".to_string(),
+                                    crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI.to_string(),
+                                ],
                             )
                             .await?;
                             eprintln!(

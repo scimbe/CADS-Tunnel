@@ -29,6 +29,34 @@ pub const CT_EDGE_CHANNEL_ALPN: &str = "ct-edge-channel";
 /// front door every other :443 leg uses, with no new public listener.
 pub const CT_EDGE_RELAY_ALPN: &str = "ct-edge-relay";
 
+/// Reserved SNI hostname that routes a `:443` front-door ClientHello to the channel
+/// broker **without** requiring the distinctive [`CT_EDGE_CHANNEL_ALPN`] — the
+/// low-DPI-visibility twin of the #106 fallback, for members whose network drops or
+/// stalls the ALPN-discriminated one.
+///
+/// Why it exists: ALPN travels in PLAINTEXT in the ClientHello, before any encryption
+/// applies, so `ct-edge-channel` is a trivially greppable tunnel fingerprint. Corporate
+/// DPI/middleboxes commonly allowlist only the ordinary web ALPN values (`h2`,
+/// `http/1.1`) and silently drop or black-hole anything else — observed in the field as
+/// a channel-join admission exchange that stalls with no bytes ever reaching the broker,
+/// identically on the direct `:4435` QUIC dial AND on the `:443` ALPN fallback. Carrying
+/// the discriminator in the `server_name` extension instead lets the client offer a
+/// perfectly boring `h2`, so the handshake looks like any other HTTPS connection on the
+/// wire.
+///
+/// Why a synthetic RFC 2606 `.invalid` name rather than a real hostname: `.invalid` is
+/// reserved by the RFC and can never be a registrable domain, which buys two properties
+/// this route needs. It is **portable** — identical across every CADS-Tunnel deployment
+/// regardless of the operator's own zone, so a client needs no per-deployment
+/// configuration to use it — and it can **never collide** with a customer's real
+/// terminate-host or Browser-Plane tunnel hostname (see `classify_front_door`, which
+/// claims this name ahead of both). It is never resolved via DNS: the client already
+/// holds the edge's `SocketAddr` and dials it directly, presenting this purely as a
+/// routing token. The name's shape is deliberately unremarkable (and carries none of
+/// this project's own distinctive strings) so a superficial DPI keyword match finds
+/// nothing to flag.
+pub const CT_EDGE_CHANNEL_FALLBACK_SNI: &str = "edge-cdn.invalid";
+
 /// Return the raw `extensions` block of a buffered TLS ClientHello record, or
 /// `None` if `buf` is not a ClientHello. Fully bounds-checked — never panics.
 fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
@@ -185,8 +213,11 @@ pub enum FrontDoorRoute {
     /// the edge TLS-TCP relay (the ADR-0004 fallback rung on :443).
     EdgeRelay,
     /// Agent-Fabric channel service — the client advertised the `ct-edge-channel`
-    /// ALPN (#106): hand off to the channel broker (rendezvous + relay), the `:443`
-    /// fallback for members that cannot reach the channel port `:4435`.
+    /// ALPN (#106) **or** presented the reserved [`CT_EDGE_CHANNEL_FALLBACK_SNI`]
+    /// hostname: hand off to the channel broker (rendezvous + relay), the `:443`
+    /// fallback for members that cannot reach the channel port `:4435`. The two
+    /// discriminators reach the identical destination; the SNI one exists so a member
+    /// behind ALPN-fingerprinting DPI can offer an ordinary `h2` instead.
     ChannelBroker,
     /// Real NAT-to-NAT hole-punch relay — the client advertised the `ct-edge-relay`
     /// ALPN: hand off to the gated Circuit-Relay v2 relay after a grant + possession
@@ -208,8 +239,9 @@ pub enum FrontDoorRoute {
 
 /// Classify a peeked ClientHello for the unified :443 front door (#31 FD1, #48).
 ///
-/// Precedence: the tunnel data-plane ALPN wins; then any **terminate-host** (SNI
-/// matches a configured proxy target — Portal or Auth IdP) is a `Proxy`; then any
+/// Precedence: the tunnel data-plane ALPN wins; then the reserved
+/// [`CT_EDGE_CHANNEL_FALLBACK_SNI`] is a `ChannelBroker`; then any **terminate-host**
+/// (SNI matches a configured proxy target — Portal or Auth IdP) is a `Proxy`; then any
 /// other SNI is a Browser-Plane passthrough candidate; a web ALPN with no SNI
 /// (e.g. `curl https://<ip>/`) lands on `default_host` (the Portal); anything else
 /// is refused. `terminate_hosts` and `default_host` are compared case-insensitively.
@@ -252,6 +284,19 @@ pub fn classify_front_door(hello: &[u8], is_terminate_host: impl Fn(&str) -> boo
         return FrontDoorRoute::RelayGate;
     }
     if let Some(sni) = exts.and_then(sni_from_extensions) {
+        // The channel leg's low-DPI-visibility twin: a member whose network stalls the
+        // distinctive `ct-edge-channel` ALPN reaches the SAME broker by presenting the
+        // reserved hostname with an ordinary `h2` (or no ALPN at all). Checked BEFORE
+        // the terminate-host and BrowserTunnel arms so the reserved name is claimed
+        // here and can never be shadowed by — or collide with — a customer's own
+        // routing: it is an RFC 2606 `.invalid` name, so no operator could legitimately
+        // own it, and a confused or malicious client presenting it reaches the broker's
+        // own grant + possession admission gate rather than someone else's tunnel.
+        // Case-insensitive, like the hostname comparisons below (ALPN matching above
+        // stays exact-byte per RFC 7301).
+        if sni.eq_ignore_ascii_case(CT_EDGE_CHANNEL_FALLBACK_SNI) {
+            return FrontDoorRoute::ChannelBroker;
+        }
         if is_terminate_host(sni) {
             return FrontDoorRoute::Proxy(sni.to_ascii_lowercase());
         }
@@ -472,6 +517,165 @@ mod tests {
         );
         // The two data-plane ALPN ids are distinct.
         assert_ne!(CT_EDGE_ALPN, CT_EDGE_CHANNEL_ALPN);
+    }
+
+    // The low-DPI-visibility channel route. Motivated by a real support case: a tester
+    // on a corporate/sandbox network could not complete channel admission against a
+    // production edge on EITHER the direct `:4435` QUIC dial or the `:443`
+    // `ct-edge-channel` ALPN fallback -- both stalled mid-exchange with zero
+    // server-side reception evidence, i.e. the join bytes never arrived, which is
+    // packet-level interference rather than a plain port block. The distinctive
+    // plaintext ALPN is the leading suspect, so the same broker is now reachable with
+    // an ordinary `h2` plus a reserved SNI instead.
+    #[test]
+    fn classify_front_door_routes_the_reserved_fallback_sni_to_the_channel_broker() {
+        let default = Some("portal.z");
+        // The whole point: a boring `h2` ALPN -- indistinguishable from ordinary HTTPS
+        // to a DPI box reading the plaintext ClientHello -- still reaches the broker.
+        assert_eq!(
+            classify_front_door(&client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &["h2"]), terminate_host, default),
+            FrontDoorRoute::ChannelBroker,
+            "the reserved SNI routes to the channel broker with a plain `h2` ALPN"
+        );
+        // …and with no ALPN extension at all, or the other ordinary web ALPN.
+        assert_eq!(
+            classify_front_door(&client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &[]), terminate_host, default),
+            FrontDoorRoute::ChannelBroker,
+            "the reserved SNI alone suffices -- no ALPN required"
+        );
+        assert_eq!(
+            classify_front_door(
+                &client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &["h2", "http/1.1"]),
+                terminate_host,
+                default
+            ),
+            FrontDoorRoute::ChannelBroker
+        );
+
+        // The pre-existing ALPN route is completely unaffected: it still works
+        // standalone, carrying no SNI at all, exactly as before this route existed.
+        assert_eq!(
+            classify_front_door(&client_hello(None, &[CT_EDGE_CHANNEL_ALPN]), terminate_host, default),
+            FrontDoorRoute::ChannelBroker,
+            "the ct-edge-channel ALPN route still works without the new SNI"
+        );
+        // A client offering BOTH discriminators lands on the same route -- no conflict.
+        assert_eq!(
+            classify_front_door(
+                &client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &[CT_EDGE_CHANNEL_ALPN]),
+                terminate_host,
+                default
+            ),
+            FrontDoorRoute::ChannelBroker
+        );
+        // Ordinary traffic is untouched: a normal SNI with a web ALPN still classifies
+        // by hostname exactly as before.
+        assert_eq!(
+            classify_front_door(&client_hello(Some("app1.z"), &["h2"]), terminate_host, default),
+            FrontDoorRoute::BrowserTunnel("app1.z".into())
+        );
+        assert_eq!(
+            classify_front_door(&client_hello(Some("Portal.Z"), &["h2"]), terminate_host, default),
+            FrontDoorRoute::Proxy("portal.z".into())
+        );
+        // The documented ALPN-before-SNI precedence still holds ahead of this branch:
+        // a data-plane ALPN wins even when the reserved SNI is also present (a client
+        // would never send this combination, but the ordering must be deterministic).
+        assert_eq!(
+            classify_front_door(
+                &client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &[CT_EDGE_ALPN]),
+                terminate_host,
+                default
+            ),
+            FrontDoorRoute::EdgeRelay,
+            "the ct-edge data-plane ALPN still wins ahead of any SNI-based routing"
+        );
+        assert_eq!(
+            classify_front_door(
+                &client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &[CT_EDGE_RELAY_ALPN]),
+                terminate_host,
+                default
+            ),
+            FrontDoorRoute::RelayGate
+        );
+    }
+
+    #[test]
+    fn reserved_fallback_sni_is_claimed_before_terminate_host_and_browser_tunnel() {
+        // Precedence, deliberately chosen: the reserved name is claimed by the channel
+        // route ahead of BOTH the terminate-host (`Proxy`) and Browser-Plane
+        // (`BrowserTunnel`) arms. Safe because RFC 2606 guarantees `.invalid` can never
+        // be a registrable domain, so no operator can legitimately own this name -- and
+        // claiming it here means a customer who somehow configured it (by accident or
+        // to hijack the route) can never shadow the channel fallback, nor capture a
+        // channel member's connection into their own tunnel.
+        let default = Some("portal.z");
+        // A terminate_hosts registry that *does* claim the reserved name: the channel
+        // route still wins, so the fallback can never be broken by configuration.
+        let claims_reserved =
+            |h: &str| h.eq_ignore_ascii_case(CT_EDGE_CHANNEL_FALLBACK_SNI) || terminate_host(h);
+        assert_eq!(
+            classify_front_door(&client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &["h2"]), claims_reserved, default),
+            FrontDoorRoute::ChannelBroker,
+            "the reserved SNI beats a terminate host that claims the same name"
+        );
+        // With no terminate hosts at all it must NOT fall through to BrowserTunnel.
+        let never_terminate = |_: &str| false;
+        assert_eq!(
+            classify_front_door(&client_hello(Some(CT_EDGE_CHANNEL_FALLBACK_SNI), &[]), never_terminate, default),
+            FrontDoorRoute::ChannelBroker,
+            "the reserved SNI is never treated as a Browser-Plane tunnel hostname"
+        );
+        // The constant itself is an RFC 2606 `.invalid` name -- the property the whole
+        // precedence argument rests on, guarded here so it survives any future rename.
+        assert!(
+            CT_EDGE_CHANNEL_FALLBACK_SNI.ends_with(".invalid"),
+            "the reserved SNI must stay in the RFC 2606 `.invalid` TLD so it can never collide with a real domain"
+        );
+        assert_eq!(
+            CT_EDGE_CHANNEL_FALLBACK_SNI,
+            CT_EDGE_CHANNEL_FALLBACK_SNI.to_ascii_lowercase(),
+            "the constant is stored lowercased, matching this module's hostname convention"
+        );
+    }
+
+    #[test]
+    fn reserved_fallback_sni_matching_is_case_insensitive_like_every_other_hostname() {
+        // Mirrors `classify_front_door_alpn_matching_is_case_sensitive_sni_matching_is_
+        // not_329`: SNI comparisons in this module are case-insensitive (a client's TLS
+        // stack may normalize casing differently), while ALPN stays exact-byte.
+        let default = Some("portal.z");
+        // Derived from the constant rather than hardcoded, so a future rename of the
+        // reserved name can't silently turn these into vacuous assertions.
+        let alternating: String = CT_EDGE_CHANNEL_FALLBACK_SNI
+            .chars()
+            .enumerate()
+            .map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c })
+            .collect();
+        for variant in [
+            CT_EDGE_CHANNEL_FALLBACK_SNI.to_string(),
+            CT_EDGE_CHANNEL_FALLBACK_SNI.to_ascii_uppercase(),
+            alternating,
+        ] {
+            let variant = variant.as_str();
+            assert_eq!(
+                classify_front_door(&client_hello(Some(variant), &["h2"]), terminate_host, default),
+                FrontDoorRoute::ChannelBroker,
+                "reserved-SNI matching must be case-insensitive for {variant:?}"
+            );
+        }
+        // A near-miss must NOT match -- it falls through to the ordinary SNI routing.
+        let suffixed = format!("{CT_EDGE_CHANNEL_FALLBACK_SNI}.z");
+        assert_eq!(
+            classify_front_door(&client_hello(Some(suffixed.as_str()), &["h2"]), terminate_host, default),
+            FrontDoorRoute::BrowserTunnel(suffixed.clone()),
+            "only an exact (case-insensitive) hostname match claims the channel route"
+        );
+        let prefixed = format!("not-{CT_EDGE_CHANNEL_FALLBACK_SNI}");
+        assert_eq!(
+            classify_front_door(&client_hello(Some(prefixed.as_str()), &["h2"]), terminate_host, default),
+            FrontDoorRoute::BrowserTunnel(prefixed.clone())
+        );
     }
 
     #[test]
