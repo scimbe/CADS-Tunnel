@@ -39,6 +39,7 @@ DESEC_EXAMPLE="$ROOT/config/desec.env.example"
 COMPOSE_BASE="$DEPLOY_DIR/compose.selfhost.yml"
 COMPOSE_FRONTDOOR="$DEPLOY_DIR/compose.frontdoor.yml"
 COMPOSE_SSO="$DEPLOY_DIR/compose.sso.yml"
+COMPOSE_RELAY="$DEPLOY_DIR/compose.relay.yml"
 
 FRESH=0
 FRONTDOOR=0
@@ -99,6 +100,18 @@ compose_() {
   local files=(-f "$COMPOSE_BASE")
   [ "$FRONTDOOR" = "1" ] && files+=(-f "$COMPOSE_FRONTDOOR")
   [ "$SSO" = "1" ] && files+=(-f "$COMPOSE_SSO")
+  # Relay-gate overlay (#330): auto-included whenever the deployment has provisioned a
+  # relay-node peer id in its .env. This overlay used to be applied only by hand, so every
+  # scripted redeploy silently DROPPED CT_EDGE_RELAY_UPSTREAM/CT_EDGE_RELAY_NODE_PEER from
+  # the recreated edge -- the relay gate then answered every NAT'd channel member with
+  # "relay gate not configured" while the rest of the edge looked perfectly healthy.
+  # Live incident 2026-08-13 19:34 UTC: one such redeploy took the gate away mid-testing;
+  # accept-side members waited out their whole park window and surfaced it as a bogus
+  # "edge relay refused the channel join" ~40s later. Keying on the .env value keeps
+  # gate-less deployments byte-identical to before.
+  if grep -q '^CT_RELAY_NODE_PEER=..*' "$ENV_FILE" 2>/dev/null; then
+    files+=(-f "$COMPOSE_RELAY")
+  fi
   docker_ compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
 
