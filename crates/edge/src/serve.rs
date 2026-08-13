@@ -1500,6 +1500,7 @@ async fn admit_tcp_agent_a<S>(
     role_label: &'static str,
 ) -> Result<
     Option<(
+        RoutingToken,
         tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
         Option<tokio::sync::OwnedSemaphorePermit>,
     )>,
@@ -1529,7 +1530,7 @@ where
     })
     .await
     .map_err(|_| format!("tcp-fallback: role '{role_label}' admission timed out"))??;
-    Ok(parked.map(|parked| (parked, sub_permit)))
+    Ok(parked.map(|parked| (_token, parked, sub_permit)))
 }
 
 /// The Browser-Plane counterpart to [`admit_tcp_agent_a`]: the admission body
@@ -1554,6 +1555,7 @@ async fn admit_tcp_agent_b<S>(
     role_label: &'static str,
 ) -> Result<
     Option<(
+        RoutingToken,
         tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
         Option<tokio::sync::OwnedSemaphorePermit>,
     )>,
@@ -1596,13 +1598,14 @@ where
     let Some((token, sub_permit)) = admitted else { return Ok(None) };
     // Returned UN-awaited: the caller decides whether to await it plainly ('B') or
     // to keep the idle connection alive with `park_and_ping` while waiting ('L').
-    Ok(Some((state.park_tcp_agent(token), sub_permit)))
+    let parked = state.park_tcp_agent(token.clone());
+    Ok(Some((token, parked, sub_permit)))
 }
 
 async fn park_and_ping<S>(
     stream: &mut S,
     parked: tokio::sync::oneshot::Receiver<crate::state::BoxedStream>,
-) -> Result<crate::state::BoxedStream, BoxError>
+) -> Result<crate::state::BoxedStream, ParkAndPingError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1612,14 +1615,41 @@ where
         tokio::select! {
             biased;
             res = &mut parked => {
-                return res.map_err(|_| "tcp-fallback: parked registration superseded/dropped before a Client arrived".into());
+                let client = res.map_err(|_| ParkAndPingError::NoClient(
+                    "tcp-fallback: parked registration superseded/dropped before a Client arrived".into(),
+                ))?;
+                // Verify-at-delivery (ct-agent#15 follow-up, residual ~40% failure with 'L'
+                // active): the cadence ping only proves liveness as of up to
+                // TCP_PING_INTERVAL ago -- a connection the middlebox killed since then is
+                // an up-to-8s-stale corpse, and splicing a Client onto it fails the
+                // request. One final PING/PONG round trip right before the STOP sentinel
+                // converts that stale-delivery failure into a detectable one, and --
+                // crucially -- RESCUES the client stream so the caller can hand it to the
+                // next parked slot instead of losing the request. Extra pre-STOP pings are
+                // explicitly legal in the wire contract (both 'K' and 'L' clients consume
+                // any number of well-formed PING frames until STOP), so this is compatible
+                // with every ping-capable client already deployed.
+                match send_ping_and_await_pong(stream, counter).await {
+                    Ok(()) => return Ok(client),
+                    Err(e) => return Err(ParkAndPingError::AgentDead { client, source: e }),
+                }
             }
             _ = tokio::time::sleep(TCP_PING_INTERVAL) => {
-                send_ping_and_await_pong(stream, counter).await?;
+                send_ping_and_await_pong(stream, counter).await.map_err(ParkAndPingError::NoClient)?;
                 counter = counter.wrapping_add(1);
             }
         }
     }
+}
+
+/// Why [`park_and_ping`] failed -- split so the caller can failover a rescued Client.
+enum ParkAndPingError {
+    /// No Client was in flight (superseded registration, or a cadence ping failed).
+    NoClient(BoxError),
+    /// The final verify-ping failed AFTER a Client was delivered: the parked agent died
+    /// within the last ping interval. The Client's stream is rescued for re-delivery to
+    /// the next parked slot for the same token.
+    AgentDead { client: crate::state::BoxedStream, source: BoxError },
 }
 
 /// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
@@ -1690,7 +1720,7 @@ where
             // connection for its whole life, not inside `admit_tcp_agent_a` --
             // #410's bound only means anything while the registration is still
             // parked, so the permit has to outlive admission.
-            let Some((parked, _sub_permit)) =
+            let Some((_token, parked, _sub_permit)) =
                 admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "A").await?
             else {
                 let _ = stream.shutdown().await;
@@ -1725,7 +1755,7 @@ where
             // arm -- zero behavior change for any already-deployed client.
             // Held for the whole parked-and-relaying life of this connection,
             // exactly as in the 'A' arm -- see `admit_tcp_agent_a`'s doc.
-            let Some((parked, _sub_permit)) =
+            let Some((token, parked, _sub_permit)) =
                 admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "K").await?
             else {
                 let _ = stream.shutdown().await;
@@ -1743,22 +1773,33 @@ where
                     relay(&mut stream, &mut client).await?;
                     Ok(())
                 }
+                // Verify-at-delivery failover: the final pre-STOP ping caught a
+                // corpse WITH a live Client in hand -- hand that Client to the
+                // next parked slot for the same token instead of failing the
+                // request. If no slot is free the stream drops, which is exactly
+                // today's behaviour, so this is strictly an improvement.
+                Err(ParkAndPingError::AgentDead { client, source }) => {
+                    eprintln!(
+                        "ct-edge: tcp-fallback 'K' verify-ping caught a dead parked agent at delivery ({source}); failing the client over to the next parked slot"
+                    );
+                    let _ = state.deliver_to_tcp_agent(&token, client);
+                    let _ = stream.shutdown().await;
+                    Ok(())
+                }
                 // Same graceful-shutdown treatment as 'A' for a superseded/
                 // never-delivered registration (#229 follow-up) -- see that
-                // arm's comment. A genuine ping/pong I/O failure (the parked
-                // Agent's connection actually died) also lands here via
-                // `park_and_ping`'s Err path and gets the same clean shutdown
-                // rather than propagating as a hard error, since "the Agent
-                // went away while parked" is an ordinary, expected outcome on
-                // this path, not a bug.
-                Err(_) => {
+                // arm's comment. A cadence ping/pong I/O failure (the parked
+                // Agent's connection died with no Client in flight) also lands
+                // here and gets the same clean shutdown.
+                Err(ParkAndPingError::NoClient(e)) => {
+                    edge_trace(format_args!("tcp-fallback 'K' parked loop ended without a client: {e}"));
                     let _ = stream.shutdown().await;
                     Ok(())
                 }
             }
         }
         b'B' => {
-            let Some((parked, _sub_permit)) =
+            let Some((_token, parked, _sub_permit)) =
                 admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "B").await?
             else {
                 return Ok(());
@@ -1798,7 +1839,7 @@ where
             // A legacy Browser-Plane agent never sends 'L' (it only ever sends 'B'),
             // so it can never reach this arm -- zero behavior change for any
             // already-deployed client.
-            let Some((parked, _sub_permit)) =
+            let Some((token, parked, _sub_permit)) =
                 admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "L").await?
             else {
                 return Ok(());
@@ -1812,10 +1853,21 @@ where
                     relay(&mut stream, &mut client).await?;
                     Ok(())
                 }
+                // Verify-at-delivery failover, same as 'K': rescue the Client to
+                // the next parked slot for this hostname's token.
+                Err(ParkAndPingError::AgentDead { client, source }) => {
+                    eprintln!(
+                        "ct-edge: tcp-fallback 'L' verify-ping caught a dead parked agent at delivery ({source}); failing the client over to the next parked slot"
+                    );
+                    let _ = state.deliver_to_tcp_agent(&token, client);
+                    let _ = stream.shutdown().await;
+                    Ok(())
+                }
                 // Same graceful shutdown as 'B'/'K' -- a superseded registration or
                 // a parked agent that genuinely went away is an ordinary outcome
                 // here, not an error to propagate.
-                Err(_) => {
+                Err(ParkAndPingError::NoClient(e)) => {
+                    edge_trace(format_args!("tcp-fallback 'L' parked loop ended without a client: {e}"));
                     let _ = stream.shutdown().await;
                     Ok(())
                 }
