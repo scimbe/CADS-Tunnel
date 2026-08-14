@@ -253,24 +253,32 @@ where
     // #41 FB2: a TCP-fallback agent (UDP/QUIC blocked) is parked with no QUIC
     // connection — hand it the browser stream (buffered ClientHello + the rest)
     // directly, rather than opening a QUIC stream it doesn't have.
-    if state.has_tcp_agent(&token) {
-        let joined: crate::state::BoxedStream = Box::new(Prepend {
-            pre: hello,
-            pos: 0,
-            inner: inbound,
-        });
-        return match state.deliver_to_tcp_agent(&token, joined) {
-            Ok(()) => Ok(()),
-            Err(_) => Err("tcp-fallback agent vanished before delivery".into()),
-        };
+    //
+    // #505: parked slots used to take ABSOLUTE precedence, and a dead one was a
+    // terminal error for the request ("vanished before delivery") — after a flap
+    // (an edge redeploy makes every agent fall back and park, then recover to
+    // QUIC), the stale dead parks bricked the hostname for every browser despite
+    // a healthy QUIC registration, until a human re-ran the demo script. Each
+    // delivery attempt consumes one slot and hands the stream back on a dead
+    // receiver, so: DRAIN dead parks in a loop, succeed on the first live one,
+    // and fall through to the QUIC registration when none are left.
+    let mut stream: crate::state::BoxedStream = Box::new(Prepend {
+        pre: hello,
+        pos: 0,
+        inner: inbound,
+    });
+    while state.has_tcp_agent(&token) {
+        match state.deliver_to_tcp_agent(&token, stream) {
+            Ok(()) => return Ok(()),
+            Err(back) => stream = back, // dead slot consumed (#505); try the next
+        }
     }
     match open_agent_stream(state, &token).await {
-        Ok((mut agent_send, agent_recv)) => {
-            // Replay the buffered ClientHello to the Agent first, then relay the
-            // rest so the browser<->origin TLS handshake completes end-to-end.
-            agent_send.write_all(&hello).await?;
+        Ok((agent_send, agent_recv)) => {
+            // The buffered ClientHello replays from the Prepend wrapper on first
+            // read, so the browser<->origin TLS handshake completes end-to-end.
             let mut agent = join(agent_recv, agent_send);
-            let (a, b) = relay(&mut inbound, &mut agent).await?;
+            let (a, b) = relay(&mut stream, &mut agent).await?;
             state.note_relay(&token, a, b);
             Ok(())
         }
@@ -281,12 +289,7 @@ where
             // open several at once). Give it a brief window to free a slot
             // rather than failing this request outright.
             if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
-                let joined: crate::state::BoxedStream = Box::new(Prepend {
-                    pre: hello,
-                    pos: 0,
-                    inner: inbound,
-                });
-                if state.deliver_to_tcp_agent(&token, joined).is_ok() {
+                if state.deliver_to_tcp_agent(&token, stream).is_ok() {
                     return Ok(());
                 }
             }
@@ -341,18 +344,20 @@ where
     // the DECRYPTED stream directly, the same way `serve_sni_passthrough`
     // hands it the raw (still-encrypted) one -- the only difference is TLS
     // already came off at the edge here.
-    if state.has_tcp_agent(&token) {
-        let boxed: crate::state::BoxedStream = Box::new(tls);
-        return match state.deliver_to_tcp_agent(&token, boxed) {
-            Ok(()) => Ok(()),
-            Err(_) => Err("tcp-fallback agent vanished before delivery".into()),
-        };
+    // #505: same drain-then-fall-through as serve_sni_passthrough — dead parked
+    // slots are consumed one by one and a healthy QUIC registration serves the
+    // request instead of the old terminal "vanished before delivery".
+    let mut stream: crate::state::BoxedStream = Box::new(tls);
+    while state.has_tcp_agent(&token) {
+        match state.deliver_to_tcp_agent(&token, stream) {
+            Ok(()) => return Ok(()),
+            Err(back) => stream = back, // dead slot consumed (#505); try the next
+        }
     }
-    let mut tls = tls;
     match open_agent_stream(state, &token).await {
         Ok((agent_send, agent_recv)) => {
             let mut agent = join(agent_recv, agent_send);
-            let (a, b) = relay(&mut tls, &mut agent).await?;
+            let (a, b) = relay(&mut stream, &mut agent).await?;
             state.note_relay(&token, a, b);
             Ok(())
         }
@@ -360,8 +365,7 @@ where
             // Same momentarily-exhausted-pool recovery as serve_sni_passthrough
             // (#229 follow-up).
             if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
-                let boxed: crate::state::BoxedStream = Box::new(tls);
-                if state.deliver_to_tcp_agent(&token, boxed).is_ok() {
+                if state.deliver_to_tcp_agent(&token, stream).is_ok() {
                     return Ok(());
                 }
             }
@@ -3433,6 +3437,46 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    /// #505: stale DEAD TCP-fallback parks (an edge-flap leftover: agents fall back,
+    /// park, then recover to QUIC — the dead parks linger) must not brick delivery.
+    /// The old code took the first park and errored terminally when it was dead
+    /// ("vanished before delivery"), bricking the hostname for every browser until a
+    /// human re-ran the demo script. Delivery now DRAINS dead parks and lands on the
+    /// first live one.
+    #[tokio::test]
+    async fn delivery_drains_dead_tcp_parks_and_reaches_the_live_one_505() {
+        use tokio::io::AsyncWriteExt;
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x55; 32]);
+        state.register_host("drain.test", token.clone());
+
+        // Two dead parks (receivers dropped -- the flap leftovers), then a live one.
+        drop(state.park_tcp_agent(token.clone()));
+        drop(state.park_tcp_agent(token.clone()));
+        let live_rx = state.park_tcp_agent(token.clone());
+
+        let (mut browser, edge_end) = tokio::io::duplex(8192);
+        let hello = crate::sni::synth_client_hello(Some("drain.test"), &[]);
+        browser.write_all(&hello).await.unwrap();
+
+        let st = state.clone();
+        let serve = tokio::spawn(async move { serve_sni_passthrough(edge_end, &st).await });
+
+        // The LIVE park receives the browser stream -- the two dead parks were
+        // drained on the way instead of erroring the request.
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), live_rx)
+            .await
+            .expect("delivery must not hang")
+            .expect("the live park receives the stream (dead parks drained, #505)");
+        drop(delivered);
+        drop(browser);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), serve).await;
+        assert!(
+            !state.has_tcp_agent(&token),
+            "all parked slots consumed: two dead drained + one live delivered"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn mesh_relay_lookup_cached_suppresses_repeat_cp_calls_within_the_ttl_471() {
