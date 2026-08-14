@@ -1438,22 +1438,40 @@ fn spawn_park_keepalive_pump(
         );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut parked = true;
+        // #499 slice B, corrected after a live false-positive regression (2026-08-14): a clean
+        // read EOF while parked is NOT a death signal on its own -- v0.4.11-and-older clients
+        // legitimately HALF-CLOSE right after the possession signature, and flagging their EOF
+        // as a corpse killed every old client's live park (4-5 false drops per sweep, plane-
+        // wide). The discriminator is the negotiated contract: a KA-negotiated client
+        // (#500 ALPNs) promises a fully-open parked leg, so its EOF is unambiguous death; for
+        // everyone else only a HARD read error (RST) is -- a clean EOF just closes the read
+        // half and the pump keeps forwarding outbound (the ack/EX must still reach a
+        // half-closed old client, which can still receive).
+        let mut read_open = true;
         let mut from_client = vec![0u8; 16 * 1024];
         let mut to_client = vec![0u8; 16 * 1024];
         loop {
             tokio::select! {
-                r = real_r.read(&mut from_client) => match r {
-                    Ok(0) | Err(_) => {
-                        // #499 slice B: the CLIENT side died. If that happens while still
-                        // parked, flag the queued member as a corpse so the pairer drops it
-                        // instead of handing it to an arriving partner (the
-                        // FIFO-pairs-the-corpse-first failure: partner sees early eof,
-                        // retries on the next sweep boundary -- the tester's measured
-                        // N x 10s first-contact staircase).
+                r = real_r.read(&mut from_client), if read_open => match r {
+                    Err(_) => {
+                        // Hard error (RST-class): unambiguous death on every client version.
                         if parked {
                             dead.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         break;
+                    }
+                    Ok(0) => {
+                        if keepalive {
+                            // KA contract: the parked leg stays fully open, so EOF = death.
+                            if parked {
+                                dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                        // Legacy half-close (or a v0.4.12 process death -- wire-ambiguous
+                        // by design until the client speaks the KA ALPN): tolerate, keep
+                        // the outbound direction alive.
+                        read_open = false;
                     }
                     Ok(n) => {
                         if far_w.write_all(&from_client[..n]).await.is_err() {
@@ -2848,9 +2866,11 @@ mod tests {
             (client, s)
         };
 
-        // A parks; its client then DIES.
+        // A parks AS A KEEPALIVE-NEGOTIATED MEMBER (the contract that makes a clean EOF an
+        // unambiguous death signal -- see the pump's half-close discriminator); its client
+        // then DIES.
         let (client_a, s_a) = admit(0xa1, Direction::Accept);
-        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
             .await
             .expect("admit A");
         assert!(r.is_none(), "A parks");
@@ -2890,6 +2910,78 @@ mod tests {
         let mut got = [0u8; 1];
         live_b.read_exact(&mut got).await.expect("B receives through the splice");
         assert_eq!(got[0], 0x77, "the spliced pair is the LIVE leg, not the corpse");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_half_close_is_not_a_corpse_and_the_park_stays_pairable_499b_fix() {
+        // Live regression fix (2026-08-14): v0.4.11-and-older clients half-close right after
+        // the possession signature. That clean EOF must NOT flag the park dead (only a
+        // KA-negotiated member's EOF or a hard error may) -- the first slice B cut flagged
+        // every legacy park as a corpse within ~100ms, breaking pairing for every deployed
+        // old client. Prove: a non-KA member half-closes, stays pairable, and still RECEIVES
+        // the relay ack through the pump's outbound direction.
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x6Cu8; 32];
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.6:6099".parse().unwrap();
+
+        let admit = |holder_byte: u8, direction: Direction| {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder_sk(holder_byte), direction, 1_000),
+                endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+            };
+            let sk = holder_sk(holder_byte);
+            let (c, s) = tokio::io::duplex(4096);
+            let client = tokio::spawn(async move {
+                let mut c = c;
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                c.read_exact(&mut ch).await.expect("challenge");
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                // The v0.4.11 behavior under test: half-close the write direction, keep reading.
+                c.shutdown().await.expect("legacy half-close");
+                c
+            });
+            (client, s)
+        };
+
+        // A parks as a NON-KA member and half-closes (the legacy pattern).
+        let (client_a, s_a) = admit(0xa7, Direction::Accept);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
+            .await
+            .expect("admit A");
+        assert!(r.is_none(), "A parks");
+        let mut half_closed_a = client_a.await.expect("client A");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // B arrives: A's half-closed park must STILL pair (no corpse flag), and A must
+        // still receive the relay ack through the pump.
+        let (client_b, s_b) = admit(0xb8, Direction::Initiate);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
+            .await
+            .expect("admit B");
+        let (a, b) = r.expect("the half-closed legacy park pairs");
+        assert_eq!(pairer.lock().unwrap().take_dead_dropped(), 0, "no false corpse drop");
+        tokio::spawn(async move {
+            let _ = finish_relay_pair_over_streams(a, b, 500).await;
+        });
+        let ack = read_relay_ack_line(&mut half_closed_a).await;
+        assert!(
+            ack.starts_with(b"OK"),
+            "the half-closed legacy client still receives its ack: {:?}",
+            String::from_utf8_lossy(&ack)
+        );
+        let mut live_b = client_b.await.expect("client B");
+        let ack = read_relay_ack_line(&mut live_b).await;
+        assert!(ack.starts_with(b"OK"), "B acked too");
     }
 
     #[tokio::test]
