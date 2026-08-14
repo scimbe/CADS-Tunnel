@@ -88,11 +88,23 @@ HELP_AGENT_TOKEN=""
 if [ -n "$EDGE_ADMIN_URL" ] && [ -n "$EDGE_ADMIN_TOKEN" ]; then
   command -v openssl >/dev/null || die "openssl needed to mint a routing token (or unset CT_CP_EDGE_ADMIN_URL to use BP4a)."
   HELP_AGENT_TOKEN="$(openssl rand -hex 32)"
-  say "Authorizing $HOSTNAME_FQDN at the edge (hostname-ownership, BP4b)"
-  curl -fsS -X POST "${EDGE_ADMIN_URL%/}/admin/authorize-host/$HELP_AGENT_TOKEN/$HOSTNAME_FQDN" \
-       -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" >/dev/null \
-    || die "edge authorize-host failed (check CT_CP_EDGE_ADMIN_URL / token / that the edge admin listener is up)."
-  echo "   authorized — agent will register under this routing token (CT_AGENT_TOKEN)."
+  say "Authorizing $HOSTNAME_FQDN (hostname-ownership, BP4b)"
+  # #502: prefer the control plane's proxy (/registry/authorize-host, #214) over the
+  # edge admin endpoint -- ONLY the CP path records mesh ownership, and an edge
+  # restart rehydrates exclusively recorded pairs. The old direct edge-admin call
+  # left the authorization in edge RAM alone: every edge restart silently dropped
+  # this hostname and took the demo down until a human re-ran this script.
+  if curl -fsS -X POST "${CP_URL%/}/registry/authorize-host/$HELP_AGENT_TOKEN/$HOSTNAME_FQDN" \
+       -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" >/dev/null 2>&1; then
+    echo "   authorized via the control plane — ownership recorded, survives edge restarts."
+  else
+    curl -fsS -X POST "${EDGE_ADMIN_URL%/}/admin/authorize-host/$HELP_AGENT_TOKEN/$HOSTNAME_FQDN" \
+         -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" >/dev/null \
+      || die "authorize-host failed (check CT_CP_EDGE_ADMIN_URL / token / that the edge admin listener is up)."
+    echo "   ! authorized directly at the edge (CP lacks /registry/authorize-host) —"
+    echo "     ownership is NOT recorded: an edge restart drops it until this script re-runs."
+  fi
+  echo "   agent will register under this routing token (CT_AGENT_TOKEN)."
 else
   echo "   ! edge host-auth not configured (CT_CP_EDGE_ADMIN_URL/TOKEN) — relying on BP4a (fine for one hostname)."
 fi
