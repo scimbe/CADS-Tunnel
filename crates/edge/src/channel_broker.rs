@@ -2953,6 +2953,84 @@ mod tests {
     }
 
     #[tokio::test]
+    /// #494 field repro (2026-08-14): two v0.4.13-shaped KA members (keepalive
+    /// negotiated, NO phase preamble) of one channel, driven through the exact
+    /// field path -- preamble peek + PrependBytes + park-keepalive pump + offer +
+    /// `finish_relay_pair_over_streams` -- must BOTH receive their acks and splice
+    /// within seconds. In the field both clients hung ~45s with the park consumed
+    /// and no ack ever arriving; this pins the completion end-to-end.
+    async fn two_ka_members_without_preamble_pair_ack_and_splice_promptly_494() {
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x4Fu8; 32];
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.9:9099".parse().unwrap();
+
+        let member = |holder_byte: u8, direction: Direction, payload: u8| {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder_sk(holder_byte), direction, 1_000),
+                endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+            };
+            let sk = holder_sk(holder_byte);
+            let (c, s) = tokio::io::duplex(4096);
+            let client = tokio::spawn(async move {
+                let mut c = c;
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                c.read_exact(&mut ch).await.expect("challenge");
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                // Ack line ("OK ...\n"), tolerating leading keepalive NULs (#500).
+                let mut line = Vec::new();
+                loop {
+                    let mut b = [0u8; 1];
+                    c.read_exact(&mut b).await.expect("ack byte");
+                    if b[0] == 0 && line.is_empty() {
+                        continue;
+                    }
+                    if b[0] == b'\n' {
+                        break;
+                    }
+                    line.push(b[0]);
+                }
+                assert!(line.starts_with(b"OK"), "ack: {:?}", String::from_utf8_lossy(&line));
+                // Spliced session: exchange one byte with the peer.
+                c.write_all(&[payload]).await.expect("send");
+                let mut got = [0u8; 1];
+                c.read_exact(&mut got).await.expect("recv");
+                got[0]
+            });
+            (client, s)
+        };
+
+        let (client_a, s_a) = member(0x4a, Direction::Accept, 0xAA);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit A");
+        assert!(r.is_none(), "A parks");
+        let (client_b, s_b) = member(0x4b, Direction::Initiate, 0xBB);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit B");
+        let (a, b) = r.expect("B pairs with parked A");
+        tokio::spawn(async move {
+            let _ = finish_relay_pair_over_streams(a, b, 500).await;
+        });
+
+        // The field hang was ~45s of silence; 5s is generous for an in-memory pair.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            (client_a.await.expect("a"), client_b.await.expect("b"))
+        })
+        .await
+        .expect("both members must be acked and spliced promptly -- a hang here is the #494 field defect");
+        assert_eq!(joined, (0xBB, 0xAA), "bytes crossed the spliced session");
+    }
+
+    #[tokio::test]
     async fn ka_clients_phase_preamble_stamps_the_park_and_gates_pairing_495a_marker() {
         // v0.4.14 edge half: a KA-negotiated member may prefix [0xFF, phase] before its
         // join. Prove through the REAL boxed admission path: (1) a Relay-marked park does
