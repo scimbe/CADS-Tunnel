@@ -460,25 +460,37 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 | One account floods issuance | working as designed | per-account rate limit returns `429`; adjust the cap if legitimate |
 | Suspected committed secret | credential in a commit | run `./scripts/check-no-secrets.sh`; rotate the exposed secret |
 | Channel joins broker-wide stalled/refused; edge log **completely silent** on the broker (no admits, no `channel-join NO`, no handshake errors) while clients keep retrying | wedged broker accept loop — the container healthcheck does **not** probe the broker ports, so the edge stays "healthy" (2026-08-13 incident, edge silent 19:12→19:34 UTC) | confirm silence with `docker logs <edge> --since 10m \| grep -c 'channel'`; recreate the edge; follow the redeploy-aftermath checklist below |
-| Two channel members both look healthy, both park, **never pair**; each reaped after ~30 s; client-side reads as `edge relay refused the channel join` ~32–41 s in | disjoint per-transport pairers ([#495]) — one member came in over `:443`, the other over QUIC | until #495 lands: put **both** halves on `CT_CHANNEL_FRONT_DOOR_ONLY=1`; the reap log names channel+holder of the lone member, so you can see who keeps half-joining |
-| `[quic-handshake] handshake not completed` flood right after an edge redeploy | clients pinning a pre-redeploy trust anchor; the CA is re-issued per deploy ([#496]) — note the **key survives** (Subject Key ID stable), so pinned anchors usually still validate; a genuine flood means clients pinned something else or need a restart anyway | live-fetching consumers (`GET /pki/ca`, e.g. sort's bridge) self-heal; restart baked-env channel members with freshly fetched certs |
+| Two channel members both look healthy, both park, **never pair**; each reaped after ~30 s; client-side reads as `edge relay refused the channel join` ~32–41 s in | disjoint per-transport pairers ([#495], transport-unification slice still open) — one member came in over `:443`, the other over QUIC | put **both** halves on `CT_CHANNEL_FRONT_DOOR_ONLY=1`; the reap log names channel+holder of the lone member. Within `:443`, #495 slices 1/2a/2b are live (park queue, phase-marked pairing, rendezvous ack-then-close): clients ≥ v0.4.14 pair phase-deterministically (field-proven 2026-08-14, p=0.013 — unmarked members hit an N×10 s retry staircase on ~5/8 of pairings) |
+| `[quic-handshake] handshake not completed` flood right after an edge redeploy | since 2026-08-14 ([#496] fixed) the CA is **byte-stable across redeploys** (cert + notAfter persisted beside the key; field-verified identical `/pki/ca` hash across a deliberate restart) — a post-redeploy handshake flood therefore indicates clients that pinned something other than the CA root, not normal churn | confirm `/pki/ca` is unchanged (`sha256sum` before/after); investigate the flooding clients |
+| Fresh channel first contacts stall 45–100 s while held sessions are fast | clients older than **ct-agent v0.4.16**: their rendezvous-ack read waits for an EOF the `:443` edge never sends (CADS-Tunnel#494) | upgrade clients to ≥ v0.4.16 (one fixed side heals each pair); edge-side, #495-2b additionally closes marked rendezvous pairs |
 | One IP hammering doomed channel joins (`channel-join NO [not-member]` storm) | stale/orphaned client retrying a dead grant | the per-IP penalty (30 definitive refusals/min, 2026-08-13) sheds it pre-handshake automatically; `grep penalty` in the edge log to confirm engagement |
 
-## Redeploy the edge — aftermath checklist (all four learned live, 2026-08-13)
+## Redeploy the edge — aftermath checklist
 
-1. **Compose overlays**: `deploy-selfhost.sh` auto-includes `compose.relay.yml` when
-   `CT_RELAY_NODE_PEER` is set in `.env` (commit `b32f8c9`). If you deploy manually, pass every
-   overlay the deployment normally runs — a dropped overlay silently unconfigures its arm (the
-   relay gate answered every NAT'd member with "not configured" for 20 minutes when this was
-   missed) .
-2. **Local long-running agents cache the edge's container IP** from their own start (one-time DNS
-   resolution). After a recreate with an IP change, restart every co-hosted agent container;
-   pre-v0.4.7 binaries never recover on their own (ct-agent#16).
-3. **help-site hostname bind** can be rejected after a control-plane recreate (token/authorization
-   race) — a plain agent restart is sometimes not enough; re-run `examples/help-site/run-demo.sh`.
-4. **The CA is re-issued** on each deploy ([#496]) but keeps its keypair — pinned anchors stay
-   valid; live-fetching consumers refresh within their cache TTL. Announce redeploys to channel
-   operators anyway: their in-flight sessions drop and their serve loops re-admit.
+Since 2026-08-14, edge redeploys are **self-healing for Browser-Plane tunnels**: hostname
+authorizations rehydrate before the listeners open (#503) from durably recorded ownership
+(#502), stale dead TCP-fallback parks are drained instead of bricking delivery (#505), and
+≥ v0.4.15 agents retry a refused hostname bind. The 2026-08-13-era duties — serialized agent
+restarts, re-running `run-demo.sh` for help — are gone. What remains:
+
+1. **Always deploy with the full flag set** — `./scripts/deploy-selfhost.sh --frontdoor --sso
+   --skip-cert`. A flagless invocation recreates the stack WITHOUT the `:443` overlay (front
+   door gone, every tunnel down — a ~15-minute full outage on 2026-08-14 came from exactly
+   this); `--skip-cert` avoids Let's Encrypt rate-limit exposure. `compose.relay.yml` is
+   auto-included when `CT_RELAY_NODE_PEER` is set in `.env`; if you deploy manually, pass every
+   overlay the deployment normally runs.
+2. **Verify, don't repair**: after the stack reports up, curl each public hostname once
+   (200/302 expected within ~30 s as agents reconnect). Pre-v0.4.7 agent binaries are the one
+   remaining exception — they cache the edge container IP and never recover (ct-agent#16);
+   none should remain deployed.
+3. **The CA is byte-stable** across redeploys ([#496] fixed): cert + notAfter persist beside
+   the key, `/pki/ca` hashes identically. Announce redeploys to channel operators anyway:
+   in-flight sessions drop and their serve loops re-admit (sub-second on ≥ v0.4.16).
+4. **Hostname authorization writes go through the control plane** — `POST
+   /registry/authorize-host` (#214), never the edge admin API directly: only the CP path
+   records the ownership that rehydration replays, and for a hostname owned by a portal
+   tunnel the proxy now answers `409` instead of being silently reverted by the Gelb/ACME
+   re-authorize loop (#504).
 
 [#495]: https://github.com/scimbe/CADS-Tunnel/issues/495
 [#496]: https://github.com/scimbe/CADS-Tunnel/issues/496
