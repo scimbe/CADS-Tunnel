@@ -270,12 +270,15 @@ impl WsChannelState {
                 // Same per-member identification as the front-door reaper (serve.rs):
                 // channel/holder hex are public grant fields, and a repeated lone-member
                 // reap is only diagnosable if the operator can see WHO keeps half-joining.
-                for m in &expired {
+                for m in expired {
                     eprintln!(
                         "ct-edge: ws-channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
                         crate::serve::hex_of_bytes(&m.channel.0),
                         crate::serve::hex_of_bytes(&m.holder),
                     );
+                    // ct-agent#21: name the expiry to the live client (EX token) so it
+                    // re-parks instead of misreading a silent close as a failure.
+                    tokio::spawn(m.payload.notify_park_expired());
                 }
             }
         });

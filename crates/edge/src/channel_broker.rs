@@ -1041,6 +1041,14 @@ pub fn new_shared_channel_pairer() -> SharedChannelPairer {
 /// attested key in the ack (#122) — exactly as the rendezvous path does. Without them a
 /// `:443`-only pair (both members forced onto the relay) could never learn each other's
 /// Noise key and the join failed at the pin step; carrying them here closes that gap.
+/// The wire token an expiring park sends before closing (ct-agent#21): a reaped member's
+/// client used to read a SILENT close, indistinguishable from a refusal -- it then advanced
+/// its dial ladder and backed off, burning 40s windows on what was a perfectly healthy rung
+/// (measured: 271 "rung failures" that were just idle park expiries). `EX` names the event so
+/// a current client re-parks on the SAME rung immediately; an older client sees it as the
+/// same EOF-ish close it always did (no behavior change).
+pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
+
 pub struct AdmittedStreamMember<S> {
     stream: S,
     req: ChannelJoinRequest,
@@ -1056,6 +1064,19 @@ pub struct AdmittedStreamMember<S> {
     /// unbounded caller (`cap: None`) and every direct test construction in this module. Never
     /// read, only held for its `Drop` -- leading underscore so `-D dead_code` doesn't flag it.
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl<S: AsyncWrite + Unpin> AdmittedStreamMember<S> {
+    /// ct-agent#21: notify this parked member that its park EXPIRED (no partner within the
+    /// TTL) before its stream is dropped -- best-effort (`EX` + shutdown, every error
+    /// ignored: the member may already be gone, which is fine, the write existed to help a
+    /// live one). Consumes the member; dropping the stream afterwards closes the connection
+    /// and releases the #451 permit, exactly as the silent drop did.
+    pub async fn notify_park_expired(mut self) {
+        let _ = self.stream.write_all(PARK_EXPIRED_TOKEN).await;
+        let _ = self.stream.flush().await;
+        let _ = self.stream.shutdown().await;
+    }
 }
 
 /// Which member of a relay pair a **mid-handoff** failure struck (#148). A completer ack-writes each
@@ -1417,7 +1438,10 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
         // so a first-comer with no partner is bounded instead of wedging the endpoint.
         let expired = pairer.lock_safe().drain_expired(now); // #497: poison-resilient
         for m in expired {
-            m.payload.conn.close(0u32.into(), b"channel park timeout");
+            // ct-agent#21: a NAMED close reason -- the QUIC analog of the stream path's EX
+            // token; a current client reads the ApplicationClose reason and re-parks on the
+            // same rung instead of misreading the close as a rung failure.
+            m.payload.conn.close(0u32.into(), b"park-expired: no partner within the park TTL");
         }
 
         // Accept the next incoming CONNECTION only — fast (the QUIC accept, not the handshake). The
@@ -2358,6 +2382,31 @@ mod tests {
         // The reaped member's connection was closed -- its join attempt ends (err or timeout).
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), lone).await;
         driver.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reaped_park_notifies_the_client_with_the_ex_token_21() {
+        // ct-agent#21: a reaped member's client must be able to DISTINGUISH "your park
+        // expired, re-park" from a refusal/failure -- the wire signal is the bare EX token
+        // followed by stream shutdown. An old client that doesn't know EX sees the same
+        // close-with-junk-or-nothing it always did; a current one re-parks the same rung.
+        use tokio::io::AsyncReadExt;
+        let (mut client_end, server_end) = tokio::io::duplex(64);
+        let member = AdmittedStreamMember {
+            stream: server_end,
+            req: ChannelJoinRequest {
+                grant: grant_h([0x21u8; 32], &holder_sk(0x21), Direction::Accept, 1_000),
+                endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+            },
+            operator: operator_pubkey(),
+            noise: None,
+            attest: None,
+            _permit: None,
+        };
+        member.notify_park_expired().await;
+        let mut buf = Vec::new();
+        client_end.read_to_end(&mut buf).await.expect("read to EOF");
+        assert_eq!(buf, PARK_EXPIRED_TOKEN, "exactly the EX token, then clean EOF");
     }
 
     #[test]

@@ -721,6 +721,7 @@ impl ChannelFrontDoor {
             pairer.clone(),
             Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
             unix_now,
+            |m| drop(m),
         );
         Self::new(resolver, acceptor, pairer)
     }
@@ -759,13 +760,15 @@ pub(crate) fn hex_of_bytes(bytes: &[u8]) -> String {
 /// member type `T` (production always instantiates it at
 /// `AdmittedStreamMember<FrontDoorChannelStream>` via [`ChannelFrontDoor::new`]) so a test
 /// can park a lightweight fake member instead of a real TLS stream.
-fn spawn_front_door_pairer_reaper<T, N>(
+fn spawn_front_door_pairer_reaper<T, N, R>(
     pairer: Arc<std::sync::Mutex<crate::channel_broker::ChannelPairer<T>>>,
     interval: Duration,
     now_fn: N,
+    on_reap: R,
 ) where
     T: Send + 'static,
     N: Fn() -> ct_common::channel::UnixSeconds + Send + Sync + 'static,
+    R: Fn(crate::channel_broker::WaitingMember<T>) + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -778,12 +781,17 @@ fn spawn_front_door_pairer_reaper<T, N>(
             // QUIC rung while this side came in via :443) could previously see only that it
             // was happening, never WHICH channel kept half-joining. Same identification
             // fields the admission refusals already log (#124/#248-follow).
-            for m in &expired {
+            for m in expired {
                 eprintln!(
                     "ct-edge: front-door channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
                     hex_of_bytes(&m.channel.0),
                     hex_of_bytes(&m.holder),
                 );
+                // ct-agent#21: the caller decides how a reaped member is torn down --
+                // production notifies the live client with the EX token (so it re-parks on
+                // the same rung instead of misreading a silent close as a rung failure);
+                // tests pass a no-op.
+                on_reap(m);
             }
         }
     });
@@ -2810,6 +2818,12 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 pairer.clone(),
                                 Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
                                 unix_now,
+                                // ct-agent#21: tell the live client its park EXPIRED (EX
+                                // token) so it re-parks on the same rung immediately,
+                                // instead of misreading the silent close as a rung failure.
+                                |m| {
+                                    tokio::spawn(m.payload.notify_park_expired());
+                                },
                             );
                             shared_channel_pairer = Some(pairer.clone());
                             Some(ChannelFrontDoor::new(
@@ -3222,7 +3236,14 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 // this branch somehow runs without the front-door one having constructed it.
                 let pairer = shared_channel_pairer.clone().unwrap_or_else(|| {
                     let p = crate::channel_broker::new_shared_channel_pairer();
-                    spawn_front_door_pairer_reaper(p.clone(), Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3), unix_now);
+                    spawn_front_door_pairer_reaper(
+                        p.clone(),
+                        Duration::from_secs(CHANNEL_PARK_TTL_SECS / 3),
+                        unix_now,
+                        |m| {
+                            tokio::spawn(m.payload.notify_park_expired());
+                        },
+                    );
                     p
                 });
                 // ws_channel_cap was resolved earlier (alongside conn_cap/browser_tunnel_cap)
@@ -3552,6 +3573,7 @@ mod tests {
             pairer.clone(),
             Duration::from_millis(5),
             move || now_reader.load(std::sync::atomic::Ordering::SeqCst),
+            |m| drop(m),
         );
 
         // Give the spawned task a handful of real ticks to run — generous relative to the 5ms
