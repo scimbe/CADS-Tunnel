@@ -1399,6 +1399,14 @@ pub async fn serve_connection(
             // refuse a bind the control plane hasn't authorized for this token —
             // an anonymous 'H' bind can't claim someone's name.
             if !state.host_bind_allowed(host, &token) {
+                // #502: the wire answer is a bare "NO" either way, so this log line
+                // is the only place the two refusal causes are distinguishable —
+                // an authorization miss here is usually the agent's bind racing the
+                // control plane's authorize-host call (freshly onboarded agent).
+                eprintln!(
+                    "ct-edge: refused hostname bind for '{host}' (no authorization for this token — \
+                     authorize-host not yet landed, or never granted) (#502)"
+                );
                 send.write_all(b"NO").await?;
                 send.finish()?;
                 return Ok(None);
@@ -1408,6 +1416,10 @@ pub async fn serve_connection(
             if state.register_host(host, token) {
                 send.write_all(b"OK").await?;
             } else {
+                eprintln!(
+                    "ct-edge: refused hostname bind for '{host}' (already bound to a different \
+                     token, or token revoked) (#502)"
+                );
                 send.write_all(b"NO").await?;
             }
             send.finish()?;
