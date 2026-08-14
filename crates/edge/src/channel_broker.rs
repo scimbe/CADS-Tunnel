@@ -179,6 +179,63 @@ impl ParkPhase {
     }
 }
 
+/// #495 slice 2a (v0.4.14 client marker): first byte of the OPTIONAL phase preamble a
+/// KA-generation client may send before its length-framed join. Unambiguous against the
+/// length prefix by construction: 0xFF as the length's high byte would mean a >=65280-byte
+/// join, which the admission's own `len > 1024` bound has always rejected ("len-oob").
+/// Only ever interpreted on connections whose TLS negotiation selected a #500 KA id --
+/// an old client can never send it (it never negotiates KA), and a NON-KA connection's
+/// stray 0xFF falls into the existing len-oob refusal, not into phase parsing.
+pub(crate) const PHASE_PREAMBLE_MAGIC: u8 = 0xFF;
+
+/// Put two already-read bytes back in front of a stream -- the no-preamble path of the
+/// phase peek (the two bytes were the join's length prefix after all). Write half passes
+/// through untouched.
+struct PrependBytes<S> {
+    pre: [u8; 2],
+    pos: usize,
+    inner: S,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrependBytes<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.pre.len() {
+            let n = (self.pre.len() - self.pos).min(buf.remaining());
+            let start = self.pos;
+            buf.put_slice(&self.pre[start..start + n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrependBytes<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// The outcome of offering a member to the [`ChannelPairer`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum PairOutcome<T> {
@@ -1396,7 +1453,8 @@ where
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
-    offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default()).await
+    // Unmarked: this generic path (WS + tests) has no phase peek -- historical behavior.
+    offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked).await
 }
 
 /// The post-admission tail shared by [`admit_and_pair_on_stream`] and
@@ -1408,6 +1466,7 @@ async fn offer_admitted_stream_member<S>(
     deadline: UnixSeconds,
     member: AdmittedStreamMember<S>,
     liveness: ParkLiveness,
+    phase: ParkPhase,
 ) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1426,7 +1485,7 @@ where
             // #495 slice 2a: today's `:443`/WS wire cannot distinguish the phases, so
             // stream members park Unmarked (pairs with anything = exactly the historical
             // behavior). The v0.4.14 client's relay-leg marker upgrades this to `Relay`.
-            phase: ParkPhase::Unmarked,
+            phase,
             payload: member,
         });
     match outcome {
@@ -1576,6 +1635,37 @@ where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
+    // #495 slice 2a (v0.4.14 marker, edge half): a KA-generation client MAY prefix its
+    // join with `[0xFF, phase]`. Peek the first two bytes only on KA-negotiated
+    // connections; without the magic they ARE the length prefix and are put back
+    // verbatim (PrependBytes), so a v0.4.13 KA client without the preamble stays
+    // byte-identical. Non-KA connections are never peeked (legacy path untouched); a
+    // stray 0xFF there falls into the admission's existing len-oob refusal.
+    let (stream, phase): (BoxedChannelStream, ParkPhase) = if keepalive {
+        let mut stream = stream;
+        let mut first = [0u8; 2];
+        stream
+            .read_exact(&mut first)
+            .await
+            .map_err(|e| -> BoxError { format!("channel join: preamble/length read failed: {e}").into() })?;
+        if first[0] == PHASE_PREAMBLE_MAGIC {
+            let phase = match first[1] {
+                0x01 => ParkPhase::Rendezvous,
+                0x02 => ParkPhase::Relay,
+                other => {
+                    return Err(format!(
+                        "channel join: unknown phase marker 0x{other:02x} after the preamble magic"
+                    )
+                    .into())
+                }
+            };
+            (stream, phase)
+        } else {
+            (Box::pin(PrependBytes { pre: first, pos: 0, inner: stream }), ParkPhase::Unmarked)
+        }
+    } else {
+        (stream, ParkPhase::Unmarked)
+    };
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     // #499 slice B: EVERY admitted `:443` member is pumped now (not only KA-negotiated
@@ -1585,8 +1675,9 @@ where
     let (liveness, dead) = ParkLiveness::monitored();
     let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
-    offer_admitted_stream_member(pairer, deadline, member, liveness).await
+    offer_admitted_stream_member(pairer, deadline, member, liveness, phase).await
 }
+
 
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
 /// channel-joins for the same channel, pair them via [`authorize_channel_pair`],
@@ -2847,6 +2938,83 @@ mod tests {
             nuls.len()
         );
         assert_eq!(tail, PARK_EXPIRED_TOKEN, "after stripping NULs the tail is exactly EX");
+    }
+
+    #[tokio::test]
+    async fn ka_clients_phase_preamble_stamps_the_park_and_gates_pairing_495a_marker() {
+        // v0.4.14 edge half: a KA-negotiated member may prefix [0xFF, phase] before its
+        // join. Prove through the REAL boxed admission path: (1) a Relay-marked park does
+        // NOT pair with a Rendezvous-marked arrival (both queue); (2) a Relay-marked
+        // arrival pairs with the Relay park; (3) a KA member WITHOUT preamble parks
+        // Unmarked (pairs with anything -- v0.4.13 compatibility, PrependBytes puts the
+        // peeked length bytes back); (4) an unknown phase byte is rejected.
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x7Eu8; 32];
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.3:3099".parse().unwrap();
+
+        let admit = |holder_byte: u8, direction: Direction, preamble: Option<[u8; 2]>| {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder_sk(holder_byte), direction, 1_000),
+                endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+            };
+            let sk = holder_sk(holder_byte);
+            let (c, s) = tokio::io::duplex(4096);
+            let client = tokio::spawn(async move {
+                let mut c = c;
+                if let Some(p) = preamble {
+                    c.write_all(&p).await.expect("preamble");
+                }
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                if c.read_exact(&mut ch).await.is_err() {
+                    return c; // rejected before the challenge (invalid-marker case)
+                }
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                c
+            });
+            (client, s)
+        };
+
+        // (1) A parks Relay-marked; B arrives Rendezvous-marked -> both queue.
+        let (_ca, s_a) = admit(0xe1, Direction::Accept, Some([PHASE_PREAMBLE_MAGIC, 0x02]));
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit A (relay-marked)");
+        assert!(r.is_none(), "A parks");
+        let (_cb, s_b) = admit(0xe2, Direction::Initiate, Some([PHASE_PREAMBLE_MAGIC, 0x01]));
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit B (rendezvous-marked)");
+        assert!(r.is_none(), "phase mismatch: B queues instead of pairing with A");
+        assert_eq!(pairer.lock().unwrap().len(), 2);
+
+        // (2) A second Relay-marked arrival (different holder) pairs with A's Relay park.
+        let (_cc, s_c) = admit(0xe2, Direction::Initiate, Some([PHASE_PREAMBLE_MAGIC, 0x02]));
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_c), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit C (relay-marked)");
+        assert!(r.is_some(), "relay pairs with relay");
+
+        // (3) No preamble on a KA connection -> Unmarked -> pairs with B's marked park.
+        let (_cd, s_d) = admit(0xe1, Direction::Accept, None);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_d), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit D (v0.4.13-style, no preamble)");
+        assert!(r.is_some(), "Unmarked pairs with the remaining marked park");
+        assert!(pairer.lock().unwrap().is_empty());
+
+        // (4) Unknown phase byte -> admission error, nothing parked.
+        let (_ce, s_e) = admit(0xe3, Direction::Accept, Some([PHASE_PREAMBLE_MAGIC, 0x7F]));
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_e), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true).await;
+        assert!(r.is_err(), "unknown phase marker is rejected");
+        assert!(pairer.lock().unwrap().is_empty());
     }
 
     #[test]
