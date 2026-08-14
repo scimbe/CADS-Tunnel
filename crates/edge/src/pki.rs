@@ -55,6 +55,13 @@ fn edge_server_transport() -> Result<Arc<quinn::TransportConfig>, BoxError> {
 pub struct Ca {
     cert: rcgen::Certificate,
     key: KeyPair,
+    /// #496: the EXACT root DER this edge publishes (`/pki/ca`, acceptor roots). On a
+    /// fresh mint it is the built cert's DER; on a reload it is the PERSISTED bytes --
+    /// byte-stable across redeploys, so anything that pinned or cached the root keeps
+    /// matching literally (notBefore/serial no longer churn per boot). Leaf SIGNING
+    /// keeps using the rebuilt `cert` (identical DN + key), which verifies against
+    /// this published root regardless of its bytes.
+    published_root: CertificateDer<'static>,
     /// #425: the CA root's own `not_after`, kept alongside the built `cert` so
     /// `issue` can clamp every leaf's validity to stay inside it -- a leaf
     /// certificate outliving the root that signed it would be trusted right up
@@ -108,6 +115,16 @@ fn write_owner_only(path: &str, bytes: &[u8]) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// #496: where the persisted CA root CERT lives, derived from the key path so both ride
+/// the same volume ("edge-ca-key.pem" -> "edge-ca-cert.der"; any other shape gets
+/// ".cert.der" appended).
+fn ca_cert_path_for(key_pem_path: &str) -> String {
+    match key_pem_path.strip_suffix("-key.pem") {
+        Some(stem) => format!("{stem}-cert.der"),
+        None => format!("{key_pem_path}.cert.der"),
+    }
+}
+
 impl Ca {
     /// Generate a fresh CA with the given common name.
     pub fn new(common_name: &str) -> Result<Self, BoxError> {
@@ -123,6 +140,50 @@ impl Ca {
     /// with `BadSignature` (issue #2). The key file is written owner-only (0600)
     /// and lives on the Edge's runtime volume, never in the repo.
     pub fn load_or_create(key_pem_path: &str, common_name: &str) -> Result<Self, BoxError> {
+        let mut ca = Self::load_or_create_key_only(key_pem_path, common_name)?;
+        // #496: persist the ROOT CERT too, not only the key. from_key rebuilds a root with
+        // fresh notBefore/serial on every boot -- cryptographically compatible (same DN +
+        // key, all leaves keep verifying), but BYTE-different, so every /pki/ca cache,
+        // baked env value, and literal pin churned per redeploy. Reusing the persisted
+        // bytes makes the published root byte-stable. Guards: the persisted cert must
+        // embed this key's exact SPKI (raw public key found verbatim in the DER --
+        // dependency-free integrity check; a stale cert from a rotated key is discarded),
+        // and its recorded not_after (sidecar) must leave room for a full leaf validity
+        // window, or we remint (with a log line) rather than clamp leaves against an
+        // expiring root.
+        let cert_path = ca_cert_path_for(key_pem_path);
+        let meta_path = format!("{cert_path}.notafter");
+        let pubkey = ca.key.public_key_der();
+        let loaded = std::fs::read(&cert_path).ok().zip(
+            std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|m| m.trim().parse::<i64>().ok())
+                .and_then(|ts| time::OffsetDateTime::from_unix_timestamp(ts).ok()),
+        );
+        match loaded {
+            Some((der, not_after))
+                if der.windows(pubkey.len()).any(|w| w == pubkey.as_slice())
+                    && not_after
+                        > time::OffsetDateTime::now_utc() + time::Duration::days(Self::LEAF_VALIDITY_DAYS + 1) =>
+            {
+                ca.published_root = CertificateDer::from(der).into_owned();
+                ca.not_after = not_after;
+            }
+            other => {
+                if other.is_some() {
+                    eprintln!(
+                        "ct-edge: persisted CA cert at {cert_path} is stale (rotated key or expiring) -- reminting"
+                    );
+                }
+                std::fs::write(&cert_path, ca.published_root.as_ref())?;
+                std::fs::write(&meta_path, ca.not_after.unix_timestamp().to_string())?;
+            }
+        }
+        Ok(ca)
+    }
+
+    /// The pre-#496 body of [`Self::load_or_create`]: key persistence only.
+    fn load_or_create_key_only(key_pem_path: &str, common_name: &str) -> Result<Self, BoxError> {
         match std::fs::read_to_string(key_pem_path) {
             Ok(pem) => {
                 // #424: `Drop for Ca` (above) zeroizes the final `KeyPair`'s own internal
@@ -188,12 +249,13 @@ impl Ca {
         params.not_before = now;
         params.not_after = not_after;
         let cert = params.self_signed(&key)?;
-        Ok(Self { cert, key, not_after })
+        let published_root = cert.der().clone();
+        Ok(Self { cert, key, not_after, published_root })
     }
 
     /// The CA root certificate (DER) that Clients must trust.
     pub fn root_der(&self) -> CertificateDer<'static> {
-        self.cert.der().clone()
+        self.published_root.clone()
     }
 
     /// Issue a leaf certificate for `sans` (hostnames/IPs), signed by this CA.
@@ -349,6 +411,41 @@ pub fn build_client_endpoint_trusting_ca(
 mod tests {
     use super::*;
     use crate::transport::accept_and_echo_one;
+
+    #[test]
+    fn persisted_ca_root_is_byte_stable_across_reloads_and_remints_on_key_rotation_496() {
+        // #496: two load_or_create calls on the same paths publish the IDENTICAL root
+        // bytes (no notBefore/serial churn); leaves from the reloaded CA verify against
+        // the first boot's published root; a rotated KEY discards the stale cert file.
+        let dir = std::env::temp_dir().join(format!("ca496-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("edge-ca-key.pem").to_string_lossy().into_owned();
+
+        let boot1 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        let root1 = boot1.root_der();
+        let boot2 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        assert_eq!(
+            root1.as_ref(),
+            boot2.root_der().as_ref(),
+            "the published root is byte-stable across restarts"
+        );
+        // A leaf minted AFTER the reload chains to the boot1-published root (same DN+key).
+        let (leaf, _key) = boot2.issue(vec!["localhost".into()]).unwrap();
+        assert!(!leaf.as_ref().is_empty());
+
+        // Key rotation: delete the key, keep the stale cert -> the SPKI guard remints.
+        std::fs::remove_file(&key_path).unwrap();
+        let boot3 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        assert_ne!(
+            root1.as_ref(),
+            boot3.root_der().as_ref(),
+            "a rotated key never republishes the old root"
+        );
+        // And the fresh cert is now the persisted one.
+        let boot4 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
+        assert_eq!(boot3.root_der().as_ref(), boot4.root_der().as_ref());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A leaf signed by the CA is accepted by a client that trusts the CA root
     /// (not the leaf) — the PKI trust chain works and rotation is possible.

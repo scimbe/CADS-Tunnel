@@ -1490,7 +1490,19 @@ where
         });
     match outcome {
         PairOutcome::Parked => Ok(None),
-        PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
+        PairOutcome::Paired(a, b) => {
+            // #495 slice 2a observability: name the ONE interesting case -- a pairing whose
+            // phases differ (only possible with a legacy Unmarked member involved).
+            // Same-phase pairings stay silent, so this is what answers "was THAT pairing
+            // phase-mixed?" during field falsification without per-pair log spam.
+            if a.phase != b.phase {
+                eprintln!(
+                    "ct-edge: phase-mixed channel pairing ({:?}+{:?}, legacy member involved) (#495)",
+                    a.phase, b.phase
+                );
+            }
+            Ok(Some((a.payload, b.payload)))
+        }
         PairOutcome::Superseded(stale) => {
             // A retry from the same holder arrived before its partner (beyond the #495 queue
             // cap); the fresh offer is now parked, so tear down the stale stream and report
