@@ -1382,6 +1382,7 @@ struct EdgeAuthorizeState {
     admin_token: Option<[u8; 32]>,
     http: reqwest::Client,
     edge_mesh: crate::edge_mesh::EdgeMeshHandle,
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
 }
 
 /// `POST /registry/authorize-host/:token/:host` — a public, admin-token-gated proxy
@@ -1406,6 +1407,7 @@ fn edge_authorize_host_router(
     edge_admin_token: String,
     admin_token: Option<[u8; 32]>,
     edge_mesh: crate::edge_mesh::EdgeMeshHandle,
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
 ) -> Router {
     Router::new()
         .route("/registry/authorize-host/:token/:host", post(authorize_host_proxy))
@@ -1413,6 +1415,7 @@ fn edge_authorize_host_router(
             edge_admin_url: Arc::from(edge_admin_url),
             edge_admin_token: Arc::from(edge_admin_token),
             admin_token,
+            tunnels,
             // #296: a bare `reqwest::Client::new()` has no timeout, so a hanging edge
             // admin endpoint wedged this proxy's request (and its caller) forever —
             // a sibling of #112, which fixed the exact same class in portal_api.rs's
@@ -1440,6 +1443,33 @@ async fn authorize_host_proxy(
     let token_bytes = hex_decode_32(&token)
         .ok_or((StatusCode::BAD_REQUEST, "invalid token".to_string()))?;
     let token = hex_encode(&token_bytes);
+    // #504: a portal tunnel's own routing token is the durable owner of its hostname —
+    // the Gelb/ACME machinery re-issues authorize-host with THAT token on its own
+    // schedule, silently reverting whatever a proxy caller authorized here (observed
+    // live: an agent authorized via this proxy lost its binding within the hour and
+    // was definitively refused after the next edge restart). Answering 409 makes the
+    // conflict visible at call time instead: whoever really wants to move the hostname
+    // must change or delete the portal tunnel, not race its re-authorize loop.
+    match state.tunnels.routing_token_for_hostname(&host) {
+        Ok(Some(canonical)) if !canonical.eq_ignore_ascii_case(&token) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "hostname '{host}' belongs to a portal tunnel with a different routing \
+                     token — authorize-host would be silently reverted by its Gelb/ACME \
+                     re-authorize loop (#504). Run the agent with the portal tunnel's own \
+                     token, or change/delete that tunnel first."
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("portal tunnel lookup failed: {e}"),
+            ));
+        }
+    }
     let endpoint = format!(
         "{}/admin/authorize-host/{}/{}",
         state.edge_admin_url.trim_end_matches('/'),
@@ -5191,7 +5221,9 @@ pub fn persistent_control_plane_router(
         // relay or GitHub coordination needed per deployment. Absent when the edge
         // admin URL/token aren't configured (nothing to proxy to).
         .merge(match edge_admin_config.clone() {
-            Some((url, token)) => edge_authorize_host_router(url, token, admin_token, edge_mesh.clone()),
+            Some((url, token)) => {
+                edge_authorize_host_router(url, token, admin_token, edge_mesh.clone(), tunnels.clone())
+            }
             None => Router::new(),
         })
         // #72 AF3-redeem-cp: cross-user channel invitation redemption — public but
@@ -8200,7 +8232,8 @@ mod tests {
         // #285: the heartbeat must also be recent (within OWNERSHIP_LIVENESS_SECS), not just present.
         mesh_store.heartbeat("primary", "test", None, now_secs() as i64).unwrap();
         let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary"));
-        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh, tunnels);
         // #402: a real, well-formed 64-hex-char routing token -- the raw "deadbeef" this
         // test used before the #402 fix is only 8 chars and is now correctly rejected as
         // an invalid token.
@@ -8237,6 +8270,71 @@ mod tests {
         );
     }
 
+    /// #504: a hostname owned by a portal tunnel must refuse an authorize-host for any
+    /// OTHER token with 409 — the tunnel's Gelb/ACME machinery re-authorizes the
+    /// canonical token on its own schedule, so a proxy-authorized foreign token was
+    /// silently reverted within the hour (observed live on a2a-demo, 2026-08-14).
+    /// The canonical token itself keeps working through the proxy unchanged.
+    #[tokio::test]
+    async fn authorize_host_proxy_refuses_a_token_conflicting_with_a_portal_tunnel_504() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x5au8; 32];
+        let edge_admin_token = "edge-secret-504";
+        let edge_hits = Arc::new(std::sync::Mutex::new(0u32));
+        let edge_hits2 = edge_hits.clone();
+        let mock_edge = Router::new().route(
+            "/admin/authorize-host/:token/:host",
+            post(move || {
+                let hits = edge_hits2.clone();
+                async move {
+                    *hits.lock().unwrap() += 1;
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock_edge).await.unwrap() });
+
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        mesh_store.heartbeat("primary", "test", None, now_secs() as i64).unwrap();
+        let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store, Arc::from("primary"));
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let portal_tunnel = tunnels
+            .create("subject-504", "demo", Some("demo-504.example.org"))
+            .unwrap();
+        let app = edge_authorize_host_router(
+            format!("http://{addr}"),
+            edge_admin_token.to_string(),
+            Some(admin),
+            edge_mesh,
+            tunnels,
+        );
+
+        let call = |tok: String, host: &str| {
+            let req = Request::post(format!("/registry/authorize-host/{tok}/{host}"))
+                .header("x-ct-admin-token", hex_encode(&admin));
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // A foreign token on the portal tunnel's hostname: 409, and the edge is never called.
+        let resp = call(hex_encode(&[0x11; 32]), "demo-504.example.org").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "foreign token on a portal hostname → 409");
+        assert_eq!(*edge_hits.lock().unwrap(), 0, "conflict is refused before reaching the edge");
+
+        // The portal tunnel's own canonical token still authorizes through the proxy.
+        let resp = call(portal_tunnel.routing_token.clone(), "demo-504.example.org").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "canonical token authorizes");
+        assert_eq!(*edge_hits.lock().unwrap(), 1, "canonical token reaches the edge");
+
+        // A hostname without any portal tunnel row stays open to any well-formed token.
+        let resp = call(hex_encode(&[0x22; 32]), "unclaimed-504.example.org").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "non-portal hostname authorizes any token");
+    }
+
     #[tokio::test]
     async fn authorize_host_proxy_rejects_a_malformed_token_instead_of_forwarding_it_402() {
         // #402: `token` used to go straight into the edge admin URL unvalidated -- a
@@ -8270,7 +8368,8 @@ mod tests {
 
         let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
         let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store, Arc::from("primary"));
-        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh);
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh, tunnels);
 
         for malicious_token in [
             // Query injection: would append `channel_tier=gelb` to the edge request.
