@@ -1348,9 +1348,51 @@ async fn write_member_ack<S: AsyncWrite + Unpin>(
 /// stream-role dance. Returns the decided pairing when either side closes; an unpairable pair
 /// gets `NO`.
 pub async fn finish_relay_pair_over_streams<A, B>(
+    a: AdmittedStreamMember<A>,
+    b: AdmittedStreamMember<B>,
+    now: UnixSeconds,
+) -> Result<ChannelPairing, BoxError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    finish_stream_pair_inner(a, b, now, StreamPairCompletion::Splice).await
+}
+
+/// #495 slice 2b: complete a **rendezvous-phase** `:443` pairing — ack each side the
+/// peer's identity exactly like the relay finisher, then **close both streams**
+/// instead of splicing. The rendezvous contract is "read the ack, then the stream
+/// ends" (QUIC `finish()`es; pre-v0.4.16 stream clients literally `read_to_end`),
+/// so ack-then-close is what a marked rendezvous member expects — and it heals
+/// v0.4.14/v0.4.15 clients (marked, but still on the EOF-waiting ack reader)
+/// server-side: their read completes at this close instead of deadlocking against
+/// a splice that never ends (CADS-Tunnel#494). Only reachable when BOTH members
+/// carried the 0x01 rendezvous preamble; legacy/mixed pairs keep the splice.
+pub async fn finish_rendezvous_pair_over_streams<A, B>(
+    a: AdmittedStreamMember<A>,
+    b: AdmittedStreamMember<B>,
+    now: UnixSeconds,
+) -> Result<ChannelPairing, BoxError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    finish_stream_pair_inner(a, b, now, StreamPairCompletion::RendezvousClose).await
+}
+
+/// How a completed `:443` stream pairing ends after both acks (#495 slice 2b).
+enum StreamPairCompletion {
+    /// Historical behavior: the acked streams become the session (relay splice).
+    Splice,
+    /// Rendezvous contract: ack, flush, close — each member then opens its relay leg.
+    RendezvousClose,
+}
+
+async fn finish_stream_pair_inner<A, B>(
     mut a: AdmittedStreamMember<A>,
     mut b: AdmittedStreamMember<B>,
     now: UnixSeconds,
+    completion: StreamPairCompletion,
 ) -> Result<ChannelPairing, BoxError>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -1387,12 +1429,22 @@ where
                 PairSide::B,
             )
             .await?;
-            // Both sides acked cleanly; a failure now is the splice itself, not a one-sided ack race.
-            crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443")
-                .await
-                .map_err(|e| -> BoxError {
-                    format!("channel relay splice ended after both sides acked: {e}").into()
-                })?;
+            match completion {
+                StreamPairCompletion::Splice => {
+                    // Both sides acked cleanly; a failure now is the splice itself, not a
+                    // one-sided ack race.
+                    crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443")
+                        .await
+                        .map_err(|e| -> BoxError {
+                            format!("channel relay splice ended after both sides acked: {e}").into()
+                        })?;
+                }
+                StreamPairCompletion::RendezvousClose => {
+                    // #495 2b: the rendezvous contract ends the stream after the ack.
+                    let _ = a.stream.shutdown().await;
+                    let _ = b.stream.shutdown().await;
+                }
+            }
             Ok(pairing)
         }
         Err(e) => {
@@ -1454,8 +1506,16 @@ where
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
     // Unmarked: this generic path (WS + tests) has no phase peek -- historical behavior.
-    offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked).await
+    Ok(offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked)
+        .await?
+        .map(|((a, _), (b, _))| (a, b)))
 }
+
+/// A completed pairing with each member's park phase (#495 slice 2b): the caller
+/// picks the completion — `Rendezvous + Rendezvous` pairs get ack-then-close
+/// (the rendezvous contract), everything else the historical relay splice.
+pub type PairedWithPhases<S> =
+    Option<((AdmittedStreamMember<S>, ParkPhase), (AdmittedStreamMember<S>, ParkPhase))>;
 
 /// The post-admission tail shared by [`admit_and_pair_on_stream`] and
 /// [`admit_and_pair_on_boxed_stream`]: offer the admitted member to the pairer and
@@ -1467,7 +1527,7 @@ async fn offer_admitted_stream_member<S>(
     member: AdmittedStreamMember<S>,
     liveness: ParkLiveness,
     phase: ParkPhase,
-) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
+) -> Result<PairedWithPhases<S>, BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1501,7 +1561,7 @@ where
                     a.phase, b.phase
                 );
             }
-            Ok(Some((a.payload, b.payload)))
+            Ok(Some(((a.payload, a.phase), (b.payload, b.phase))))
         }
         PairOutcome::Superseded(stale) => {
             // A retry from the same holder arrived before its partner (beyond the #495 queue
@@ -1642,7 +1702,7 @@ pub async fn admit_and_pair_on_boxed_stream<F, Fut>(
     pairer: &std::sync::Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>>,
     permit: Option<OwnedSemaphorePermit>,
     keepalive: bool,
-) -> Result<Option<(AdmittedStreamMember<BoxedChannelStream>, AdmittedStreamMember<BoxedChannelStream>)>, BoxError>
+) -> Result<PairedWithPhases<BoxedChannelStream>, BoxError>
 where
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
@@ -2953,6 +3013,76 @@ mod tests {
     }
 
     #[tokio::test]
+    /// #495 slice 2b: two RENDEZVOUS-marked members (0x01 preamble) complete with
+    /// ack-then-CLOSE — and that heals even the pre-v0.4.16 EOF-waiting ack reader
+    /// (simulated here with `take(512).read_to_end`, the exact #494 deadlock shape):
+    /// both clients get their ack promptly because the stream genuinely ends.
+    async fn rendezvous_marked_pair_acks_then_closes_healing_eof_readers_495_2b() {
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x5Au8; 32];
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.11:1111".parse().unwrap();
+
+        let member = |holder_byte: u8, direction: Direction| {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder_sk(holder_byte), direction, 1_000),
+                endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+            };
+            let sk = holder_sk(holder_byte);
+            let (c, s) = tokio::io::duplex(4096);
+            let client = tokio::spawn(async move {
+                let mut c = c;
+                c.write_all(&[PHASE_PREAMBLE_MAGIC, 0x01]).await.expect("preamble");
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                c.read_exact(&mut ch).await.expect("challenge");
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                // The pre-v0.4.16 ack reader: completes ONLY at EOF (or 512 bytes) --
+                // under the relay splice this deadlocked (#494); under 2b's
+                // ack-then-close it must complete promptly.
+                let mut ack = Vec::new();
+                use tokio::io::AsyncReadExt as _;
+                (&mut c).take(512).read_to_end(&mut ack).await.expect("read to close");
+                let first = ack.iter().position(|b| *b != 0).unwrap_or(ack.len());
+                assert!(
+                    ack[first..].starts_with(b"OK"),
+                    "rendezvous ack delivered before the close: {:?}",
+                    String::from_utf8_lossy(&ack[first..])
+                );
+            });
+            (client, s)
+        };
+
+        let (client_a, s_a) = member(0x5a, Direction::Accept);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit A");
+        assert!(r.is_none(), "A parks rendezvous-marked");
+        let (client_b, s_b) = member(0x5b, Direction::Initiate);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
+            .await
+            .expect("admit B");
+        let ((a, pa), (b, pb)) = r.expect("B pairs with parked A");
+        assert_eq!((pa, pb), (ParkPhase::Rendezvous, ParkPhase::Rendezvous));
+        tokio::spawn(async move {
+            let _ = finish_rendezvous_pair_over_streams(a, b, 500).await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            client_a.await.expect("a");
+            client_b.await.expect("b");
+        })
+        .await
+        .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
+    }
+
+    #[tokio::test]
     /// #494 field repro (2026-08-14): two v0.4.13-shaped KA members (keepalive
     /// negotiated, NO phase preamble) of one channel, driven through the exact
     /// field path -- preamble peek + PrependBytes + park-keepalive pump + offer +
@@ -3016,7 +3146,7 @@ mod tests {
         let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true)
             .await
             .expect("admit B");
-        let (a, b) = r.expect("B pairs with parked A");
+        let ((a, _), (b, _)) = r.expect("B pairs with parked A");
         tokio::spawn(async move {
             let _ = finish_relay_pair_over_streams(a, b, 500).await;
         });
@@ -3271,7 +3401,7 @@ mod tests {
         let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
             .await
             .expect("admit B");
-        let (a, b) = r.expect("B pairs with the live park");
+        let ((a, _), (b, _)) = r.expect("B pairs with the live park");
         assert_eq!(pairer.lock().unwrap().take_dead_dropped(), 1, "the corpse was dropped, counted");
         // Prove the paired A-side leg is the LIVE second connection: splice and pass a byte.
         let mut live_a = client_a2.await.expect("client A2");
@@ -3346,7 +3476,7 @@ mod tests {
         let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
             .await
             .expect("admit B");
-        let (a, b) = r.expect("the half-closed legacy park pairs");
+        let ((a, _), (b, _)) = r.expect("the half-closed legacy park pairs");
         assert_eq!(pairer.lock().unwrap().take_dead_dropped(), 0, "no false corpse drop");
         tokio::spawn(async move {
             let _ = finish_relay_pair_over_streams(a, b, 500).await;

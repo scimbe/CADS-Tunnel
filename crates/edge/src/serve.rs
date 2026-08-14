@@ -1180,12 +1180,22 @@ pub async fn serve_front_door(
                     return Err(e);
                 }
             };
-            if let Some((a, b)) = paired {
+            if let Some(((a, a_phase), (b, b_phase))) = paired {
+                use crate::channel_broker::ParkPhase;
+                // #495 slice 2b: a pair where BOTH members carried the 0x01 rendezvous
+                // preamble gets the rendezvous completion (ack-then-close) — the contract
+                // their ack readers expect. Everything else (relay-marked, legacy
+                // unmarked, mixed) keeps the historical splice.
+                let rendezvous =
+                    a_phase == ParkPhase::Rendezvous && b_phase == ParkPhase::Rendezvous;
                 tokio::spawn(async move {
-                    if let Err(e) =
+                    let r = if rendezvous {
+                        crate::channel_broker::finish_rendezvous_pair_over_streams(a, b, now).await
+                    } else {
                         crate::channel_broker::finish_relay_pair_over_streams(a, b, now).await
-                    {
-                        eprintln!("ct-edge: front-door :443 channel relay ended: {e}");
+                    };
+                    if let Err(e) = r {
+                        eprintln!("ct-edge: front-door :443 channel pairing ended: {e}");
                     }
                 });
             }
