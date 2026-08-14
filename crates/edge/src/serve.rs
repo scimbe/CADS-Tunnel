@@ -6666,6 +6666,179 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }
 
+    /// #494: the SAME wired real-TLS front-door pairing as
+    /// [`front_door_wires_channel_alpn_to_the_admit_pair_relay_broker`], but with the
+    /// KA generation ALPN (`ct-edge-channel-ka`) both v0.4.13+ clients negotiate in the
+    /// field -- keepalive=true engages the preamble peek + PrependBytes + NUL-ticking
+    /// park pump. In the field two such members hung ~45s with the park consumed and no
+    /// ack; the in-memory path is proven clean (channel_broker's `two_ka_members_...`),
+    /// so this pins the real-TLS layer. Hard 10s timeout: a hang FAILS loudly.
+    #[tokio::test]
+    async fn front_door_pairs_two_ka_alpn_members_promptly_over_real_tls_494() {
+        use ct_common::channel::{
+            ChannelGrant, ChannelId, ChannelJoinRequest, Direction, Rights, SignedChannelGrant,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        const OP_SEED: [u8; 32] = [6u8; 32];
+        let op_sk = SigningKey::from_bytes(&OP_SEED);
+        let operator = op_sk.verifying_key().to_bytes();
+        let channel = ChannelId([0x4Eu8; 32]);
+        let grant_h = |holder: &SigningKey, dir: Direction| -> SignedChannelGrant {
+            let g = ChannelGrant {
+                channel,
+                holder: holder.verifying_key().to_bytes(),
+                direction: dir,
+                rights: Rights::ReadWrite,
+                delegable: false,
+                expires_at: 4_000_000_000,
+            };
+            let signature = op_sk.sign(&g.signing_bytes()).to_bytes();
+            SignedChannelGrant { grant: g, signature }
+        };
+        let src = SigningKey::from_bytes(&[0xc1u8; 32]);
+        let snk = SigningKey::from_bytes(&[0xd2u8; 32]);
+        let req_src = ChannelJoinRequest {
+            grant: grant_h(&src, Direction::Initiate),
+            endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+        let req_snk = ChannelJoinRequest {
+            grant: grant_h(&snk, Direction::Accept),
+            endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+
+        struct MockResolver {
+            operator: [u8; 32],
+            channel: ChannelId,
+        }
+        impl ChannelMemberResolver for MockResolver {
+            fn resolve_member<'a>(
+                &'a self,
+                channel: ChannelId,
+                _holder: [u8; 32],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                let op = self.operator;
+                let ok = channel == self.channel;
+                Box::pin(async move { ok.then_some((op, None, None)) })
+            }
+        }
+
+        let ca = crate::pki::Ca::new("ct-edge-ca").unwrap();
+        let ca_root = ca.root_der();
+        let channel_acceptor =
+            crate::pki::build_channel_front_door_acceptor(&ca, vec!["edge.test".to_string()])
+                .await
+                .unwrap();
+        let (shared_leaf, shared_key) = ca.issue(vec!["edge.test".to_string()]).unwrap();
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![shared_leaf], shared_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let ctx =
+            ChannelFrontDoor::standalone(Arc::new(MockResolver { operator, channel }), channel_acceptor);
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = fd.accept().await.unwrap();
+                let ctx = ctx.clone();
+                let acceptor = acceptor.clone();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let proxies: std::collections::HashMap<String, ProxyTarget> =
+                        std::collections::HashMap::new();
+                    let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                    let _ = serve_front_door(
+                        tcp, &state, &acceptor, &proxies, None, &challenge, Some(&ctx), None, None, None, None, None,
+                        None,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // A KA-generation member (v0.4.13 shape): ka ALPN, NO phase preamble, ack read
+        // tolerating leading keepalive NULs (#500).
+        async fn ka_member(
+            addr: SocketAddr,
+            cert: rustls::pki_types::CertificateDer<'static>,
+            req: ChannelJoinRequest,
+            holder: SigningKey,
+            send_byte: u8,
+        ) -> u8 {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let mut ccfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            ccfg.alpn_protocols = vec![crate::sni::CT_EDGE_CHANNEL_KA_ALPN.as_bytes().to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let sni = rustls::pki_types::ServerName::try_from("edge.test").unwrap();
+            let mut tls = connector.connect(sni, tcp).await.expect("channel TLS terminates");
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(crate::sni::CT_EDGE_CHANNEL_KA_ALPN.as_bytes()),
+                "the ka ALPN negotiates (#500)"
+            );
+            let rb = req.encode();
+            tls.write_all(&(rb.len() as u16).to_be_bytes()).await.unwrap();
+            tls.write_all(&rb).await.unwrap();
+            let mut ch = [0u8; 32];
+            tls.read_exact(&mut ch).await.unwrap();
+            tls.write_all(&holder.sign(&ch).to_bytes()).await.unwrap();
+            let mut ack = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                tls.read_exact(&mut byte).await.unwrap();
+                if byte[0] == 0 && ack.is_empty() {
+                    continue; // leading park keepalive NUL (#500)
+                }
+                if byte[0] == b'\n' {
+                    break;
+                }
+                ack.push(byte[0]);
+            }
+            assert!(
+                ack.starts_with(b"OK"),
+                "paired ack expected, got {:?}",
+                String::from_utf8_lossy(&ack)
+            );
+            tls.write_all(&[send_byte]).await.unwrap();
+            let mut got = [0u8; 1];
+            tls.read_exact(&mut got).await.unwrap();
+            let _ = tls.shutdown().await;
+            got[0]
+        }
+
+        let c1 = ca_root.clone();
+        let src_task = tokio::spawn(async move { ka_member(fd_addr, c1, req_src, src, 0x33).await });
+        let c2 = ca_root.clone();
+        let snk_task = tokio::spawn(async move { ka_member(fd_addr, c2, req_snk, snk, 0x44).await });
+
+        let (got_src, got_snk) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            (src_task.await.expect("src"), snk_task.await.expect("snk"))
+        })
+        .await
+        .expect("KA members must be acked+spliced promptly -- a hang here is the #494 field defect");
+        assert_eq!(got_src, 0x44, "source got the sink's byte (ka path)");
+        assert_eq!(got_snk, 0x33, "sink got the source's byte (ka path)");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
+    }
+
     #[tokio::test]
     async fn front_door_channel_arm_holds_the_connection_caps_permit_while_parked_and_relaying_451() {
         // #451, end to end through `serve_front_door`'s own accept-loop wiring (production
