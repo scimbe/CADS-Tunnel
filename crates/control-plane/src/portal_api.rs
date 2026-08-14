@@ -919,7 +919,13 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
         Err(e) => return internal_error("install_page/issue_join_token", e).into_response(),
     };
     let edge_host = edge_host_port(&st.portal_base);
-    let build_cmd = "git clone https://github.com/scimbe/CADS-Tunnel.git && cd CADS-Tunnel\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine";
+    // #502-class audit finding (2026-08-14): this used to clone CADS-Tunnel and build
+    // its `-p ct-agent` GIT DEPENDENCY -- pinned at a v0.3.0-era rev, months behind
+    // the released agent (missing the #16 UDP fallback, the whole v0.4.x line, and
+    // the #494 first-contact fix). Every self-service install got a stale agent that
+    // LOOKED broken for its first minute. Build the standalone release tag instead;
+    // bump this tag alongside releases.
+    let build_cmd = "git clone https://github.com/scimbe/ct-agent.git && cd ct-agent && git checkout v0.4.17\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release --locked -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine\n# (or skip the build: download a prebuilt binary from https://github.com/scimbe/ct-agent/releases/tag/v0.4.17)";
     // Only this tunnel's own already-assigned hostname -- never a value the
     // caller supplies -- so the agent never has to copy it by hand from the
     // tunnels list, and can never accidentally (or otherwise) end up with a
@@ -4258,6 +4264,19 @@ mod tests {
         // themselves (those stay visible up front).
         assert!(!html.contains("curl -fsSL"), "no non-functional one-liner shown");
         assert!(!html.contains("irm "), "no non-functional PowerShell one-liner shown");
+        // 2026-08-14 audit: the build step must produce a CURRENT released agent.
+        // The old command cloned CADS-Tunnel and built its git-pinned `ct-agent`
+        // dependency -- stuck at a v0.3.0-era rev, months behind the releases --
+        // so every self-service install got a stale agent.
+        assert!(
+            html.contains("clone https://github.com/scimbe/ct-agent.git")
+                && html.contains("git checkout v0.4"),
+            "the install build clones the standalone agent repo at a release tag"
+        );
+        assert!(
+            !html.contains("clone https://github.com/scimbe/CADS-Tunnel.git"),
+            "must not build the workspace's stale git-pinned agent dependency"
+        );
         assert!(
             html.contains("<details>") && html.contains("<summary>"),
             "the how-to-run steps are collapsible, not dumped inline"
@@ -4271,8 +4290,8 @@ mod tests {
         // ct-agent's onboard flow actually reads (CT_AGENT_CP_URL/CT_AGENT_EDGE),
         // not just a vague pointer to "the onboarding guide".
         assert!(
-            html.contains("docker run") && html.contains("cargo build --release -p ct-agent"),
-            "gives a real, working build command, not just a link"
+            html.contains("docker run") && html.contains("cargo build --release --locked -p ct-agent"),
+            "gives a real, working build command (locked to the release tag's lockfile), not just a link"
         );
         assert!(
             html.contains("CT_AGENT_CP_URL=https://portal.example"),
