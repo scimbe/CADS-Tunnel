@@ -201,12 +201,18 @@ services:
     # bare TCP connect to the QUIC/TLS front-door port, which isn't an HTTP server
     # and wouldn't validate the same probe request the finding's own suggested
     # command sent to it.
+    # #498 hardening: probe /healthz, not /metrics. /metrics only proved the metrics HTTP
+    # server was alive -- a wedged channel-broker accept loop (the 2026-08-13 outage class:
+    # process running, listener bound, no join ever admitted) stayed "healthy" forever.
+    # /healthz gates on the #497 broker-loop heartbeats (beaten every iteration incl. 10s
+    # idle ticks; stale > 60s = wedged), so "healthy" now means "can admit channel joins".
+    # start_period covers the first beat landing within one idle tick of spawn.
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:9600/metrics"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9600/healthz"]
       interval: 15s
       timeout: 3s
       retries: 5
-      start_period: 10s
+      start_period: 30s
     depends_on:
       control-plane:
         condition: service_healthy

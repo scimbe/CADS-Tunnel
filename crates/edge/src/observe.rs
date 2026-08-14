@@ -103,10 +103,51 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
     out
 }
 
-/// Build the metrics router: `GET /metrics` renders the current gauges.
+/// #498: how stale a broker-loop heartbeat may be before `/healthz` reports the loop as
+/// wedged. The loops beat every iteration INCLUDING their 10s idle tick, so 60s (6 missed
+/// ticks) is far above scheduler jitter and far below the latency at which an operator (or
+/// a dependent's `service_healthy` condition) needs the truth.
+pub const BROKER_HEALTH_MAX_AGE_SECS: u64 = 60;
+
+/// #498: pure health classifier over the two QUIC broker-loop heartbeats. `Ok(())` when every
+/// loop that has EVER beaten (`last_seen > 0`) beat within `max_age` of `now`; `Err` names
+/// each stale loop and its age. A never-started loop (`last_seen == 0`) is deliberately NOT a
+/// failure: the relay loop legitimately refuses to start on an address collision (the #103
+/// guard), and boot is the container healthcheck's `start_period`. Documented trade-off: a
+/// loop that wedges before its very first beat is invisible here -- the observed outage class
+/// (2026-08-13) is a long-running loop wedging later, and the first beat lands within one
+/// idle tick of spawn. Pure -- the caller supplies `now` -- so tests need no clock.
+pub fn broker_loops_health(
+    relay_last_seen: u64,
+    rendezvous_last_seen: u64,
+    now: u64,
+    max_age_secs: u64,
+) -> Result<(), String> {
+    let mut stale = Vec::new();
+    for (name, last) in [("relay", relay_last_seen), ("rendezvous", rendezvous_last_seen)] {
+        if last > 0 && now.saturating_sub(last) > max_age_secs {
+            stale.push(format!("{name} (last beat {}s ago)", now.saturating_sub(last)));
+        }
+    }
+    if stale.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "wedged channel broker loop(s): {} -- the accept loop stopped iterating (idle \
+             ticks included), so channel joins on that transport stall (#498)",
+            stale.join(", ")
+        ))
+    }
+}
+
+/// Build the metrics router: `GET /metrics` renders the current gauges; `GET /healthz` (#498)
+/// answers 200 only while the broker accept loops are provably iterating -- the container
+/// healthcheck's probe target, so "healthy" means "can admit channel joins", not merely "the
+/// metrics HTTP server responds".
 pub fn metrics_router(state: Arc<EdgeState<Connection>>, ws_channel_cap: Option<ConnectionCap>) -> Router {
     Router::new()
         .route("/metrics", get(render))
+        .route("/healthz", get(healthz))
         .with_state((state, ws_channel_cap))
 }
 
@@ -115,6 +156,22 @@ async fn render(State((state, ws_channel_cap)): State<(Arc<EdgeState<Connection>
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
         render_edge_metrics(&*state, ws_channel_cap.as_ref()),
     )
+}
+
+async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<ConnectionCap>)>) -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match broker_loops_health(
+        state.relay_broker_heartbeat().last_seen(),
+        state.rendezvous_broker_heartbeat().last_seen(),
+        now,
+        BROKER_HEALTH_MAX_AGE_SECS,
+    ) {
+        Ok(()) => (axum::http::StatusCode::OK, "ok\n".to_string()),
+        Err(why) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
+    }
 }
 
 /// Bind `listen` and serve the Edge metrics endpoint until the process exits.
@@ -188,6 +245,53 @@ mod tests {
         assert!(text.contains("ct_edge_active_tunnels 0"), "empty edge → 0 tunnels: {text}");
         assert!(text.contains("ct_edge_active_agents 0"));
         assert!(!text.contains("ct_edge_ws_channel_"), "no ws_channel_cap -> no ws-channel gauges at all: {text}");
+    }
+
+    #[test]
+    fn broker_loops_health_classifies_fresh_stale_and_never_started_498() {
+        // Fresh beats within the window -> healthy.
+        assert!(broker_loops_health(1_000, 1_005, 1_030, 60).is_ok());
+        // Exactly at the boundary is still healthy; one past it is not.
+        assert!(broker_loops_health(940, 1_000, 1_000, 60).is_ok());
+        let why = broker_loops_health(939, 1_000, 1_000, 60).expect_err("61s old = wedged");
+        assert!(why.contains("relay") && why.contains("61s"), "names the stale loop and age: {why}");
+        assert!(!why.contains("rendezvous ("), "the fresh loop is not named: {why}");
+        // Both stale -> both named.
+        let why = broker_loops_health(100, 200, 1_000, 60).expect_err("both wedged");
+        assert!(why.contains("relay") && why.contains("rendezvous"), "{why}");
+        // Never-started (0) is NOT a failure -- the relay loop legitimately refuses to start
+        // on a #103 address collision, and boot is covered by the healthcheck start_period.
+        assert!(broker_loops_health(0, 1_000, 1_030, 60).is_ok());
+        assert!(broker_loops_health(0, 0, 1_030, 60).is_ok());
+    }
+
+    #[tokio::test]
+    async fn healthz_endpoint_reports_200_fresh_and_503_wedged_498() {
+        // Router-level: a fresh heartbeat answers 200 "ok"; a stale one flips the SAME
+        // endpoint to 503 with a body naming the wedged loop -- the exact signal the
+        // container healthcheck consumes (#498).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.relay_broker_heartbeat().beat(now);
+        state.rendezvous_broker_heartbeat().beat(now);
+        let resp = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        state.relay_broker_heartbeat().beat(now - BROKER_HEALTH_MAX_AGE_SECS - 120);
+        let resp = metrics_router(state, None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("relay") && text.contains("#498"), "names the wedged loop: {text}");
     }
 
     #[test]
