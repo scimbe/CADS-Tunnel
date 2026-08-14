@@ -1772,27 +1772,53 @@ where
     // verbatim (PrependBytes), so a v0.4.13 KA client without the preamble stays
     // byte-identical. Non-KA connections are never peeked (legacy path untouched); a
     // stray 0xFF there falls into the admission's existing len-oob refusal.
+    // #509: the peek is part of the admission read, so it runs under the SAME
+    // `join_timeout` bound the admission proper applies internally
+    // (`read_channel_join_on_stream`, #105/#452). The `:443` listener deliberately
+    // passes no listener-level handshake timeout and relies on every arm bounding
+    // its own read phase -- an unguarded peek let a KA peer that completed TLS and
+    // then went silent hold its conn-cap and #451 permits forever.
     let (stream, phase): (BoxedChannelStream, ParkPhase) = if keepalive {
-        let mut stream = stream;
-        let mut first = [0u8; 2];
-        stream
-            .read_exact(&mut first)
-            .await
-            .map_err(|e| -> BoxError { format!("channel join: preamble/length read failed: {e}").into() })?;
-        if first[0] == PHASE_PREAMBLE_MAGIC {
-            let phase = match first[1] {
-                0x01 => ParkPhase::Rendezvous,
-                0x02 => ParkPhase::Relay,
-                other => {
-                    return Err(format!(
-                        "channel join: unknown phase marker 0x{other:02x} after the preamble magic"
-                    )
-                    .into())
-                }
-            };
-            (stream, phase)
-        } else {
-            (Box::pin(PrependBytes { pre: first, pos: 0, inner: stream }), ParkPhase::Unmarked)
+        let peek = async {
+            let mut stream = stream;
+            let mut first = [0u8; 2];
+            stream
+                .read_exact(&mut first)
+                .await
+                .map_err(|e| -> BoxError { format!("channel join: preamble/length read failed: {e}").into() })?;
+            if first[0] == PHASE_PREAMBLE_MAGIC {
+                let phase = match first[1] {
+                    0x01 => ParkPhase::Rendezvous,
+                    0x02 => ParkPhase::Relay,
+                    // A wrong byte AFTER the magic is a defect in the client's marker
+                    // writer, never transient -- no retry can succeed, so the per-IP
+                    // penalty must see it as definitive (#509).
+                    other => {
+                        return Err(DefinitiveJoinRefusal::boxed(
+                            format!(
+                                "channel join: unknown phase marker 0x{other:02x} after the preamble magic"
+                            )
+                            .into(),
+                        ))
+                    }
+                };
+                Ok((stream, phase))
+            } else {
+                Ok((
+                    Box::pin(PrependBytes { pre: first, pos: 0, inner: stream }) as BoxedChannelStream,
+                    ParkPhase::Unmarked,
+                ))
+            }
+        };
+        match tokio::time::timeout(join_timeout, peek).await {
+            Ok(r) => r?,
+            Err(_) => {
+                eprintln!("ct-edge: channel-join NO [timeout]: phase preamble not submitted within {join_timeout:?} — dropping stalled connection (#509)");
+                return Err(
+                    "channel join preamble not submitted within the timeout — dropping stalled connection (#509)"
+                        .into(),
+                );
+            }
         }
     } else {
         (stream, ParkPhase::Unmarked)
@@ -3176,6 +3202,67 @@ mod tests {
         })
         .await
         .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
+    }
+
+    #[tokio::test]
+    /// #509: the #495-2a preamble peek is an admission read and must sit under the
+    /// same `join_timeout` bound as the admission proper -- the `:443` listener
+    /// passes no listener-level handshake timeout and relies on every arm bounding
+    /// its own read phase. A KA peer that completes TLS and then goes silent must
+    /// be dropped within `join_timeout`, not held (with its permits) forever.
+    async fn silent_ka_peer_is_dropped_within_the_join_timeout_509() {
+        use std::sync::Mutex;
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize = |_c: ChannelId, _h: [u8; 32]| async move { None };
+        let obs: std::net::SocketAddr = "203.0.113.31:3131".parse().unwrap();
+        // `_c` held open and never written to: TLS done, then silence.
+        let (_c, s) = tokio::io::duplex(4096);
+        let join_timeout = std::time::Duration::from_millis(200);
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admit_and_pair_on_boxed_stream(Box::pin(s), obs, 500, join_timeout, &authorize, 10_000, &pairer, None, true),
+        )
+        .await
+        .expect("the peek must not hang past join_timeout (#509)");
+        let e = match r {
+            Err(e) => e,
+            Ok(_) => panic!("a silent peer is an admission error, not a park"),
+        };
+        assert!(
+            !is_definitive_join_refusal(&e),
+            "a stall is transient (a retry may succeed), not a definitive refusal: {e}"
+        );
+    }
+
+    #[tokio::test]
+    /// #509 (typed-errors half): a wrong byte AFTER the preamble magic is a defect
+    /// in the client's marker writer -- no retry can succeed -- so it must be a
+    /// [`DefinitiveJoinRefusal`] for the per-IP penalty to catch a client looping
+    /// on it, and it must fail promptly (it is part of the guarded admission read).
+    async fn unknown_phase_marker_is_a_definitive_refusal_509() {
+        use std::sync::Mutex;
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize = |_c: ChannelId, _h: [u8; 32]| async move { None };
+        let obs: std::net::SocketAddr = "203.0.113.32:3232".parse().unwrap();
+        let (c, s) = tokio::io::duplex(4096);
+        let mut c = c;
+        c.write_all(&[PHASE_PREAMBLE_MAGIC, 0x7F]).await.expect("bad marker");
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admit_and_pair_on_boxed_stream(Box::pin(s), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, true),
+        )
+        .await
+        .expect("an unknown marker must fail promptly, not hang");
+        let e = match r {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown marker is refused"),
+        };
+        assert!(
+            is_definitive_join_refusal(&e),
+            "unknown phase marker must be typed as a definitive refusal (#509): {e}"
+        );
     }
 
     #[tokio::test]
