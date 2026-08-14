@@ -1842,6 +1842,11 @@ impl SqliteTunnelStore {
         // tunnel on upgrade -- enabling it is always an explicit owner action
         // (`set_require_login`), never silently turned on by this migration.
         ensure_column(&conn, "subject_tunnels", "require_login", "INTEGER NOT NULL DEFAULT 0")?;
+        // #501: self-service complement to the strict allow-list -- when set (and
+        // require_login is on), ANY successfully authenticated account passes the gate;
+        // the allow-list is ignored while this is on. Off by default for every existing
+        // tunnel on upgrade, same explicit-owner-action-only posture as require_login.
+        ensure_column(&conn, "subject_tunnels", "allow_any_login", "INTEGER NOT NULL DEFAULT 0")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -2203,6 +2208,48 @@ impl SqliteTunnelStore {
             .unwrap_or(false))
     }
 
+    /// #501: enable/disable the "any authenticated account may enter" mode for a
+    /// tunnel the caller owns. Only meaningful while `require_login` is on; the
+    /// allow-list is ignored while this is set. `false` if the id is unknown or
+    /// owned by someone else.
+    pub fn set_allow_any_login(&self, subject: &str, tunnel_id: &str, enabled: bool) -> rusqlite::Result<bool> {
+        let n = self.writer.lock_safe().execute(
+            "UPDATE subject_tunnels SET allow_any_login = ?1 WHERE id = ?2 AND subject = ?3",
+            params![enabled as i64, tunnel_id, subject],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// #501: whether "any authenticated account" mode is on for a tunnel the caller
+    /// owns (`None` if unknown/foreign) -- for rendering the portal checkbox.
+    pub fn allow_any_login(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<bool>> {
+        self.read()
+            .query_row(
+                "SELECT allow_any_login FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.map(|n| n != 0))
+    }
+
+    /// #501: the gate-path lookup, hostname-keyed like
+    /// [`require_login_for_hostname`](Self::require_login_for_hostname) and with the
+    /// same #393 `COLLATE NOCASE` reasoning. A false `false` here only ever makes the
+    /// gate STRICTER (falls back to the allow-list), never more permissive.
+    pub fn allow_any_login_for_hostname(&self, hostname: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT allow_any_login FROM subject_tunnels WHERE hostname = ?1 COLLATE NOCASE",
+                params![hostname],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|n| n != 0)
+            .unwrap_or(false))
+    }
+
     /// Add `email` to the login gate's allow-list for a tunnel the caller owns
     /// (#382-follow), keyed by the tunnel's current hostname. `false` if the id
     /// is unknown, owned by someone else, or has no hostname yet.
@@ -2357,23 +2404,25 @@ impl SqliteTunnelStore {
     /// loop -- one query for every row instead of one query per row. Keyed by
     /// tunnel id; a row with no entry means "off" (matching the original's
     /// `unwrap_or(false)` caller-side default).
+    /// #501: returns `(require_login, allow_any_login)` per tunnel in one query --
+    /// the tunnels-page render needs both checkboxes' state anyway.
     pub fn require_login_batch(
         &self,
         subject: &str,
         tunnel_ids: &[&str],
-    ) -> rusqlite::Result<std::collections::HashMap<String, bool>> {
+    ) -> rusqlite::Result<std::collections::HashMap<String, (bool, bool)>> {
         if tunnel_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
         let conn = self.read();
         let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, require_login FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders})"
+            "SELECT id, require_login, allow_any_login FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
         let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0)))
         })?;
         rows.collect()
     }

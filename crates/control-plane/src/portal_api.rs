@@ -615,10 +615,11 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                 // #382-follow (Browser-Plane login gate): owner-scoped, so a shared
                 // (not-owned) row simply gets the off/empty defaults -- matching the
                 // existing owner-only convention for Revoke/Share above.
-                let require_login = require_logins.get(&t.id).copied().unwrap_or(false);
+                let (require_login, allow_any_login) =
+                    require_logins.get(&t.id).copied().unwrap_or((false, false));
                 let (login_allowlist, pending_requests) =
                     allow_and_pending.get(&t.id).cloned().unwrap_or_default();
-                rows.push((t, owned, admission, status, require_login, login_allowlist, pending_requests));
+                rows.push((t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests));
             }
             Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref())).into_response()
         }
@@ -1178,9 +1179,23 @@ fn human_bytes(n: u64) -> String {
 /// its public content is served, and -- while enabled -- the allow-list itself
 /// with add/remove forms. Owner-scoped by construction: only called for owned
 /// rows (see `tunnels_html`).
-fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String], pending_requests: &[(String, String, i64)]) -> String {
+fn login_gate_html(id: &str, require_login: bool, allow_any_login: bool, login_allowlist: &[String], pending_requests: &[(String, String, i64)]) -> String {
     let checked = if require_login { " checked" } else { "" };
     let allowlist_section = if require_login {
+        // #501: the self-service complement -- while this is on, the access list below
+        // is ignored and ANY signed-in account passes the gate. Rendered first so the
+        // owner reads the mode before the list it overrides.
+        let any_checked = if allow_any_login { " checked" } else { "" };
+        let any_note = if allow_any_login {
+            r#"<p class="k">Any signed-in account may enter -- the access list below is ignored while this is on.</p>"#
+        } else {
+            ""
+        };
+        let allow_any_form = format!(
+            r#"<form method="post" action="/portal/tunnels/{id}/allow-any-login">
+ <label><input type="checkbox" name="enabled"{any_checked}> Allow any signed-in account</label>
+ <button type="submit">Update</button></form>{any_note}"#
+        );
         let items = login_allowlist
             .iter()
             .map(|email| {
@@ -1227,7 +1242,7 @@ fn login_gate_html(id: &str, require_login: bool, login_allowlist: &[String], pe
             format!(r#"<div class="row"><p class="k">Pending access requests:</p><ul class="login-allowlist">{items}</ul></div>"#)
         };
         format!(
-            r#"<div class="row"><ul class="login-allowlist">{items}</ul>{empty_note}
+            r#"<div class="row">{allow_any_form}<ul class="login-allowlist">{items}</ul>{empty_note}
 <form class="inline" method="post" action="/portal/tunnels/{id}/login-allowlist">
  <input type="email" name="email" placeholder="invite@example.com" required>
  <button class="sec" type="submit">Add to access list</button>
@@ -1256,6 +1271,7 @@ type TunnelRow = (
     Option<crate::storage::CertAdmission>,
     Option<EdgeTunnelStatus>,
     bool,
+    bool, // #501: allow_any_login
     Vec<String>,
     Vec<(String, String, i64)>,
 );
@@ -1269,7 +1285,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
     let owned_count = tunnels.iter().filter(|(_, owned, ..)| *owned).count() as u32;
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, login_allowlist, pending_requests)| {
+        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -1325,7 +1341,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
             // Browser-Plane login gate (#382-follow): owner-only, and only shown for
             // a tunnel that actually has public content to protect (a hostname).
             let login_gate = if *owned && t.hostname.is_some() {
-                login_gate_html(&id, *require_login, login_allowlist, pending_requests)
+                login_gate_html(&id, *require_login, *allow_any_login, login_allowlist, pending_requests)
             } else {
                 String::new()
             };
@@ -1920,6 +1936,7 @@ pub fn login_gate_portal_router(
 ) -> Router {
     Router::new()
         .route("/portal/tunnels/:id/require-login", post(set_require_login_route))
+        .route("/portal/tunnels/:id/allow-any-login", post(set_allow_any_login_route))
         .route(
             "/portal/tunnels/:id/login-allowlist",
             post(login_allowlist_add_route).get(login_allowlist_list_route),
@@ -1938,6 +1955,23 @@ struct RequireLoginForm {
     /// Present (any value) when the portal checkbox was checked; absent when
     /// unchecked -- standard HTML checkbox-form semantics, not a boolean field.
     enabled: Option<String>,
+}
+
+async fn set_allow_any_login_route(
+    State(st): State<LoginGateState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<RequireLoginForm>,
+) -> Response {
+    // #501: same owner-scoping and form shape as the require-login toggle below.
+    let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.set_allow_any_login(&subject, &id, form.enabled.is_some()) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
+        Err(e) => internal_error("set_allow_any_login", e).into_response(),
+    }
 }
 
 async fn set_require_login_route(
@@ -2711,7 +2745,7 @@ mod tests {
     // also matched the checkbox and forced it onto its own block-level line.
     #[test]
     fn require_login_checkbox_markup_has_input_before_its_label_text() {
-        let html = login_gate_html("tun1", false, &[], &[]);
+        let html = login_gate_html("tun1", false, false, &[], &[]);
         let input_pos = html.find(r#"<input type="checkbox" name="enabled" value="1">"#).expect("checkbox present");
         let text_pos = html.find("Require login to access this tunnel").expect("label text present");
         assert!(input_pos < text_pos, "checkbox markup must precede its label text");

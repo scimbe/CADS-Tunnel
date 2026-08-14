@@ -326,7 +326,11 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
     // is stored/checked the same way an email is -- the owner adds it to the
     // allow-list the same way, from the same UI, once #42-follow exposes that.
     if let Ok(subject) = crate::service::subject_of(&st.verifier, &headers) {
-        if matches!(st.tunnels.email_allowed_for_hostname(&host, &subject), Ok(true)) {
+        // #501: same order as the browser callback -- allow-any first, then the strict
+        // list. The bearer token was already cryptographically verified by subject_of.
+        if matches!(st.tunnels.allow_any_login_for_hostname(&host), Ok(true))
+            || matches!(st.tunnels.email_allowed_for_hostname(&host, &subject), Ok(true))
+        {
             if let Ok(v) = HeaderValue::from_str(&subject) {
                 return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
             }
@@ -437,7 +441,12 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
     match (st.exchange)(packed).await {
         Ok(identity) => {
             let email = identity.email.unwrap_or_default();
-            let allowed = st.tunnels.email_allowed_for_hostname(host, &email).unwrap_or(false);
+            // #501: "any authenticated account" mode short-circuits the allow-list -- the
+            // successful OIDC exchange above IS the legitimation then. Checked first so an
+            // empty allow-list no longer means "nobody" for self-service tunnels; with the
+            // flag off (the default), behavior is byte-for-byte the strict membership check.
+            let allowed = st.tunnels.allow_any_login_for_hostname(host).unwrap_or(false)
+                || st.tunnels.email_allowed_for_hostname(host, &email).unwrap_or(false);
             if !allowed {
                 let mut resp = (StatusCode::FORBIDDEN, Html(access_denied_html(host))).into_response();
                 set_cookie(&mut resp, &cleared_gate_state_cookie());
@@ -1334,6 +1343,75 @@ mod tests {
                 .any(|c| c.to_str().unwrap().starts_with(&format!("{GATE_SESSION_COOKIE}="))),
             "no gate session is minted for a successful-but-unlisted login"
         );
+    }
+
+    #[tokio::test]
+    async fn allow_any_login_admits_a_fresh_account_and_off_keeps_the_strict_list_501() {
+        // #501: with "allow any signed-in account" ON, a successful login whose email is
+        // NOT on the allow-list passes the gate (the OIDC exchange IS the legitimation);
+        // with the flag OFF the very same account is rejected exactly as before -- the
+        // issue's pre-registered falsification criterion, both directions.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.set_allow_any_login("alice", &t.id, true).unwrap());
+        assert_eq!(tunnels.allow_any_login("alice", &t.id).unwrap(), Some(true));
+        assert!(tunnels.allow_any_login_for_hostname("Demo.Bunsenbrenner.ORG").unwrap(), "NOCASE like #393");
+        // Deliberately no allow-list entry for fresh@example.com.
+
+        let app = gate_router_with(
+            tunnels.clone(),
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("fresh@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/gate/callback?code=abc&state=xyz")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "any authenticated account passes with the flag on");
+        assert_eq!(resp.headers().get("location").unwrap(), "https://demo.bunsenbrenner.org/join.html");
+        assert!(
+            resp.headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|c| c.to_str().unwrap().starts_with(&format!("{GATE_SESSION_COOKIE}="))),
+            "a real gate session is minted -- X-Gate-Email keeps carrying the verified identity"
+        );
+
+        // Flip the flag OFF: the same fresh account must be rejected again (strict list).
+        assert!(tunnels.set_allow_any_login("alice", &t.id, false).unwrap());
+        let app = gate_router_with(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("fresh@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/gate/callback?code=abc&state=xyz")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "flag off = byte-for-byte the strict behavior");
     }
 
     #[tokio::test]
