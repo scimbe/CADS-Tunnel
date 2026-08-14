@@ -3077,6 +3077,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 // `EdgeState` -- one budget per IP across all three
                                 // channel-join transports (2026-08-13 storm).
                                 let relay_penalty = state.join_refusal_penalty();
+                                let relay_heartbeat = state.relay_broker_heartbeat();
                                 // #400: constructed here (not inside `run_channel_broker_loop`) so
                                 // `run_edge` can keep its own clone alive independently of the
                                 // loop's lifetime -- see `_relay_pairer_keepalive`'s own comment above.
@@ -3120,6 +3121,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         shutdown_relay,
                                         relay_pairer,
                                         relay_penalty,
+                                        relay_heartbeat,
                                     )
                                     .await;
                                 });
@@ -3137,6 +3139,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         // Same shared penalty as the relay loop above (one per-IP budget
                         // across every channel-join transport).
                         let rendezvous_penalty = state.join_refusal_penalty();
+                        let rendezvous_heartbeat = state.rendezvous_broker_heartbeat();
                         // #400: same reasoning as the relay pairer above -- constructed here so
                         // `run_edge` can keep its own clone alive independently of the loop's
                         // own lifetime.
@@ -3181,6 +3184,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 shutdown_rendezvous,
                                 rendezvous_pairer,
                                 rendezvous_penalty,
+                                rendezvous_heartbeat,
                             )
                             .await;
                         });

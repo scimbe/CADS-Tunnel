@@ -69,6 +69,20 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         tcp_parks = state.tcp_parks_total(),
         tcp_deliveries = state.tcp_deliveries_total(),
     );
+    // #497 slice 2: broker-loop liveness. Raw unix seconds (0 = loop never started); a
+    // scraper alerts on staleness -- with the loops' own 10s idle tick, a value older than
+    // ~30s means the accept loop is wedged, not idle (the 2026-08-13 outage class, invisible
+    // to the process-level healthcheck).
+    out.push_str(&format!(
+        "# HELP ct_edge_channel_broker_loop_last_seen_seconds Unix time of each QUIC broker \
+         accept loop's last iteration (idle ticks included); 0 = never started. Staleness \
+         beyond ~30s means the loop is wedged.\n\
+         # TYPE ct_edge_channel_broker_loop_last_seen_seconds gauge\n\
+         ct_edge_channel_broker_loop_last_seen_seconds{{loop=\"relay\"}} {relay}\n\
+         ct_edge_channel_broker_loop_last_seen_seconds{{loop=\"rendezvous\"}} {rendezvous}\n",
+        relay = state.relay_broker_heartbeat().last_seen(),
+        rendezvous = state.rendezvous_broker_heartbeat().last_seen(),
+    ));
     if let Some(cap) = ws_channel_cap {
         out.push_str(&format!(
             "# HELP ct_edge_ws_channel_connections Browser WebSocket Agent-Fabric channel \

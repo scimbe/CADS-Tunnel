@@ -1352,6 +1352,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     shutdown: crate::shutdown::ShutdownSignal,
     pairer: SharedQuicChannelPairer,
     penalty: std::sync::Arc<crate::state::JoinRefusalPenalty>,
+    heartbeat: std::sync::Arc<crate::state::BrokerHeartbeat>,
 ) where
     N: Fn() -> UnixSeconds + Send + Sync + 'static,
     F: Fn(ChannelId, [u8; 32]) -> Fut + Send + Sync + 'static,
@@ -1367,8 +1368,20 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     let now_fn = std::sync::Arc::new(now_fn);
     let authorize = std::sync::Arc::new(authorize);
     let complete = std::sync::Arc::new(complete);
+    // #497 slice 2: a fixed idle tick serves two jobs at once. (1) LIVENESS: the loop beats
+    // the shared heartbeat on every iteration -- including idle ones -- so `/metrics` can
+    // distinguish "idle broker" from "wedged broker" (the 2026-08-13 outage was invisible
+    // for 22 minutes precisely because it couldn't). (2) IDLE-TIME SWEEPING: the TTL sweep
+    // below used to run only when a NEW connection arrived, so on a quiet endpoint an
+    // expired lone park (and its #451 cap permit!) lingered indefinitely -- now the tick
+    // sweeps too. 10s: three ticks per park TTL, and a staleness alert at ~30s is
+    // unambiguous.
+    const BROKER_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut idle_tick = tokio::time::interval(BROKER_IDLE_TICK);
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let now = now_fn();
+        heartbeat.beat(now);
 
         // Sweep lone waiters past their park deadline (#3) before accepting the next connection,
         // so a first-comer with no partner is bounded instead of wedging the endpoint.
@@ -1387,6 +1400,10 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             _ = shutdown.cancelled() => {
                 eprintln!("ct-edge: channel broker stopping new accepts (shutdown)");
                 return;
+            }
+            _ = idle_tick.tick() => {
+                // Idle tick: loop back around to beat + sweep, then wait again (#497).
+                continue;
             }
             accepted = endpoint.accept() => match accepted {
                 Some(i) => i,
@@ -2190,6 +2207,78 @@ mod tests {
                 assert_ne!(reasons[i], reasons[j], "checkpoint reasons must be distinct");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn idle_broker_loop_beats_the_heartbeat_and_sweeps_expired_parks_497() {
+        // #497 slice 2, both halves of the idle tick's job, against a REAL loopback QUIC
+        // endpoint: (1) liveness -- the heartbeat advances while the loop sits idle, so
+        // /metrics can tell "idle" from "wedged" (the 2026-08-13 invisible-outage class);
+        // (2) idle-time sweeping -- an expired lone park is reaped WITHOUT any new connection
+        // arriving. Previously the sweep ran only per-accept, so a quiet endpoint held an
+        // expired park (and its #451 cap permit) indefinitely; this test parks ONE real member,
+        // expires it via the fake clock, and proves the tick alone evicts it.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let pk = operator_pubkey();
+        let chan = [0x77u8; 32];
+        let clock = Arc::new(AtomicU64::new(100));
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let pairer: SharedQuicChannelPairer =
+            std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new()));
+        let heartbeat = std::sync::Arc::new(crate::state::BrokerHeartbeat::new());
+
+        let clock_loop = clock.clone();
+        let pairer_loop = pairer.clone();
+        let hb_loop = heartbeat.clone();
+        let driver = tokio::spawn(async move {
+            run_channel_broker_loop(
+                &server,
+                move || clock_loop.load(Ordering::Relaxed),
+                move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
+                5, // park TTL in fake-clock seconds
+                finish_rendezvous_pair,
+                None,
+                crate::shutdown::ShutdownSignal::never(),
+                pairer_loop,
+                std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                hb_loop,
+            )
+            .await;
+        });
+
+        // ONE real member joins and parks (its partner never comes).
+        let lone = tokio::spawn(run_rendezvous_member(
+            cert.clone(), addr, chan, holder_sk(0xc3), Direction::Initiate, "203.0.113.9:7009", None, None,
+        ));
+        // Wait until it is genuinely parked.
+        for _ in 0..100 {
+            if !pairer.lock_safe().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(pairer.lock_safe().len(), 1, "the lone member parked");
+        let beat_at_park = heartbeat.last_seen();
+        assert_eq!(beat_at_park, 100, "iterations so far beat with the fake clock's time");
+
+        // Expire it and let ONE idle tick (10s real time) pass -- NO further connection.
+        clock.store(200, Ordering::Relaxed);
+        let mut swept = false;
+        for _ in 0..140 {
+            if pairer.lock_safe().is_empty() {
+                swept = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(swept, "the expired park was swept by the idle tick alone (no new connection)");
+        assert_eq!(heartbeat.last_seen(), 200, "the idle tick beat the heartbeat with fresh time");
+        // The reaped member's connection was closed -- its join attempt ends (err or timeout).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), lone).await;
+        driver.abort();
     }
 
     #[test]
@@ -3251,6 +3340,7 @@ mod tests {
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });
@@ -3373,6 +3463,7 @@ mod tests {
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });
@@ -3459,6 +3550,7 @@ mod tests {
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });
@@ -3528,6 +3620,7 @@ mod tests {
             crate::shutdown::ShutdownSignal::never(),
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });
@@ -4099,6 +4192,7 @@ mod tests {
                 crate::shutdown::ShutdownSignal::never(),
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });
@@ -4200,6 +4294,7 @@ mod tests {
                 shutdown,
                 pairer_loop,
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });
@@ -4255,6 +4350,7 @@ mod tests {
                 crate::shutdown::ShutdownSignal::never(),
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
+                std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
             )
             .await;
         });

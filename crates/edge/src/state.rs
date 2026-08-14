@@ -112,6 +112,36 @@ const JOIN_REFUSAL_WINDOW_SECS: u64 = 60;
 /// definitively-refused sources per minute.
 const JOIN_REFUSAL_MAX_TRACKED_IPS: usize = 4096;
 
+/// #497 slice 2: liveness heartbeat for a broker accept loop. The 2026-08-13 broker wedge
+/// (accept loop dead inside a live, healthcheck-green process, 22 minutes of fleet-wide
+/// channel outage) was invisible precisely because nothing observable distinguished "idle
+/// broker" from "dead broker". Each loop iteration -- INCLUDING idle ticks, see
+/// `run_channel_broker_loop`'s select! -- stores the current unix time here; `/metrics`
+/// exposes it as `ct_edge_channel_broker_loop_last_seen_seconds{loop=...}`, so a scraper (or
+/// a hardened container healthcheck) can alert on staleness: with the loop's own 10s idle
+/// tick, anything older than ~30s means the loop is genuinely wedged, not idle.
+pub struct BrokerHeartbeat(std::sync::atomic::AtomicU64);
+
+impl BrokerHeartbeat {
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+    /// Record one loop iteration at `now` (unix seconds).
+    pub fn beat(&self, now: u64) {
+        self.0.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// The last recorded iteration time (unix seconds); 0 = this loop never started.
+    pub fn last_seen(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for BrokerHeartbeat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The per-source-IP definitive-refusal tracker behind [`EdgeState::join_penalized`] --
 /// a standalone, `Arc`-shareable type (rather than a private `EdgeState` field only)
 /// because TWO accept paths must consult the SAME budget: the `:443` front door's
@@ -320,6 +350,11 @@ pub struct EdgeState<H> {
     /// `Arc`-shared (see [`JoinRefusalPenalty`]) because the QUIC broker loop enforces
     /// the SAME budget without holding an `EdgeState`.
     join_refusal: std::sync::Arc<JoinRefusalPenalty>,
+    /// #497 slice 2: liveness heartbeats for the two QUIC broker accept loops (relay,
+    /// rendezvous) -- `Arc`-shared into the loops the same way `join_refusal` is, read by
+    /// `/metrics`. See [`BrokerHeartbeat`].
+    relay_broker_heartbeat: std::sync::Arc<BrokerHeartbeat>,
+    rendezvous_broker_heartbeat: std::sync::Arc<BrokerHeartbeat>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -407,6 +442,8 @@ impl<H: Clone> EdgeState<H> {
             gelb_hosts: RwLock::new(HashSet::new()),
             rendezvous_limiter: Mutex::new(None),
             join_refusal: std::sync::Arc::new(JoinRefusalPenalty::new()),
+            relay_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
+            rendezvous_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             registrations: Counter::default(),
             relays: Counter::default(),
             tcp_parks: Counter::default(),
@@ -599,6 +636,16 @@ impl<H: Clone> EdgeState<H> {
     /// budget per IP -- a storm that alternates transports can't double its allowance.
     pub fn join_refusal_penalty(&self) -> std::sync::Arc<JoinRefusalPenalty> {
         self.join_refusal.clone()
+    }
+
+    /// #497 slice 2: the relay broker loop's liveness heartbeat (see [`BrokerHeartbeat`]).
+    pub fn relay_broker_heartbeat(&self) -> std::sync::Arc<BrokerHeartbeat> {
+        self.relay_broker_heartbeat.clone()
+    }
+
+    /// #497 slice 2: the rendezvous broker loop's liveness heartbeat.
+    pub fn rendezvous_broker_heartbeat(&self) -> std::sync::Arc<BrokerHeartbeat> {
+        self.rendezvous_broker_heartbeat.clone()
     }
 
     /// [`JoinRefusalPenalty::note_definitive_refusal`] on the shared penalty.
