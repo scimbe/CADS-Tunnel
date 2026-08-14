@@ -1528,8 +1528,14 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
     tunnels rather than each tunnel owning its own (it never was shared --
     login_allowlist_list is already scoped per tunnel id -- the bug was purely
     that the boundary between tunnels wasn't visible). */
+ /* No resting max-height: a fixed cap (640px historically) let long cards --
+    require-login + allowlist + pending requests + the Gelb notice easily exceed
+    it on a phone -- BLEED over the neighbouring card (overflow is visible at
+    rest by design; only .leaving clips). The collapse-to-0 removal animation
+    gets its from-value measured in JS (scrollHeight) right before .leaving is
+    added, so it stays smooth without any cap. */
  .tunnel-card{{border:1px solid var(--border);border-radius:10px;padding:.2rem 1rem;margin:0 0 1rem;
-      background:#131820;max-height:640px;animation:cardIn .3s ease-out backwards;
+      background:#131820;animation:cardIn .3s ease-out backwards;
       transition:opacity .2s ease,transform .2s ease,max-height .25s ease,margin .25s ease,padding .25s ease}}
  .tunnel-card:nth-of-type(1){{animation-delay:0ms}} .tunnel-card:nth-of-type(2){{animation-delay:50ms}}
  .tunnel-card:nth-of-type(3){{animation-delay:100ms}} .tunnel-card:nth-of-type(n+4){{animation-delay:150ms}}
@@ -1647,6 +1653,12 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
   var target = form.closest('li') || form.closest('.tunnel-card') || form;
   if(target.classList.contains('leaving')){{ return; }}
   ev.preventDefault();
+  // Measure the collapse's from-value: .leaving animates max-height to 0, and
+  // since the resting card carries NO max-height (a fixed cap made tall cards
+  // bleed over their neighbours on phones), the transition needs a concrete
+  // starting height set inline first (reflow forced so it takes effect).
+  target.style.maxHeight = target.scrollHeight + 'px';
+  void target.offsetHeight;
   target.classList.add('leaving');
   setTimeout(function(){{ form.submit(); }}, 220);
  }});
@@ -2778,35 +2790,42 @@ mod tests {
         );
     }
 
-    // Screenshot bug report: the whole tunnel card scrolled internally
-    // (clipping rows/buttons/login-gate) instead of just the access list. Only
-    // `.login-allowlist` (the <ul> of granted emails) should get its own
-    // scroll container; `.tunnel-card` keeps its max-height (load-bearing for
-    // the existing collapse-to-0 removal animation, see `.leaving`) but must
-    // no longer also clip/scroll its own content.
+    // Screenshot bug reports, two generations: (1) the whole tunnel card
+    // scrolled internally (clipping rows/buttons) -- fixed by giving only
+    // `.login-allowlist` its own scroll container; (2) the resting
+    // `max-height:640px` cap that was kept as "load-bearing" for the removal
+    // animation made tall cards (require-login + allowlist + pending requests
+    // + Gelb notice, on a phone) BLEED over the neighbouring card, because the
+    // resting card never clips. The cap is gone now: the `.leaving` collapse
+    // measures its from-value in JS (scrollHeight, set inline, reflow forced)
+    // right before the class is added.
     #[test]
     fn only_the_access_list_scrolls_internally_not_the_whole_tunnel_card() {
         let full_page = page("t", "", None);
-        // Isolate just the `.tunnel-card{...}` rule body (up to its closing
-        // brace) rather than a brittle exact-whitespace substring match, so
-        // this survives incidental reformatting of the surrounding CSS.
         let rule_start = full_page.find(".tunnel-card{").expect(".tunnel-card rule present");
         let rule_body_start = rule_start + ".tunnel-card{".len();
         let rule_end = full_page[rule_body_start..].find('}').map(|p| p + rule_body_start).expect("rule closes");
         let tunnel_card_rule = &full_page[rule_start..rule_end];
         assert!(
             !tunnel_card_rule.contains("overflow-y:auto"),
-            ".tunnel-card must no longer clip/scroll its own content: {tunnel_card_rule}"
+            ".tunnel-card must not clip/scroll its own content: {tunnel_card_rule}"
         );
         assert!(
-            tunnel_card_rule.contains("max-height:640px"),
-            "tunnel-card keeps its generous cap (load-bearing for the .leaving collapse-to-0 removal animation): {tunnel_card_rule}"
+            !tunnel_card_rule.contains("max-height:"),
+            "the resting card must carry NO max-height DECLARATION -- a fixed cap made tall \
+             cards bleed over their neighbours (2026-08-14 phone screenshot). The word may \
+             still appear in the transition property list (needed for the .leaving collapse): \
+             {tunnel_card_rule}"
         );
         assert!(
             full_page.contains(".login-allowlist{max-height:220px;overflow-y:auto}"),
-            "the access list itself must get its own scroll container"
+            "the access list itself keeps its own scroll container"
         );
         assert!(full_page.contains(".leaving{"), "the removal-animation class is unaffected");
+        assert!(
+            full_page.contains("target.style.maxHeight = target.scrollHeight + 'px'"),
+            "the removal animation measures its collapse from-value in JS now"
+        );
     }
 
     // #112 (frozen): a hung edge admin endpoint must NOT block the portal path.
