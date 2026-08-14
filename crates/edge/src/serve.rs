@@ -3168,6 +3168,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         now_fn,
                                         authorize,
                                         CHANNEL_PARK_TTL_SECS,
+                                        crate::channel_broker::ParkPhase::Relay,
                                         |a, b, now| {
                                             crate::channel_broker::finish_relay_pair(a, b, now)
                                         },
@@ -3231,6 +3232,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 now_fn,
                                 authorize,
                                 CHANNEL_PARK_TTL_SECS,
+                                crate::channel_broker::ParkPhase::Rendezvous,
                                 |a, b, now| {
                                     crate::channel_broker::finish_rendezvous_pair(a, b, now)
                                 },
@@ -3602,6 +3604,7 @@ mod tests {
             holder: [1u8; 32],
             deadline: 100,
             liveness: crate::channel_broker::ParkLiveness::default(),
+            phase: crate::channel_broker::ParkPhase::Unmarked,
             payload: 0u8,
         });
         assert_eq!(pairer.lock().unwrap().len(), 1, "parked before the reaper ticks");

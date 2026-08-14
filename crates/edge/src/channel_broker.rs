@@ -127,6 +127,8 @@ pub struct WaitingMember<T> {
     /// boundary). `default()` (unmonitored, e.g. QUIC members -- QUIC has connection-level
     /// death detection of its own) never reads as dead.
     pub liveness: ParkLiveness,
+    /// #495 slice 2a: the park's protocol phase -- see [`ParkPhase`].
+    pub phase: ParkPhase,
     pub payload: T,
 }
 
@@ -153,6 +155,29 @@ impl PartialEq for ParkLiveness {
     }
 }
 impl Eq for ParkLiveness {}
+
+/// #495 slice 2a: which protocol PHASE a park belongs to. Phase 1 (`Rendezvous`) is the
+/// admission park -- its client reads the ack and CLOSES; phase 2 (`Relay`) is the relay
+/// leg -- its client expects the spliced session on the SAME stream after the ack. A
+/// phase-mixed pairing puts a splice against an ack-and-close peer (instant early eof,
+/// the residual boundary-transportFault class measured after #499b). The QUIC brokers
+/// have always separated the phases by PORT (4435/4436); the `:443`/WS legs cannot tell
+/// them apart on today's wire, so they park as [`ParkPhase::Unmarked`] -- which pairs
+/// with ANYTHING, i.e. exactly today's mixed behavior, until the v0.4.14 client marks
+/// its relay legs. Same-phase-only pairing is therefore strictly additive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkPhase {
+    Rendezvous,
+    Relay,
+    Unmarked,
+}
+
+impl ParkPhase {
+    /// Whether two parks may pair: equal phases, or either side legacy-unmarked.
+    pub fn compatible(self, other: ParkPhase) -> bool {
+        self == other || self == ParkPhase::Unmarked || other == ParkPhase::Unmarked
+    }
+}
 
 /// The outcome of offering a member to the [`ChannelPairer`].
 #[derive(Debug, PartialEq, Eq)]
@@ -219,32 +244,45 @@ impl<T> ChannelPairer<T> {
     /// -- supersedes its own oldest park. See [`PairOutcome`].
     pub fn offer(&mut self, member: WaitingMember<T>) -> PairOutcome<T> {
         let queue = self.waiting.entry(member.channel).or_default();
-        // A different holder waiting? Pair with its oldest LIVE park (invariant: the queue
-        // only ever holds one holder's parks, so checking the front suffices for the holder;
-        // #499 slice B walks past corpses instead of pairing the partner with one).
-        if queue.front().is_some_and(|w| w.holder != member.holder) {
-            while let Some(candidate) = queue.pop_front() {
-                if candidate.liveness.is_dead() {
-                    self.dead_dropped += 1;
-                    continue;
-                }
+        // #495 slice 2a: pair with the OLDEST live, DIFFERENT-holder, PHASE-COMPATIBLE park
+        // (FIFO fairness within the compatible set). Corpses encountered during the search
+        // are dropped (#499 slice B); phase-INCOMPATIBLE members are skipped but KEPT in
+        // order -- with phases, one channel's queue may legitimately hold BOTH holders'
+        // parks (e.g. A's rendezvous park alongside B's relay park), so the old
+        // one-holder-per-queue invariant becomes the PER-HOLDER accounting below.
+        let mut idx = 0;
+        while idx < queue.len() {
+            if queue[idx].liveness.is_dead() {
+                queue.remove(idx);
+                self.dead_dropped += 1;
+                continue; // same idx now holds the next member
+            }
+            if queue[idx].holder != member.holder && queue[idx].phase.compatible(member.phase) {
+                let candidate = queue.remove(idx).expect("idx < len just checked");
                 if queue.is_empty() {
                     self.waiting.remove(&member.channel);
                 }
                 return PairOutcome::Paired(candidate, member);
             }
-            // Every queued park was a corpse: the arrival parks as the fresh first member.
+            idx += 1;
         }
-        // Same holder (or empty): purge corpses first (#499 slice B -- they must neither
-        // block the cap nor age out "in order" ahead of live parks), then join the queue;
-        // beyond the cap, the OLDEST park is superseded -- not the newest, so a member's
-        // parks age out in arrival order.
+        // No live compatible partner: purge this member's OWN corpses (they must neither
+        // block the cap nor age out ahead of live parks -- #499 slice B; other holders'
+        // members are untouched here, their corpses fall to the search above / the sweep),
+        // then join the queue; beyond the PER-HOLDER cap, the member's own OLDEST park is
+        // superseded -- not the newest, so a member's parks age out in arrival order.
         let before = queue.len();
-        queue.retain(|w| !w.liveness.is_dead());
+        queue.retain(|w| w.holder != member.holder || !w.liveness.is_dead());
         self.dead_dropped += (before - queue.len()) as u64;
+        let holder = member.holder;
         queue.push_back(member);
-        if queue.len() > PARKS_PER_MEMBER {
-            let stale = queue.pop_front().expect("len just checked > cap >= 1");
+        let own_count = queue.iter().filter(|w| w.holder == holder).count();
+        if own_count > PARKS_PER_MEMBER {
+            let stale_idx = queue
+                .iter()
+                .position(|w| w.holder == holder)
+                .expect("at least the just-pushed park has this holder");
+            let stale = queue.remove(stale_idx).expect("position just found");
             return PairOutcome::Superseded(stale);
         }
         PairOutcome::Parked
@@ -1380,7 +1418,17 @@ where
     // every later offer (the 2026-08-13 broker-outage class).
     let outcome = pairer
         .lock_safe()
-        .offer(WaitingMember { channel, holder, deadline, liveness, payload: member });
+        .offer(WaitingMember {
+            channel,
+            holder,
+            deadline,
+            liveness,
+            // #495 slice 2a: today's `:443`/WS wire cannot distinguish the phases, so
+            // stream members park Unmarked (pairs with anything = exactly the historical
+            // behavior). The v0.4.14 client's relay-leg marker upgrades this to `Relay`.
+            phase: ParkPhase::Unmarked,
+            payload: member,
+        });
     match outcome {
         PairOutcome::Parked => Ok(None),
         PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
@@ -1640,6 +1688,9 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     now_fn: N,
     authorize: F,
     park_ttl: UnixSeconds,
+    // #495 slice 2a: which protocol phase this endpoint serves (relay :4436 -> Relay,
+    // rendezvous :4435 -> Rendezvous) -- stamped on every park it offers.
+    phase: ParkPhase,
     complete: C,
     cap: Option<crate::state::ConnectionCap>,
     shutdown: crate::shutdown::ShutdownSignal,
@@ -1794,6 +1845,9 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 // #499 slice B: unmonitored -- a QUIC park's death is visible at the
                 // connection layer (the sweep's close/read paths), unlike a raw stream's.
                 liveness: ParkLiveness::default(),
+                // #495 slice 2a: the QUIC brokers' phase IS their port -- the loop is
+                // told which one it serves.
+                phase,
                 payload: member,
             });
             match outcome {
@@ -1977,6 +2031,7 @@ mod tests {
             holder: [holder; 32],
             deadline,
             liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
             payload: tag,
         };
         let mut pairer: ChannelPairer<&'static str> = ChannelPairer::new();
@@ -2030,6 +2085,7 @@ mod tests {
             holder: [holder; 32],
             deadline,
             liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
             payload: tag,
         };
         let mut pairer: ChannelPairer<&'static str> = ChannelPairer::new();
@@ -2597,6 +2653,7 @@ mod tests {
                 move || clock_loop.load(Ordering::Relaxed),
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
                 5, // park TTL in fake-clock seconds
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_rendezvous_pair,
                 None,
                 crate::shutdown::ShutdownSignal::never(),
@@ -2793,6 +2850,68 @@ mod tests {
     }
 
     #[test]
+    fn pairing_is_phase_compatible_and_the_cap_is_per_holder_495a() {
+        // #495 slice 2a: (1) same-phase pairs; (2) mismatched phases coexist in ONE
+        // channel queue across holders (the old one-holder invariant is now per-holder
+        // accounting); (3) Unmarked (legacy :443) pairs with anything; (4) the supersede
+        // cap counts only the member's OWN parks.
+        let m = |holder: u8, phase: ParkPhase, tag: &'static str| WaitingMember {
+            channel: ChannelId([0x2Au8; 32]),
+            holder: [holder; 32],
+            deadline: 1_000,
+            liveness: ParkLiveness::default(),
+            phase,
+            payload: tag,
+        };
+        let mut p = ChannelPairer::new();
+
+        // A parks Rendezvous; B arrives with Relay -> INCOMPATIBLE -> B parks alongside.
+        assert_eq!(p.offer(m(1, ParkPhase::Rendezvous, "a-rdv")), PairOutcome::Parked);
+        assert_eq!(p.offer(m(2, ParkPhase::Relay, "b-relay")), PairOutcome::Parked);
+        assert_eq!(p.len(), 2, "both holders' parks coexist, phase-separated");
+
+        // B's Rendezvous join pairs with A's Rendezvous park (skipping B's own Relay park
+        // and A's... none) -- FIFO within the compatible set.
+        match p.offer(m(2, ParkPhase::Rendezvous, "b-rdv")) {
+            PairOutcome::Paired(x, y) => {
+                assert_eq!(x.payload, "a-rdv");
+                assert_eq!(y.payload, "b-rdv");
+            }
+            other => panic!("rendezvous must pair with rendezvous, got {other:?}"),
+        }
+        // A's Relay join pairs with B's waiting Relay park.
+        match p.offer(m(1, ParkPhase::Relay, "a-relay")) {
+            PairOutcome::Paired(x, y) => {
+                assert_eq!(x.payload, "b-relay");
+                assert_eq!(y.payload, "a-relay");
+            }
+            other => panic!("relay must pair with relay, got {other:?}"),
+        }
+        assert!(p.is_empty());
+
+        // Unmarked pairs with a marked phase (legacy compatibility).
+        assert_eq!(p.offer(m(1, ParkPhase::Relay, "a-relay2")), PairOutcome::Parked);
+        assert!(matches!(p.offer(m(2, ParkPhase::Unmarked, "b-legacy")), PairOutcome::Paired(..)));
+
+        // Per-holder cap: A queues PARKS_PER_MEMBER Rendezvous parks; B's incompatible
+        // Relay park sits in the same queue; A's (cap+1)th supersedes A's OWN oldest --
+        // B's park is untouched.
+        for i in 0..PARKS_PER_MEMBER {
+            assert_eq!(p.offer(m(1, ParkPhase::Rendezvous, "a-park")), PairOutcome::Parked, "park {i}");
+        }
+        assert_eq!(p.offer(m(2, ParkPhase::Relay, "b-waiting")), PairOutcome::Parked);
+        match p.offer(m(1, ParkPhase::Rendezvous, "a-overflow")) {
+            PairOutcome::Superseded(stale) => assert_eq!(stale.holder, [1u8; 32], "A's own oldest, never B's"),
+            other => panic!("beyond the per-holder cap the own oldest is superseded, got {other:?}"),
+        }
+        assert_eq!(
+            p.len(),
+            PARKS_PER_MEMBER + 1,
+            "A back at cap, B's incompatible park still queued"
+        );
+    }
+
+    #[test]
     fn pairer_never_hands_out_a_corpse_and_counts_the_drop_499b() {
         // #499 slice B, pairer level: a queued park flagged dead must be skipped by FIFO
         // pairing (the arriving partner gets the oldest LIVE park), purged by the sweep
@@ -2802,6 +2921,7 @@ mod tests {
             holder: [holder; 32],
             deadline: 1_000,
             liveness,
+            phase: ParkPhase::Unmarked,
             payload: tag,
         };
         let (dead_liveness, dead_flag) = ParkLiveness::monitored();
@@ -3068,6 +3188,7 @@ mod tests {
             holder: [0x11u8; 32],
             deadline: 100,
             liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
             payload: (),
         });
         assert!(matches!(outcome, PairOutcome::Parked), "offer works through the poisoned lock");
@@ -4098,6 +4219,7 @@ mod tests {
                     (c.0 == chan_x || c.0 == chan_y).then_some((pk, None, None))
                 },
                 10_000,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_relay_pair,
             None,
             crate::shutdown::ShutdownSignal::never(),
@@ -4221,6 +4343,7 @@ mod tests {
                     (c.0 == chan_x || c.0 == chan_y).then_some((pk, None, None))
                 },
                 10_000,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_rendezvous_pair,
             None,
             crate::shutdown::ShutdownSignal::never(),
@@ -4308,6 +4431,7 @@ mod tests {
                 || 500u64,
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan_y).then_some((pk, None, None)) },
                 10_000,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_rendezvous_pair,
             None,
             crate::shutdown::ShutdownSignal::never(),
@@ -4378,6 +4502,7 @@ mod tests {
                     (c.0 == chan).then_some((pk, None, None))
                 },
                 park_ttl,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_rendezvous_pair,
             None,
             crate::shutdown::ShutdownSignal::never(),
@@ -4860,6 +4985,7 @@ mod tests {
             holder: [1u8; 32],
             deadline: 100,
             liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
             payload: FakeMember { _permit: p1 },
         });
         assert!(matches!(outcome, PairOutcome::Parked), "first offer parks");
@@ -4900,6 +5026,7 @@ mod tests {
             holder: [1u8; 32],
             deadline: 100,
             liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
             payload: FakeMember { _permit: p1 },
         });
         assert_eq!(sem.available_permits(), 0, "both permits are outstanding: 1 parked, 1 about to offer");
@@ -4909,6 +5036,7 @@ mod tests {
             holder: [2u8; 32],
             deadline: 100,
             liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
             payload: FakeMember { _permit: p2 },
         });
         let (a, b) = match outcome {
@@ -4953,6 +5081,7 @@ mod tests {
                     (c.0 == chan || c.0 == chan2).then_some((pk, None, None))
                 },
                 park_ttl,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_rendezvous_pair,
                 Some(cap_loop),
                 crate::shutdown::ShutdownSignal::never(),
@@ -5055,6 +5184,7 @@ mod tests {
                 || 500u64,
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
                 10_000,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_rendezvous_pair,
                 Some(cap_loop),
                 shutdown,
@@ -5111,6 +5241,7 @@ mod tests {
                 || 500u64,
                 move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == chan).then_some((pk, None, None)) },
                 10_000,
+                ParkPhase::Unmarked, // 2a: neutral in tests
                 finish_relay_pair,
                 Some(cap_loop),
                 crate::shutdown::ShutdownSignal::never(),
