@@ -1703,6 +1703,25 @@ where
             _ = tokio::time::sleep(TCP_PING_INTERVAL) => {
                 send_ping_and_await_pong(stream, counter).await.map_err(ParkAndPingError::NoClient)?;
                 counter = counter.wrapping_add(1);
+                // Straddle (found by tcp_fallback_role_k_hands_off_cleanly_...: a Client that
+                // arrives while THIS round trip is in flight): the PONG that just landed
+                // already proves liveness AFTER the Client's arrival -- it IS the
+                // verify-at-delivery round trip, so running the parked arm's extra PING would
+                // be a redundant second verification (and the wire contract's readers document
+                // STOP directly after a straddling PONG). `biased` guarantees the arrival
+                // really was mid-flight: had the Client been delivered before this iteration,
+                // the parked arm would have won instead. A `Closed` here is terminal for the
+                // oneshot (polling it again would panic), so it maps to the same
+                // superseded/dropped error the parked arm produces.
+                match parked.as_mut().get_mut().try_recv() {
+                    Ok(client) => return Ok(client),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        return Err(ParkAndPingError::NoClient(
+                            "tcp-fallback: parked registration superseded/dropped before a Client arrived".into(),
+                        ))
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
             }
         }
     }
