@@ -1289,10 +1289,16 @@ where
         PairOutcome::Parked => Ok(None),
         PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
         PairOutcome::Superseded(stale) => {
-            // A retry from the same holder arrived before its partner; the fresh offer is
-            // now parked, so close the stale stream and report "parked" (nothing to pair).
-            let mut stale = stale.payload;
-            let _ = stale.stream.shutdown().await;
+            // A retry from the same holder arrived before its partner (beyond the #495 queue
+            // cap); the fresh offer is now parked, so tear down the stale stream and report
+            // "parked" (nothing to pair). #499 slice A: the teardown used to be a silent
+            // shutdown -- a LIVE client on the stale leg saw exactly the pre-ct-agent#21
+            // ambiguous EOF (classified as a refusal, advancing its ladder). It now gets the
+            // same best-effort `EX` token a TTL reap sends: the park is gone through no
+            // fault of its grant, and re-park-same-rung is the correct client reaction in
+            // both cases. In the common case the stale leg is a corpse (an abandoned retry)
+            // and the write vanishes harmlessly, like the reaper's.
+            stale.payload.notify_park_expired().await;
             Ok(None)
         }
     }
@@ -1560,10 +1566,18 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                         eprintln!("ct-edge: channel pair ended: {e}");
                     }
                 }
-                // Same holder re-presented before its partner arrived: the fresh offer stays parked;
-                // close the stale connection (pairing a holder with itself is refused).
+                // Same holder re-presented before its partner arrived (beyond the #495 queue
+                // cap): the fresh offer stays parked; close the stale connection. #499 slice A:
+                // the reason carries the `park-expired:` wire prefix so a LIVE client on the
+                // stale leg classifies it as ParkExpired (re-park, no ladder advance, no
+                // refusal backoff) instead of an anonymous transport error -- the park is gone
+                // through no fault of its grant, exactly like a TTL reap. The suffix stays
+                // honest about WHY.
                 PairOutcome::Superseded(stale) => {
-                    stale.payload.conn.close(0u32.into(), b"superseded by newer join");
+                    stale.payload.conn.close(
+                        0u32.into(),
+                        b"park-expired: superseded by a newer join from the same holder",
+                    );
                 }
             }
         });
@@ -2407,6 +2421,65 @@ mod tests {
         let mut buf = Vec::new();
         client_end.read_to_end(&mut buf).await.expect("read to EOF");
         assert_eq!(buf, PARK_EXPIRED_TOKEN, "exactly the EX token, then clean EOF");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_park_gets_the_ex_token_not_a_silent_close_499() {
+        // #499 slice A: when the same holder's (PARKS_PER_MEMBER+1)th park supersedes its
+        // oldest, the stale leg's teardown must carry the same EX token a TTL reap sends --
+        // a LIVE client there would otherwise see the pre-ct-agent#21 ambiguous EOF and
+        // misread its lost park as a refusal. Drive the REAL admit_and_pair_on_stream path
+        // for every offer; assert the FIRST (oldest) client reads exactly EX + EOF while
+        // the queue still holds the newest PARKS_PER_MEMBER parks.
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x99u8; 32];
+        let holder = holder_sk(0xc3);
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<tokio::io::DuplexStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.9:9009".parse().unwrap();
+
+        let mut clients = Vec::new();
+        for i in 0..=PARKS_PER_MEMBER {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder, Direction::Accept, 1_000),
+                endpoint: format!("203.0.113.9:9{i:03}"),
+            };
+            let sk = holder_sk(0xc3);
+            let (c, s) = tokio::io::duplex(4096);
+            clients.push(tokio::spawn(async move {
+                let mut c = c;
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                c.read_exact(&mut ch).await.expect("challenge");
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                // Parked: read whatever teardown (or nothing) arrives.
+                let mut buf = Vec::new();
+                let _ = c.read_to_end(&mut buf).await;
+                buf
+            }));
+            let r = admit_and_pair_on_stream(s, obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
+                .await
+                .expect("admit");
+            assert!(r.is_none(), "same-holder offers park (or supersede-park), never pair");
+        }
+
+        // The oldest park was superseded by the (cap+1)th offer -- its client must read the
+        // EX token, not a bare EOF.
+        let oldest = clients.remove(0).await.expect("oldest client");
+        assert_eq!(oldest, PARK_EXPIRED_TOKEN, "the superseded leg carries EX (#499 slice A)");
+        assert_eq!(
+            pairer.lock().unwrap().len(),
+            PARKS_PER_MEMBER,
+            "the newest {PARKS_PER_MEMBER} parks remain queued"
+        );
+        for c in clients {
+            c.abort(); // still parked -- nothing to read; the test only asserts the superseded one
+        }
     }
 
     #[test]
