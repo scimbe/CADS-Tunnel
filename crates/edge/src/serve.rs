@@ -3665,6 +3665,7 @@ mod tests {
         pairer.lock().unwrap().offer(WaitingMember {
             channel: ChannelId([7u8; 32]),
             holder: [1u8; 32],
+            observed: None,
             deadline: 100,
             liveness: crate::channel_broker::ParkLiveness::default(),
             phase: crate::channel_broker::ParkPhase::Unmarked,

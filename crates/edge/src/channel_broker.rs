@@ -117,6 +117,11 @@ pub fn authorize_channel_pair(
 pub struct WaitingMember<T> {
     pub channel: ChannelId,
     pub holder: [u8; 32],
+    /// #508: the member's observed remote IP, when the admission path knows it --
+    /// used ONLY by the sibling-channel mismatch diagnostic in `drain_expired`
+    /// (a lone park expiring while a SAME-peer park waits on a DIFFERENT channel
+    /// is the mismatched-provisioning signature that cost 19h to diagnose by hand).
+    pub observed: Option<std::net::IpAddr>,
     /// Absolute time by which this lone waiter must be paired or evicted (#109 #3).
     pub deadline: UnixSeconds,
     /// #499 slice B: live corpse signal for this park. The `:443` park pump sets it the
@@ -234,6 +239,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrependBytes<S> {
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+/// First 8 bytes of an id as lowercase hex — enough to correlate with other log
+/// lines (the reaper prints the same prefix length) without dumping full ids.
+fn hex_prefix(bytes: &[u8; 32]) -> String {
+    bytes[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The outcome of offering a member to the [`ChannelPairer`].
@@ -369,7 +380,53 @@ impl<T> ChannelPairer<T> {
             !queue.is_empty()
         });
         self.dead_dropped += dead;
+        // #508: the mismatched-provisioning diagnostic. A lone park expiring while a
+        // SAME-peer park still waits on a DIFFERENT channel is the signature of a
+        // half-updated deployment (one side's grants regenerated, the other's env
+        // stale) -- the pairer correctly never matches them, but its silence cost 19h
+        // of by-hand diagnosis in the field (2026-08-14, flappy crew bridge). Named
+        // here, rate-limited to one line per minute process-wide.
+        for (expired_channel, waiting_channel, ip) in self.sibling_channel_mismatches(&drained) {
+            static LAST_508_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let last = LAST_508_LOG.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60 && LAST_508_LOG
+                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+            {
+                eprintln!(
+                    "ct-edge: lone park expired (channel={}…) while a park from the SAME peer ({ip}) \
+                     waits on a DIFFERENT channel ({}…) — mismatched provisioning between the two \
+                     sides? (#508)",
+                    hex_prefix(&expired_channel.0),
+                    hex_prefix(&waiting_channel.0),
+                );
+            }
+        }
         drained
+    }
+
+    /// #508, pure core: for each drained (expired, partnerless) member with a known
+    /// observed IP, find a STILL-WAITING member from the same IP parked on a
+    /// different channel. Returns (expired member's channel, waiting sibling's
+    /// channel, shared IP) triples — the caller logs them rate-limited.
+    pub(crate) fn sibling_channel_mismatches(
+        &self,
+        drained: &[WaitingMember<T>],
+    ) -> Vec<(ChannelId, ChannelId, std::net::IpAddr)> {
+        let mut out = Vec::new();
+        for e in drained {
+            let Some(ip) = e.observed else { continue };
+            for (chan, queue) in &self.waiting {
+                if *chan == e.channel {
+                    continue;
+                }
+                if queue.iter().any(|w| w.observed == Some(ip)) {
+                    out.push((e.channel, *chan, ip));
+                    break; // one sibling per expired member is signal enough
+                }
+            }
+        }
+        out
     }
 
     /// Total members currently parked (across all channels and queue depths).
@@ -1506,7 +1563,7 @@ where
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
     // Unmarked: this generic path (WS + tests) has no phase peek -- historical behavior.
-    Ok(offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked)
+    Ok(offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked, Some(observed.ip()))
         .await?
         .map(|((a, _), (b, _))| (a, b)))
 }
@@ -1527,6 +1584,7 @@ async fn offer_admitted_stream_member<S>(
     member: AdmittedStreamMember<S>,
     liveness: ParkLiveness,
     phase: ParkPhase,
+    observed: Option<std::net::IpAddr>,
 ) -> Result<PairedWithPhases<S>, BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1540,6 +1598,7 @@ where
         .offer(WaitingMember {
             channel,
             holder,
+            observed,
             deadline,
             liveness,
             // #495 slice 2a: today's `:443`/WS wire cannot distinguish the phases, so
@@ -1747,7 +1806,7 @@ where
     let (liveness, dead) = ParkLiveness::monitored();
     let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
-    offer_admitted_stream_member(pairer, deadline, member, liveness, phase).await
+    offer_admitted_stream_member(pairer, deadline, member, liveness, phase, Some(observed.ip())).await
 }
 
 
@@ -2004,6 +2063,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             let outcome = pairer.lock_safe().offer(WaitingMember { // #497: poison-resilient
                 channel,
                 holder,
+                observed: Some(member.conn.remote_address().ip()),
                 deadline: now.saturating_add(park_ttl),
                 // #499 slice B: unmonitored -- a QUIC park's death is visible at the
                 // connection layer (the sweep's close/read paths), unlike a raw stream's.
@@ -2192,6 +2252,7 @@ mod tests {
         let m = |chan: u8, holder: u8, deadline: UnixSeconds, tag: &'static str| WaitingMember {
             channel: ChannelId([chan; 32]),
             holder: [holder; 32],
+            observed: None,
             deadline,
             liveness: ParkLiveness::default(),
             phase: ParkPhase::Unmarked,
@@ -2246,6 +2307,7 @@ mod tests {
         let m = |chan: u8, holder: u8, deadline: u64, tag: &'static str| WaitingMember {
             channel: ChannelId([chan; 32]),
             holder: [holder; 32],
+            observed: None,
             deadline,
             liveness: ParkLiveness::default(),
             phase: ParkPhase::Unmarked,
@@ -3012,6 +3074,40 @@ mod tests {
         assert_eq!(tail, PARK_EXPIRED_TOKEN, "after stripping NULs the tail is exactly EX");
     }
 
+    /// #508: the mismatched-provisioning diagnostic — an expired lone park whose
+    /// SAME-peer sibling waits on a DIFFERENT channel is detected; different peers
+    /// or unknown IPs stay silent (no false alarm on normal multi-tenant traffic).
+    #[test]
+    fn sibling_channel_mismatch_detects_same_peer_on_different_channels_508() {
+        use std::net::IpAddr;
+        let ip_a: IpAddr = "203.0.113.50".parse().unwrap();
+        let ip_other: IpAddr = "203.0.113.99".parse().unwrap();
+        let m = |chan: u8, holder: u8, observed: Option<IpAddr>| WaitingMember {
+            channel: ChannelId([chan; 32]),
+            holder: [holder; 32],
+            observed,
+            deadline: 100,
+            liveness: ParkLiveness::default(),
+            phase: ParkPhase::Unmarked,
+            payload: (),
+        };
+        let mut pairer: ChannelPairer<()> = ChannelPairer::new();
+        // Still waiting: same peer on channel B, a different peer on channel C.
+        assert!(matches!(pairer.offer(m(0xB, 1, Some(ip_a))), PairOutcome::Parked));
+        assert!(matches!(pairer.offer(m(0xC, 2, Some(ip_other))), PairOutcome::Parked));
+
+        // Expired: same peer, channel A -> exactly one (expired A, waiting B, ip_a) hit.
+        let hits = pairer.sibling_channel_mismatches(&[m(0xA, 3, Some(ip_a))]);
+        assert_eq!(hits, vec![(ChannelId([0xA; 32]), ChannelId([0xB; 32]), ip_a)]);
+
+        // A different peer expiring, or an unknown IP: silent.
+        assert!(pairer.sibling_channel_mismatches(&[m(0xA, 4, Some("198.51.100.7".parse().unwrap()))]).is_empty());
+        assert!(pairer.sibling_channel_mismatches(&[m(0xA, 5, None)]).is_empty());
+
+        // Same peer expiring on the SAME channel it waits on: not a mismatch.
+        assert!(pairer.sibling_channel_mismatches(&[m(0xB, 6, Some(ip_a))]).is_empty());
+    }
+
     #[tokio::test]
     /// #495 slice 2b: two RENDEZVOUS-marked members (0x01 preamble) complete with
     /// ack-then-CLOSE — and that heals even the pre-v0.4.16 EOF-waiting ack reader
@@ -3246,6 +3342,7 @@ mod tests {
         let m = |holder: u8, phase: ParkPhase, tag: &'static str| WaitingMember {
             channel: ChannelId([0x2Au8; 32]),
             holder: [holder; 32],
+            observed: None,
             deadline: 1_000,
             liveness: ParkLiveness::default(),
             phase,
@@ -3307,6 +3404,7 @@ mod tests {
         let m = |holder: u8, liveness: ParkLiveness, tag: &'static str| WaitingMember {
             channel: ChannelId([0x4Bu8; 32]),
             holder: [holder; 32],
+            observed: None,
             deadline: 1_000,
             liveness,
             phase: ParkPhase::Unmarked,
@@ -3574,6 +3672,7 @@ mod tests {
         let outcome = pairer.lock_safe().offer(WaitingMember {
             channel: ChannelId([0x97u8; 32]),
             holder: [0x11u8; 32],
+            observed: None,
             deadline: 100,
             liveness: ParkLiveness::default(),
             phase: ParkPhase::Unmarked,
@@ -5371,6 +5470,7 @@ mod tests {
         let outcome = pairer.offer(WaitingMember {
             channel: ChannelId([1u8; 32]),
             holder: [1u8; 32],
+            observed: None,
             deadline: 100,
             liveness: ParkLiveness::default(),
             phase: ParkPhase::Unmarked,
@@ -5412,6 +5512,7 @@ mod tests {
         let _ = pairer.offer(WaitingMember {
             channel: ChannelId([2u8; 32]),
             holder: [1u8; 32],
+            observed: None,
             deadline: 100,
             liveness: ParkLiveness::default(),
             phase: ParkPhase::Unmarked,
@@ -5422,6 +5523,7 @@ mod tests {
         let outcome = pairer.offer(WaitingMember {
             channel: ChannelId([2u8; 32]),
             holder: [2u8; 32],
+            observed: None,
             deadline: 100,
             liveness: ParkLiveness::default(),
             phase: ParkPhase::Unmarked,
