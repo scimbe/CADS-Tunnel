@@ -171,6 +171,19 @@ impl Eq for ParkLiveness {}
 /// with ANYTHING, i.e. exactly today's mixed behavior, until the v0.4.14 client marks
 /// its relay legs. Same-phase-only pairing is therefore strictly additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// #495 2a: which join PHASE a parked member declared — and, per transport, where that
+/// declaration comes from (#511, the one place this is written down):
+///
+/// | transport                       | phase origin                                       |
+/// |---------------------------------|----------------------------------------------------|
+/// | QUIC broker `:4435` (rendezvous)| constant at the accept-loop spawn site (`serve.rs`)|
+/// | QUIC broker `:4436` (relay)     | constant at the accept-loop spawn site (`serve.rs`)|
+/// | `:443` front door (TLS-TCP)     | the client's `[0xFF, phase]` preamble (peeked in `admit_and_pair_on_boxed_stream`; absent → `Unmarked`) |
+/// | WS upgrade path                 | always `Unmarked` (no peek on this path)           |
+///
+/// The QUIC brokers can use constants because each port IS one phase; only `:443`
+/// multiplexes both phases over one listener and needs the client to say which.
+/// The phase→completion decision is [`completion_for`].
 pub enum ParkPhase {
     Rendezvous,
     Relay,
@@ -282,10 +295,13 @@ const PARKS_PER_MEMBER: usize = 4;
 
 #[derive(Debug, Default)]
 pub struct ChannelPairer<T> {
-    /// #495 slice 1: a small FIFO of waiters per channel (was: exactly one). Invariant kept by
-    /// `offer`: at any moment the queue holds waiters of AT MOST one holder -- the instant a
-    /// different holder arrives it pairs with the oldest queued waiter instead of joining the
-    /// queue, so two holders' parks never coexist for one channel.
+    /// #495 slice 1: a small FIFO of waiters per channel (was: exactly one). Since the 2a
+    /// phases, one channel's queue may legitimately hold BOTH holders' parks at once (e.g.
+    /// A's rendezvous park alongside B's relay park — phase-incompatible, so `offer` skips
+    /// rather than pairs them); the bounding invariant is PER-HOLDER, kept by `offer`:
+    /// at most [`PARKS_PER_MEMBER`] parks per holder per channel, oldest superseded first.
+    /// (#511: this doc used to state the pre-2a one-holder-per-queue invariant, which 2a
+    /// deliberately abolished.)
     waiting: std::collections::HashMap<ChannelId, std::collections::VecDeque<WaitingMember<T>>>,
     /// #499 slice B: corpses dropped so far (parks whose client died while queued, detected
     /// via [`ParkLiveness`] and discarded at offer/drain time instead of being paired or
@@ -385,21 +401,28 @@ impl<T> ChannelPairer<T> {
         // half-updated deployment (one side's grants regenerated, the other's env
         // stale) -- the pairer correctly never matches them, but its silence cost 19h
         // of by-hand diagnosis in the field (2026-08-14, flappy crew bridge). Named
-        // here, rate-limited to one line per minute process-wide.
-        for (expired_channel, waiting_channel, ip) in self.sibling_channel_mismatches(&drained) {
-            static LAST_508_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let last = LAST_508_LOG.load(std::sync::atomic::Ordering::Relaxed);
-            if now.saturating_sub(last) >= 60 && LAST_508_LOG
-                .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
-                .is_ok()
+        // here, rate-limited to one line per minute process-wide -- and the rate gate
+        // is checked BEFORE the O(drained x queues) sibling scan runs (#511: this
+        // whole block executes under the pairer lock, so a gated minute must not pay
+        // the scan either).
+        static LAST_508_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let last = LAST_508_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if !drained.is_empty() && now.saturating_sub(last) >= 60 {
+            if let Some((expired_channel, waiting_channel, ip)) =
+                self.sibling_channel_mismatches(&drained).into_iter().next()
             {
-                eprintln!(
-                    "ct-edge: lone park expired (channel={}…) while a park from the SAME peer ({ip}) \
-                     waits on a DIFFERENT channel ({}…) — mismatched provisioning between the two \
-                     sides? (#508)",
-                    hex_prefix(&expired_channel.0),
-                    hex_prefix(&waiting_channel.0),
-                );
+                if LAST_508_LOG
+                    .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                    .is_ok()
+                {
+                    eprintln!(
+                        "ct-edge: lone park expired (channel={}…) while a park from the SAME peer ({ip}) \
+                         waits on a DIFFERENT channel ({}…) — mismatched provisioning between the two \
+                         sides? (#508)",
+                        hex_prefix(&expired_channel.0),
+                        hex_prefix(&waiting_channel.0),
+                    );
+                }
             }
         }
         drained
@@ -1043,31 +1066,55 @@ where
 /// pair-completion tail of [`broker_channel_rendezvous`], split from admission so a
 /// concurrent loop can `spawn` it per `ChannelPairer::offer` -> `Paired(a, b)`.
 pub(crate) async fn finish_rendezvous_pair(
+    a: AdmittedMember,
+    b: AdmittedMember,
+    now: UnixSeconds,
+) -> Result<ChannelPairing, BoxError> {
+    finish_quic_pair_inner(a, b, now, QuicPairCompletion::EndpointSwap).await
+}
+
+/// How a completed **QUIC-native** pairing ends after both acks — the QUIC twin of
+/// [`StreamPairCompletion`] (#511: the two families used to be ~40 duplicated lines
+/// whose ack construction had already diverged once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicPairCompletion {
+    /// Rendezvous: each side got the other's endpoint/keys; wait out both connections
+    /// (the members dial each other directly / walk their own relay fallback).
+    EndpointSwap,
+    /// Relay: splice each side's next bi-stream through the edge.
+    Splice,
+}
+
+/// The shared completion tail of [`finish_rendezvous_pair`] / [`finish_relay_pair`]:
+/// authorize the pair, ack both sides, then run `completion`.
+///
+/// The ack line is the SAME on both completers — `OK <peer-endpoint><suffix> r=<own
+/// observed> sp=<0|1>`:
+/// - `r=<addr>` (#121 B1-follow, #104-follow): each side's OWN edge-observed reflexive,
+///   the punch address / the input to the in-band relay→direct upgrade. Members reach
+///   these completers over the direct QUIC broker port, so the reflexive is genuinely
+///   meaningful (unlike `finish_relay_pair_over_streams`'s deliberately deferred case).
+/// - `<suffix>` (#122/#101, #134-follow): the peer's attested Noise key + holder +
+///   attestation. The relay completer historically omitted it, which made the #136
+///   NAT-to-NAT DCUtR upgrade structurally impossible against a real edge — the
+///   shared construction here is what prevents that class of divergence.
+/// - `sp=<0|1>` (#276 piece 1): edge-attested same-public-IP fact gating LAN-local
+///   dial candidates; always present, unlike the suffix's all-or-nothing convention.
+///
+/// Acks go through [`quic_ack_member`] (#148/#154/#155) so a mid-handoff drop names
+/// the dead side (a transient race) instead of reading like a refusal.
+async fn finish_quic_pair_inner(
     mut a: AdmittedMember,
     mut b: AdmittedMember,
     now: UnixSeconds,
+    completion: QuicPairCompletion,
 ) -> Result<ChannelPairing, BoxError> {
+    let refusal_label = match completion {
+        QuicPairCompletion::EndpointSwap => "channel pair refused",
+        QuicPairCompletion::Splice => "channel relay pair refused",
+    };
     match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
         Ok(pairing) => {
-            // Each side's ack carries the PEER's endpoint/keys plus its OWN edge-observed
-            // reflexive as the trailing `r=<addr>` token (#121 B1-follow) — so a member learns
-            // its punch address during live rendezvous pairing. The client parses `r=` as a
-            // self-addressed, order-independent token (absent on legacy acks → `None`).
-            //
-            // #155: ack each side through `quic_ack_member` so a mid-handoff drop on THIS completer
-            // — the QUIC rendezvous broker, which every member (including relay-only NAT'd ones)
-            // admits through before any relay fallback — surfaces as a `RelayHandoffError` naming the
-            // dead side, not a bare error that reads like a refusal (the fix #148/#154 gave the other
-            // two completers; this is the one actually in source-2/sink's admission path).
-            //
-            // #276 piece 1: append `sp=<0|1>` — whether this pair's two edge-observed reflexive
-            // (public) IPs match, i.e. both members are behind the same NAT/on the same network.
-            // This is the edge-attested fact #276 needs to safely gate a LAN-local dial candidate:
-            // a private-range candidate is only safe to dial when the edge independently observed
-            // BOTH sides arriving from the same public IP, not merely a self-reported claim. Purely
-            // additive, always present (unlike the noise/attest suffix's all-or-nothing convention)
-            // so the client can parse it unambiguously without a presence check; a legacy client
-            // that doesn't look for `sp=` is unaffected exactly as an unrecognized `r=` was.
             let sp = same_public_ip(a.observed, b.observed);
             let a_ack = format!(
                 "OK {}{} r={} sp={}",
@@ -1085,8 +1132,26 @@ pub(crate) async fn finish_rendezvous_pair(
             );
             quic_ack_member(&mut a.send, a_ack.as_bytes(), PairSide::A).await?;
             quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
-            a.conn.closed().await;
-            b.conn.closed().await;
+            match completion {
+                QuicPairCompletion::EndpointSwap => {
+                    a.conn.closed().await;
+                    b.conn.closed().await;
+                }
+                QuicPairCompletion::Splice => {
+                    let (init_conn, acc_conn) = if pairing.initiator_holder == a.req.grant.grant.holder {
+                        (&a.conn, &b.conn)
+                    } else {
+                        (&b.conn, &a.conn)
+                    };
+                    // Both sides acked cleanly; a failure now is the splice itself, not a
+                    // one-sided ack race.
+                    crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay")
+                        .await
+                        .map_err(|e| -> BoxError {
+                            format!("channel relay splice ended after both sides acked: {e}").into()
+                        })?;
+                }
+            }
             Ok(pairing)
         }
         Err(e) => {
@@ -1094,7 +1159,7 @@ pub(crate) async fn finish_rendezvous_pair(
             let _ = b.send.write_all(b"NO").await;
             let _ = a.send.finish();
             let _ = b.send.finish();
-            Err(format!("channel pair refused: {e}").into())
+            Err(format!("{refusal_label}: {e}").into())
         }
     }
 }
@@ -1109,84 +1174,11 @@ pub(crate) async fn finish_rendezvous_pair(
 /// per pair — the mechanical prerequisite for taking the splice off the accept loop's
 /// single global slot (#109-concurrent).
 pub(crate) async fn finish_relay_pair(
-    mut a: AdmittedMember,
-    mut b: AdmittedMember,
+    a: AdmittedMember,
+    b: AdmittedMember,
     now: UnixSeconds,
 ) -> Result<ChannelPairing, BoxError> {
-    match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
-        Ok(pairing) => {
-            // #154: ack each side through `quic_ack_member`, which tags an I/O failure with its
-            // `PairSide` — so a mid-handoff drop on this QUIC-native completer surfaces as a
-            // `RelayHandoffError` naming the dead side (a transient race, not an admission refusal),
-            // exactly as `finish_relay_pair_over_streams` already does for the stream path (#148). This
-            // is the completer the NAT-to-NAT relay path uses, so the distinction matters most here.
-            //
-            // #104-follow: unlike `finish_relay_pair_over_streams` (whose `:443`-forced members are
-            // almost always behind symmetric/CGNAT NAT, so learning their reflexive is low-value and
-            // was deliberately deferred — see `admit_and_pair_on_stream`'s #121 Phase B1 comment), a
-            // member reaching THIS completer came in over the direct QUIC broker port — the exact
-            // population `CT_CHANNEL_RELAY_ONLY` covers and `#104`'s in-band relay->direct upgrade
-            // targets. `a`/`b.observed` were already captured at admission (used by
-            // `finish_rendezvous_pair` since #121 B1-follow) but never echoed here, so a relay-only
-            // member's own `ct-agent` never learned its `observed_reflexive` and `#104`'s upgrade
-            // path was structurally unreachable for it — live-reproduced via #248's cross-NAT test.
-            // Purely additive: `parse_channel_ack` already treats a missing `r=` as backward-compatible
-            // `None`, so this changes nothing for any client that doesn't look for the token.
-            //
-            // #134-follow (real gated hole-punch E2E test): this completer ALSO never relayed the
-            // peer's attested Noise key/holder/attestation — unlike `finish_rendezvous_pair` and
-            // `finish_relay_pair_over_streams`, both of which already carry it via `member_ack_suffix`/
-            // `write_member_ack`. Every relay-only member joining over the direct QUIC relay port (the
-            // ONLY path `join_via_relay_dcutr`/`join_via_relay_gate_dcutr` use) therefore always got
-            // `peer_noise_pubkey: None` and failed with "needs the peer's relayed Noise key (#101)" --
-            // the #136 NAT-to-NAT DCUtR upgrade had never actually completed against a real deployed
-            // edge, only in in-process tests that bypass this completer entirely. Fixed by including
-            // the endpoint + `member_ack_suffix` exactly as `finish_rendezvous_pair` does (a relay-only
-            // member's `req.endpoint` is already the relay-only sentinel, harmless to echo back).
-            //
-            // #276 piece 1: same `sp=<0|1>` edge-attested same-public-IP token as
-            // `finish_rendezvous_pair` — see that function's comment. Relay-only members reach this
-            // completer via the direct QUIC broker port (not the :443 front door), so their reflexive
-            // is genuinely meaningful here, unlike `finish_relay_pair_over_streams`'s deliberately
-            // deferred case.
-            let sp = same_public_ip(a.observed, b.observed);
-            let a_ack = format!(
-                "OK {}{} r={} sp={}",
-                b.req.endpoint,
-                member_ack_suffix(b.noise, &b.req.grant.grant.holder, b.attest),
-                a.observed,
-                sp as u8
-            );
-            let b_ack = format!(
-                "OK {}{} r={} sp={}",
-                a.req.endpoint,
-                member_ack_suffix(a.noise, &a.req.grant.grant.holder, a.attest),
-                b.observed,
-                sp as u8
-            );
-            quic_ack_member(&mut a.send, a_ack.as_bytes(), PairSide::A).await?;
-            quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
-            let (init_conn, acc_conn) = if pairing.initiator_holder == a.req.grant.grant.holder {
-                (&a.conn, &b.conn)
-            } else {
-                (&b.conn, &a.conn)
-            };
-            // Both sides acked cleanly; a failure now is the splice itself, not a one-sided ack race.
-            crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay")
-                .await
-                .map_err(|e| -> BoxError {
-                    format!("channel relay splice ended after both sides acked: {e}").into()
-                })?;
-            Ok(pairing)
-        }
-        Err(e) => {
-            let _ = a.send.write_all(b"NO").await;
-            let _ = b.send.write_all(b"NO").await;
-            let _ = a.send.finish();
-            let _ = b.send.finish();
-            Err(format!("channel relay pair refused: {e}").into())
-        }
-    }
+    finish_quic_pair_inner(a, b, now, QuicPairCompletion::Splice).await
 }
 
 /// Write one **QUIC-native** member's `ack` bytes + FIN, tagging any I/O failure with `side` so a
@@ -1240,6 +1232,14 @@ pub fn new_shared_channel_pairer() -> SharedChannelPairer {
     std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new()))
 }
 
+/// The wire token an expiring park sends before closing (ct-agent#21): a reaped member's
+/// client used to read a SILENT close, indistinguishable from a refusal -- it then advanced
+/// its dial ladder and backed off, burning 40s windows on what was a perfectly healthy rung
+/// (measured: 271 "rung failures" that were just idle park expiries). `EX` names the event so
+/// a current client re-parks on the SAME rung immediately; an older client sees it as the
+/// same EOF-ish close it always did (no behavior change).
+pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
+
 /// A channel member admitted over a **generic byte stream** (not a `quinn::Connection`)
 /// — e.g. a `:443` TLS-over-TCP front-door member whose network blocks the channel
 /// UDP/TCP ports (#106). Unlike [`AdmittedMember`] it carries no `quinn::Connection`:
@@ -1256,14 +1256,6 @@ pub fn new_shared_channel_pairer() -> SharedChannelPairer {
 /// attested key in the ack (#122) — exactly as the rendezvous path does. Without them a
 /// `:443`-only pair (both members forced onto the relay) could never learn each other's
 /// Noise key and the join failed at the pin step; carrying them here closes that gap.
-/// The wire token an expiring park sends before closing (ct-agent#21): a reaped member's
-/// client used to read a SILENT close, indistinguishable from a refusal -- it then advanced
-/// its dial ladder and backed off, burning 40s windows on what was a perfectly healthy rung
-/// (measured: 271 "rung failures" that were just idle park expiries). `EX` names the event so
-/// a current client re-parks on the SAME rung immediately; an older client sees it as the
-/// same EOF-ish close it always did (no behavior change).
-pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
-
 pub struct AdmittedStreamMember<S> {
     stream: S,
     req: ChannelJoinRequest,
@@ -1289,25 +1281,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AdmittedStreamMember<S> {
     /// and releases the #451 permit, exactly as the silent drop did.
     pub async fn notify_park_expired(mut self) {
         let _ = self.stream.write_all(PARK_EXPIRED_TOKEN).await;
-        let _ = self.stream.flush().await;
-        let _ = self.stream.shutdown().await;
-        // Packet-capture-proven (2026-08-14, the #21 measurement failure): v0.4.11 clients
-        // half-close their leg right after the possession signature, so by reap time this
-        // socket holds their UNREAD close_notify -- dropping it now makes the kernel send
-        // an immediate RST after our FIN, and at real-world RTT that RST overtakes the EX
-        // record still in flight and DISCARDS it from the peer's receive buffer (locally
-        // the EX won the race, which is why the E2E repro passed while every remote
-        // measurement saw an empty ack). Drain to EOF (bounded) so the close is graceful:
-        // FIN, no RST, the EX survives delivery.
-        let mut sink = [0u8; 256];
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while let Ok(n) = self.stream.read(&mut sink).await {
-                if n == 0 {
-                    break;
-                }
-            }
-        })
-        .await;
+        // Graceful close (found here first, 2026-08-14: v0.4.11 clients half-close their
+        // leg right after the possession signature, so by reap time this socket holds
+        // their unread close_notify — the EX was then RST-discarded on every remote
+        // measurement while the local E2E repro passed). The rule now lives in
+        // [`graceful_close`], shared with the 2b rendezvous completion (#511).
+        graceful_close(&mut self.stream).await;
     }
 }
 
@@ -1438,11 +1417,27 @@ where
 }
 
 /// How a completed `:443` stream pairing ends after both acks (#495 slice 2b).
-enum StreamPairCompletion {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPairCompletion {
     /// Historical behavior: the acked streams become the session (relay splice).
     Splice,
     /// Rendezvous contract: ack, flush, close — each member then opens its relay leg.
     RendezvousClose,
+}
+
+/// #495 2b / #511: THE phase→completion decision for stream pairings, in one place —
+/// every stream call site (the `:443` front-door arm; the WS upgrade path, whose
+/// members are always [`ParkPhase::Unmarked`]) routes through this rule. Ack-then-
+/// close ONLY when BOTH members marked the rendezvous phase; every other combination
+/// (relay-marked, legacy unmarked, mixed) keeps the historical splice — which is why
+/// `Unmarked` members can never reach `RendezvousClose`, by rule rather than by
+/// coincidence.
+pub fn completion_for(a: ParkPhase, b: ParkPhase) -> StreamPairCompletion {
+    if a == ParkPhase::Rendezvous && b == ParkPhase::Rendezvous {
+        StreamPairCompletion::RendezvousClose
+    } else {
+        StreamPairCompletion::Splice
+    }
 }
 
 async fn finish_stream_pair_inner<A, B>(
@@ -1497,9 +1492,10 @@ where
                         })?;
                 }
                 StreamPairCompletion::RendezvousClose => {
-                    // #495 2b: the rendezvous contract ends the stream after the ack.
-                    let _ = a.stream.shutdown().await;
-                    let _ = b.stream.shutdown().await;
+                    // #495 2b: the rendezvous contract ends the stream after the ack —
+                    // gracefully (#511): for this completer the ack IS the in-flight
+                    // final record the RST race would discard, see [`graceful_close`].
+                    tokio::join!(graceful_close(&mut a.stream), graceful_close(&mut b.stream));
                 }
             }
             Ok(pairing)
@@ -1509,9 +1505,36 @@ where
             let _ = b.stream.write_all(b"NO").await;
             let _ = a.stream.shutdown().await;
             let _ = b.stream.shutdown().await;
-            Err(format!("channel relay pair refused: {e}").into())
+            let refusal_label = match completion {
+                StreamPairCompletion::Splice => "channel relay pair refused",
+                // #511: a rendezvous pairing used to report itself as a "relay pair" here.
+                StreamPairCompletion::RendezvousClose => "channel rendezvous pair refused",
+            };
+            Err(format!("{refusal_label}: {e}").into())
         }
     }
+}
+
+/// Close a stream gracefully: flush, shutdown (FIN), then DRAIN to EOF (bounded 2s).
+/// Packet-capture-proven rule (ct-agent#21 measurement failure, 2026-08-14): dropping
+/// a socket that still holds the peer's unread close_notify makes the kernel send an
+/// RST right after our FIN, and at real-world RTT that RST overtakes the last record
+/// still in flight (the `EX` token there; the 2b rendezvous ack equally) and discards
+/// it from the peer's receive buffer. Draining keeps the close FIN-only so the final
+/// record survives delivery. Best-effort: every error ignored. Takes `&mut` so the
+/// caller's owner (and its #451 permit) stays alive through the close (#511).
+async fn graceful_close<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+    let mut sink = [0u8; 256];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Ok(n) = stream.read(&mut sink).await {
+            if n == 0 {
+                break;
+            }
+        }
+    })
+    .await;
 }
 
 /// Admit one channel member arriving over a `:443` front-door stream and offer it to a
@@ -1549,7 +1572,7 @@ pub async fn admit_and_pair_on_stream<S, F, Fut>(
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: Fn(ChannelId, [u8; 32]) -> Fut,
     Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
 {
@@ -1587,7 +1610,7 @@ async fn offer_admitted_stream_member<S>(
     observed: Option<std::net::IpAddr>,
 ) -> Result<PairedWithPhases<S>, BoxError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let channel = member.req.grant.grant.channel;
     let holder = member.req.grant.grant.holder;
@@ -1631,8 +1654,10 @@ where
             // same best-effort `EX` token a TTL reap sends: the park is gone through no
             // fault of its grant, and re-park-same-rung is the correct client reaction in
             // both cases. In the common case the stale leg is a corpse (an abandoned retry)
-            // and the write vanishes harmlessly, like the reaper's.
-            stale.payload.notify_park_expired().await;
+            // and the write vanishes harmlessly, like the reaper's. Spawned (#511): the
+            // notify's graceful close drains up to 2s, and this is the NEW member's
+            // admission path — the fresh park must not wait out the stale leg's teardown.
+            tokio::spawn(stale.payload.notify_park_expired());
             Ok(None)
         }
     }
@@ -3202,6 +3227,27 @@ mod tests {
         })
         .await
         .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
+    }
+
+    #[test]
+    /// #511: THE phase→completion rule, pinned as a matrix — ack-then-close ONLY for
+    /// a both-rendezvous pair; every other combination (mixed, relay, legacy
+    /// unmarked) splices. `Unmarked` never reaching `RendezvousClose` is what makes
+    /// the WS path's direct relay-completer call an instance of this rule.
+    fn completion_for_closes_only_a_both_rendezvous_pair_511() {
+        use ParkPhase::*;
+        assert_eq!(completion_for(Rendezvous, Rendezvous), StreamPairCompletion::RendezvousClose);
+        for (a, b) in [
+            (Rendezvous, Relay),
+            (Rendezvous, Unmarked),
+            (Relay, Relay),
+            (Relay, Unmarked),
+            (Unmarked, Unmarked),
+            (Unmarked, Rendezvous),
+            (Relay, Rendezvous),
+        ] {
+            assert_eq!(completion_for(a, b), StreamPairCompletion::Splice, "{a:?}+{b:?} must splice");
+        }
     }
 
     #[tokio::test]

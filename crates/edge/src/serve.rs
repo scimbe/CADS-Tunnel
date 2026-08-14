@@ -1182,18 +1182,19 @@ pub async fn serve_front_door(
                 }
             };
             if let Some(((a, a_phase), (b, b_phase))) = paired {
-                use crate::channel_broker::ParkPhase;
-                // #495 slice 2b: a pair where BOTH members carried the 0x01 rendezvous
-                // preamble gets the rendezvous completion (ack-then-close) — the contract
-                // their ack readers expect. Everything else (relay-marked, legacy
-                // unmarked, mixed) keeps the historical splice.
-                let rendezvous =
-                    a_phase == ParkPhase::Rendezvous && b_phase == ParkPhase::Rendezvous;
+                // #495 slice 2b / #511: the phase→completion rule lives in ONE place
+                // (`channel_broker::completion_for`) — both-rendezvous pairs get
+                // ack-then-close (the contract their ack readers expect), everything
+                // else keeps the historical splice.
+                let completion = crate::channel_broker::completion_for(a_phase, b_phase);
                 tokio::spawn(async move {
-                    let r = if rendezvous {
-                        crate::channel_broker::finish_rendezvous_pair_over_streams(a, b, now).await
-                    } else {
-                        crate::channel_broker::finish_relay_pair_over_streams(a, b, now).await
+                    let r = match completion {
+                        crate::channel_broker::StreamPairCompletion::RendezvousClose => {
+                            crate::channel_broker::finish_rendezvous_pair_over_streams(a, b, now).await
+                        }
+                        crate::channel_broker::StreamPairCompletion::Splice => {
+                            crate::channel_broker::finish_relay_pair_over_streams(a, b, now).await
+                        }
                     };
                     if let Err(e) = r {
                         eprintln!("ct-edge: front-door :443 channel pairing ended: {e}");

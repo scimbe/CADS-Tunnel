@@ -409,6 +409,10 @@ async fn handle_ws_channel_join(
     .await;
     match paired {
         Ok(Some((a, b))) => {
+            // #511: WS members are always ParkPhase::Unmarked (no preamble peek on this
+            // path), and `channel_broker::completion_for` maps any Unmarked side to the
+            // splice — so calling the relay completer directly here IS that rule, not an
+            // exception to it.
             if let Err(e) = crate::channel_broker::finish_relay_pair_over_streams(a, b, now).await {
                 eprintln!("ct-edge: ws-channel relay ended: {e}");
             }
