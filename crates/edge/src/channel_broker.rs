@@ -141,9 +141,27 @@ pub enum PairOutcome<T> {
 /// and only pairs it with a *different holder of the same channel* — so two channels'
 /// members racing to connect can never cross-pair (the #109 mis-pairing failure), and
 /// a lone first-comer is bounded by its `deadline` instead of wedging the round.
+///
+/// #495 slice 1: how many parks ONE member (channel+holder) may hold queued at once before its
+/// oldest is superseded. Why a queue at all: the old single-slot supersede-on-reoffer semantics
+/// meant every consumed park left a no-park window until the client's re-admit round trip
+/// (~200-400ms over WAN) landed -- measured live as a structural 15-22% per-round fault rate for
+/// call-per-round consumers (ct-agent#18). A client that re-parks BEFORE its previous park is
+/// consumed now simply deepens the queue instead of killing its own live park. Why a CAP: each
+/// queued park holds a real connection and (#451) a cap permit; a crash-looping client must not
+/// accumulate them unboundedly. 4 = deep enough that a serve loop keeping 1-2 parks in flight
+/// never trips it, small enough that the worst case per member stays trivial. Entries expire at
+/// the park TTL (30s) well inside the client-side 45s admission bound (#140), so queued parks
+/// are live in practice, not corpses.
+const PARKS_PER_MEMBER: usize = 4;
+
 #[derive(Debug, Default)]
 pub struct ChannelPairer<T> {
-    waiting: std::collections::HashMap<ChannelId, WaitingMember<T>>,
+    /// #495 slice 1: a small FIFO of waiters per channel (was: exactly one). Invariant kept by
+    /// `offer`: at any moment the queue holds waiters of AT MOST one holder -- the instant a
+    /// different holder arrives it pairs with the oldest queued waiter instead of joining the
+    /// queue, so two holders' parks never coexist for one channel.
+    waiting: std::collections::HashMap<ChannelId, std::collections::VecDeque<WaitingMember<T>>>,
 }
 
 impl<T> ChannelPairer<T> {
@@ -151,42 +169,54 @@ impl<T> ChannelPairer<T> {
         Self { waiting: std::collections::HashMap::new() }
     }
 
-    /// Offer an admitted member. Parks it, pairs it with the waiting partner of the
-    /// same channel, or supersedes a stale same-holder wait — see [`PairOutcome`].
+    /// Offer an admitted member. Pairs it with the OLDEST queued waiter of a different holder
+    /// on the same channel (FIFO fairness: the longest-waiting park is consumed first), parks
+    /// it otherwise, or -- only when this member already has [`PARKS_PER_MEMBER`] parks queued
+    /// -- supersedes its own oldest park. See [`PairOutcome`].
     pub fn offer(&mut self, member: WaitingMember<T>) -> PairOutcome<T> {
-        match self.waiting.remove(&member.channel) {
-            None => {
-                self.waiting.insert(member.channel, member);
-                PairOutcome::Parked
+        let queue = self.waiting.entry(member.channel).or_default();
+        // A different holder waiting? Pair with its oldest park (invariant: the queue only
+        // ever holds one holder's parks, so checking the front suffices).
+        if queue.front().is_some_and(|w| w.holder != member.holder) {
+            let existing = queue.pop_front().expect("front just checked");
+            if queue.is_empty() {
+                self.waiting.remove(&member.channel);
             }
-            Some(existing) if existing.holder == member.holder => {
-                // Same holder retried before its partner showed up: keep the fresh
-                // offer parked, hand the stale one back to be closed.
-                self.waiting.insert(member.channel, member);
-                PairOutcome::Superseded(existing)
-            }
-            Some(existing) => PairOutcome::Paired(existing, member),
+            return PairOutcome::Paired(existing, member);
         }
+        // Same holder (or empty): join the queue; beyond the cap, the OLDEST park is
+        // superseded -- not the newest, so a member's parks age out in arrival order.
+        queue.push_back(member);
+        if queue.len() > PARKS_PER_MEMBER {
+            let stale = queue.pop_front().expect("len just checked > cap >= 1");
+            return PairOutcome::Superseded(stale);
+        }
+        PairOutcome::Parked
     }
 
-    /// Evict and return every lone waiter whose `deadline` is at or before `now` (#3):
-    /// a first-comer with no partner is bounded instead of wedging the round forever.
+    /// Evict and return every waiter whose `deadline` is at or before `now` (#3): a park with
+    /// no partner is bounded instead of wedging the round forever. Sweeps INSIDE each queue
+    /// (an expired older park behind a fresher one is still evicted) and drops emptied queues.
     pub fn drain_expired(&mut self, now: UnixSeconds) -> Vec<WaitingMember<T>> {
-        let expired: Vec<ChannelId> = self
-            .waiting
-            .iter()
-            .filter(|(_, m)| m.deadline <= now)
-            .map(|(c, _)| *c)
-            .collect();
-        expired
-            .into_iter()
-            .filter_map(|c| self.waiting.remove(&c))
-            .collect()
+        let mut drained = Vec::new();
+        self.waiting.retain(|_, queue| {
+            let mut kept = std::collections::VecDeque::with_capacity(queue.len());
+            for m in queue.drain(..) {
+                if m.deadline <= now {
+                    drained.push(m);
+                } else {
+                    kept.push_back(m);
+                }
+            }
+            *queue = kept;
+            !queue.is_empty()
+        });
+        drained
     }
 
-    /// Number of members currently parked (one per waiting channel).
+    /// Total members currently parked (across all channels and queue depths).
     pub fn len(&self) -> usize {
-        self.waiting.len()
+        self.waiting.values().map(std::collections::VecDeque::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1695,19 +1725,68 @@ mod tests {
 
         // A same-holder re-offer (a retry) supersedes the stale wait rather than
         // pairing the holder with itself.
+        // #495 slice 1 CONTRACT CHANGE: a same-holder re-offer QUEUES (up to PARKS_PER_MEMBER)
+        // instead of superseding at depth 1 -- the whole point of the queue is that a fresh
+        // park no longer kills the live older one (the re-park gap, ct-agent#18).
         assert_eq!(pairer.offer(m(0x33, 0xDD, 100, "Z-v1")), PairOutcome::Parked);
-        match pairer.offer(m(0x33, 0xDD, 200, "Z-v2")) {
-            PairOutcome::Superseded(stale) => assert_eq!(stale.payload, "Z-v1"),
-            other => panic!("expected Superseded(Z-v1), got {other:?}"),
-        }
-        assert_eq!(pairer.len(), 2, "the fresh Z offer stays parked, plus Y");
+        assert_eq!(pairer.offer(m(0x33, 0xDD, 200, "Z-v2")), PairOutcome::Parked, "same holder queues now");
+        assert_eq!(pairer.len(), 3, "both Z parks queued, plus Y");
 
-        // Lone waiters past their deadline are drained (#3): Y (deadline 100) is evicted
-        // at now=150, but the fresh Z-v2 (deadline 200) survives.
-        let drained = pairer.drain_expired(150);
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].payload, "Y-init");
+        // Expired waiters are drained from INSIDE queues (#3/#495): Y (deadline 100) and the
+        // older Z-v1 (deadline 100) are evicted at now=150; the fresh Z-v2 (deadline 200)
+        // survives behind its evicted elder.
+        let mut drained: Vec<&str> = pairer.drain_expired(150).into_iter().map(|m| m.payload).collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec!["Y-init", "Z-v1"]);
         assert_eq!(pairer.len(), 1, "Z-v2 (deadline 200) is not yet expired at 150");
+    }
+
+    #[test]
+    fn park_queue_closes_the_repark_gap_and_caps_per_member_495() {
+        // #495 slice 1, the three queue properties in one place:
+        // (1) same-holder re-parks DEEPEN the queue (no gap: consuming one park leaves the
+        //     next already standing); (2) a different holder pairs with the OLDEST park (FIFO);
+        //     (3) beyond PARKS_PER_MEMBER the member's own oldest park is superseded (bounded).
+        let m = |chan: u8, holder: u8, deadline: u64, tag: &'static str| WaitingMember {
+            channel: ChannelId([chan; 32]),
+            holder: [holder; 32],
+            deadline,
+            payload: tag,
+        };
+        let mut pairer: ChannelPairer<&'static str> = ChannelPairer::new();
+
+        // (1) depth builds without supersede up to the cap.
+        for (i, tag) in ["a1", "a2", "a3", "a4"].iter().enumerate() {
+            assert_eq!(
+                pairer.offer(m(0x55, 0xAA, 100 + i as u64, tag)),
+                PairOutcome::Parked,
+                "park {tag} queues"
+            );
+        }
+        assert_eq!(pairer.len(), 4);
+
+        // (3) the 5th park supersedes the OLDEST (a1), not the newest.
+        match pairer.offer(m(0x55, 0xAA, 105, "a5")) {
+            PairOutcome::Superseded(stale) => assert_eq!(stale.payload, "a1", "oldest ages out first"),
+            other => panic!("expected Superseded(a1), got {other:?}"),
+        }
+        assert_eq!(pairer.len(), 4, "still at the cap");
+
+        // (2) a different holder pairs with the oldest REMAINING park (a2)...
+        match pairer.offer(m(0x55, 0xBB, 300, "b1")) {
+            PairOutcome::Paired(oldest, fresh) => {
+                assert_eq!(oldest.payload, "a2", "FIFO: the longest-waiting park is consumed first");
+                assert_eq!(fresh.payload, "b1");
+            }
+            other => panic!("expected Paired, got {other:?}"),
+        }
+        // ...and the NEXT partner pairs instantly with a3 -- the re-park gap is structurally
+        // gone: no window where the member has zero parks between consumption and re-admit.
+        match pairer.offer(m(0x55, 0xBB, 300, "b2")) {
+            PairOutcome::Paired(oldest, _) => assert_eq!(oldest.payload, "a3"),
+            other => panic!("expected Paired with a3, got {other:?}"),
+        }
+        assert_eq!(pairer.len(), 2, "a4 + a5 still parked, ready for further partners");
     }
 
     #[test]
