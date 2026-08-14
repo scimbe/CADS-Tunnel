@@ -308,11 +308,42 @@ pub struct ChannelPairer<T> {
     /// EX-notified). Monotonic; [`Self::take_dead_dropped`] reads-and-resets for the reaper's
     /// per-sweep visibility line.
     dead_dropped: u64,
+    /// #508 persistence memory: how long each (expired-channel, waiting-channel, ip)
+    /// sibling triple has been recurring. Field-tuned 2026-08-14 evening: the naive
+    /// per-sighting log fired every minute for the 12-minute post-redeploy settle of a
+    /// legitimate MULTI-CHANNEL host (an idle channel's parks expire partnerless every
+    /// park cycle while a busy sibling waits — normal), while the true positive it was
+    /// built for (mismatched provisioning) recurs for HOURS. A triple must persist
+    /// [`SIBLING_PERSISTENCE_SECS`] across [`SIBLING_MIN_SIGHTINGS`] sweeps before it
+    /// is spoken; entries unseen for [`SIBLING_PRUNE_SECS`] reset.
+    sibling_sightings: std::collections::HashMap<(ChannelId, ChannelId, std::net::IpAddr), SiblingSighting>,
 }
+
+/// One #508 triple's recurrence record (see `ChannelPairer::sibling_sightings`).
+#[derive(Debug, Clone, Copy)]
+struct SiblingSighting {
+    first: UnixSeconds,
+    last: UnixSeconds,
+    count: u32,
+}
+
+/// #508: how long a sibling-channel triple must keep recurring before it is logged.
+/// 15 min: the flappy-class true positive (19 h) trips early and keeps alarming; a
+/// post-redeploy settle (measured ≤12 min) never speaks.
+const SIBLING_PERSISTENCE_SECS: u64 = 900;
+/// #508: minimum recurrences within the persistence window (guards against sparse
+/// coincidental overlaps counting as persistence).
+const SIBLING_MIN_SIGHTINGS: u32 = 10;
+/// #508: a triple unseen this long is forgotten (the condition resolved).
+const SIBLING_PRUNE_SECS: u64 = 600;
 
 impl<T> ChannelPairer<T> {
     pub fn new() -> Self {
-        Self { waiting: std::collections::HashMap::new(), dead_dropped: 0 }
+        Self {
+            waiting: std::collections::HashMap::new(),
+            dead_dropped: 0,
+            sibling_sightings: std::collections::HashMap::new(),
+        }
     }
 
     /// #499 slice B: corpses dropped since the last call (read-and-reset -- the reaper logs
@@ -400,25 +431,26 @@ impl<T> ChannelPairer<T> {
         // SAME-peer park still waits on a DIFFERENT channel is the signature of a
         // half-updated deployment (one side's grants regenerated, the other's env
         // stale) -- the pairer correctly never matches them, but its silence cost 19h
-        // of by-hand diagnosis in the field (2026-08-14, flappy crew bridge). Named
-        // here, rate-limited to one line per minute process-wide -- and the rate gate
-        // is checked BEFORE the O(drained x queues) sibling scan runs (#511: this
-        // whole block executes under the pairer lock, so a gated minute must not pay
-        // the scan either).
-        static LAST_508_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let last = LAST_508_LOG.load(std::sync::atomic::Ordering::Relaxed);
-        if !drained.is_empty() && now.saturating_sub(last) >= 60 {
-            if let Some((expired_channel, waiting_channel, ip)) =
-                self.sibling_channel_mismatches(&drained).into_iter().next()
-            {
-                if LAST_508_LOG
+        // of by-hand diagnosis in the field (2026-08-14, flappy crew bridge). A triple
+        // must PERSIST (see `sibling_sightings`) before it is spoken -- a legitimate
+        // multi-channel host recreates this signature transiently after every
+        // redeploy -- and confirmed triples stay rate-limited to one line per minute.
+        // (The scan runs on every non-empty drain to feed the persistence memory; the
+        // #511 gate-first micro-optimization gave way to that -- `drained` is a
+        // handful of members and the scan is bounded by the queue count.)
+        if !drained.is_empty() {
+            let triples = self.sibling_channel_mismatches(&drained);
+            for (expired_channel, waiting_channel, ip) in self.note_sibling_sightings(triples, now) {
+                static LAST_508_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let last = LAST_508_LOG.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= 60 && LAST_508_LOG
                     .compare_exchange(last, now, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
                     .is_ok()
                 {
                     eprintln!(
                         "ct-edge: lone park expired (channel={}…) while a park from the SAME peer ({ip}) \
-                         waits on a DIFFERENT channel ({}…) — mismatched provisioning between the two \
-                         sides? (#508)",
+                         has waited on a DIFFERENT channel ({}…) persistently for 15+ minutes — \
+                         mismatched provisioning between the two sides? (#508)",
                         hex_prefix(&expired_channel.0),
                         hex_prefix(&waiting_channel.0),
                     );
@@ -426,6 +458,32 @@ impl<T> ChannelPairer<T> {
             }
         }
         drained
+    }
+
+    /// #508 persistence core (pure, unit-tested): record `triples` as sighted at `now`,
+    /// prune entries unseen for [`SIBLING_PRUNE_SECS`], and return only the triples
+    /// whose recurrence has now crossed BOTH thresholds ([`SIBLING_PERSISTENCE_SECS`]
+    /// since first sighting and [`SIBLING_MIN_SIGHTINGS`] sightings) -- the ones worth
+    /// an operator's attention.
+    fn note_sibling_sightings(
+        &mut self,
+        triples: Vec<(ChannelId, ChannelId, std::net::IpAddr)>,
+        now: UnixSeconds,
+    ) -> Vec<(ChannelId, ChannelId, std::net::IpAddr)> {
+        self.sibling_sightings.retain(|_, s| now.saturating_sub(s.last) <= SIBLING_PRUNE_SECS);
+        let mut confirmed = Vec::new();
+        for t in triples {
+            let s = self
+                .sibling_sightings
+                .entry(t)
+                .or_insert(SiblingSighting { first: now, last: now, count: 0 });
+            s.last = now;
+            s.count = s.count.saturating_add(1);
+            if s.count >= SIBLING_MIN_SIGHTINGS && now.saturating_sub(s.first) >= SIBLING_PERSISTENCE_SECS {
+                confirmed.push(t);
+            }
+        }
+        confirmed
     }
 
     /// #508, pure core: for each drained (expired, partnerless) member with a known
@@ -3227,6 +3285,38 @@ mod tests {
         })
         .await
         .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
+    }
+
+    /// #508 persistence tuning (field-falsified 2026-08-14 evening: the per-sighting
+    /// log fired every minute through a legitimate multi-channel host's 12-minute
+    /// post-redeploy settle): a sibling triple is only confirmed after 15+ minutes
+    /// AND 10+ sightings; a gap over 10 minutes resets the record.
+    #[test]
+    fn sibling_sightings_confirm_only_persistent_triples_508() {
+        let mut pairer: ChannelPairer<()> = ChannelPairer::new();
+        let ip: std::net::IpAddr = "203.0.113.50".parse().unwrap();
+        let triple = (ChannelId([0xA; 32]), ChannelId([0xB; 32]), ip);
+
+        // A post-redeploy settle: sightings every 60s for 12 minutes -- never confirmed.
+        for min in 0..12 {
+            assert!(
+                pairer.note_sibling_sightings(vec![triple], 1_000 + min * 60).is_empty(),
+                "minute {min}: not yet persistent"
+            );
+        }
+        // The condition clears for >10 minutes: the record is pruned, a fresh start.
+        assert!(pairer.note_sibling_sightings(vec![triple], 1_000 + 12 * 60 + 601).is_empty());
+        // The flappy class: recurring every 60s -- confirmed once BOTH thresholds hold
+        // (>=10 sightings and >=900s since the post-prune first sighting).
+        let base = 1_000 + 12 * 60 + 601;
+        let mut confirmed_at = None;
+        for min in 1..=20 {
+            if !pairer.note_sibling_sightings(vec![triple], base + min * 60).is_empty() {
+                confirmed_at = Some(min);
+                break;
+            }
+        }
+        assert_eq!(confirmed_at, Some(15), "confirmed at the 15-minute persistence bound");
     }
 
     /// #511: THE phase→completion rule, pinned as a matrix — ack-then-close ONLY for
