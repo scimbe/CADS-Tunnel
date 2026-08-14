@@ -11,7 +11,7 @@ RUN apt-get update \
 # Which ct-agent tag/branch/commit to build -- bump deliberately. No tagged release
 # exists yet (see crates/agent-tools/Cargo.toml's comment), so this defaults to a
 # pinned commit; switch to a `vX.Y.Z` tag once one exists.
-ARG CT_AGENT_REF=622e8f8fce57ad857022e463b611f397d685c1fb
+ARG CT_AGENT_REF=2439f8138120f7f8408f6173096f4b457f54ef5a
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
