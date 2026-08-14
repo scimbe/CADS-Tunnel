@@ -490,7 +490,10 @@ restarts, re-running `run-demo.sh` for help — are gone. What remains:
    /registry/authorize-host` (#214), never the edge admin API directly: only the CP path
    records the ownership that rehydration replays, and for a hostname owned by a portal
    tunnel the proxy now answers `409` instead of being silently reverted by the Gelb/ACME
-   re-authorize loop (#504).
+   re-authorize loop (#504). The edge's own `/admin/authorize-host` route still exists
+   (tests, emergencies) but has neither of those guarantees — it logs a loud
+   `DIRECT edge write` warning on every use (#513); if you see that line outside a
+   deliberate emergency, someone is provisioning the wrong way.
 
 [#495]: https://github.com/scimbe/CADS-Tunnel/issues/495
 [#496]: https://github.com/scimbe/CADS-Tunnel/issues/496

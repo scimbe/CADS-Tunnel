@@ -1984,7 +1984,7 @@ pub fn login_gate_portal_router(
 }
 
 #[derive(Deserialize)]
-struct RequireLoginForm {
+struct LoginPolicyForm {
     /// Present (any value) when the portal checkbox was checked; absent when
     /// unchecked -- standard HTML checkbox-form semantics, not a boolean field.
     enabled: Option<String>,
@@ -1994,7 +1994,7 @@ async fn set_allow_any_login_route(
     State(st): State<LoginGateState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Form(form): Form<RequireLoginForm>,
+    Form(form): Form<LoginPolicyForm>,
 ) -> Response {
     // #501: same owner-scoping and form shape as the require-login toggle below.
     let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
@@ -2011,7 +2011,7 @@ async fn set_require_login_route(
     State(st): State<LoginGateState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Form(form): Form<RequireLoginForm>,
+    Form(form): Form<LoginPolicyForm>,
 ) -> Response {
     let Some(subject) = crate::portal::session_subject_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();

@@ -3159,11 +3159,11 @@ mod tests {
         assert!(pairer.sibling_channel_mismatches(&[m(0xB, 6, Some(ip_a))]).is_empty());
     }
 
-    #[tokio::test]
     /// #495 slice 2b: two RENDEZVOUS-marked members (0x01 preamble) complete with
     /// ack-then-CLOSE — and that heals even the pre-v0.4.16 EOF-waiting ack reader
     /// (simulated here with `take(512).read_to_end`, the exact #494 deadlock shape):
     /// both clients get their ack promptly because the stream genuinely ends.
+    #[tokio::test]
     async fn rendezvous_marked_pair_acks_then_closes_healing_eof_readers_495_2b() {
         use std::sync::Mutex;
         let pk = operator_pubkey();
@@ -3229,11 +3229,11 @@ mod tests {
         .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
     }
 
-    #[test]
     /// #511: THE phase→completion rule, pinned as a matrix — ack-then-close ONLY for
     /// a both-rendezvous pair; every other combination (mixed, relay, legacy
     /// unmarked) splices. `Unmarked` never reaching `RendezvousClose` is what makes
     /// the WS path's direct relay-completer call an instance of this rule.
+    #[test]
     fn completion_for_closes_only_a_both_rendezvous_pair_511() {
         use ParkPhase::*;
         assert_eq!(completion_for(Rendezvous, Rendezvous), StreamPairCompletion::RendezvousClose);
@@ -3250,12 +3250,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
     /// #509: the #495-2a preamble peek is an admission read and must sit under the
     /// same `join_timeout` bound as the admission proper -- the `:443` listener
     /// passes no listener-level handshake timeout and relies on every arm bounding
     /// its own read phase. A KA peer that completes TLS and then goes silent must
     /// be dropped within `join_timeout`, not held (with its permits) forever.
+    #[tokio::test]
     async fn silent_ka_peer_is_dropped_within_the_join_timeout_509() {
         use std::sync::Mutex;
         let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
@@ -3281,11 +3281,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
     /// #509 (typed-errors half): a wrong byte AFTER the preamble magic is a defect
     /// in the client's marker writer -- no retry can succeed -- so it must be a
     /// [`DefinitiveJoinRefusal`] for the per-IP penalty to catch a client looping
     /// on it, and it must fail promptly (it is part of the guarded admission read).
+    #[tokio::test]
     async fn unknown_phase_marker_is_a_definitive_refusal_509() {
         use std::sync::Mutex;
         let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
@@ -3311,13 +3311,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
     /// #494 field repro (2026-08-14): two v0.4.13-shaped KA members (keepalive
     /// negotiated, NO phase preamble) of one channel, driven through the exact
     /// field path -- preamble peek + PrependBytes + park-keepalive pump + offer +
     /// `finish_relay_pair_over_streams` -- must BOTH receive their acks and splice
     /// within seconds. In the field both clients hung ~45s with the park consumed
     /// and no ack ever arriving; this pins the completion end-to-end.
+    #[tokio::test]
     async fn two_ka_members_without_preamble_pair_ack_and_splice_promptly_494() {
         use std::sync::Mutex;
         let pk = operator_pubkey();

@@ -91,6 +91,20 @@ impl ConnectionCap {
 /// TCP-fallback agent rendezvous (issue #3 / P1.2c-3), where a single stream
 /// cannot be cloned/multiplexed like a QUIC connection.
 pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
+/// #502-follow (#513): WHY a hostname bind was refused. The 'H' arm's operator log
+/// used to collapse "already bound to a different token" and "token revoked" into
+/// one line, leaving exactly the revoke case -- the one an operator can act on
+/// (re-provision the agent) -- indistinguishable from a takeover refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostBindRefusal {
+    /// Rejected by hostname normalization (#23 BP4b-d).
+    MalformedHostname,
+    /// The token is revoked (#411) -- re-provision the agent.
+    Revoked,
+    /// The hostname is bound to a DIFFERENT token (takeover refusal, #23 BP4a).
+    BoundToDifferentToken,
+}
+
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> DuplexStream for T {}
 pub type BoxedStream = Box<dyn DuplexStream>;
 
@@ -458,15 +472,17 @@ impl<H: Clone> EdgeState<H> {
         }
     }
 
+
+
     /// Bind a public hostname to a routing token (Browser Plane, #23), **unless**
     /// the hostname is already bound to a *different* token — a takeover-safe bind
     /// (#23 BP4a). Rebinding the same token (an agent reconnecting) is idempotent
     /// and succeeds. Returns `true` when the binding is in place, `false` when a
     /// conflicting bind was refused (the existing route is left untouched). The
     /// hostname is lowercased so SNI lookups are case-insensitive.
-    pub fn register_host(&self, host: &str, token: RoutingToken) -> bool {
+    pub fn register_host(&self, host: &str, token: RoutingToken) -> Result<(), HostBindRefusal> {
         let Some(key) = ct_common::normalize_hostname(host) else {
-            return false; // reject malformed hostnames (#23 BP4b-d)
+            return Err(HostBindRefusal::MalformedHostname);
         };
         // #282: held across the whole bind so a concurrent remove_registration
         // teardown for this token can't observe "not yet bound" and wipe this
@@ -477,11 +493,11 @@ impl<H: Clone> EdgeState<H> {
         // revocation before calling this, so a revoked token could still claim a
         // public hostname. Fixed once, here, so no caller can forget it.
         if self.is_revoked(&token) {
-            return false;
+            return Err(HostBindRefusal::Revoked);
         }
         let mut hosts = self.hosts.write_safe();
         match hosts.get(&key) {
-            Some(existing) if *existing != token => false,
+            Some(existing) if *existing != token => Err(HostBindRefusal::BoundToDifferentToken),
             _ => {
                 // #360: keep the reverse index in lockstep. A HashSet insert
                 // is naturally idempotent, so the "same token reconnects,
@@ -490,7 +506,7 @@ impl<H: Clone> EdgeState<H> {
                 // "was it already there" check is needed here.
                 self.hosts_by_token.lock_safe().entry(token.clone()).or_default().insert(key.clone());
                 hosts.insert(key, token);
-                true
+                Ok(())
             }
         }
     }
@@ -1374,10 +1390,14 @@ mod tests {
     fn host_normalization_collapses_trailing_dot_and_rejects_junk() {
         // #23 BP4b-d: bind/lookup normalize identically; malformed hosts refused.
         let state = EdgeState::<u32>::new();
-        assert!(state.register_host("App.Example.", token(7)));
+        assert!(state.register_host("App.Example.", token(7)).is_ok());
         assert_eq!(state.route_host("app.example"), Some(token(7)));
         assert_eq!(state.route_host("app.example."), Some(token(7)), "trailing dot collapses");
-        assert!(!state.register_host("bad host", token(8)), "malformed hostname refused at bind");
+        assert_eq!(
+            state.register_host("bad host", token(8)),
+            Err(HostBindRefusal::MalformedHostname),
+            "malformed hostname refused at bind"
+        );
         assert_eq!(state.route_host("bad host"), None);
     }
 
@@ -1411,19 +1431,23 @@ mod tests {
         let id = state.register(t1.clone(), 5u32);
 
         // First bind wins; rebinding the SAME token (reconnect) is idempotent-OK.
-        assert!(state.register_host("app.example", t1.clone()));
-        assert!(state.register_host("app.example", t1.clone()), "same-token rebind ok");
+        assert!(state.register_host("app.example", t1.clone()).is_ok());
+        assert!(state.register_host("app.example", t1.clone()).is_ok(), "same-token rebind ok");
         assert_eq!(state.route_host("app.example"), Some(t1.clone()));
 
         // #360: bind a SECOND, different hostname to the same token. This is
         // the case the hosts_by_token reverse index has to get right -- one
         // token owning multiple hostnames, all of which must be found and
         // cleared on teardown, not just the first one ever bound.
-        assert!(state.register_host("app-2.example", t1.clone()));
+        assert!(state.register_host("app-2.example", t1.clone()).is_ok());
         assert_eq!(state.route_host("app-2.example"), Some(t1.clone()));
 
         // A conflicting bind to a DIFFERENT token is refused; route untouched.
-        assert!(!state.register_host("app.example", t2.clone()), "takeover refused");
+        assert_eq!(
+            state.register_host("app.example", t2.clone()),
+            Err(HostBindRefusal::BoundToDifferentToken),
+            "takeover refused"
+        );
         assert_eq!(state.route_host("app.example"), Some(t1.clone()), "original route intact");
 
         // When the tunnel's last agent drops, BOTH stale host routes are
@@ -1434,7 +1458,7 @@ mod tests {
         assert_eq!(state.route_host("app-2.example"), None, "second host route also cleared on drop");
 
         // ...so the hostnames are now free for a different tunnel to claim.
-        assert!(state.register_host("app.example", t2.clone()));
+        assert!(state.register_host("app.example", t2.clone()).is_ok());
         assert_eq!(state.route_host("app.example"), Some(t2));
     }
 
@@ -1458,7 +1482,7 @@ mod tests {
         // so a reconnecting agent can't defeat a customer's "revoke".
         let state = EdgeState::new();
         let t = token(9);
-        state.register_host("app.example", t.clone());
+        let _ = state.register_host("app.example", t.clone());
         state.register(t.clone(), 1u32);
         state.register(t.clone(), 4u32); // a second, redundant registration (#8)
         assert_eq!(state.active_tunnels(), 1);
@@ -1492,7 +1516,7 @@ mod tests {
         // left behind, independent of the new tenant's own actual cert state.
         let state = EdgeState::<u32>::new();
         let old_owner = token(11);
-        state.register_host("shared.example", old_owner.clone());
+        let _ = state.register_host("shared.example", old_owner.clone());
         state.set_cert_tier("shared.example", true); // old tenant is Gelb
         assert!(state.is_gelb("shared.example"));
 
@@ -1506,7 +1530,7 @@ mod tests {
         // re-provisioning) -- it must start neutral (not-Gelb), not inherit
         // the old tenant's tier.
         let new_owner = token(12);
-        assert!(state.register_host("shared.example", new_owner));
+        assert!(state.register_host("shared.example", new_owner).is_ok());
         assert!(
             !state.is_gelb("shared.example"),
             "a freshly re-bound hostname must never inherit a previous tenant's Gelb/Grün tier"
@@ -1568,8 +1592,9 @@ mod tests {
         let state = EdgeState::<u32>::new();
         let t = token(5);
         state.revoke_token(&t);
-        assert!(
-            !state.register_host("revoked.example", t),
+        assert_eq!(
+            state.register_host("revoked.example", t),
+            Err(HostBindRefusal::Revoked),
             "a revoked token must never be able to bind a public hostname"
         );
         assert_eq!(state.route_host("revoked.example"), None);

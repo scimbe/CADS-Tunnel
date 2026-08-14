@@ -950,7 +950,7 @@ pub async fn serve_front_door(
     // The `ChannelBroker` arm is the one that DOESN'T block for the connection's real
     // lifetime (it can return the instant a lone member parks, or after merely
     // spawning the relay for a matched pair) -- so it explicitly moves `permit` into
-    // `admit_and_pair_on_stream`, which carries it on the constructed member so it
+    // `admit_and_pair_on_boxed_stream`, which carries it on the constructed member so it
     // travels with the connection instead of dropping early. See #451's issue for the
     // "0 permits for 2N live sockets" gap this closes.
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -1086,10 +1086,7 @@ pub async fn serve_front_door(
             // (power-of-two logging), and scoped to the ChannelBroker arm only: every
             // other front-door route from the same possibly-NAT-shared IP is untouched.
             {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now = unix_now();
                 if state.join_penalized(observed.ip(), now) {
                     let total = state.join_refusal_penalty().note_shed();
                     if total.is_power_of_two() || total % 1000 == 0 {
@@ -1130,10 +1127,7 @@ pub async fn serve_front_door(
                 tls.get_ref().1.alpn_protocol(),
                 Some(p) if p == crate::sni::CT_EDGE_CHANNEL_KA_ALPN.as_bytes() || p == b"http/1.1"
             );
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = unix_now();
             // Same closure shape the QUIC broker builds from its `ChannelAuthorizer`,
             // here routed through the boxed resolver so a test can supply a mock.
             let resolver = ctx.resolver.clone();
@@ -1141,7 +1135,7 @@ pub async fn serve_front_door(
                 let resolver = resolver.clone();
                 async move { resolver.resolve_member(c, h).await }
             };
-            // Boxed into the shared cross-transport stream type (#XXX) so this `:443`
+            // Boxed into the shared cross-transport stream type (#495) so this `:443`
             // member correlates through the SAME pairer a browser member
             // (ws_channel.rs) offers itself to -- either can now be the partner.
             let boxed: crate::channel_broker::BoxedChannelStream = Box::pin(tls);
@@ -1151,7 +1145,7 @@ pub async fn serve_front_door(
             // and this whole function returns while the live TLS stream stays open inside
             // `ctx.pairer`, or a matched pair's relay is handed to a freshly spawned task
             // below. Carrying the permit on the constructed `AdmittedStreamMember` (inside
-            // `admit_and_pair_on_stream`) means it now travels with the connection through
+            // `admit_and_pair_on_boxed_stream`) means it now travels with the connection through
             // either path instead of releasing the moment this function returns.
             let paired = match crate::channel_broker::admit_and_pair_on_boxed_stream(
                 boxed,
@@ -1217,10 +1211,7 @@ pub async fn serve_front_door(
                 pos: 0,
                 inner: inbound,
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = unix_now();
             crate::relay_gate::serve_relay_gate(joined, ctx, now).await
         }
         crate::sni::FrontDoorRoute::Reject => Ok(()),
@@ -1425,14 +1416,19 @@ pub async fn serve_connection(
             }
             // Takeover-safe (#23 BP4a): refuse if the hostname is already bound to
             // a different tunnel, so a later bind can't silently steal the route.
-            if state.register_host(host, token) {
-                send.write_all(b"OK").await?;
-            } else {
-                eprintln!(
-                    "ct-edge: refused hostname bind for '{host}' (already bound to a different \
-                     token, or token revoked) (#502)"
-                );
-                send.write_all(b"NO").await?;
+            match state.register_host(host, token) {
+                Ok(()) => send.write_all(b"OK").await?,
+                Err(reason) => {
+                    // #502/#513: name the WHY -- the revoke case (re-provision the
+                    // agent) needs a different operator reaction than a takeover.
+                    let why = match reason {
+                        crate::state::HostBindRefusal::MalformedHostname => "malformed hostname",
+                        crate::state::HostBindRefusal::Revoked => "token revoked -- re-provision this agent",
+                        crate::state::HostBindRefusal::BoundToDifferentToken => "already bound to a DIFFERENT token",
+                    };
+                    eprintln!("ct-edge: refused hostname bind for '{host}': {why} (#502)");
+                    send.write_all(b"NO").await?;
+                }
             }
             send.finish()?;
             Ok(None)
@@ -1695,7 +1691,7 @@ where
         stream.read_exact(&mut host).await?;
         let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?.to_string();
         // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
-        if !state.host_bind_allowed(&host, &token) || !state.register_host(&host, token.clone()) {
+        if !state.host_bind_allowed(&host, &token) || state.register_host(&host, token.clone()).is_err() {
             stream.write_all(b"NO").await?;
             stream.flush().await?;
             return Ok::<_, BoxError>(None);
@@ -2288,10 +2284,7 @@ fn ca_key_path_for(cert_out: &str) -> String {
 /// the live edge accept path; the limiter's own logic is tested deterministically.
 fn rendezvous_window() -> u64 {
     const WINDOW_SECS: u64 = 60;
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / WINDOW_SECS)
-        .unwrap_or(0)
+    unix_now() / WINDOW_SECS
 }
 
 fn host_auth_required(require_env: Option<&str>, front_door_set: bool) -> bool {
@@ -2635,18 +2628,22 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     crate::edge_mesh_client::rehydrate(&cp_url, &tok, &edge_id),
                     crate::edge_mesh_client::fetch_revoked_tokens(&cp_url, &tok),
                 );
-                let n = pairs.len();
+                // #513: count what was actually AUTHORIZED -- `pairs` includes
+                // hostname-less (mesh-only) entries, and the old `pairs.len()` line
+                // overstated the rehydration by exactly those.
+                let mut authorized = 0usize;
                 for pair in pairs {
                     if let Some(host) = pair.hostname {
                         state.authorize_host(&host, RoutingToken(pair.token));
+                        authorized += 1;
                     }
                 }
                 eprintln!(
-                    "ct-edge: rehydrated {n} hostname authorization(s) from {cp_url} (edge_id={edge_id})"
+                    "ct-edge: rehydrated {authorized} hostname authorization(s) from {cp_url} (edge_id={edge_id})"
                 );
-                let n = revoked.len();
+                let revoked_count = revoked.len();
                 state.seed_revoked_tokens(revoked.into_iter().map(RoutingToken));
-                eprintln!("ct-edge: replayed {n} revoked token(s) from {cp_url}");
+                eprintln!("ct-edge: replayed {revoked_count} revoked token(s) from {cp_url}");
                 let hstate_cp_url = cp_url.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -2738,7 +2735,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // the Portal, or a Browser-Plane tunnel (serve_front_door). Off unless
     // CT_FRONT_DOOR is set; additive, so direct :8090/:4433 keep working. This is
     // the single port agents/clients/browsers on :443-only networks reach.
-    // Cross-transport pairing (#XXX): populated below (inside the CT_FRONT_DOOR arm,
+    // Cross-transport pairing (#495): populated below (inside the CT_FRONT_DOOR arm,
     // where the `:443` channel broker's pairer is actually constructed) whenever
     // channel brokering is enabled; the browser WebSocket listener further down
     // (unconditional on CT_FRONT_DOOR -- it can run standalone) picks it up if
@@ -3169,12 +3166,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     // two channels can never cross-pair. Replaces the old serial
                                     // `loop { broker_channel_relay(..).await }` that ran the
                                     // splice inline on the accept loop.
-                                    let now_fn = || {
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .map(|d| d.as_secs())
-                                            .unwrap_or(0)
-                                    };
+                                    let now_fn = unix_now;
                                     let authorize =
                                         move |c: ct_common::channel::ChannelId, h: [u8; 32]| {
                                             let a = relay_az.clone();
@@ -3231,12 +3223,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             // wedge the single global accept slot and two channels can never
                             // cross-pair. Replaces the old serial `loop { broker_channel_
                             // rendezvous(..).await }` that awaited both `conn.closed()` inline.
-                            let now_fn = || {
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0)
-                            };
+                            let now_fn = unix_now;
                             let authorize = move |c: ct_common::channel::ChannelId, h: [u8; 32]| {
                                 let a = authorizer.clone();
                                 // Resolve both the operator key (grant check) and the
@@ -3291,7 +3278,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let resolver: std::sync::Arc<dyn ChannelMemberResolver> = std::sync::Arc::new(
                     crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok),
                 );
-                // Cross-transport pairing (#XXX): reuse the SAME pairer the `:443` front
+                // Cross-transport pairing (#495): reuse the SAME pairer the `:443` front
                 // door's channel broker uses (constructed above whenever CP_URL+ADMIN_TOKEN
                 // are set, which this branch already requires too) so a browser member and a
                 // `:443`/QUIC member of the same channel correlate and can pair with each
@@ -3447,7 +3434,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let state = Arc::new(EdgeState::<Connection>::new());
         let token = RoutingToken([0x55; 32]);
-        state.register_host("drain.test", token.clone());
+        let _ = state.register_host("drain.test", token.clone());
 
         // Two dead parks (receivers dropped -- the flap leftovers), then a live one.
         drop(state.park_tcp_agent(token.clone()));
@@ -4062,7 +4049,7 @@ mod tests {
         let state_b: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
         state_b.set_admin_token([0x42u8; 32]);
         let host = "app.example.test";
-        state_b.register_host(host, RoutingToken([0x77; 32]));
+        let _ = state_b.register_host(host, RoutingToken([0x77; 32]));
         tokio::spawn(async move {
             let (tcp, _) = listener_b.accept().await.unwrap();
             if let Ok(tls) = acceptor_b.accept(tcp).await {
@@ -5668,7 +5655,7 @@ mod tests {
         // origin verbatim (Browser Plane carries raw TLS, not Noise).
         let token = RoutingToken([0x42; 32]);
         let state = Arc::new(EdgeState::<Connection>::new());
-        state.register_host("Browser.Test", token.clone()); // case-insensitive
+        let _ = state.register_host("Browser.Test", token.clone()); // case-insensitive
         let (server, cert) = build_server_endpoint_with_cert().expect("edge");
         let edge_addr = server.local_addr().unwrap();
         let state_e = state.clone();
@@ -5780,7 +5767,7 @@ mod tests {
         // plain origin (same registration dance as the passthrough test above).
         let token = RoutingToken([0x77; 32]);
         let state = Arc::new(EdgeState::<Connection>::new());
-        state.register_host("app.example.test", token.clone());
+        let _ = state.register_host("app.example.test", token.clone());
         state.set_cert_tier("app.example.test", true); // <-- the new bit: Gelb
         let (server, cert) = build_server_endpoint_with_cert().expect("edge");
         let edge_addr = server.local_addr().unwrap();
@@ -5889,7 +5876,7 @@ mod tests {
 
         let token = RoutingToken([0x88; 32]);
         let state = Arc::new(EdgeState::<Connection>::new());
-        state.register_host("app.example.test", token.clone());
+        let _ = state.register_host("app.example.test", token.clone());
         state.set_cert_tier("app.example.test", true);
         // Park a TCP-fallback "agent" instead of registering one over QUIC --
         // this is the exact state a UDP-blocked agent leaves the edge in.
@@ -5955,7 +5942,7 @@ mod tests {
 
         let token = RoutingToken([0x89; 32]);
         let state = Arc::new(EdgeState::<Connection>::new());
-        state.register_host("app.example.test", token.clone());
+        let _ = state.register_host("app.example.test", token.clone());
         state.set_cert_tier("app.example.test", true);
 
         let (_attacker_side, edge_inbound) = tokio::io::duplex(64); // attacker never writes anything

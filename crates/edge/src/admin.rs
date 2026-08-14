@@ -104,6 +104,18 @@ async fn authorize_host(
     let host = host.trim();
     match parse_token_hex(&token) {
         Some(t) if !host.is_empty() => {
+            // #504/#513: this route writes ownership DIRECTLY into the edge. It
+            // bypasses the control plane's portal-tunnel conflict check (the CP
+            // proxy `/registry/authorize-host` 409s on a portal-owned hostname;
+            // this route cannot know about them) and nothing here persists to
+            // `mesh_ownership`, so a direct write silently vanishes on the next
+            // edge restart -- both properties caused real outages (#502). Named
+            // loudly so an operator reaching for this route knows the trade.
+            eprintln!(
+                "ct-edge: admin authorize-host '{host}': DIRECT edge write -- bypasses the CP \
+                 portal-conflict check (#504) and does not survive an edge restart; prefer the \
+                 CP proxy /registry/authorize-host (#502)"
+            );
             state.authorize_host(host, RoutingToken(t));
             state.set_cert_tier(host, q.channel_tier.as_deref() == Some("gelb"));
             StatusCode::OK
