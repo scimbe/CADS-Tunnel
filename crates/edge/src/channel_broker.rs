@@ -119,8 +119,40 @@ pub struct WaitingMember<T> {
     pub holder: [u8; 32],
     /// Absolute time by which this lone waiter must be paired or evicted (#109 #3).
     pub deadline: UnixSeconds,
+    /// #499 slice B: live corpse signal for this park. The `:443` park pump sets it the
+    /// moment the CLIENT side of the parked connection dies (EOF/error on the read half
+    /// while parked); `offer`/`drain_expired` then drop the member instead of ever handing
+    /// a corpse to an arriving partner (the FIFO-pairs-the-corpse-first failure that cost
+    /// real first-contact latency, measured live: 20.6s + a transport fault on the re-park
+    /// boundary). `default()` (unmonitored, e.g. QUIC members -- QUIC has connection-level
+    /// death detection of its own) never reads as dead.
+    pub liveness: ParkLiveness,
     pub payload: T,
 }
+
+/// #499 slice B: a shared park-death flag (see [`WaitingMember::liveness`]). Deliberately
+/// equality-neutral -- two members are the same member regardless of monitor identity --
+/// so `WaitingMember`'s derived `PartialEq/Eq` (used by pairer unit tests) keep working.
+#[derive(Debug, Clone, Default)]
+pub struct ParkLiveness(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+
+impl ParkLiveness {
+    /// A monitored flag: the pump holds the returned handle and sets it on client death.
+    pub fn monitored() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (Self(Some(flag.clone())), flag)
+    }
+    pub fn is_dead(&self) -> bool {
+        self.0.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl PartialEq for ParkLiveness {
+    fn eq(&self, _other: &Self) -> bool {
+        true // identity-neutral by design; see the type's doc comment
+    }
+}
+impl Eq for ParkLiveness {}
 
 /// The outcome of offering a member to the [`ChannelPairer`].
 #[derive(Debug, PartialEq, Eq)]
@@ -162,30 +194,54 @@ pub struct ChannelPairer<T> {
     /// different holder arrives it pairs with the oldest queued waiter instead of joining the
     /// queue, so two holders' parks never coexist for one channel.
     waiting: std::collections::HashMap<ChannelId, std::collections::VecDeque<WaitingMember<T>>>,
+    /// #499 slice B: corpses dropped so far (parks whose client died while queued, detected
+    /// via [`ParkLiveness`] and discarded at offer/drain time instead of being paired or
+    /// EX-notified). Monotonic; [`Self::take_dead_dropped`] reads-and-resets for the reaper's
+    /// per-sweep visibility line.
+    dead_dropped: u64,
 }
 
 impl<T> ChannelPairer<T> {
     pub fn new() -> Self {
-        Self { waiting: std::collections::HashMap::new() }
+        Self { waiting: std::collections::HashMap::new(), dead_dropped: 0 }
     }
 
-    /// Offer an admitted member. Pairs it with the OLDEST queued waiter of a different holder
-    /// on the same channel (FIFO fairness: the longest-waiting park is consumed first), parks
-    /// it otherwise, or -- only when this member already has [`PARKS_PER_MEMBER`] parks queued
+    /// #499 slice B: corpses dropped since the last call (read-and-reset -- the reaper logs
+    /// a per-sweep summary so silent discards stay operator-visible).
+    pub fn take_dead_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.dead_dropped)
+    }
+
+    /// Offer an admitted member. Pairs it with the OLDEST queued **live** waiter of a
+    /// different holder on the same channel (FIFO fairness; #499 slice B: corpses -- parks
+    /// whose client already died -- are discarded, never handed to a partner), parks it
+    /// otherwise, or -- only when this member already has [`PARKS_PER_MEMBER`] parks queued
     /// -- supersedes its own oldest park. See [`PairOutcome`].
     pub fn offer(&mut self, member: WaitingMember<T>) -> PairOutcome<T> {
         let queue = self.waiting.entry(member.channel).or_default();
-        // A different holder waiting? Pair with its oldest park (invariant: the queue only
-        // ever holds one holder's parks, so checking the front suffices).
+        // A different holder waiting? Pair with its oldest LIVE park (invariant: the queue
+        // only ever holds one holder's parks, so checking the front suffices for the holder;
+        // #499 slice B walks past corpses instead of pairing the partner with one).
         if queue.front().is_some_and(|w| w.holder != member.holder) {
-            let existing = queue.pop_front().expect("front just checked");
-            if queue.is_empty() {
-                self.waiting.remove(&member.channel);
+            while let Some(candidate) = queue.pop_front() {
+                if candidate.liveness.is_dead() {
+                    self.dead_dropped += 1;
+                    continue;
+                }
+                if queue.is_empty() {
+                    self.waiting.remove(&member.channel);
+                }
+                return PairOutcome::Paired(candidate, member);
             }
-            return PairOutcome::Paired(existing, member);
+            // Every queued park was a corpse: the arrival parks as the fresh first member.
         }
-        // Same holder (or empty): join the queue; beyond the cap, the OLDEST park is
-        // superseded -- not the newest, so a member's parks age out in arrival order.
+        // Same holder (or empty): purge corpses first (#499 slice B -- they must neither
+        // block the cap nor age out "in order" ahead of live parks), then join the queue;
+        // beyond the cap, the OLDEST park is superseded -- not the newest, so a member's
+        // parks age out in arrival order.
+        let before = queue.len();
+        queue.retain(|w| !w.liveness.is_dead());
+        self.dead_dropped += (before - queue.len()) as u64;
         queue.push_back(member);
         if queue.len() > PARKS_PER_MEMBER {
             let stale = queue.pop_front().expect("len just checked > cap >= 1");
@@ -197,12 +253,18 @@ impl<T> ChannelPairer<T> {
     /// Evict and return every waiter whose `deadline` is at or before `now` (#3): a park with
     /// no partner is bounded instead of wedging the round forever. Sweeps INSIDE each queue
     /// (an expired older park behind a fresher one is still evicted) and drops emptied queues.
+    /// #499 slice B: corpses are dropped and counted here too -- NOT returned as expired,
+    /// because the reaper's EX notification exists for live clients and a corpse has nobody
+    /// left to notify.
     pub fn drain_expired(&mut self, now: UnixSeconds) -> Vec<WaitingMember<T>> {
         let mut drained = Vec::new();
+        let mut dead = 0u64;
         self.waiting.retain(|_, queue| {
             let mut kept = std::collections::VecDeque::with_capacity(queue.len());
             for m in queue.drain(..) {
-                if m.deadline <= now {
+                if m.liveness.is_dead() {
+                    dead += 1;
+                } else if m.deadline <= now {
                     drained.push(m);
                 } else {
                     kept.push_back(m);
@@ -211,6 +273,7 @@ impl<T> ChannelPairer<T> {
             *queue = kept;
             !queue.is_empty()
         });
+        self.dead_dropped += dead;
         drained
     }
 
@@ -1295,16 +1358,18 @@ where
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
-    offer_admitted_stream_member(pairer, deadline, member).await
+    offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default()).await
 }
 
 /// The post-admission tail shared by [`admit_and_pair_on_stream`] and
 /// [`admit_and_pair_on_boxed_stream`]: offer the admitted member to the pairer and
-/// translate the outcome (park / pair / supersede-with-EX).
+/// translate the outcome (park / pair / supersede-with-EX). `liveness` is the #499 slice B
+/// corpse flag (monitored for pumped `:443` members, `default()` elsewhere).
 async fn offer_admitted_stream_member<S>(
     pairer: &std::sync::Mutex<ChannelPairer<AdmittedStreamMember<S>>>,
     deadline: UnixSeconds,
     member: AdmittedStreamMember<S>,
+    liveness: ParkLiveness,
 ) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1315,7 +1380,7 @@ where
     // every later offer (the 2026-08-13 broker-outage class).
     let outcome = pairer
         .lock_safe()
-        .offer(WaitingMember { channel, holder, deadline, payload: member });
+        .offer(WaitingMember { channel, holder, deadline, liveness, payload: member });
     match outcome {
         PairOutcome::Parked => Ok(None),
         PairOutcome::Paired(a, b) => Ok(Some((a.payload, b.payload))),
@@ -1356,7 +1421,11 @@ pub(crate) const PARK_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Durat
 /// EOF/error tears the pump down (the parked side then fails fast on its next write --
 /// the corpse surfaces at pairing instead of poisoning it silently); the arm side
 /// dropping/shutting down closes the real connection.
-fn spawn_park_keepalive_pump(stream: BoxedChannelStream) -> tokio::io::DuplexStream {
+fn spawn_park_keepalive_pump(
+    stream: BoxedChannelStream,
+    keepalive: bool,
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::io::DuplexStream {
     let (near, far) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let (mut real_r, mut real_w) = tokio::io::split(stream);
@@ -1374,7 +1443,18 @@ fn spawn_park_keepalive_pump(stream: BoxedChannelStream) -> tokio::io::DuplexStr
         loop {
             tokio::select! {
                 r = real_r.read(&mut from_client) => match r {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        // #499 slice B: the CLIENT side died. If that happens while still
+                        // parked, flag the queued member as a corpse so the pairer drops it
+                        // instead of handing it to an arriving partner (the
+                        // FIFO-pairs-the-corpse-first failure: partner sees early eof,
+                        // retries on the next sweep boundary -- the tester's measured
+                        // N x 10s first-contact staircase).
+                        if parked {
+                            dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        break;
+                    }
                     Ok(n) => {
                         if far_w.write_all(&from_client[..n]).await.is_err() {
                             break;
@@ -1392,8 +1472,11 @@ fn spawn_park_keepalive_pump(stream: BoxedChannelStream) -> tokio::io::DuplexStr
                         let _ = real_w.flush().await;
                     }
                 },
-                _ = ticker.tick(), if parked => {
+                _ = ticker.tick(), if parked && keepalive => {
                     if real_w.write_all(&[0u8]).await.is_err() {
+                        // The write path died while parked: same corpse semantics as a
+                        // read-side death (#499 slice B).
+                        dead.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                     let _ = real_w.flush().await;
@@ -1429,13 +1512,14 @@ where
 {
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
-    let stream: BoxedChannelStream = if keepalive {
-        Box::pin(spawn_park_keepalive_pump(stream))
-    } else {
-        stream
-    };
+    // #499 slice B: EVERY admitted `:443` member is pumped now (not only KA-negotiated
+    // ones) -- the pump is also the park's death monitor, and a corpse must be flagged
+    // regardless of whether its client spoke the keepalive ALPN. `keepalive` only gates
+    // the NUL ticks.
+    let (liveness, dead) = ParkLiveness::monitored();
+    let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
-    offer_admitted_stream_member(pairer, deadline, member).await
+    offer_admitted_stream_member(pairer, deadline, member, liveness).await
 }
 
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
@@ -1689,6 +1773,9 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 channel,
                 holder,
                 deadline: now.saturating_add(park_ttl),
+                // #499 slice B: unmonitored -- a QUIC park's death is visible at the
+                // connection layer (the sweep's close/read paths), unlike a raw stream's.
+                liveness: ParkLiveness::default(),
                 payload: member,
             });
             match outcome {
@@ -1871,6 +1958,7 @@ mod tests {
             channel: ChannelId([chan; 32]),
             holder: [holder; 32],
             deadline,
+            liveness: ParkLiveness::default(),
             payload: tag,
         };
         let mut pairer: ChannelPairer<&'static str> = ChannelPairer::new();
@@ -1923,6 +2011,7 @@ mod tests {
             channel: ChannelId([chan; 32]),
             holder: [holder; 32],
             deadline,
+            liveness: ParkLiveness::default(),
             payload: tag,
         };
         let mut pairer: ChannelPairer<&'static str> = ChannelPairer::new();
@@ -2565,7 +2654,9 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let (client_end, real) = tokio::io::duplex(4096);
         let boxed: BoxedChannelStream = Box::pin(real);
-        let mut parked_end = spawn_park_keepalive_pump(boxed);
+        let (lv, _dead) = ParkLiveness::monitored();
+        let _ = lv;
+        let mut parked_end = spawn_park_keepalive_pump(boxed, true, _dead);
         let (mut client_r, mut client_w) = tokio::io::split(client_end);
 
         // Three intervals of parked silence -> exactly three NULs, on schedule.
@@ -2683,6 +2774,124 @@ mod tests {
         assert_eq!(tail, PARK_EXPIRED_TOKEN, "after stripping NULs the tail is exactly EX");
     }
 
+    #[test]
+    fn pairer_never_hands_out_a_corpse_and_counts_the_drop_499b() {
+        // #499 slice B, pairer level: a queued park flagged dead must be skipped by FIFO
+        // pairing (the arriving partner gets the oldest LIVE park), purged by the sweep
+        // without being returned as expired (no EX for corpses), and counted.
+        let m = |holder: u8, liveness: ParkLiveness, tag: &'static str| WaitingMember {
+            channel: ChannelId([0x4Bu8; 32]),
+            holder: [holder; 32],
+            deadline: 1_000,
+            liveness,
+            payload: tag,
+        };
+        let (dead_liveness, dead_flag) = ParkLiveness::monitored();
+        let mut pairer = ChannelPairer::new();
+        assert_eq!(pairer.offer(m(1, dead_liveness, "corpse")), PairOutcome::Parked);
+        assert_eq!(pairer.offer(m(1, ParkLiveness::default(), "live")), PairOutcome::Parked);
+        dead_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // A different holder arrives: FIFO would pick "corpse" first -- slice B must skip
+        // it and pair with "live".
+        match pairer.offer(m(2, ParkLiveness::default(), "partner")) {
+            PairOutcome::Paired(a, b) => {
+                assert_eq!(a.payload, "live", "the corpse is never handed to a partner");
+                assert_eq!(b.payload, "partner");
+            }
+            other => panic!("expected a pairing with the live park, got {other:?}"),
+        }
+        assert_eq!(pairer.take_dead_dropped(), 1, "the skipped corpse is counted");
+        assert!(pairer.is_empty(), "corpse dropped, pair consumed -- nothing queued");
+
+        // Sweep path: a corpse expires silently (not returned -- nobody to EX-notify).
+        let (dl2, df2) = ParkLiveness::monitored();
+        assert_eq!(pairer.offer(m(3, dl2, "corpse2")), PairOutcome::Parked);
+        df2.store(true, std::sync::atomic::Ordering::Relaxed);
+        let expired = pairer.drain_expired(2_000);
+        assert!(expired.is_empty(), "a corpse is not 'expired' -- it is dropped: {expired:?}");
+        assert_eq!(pairer.take_dead_dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dead_parked_client_is_flagged_by_the_pump_and_never_paired_499b() {
+        // #499 slice B end to end (minus TLS): member A parks via the REAL boxed admission
+        // path, its client dies (the tester's early-eof producer), A re-parks fresh; an
+        // arriving partner B must pair with the LIVE park -- the corpse is dropped, not
+        // spliced (the N x 10s first-contact staircase this slice removes).
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x5Bu8; 32];
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.4:4099".parse().unwrap();
+
+        let admit = |holder_byte: u8, direction: Direction| {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder_sk(holder_byte), direction, 1_000),
+                endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+            };
+            let sk = holder_sk(holder_byte);
+            let (c, s) = tokio::io::duplex(4096);
+            let client = tokio::spawn(async move {
+                let mut c = c;
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                c.read_exact(&mut ch).await.expect("challenge");
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                c // keep the connection alive; the caller decides its fate
+            });
+            (client, s)
+        };
+
+        // A parks; its client then DIES.
+        let (client_a, s_a) = admit(0xa1, Direction::Accept);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
+            .await
+            .expect("admit A");
+        assert!(r.is_none(), "A parks");
+        let conn_a = client_a.await.expect("client A");
+        drop(conn_a); // the client-side death the pump must notice
+        // Give the pump a few polls to observe the EOF and flag the corpse.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // A re-parks fresh (the tester's serve loop does exactly this).
+        let (client_a2, s_a2) = admit(0xa1, Direction::Accept);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_a2), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
+            .await
+            .expect("admit A2");
+        assert!(r.is_none(), "A's fresh park queues");
+
+        // B arrives: must pair with the FRESH park, never the corpse.
+        let (client_b, s_b) = admit(0xb2, Direction::Initiate);
+        let r = admit_and_pair_on_boxed_stream(Box::pin(s_b), obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None, false)
+            .await
+            .expect("admit B");
+        let (a, b) = r.expect("B pairs with the live park");
+        assert_eq!(pairer.lock().unwrap().take_dead_dropped(), 1, "the corpse was dropped, counted");
+        // Prove the paired A-side leg is the LIVE second connection: splice and pass a byte.
+        let mut live_a = client_a2.await.expect("client A2");
+        let mut live_b = client_b.await.expect("client B");
+        tokio::spawn(async move {
+            let _ = finish_relay_pair_over_streams(a, b, 500).await;
+        });
+        let ack = read_relay_ack_line(&mut live_a).await;
+        assert!(ack.starts_with(b"OK"), "live A2 got the relay ack: {:?}", String::from_utf8_lossy(&ack));
+        let ack = read_relay_ack_line(&mut live_b).await;
+        assert!(ack.starts_with(b"OK"), "B got the relay ack");
+        live_a.write_all(&[0x77]).await.expect("A2 sends");
+        live_a.flush().await.expect("flush");
+        let mut got = [0u8; 1];
+        live_b.read_exact(&mut got).await.expect("B receives through the splice");
+        assert_eq!(got[0], 0x77, "the spliced pair is the LIVE leg, not the corpse");
+    }
+
     #[tokio::test]
     async fn a_superseded_park_gets_the_ex_token_not_a_silent_close_499() {
         // #499 slice A: when the same holder's (PARKS_PER_MEMBER+1)th park supersedes its
@@ -2766,6 +2975,7 @@ mod tests {
             channel: ChannelId([0x97u8; 32]),
             holder: [0x11u8; 32],
             deadline: 100,
+            liveness: ParkLiveness::default(),
             payload: (),
         });
         assert!(matches!(outcome, PairOutcome::Parked), "offer works through the poisoned lock");
@@ -4557,6 +4767,7 @@ mod tests {
             channel: ChannelId([1u8; 32]),
             holder: [1u8; 32],
             deadline: 100,
+            liveness: ParkLiveness::default(),
             payload: FakeMember { _permit: p1 },
         });
         assert!(matches!(outcome, PairOutcome::Parked), "first offer parks");
@@ -4596,6 +4807,7 @@ mod tests {
             channel: ChannelId([2u8; 32]),
             holder: [1u8; 32],
             deadline: 100,
+            liveness: ParkLiveness::default(),
             payload: FakeMember { _permit: p1 },
         });
         assert_eq!(sem.available_permits(), 0, "both permits are outstanding: 1 parked, 1 about to offer");
@@ -4604,6 +4816,7 @@ mod tests {
             channel: ChannelId([2u8; 32]),
             holder: [2u8; 32],
             deadline: 100,
+            liveness: ParkLiveness::default(),
             payload: FakeMember { _permit: p2 },
         });
         let (a, b) = match outcome {

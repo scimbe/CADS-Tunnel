@@ -774,7 +774,18 @@ fn spawn_front_door_pairer_reaper<T, N, R>(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            let expired = pairer.lock_safe().drain_expired(now_fn()); // #497: poison-resilient
+            // #497: poison-resilient; #499 slice B: drain also silently discards corpse
+            // parks (client died while queued) -- surface the per-sweep count so silent
+            // discards stay operator-visible without per-corpse identity spam.
+            let (expired, dead_dropped) = {
+                let mut p = pairer.lock_safe();
+                (p.drain_expired(now_fn()), p.take_dead_dropped())
+            };
+            if dead_dropped > 0 {
+                eprintln!(
+                    "ct-edge: front-door channel pairer dropped {dead_dropped} corpse park(s) — client died while queued (#499)"
+                );
+            }
             // One line PER member, naming the public grant fields (channel/holder hex --
             // never a secret) plus the count: a live operator watching repeated lone-member
             // reaps (a client whose PARTNER never arrives, e.g. still stuck on a blocked
@@ -3590,6 +3601,7 @@ mod tests {
             channel: ChannelId([7u8; 32]),
             holder: [1u8; 32],
             deadline: 100,
+            liveness: crate::channel_broker::ParkLiveness::default(),
             payload: 0u8,
         });
         assert_eq!(pairer.lock().unwrap().len(), 1, "parked before the reaper ticks");
