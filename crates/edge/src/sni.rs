@@ -21,6 +21,16 @@ pub const CT_EDGE_ALPN: &str = "ct-edge";
 /// [`CT_EDGE_ALPN`], mirroring the #31/#46 classic-tunnel fallback.
 pub const CT_EDGE_CHANNEL_ALPN: &str = "ct-edge-channel";
 
+/// #500 K2: the park-keepalive-capable variant of [`CT_EDGE_CHANNEL_ALPN`]. A client
+/// offering `[ct-edge-channel-ka, ct-edge-channel]` negotiates keepalive against a
+/// current edge (server preference selects this id) and degrades byte-for-byte to the
+/// plain leg against an older one -- the whole capability handshake lives in the TLS
+/// ALPN selection, zero wire-format changes. The boring twin has no `-ka` id (it would
+/// destroy the low-DPI camouflage): there the client offers `[h2, http/1.1]` and a
+/// current edge deliberately selects `http/1.1` as the same keepalive signal -- both
+/// ids ubiquitous, the selection unremarkable to any observer.
+pub const CT_EDGE_CHANNEL_KA_ALPN: &str = "ct-edge-channel-ka";
+
 /// ALPN protocol id a real NAT-to-NAT hole-punch relay client advertises on the
 /// unified :443 front door: a ClientHello carrying it is routed to the gated
 /// Circuit-Relay v2 relay (`RelayGate` — grant + possession pre-auth, then a raw
@@ -275,7 +285,7 @@ pub fn classify_front_door(hello: &[u8], is_terminate_host: impl Fn(&str) -> boo
     // #106: a channel member on a `:4435`-blocked network falls back to `:443` with
     // the channel ALPN. Like the `ct-edge` data-plane leg, it carries no SNI, so the
     // ALPN discriminator wins ahead of any SNI-based routing.
-    if alpn_has(CT_EDGE_CHANNEL_ALPN) {
+    if alpn_has(CT_EDGE_CHANNEL_ALPN) || alpn_has(CT_EDGE_CHANNEL_KA_ALPN) {
         return FrontDoorRoute::ChannelBroker;
     }
     // Same ALPN-before-SNI precedence as the channel leg above -- a relay client
@@ -492,6 +502,26 @@ mod tests {
         );
         // Nothing usable -> reject.
         assert_eq!(classify_front_door(&client_hello(None, &[]), terminate_host, default), FrontDoorRoute::Reject);
+    }
+
+    #[test]
+    fn classify_front_door_routes_the_ka_channel_alpn_to_the_broker_500() {
+        // #500 K2: a keepalive-capable client offers [ct-edge-channel-ka, ct-edge-channel];
+        // BOTH ids must classify to the broker (an old client's bare-id offer already did).
+        let default = Some("portal.z");
+        assert_eq!(
+            classify_front_door(
+                &client_hello(None, &[CT_EDGE_CHANNEL_KA_ALPN, CT_EDGE_CHANNEL_ALPN]),
+                terminate_host,
+                default
+            ),
+            FrontDoorRoute::ChannelBroker
+        );
+        assert_eq!(
+            classify_front_door(&client_hello(None, &[CT_EDGE_CHANNEL_KA_ALPN]), terminate_host, default),
+            FrontDoorRoute::ChannelBroker,
+            "the -ka id alone classifies too (a future client may drop the legacy id)"
+        );
     }
 
     #[test]

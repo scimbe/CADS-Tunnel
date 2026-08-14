@@ -290,8 +290,18 @@ pub async fn build_channel_front_door_acceptor(
     let mut tls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
+    // #500 K2: SERVER-preference order encodes the keepalive negotiation. A KA-capable
+    // plain-leg client offers [ct-edge-channel-ka, ct-edge-channel] -> the `-ka` id wins
+    // here; an old client offers only the bare id. The boring leg has no distinctive id
+    // (camouflage): a KA-capable boring client offers [h2, http/1.1] and `http/1.1`
+    // listed BEFORE `h2` makes its selection the keepalive signal, while an old boring
+    // client's [h2]-only offer still lands on `h2`. Only channel-classified connections
+    // ever reach this acceptor (ALPN/reserved-SNI routing), so claiming `http/1.1` here
+    // can never shadow a real proxied host.
     tls_cfg.alpn_protocols = vec![
+        crate::sni::CT_EDGE_CHANNEL_KA_ALPN.as_bytes().to_vec(),
         crate::sni::CT_EDGE_CHANNEL_ALPN.as_bytes().to_vec(),
+        b"http/1.1".to_vec(),
         b"h2".to_vec(),
     ];
     Ok(TlsAcceptor::from(Arc::new(tls_cfg)))
@@ -365,6 +375,53 @@ mod tests {
 
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
+    }
+
+    /// #500 K2: the channel acceptor's ALPN preference order IS the keepalive
+    /// negotiation -- prove all four old/new x plain/boring combinations against a REAL
+    /// TLS handshake: a KA-capable plain client lands on `-ka`, an old plain client on
+    /// the bare id; a KA-capable boring client's [h2, http/1.1] offer is deliberately
+    /// answered with `http/1.1` (the camouflage-preserving KA signal), an old boring
+    /// client's [h2]-only offer stays on `h2`.
+    #[tokio::test]
+    async fn channel_acceptor_negotiates_keepalive_by_alpn_preference_500() {
+        let ca = Ca::new("ct-edge-ca").unwrap();
+        let acceptor = build_channel_front_door_acceptor(&ca, vec!["localhost".into()])
+            .await
+            .expect("channel acceptor");
+        let cases: &[(&[&str], &str)] = &[
+            (&["ct-edge-channel-ka", "ct-edge-channel"], "ct-edge-channel-ka"),
+            (&["ct-edge-channel"], "ct-edge-channel"),
+            (&["h2", "http/1.1"], "http/1.1"),
+            (&["h2"], "h2"),
+        ];
+        for (offer, expect) in cases {
+            let (c, s) = tokio::io::duplex(16 * 1024);
+            let acceptor = acceptor.clone();
+            let srv = tokio::spawn(async move { acceptor.accept(s).await });
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.root_der()).unwrap();
+            let mut cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            cfg.alpn_protocols = offer.iter().map(|p| p.as_bytes().to_vec()).collect();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+            let tls = connector
+                .connect("localhost".try_into().unwrap(), c)
+                .await
+                .expect("client handshake");
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(expect.as_bytes()),
+                "client view for offer {offer:?}"
+            );
+            let stls = srv.await.unwrap().expect("server handshake");
+            assert_eq!(
+                stls.get_ref().1.alpn_protocol(),
+                Some(expect.as_bytes()),
+                "server view for offer {offer:?}"
+            );
+        }
     }
 
     /// A client trusting a *different* CA root rejects the Edge's leaf.

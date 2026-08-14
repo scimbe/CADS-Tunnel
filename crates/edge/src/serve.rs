@@ -1109,6 +1109,15 @@ pub async fn serve_front_door(
                 .await
                 .map_err(|_| -> BoxError { "front door: channel TLS handshake not completed within the timeout (#422/#452)".into() })?
                 .map_err(|e| { eprintln!("ct-edge: channel-join NO [tls-accept]: {e}"); e })?;
+            // #500 K2: the negotiated ALPN IS the park-keepalive capability handshake --
+            // `ct-edge-channel-ka` on the plain leg, or `http/1.1` on the boring leg
+            // (deliberately selected over `h2` by the acceptor's preference order; an old
+            // client's [h2]-only or bare-channel-ALPN offer lands on the non-KA ids). See
+            // `build_channel_front_door_acceptor` for the full negotiation table.
+            let keepalive = matches!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(p) if p == crate::sni::CT_EDGE_CHANNEL_KA_ALPN.as_bytes() || p == b"http/1.1"
+            );
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1132,7 +1141,7 @@ pub async fn serve_front_door(
             // below. Carrying the permit on the constructed `AdmittedStreamMember` (inside
             // `admit_and_pair_on_stream`) means it now travels with the connection through
             // either path instead of releasing the moment this function returns.
-            let paired = match crate::channel_broker::admit_and_pair_on_stream(
+            let paired = match crate::channel_broker::admit_and_pair_on_boxed_stream(
                 boxed,
                 observed,
                 now,
@@ -1141,6 +1150,7 @@ pub async fn serve_front_door(
                 now + CHANNEL_PARK_TTL_SECS,
                 &ctx.pairer,
                 permit,
+                keepalive,
             )
             .await
             {

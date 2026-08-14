@@ -1066,7 +1066,7 @@ pub struct AdmittedStreamMember<S> {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
-impl<S: AsyncWrite + Unpin> AdmittedStreamMember<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AdmittedStreamMember<S> {
     /// ct-agent#21: notify this parked member that its park EXPIRED (no partner within the
     /// TTL) before its stream is dropped -- best-effort (`EX` + shutdown, every error
     /// ignored: the member may already be gone, which is fine, the write existed to help a
@@ -1076,6 +1076,23 @@ impl<S: AsyncWrite + Unpin> AdmittedStreamMember<S> {
         let _ = self.stream.write_all(PARK_EXPIRED_TOKEN).await;
         let _ = self.stream.flush().await;
         let _ = self.stream.shutdown().await;
+        // Packet-capture-proven (2026-08-14, the #21 measurement failure): v0.4.11 clients
+        // half-close their leg right after the possession signature, so by reap time this
+        // socket holds their UNREAD close_notify -- dropping it now makes the kernel send
+        // an immediate RST after our FIN, and at real-world RTT that RST overtakes the EX
+        // record still in flight and DISCARDS it from the peer's receive buffer (locally
+        // the EX won the race, which is why the E2E repro passed while every remote
+        // measurement saw an empty ack). Drain to EOF (bounded) so the close is graceful:
+        // FIN, no RST, the EX survives delivery.
+        let mut sink = [0u8; 256];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Ok(n) = self.stream.read(&mut sink).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 }
 
@@ -1277,9 +1294,23 @@ where
     // the relay finisher relays each side the PEER's, so a `:443`-only pair can pin each other.
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
-    let channel = req.grant.grant.channel;
-    let holder = req.grant.grant.holder;
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
+    offer_admitted_stream_member(pairer, deadline, member).await
+}
+
+/// The post-admission tail shared by [`admit_and_pair_on_stream`] and
+/// [`admit_and_pair_on_boxed_stream`]: offer the admitted member to the pairer and
+/// translate the outcome (park / pair / supersede-with-EX).
+async fn offer_admitted_stream_member<S>(
+    pairer: &std::sync::Mutex<ChannelPairer<AdmittedStreamMember<S>>>,
+    deadline: UnixSeconds,
+    member: AdmittedStreamMember<S>,
+) -> Result<Option<(AdmittedStreamMember<S>, AdmittedStreamMember<S>)>, BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let channel = member.req.grant.grant.channel;
+    let holder = member.req.grant.grant.holder;
     // #497: lock_safe -- a panic in some other critical section must not permanently wedge
     // every later offer (the 2026-08-13 broker-outage class).
     let outcome = pairer
@@ -1302,6 +1333,109 @@ where
             Ok(None)
         }
     }
+}
+
+/// #500 K2: how often a parked, keepalive-negotiated `:443` leg gets one NUL byte of real
+/// application payload. Tester-proven necessity: parked legs are otherwise completely
+/// traffic-free, and payload-required middleboxes reap them at ~40s -- BEFORE the 30s park
+/// TTL can fire and send `EX` -- while the TCP-level keepalive the front door has applied
+/// since #452 flows beneath such a middlebox's payload counter unnoticed. 10s stays far
+/// inside every plausible idle timer and costs ~one TLS record per tick.
+pub(crate) const PARK_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #500 K2: wrap an ADMITTED (post-challenge) keepalive-negotiated stream in a pump task
+/// that owns the real connection and injects one NUL byte of application payload every
+/// [`PARK_KEEPALIVE_INTERVAL`] while the leg is parked. The pairer parks the returned
+/// duplex end instead; acks/`EX`/the relay splice flow through the pump transparently.
+///
+/// The parked phase ends at the FIRST edge->client chunk after this wrap (the ack or the
+/// `EX` token -- admission's challenge was written before the wrap): keepalive stops
+/// permanently then, so no NUL can ever interleave into the spliced session. A NUL racing
+/// the ack's first chunk lands BEFORE it (the select! serializes whole chunks), i.e. as
+/// one more leading NUL of exactly the kind a keepalive-negotiated client strips. Client
+/// EOF/error tears the pump down (the parked side then fails fast on its next write --
+/// the corpse surfaces at pairing instead of poisoning it silently); the arm side
+/// dropping/shutting down closes the real connection.
+fn spawn_park_keepalive_pump(stream: BoxedChannelStream) -> tokio::io::DuplexStream {
+    let (near, far) = tokio::io::duplex(16 * 1024);
+    tokio::spawn(async move {
+        let (mut real_r, mut real_w) = tokio::io::split(stream);
+        let (mut far_r, mut far_w) = tokio::io::split(far);
+        // interval() fires immediately on its first tick; the first keepalive belongs one
+        // full interval AFTER parking, so anchor the start explicitly.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + PARK_KEEPALIVE_INTERVAL,
+            PARK_KEEPALIVE_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut parked = true;
+        let mut from_client = vec![0u8; 16 * 1024];
+        let mut to_client = vec![0u8; 16 * 1024];
+        loop {
+            tokio::select! {
+                r = real_r.read(&mut from_client) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if far_w.write_all(&from_client[..n]).await.is_err() {
+                            break;
+                        }
+                        let _ = far_w.flush().await;
+                    }
+                },
+                r = far_r.read(&mut to_client) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        parked = false; // ack/EX started -- keepalive off for good
+                        if real_w.write_all(&to_client[..n]).await.is_err() {
+                            break;
+                        }
+                        let _ = real_w.flush().await;
+                    }
+                },
+                _ = ticker.tick(), if parked => {
+                    if real_w.write_all(&[0u8]).await.is_err() {
+                        break;
+                    }
+                    let _ = real_w.flush().await;
+                }
+            }
+        }
+        let _ = real_w.shutdown().await;
+    });
+    near
+}
+
+/// [`admit_and_pair_on_stream`] for the shared boxed stream type, with the #500 K2 park
+/// keepalive: when `keepalive` (the client negotiated a KA-capable ALPN -- see
+/// `pki::build_channel_front_door_acceptor`'s list), the admitted stream is wrapped in
+/// [`spawn_park_keepalive_pump`] BEFORE it is offered/parked, so a parked leg carries one
+/// NUL of application payload every [`PARK_KEEPALIVE_INTERVAL`]. `keepalive: false` is
+/// byte-for-byte [`admit_and_pair_on_stream`].
+#[allow(clippy::too_many_arguments)] // mirrors admit_and_pair_on_stream's signature + the flag
+pub async fn admit_and_pair_on_boxed_stream<F, Fut>(
+    stream: BoxedChannelStream,
+    observed: std::net::SocketAddr,
+    now: UnixSeconds,
+    join_timeout: std::time::Duration,
+    authorize: &F,
+    deadline: UnixSeconds,
+    pairer: &std::sync::Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>>,
+    permit: Option<OwnedSemaphorePermit>,
+    keepalive: bool,
+) -> Result<Option<(AdmittedStreamMember<BoxedChannelStream>, AdmittedStreamMember<BoxedChannelStream>)>, BoxError>
+where
+    F: Fn(ChannelId, [u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>>,
+{
+    let (stream, req, operator, noise, attest, _observed) =
+        admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
+    let stream: BoxedChannelStream = if keepalive {
+        Box::pin(spawn_park_keepalive_pump(stream))
+    } else {
+        stream
+    };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
+    offer_admitted_stream_member(pairer, deadline, member).await
 }
 
 /// Broker a direct channel between two agents (AF2d-transport-b): accept two
@@ -2421,6 +2555,132 @@ mod tests {
         let mut buf = Vec::new();
         client_end.read_to_end(&mut buf).await.expect("read to EOF");
         assert_eq!(buf, PARK_EXPIRED_TOKEN, "exactly the EX token, then clean EOF");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_keepalive_pump_ticks_nuls_while_parked_and_stops_at_the_first_ack_chunk_500() {
+        // #500 K2 core behavior: one NUL of application payload per PARK_KEEPALIVE_INTERVAL
+        // toward the client while parked; the FIRST edge->client chunk (the ack/EX) stops
+        // the keepalive for good; payload still relays in both directions afterwards.
+        use tokio::io::AsyncReadExt;
+        let (client_end, real) = tokio::io::duplex(4096);
+        let boxed: BoxedChannelStream = Box::pin(real);
+        let mut parked_end = spawn_park_keepalive_pump(boxed);
+        let (mut client_r, mut client_w) = tokio::io::split(client_end);
+
+        // Three intervals of parked silence -> exactly three NULs, on schedule.
+        let mut nul = [0u8; 1];
+        for i in 0..3u32 {
+            tokio::time::advance(PARK_KEEPALIVE_INTERVAL).await;
+            client_r.read_exact(&mut nul).await.expect("keepalive byte");
+            assert_eq!(nul[0], 0, "keepalive tick {i} is a NUL");
+        }
+
+        // The completer writes the ack through the parked end -> client sees it verbatim...
+        parked_end.write_all(b"OK 203.0.113.5:9999").await.expect("ack");
+        parked_end.flush().await.expect("flush");
+        let mut ack = [0u8; 19];
+        client_r.read_exact(&mut ack).await.expect("ack relayed");
+        assert_eq!(&ack[..], b"OK 203.0.113.5:9999");
+
+        // ...and the keepalive is off for good: two more intervals, not one further byte.
+        let quiet = tokio::time::timeout(PARK_KEEPALIVE_INTERVAL * 2 + std::time::Duration::from_secs(1), async {
+            let mut b = [0u8; 1];
+            client_r.read_exact(&mut b).await.map(|_| b[0])
+        })
+        .await;
+        assert!(quiet.is_err(), "no byte after the ack -- keepalive stopped, got {quiet:?}");
+
+        // Client->edge payload still relays through the pump (the session phase).
+        client_w.write_all(b"m1").await.expect("client payload");
+        client_w.flush().await.expect("flush");
+        let mut m1 = [0u8; 2];
+        parked_end.read_exact(&mut m1).await.expect("relayed to the parked side");
+        assert_eq!(&m1[..], b"m1");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_park_delivers_nuls_then_ex_through_the_real_admission_path_500() {
+        // #500 K2 end-to-end (minus TLS): a keepalive-negotiated member drives the REAL
+        // admission over admit_and_pair_on_boxed_stream, parks, receives NUL keepalives,
+        // and when the reaper drains it past TTL the EX token arrives THROUGH the pump --
+        // the client-visible byte stream is NUL* then EX then EOF, exactly what a
+        // KA-negotiated v0.4.12 client strips-then-classifies.
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x50u8; 32];
+        let holder = holder_sk(0xd4);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Accept, 1_000),
+            endpoint: ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY.to_string(),
+        };
+        let (c, s) = tokio::io::duplex(4096);
+        let sk = holder_sk(0xd4);
+        let client = tokio::spawn(async move {
+            let mut c = c;
+            let rb = req.encode();
+            c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+            c.write_all(&rb).await.expect("req");
+            let mut ch = [0u8; 32];
+            c.read_exact(&mut ch).await.expect("challenge");
+            c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+            let mut buf = Vec::new();
+            let _ = c.read_to_end(&mut buf).await;
+            buf
+        });
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<BoxedChannelStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.7:7050".parse().unwrap();
+        let r = admit_and_pair_on_boxed_stream(
+            Box::pin(s),
+            obs,
+            500,
+            std::time::Duration::from_secs(5),
+            &authorize,
+            530, // deadline: 30s TTL from admission at now=500
+            &pairer,
+            None,
+            true,
+        )
+        .await
+        .expect("admit");
+        assert!(r.is_none(), "lone member parks");
+
+        // Let the freshly spawned pump task take its first poll NOW (virtual t0), so its
+        // interval anchors at t0 + INTERVAL -- without this, the task's first poll happens
+        // after the first advance and one tick is lost to the late anchor.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Three parked intervals pass (virtual time). Advance one interval at a time and
+        // yield in between: a single big advance would leave all three ticks AND the later
+        // EX write racing in one select round, which no real clock ever produces -- the
+        // pump must get to write each tick's NUL while it is the only ready branch.
+        for _ in 0..3 {
+            tokio::time::advance(PARK_KEEPALIVE_INTERVAL).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let expired = pairer.lock().unwrap().drain_expired(531);
+        assert_eq!(expired.len(), 1, "the park expired at its deadline");
+        for m in expired {
+            m.payload.notify_park_expired().await;
+        }
+
+        let bytes = client.await.expect("client task");
+        let (nuls, tail): (Vec<u8>, Vec<u8>) = {
+            let split = bytes.iter().position(|b| *b != 0).unwrap_or(bytes.len());
+            (bytes[..split].to_vec(), bytes[split..].to_vec())
+        };
+        assert!(
+            nuls.len() >= 3,
+            "at least the three parked intervals' keepalives arrived, got {} NULs",
+            nuls.len()
+        );
+        assert_eq!(tail, PARK_EXPIRED_TOKEN, "after stripping NULs the tail is exactly EX");
     }
 
     #[tokio::test]
