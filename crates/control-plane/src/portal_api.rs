@@ -892,6 +892,17 @@ fn portal_host(portal_base: &str) -> &str {
         .trim_end_matches('/')
 }
 
+/// #512: the ONE source for the released ct-agent tag this repo points users at —
+/// the repo-root `CT_AGENT_RELEASE` file, embedded at compile time. A release bump
+/// is a one-file change; the help-site example's Dockerfile/compose defaults are
+/// asserted against this same source by the install-page test, so the pin
+/// scatter that caused the #502 class (seven pins, four values) cannot re-grow
+/// around the user-facing install surfaces. (The wasm/relay-node/e2e build pins
+/// are deliberately NOT tied to this: they are API-drift-gated, see #507.)
+pub(crate) fn ct_agent_release_tag() -> &'static str {
+    include_str!("../../../CT_AGENT_RELEASE").trim()
+}
+
 pub(crate) fn edge_host_port(portal_base: &str) -> String {
     format!("{}:{}", portal_host(portal_base), crate::service::NetworkInfoResp::from_env().mesh_edge_port)
 }
@@ -925,7 +936,11 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     // the #494 first-contact fix). Every self-service install got a stale agent that
     // LOOKED broken for its first minute. Build the standalone release tag instead;
     // bump this tag alongside releases.
-    let build_cmd = "git clone https://github.com/scimbe/ct-agent.git && cd ct-agent && git checkout v0.4.17\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release --locked -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine\n# (or skip the build: download a prebuilt binary from https://github.com/scimbe/ct-agent/releases/tag/v0.4.17)";
+    let tag = ct_agent_release_tag();
+    let build_cmd = format!(
+        "git clone https://github.com/scimbe/ct-agent.git && cd ct-agent && git checkout {tag}\ndocker run --rm -v \"$PWD\":/work -w /work rust:1-slim \\\n  cargo build --release --locked -p ct-agent --bin ct-agent\n# binary is now at ./target/release/ct-agent -- no Rust toolchain needed on your machine\n# (or skip the build: download a prebuilt binary from https://github.com/scimbe/ct-agent/releases/tag/{tag})"
+    );
+    let build_cmd = build_cmd.as_str();
     // Only this tunnel's own already-assigned hostname -- never a value the
     // caller supplies -- so the agent never has to copy it by hand from the
     // tunnels list, and can never accidentally (or otherwise) end up with a
@@ -4268,10 +4283,36 @@ mod tests {
         // The old command cloned CADS-Tunnel and built its git-pinned `ct-agent`
         // dependency -- stuck at a v0.3.0-era rev, months behind the releases --
         // so every self-service install got a stale agent.
+        // #512: asserted against the ONE pin source (repo-root CT_AGENT_RELEASE),
+        // not a version prefix -- the old `git checkout v0.4` check would have
+        // stayed green on a frozen pin until v0.5.
+        let tag = ct_agent_release_tag();
+        {
+            // The source itself must be a plausible release tag: `v` + three
+            // dot-separated numeric parts (a corrupted/empty file must fail HERE,
+            // not ship a broken install command).
+            let parts: Vec<&str> = tag.trim_start_matches('v').split('.').collect();
+            assert!(
+                tag.starts_with('v') && parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "CT_AGENT_RELEASE must hold a vX.Y.Z tag, got {tag:?}"
+            );
+        }
         assert!(
             html.contains("clone https://github.com/scimbe/ct-agent.git")
-                && html.contains("git checkout v0.4"),
-            "the install build clones the standalone agent repo at a release tag"
+                && html.contains(&format!("git checkout {tag}"))
+                && html.contains(&format!("releases/tag/{tag}")),
+            "the install build clones the standalone agent repo at the pinned release tag"
+        );
+        // #512: the help-site example (the other user-facing install surface) must
+        // default to the same source -- this is what keeps the pin scatter from
+        // re-growing (seven pins with four different values caused the #502 class).
+        assert!(
+            include_str!("../../../examples/help-site/Agent.Dockerfile").contains(&format!("ARG CT_AGENT_REF={tag}")),
+            "help-site Agent.Dockerfile default must match CT_AGENT_RELEASE ({tag})"
+        );
+        assert!(
+            include_str!("../../../examples/help-site/compose.help-site.yml").contains(&format!("CT_AGENT_REF:-{tag}")),
+            "help-site compose fallback must match CT_AGENT_RELEASE ({tag})"
         );
         assert!(
             !html.contains("clone https://github.com/scimbe/CADS-Tunnel.git"),

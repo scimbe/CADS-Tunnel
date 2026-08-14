@@ -8,10 +8,10 @@ FROM rust:1-slim-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
-# Which ct-agent tag/branch/commit to build -- bump deliberately. No tagged release
-# exists yet (see crates/agent-tools/Cargo.toml's comment), so this defaults to a
-# pinned commit; switch to a `vX.Y.Z` tag once one exists.
-ARG CT_AGENT_REF=2439f8138120f7f8408f6173096f4b457f54ef5a
+# Which ct-agent tag/branch/commit to build -- bump deliberately. The default MUST
+# match the repo-root `CT_AGENT_RELEASE` file (#512, the one pin source; a portal
+# test asserts this file agrees with it), so a release bump updates both together.
+ARG CT_AGENT_REF=v0.4.18
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
