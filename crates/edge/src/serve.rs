@@ -262,17 +262,15 @@ where
     // delivery attempt consumes one slot and hands the stream back on a dead
     // receiver, so: DRAIN dead parks in a loop, succeed on the first live one,
     // and fall through to the QUIC registration when none are left.
-    let mut stream: crate::state::BoxedStream = Box::new(Prepend {
+    let stream: crate::state::BoxedStream = Box::new(Prepend {
         pre: hello,
         pos: 0,
         inner: inbound,
     });
-    while state.has_tcp_agent(&token) {
-        match state.deliver_to_tcp_agent(&token, stream) {
-            Ok(()) => return Ok(()),
-            Err(back) => stream = back, // dead slot consumed (#505); try the next
-        }
-    }
+    let mut stream = match state.deliver_to_tcp_agent_draining(&token, stream) {
+        Ok(()) => return Ok(()),
+        Err(back) => back, // no live parked slot (#505); fall through to QUIC
+    };
     match open_agent_stream(state, &token).await {
         Ok((agent_send, agent_recv)) => {
             // The buffered ClientHello replays from the Prepend wrapper on first
@@ -287,9 +285,10 @@ where
             // blocked) whose pool was momentarily exhausted by a burst of
             // parallel browser connections (#229 follow-up: real page loads
             // open several at once). Give it a brief window to free a slot
-            // rather than failing this request outright.
+            // rather than failing this request outright. Draining too (#510):
+            // the freed slot may sit behind stale dead ones.
             if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
-                if state.deliver_to_tcp_agent(&token, stream).is_ok() {
+                if state.deliver_to_tcp_agent_draining(&token, stream).is_ok() {
                     return Ok(());
                 }
             }
@@ -347,13 +346,11 @@ where
     // #505: same drain-then-fall-through as serve_sni_passthrough — dead parked
     // slots are consumed one by one and a healthy QUIC registration serves the
     // request instead of the old terminal "vanished before delivery".
-    let mut stream: crate::state::BoxedStream = Box::new(tls);
-    while state.has_tcp_agent(&token) {
-        match state.deliver_to_tcp_agent(&token, stream) {
-            Ok(()) => return Ok(()),
-            Err(back) => stream = back, // dead slot consumed (#505); try the next
-        }
-    }
+    let stream: crate::state::BoxedStream = Box::new(tls);
+    let mut stream = match state.deliver_to_tcp_agent_draining(&token, stream) {
+        Ok(()) => return Ok(()),
+        Err(back) => back, // no live parked slot (#505); fall through to QUIC
+    };
     match open_agent_stream(state, &token).await {
         Ok((agent_send, agent_recv)) => {
             let mut agent = join(agent_recv, agent_send);
@@ -363,9 +360,9 @@ where
         }
         Err(e) => {
             // Same momentarily-exhausted-pool recovery as serve_sni_passthrough
-            // (#229 follow-up).
+            // (#229 follow-up), draining too (#510).
             if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
-                if state.deliver_to_tcp_agent(&token, stream).is_ok() {
+                if state.deliver_to_tcp_agent_draining(&token, stream).is_ok() {
                     return Ok(());
                 }
             }

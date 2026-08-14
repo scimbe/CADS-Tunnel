@@ -796,12 +796,37 @@ impl<H: Clone> EdgeState<H> {
         drop(agents);
         // One parked slot consumed, whether or not the Agent is still there to
         // receive it (a dropped receiver means that slot is gone either way).
-        self.tcp_parked_gauge.fetch_sub(1, Ordering::Relaxed);
+        // Saturating (#510): a gauge can never owe parks, and a miscounted
+        // increment elsewhere must show as 0, not wrap to u64::MAX in /metrics.
+        let _ = self
+            .tcp_parked_gauge
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |g| Some(g.saturating_sub(1)));
         let sent = tx.send(stream);
         if sent.is_ok() {
             self.tcp_deliveries.inc();
         }
         sent
+    }
+
+    /// [`deliver_to_tcp_agent`](Self::deliver_to_tcp_agent) in a drain loop
+    /// (#505/#510): dead parked slots (dropped receivers) are consumed one by
+    /// one; succeeds on the first live one and hands the stream back once no
+    /// parked slot is left, so the caller can fall through to the QUIC
+    /// registration. This is THE delivery entry point -- every serve path
+    /// (primary and recovery) must drain, or a stale dead park blocks a
+    /// hostname that has a healthy registration right behind it.
+    pub fn deliver_to_tcp_agent_draining(
+        &self,
+        token: &RoutingToken,
+        mut stream: BoxedStream,
+    ) -> Result<(), BoxedStream> {
+        while self.has_tcp_agent(token) {
+            match self.deliver_to_tcp_agent(token, stream) {
+                Ok(()) => return Ok(()),
+                Err(back) => stream = back, // dead slot consumed; try the next
+            }
+        }
+        Err(stream)
     }
 
     /// Whether at least one TCP-fallback agent is currently parked for `token`.
@@ -1142,10 +1167,11 @@ impl<H: Clone> EdgeState<H> {
         if self.is_revoked(&token) {
             return None;
         }
-        let (tx, rx) = oneshot::channel();
-        self.tcp_agents.lock_safe().entry(token).or_default().push_back(tx);
-        self.tcp_agent_parked.notify_one();
-        Some(rx)
+        // #510: delegate to `park_tcp_agent` so this (the production 'A'/'K'
+        // path) counts `tcp_parks`/`tcp_parked_gauge` exactly like the plain
+        // path -- it used to skip both while `deliver_to_tcp_agent` always
+        // decremented, wrapping the gauge to u64::MAX on first delivery.
+        Some(self.park_tcp_agent(token))
     }
 
     /// Whether `token` currently has at least one live Agent tunnel.
@@ -1840,6 +1866,60 @@ mod tests {
         assert!(res.is_err(), "a vanished agent hands the stream back");
         assert_eq!(state.tcp_parked(), 0, "the slot is still released -- no gauge leak");
         assert_eq!(state.tcp_deliveries_total(), 0, "but it is NOT counted as a delivery");
+    }
+
+    #[tokio::test]
+    async fn the_production_park_path_counts_metrics_and_the_gauge_never_wraps_510() {
+        // #510: `park_tcp_agent_unless_revoked` -- the path the production 'A'/'K'
+        // roles take -- used to skip both counters while `deliver_to_tcp_agent`
+        // always decremented the gauge, so the FIRST delivery wrapped tcp_parked
+        // to u64::MAX and /metrics reported nonsense from then on.
+        let state: EdgeState<u32> = EdgeState::new();
+        let rx = state.park_tcp_agent_unless_revoked(token(23)).expect("not revoked");
+        assert_eq!(state.tcp_parks_total(), 1, "the production path counts the park");
+        assert_eq!(state.tcp_parked(), 1, "and the gauge");
+
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(state.deliver_to_tcp_agent(&token(23), client).is_ok());
+        assert!(rx.await.is_ok());
+        assert_eq!(state.tcp_parked(), 0, "gauge returns to 0 -- no u64 wrap");
+
+        // Even a miscounted extra decrement must saturate at 0, never wrap: the
+        // gauge is an operator-facing reading, and u64::MAX reads as an outage.
+        let stray: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        let _rx2 = state.park_tcp_agent(token(23));
+        let _ = state.deliver_to_tcp_agent(&token(23), stray);
+        let extra: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        let _ = state.deliver_to_tcp_agent(&token(23), extra); // no slot: Err, no decrement
+        assert_eq!(state.tcp_parked(), 0, "saturated, not wrapped");
+    }
+
+    #[tokio::test]
+    async fn deliver_draining_consumes_dead_slots_and_hands_back_when_none_live_510() {
+        // #510: the drain loop (#505) lived inline on the primary serve paths only;
+        // this pins the shared entry point both primary AND recovery paths use now.
+        let state: EdgeState<u32> = EdgeState::new();
+        let dead = state.park_tcp_agent(token(24));
+        drop(dead); // agent vanished -- stale dead slot at the FRONT of the queue
+        let live = state.park_tcp_agent(token(24));
+
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(
+            state.deliver_to_tcp_agent_draining(&token(24), client).is_ok(),
+            "a dead slot in front must be drained, not fail the delivery"
+        );
+        assert!(live.await.is_ok(), "the live agent behind it receives the stream");
+        assert_eq!(state.tcp_parked(), 0, "both slots consumed, gauge consistent");
+
+        // All slots dead: the stream comes back so the caller can fall through
+        // to the QUIC registration instead of failing terminally.
+        drop(state.park_tcp_agent(token(24)));
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(
+            state.deliver_to_tcp_agent_draining(&token(24), client).is_err(),
+            "no live slot: the stream is handed back for the QUIC fall-through"
+        );
+        assert_eq!(state.tcp_parked(), 0);
     }
 
     #[tokio::test]
