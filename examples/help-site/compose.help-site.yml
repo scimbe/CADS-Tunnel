@@ -39,7 +39,7 @@ services:
       context: .
       dockerfile: Agent.Dockerfile
       args:
-        - CT_AGENT_REF=${CT_AGENT_REF:-56a1db44ee93c07ae8763bad4243ecd1611ce6c3}
+        - CT_AGENT_REF=${CT_AGENT_REF:-622e8f8fce57ad857022e463b611f397d685c1fb}
     environment:
       - CT_AGENT_MODE=browser                       # SNI passthrough to the origin
       - CT_AGENT_HOSTNAME=help.bunsenbrenner.org     # bound at the edge via 'H'
