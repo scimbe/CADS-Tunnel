@@ -5198,6 +5198,22 @@ pub fn persistent_control_plane_router(
             std::time::Duration::from_secs(tick_secs),
         ));
     }
+    // #517 V3 slice 3: the direct-serving reachability probe loop, opt-in via
+    // CT_CP_DIRECT_PROBE=1 (default off -- absent unless configured, like the acme
+    // broker). Slice 3 only probes + records the hysteresis state; it does not touch
+    // DNS, so enabling it has no live-routing effect yet -- it just makes the probe
+    // decisions observable (logged) before slice 4 wires them to deSEC records.
+    if std::env::var("CT_CP_DIRECT_PROBE").ok().as_deref() == Some("1") {
+        let tick_secs = std::env::var("CT_CP_DIRECT_PROBE_TICK_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        tokio::spawn(crate::direct_serving::run_probe_loop(
+            tunnels.clone(),
+            std::time::Duration::from_secs(tick_secs),
+        ));
+        eprintln!("ct-cp: direct-serving reachability probe loop ON ({tick_secs}s, CT_CP_DIRECT_PROBE) — slice 3, no DNS yet");
+    }
     // Operator status view + landing page (F4.1/F4.2): aggregate counts across
     // the stores, plus a self-contained HTML dashboard at `/`.
     let status = status_router(
