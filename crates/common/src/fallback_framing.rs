@@ -47,7 +47,10 @@
 //!   outstanding counters are discarded and no dead verdict is reached anymore. A peer is not
 //!   ACK-obliged after its own FIN, and after an implicit FIN it physically cannot answer, so
 //!   any verdict then would be a guaranteed false positive. The surviving direction is
-//!   protected by its own DATA traffic and, ultimately, by write errors / kernel keepalive.
+//!   protected by its own DATA traffic and, ultimately, by write errors after TCP retransmit
+//!   escalation (minutes, not seconds — the 8 s injection itself keeps the connection's idle
+//!   timer reset, so the kernel keepalive window never even starts; do not mistake this
+//!   backstop for a reason to skip a real timeout).
 //!   Injection, however, CONTINUES until FIN has passed in BOTH directions: a keepalive sent
 //!   after the peer's FIN is middlebox state refresh for the still-open sending direction, not
 //!   a probe — deliberately untracked and not ACK-obliged; do NOT "simplify" it away. An
