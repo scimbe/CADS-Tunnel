@@ -1320,6 +1320,24 @@ pub fn new_shared_channel_pairer() -> SharedChannelPairer {
 /// same EOF-ish close it always did (no behavior change).
 pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
 
+/// The QUIC-leg park-expiry close-reason PREFIX -- the `quinn::Connection::close` analog of
+/// the stream-leg [`PARK_EXPIRED_TOKEN`] (`EX`). When the edge reaps an idle QUIC park it closes
+/// the connection with an ApplicationClose reason beginning with this prefix; ct-agent's
+/// `error_names_park_expiry` matches exactly this substring in the quinn-surfaced close reason to
+/// classify the event as "re-park", NOT a refusal (no ladder advance, no refusal backoff). It
+/// previously lived as two independent inline literals (a TTL reap and a supersede) with no shared
+/// source of truth -- unlike its stream-leg sibling, which is this named const. Centralized here
+/// so a reword can't silently decouple that cross-repo client classification; both reasons are
+/// built via [`quic_park_expired_reason`], and `quic_park_expiry_reasons_carry_the_wire_prefix`
+/// pins the contract so a breaking edit fails the edge's own gate.
+pub const QUIC_PARK_EXPIRED_REASON_PREFIX: &str = "park-expired:";
+
+/// Build a QUIC park-expiry close reason: the [`QUIC_PARK_EXPIRED_REASON_PREFIX`] the client
+/// classifies on, plus an honest human-readable `why` suffix (logged, never parsed).
+pub fn quic_park_expired_reason(why: &str) -> String {
+    format!("{QUIC_PARK_EXPIRED_REASON_PREFIX} {why}")
+}
+
 /// A channel member admitted over a **generic byte stream** (not a `quinn::Connection`)
 /// — e.g. a `:443` TLS-over-TCP front-door member whose network blocks the channel
 /// UDP/TCP ports (#106). Unlike [`AdmittedMember`] it carries no `quinn::Connection`:
@@ -2152,7 +2170,9 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             // ct-agent#21: a NAMED close reason -- the QUIC analog of the stream path's EX
             // token; a current client reads the ApplicationClose reason and re-parks on the
             // same rung instead of misreading the close as a rung failure.
-            m.payload.conn.close(0u32.into(), b"park-expired: no partner within the park TTL");
+            m.payload
+                .conn
+                .close(0u32.into(), quic_park_expired_reason("no partner within the park TTL").as_bytes());
         }
 
         // Accept the next incoming CONNECTION only — fast (the QUIC accept, not the handshake). The
@@ -2288,7 +2308,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 PairOutcome::Superseded(stale) => {
                     stale.payload.conn.close(
                         0u32.into(),
-                        b"park-expired: superseded by a newer join from the same holder",
+                        quic_park_expired_reason("superseded by a newer join from the same holder").as_bytes(),
                     );
                 }
             }
@@ -2307,6 +2327,32 @@ mod tests {
 
     fn operator_pubkey() -> [u8; 32] {
         SigningKey::from_bytes(&OP_SEED).verifying_key().to_bytes()
+    }
+
+    /// Cross-repo wire contract: ct-agent's `error_names_park_expiry` classifies a QUIC
+    /// park-expiry (vs a refusal) by matching the substring `park-expired` in the quinn-surfaced
+    /// close reason. Both edge close reasons are built from
+    /// [`QUIC_PARK_EXPIRED_REASON_PREFIX`]; this pins that the prefix still carries the substring
+    /// the client matches, so a reword that would silently make ct-agent misread a park-expiry as
+    /// a refusal fails the edge's own gate instead.
+    #[test]
+    fn quic_park_expiry_reasons_carry_the_wire_prefix() {
+        assert!(
+            QUIC_PARK_EXPIRED_REASON_PREFIX.contains("park-expired"),
+            "ct-agent matches the substring \"park-expired\"; the prefix must contain it"
+        );
+        for why in [
+            "no partner within the park TTL",
+            "superseded by a newer join from the same holder",
+        ] {
+            let reason = quic_park_expired_reason(why);
+            assert!(reason.starts_with(QUIC_PARK_EXPIRED_REASON_PREFIX));
+            assert!(
+                reason.contains("park-expired"),
+                "a current ct-agent must classify {reason:?} as park-expiry, not a refusal"
+            );
+            assert!(reason.ends_with(why), "the honest human-readable why-suffix is preserved");
+        }
     }
 
     #[test]
