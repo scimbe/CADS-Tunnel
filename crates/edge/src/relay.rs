@@ -1404,7 +1404,17 @@ mod tests {
         let mut keepalives = 0u32;
         loop {
             match far_reader.next().await.unwrap() {
-                Some(Frame::Keepalive { .. }) => keepalives += 1,
+                Some(Frame::Keepalive { .. }) => {
+                    keepalives += 1;
+                    // Without this cap a regressed (never-firing) N2 arm would keep
+                    // this loop reading auto-advancing keepalives forever -- the suite
+                    // would HANG instead of fail. 60 cadences (~480s) is far past the
+                    // bound + one interval, so hitting it can only be the regression.
+                    assert!(
+                        keepalives <= 60,
+                        "the relay never sent its N2 FIN -- {keepalives} keepalives past the bound is the pre-#529 forever-hold"
+                    );
+                }
                 Some(Frame::Fin) => break,
                 other => panic!("expected keepalives then the N2 FIN, got {other:?}"),
             }
