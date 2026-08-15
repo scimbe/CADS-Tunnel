@@ -86,6 +86,41 @@ only (unchanged payload-blindness). A channel is therefore a **hub of pairwise
 agent↔agent Noise sessions**, *not* a multi-party group session — which sidesteps the
 two-party Noise constraint honestly instead of inventing group crypto.
 
+### 4a. Edge-side pairer topology & transport unification (issue #495)
+The edge correlates the two members of a channel connection **per transport**, in
+separate pairer instances (`crates/edge/src/channel_broker.rs`, `serve.rs`):
+
+- the `:443` **front-door** broker and the **WebSocket** listener share **one**
+  `SharedChannelPairer` (deliberate cross-transport pairing; its member payload is
+  `AdmittedStreamMember<BoxedChannelStream>` — ack and relayed session on the same duplex);
+- the **QUIC relay** endpoint (`:4436`) and the **QUIC rendezvous** endpoint (`:4435`)
+  each have their **own** `SharedQuicChannelPairer` (member payload `AdmittedMember`).
+
+Two members pair **only within one pairer instance**. The consequence — and the origin
+of #495 — is that **mixed-transport pairs never meet**: if member A's UDP is blocked (its
+ladder falls back to `:443`) while member B's UDP works (its ladder picks a QUIC
+endpoint), A parks in the front-door pairer and B in a QUIC pairer, neither finds a
+partner, both are reaped at `CHANNEL_PARK_TTL_SECS`, and both sides see a ~30–40 s
+"refused" that is really a park-TTL reap. **Operational guidance today:** set
+`CT_CHANNEL_FRONT_DOOR_ONLY=1` on **both** members so they deterministically park in the
+same (`:443`) pairer.
+
+**Transport unification (#495), in progress, flag-gated `CT_EDGE_UNIFIED_PAIRER`:**
+- **U1 (landed):** ack-format unification — stream acks carry `r=`/`sp=` like the QUIC
+  completers; and a `SessionSource` abstraction (`SameStream` for `:443`/WS,
+  `EndpointSwap` for QUIC rendezvous) so a pair with any EndpointSwap side completes
+  ack-then-close.
+- **U2 (next, relay-first — decided 2026-08-15):** unify the **QUIC relay** endpoint
+  (`:4436`) into the shared pairer. Chosen over rendezvous-first because cross-transport
+  completion is then unambiguous — the edge **relays** between the `:443` stream and the
+  QUIC relay connection (its session bi-stream wrapped as a `BoxedChannelStream`), with no
+  "how does the `:443` side connect directly?" gap. The **rendezvous** endpoint (`:4435`)
+  stays separate: a successful direct rendezvous needs both sides UDP-capable by
+  definition, so there is nothing to gain from mixing it into the relay pool.
+
+Until U2+ ship and the flag is enabled, the `FRONT_DOOR_ONLY` guidance above stays
+required. See issue #495 for the slice-by-slice plan.
+
 ### Key custody (decided 2026-07-17)
 The channel operator's grant-signing key is **agent-held**, not control-plane-held.
 The operator *agent* generates and holds its channel keypair and signs member
