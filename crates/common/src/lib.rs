@@ -12,6 +12,7 @@ pub mod channel;
 pub mod cookbook;
 pub mod credential;
 pub mod crew;
+pub mod fallback_framing;
 pub mod mcp;
 pub mod metrics;
 pub mod noise;

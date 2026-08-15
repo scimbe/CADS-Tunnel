@@ -842,7 +842,21 @@ impl<H: Clone> EdgeState<H> {
     /// caller can fall through to the QUIC route), consuming that one
     /// registration (FIFO) on success -- the rest of the pool, if any, stays
     /// parked for the next concurrent Client.
-    pub fn deliver_to_tcp_agent(
+    ///
+    /// PRIVATE on purpose (#528 review findings 8/9): a single delivery
+    /// attempt stops at the FIRST parked slot -- if that slot is dead (a
+    /// dropped receiver), the attempt fails with the stream handed back even
+    /// when a live park sits right behind the corpse. Callers then either
+    /// discarded the stream (the 'K'/'L' verify-at-delivery failover's
+    /// `let _ =`, losing the request) or spuriously fell through to the QUIC
+    /// route (the QUIC 'C' cross-transport handoff, the TCP 'C'/'M' arms).
+    /// Every production path must go through
+    /// [`deliver_to_tcp_agent_draining`](Self::deliver_to_tcp_agent_draining),
+    /// which consumes dead slots until a live one answers -- private
+    /// visibility now enforces what used to be a code-review rule (#505/#510
+    /// called draining "THE delivery entry point" and review still found six
+    /// non-draining production call sites).
+    fn deliver_to_tcp_agent(
         &self,
         token: &RoutingToken,
         stream: BoxedStream,
