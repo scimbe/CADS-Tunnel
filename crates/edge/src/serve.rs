@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::EdgeConfig;
-use crate::relay::{relay, relay_quic};
+use crate::relay::{framed_relay, relay, relay_quic};
 use crate::state::{ConnectionCap, EdgeState};
 use crate::pki::{build_dual_edge_from_ca, build_server_endpoint_from_ca, Ca};
 use crate::transport::save_cert;
@@ -875,6 +875,11 @@ const TCP_FALLBACK_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// edge legitimately originates and observes it) -- see the module doc on
 /// [`serve_tcp_connection`]'s `'K'` arm for the full wire format and the
 /// race-free handoff design.
+///
+/// #528: the framed relay phase injects its in-flight keepalive on this SAME
+/// measured cadence, via the codec's `KEEPALIVE_INTERVAL` constant -- the
+/// coupling is textual (asserted in this file's invariants test), since the
+/// codec crate cannot see this private constant.
 const TCP_PING_INTERVAL: Duration = Duration::from_secs(8);
 
 /// Bound on one PING/PONG round trip ([`send_ping_and_await_pong`]) during the
@@ -1859,6 +1864,14 @@ impl std::fmt::Debug for ParkAndPingError {
 ///   receives a single ping-protocol byte. Opt-in only -- see those
 ///   functions' docs for the exact wire format and the race-free hand-off to
 ///   [`relay`] once a Client arrives.
+/// * `'F'` (#528; "F" for Framed) — the framed-capable variant of `'K'`:
+///   byte-identical admission and park-phase keepalive, but once a Client is
+///   delivered the relay phase speaks the `ct_common::fallback_framing` codec on
+///   the edge↔agent hop ([`framed_relay`]) instead of a raw byte pump, so an
+///   in-flight request whose origin goes silent past the middlebox idle floor
+///   keeps keepalive frames flowing and survives. Opt-in only; a legacy Agent
+///   never sends `'F'`, and an old edge's `unknown role byte` drop is the
+///   refusal an `'F'`-capable Agent downgrades on (`'F'`→`'L'`→`'B'`).
 /// * `'C'` — a Client runs the `'C'` rendezvous (challenge → PoW) and is delivered
 ///   to a parked TCP agent if one exists, else relayed to a QUIC-registered agent.
 ///
@@ -1980,6 +1993,65 @@ where
                 // here and gets the same clean shutdown.
                 Err(ParkAndPingError::NoClient(e)) => {
                     edge_trace(format_args!("tcp-fallback 'K' parked loop ended without a client: {e}"));
+                    let _ = stream.shutdown().await;
+                    Ok(())
+                }
+            }
+        }
+        b'F' => {
+            // #528: the FRAMED-capable variant of 'K'. Admission, cap/revoke
+            // checks, park, and the whole park-phase PING/PONG keepalive are
+            // BYTE-IDENTICAL to 'K' (`admit_tcp_agent_a` + `park_and_ping`) --
+            // a legacy Agent never sends 'F', so this arm is unreachable for
+            // any already-deployed client, and an edge WITHOUT this arm hits
+            // the `unknown role byte` error below and drops, which is exactly
+            // the refusal signal the Agent's 'F'->'L'->'B' downgrade ladder
+            // expects. The ONLY difference from 'K' is what runs AFTER the
+            // `TCP_PING_STOP` hand-off byte: the relay phase speaks the
+            // `ct_common::fallback_framing` codec on the edge<->agent hop
+            // (`framed_relay`) instead of a raw byte pump, so an in-flight
+            // request whose origin falls silent past the middlebox idle floor
+            // keeps keepalive frames flowing and survives (#388 class). The
+            // browser side stays raw; `framed_relay` unframes agent bytes
+            // before forwarding to the browser and frames browser bytes before
+            // they reach the agent. `_sub_permit` is held for the whole
+            // parked-and-relaying life exactly as in 'A'/'K' -- see
+            // `admit_tcp_agent_a`'s doc.
+            let Some((token, parked, _sub_permit)) =
+                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "F").await?
+            else {
+                let _ = stream.shutdown().await;
+                return Ok(());
+            };
+            match park_and_ping(&mut stream, parked).await {
+                Ok(mut client) => {
+                    // Same clean park->relay boundary as 'K': the STOP sentinel
+                    // ends the PING phase strictly before the first framed
+                    // relay byte can reach the Agent (TCP ordering guarantees
+                    // it is seen first). After STOP, both directions speak the
+                    // frame codec until the connection ends -- single-use, no
+                    // way back to a park phase.
+                    stream.write_all(&[TCP_PING_STOP]).await?;
+                    stream.flush().await?;
+                    framed_relay(&mut stream, &mut client).await?;
+                    Ok(())
+                }
+                // Verify-at-delivery failover, identical to 'K': the rescued
+                // `client` is the RAW browser stream (framing lives only on the
+                // edge<->agent hop, and only after STOP -- which this dead
+                // agent never reached), so re-delivering it to the next parked
+                // slot for the same token is correct whether that slot is
+                // framed or not.
+                Err(ParkAndPingError::AgentDead { client, source }) => {
+                    eprintln!(
+                        "ct-edge: tcp-fallback 'F' verify-ping caught a dead parked agent at delivery ({source}); failing the client over to the next parked slot"
+                    );
+                    let _ = state.deliver_to_tcp_agent_draining(&token, client);
+                    let _ = stream.shutdown().await;
+                    Ok(())
+                }
+                Err(ParkAndPingError::NoClient(e)) => {
+                    edge_trace(format_args!("tcp-fallback 'F' parked loop ended without a client: {e}"));
                     let _ = stream.shutdown().await;
                     Ok(())
                 }
@@ -5013,6 +5085,16 @@ mod tests {
             "one round trip ({TCP_PING_PONG_TIMEOUT:?}) must be bounded well inside one ping \
              period ({TCP_PING_INTERVAL:?}), so probes can never pile up on top of each other"
         );
+        // #528: the framed relay phase's keepalive cadence (the codec's
+        // KEEPALIVE_INTERVAL) reuses THIS measured park-phase interval by
+        // contract. The coupling is textual (the codec crate cannot see this
+        // private constant), so it is asserted here instead of trusted.
+        assert_eq!(
+            TCP_PING_INTERVAL,
+            ct_common::fallback_framing::KEEPALIVE_INTERVAL,
+            "the codec's KEEPALIVE_INTERVAL must stay in lockstep with the park phase's \
+             TCP_PING_INTERVAL -- both are the same calibrated middlebox-survival cadence"
+        );
     }
 
     #[test]
@@ -5421,6 +5503,193 @@ mod tests {
         client_peer.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"rescued", "the rescued stream is the real delivered Client");
 
+        drop(agent_peer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_role_f_admits_and_pings_like_k_then_relays_framed_end_to_end_528() {
+        // #528 (iii): the full 'F' lifecycle through the real
+        // `serve_tcp_connection` dispatch. Byte-identical to 'K' up to and
+        // including the STOP sentinel (admission, park-phase PING/PONG); after
+        // STOP the edge<->agent hop speaks the frame codec: raw client bytes
+        // arrive as DATA frames, agent DATA is unframed toward the client, an
+        // agent keepalive is ACKed and discarded -- never leaked into the raw
+        // client stream.
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x46; 32]); // 0x46 == b'F'
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
+        let state_f = state.clone();
+        let edge =
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None).await });
+
+        // Admission: identical wire to 'A'/'K' -- role byte + 32-byte token in, OK out.
+        let mut hdr = vec![b'F'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK", "'F' admission is byte-identical to 'K'");
+
+        // One real park-phase PING/PONG round trip, exactly as 'K' -- framing
+        // begins only AFTER the STOP sentinel, never during the park phase.
+        let mut ping = [0u8; 9];
+        agent_peer.read_exact(&mut ping).await.unwrap();
+        assert_eq!(ping[0], TCP_PING_MAGIC, "the park phase still runs the raw PING keepalive");
+        agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+        agent_peer.flush().await.unwrap();
+
+        // A real Client arrives and is delivered to the parked 'F' agent.
+        assert!(state.has_tcp_agent(&token), "the 'F' registration is parked and routable");
+        let (mut client_peer, client_edge) = tokio::io::duplex(1 << 16);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        // Drain the ping phase until STOP (same contract as 'K': every pre-STOP
+        // byte is a well-formed PING; a Client can straddle one round trip).
+        loop {
+            let mut lead = [0u8; 1];
+            agent_peer.read_exact(&mut lead).await.unwrap();
+            if lead[0] == TCP_PING_STOP {
+                break;
+            }
+            assert_eq!(lead[0], TCP_PING_MAGIC, "every pre-STOP byte belongs to a PING frame");
+            let mut rest = [0u8; 8];
+            agent_peer.read_exact(&mut rest).await.unwrap();
+            let mut ping = [0u8; 9];
+            ping[0] = lead[0];
+            ping[1..9].copy_from_slice(&rest);
+            agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        }
+
+        // Post-STOP the agent side speaks the frame codec.
+        let (far_r, far_w) = tokio::io::split(agent_peer);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        // Client -> Agent: raw bytes (packed with park-phase magic AND frame
+        // discriminators -- a Noise handshake will contain them) arrive as ONE
+        // DATA frame.
+        const FROM_CLIENT: &[u8] = &[0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0x42, 0xFF];
+        client_peer.write_all(FROM_CLIENT).await.unwrap();
+        client_peer.flush().await.unwrap();
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Data(FROM_CLIENT.to_vec())),
+            "post-STOP Client->Agent bytes arrive wrapped in a DATA frame",
+        );
+
+        // Agent -> Client: a keepalive then DATA. The keepalive is discarded
+        // (never a byte of it reaches the raw client) and ACKed through the
+        // edge's writer-owner; the DATA payload arrives unframed.
+        far_writer.keepalive(9).await.unwrap();
+        const FROM_AGENT: &[u8] = &[0xFA, 0xFB, 0xF9, 0x01, 0xFC];
+        far_writer.data(FROM_AGENT).await.unwrap();
+        far_writer.flush().await.unwrap();
+        let mut back = [0u8; 5];
+        client_peer.read_exact(&mut back).await.unwrap();
+        assert_eq!(
+            &back[..],
+            FROM_AGENT,
+            "agent DATA payload reaches the client unframed; the interleaved keepalive was discarded",
+        );
+
+        // The ACK for counter 9 comes back framed (skipping any keepalives the
+        // edge's own idle injector may have interleaved under paused time).
+        loop {
+            match far_reader.next().await.unwrap() {
+                Some(Frame::KeepaliveAck { counter }) => {
+                    assert_eq!(counter, 9, "the edge ACKs the agent's keepalive counter");
+                    break;
+                }
+                Some(Frame::Keepalive { counter, .. }) => {
+                    // The edge's own injected keepalive (paused-time idle); the
+                    // real agent would ACK it -- irrelevant to this assertion.
+                    let _ = counter;
+                }
+                other => panic!("expected the keepalive ACK, got {other:?}"),
+            }
+        }
+
+        drop(client_peer);
+        drop(far_reader);
+        drop(far_writer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_role_k_relay_stays_a_raw_byte_pump_not_framed_regression_528() {
+        // #528 regression (iv): adding the framed 'F' path must NOT change 'K'.
+        // A 'K' agent keeps the RAW post-STOP byte pump -- a payload that
+        // deliberately STARTS with the frame codec's DATA discriminator (0xFC)
+        // is delivered verbatim, never re-interpreted as a length-prefixed
+        // frame header.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x4B; 32]); // 0x4B == b'K'
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
+        let state_k = state.clone();
+        let edge =
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_k, &challenge, None).await });
+
+        let mut hdr = vec![b'K'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK");
+
+        assert!(state.has_tcp_agent(&token), "'K' is parked after OK");
+        let (mut client_peer, client_edge) = tokio::io::duplex(1 << 16);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        // Drain PINGs until STOP.
+        loop {
+            let mut lead = [0u8; 1];
+            agent_peer.read_exact(&mut lead).await.unwrap();
+            if lead[0] == TCP_PING_STOP {
+                break;
+            }
+            assert_eq!(lead[0], TCP_PING_MAGIC);
+            let mut rest = [0u8; 8];
+            agent_peer.read_exact(&mut rest).await.unwrap();
+            let mut ping = [0u8; 9];
+            ping[0] = lead[0];
+            ping[1..9].copy_from_slice(&rest);
+            agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        }
+
+        // A payload that parses as a plausible DATA frame header must arrive
+        // RAW and byte-exact -- 'K' has no framing in either direction.
+        const RAW: &[u8] = &[0xFC, 0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC];
+        client_peer.write_all(RAW).await.unwrap();
+        client_peer.flush().await.unwrap();
+        let mut got = [0u8; 8];
+        agent_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[..], RAW, "'K' relay stays raw: bytes arrive verbatim, never re-framed");
+
+        // And the reverse direction is raw too.
+        agent_peer.write_all(&[0xFD, 0xFE, 0x01]).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut rev = [0u8; 3];
+        client_peer.read_exact(&mut rev).await.unwrap();
+        assert_eq!(&rev, &[0xFD, 0xFE, 0x01], "agent->client stays raw as well");
+
+        drop(client_peer);
         drop(agent_peer);
         let _ = edge.await;
     }

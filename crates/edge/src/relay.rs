@@ -5,6 +5,9 @@
 //! inspecting them. P2.4a is the generic bidirectional relay primitive; P2.4b
 //! wires it onto paired QUIC streams (Client stream ↔ Agent tunnel).
 
+use ct_common::fallback_framing::{
+    Frame, FrameReader, FrameWriter, KeepaliveTracker, KEEPALIVE_DEAD_AFTER, KEEPALIVE_INTERVAL,
+};
 use quinn::{RecvStream, SendStream};
 use tokio::io::{
     copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
@@ -294,6 +297,278 @@ where
     let (a_recv, a_send) = tokio::io::split(a);
     let (b_recv, b_send) = tokio::io::split(b);
     relay_pair(a_recv, a_send, b_recv, b_send, label).await
+}
+
+/// The codec's dead-peer bound ([`KEEPALIVE_DEAD_AFTER`], 24s = 3x the cadence)
+/// in the milliseconds the clock-free [`KeepaliveTracker`] speaks. ACKs are
+/// cumulative ([`KeepaliveTracker::ack`]), so a crossing ACK can never produce
+/// a false dead verdict.
+const FRAMED_KEEPALIVE_DEAD_AFTER_MS: u64 = KEEPALIVE_DEAD_AFTER.as_millis() as u64;
+
+/// Cross-leg notifications for [`framed_relay`]: everything the agent->browser
+/// (reader) leg learns that the browser->agent (writer-owner) leg must act on.
+/// The codec contract mandates ONE writer-owner per direction, so the reader leg
+/// never touches the agent-bound writer itself -- it sends these instead.
+enum FramedEvent {
+    /// A peer keepalive whose [`Frame::Keepalive`]`.should_ack` verdict was
+    /// `true` (the reader evaluates the bounded-ACK rule itself): echo it.
+    Ack(u64),
+    /// The peer acked (cumulatively) every keepalive counter `<=` this value.
+    AckSeen(u64),
+    /// The peer sent its in-band FIN (data-EOF) -- for the termination rule.
+    PeerFin,
+}
+
+/// `sleep_until` an optional deadline; `None` never fires. Lets the liveness arm
+/// of [`framed_relay`]'s select stay inert while no keepalive is outstanding.
+async fn maybe_deadline(d: Option<tokio::time::Instant>) {
+    match d {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Framed fallback relay for an `'F'`-registered TLS-TCP Agent (#528). Only the
+/// **edge<->agent** hop speaks the `ct_common::fallback_framing` codec; the
+/// browser side stays raw. `agent` is the parked Agent's fallback stream
+/// (post-`TCP_PING_STOP`); `browser` is the delivered Client stream.
+///
+/// Structure (per the codec's normative v4 contract -- read that module doc
+/// first):
+/// - **One writer-owner per direction.** The browser->agent leg exclusively owns
+///   the agent-bound [`FrameWriter`]: browser DATA, keepalive injection on 8s
+///   send-silence ([`KEEPALIVE_INTERVAL`], the park phase's cadence), ACK
+///   echoes, the own FIN
+///   and the final shutdown all go through it, serialized by construction. The
+///   agent->browser leg owns the [`FrameReader`] plus the browser write half,
+///   and forwards what the writer-owner must know as [`FramedEvent`]s over a
+///   bounded channel.
+/// - **FIN semantics.** Browser EOF => in-band FIN toward the agent (the TCP
+///   stream stays open both ways so keepalives can protect the reply's silent
+///   tail). Peer FIN => shutdown toward the browser, relay continues (trailing
+///   keepalives stay legal). The clean-EOF **implicit FIN** (an agent ending via
+///   TLS close_notify instead of an explicit FIN frame) lands on the same path:
+///   the reader leg finishes, the writer leg keeps pumping browser->agent until
+///   its own natural end. **Termination is this caller's duty**: once FIN has
+///   passed in BOTH directions the writer-owner calls [`FrameWriter::shutdown`]
+///   (TLS close_notify, not an abrupt drop) and the relay returns promptly.
+/// - **Liveness.** Injected counters are tracked in the codec's
+///   [`KeepaliveTracker`] (cumulative acks); the relay fails `TimedOut` when
+///   the oldest outstanding exceeds [`FRAMED_KEEPALIVE_DEAD_AFTER_MS`] (24s).
+///   Injection stops once the peer has FINed -- keepalives exist to protect the
+///   counter-direction's in-flight data, and there is none anymore. Peer
+///   keepalives are ACKed iff the reader's own `should_ack` verdict says so and
+///   are never forwarded -- a keepalive must not corrupt the raw browser stream.
+/// - **DATA flushing** applies the #338 short-read heuristic on both legs: the
+///   agent-bound writer flushes after a short browser read (a likely message
+///   boundary the far side waits on), full-buffer chunks coalesce; the codec
+///   flushes KA/ACK/FIN inline itself. The browser leg flushes per chunk, since
+///   each DATA frame is already a peer-chosen chunk.
+///
+/// The relay phase is single-use, exactly like the raw one: it ends only with
+/// the connection (no return to a park phase; the worker redials).
+/// Returns `(bytes browser->agent, bytes agent->browser)`, application bytes
+/// only (frame overhead and keepalives excluded).
+pub async fn framed_relay<A, B>(agent: &mut A, browser: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (agent_read, agent_write) = tokio::io::split(agent);
+    let (mut browser_read, mut browser_write) = tokio::io::split(browser);
+    let mut reader = FrameReader::new(agent_read);
+    let mut writer = FrameWriter::new(agent_write);
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<FramedEvent>(8);
+
+    // Shared byte counters (atomics, not `Cell`: the enclosing future must stay
+    // `Send` for the spawned serve paths). Loaded after the select below while
+    // both leg futures are still pinned in scope, so plain shared borrows.
+    let fwd_bytes = AtomicU64::new(0);
+    let rev_bytes = AtomicU64::new(0);
+
+    // Agent -> browser: decode frames, forward DATA raw, discard keepalives
+    // (reporting ACK-worthy ones), map the peer's FIN onto a browser shutdown.
+    // Returns `Ok` at the agent's clean EOF (explicit-FIN'd or the implicit
+    // kind) -- consuming trailing keepalives until then, per the contract. An
+    // `ev_tx.send` failing means the writer leg already terminated (both FINs
+    // passed); nothing is left to notify, so end cleanly.
+    let rev_leg = async {
+        // Rebind the channel sender as a BODY-LOCAL: an async block's captured
+        // upvars are dropped when the FUTURE is dropped, not when its body
+        // completes -- and this future stays pinned (completed) until the whole
+        // relay returns. Without the rebind, `ev_rx.recv()` in the other leg
+        // would never observe the channel closing.
+        let ev_tx = ev_tx;
+        loop {
+            match reader.next().await.map_err(|e| relay_io_error(e, "agent->browser", "framed"))? {
+                None => {
+                    // Clean EOF: the contract's IMPLICIT FIN when no explicit
+                    // one preceded it -- converge on the exact same downstream
+                    // behavior as Frame::Fin (idempotent if it already ran),
+                    // including the explicit PeerFin notification so the
+                    // writer-owner learns of it promptly.
+                    let _ = browser_write.shutdown().await;
+                    let _ = ev_tx.send(FramedEvent::PeerFin).await;
+                    return Ok::<(), std::io::Error>(());
+                }
+                Some(Frame::Data(payload)) => {
+                    // An empty DATA frame is a wire-legal no-op (never EOF);
+                    // write_all(&[]) forwards nothing, exactly right.
+                    rev_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    browser_write
+                        .write_all(&payload)
+                        .await
+                        .map_err(|e| relay_io_error(e, "agent->browser", "framed"))?;
+                    browser_write
+                        .flush()
+                        .await
+                        .map_err(|e| relay_io_error(e, "agent->browser", "framed"))?;
+                }
+                Some(Frame::Keepalive { counter, should_ack }) => {
+                    // The reader evaluated the bounded-ACK rule already; a
+                    // repeated/regressing counter earns nothing (flood bound).
+                    if should_ack && ev_tx.send(FramedEvent::Ack(counter)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(Frame::KeepaliveAck { counter }) => {
+                    if ev_tx.send(FramedEvent::AckSeen(counter)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(Frame::Fin) => {
+                    // In-band data-EOF: half-close toward the browser; keep
+                    // reading (trailing keepalives/acks are contract-legal).
+                    let _ = browser_write.shutdown().await;
+                    if ev_tx.send(FramedEvent::PeerFin).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    };
+
+    // Browser -> agent: the one writer-owner. Every select arm here is
+    // cancel-safe (`read`, `recv`, timers); the frame writes run to completion
+    // inside the chosen arm's body, so a frame is never torn by arm selection.
+    let fwd_leg = async {
+        let mut buf = [0u8; 16 * 1024];
+        let mut own_fin = false;
+        let mut peer_fin = false;
+        let mut events_open = true;
+        let mut next_counter: u64 = 0;
+        let mut tracker = KeepaliveTracker::new();
+        let epoch = tokio::time::Instant::now();
+        let now_ms = |epoch: tokio::time::Instant| epoch.elapsed().as_millis() as u64;
+        let mut last_send = tokio::time::Instant::now();
+        loop {
+            if own_fin && peer_fin {
+                // Termination rule: FIN has passed in both directions -- close
+                // promptly (close_notify, #229 class) instead of keeping a
+                // finished request's corpse alive with mutual pinging. A
+                // shutdown error is not a relay failure: the request completed.
+                let _ = writer.shutdown().await;
+                return Ok::<(), std::io::Error>(());
+            }
+            let dead_deadline = tracker.oldest_outstanding_age_ms(now_ms(epoch)).map(|age| {
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(FRAMED_KEEPALIVE_DEAD_AFTER_MS.saturating_sub(age))
+            });
+            tokio::select! {
+                read = browser_read.read(&mut buf), if !own_fin => {
+                    let n = read.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                    if n == 0 {
+                        // In-band half-close: the agent's reply (and the
+                        // keepalives protecting it) can keep flowing.
+                        writer.fin().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        own_fin = true;
+                    } else {
+                        fwd_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        writer.data(&buf[..n]).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        if n < buf.len() {
+                            // #338 short-read heuristic (the codec contract's
+                            // caller duty): a short read marks a likely message
+                            // boundary the far side is waiting on.
+                            writer.flush().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        }
+                    }
+                    last_send = tokio::time::Instant::now();
+                }
+                ev = ev_rx.recv(), if events_open => match ev {
+                    Some(FramedEvent::Ack(counter)) => {
+                        writer
+                            .keepalive_ack(counter)
+                            .await
+                            .map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        // An ACK is real payload on the wire: it refreshes the
+                        // middlebox exactly like a keepalive would, so it resets
+                        // the injection timer too.
+                        last_send = tokio::time::Instant::now();
+                    }
+                    Some(FramedEvent::AckSeen(counter)) => tracker.ack(counter),
+                    Some(FramedEvent::PeerFin) => {
+                        peer_fin = true;
+                        // The dead verdict protects the counter-direction's
+                        // in-flight data; after its FIN there is none, and a
+                        // peer that stops acking pre-FIN keepalives now must
+                        // not be misdeclared dead while the browser still
+                        // uploads -- a genuinely dead connection surfaces as a
+                        // DATA write error instead.
+                        tracker = KeepaliveTracker::new();
+                    }
+                    // The reader leg finished: the agent's clean EOF, i.e. the
+                    // contract's IMPLICIT FIN (e.g. a TLS close_notify ending
+                    // instead of an explicit FIN frame). Same path as the
+                    // explicit one; this leg keeps pumping browser->agent
+                    // toward its own natural end -- and the agent's write
+                    // direction is gone, so pending acks can never arrive:
+                    // clear the tracker so the dead verdict cannot misfire.
+                    None => {
+                        events_open = false;
+                        peer_fin = true;
+                        tracker = KeepaliveTracker::new();
+                    }
+                },
+                _ = tokio::time::sleep_until(last_send + KEEPALIVE_INTERVAL), if !peer_fin => {
+                    // Inject on own send-silence -- only while the peer's FIN is
+                    // still outstanding (keepalives protect the peer's in-flight
+                    // reply; after its FIN there is nothing left to protect).
+                    let counter = next_counter;
+                    next_counter += 1;
+                    tracker.sent(counter, now_ms(epoch));
+                    writer.keepalive(counter).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                    last_send = tokio::time::Instant::now();
+                }
+                _ = maybe_deadline(dead_deadline) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "framed relay: peer dead -- oldest keepalive unacked for \
+                             {FRAMED_KEEPALIVE_DEAD_AFTER_MS}ms"
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+
+    tokio::pin!(rev_leg, fwd_leg);
+    tokio::select! {
+        // The reader leg ends first on the agent's clean EOF (implicit FIN) or
+        // a decode error. On the clean end the writer leg keeps running -- the
+        // browser may still be sending on the half-open connection -- so hand
+        // control to it; an error tears the relay down immediately.
+        r = &mut rev_leg => {
+            r?;
+            fwd_leg.await?;
+        }
+        // The writer leg ends on the both-FINs termination rule (having sent
+        // close_notify), a write error, or the dead-peer verdict.
+        f = &mut fwd_leg => f?,
+    }
+    Ok((fwd_bytes.load(Ordering::Relaxed), rev_bytes.load(Ordering::Relaxed)))
 }
 
 #[cfg(test)]
@@ -778,5 +1053,212 @@ mod tests {
             "origin decrypts the E2E payload the edge relayed blindly"
         );
         relay_task.abort();
+    }
+
+    /// Spawn `framed_relay` over two in-memory duplexes and hand back the far
+    /// (peer) ends: the agent peer speaks the frame codec, the browser peer
+    /// speaks raw bytes -- the exact #528 topology.
+    #[allow(clippy::type_complexity)]
+    fn spawn_framed_relay() -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<std::io::Result<(u64, u64)>>,
+    ) {
+        let (agent_edge, agent_far) = tokio::io::duplex(1 << 16);
+        let (browser_edge, browser_far) = tokio::io::duplex(1 << 16);
+        let relay = tokio::spawn(async move {
+            let mut agent_edge = agent_edge;
+            let mut browser_edge = browser_edge;
+            framed_relay(&mut agent_edge, &mut browser_edge).await
+        });
+        (agent_far, browser_far, relay)
+    }
+
+    #[tokio::test]
+    async fn framed_relay_frames_browser_bytes_unframes_agent_frames_and_terminates_on_both_fins() {
+        // #528 (i): the edge<->agent hop is FRAMED while the browser side stays
+        // raw -- and the relay terminates promptly (contract duty) once FIN has
+        // passed in both directions.
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (agent_far, mut browser_far, relay) = spawn_framed_relay();
+        let (far_r, far_w) = tokio::io::split(agent_far);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        // Browser -> Agent: raw bytes (deliberately containing every frame
+        // discriminator) arrive at the agent as ONE DATA frame -- payload bytes
+        // are never re-interpreted as framing.
+        const FROM_BROWSER: &[u8] = &[0xF8, 0xFC, 0xFD, 0xFE, 0x00, 0xFF, b'h', b'i'];
+        browser_far.write_all(FROM_BROWSER).await.unwrap();
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Data(FROM_BROWSER.to_vec())),
+            "browser bytes reach the agent wrapped in a DATA frame",
+        );
+
+        // Agent -> Browser: a DATA frame arrives at the browser as its raw payload.
+        far_writer.data(b"reply from the agent").await.unwrap();
+        far_writer.flush().await.unwrap();
+        let mut got = vec![0u8; b"reply from the agent".len()];
+        browser_far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"reply from the agent", "agent DATA payload reaches the browser unframed");
+
+        // Browser EOF -> the edge sends the in-band FIN (not a TCP shutdown).
+        browser_far.shutdown().await.unwrap();
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Fin),
+            "browser EOF becomes the codec's in-band half-close toward the agent",
+        );
+
+        // Agent FIN -> the browser sees EOF; both FINs passed -> the relay
+        // returns promptly with application-byte counts (frame overhead excluded).
+        far_writer.fin().await.unwrap();
+        let mut rest = Vec::new();
+        browser_far.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "the agent's FIN surfaces as a clean browser EOF");
+        let (fwd, rev) = relay.await.unwrap().unwrap();
+        assert_eq!(fwd, FROM_BROWSER.len() as u64, "browser->agent application bytes");
+        assert_eq!(rev, b"reply from the agent".len() as u64, "agent->browser application bytes");
+    }
+
+    #[tokio::test]
+    async fn framed_relay_discards_keepalives_acks_them_bounded_and_never_corrupts_the_browser() {
+        // #528 (ii): keepalives are discarded (never a byte of them reaches the
+        // raw browser stream) and ACKed exactly per the reader's bounded
+        // verdict -- a repeated counter earns NO second ack.
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
+        use tokio::io::AsyncReadExt;
+
+        let (agent_far, mut browser_far, relay) = spawn_framed_relay();
+        let (far_r, far_w) = tokio::io::split(agent_far);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        // A keepalive around real DATA: the browser must see ONLY the payload.
+        far_writer.keepalive(5).await.unwrap();
+        far_writer.data(b"chunk").await.unwrap();
+        far_writer.flush().await.unwrap();
+        let mut got = [0u8; 5];
+        browser_far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"chunk", "only the DATA payload reaches the browser");
+
+        // The edge ACKed counter 5 through its one writer-owner.
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::KeepaliveAck { counter: 5 }),
+            "a first-seen keepalive counter is ACKed",
+        );
+
+        // A REPEATED counter earns nothing (flood bound). Deterministic absence
+        // proof: keepalive events flow FIFO through the relay's one
+        // writer-owner, so if the repeated 5 wrongly earned an ack, that ack
+        // would arrive BEFORE counter 6's -- the next ACK must be exactly {6}.
+        far_writer.keepalive(5).await.unwrap();
+        far_writer.keepalive(6).await.unwrap();
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::KeepaliveAck { counter: 6 }),
+            "the repeated counter 5 earned no second ACK; the next ACK is 6's",
+        );
+
+        // And nothing of any keepalive leaked into the raw browser stream: the
+        // next browser byte the agent sends is the very next thing it reads.
+        far_writer.data(b"y").await.unwrap();
+        far_writer.flush().await.unwrap();
+        let mut y = [0u8; 1];
+        browser_far.read_exact(&mut y).await.unwrap();
+        assert_eq!(&y, b"y");
+
+        relay.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn framed_relay_injects_counted_keepalives_on_send_silence() {
+        // #528: the whole point -- when the edge's send side toward the agent
+        // falls silent past the codec cadence, it injects counted keepalives so
+        // the middlebox never sees a quiet connection. Paused time auto-advances,
+        // so no real 8s wait is incurred.
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
+
+        let (agent_far, _browser_far, relay) = spawn_framed_relay();
+        let (far_r, far_w) = tokio::io::split(agent_far);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        // First injected keepalive after one cadence of silence; ack it so the
+        // tracker never approaches the dead verdict.
+        match far_reader.next().await.unwrap() {
+            Some(Frame::Keepalive { counter, .. }) => assert_eq!(counter, 0, "counters start at 0"),
+            other => panic!("expected the injected keepalive, got {other:?}"),
+        }
+        far_writer.keepalive_ack(0).await.unwrap();
+
+        // The next cadence yields the next counter.
+        match far_reader.next().await.unwrap() {
+            Some(Frame::Keepalive { counter, .. }) => assert_eq!(counter, 1, "the counter advances"),
+            other => panic!("expected the second injected keepalive, got {other:?}"),
+        }
+
+        relay.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn framed_relay_declares_a_never_acking_peer_dead_after_the_bound() {
+        // #528 liveness: a peer that swallows keepalives without ever ACKing is
+        // indistinguishable from a middlebox-killed connection -- after the
+        // codec's dead bound (oldest outstanding > 24s) the relay must fail
+        // TimedOut instead of pumping keepalives into a corpse forever.
+        let (agent_far, _browser_far, relay) = spawn_framed_relay();
+        // The far agent end stays open but silent: keepalives pile up unacked
+        // in the duplex buffer.
+        let _hold_far_open = agent_far;
+
+        let err = relay
+            .await
+            .unwrap()
+            .expect_err("a never-acking peer must produce the dead verdict, not an infinite ping loop");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "the verdict is a timeout: {err}");
+        assert!(
+            err.to_string().contains("keepalive unacked"),
+            "the error names the real cause: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn framed_relay_treats_agent_clean_eof_as_implicit_fin_and_still_pumps_browser_data() {
+        // Contract: a clean EOF without an explicit FIN frame (e.g. the agent
+        // ending via TLS close_notify) is an IMPLICIT FIN -- same downstream
+        // behavior: browser write side closes, and the browser->agent direction
+        // keeps running toward its own natural end.
+        use ct_common::fallback_framing::{Frame, FrameReader};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut agent_far, mut browser_far, relay) = spawn_framed_relay();
+
+        // The agent half-closes WITHOUT any FIN frame (a TLS close_notify
+        // ending): a clean EOF at a frame boundary = the implicit FIN. Its
+        // read direction stays open.
+        agent_far.shutdown().await.unwrap();
+        let mut far_reader = FrameReader::new(agent_far);
+        let mut eof = Vec::new();
+        browser_far.read_to_end(&mut eof).await.unwrap();
+        assert!(eof.is_empty(), "the agent's clean EOF closes the browser's read side");
+
+        // The browser can still send on the half-open connection...
+        browser_far.write_all(b"late upload").await.unwrap();
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Data(b"late upload".to_vec())),
+            "browser->agent keeps flowing after the agent's implicit FIN",
+        );
+
+        // ...and the browser's own EOF ends the relay (FIN both ways).
+        browser_far.shutdown().await.unwrap();
+        assert_eq!(far_reader.next().await.unwrap(), Some(Frame::Fin), "own FIN still goes out");
+        let (fwd, _rev) = relay.await.unwrap().unwrap();
+        assert_eq!(fwd, b"late upload".len() as u64);
     }
 }
