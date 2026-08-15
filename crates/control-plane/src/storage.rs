@@ -1595,6 +1595,16 @@ impl SqliteLedger {
     }
 }
 
+/// How a self-service tunnel create resolved (#432 atomic gate + the 15.08.
+/// hostname-collision fix): the three answers need three different HTTP shapes
+/// (created / quota exceeded / name already taken).
+#[derive(Debug)]
+pub enum CreateTunnelOutcome {
+    Created(SubjectTunnel),
+    OverLimit,
+    HostnameTaken,
+}
+
 /// One tunnel owned by a customer, as shown in the portal listing (#27). Holds
 /// **no secret**: the routing token and capability are minted and shown once at
 /// creation (a later sub-packet) and never persisted here, so listing a tunnel
@@ -2000,7 +2010,7 @@ impl SqliteTunnelStore {
         name: &str,
         hostname: Option<&str>,
         max: u32,
-    ) -> rusqlite::Result<Option<SubjectTunnel>> {
+    ) -> rusqlite::Result<CreateTunnelOutcome> {
         let conn = self.writer.lock_safe();
         let owned_count: u32 = conn.query_row(
             "SELECT COUNT(*) FROM subject_tunnels WHERE subject = ?1",
@@ -2008,7 +2018,22 @@ impl SqliteTunnelStore {
             |r| r.get(0),
         )?;
         if owned_count >= max {
-            return Ok(None);
+            return Ok(CreateTunnelOutcome::OverLimit);
+        }
+        // Operator bug report (15.08.): re-creating a name whose derived hostname
+        // already exists hit the UNIQUE(hostname) constraint and surfaced as a 500
+        // "internal error" in the portal. auto_hostname is deterministic per
+        // (name, account), so the same account re-using a name ALWAYS collides --
+        // checked here under the same writer lock the insert runs under, so the
+        // answer can't race a concurrent create.
+        if let Some(h) = hostname {
+            let taken: bool = conn
+                .query_row("SELECT 1 FROM subject_tunnels WHERE hostname = ?1", params![h], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if taken {
+                return Ok(CreateTunnelOutcome::HostnameTaken);
+            }
         }
         let mut idb = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut idb);
@@ -2025,7 +2050,7 @@ impl SqliteTunnelStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, subject, name, hostname, created_at, routing_token],
         )?;
-        Ok(Some(SubjectTunnel {
+        Ok(CreateTunnelOutcome::Created(SubjectTunnel {
             id,
             name: name.to_string(),
             hostname: hostname.map(str::to_string),
@@ -5932,6 +5957,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    /// Operator bug report (15.08.): re-creating a name whose deterministic
+    /// hostname already exists surfaced as a 500 "internal error" (UNIQUE
+    /// constraint) instead of a clean answer. The create gate now answers with
+    /// three distinct shapes: Created / OverLimit / HostnameTaken.
+    #[test]
+    fn create_gate_distinguishes_quota_from_hostname_collision() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = match store.create_if_under_owned_limit("subj-a", "app", Some("app-x.example"), 2).unwrap() {
+            CreateTunnelOutcome::Created(t) => t,
+            other => panic!("first create must succeed, got {other:?}"),
+        };
+        assert_eq!(t.hostname.as_deref(), Some("app-x.example"));
+        // Same derived hostname again (same account re-typing the same name):
+        // a clean HostnameTaken, NOT a rusqlite UNIQUE error.
+        assert!(matches!(
+            store.create_if_under_owned_limit("subj-a", "app", Some("app-x.example"), 2).unwrap(),
+            CreateTunnelOutcome::HostnameTaken
+        ));
+        // Different hostname still fits under the limit...
+        assert!(matches!(
+            store.create_if_under_owned_limit("subj-a", "app2", Some("app2-x.example"), 2).unwrap(),
+            CreateTunnelOutcome::Created(_)
+        ));
+        // ...and the quota answer stays distinct from the collision answer.
+        assert!(matches!(
+            store.create_if_under_owned_limit("subj-a", "app3", Some("app3-x.example"), 2).unwrap(),
+            CreateTunnelOutcome::OverLimit
+        ));
     }
 
     #[test]

@@ -656,8 +656,11 @@ async fn provision_tunnel(st: &ApiState, subject: &str, name: &str) {
     // unchanged here, just made race-free. `Ok(None)` means a concurrent request
     // already provisioned one first -- nothing to do, not an error.
     let tunnel = match st.tunnels.create_if_under_owned_limit(subject, display_name, hostname.as_deref(), 1) {
-        Ok(Some(t)) => t,
-        Ok(None) => return,
+        Ok(crate::storage::CreateTunnelOutcome::Created(t)) => t,
+        // OverLimit: a concurrent request provisioned first -- nothing to do, not an
+        // error. HostnameTaken: the derived hostname already exists (e.g. an older
+        // row); auto-provisioning must not fight it -- the page shows what exists.
+        Ok(_) => return,
         Err(e) => {
             eprintln!("ct-cp: auto-provisioning a tunnel for {subject} failed: {e}");
             return;
@@ -775,11 +778,21 @@ async fn create_tunnel(
     // separate list_authorized_for_subject() read followed by create() let two
     // concurrent requests both observe owned_count < max before either commit.
     let tunnel = match st.tunnels.create_if_under_owned_limit(&subject, display_name, hostname.as_deref(), max) {
-        Ok(Some(t)) => t,
-        Ok(None) => {
+        Ok(crate::storage::CreateTunnelOutcome::Created(t)) => t,
+        Ok(crate::storage::CreateTunnelOutcome::OverLimit) => {
             return (
                 StatusCode::FORBIDDEN,
                 "the Standard tier includes one tunnel per account; additional tunnels are a planned paid-tier feature (or ask the operator to raise your account's limit)",
+            )
+                .into_response()
+        }
+        // Operator bug report (15.08.): this used to hit the UNIQUE(hostname)
+        // constraint and render as a bare 500 "internal error".
+        Ok(crate::storage::CreateTunnelOutcome::HostnameTaken) => {
+            return (
+                StatusCode::CONFLICT,
+                "that name is already taken by one of your tunnels (hostnames derive \
+                 deterministically from the name) -- pick a different name",
             )
                 .into_response()
         }
