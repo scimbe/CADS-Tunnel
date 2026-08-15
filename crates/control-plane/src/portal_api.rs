@@ -1866,6 +1866,7 @@ pub fn channel_claim_router(
     Router::new()
         .route("/portal/channels", get(channels_page))
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
+        .route("/portal/channels/:channel/grant", get(fetch_deposited_grant))
         .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
         .route("/portal/static/ct_agent_wasm.js", get(serve_ct_agent_wasm_js))
         .route("/portal/static/ct_agent_wasm_bg.wasm", get(serve_ct_agent_wasm_bg))
@@ -2285,6 +2286,52 @@ struct ClaimResp {
 /// The outcome of a claim attempt, shared by the JSON API ([`claim_channel`]) and
 /// the HTML form ([`claim_channel`]'s `GET` sibling, [`claim_page`]) so the
 /// verification + allow-list logic lives in exactly one place.
+/// `GET /portal/channels/:channel/grant` (#514): a member re-fetches the signed
+/// grant its channel owner deposited (`POST /me/channels/:channel/grants/:holder`)
+/// -- any number of times, from any later session of the same account. This is the
+/// persistent replacement for demo-side one-shot delivery (the sort#26 class:
+/// a redeploy between approval and pickup used to strand the grant forever).
+/// Resolution is session-subject -> the holders THIS account claimed on the
+/// channel (recorded at claim time) -> their deposited grants; holders whose
+/// grant has not been deposited yet are listed with `grant: null` so a caller
+/// can render "waiting for your grant" instead of a bare 404.
+async fn fetch_deposited_grant(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "log in to the portal first").into_response();
+    };
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    let rows = match st
+        .channels
+        .deposited_grants_for_subject(&ct_common::channel::ChannelId(channel), &claims.subject)
+    {
+        Ok(rows) => rows,
+        Err(e) => return internal_error("fetch_deposited_grant/list", e).into_response(),
+    };
+    if rows.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            "no claimed identity on this channel for your account -- claim membership first",
+        )
+            .into_response();
+    }
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(holder, grant)| {
+            serde_json::json!({
+                "holder": holder.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "grant": grant,
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "channel": channel_hex, "identities": items })).into_response()
+}
+
 async fn do_claim(st: &ClaimState, headers: &HeaderMap, channel_hex: &str, req: &ClaimReq) -> Result<(), (StatusCode, String)> {
     let claims = crate::portal::session_claims_for(&st.session_key, headers)
         .ok_or((StatusCode::UNAUTHORIZED, "log in to the portal first".to_string()))?;
@@ -2317,7 +2364,7 @@ async fn do_claim(st: &ClaimState, headers: &HeaderMap, channel_hex: &str, req: 
         .unwrap_or(0);
     let claimed = st
         .channels
-        .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation, now)
+        .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation, now, Some(&claims.subject))
         .map_err(|e| internal_error("do_claim/claim_via_allowlist", e))?;
     if claimed {
         Ok(())
@@ -4504,6 +4551,98 @@ mod tests {
         assert!(!a.is_empty());
     }
 
+    /// #514: after a self-service claim, the SAME account's session re-fetches the
+    /// owner-deposited grant from `GET /portal/channels/:channel/grant` -- before the
+    /// deposit the claimed identity is listed with `grant: null` ("waiting"), and an
+    /// unauthenticated fetch is refused. The persistent replacement for demo-side
+    /// one-shot grant delivery (the sort#26 class).
+    #[tokio::test]
+    async fn a_claimed_member_refetches_its_deposited_grant_514() {
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::{GrantDepositOutcome, SqliteChannelStore};
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x6eu8; 32]);
+        assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
+        assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
+        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let holder_sk = SigningKey::from_bytes(&[0xc5u8; 32]);
+        let holder_bytes = holder_sk.verifying_key().to_bytes();
+        let noise = [0xd6u8; 32];
+        let attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder_bytes, &noise)).to_bytes();
+        let ch_hex = hex(&ch.0);
+        let cookie = format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "subj-nat", "nat@example.com"));
+
+        // Unauthenticated fetch: refused.
+        let resp = app
+            .clone()
+            .oneshot(Request::get(format!("/portal/channels/{ch_hex}/grant")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Claim with the session, then fetch: identity listed, grant still null.
+        let claim_body = serde_json::json!({
+            "holder": hex(&holder_bytes),
+            "noise_pubkey": hex(&noise),
+            "noise_attestation": hex(&attest),
+        })
+        .to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/portal/channels/{ch_hex}/claim"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie.clone())
+                    .body(Body::from(claim_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "claim succeeds");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/portal/channels/{ch_hex}/grant"))
+                    .header("cookie", cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["identities"][0]["holder"], serde_json::json!(hex(&holder_bytes)));
+        assert!(v["identities"][0]["grant"].is_null(), "no deposit yet: waiting state");
+
+        // Owner deposits; the member's next fetch carries the grant bytes.
+        let grant_hex = format!("{}{}{}{}", "ab".repeat(64), hex(&ch.0), hex(&holder_bytes), "cd".repeat(11));
+        assert_eq!(grant_hex.len(), 278, "wire-encoding length the endpoint validates");
+        assert_eq!(
+            channels.deposit_grant(&ch, "alice-owner", &holder_bytes, &grant_hex, 3_000).unwrap(),
+            GrantDepositOutcome::Deposited
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/portal/channels/{ch_hex}/grant"))
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["identities"][0]["grant"], serde_json::json!(grant_hex));
+    }
+
     #[tokio::test]
     async fn channel_claim_requires_a_verified_session_email_on_the_allowlist_248() {
         use crate::portal::sign_session_with_email_for_test;
@@ -4967,7 +5106,7 @@ mod tests {
         assert!(channels.allowlist_add(&ch_claimed, "owner", "nat@example.com", 1_100).unwrap());
         assert!(channels.allowlist_add(&ch_other_user, "owner", "someone-else@example.com", 1_200).unwrap());
         assert!(channels
-            .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000)
+            .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000, None)
             .unwrap());
 
         let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");

@@ -842,6 +842,10 @@ pub fn authed_channel_router(
             post(channel_remove_member),
         )
         .route(
+            "/me/channels/:channel/grants/:holder",
+            post(channel_deposit_grant),
+        )
+        .route(
             "/me/channels/:channel/allowlist",
             post(channel_allowlist_add).get(channel_allowlist_list),
         )
@@ -2890,6 +2894,71 @@ async fn channel_add_member(
     } else {
         Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
     }
+}
+
+/// `POST /me/channels/:channel/grants/:holder` `{grant}` (#514): the channel OWNER
+/// deposits `holder`'s already-signed grant for persistent, re-fetchable pickup
+/// through the member's portal session (`GET /portal/channels/:channel/grant`) --
+/// the structural replacement for demo-side one-shot delivery (the sort#26 class).
+/// This server never holds the operator private key: it stores exactly the signed
+/// bytes the owner minted, and a stored grant is useless without the member's
+/// private holder key (#81 possession). The embedded channel and holder ids (hex
+/// chars 128..192 and 192..256 of the 278-char wire encoding) must match the path
+/// -- a grant deposited under the wrong channel/member would otherwise sit
+/// undetected until a very confusing join failure.
+async fn channel_deposit_grant(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path((channel_hex, holder_hex)): Path<(String, String)>,
+    Json(req): Json<GrantDepositReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
+    let channel = hex_decode_32(&channel_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
+    let holder = hex_decode_32(&holder_hex)
+        .ok_or((StatusCode::BAD_REQUEST, "malformed holder".to_string()))?;
+    let grant = req.grant.trim().to_ascii_lowercase();
+    if grant.len() != 278 || !grant.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "grant must be the 278-hex-char signed wire encoding".to_string(),
+        ));
+    }
+    if grant[128..192] != channel_hex.to_ascii_lowercase() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the grant's embedded channel id does not match this channel".to_string(),
+        ));
+    }
+    if grant[192..256] != holder_hex.to_ascii_lowercase() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the grant's embedded holder does not match this member".to_string(),
+        ));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match state
+        .channels
+        .deposit_grant(&ChannelId(channel), &owner, &holder, &grant, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        crate::storage::GrantDepositOutcome::Deposited => Ok(StatusCode::OK),
+        crate::storage::GrantDepositOutcome::NotOwner => {
+            Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
+        }
+        crate::storage::GrantDepositOutcome::NotAMember => Err((
+            StatusCode::NOT_FOUND,
+            "that holder is not a member of this channel -- add it first".to_string(),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct GrantDepositReq {
+    grant: String,
 }
 
 async fn channel_remove_member(

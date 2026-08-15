@@ -3097,6 +3097,15 @@ pub struct SqliteChannelStore {
     readers: Option<r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>>,
 }
 
+/// #514: how a grant deposit attempt resolved -- the two refusals need different
+/// HTTP answers (403 vs. 404), so a bare bool won't do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GrantDepositOutcome {
+    Deposited,
+    NotOwner,
+    NotAMember,
+}
+
 impl SqliteChannelStore {
     /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
     /// connections (#398; see the struct doc).
@@ -3180,6 +3189,36 @@ impl SqliteChannelStore {
         // `channels_for_email` report status (pending / claimed) without needing
         // to guess a not-yet-known holder key. Additive, nullable -- #44 pattern.
         ensure_column(&conn, "channel_allowlist", "claimed_at", "INTEGER")?;
+        // #514: persisted, re-fetchable grant delivery -- the structural fix for the
+        // sort#26 class (a demo's one-shot in-memory delivery stranding a grant when a
+        // redeploy raced the pickup). The channel OWNER (who alone holds the operator
+        // private key -- this server never does, it only stores the already-signed
+        // grant bytes) deposits a member's signed grant here; the member re-fetches it
+        // through its portal session any number of times. A stored grant is useless
+        // without the member's private holder key (#81 possession challenge), so this
+        // adds no bearer surface.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_grant_deposits (
+                 channel      BLOB NOT NULL,
+                 holder       BLOB NOT NULL,
+                 grant_hex    TEXT NOT NULL,
+                 deposited_at INTEGER NOT NULL,
+                 PRIMARY KEY (channel, holder)
+             );
+             -- #514: which portal SUBJECT claimed which holder on which channel --
+             -- written at self-service claim time, so a member's portal session can
+             -- find its own holders (and their deposited grants) without ever
+             -- retyping key material.
+             CREATE TABLE IF NOT EXISTS channel_member_subjects (
+                 channel    BLOB NOT NULL,
+                 holder     BLOB NOT NULL,
+                 subject    TEXT NOT NULL,
+                 claimed_at INTEGER NOT NULL,
+                 PRIMARY KEY (channel, holder)
+             );
+             CREATE INDEX IF NOT EXISTS idx_channel_member_subjects_subject
+                 ON channel_member_subjects (subject);",
+        )?;
         Ok(Self {
             writer: Mutex::new(conn),
             readers: None,
@@ -3648,6 +3687,7 @@ impl SqliteChannelStore {
         noise_pubkey: &[u8; 32],
         noise_attestation: &[u8; 64],
         now: u64,
+        subject: Option<&str>,
     ) -> rusqlite::Result<bool> {
         let conn = self.writer.lock_safe();
         let allowed: bool = conn
@@ -3670,6 +3710,17 @@ impl SqliteChannelStore {
             "UPDATE channel_allowlist SET claimed_at = ?3 WHERE channel = ?1 AND email = ?2",
             params![&channel.0[..], email.to_ascii_lowercase(), now as i64],
         )?;
+        // #514: remember which portal subject claimed this holder, so the member's
+        // own session can later find its holders (and re-fetch deposited grants)
+        // without retyping key material. `subject` is `None` for legacy callers
+        // that have no session identity to record.
+        if let Some(subject) = subject {
+            conn.execute(
+                "INSERT OR REPLACE INTO channel_member_subjects (channel, holder, subject, claimed_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![&channel.0[..], &holder[..], subject, now as i64],
+            )?;
+        }
         Ok(true)
     }
 
@@ -3683,6 +3734,83 @@ impl SqliteChannelStore {
     /// [`claim_via_allowlist`](Self::claim_via_allowlist) — the caller here is the
     /// invitee, not the owner) and deliberately scoped to exactly the caller's own
     /// verified email — never call this with an email the session doesn't own.
+    /// #514: the channel OWNER deposits `holder`'s already-signed grant for later
+    /// (re-)pickup through the member's portal session -- the persistent replacement
+    /// for demo-side one-shot delivery (the sort#26 class). Owner-scoped like every
+    /// membership mutation; the holder must already be a member (deposit-for-stranger
+    /// is a 404-shaped refusal, not a silent insert). Idempotent upsert: re-depositing
+    /// (e.g. after a grant rotation) replaces the stored bytes.
+    pub fn deposit_grant(
+        &self,
+        channel: &ChannelId,
+        owner: &str,
+        holder: &[u8; 32],
+        grant_hex: &str,
+        now: u64,
+    ) -> rusqlite::Result<GrantDepositOutcome> {
+        let conn = self.writer.lock_safe();
+        let owns: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !owns {
+            return Ok(GrantDepositOutcome::NotOwner);
+        }
+        let member: bool = conn
+            .query_row(
+                "SELECT 1 FROM channel_members WHERE channel = ?1 AND holder = ?2",
+                params![&channel.0[..], &holder[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !member {
+            return Ok(GrantDepositOutcome::NotAMember);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_grant_deposits (channel, holder, grant_hex, deposited_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&channel.0[..], &holder[..], grant_hex, now as i64],
+        )?;
+        Ok(GrantDepositOutcome::Deposited)
+    }
+
+    /// #514: every (holder, deposited grant) pair on `channel` that `subject`'s own
+    /// portal claims produced -- what the member-facing fetch surface serves. Holders
+    /// the subject claimed but whose grant nobody deposited yet are returned with
+    /// `None`, so the caller can render "waiting for your grant" instead of a bare 404.
+    pub fn deposited_grants_for_subject(
+        &self,
+        channel: &ChannelId,
+        subject: &str,
+    ) -> rusqlite::Result<Vec<([u8; 32], Option<String>)>> {
+        let conn = self.writer.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT s.holder, d.grant_hex FROM channel_member_subjects s \
+             LEFT JOIN channel_grant_deposits d ON d.channel = s.channel AND d.holder = s.holder \
+             WHERE s.channel = ?1 AND s.subject = ?2 ORDER BY s.claimed_at",
+        )?;
+        let rows = stmt.query_map(params![&channel.0[..], subject], |row| {
+            let h: Vec<u8> = row.get(0)?;
+            let g: Option<String> = row.get(1)?;
+            Ok((h, g))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (h, g) = r?;
+            let mut holder = [0u8; 32];
+            if h.len() == 32 {
+                holder.copy_from_slice(&h);
+                out.push((holder, g));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn channels_for_email(&self, email: &str) -> rusqlite::Result<Vec<(ChannelId, Option<u64>)>> {
         let conn = self.read();
         let mut stmt = conn.prepare(
@@ -6932,6 +7060,57 @@ mod tests {
         assert_eq!(s.channel_owner(&other).unwrap(), Some("bob".to_string()), "bob's channel itself is untouched");
     }
 
+    /// #514: grant deposit is owner- and member-scoped, idempotent, and the member's
+    /// SUBJECT (recorded at claim time) can re-fetch it any number of times -- the
+    /// storage half of the persistent grant-delivery flow that replaces demo-side
+    /// one-shot delivery (the sort#26 class).
+    #[test]
+    fn grant_deposit_is_scoped_and_refetchable_by_the_claiming_subject_514() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x77u8; 32]);
+        let holder = [0xabu8; 32];
+        assert!(s.register_channel(&ch, &[0x11u8; 32], "alice").unwrap());
+        assert!(s.allowlist_add(&ch, "alice", "nat@example.com", 1_000).unwrap());
+
+        // Deposit before membership: refused as NotAMember (a deposit-for-stranger
+        // must not sit undetected); non-owner deposit: refused as NotOwner.
+        assert_eq!(
+            s.deposit_grant(&ch, "alice", &holder, "aa", 1_500).unwrap(),
+            GrantDepositOutcome::NotAMember
+        );
+        assert!(s
+            .claim_via_allowlist(&ch, "nat@example.com", &holder, &[0xcdu8; 32], &[0u8; 64], 2_000, Some("subj-nat"))
+            .unwrap());
+        assert_eq!(
+            s.deposit_grant(&ch, "mallory", &holder, "aa", 2_100).unwrap(),
+            GrantDepositOutcome::NotOwner
+        );
+
+        // Before any deposit the claimed identity is visible with grant: None -- the
+        // "waiting for your grant" state.
+        assert_eq!(s.deposited_grants_for_subject(&ch, "subj-nat").unwrap(), vec![(holder, None)]);
+
+        assert_eq!(
+            s.deposit_grant(&ch, "alice", &holder, "deadbeef01", 2_200).unwrap(),
+            GrantDepositOutcome::Deposited
+        );
+        assert_eq!(
+            s.deposited_grants_for_subject(&ch, "subj-nat").unwrap(),
+            vec![(holder, Some("deadbeef01".to_string()))],
+            "the claiming subject re-fetches the deposited grant"
+        );
+        // Re-deposit replaces (grant rotation), other subjects see nothing.
+        assert_eq!(
+            s.deposit_grant(&ch, "alice", &holder, "deadbeef02", 2_300).unwrap(),
+            GrantDepositOutcome::Deposited
+        );
+        assert_eq!(
+            s.deposited_grants_for_subject(&ch, "subj-nat").unwrap(),
+            vec![(holder, Some("deadbeef02".to_string()))]
+        );
+        assert!(s.deposited_grants_for_subject(&ch, "subj-other").unwrap().is_empty());
+    }
+
     #[test]
     fn allowlist_is_owner_scoped_case_insensitive_and_claim_adds_the_member_248() {
         let s = SqliteChannelStore::open_in_memory().unwrap();
@@ -6954,11 +7133,11 @@ mod tests {
         assert!(!s.allowlist_contains(&ch, "someone-else@example.com").unwrap());
 
         // An email NOT on the allow-list can't claim.
-        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest, 3_000).unwrap());
+        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest, 3_000, None).unwrap());
         assert!(!s.is_member(&ch, &holder).unwrap());
 
         // The allow-listed email claims successfully (owner never involved in this call).
-        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest, 3_000).unwrap());
+        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest, 3_000, None).unwrap());
         assert!(s.is_member(&ch, &holder).unwrap());
 
         // Owner removes the email; a FUTURE claim by a new holder is refused, but the
@@ -6969,11 +7148,11 @@ mod tests {
         assert_eq!(s.allowlist_list(&ch, "alice").unwrap(), Some(vec![]));
         assert!(s.is_member(&ch, &holder).unwrap(), "de-listing doesn't revoke an existing member");
         let another_holder = [0x99u8; 32];
-        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest, 4_000).unwrap());
+        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest, 4_000, None).unwrap());
 
         // An unknown channel's allow-list is always empty -> claim always false.
         let unknown = ChannelId([0xAB; 32]);
-        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest, 4_000).unwrap());
+        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest, 4_000, None).unwrap());
     }
 
     #[test]
@@ -7003,7 +7182,7 @@ mod tests {
         assert!(listed.iter().all(|(_, claimed_at)| claimed_at.is_none()));
 
         // Claim on ch_a only -> that one shows claimed_at, ch_b still pending.
-        assert!(s.claim_via_allowlist(&ch_a, "nat@example.com", &holder, &noise, &attest, 5_000).unwrap());
+        assert!(s.claim_via_allowlist(&ch_a, "nat@example.com", &holder, &noise, &attest, 5_000, None).unwrap());
         let listed = s.channels_for_email("nat@example.com").unwrap();
         let a_status = listed.iter().find(|(c, _)| *c == ch_a).unwrap().1;
         let b_status = listed.iter().find(|(c, _)| *c == ch_b).unwrap().1;
