@@ -1320,6 +1320,14 @@ pub struct AdmittedStreamMember<S> {
     operator: [u8; 32],
     noise: Option<[u8; 32]>,
     attest: Option<[u8; 64]>,
+    /// #495-U1: this member's edge-observed reflexive (post-NAT) source, captured at
+    /// admission — echoed back as the ack's self-addressed `r=<addr>` token and the
+    /// input to the pair's `sp=` same-public-IP fact, exactly as the QUIC completers
+    /// have carried since #121/#276. Bringing it to the stream family is what erases
+    /// the historical ack-format asymmetry the unified pairer would otherwise trip
+    /// over (a QUIC member pairing via the shared pairer must not lose its punch
+    /// address).
+    observed: std::net::SocketAddr,
     /// #451: the [`crate::state::ConnectionCap`] permit admitting this connection, carried on
     /// the value that owns the live stream (same rationale as [`AdmittedMember::_permit`]) —
     /// `admit_and_pair_on_stream`'s caller (the `:443` front door's `ChannelBroker` arm,
@@ -1408,9 +1416,23 @@ async fn write_member_ack<S: AsyncWrite + Unpin>(
     peer_noise: Option<[u8; 32]>,
     peer_holder: &[u8; 32],
     peer_attest: Option<[u8; 64]>,
+    own_observed: std::net::SocketAddr,
+    sp: bool,
     side: PairSide,
 ) -> Result<(), RelayHandoffError> {
-    let line = format!("OK {}{}\n", peer_endpoint, member_ack_suffix(peer_noise, peer_holder, peer_attest));
+    // #495-U1: `r=` (the member's OWN reflexive, #121) and `sp=` (edge-attested
+    // same-public-IP, #276) now ride the stream ack exactly as on the QUIC
+    // completers — backward-additive (clients parse `r=` order-independently since
+    // v0.4.13; unknown tokens fall out of the positional fields harmlessly), and
+    // the precondition for pairing QUIC members through the shared pairer without
+    // losing their punch address.
+    let line = format!(
+        "OK {}{} r={} sp={}\n",
+        peer_endpoint,
+        member_ack_suffix(peer_noise, peer_holder, peer_attest),
+        own_observed,
+        sp as u8
+    );
     stream
         .write_all(line.as_bytes())
         .await
@@ -1521,12 +1543,15 @@ where
             // side. If one member's stream is dying (a re-park race), this returns a
             // `RelayHandoffError` naming the dead side — so the caller can log "handoff race, side X"
             // instead of a bare "connection lost" that reads like the healthy peer was refused.
+            let sp = same_public_ip(a.observed, b.observed);
             write_member_ack(
                 &mut a.stream,
                 &b.req.endpoint,
                 b.noise,
                 &b.req.grant.grant.holder,
                 b.attest,
+                a.observed,
+                sp,
                 PairSide::A,
             )
             .await?;
@@ -1536,6 +1561,8 @@ where
                 a.noise,
                 &a.req.grant.grant.holder,
                 a.attest,
+                b.observed,
+                sp,
                 PairSide::B,
             )
             .await?;
@@ -1642,7 +1669,7 @@ where
     // the relay finisher relays each side the PEER's, so a `:443`-only pair can pin each other.
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, _permit: permit };
     // Unmarked: this generic path (WS + tests) has no phase peek -- historical behavior.
     Ok(offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked, Some(observed.ip()))
         .await?
@@ -1914,7 +1941,7 @@ where
     // the NUL ticks.
     let (liveness, dead) = ParkLiveness::monitored();
     let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest, _permit: permit };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, _permit: permit };
     offer_admitted_stream_member(pairer, deadline, member, liveness, phase, Some(observed.ip())).await
 }
 
@@ -2624,6 +2651,7 @@ mod tests {
             operator: op,
             noise: None,
             attest: None,
+            observed: "203.0.113.9:9999".parse().unwrap(),
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -2635,6 +2663,7 @@ mod tests {
             operator: op,
             noise: None,
             attest: None,
+            observed: "203.0.113.9:9999".parse().unwrap(),
             _permit: None,
         };
 
@@ -3047,6 +3076,7 @@ mod tests {
             operator: operator_pubkey(),
             noise: None,
             attest: None,
+            observed: "203.0.113.9:9999".parse().unwrap(),
             _permit: None,
         };
         member.notify_park_expired().await;
@@ -4162,8 +4192,8 @@ mod tests {
                     .await
                     .expect("admit 2");
             finish_relay_pair_over_streams(
-                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, _permit: None },
-                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, _permit: None },
+                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, observed: "203.0.113.1:1111".parse().unwrap(), _permit: None },
+                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, observed: "203.0.113.2:2222".parse().unwrap(), _permit: None },
                 500,
             )
             .await
@@ -5461,6 +5491,7 @@ mod tests {
             operator: pk,
             noise: None,
             attest: None,
+            observed: "203.0.113.9:9999".parse().unwrap(),
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -5472,6 +5503,7 @@ mod tests {
             operator: pk,
             noise: None,
             attest: None,
+            observed: "203.0.113.9:9999".parse().unwrap(),
             _permit: None,
         };
 
