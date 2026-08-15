@@ -135,6 +135,40 @@ per `docs/agent-onboarding.md`'s handler I/O contract).
 `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` accept a `host:port` directly since #214
 (`6d85644`) — a bare IP is no longer required.
 
+### The relay-**gate** is a third, separate thing (#330) — and its admission runs over TLS-TCP on `:443`, not QUIC
+
+`CT_CHANNEL_RELAY_GATE` (+ `CT_CHANNEL_RELAY_GATE_CERT`) configures the **:443 front
+door's relay-gate leg** (`crates/edge/src/relay_gate.rs`) — a *different protocol* from
+plain `CT_CHANNEL_RELAY`, **not interchangeable** with it, and easy to confuse because
+both have "relay" in the name:
+
+- `CT_CHANNEL_RELAY` (`:4436`) is the **QUIC** channel relay — the edge splices two
+  members' QUIC connections.
+- `CT_CHANNEL_RELAY_GATE` is the pre-auth gate in front of the **libp2p
+  Circuit-Relay-v2 + DCUtR hole-punch** path (`ct-agent`'s `p2p.rs` client side): a
+  member behind NAT that cannot reach the broker/relay ports directly presents its
+  grant **over the TLS-TCP front door on `:443`** (the gate's own dedicated ALPN — no
+  UDP involved), proves possession with the same `verify_stateless` +
+  challenge-signature primitives channel admission uses, and only then is byte-spliced
+  to the internal-only relay-node. The relay-node itself is never publicly reachable;
+  the gate IS its only door — that is what makes running a relay safe (an unguarded
+  public relay would be an open proxy).
+
+**Discovery** (#330 is exactly this gap — docs are the discovery path today): the gate
+address is the deployment's unified front-door host with
+`GET /network-info` → `channel_relay_gate_port` (same host as `CT_AGENT_CP_URL`), and
+`CT_CHANNEL_RELAY_GATE_CERT` is the DER from `GET /pki/ca` — the same CA fetch every
+other leg uses.
+
+**When you need it:** only when a deployment pairs members through the DCUtR
+hole-punch path and your member sits behind NAT without direct broker/relay
+reachability. **When it's misconfigured, the failure is silent and downstream** — a
+channel pairing that needed the gate dies as an unhelpful `early-eof` later, not as an
+auth refusal at the gate — so ask the operator whether the deployment needs it rather
+than inferring from an error message. (A bare TCP probe against `:4435`/`:4436` proves
+nothing either way — those are UDP/QUIC listeners; probing them with TCP was a
+documented false lead, retracted on CADS-DEMO-sort#22.)
+
 ## Cross-account invitations: `ct-agent channel invite` (was #234, now scimbe/ct-agent#9)
 
 Everything above (`operator-init`, `channel init`, `provision-link-channel.sh`) provisions a
