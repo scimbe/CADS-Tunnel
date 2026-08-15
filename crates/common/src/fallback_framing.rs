@@ -38,11 +38,22 @@
 //! - **FIN rules.** The DATA/double-FIN subset is enforced by the types: after sending FIN no
 //!   further DATA (writer errors), a second FIN — sent or received — errors, DATA after the
 //!   peer's FIN errors. **Termination is a CALLER duty, not type-checked** (the writer knows
-//!   `sent_fin`, the reader knows `peer_fin`, neither sees both): keepalives are only sent
-//!   while the counter-direction's FIN is outstanding, and once FIN has passed in **both**
-//!   directions each side closes promptly via [`FrameWriter::shutdown`] — two mutually-FINed
-//!   sides must not ping each other forever (the registration is single-use; the worker
-//!   redials).
+//!   `sent_fin`, the reader knows `peer_fin`, neither sees both): once FIN has passed in
+//!   **both** directions each side closes promptly via [`FrameWriter::shutdown`] — two
+//!   mutually-FINed sides must not ping each other forever (the registration is single-use;
+//!   the worker redials).
+//! - **Liveness ends at the peer's FIN; injection does not (#528 review I3).** After the
+//!   peer's FIN — explicit, or the implicit clean-EOF kind — active liveness monitoring ENDS:
+//!   outstanding counters are discarded and no dead verdict is reached anymore. A peer is not
+//!   ACK-obliged after its own FIN, and after an implicit FIN it physically cannot answer, so
+//!   any verdict then would be a guaranteed false positive. The surviving direction is
+//!   protected by its own DATA traffic and, ultimately, by write errors / kernel keepalive.
+//!   Injection, however, CONTINUES until FIN has passed in BOTH directions: a keepalive sent
+//!   after the peer's FIN is middlebox state refresh for the still-open sending direction, not
+//!   a probe — deliberately untracked and not ACK-obliged; do NOT "simplify" it away. An
+//!   origin that closes early while the browser still uploads must not strip the surviving
+//!   direction of its middlebox protection — on a blackholing middlebox, write errors would
+//!   only surface after minutes of retransmit escalation, not seconds.
 //! - **Keepalive cadence + liveness.** Inject after [`KEEPALIVE_INTERVAL`] (8 s — the park
 //!   phase's measured interval, calibrated against a real middlebox that kills idle flows in
 //!   ~10–15 s). Track sent counters in a [`KeepaliveTracker`]; the peer is dead when the
