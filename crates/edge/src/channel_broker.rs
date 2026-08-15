@@ -1295,6 +1295,68 @@ pub trait AsyncDuplex: AsyncRead + AsyncWrite + Send {}
 impl<T: AsyncRead + AsyncWrite + Send> AsyncDuplex for T {}
 pub type BoxedChannelStream = std::pin::Pin<Box<dyn AsyncDuplex>>;
 
+/// #495-U2 slice 1: adapts a QUIC **bidirectional stream** (a `quinn` `SendStream` +
+/// `RecvStream`, plus the owning `Connection` held only for liveness) into a single
+/// [`AsyncDuplex`], so a QUIC-relay member's session stream can be `Box::pin`-ed into a
+/// [`BoxedChannelStream`] and parked in the SAME shared pairer as the `:443`/WebSocket
+/// stream members — exactly how [`crate::ws_channel`] boxes its `WsByteStream`. Read
+/// delegates to the `RecvStream`, write/flush/shutdown to the `SendStream`. The
+/// `Connection` is held (never used directly) so the pair of streams outlives any *other*
+/// clone of the connection being dropped elsewhere — the "conn-liveness, not a pump task"
+/// the U2 plan calls for. quinn's `SendStream`/`RecvStream` already implement
+/// tokio's `AsyncWrite`/`AsyncRead` (runtime-tokio), so this is a thin, allocation-free
+/// combiner. Not yet wired: the `:4436` relay offer path (a later U2 slice) constructs one
+/// and hands it to the shared pairer behind `CT_EDGE_UNIFIED_PAIRER`.
+pub struct QuicBi {
+    _conn: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl QuicBi {
+    /// Wrap a QUIC bi-stream (its `send`/`recv` halves) plus the owning `conn` (kept alive
+    /// for this duplex's whole life) as an [`AsyncDuplex`].
+    pub fn new(conn: quinn::Connection, send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self { _conn: conn, send, recv }
+    }
+}
+
+// NB: quinn's `SendStream`/`RecvStream` carry INHERENT `poll_write`/`poll_read` (returning
+// quinn's `WriteError`/`ReadError`) that shadow the tokio-trait methods via method-resolution
+// precedence, so each impl calls the trait method explicitly (UFCS) to get the `io::Error`
+// contract `AsyncDuplex` requires.
+impl tokio::io::AsyncRead for QuicBi {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.recv), cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for QuicBi {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.send), cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.send), cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.send), cx)
+    }
+}
+
 /// The shared cross-transport channel pairer type every transport opts into (the
 /// `:443` front door, the browser WebSocket listener, ...): one `Arc` constructed
 /// once at edge startup ([`crate::serve::run_edge`]) and cloned into each transport's
@@ -2353,6 +2415,42 @@ mod tests {
             );
             assert!(reason.ends_with(why), "the honest human-readable why-suffix is preserved");
         }
+    }
+
+    /// #495-U2 slice 1: a `QuicBi` wraps a real quinn bi-stream as an `AsyncDuplex`, boxes
+    /// into a `BoxedChannelStream` exactly like a shared-pairer offer would, and round-trips
+    /// bytes both ways with a clean finish surfacing as EOF through its read half.
+    #[tokio::test]
+    async fn quic_bi_adapts_a_quinn_bistream_as_a_boxed_channel_stream_495_u2() {
+        use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
+        let (server, cert) = build_server_endpoint_with_cert().expect("server endpoint");
+        let addr = server.local_addr().expect("addr");
+        let srv = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("incoming");
+            let conn = incoming.await.expect("server accepts");
+            let (send, recv) = conn.accept_bi().await.expect("accept bi");
+            // Box exactly as a real :4436 offer into the shared pairer will (cf. ws_channel).
+            let mut duplex: BoxedChannelStream = Box::pin(QuicBi::new(conn, send, recv));
+            let mut got = [0u8; 5];
+            duplex.read_exact(&mut got).await.expect("read via QuicBi");
+            assert_eq!(&got, b"hello");
+            duplex.write_all(b"world").await.expect("write via QuicBi");
+            duplex.flush().await.expect("flush via QuicBi");
+            // The peer finishes its send → our read half sees EOF (no extra bytes).
+            let mut tail = Vec::new();
+            duplex.read_to_end(&mut tail).await.expect("read to EOF via QuicBi");
+            assert!(tail.is_empty(), "a clean peer finish is EOF, not stray bytes");
+        });
+        let client = build_client_endpoint(cert).expect("client endpoint");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("connects");
+        let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
+        send.write_all(b"hello").await.expect("client writes");
+        let mut reply = [0u8; 5];
+        recv.read_exact(&mut reply).await.expect("client reads reply");
+        assert_eq!(&reply, b"world");
+        send.finish().expect("client finishes → server read half sees EOF");
+        srv.await.expect("server task completes");
+        drop(conn);
     }
 
     #[test]
