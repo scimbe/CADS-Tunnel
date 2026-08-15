@@ -16,7 +16,10 @@
 //!
 //! ## Wire format (relay phase only, both directions on the edge↔agent hop)
 //!
-//! - [`FRAME_DATA`] (`0xFC`): big-endian `u32` length, then that many relayed bytes.
+//! - [`FRAME_DATA`] (`0xFC`): big-endian `u32` length, then that many relayed bytes. An empty
+//!   DATA frame is legal on the wire but a meaningless no-op — it is NEVER an EOF signal, and
+//!   receivers must not treat it as one (relevant e.g. for a lazy origin-dial trigger, which
+//!   must fire on the first NON-empty payload only).
 //! - [`FRAME_KEEPALIVE`] (`0xFD`): big-endian `u64` counter; the receiver answers with an ACK.
 //! - [`FRAME_KEEPALIVE_ACK`] (`0xF8`): the echo, same counter; never answered.
 //! - [`FRAME_FIN`] (`0xFE`): no payload — in-band half-close (data-EOF); keepalives continue.
@@ -32,24 +35,28 @@
 //!   boundary; an EOF *inside* a frame is `UnexpectedEof` (a torn frame is a connection error).
 //!   A clean EOF **without** a preceding [`Frame::Fin`] is an **implicit FIN** (data-EOF of
 //!   that direction) — both endings converge on the same downstream behavior.
-//! - **FIN rules (enforced by the types).** After sending FIN: no further DATA (writer errors),
-//!   keepalives/acks may continue. A second FIN — sent or received — is an error. After
-//!   receiving FIN: further DATA from the peer is `InvalidData`.
-//! - **Termination.** Keepalives exist to protect an in-flight request; they are only sent
-//!   while the counter-direction's FIN is still outstanding. Once FIN has passed in **both**
-//!   directions, each side closes its TCP connection promptly — two mutually-FINed sides must
-//!   not ping each other forever (the fallback registration is single-use; the worker redials).
+//! - **FIN rules.** The DATA/double-FIN subset is enforced by the types: after sending FIN no
+//!   further DATA (writer errors), a second FIN — sent or received — errors, DATA after the
+//!   peer's FIN errors. **Termination is a CALLER duty, not type-checked** (the writer knows
+//!   `sent_fin`, the reader knows `peer_fin`, neither sees both): keepalives are only sent
+//!   while the counter-direction's FIN is outstanding, and once FIN has passed in **both**
+//!   directions each side closes promptly via [`FrameWriter::shutdown`] — two mutually-FINed
+//!   sides must not ping each other forever (the registration is single-use; the worker
+//!   redials).
 //! - **Keepalive cadence + liveness.** Inject after the park phase's measured interval
 //!   (`TCP_PING_INTERVAL`, 8 s — calibrated against a real middlebox that kills idle flows in
-//!   ~10–15 s). The injector keeps its sent counters outstanding until acked and declares the
-//!   peer dead when the OLDEST outstanding counter is older than ~3× the cadence (24 s — under
-//!   the ~40 s TCP-keepalive death window). **An ACK acknowledges every counter ≤ the acked
-//!   value** (cumulative), so crossing acks can never produce a false dead verdict — the same
-//!   reason the park phase deliberately never compares its PONG counter.
-//! - **ACK bounding (PING-flood class, cf. CVE-2019-9512).** The receiver ACKs a keepalive only
-//!   when its counter is **strictly greater** than the last counter it acked
-//!   ([`FrameReader::should_ack`]) — a flood with a constant or regressing counter earns
-//!   nothing. ACKs are never answered, so there is no reflection cycle.
+//!   ~10–15 s). Track sent counters in a [`KeepaliveTracker`]; the peer is dead when the
+//!   OLDEST outstanding counter is older than ~3× the cadence (24 s — independently justified:
+//!   it tolerates two lost keepalives before the verdict; for reference, the *agent*-side TCP
+//!   keepalive kills at ~40 s today while the edge side takes ~200 s, so the framed verdict
+//!   fires first either way). **An ACK acknowledges every counter ≤ the acked value**
+//!   (cumulative), so crossing acks can never produce a false dead verdict — the same reason
+//!   the park phase deliberately never compares its PONG counter.
+//! - **ACK bounding (PING-flood class, cf. CVE-2019-9512).** [`FrameReader::next`] evaluates
+//!   the bound itself and delivers it as [`Frame::Keepalive`]`.should_ack`: `true` only when
+//!   the counter is strictly greater than the last counter marked for ack — a flood with a
+//!   constant or regressing counter earns nothing, and a caller cannot forget the rule. ACKs
+//!   are never answered, so there is no reflection cycle.
 //! - **Phase lifetime.** The framed phase begins byte-exactly after the park phase's
 //!   `TCP_PING_STOP` (`0xFB`) and ends only with the connection — there is no unframe
 //!   transition and no return to a park phase.
@@ -57,7 +64,12 @@
 //!   park phase's and `0xFF` the channel phase preamble; `0x00`–`0xF7` are RESERVED and a hard
 //!   `InvalidData` today, so a future frame type fails loudly instead of desynchronising.
 //! - **Flushing.** Keepalive/ack/FIN writes flush inline (a keepalive sitting in a buffer never
-//!   reaches the middlebox); bulk DATA leaves flushing to the caller's own batching policy.
+//!   reaches the middlebox). Bulk DATA does not auto-flush; the caller applies the house
+//!   short-read heuristic (#338, see `crates/edge/src/relay.rs` `relay_streams`): flush after a
+//!   read that returned FEWER bytes than the buffer holds — a short read marks a likely
+//!   message boundary the far side is waiting on — not after every chunk. This is a LATENCY
+//!   rule, not a throughput knob: the failure mode is response bytes stranded in a buffer
+//!   while the browser waits, with no FIN due for a long time.
 //!
 //! Perf follow-ups, deliberately deferred until the real pump shape exists (#114 class):
 //! reader-side `read_frame_into(&mut Vec)` (review finding 5) and writer-side header-in-place
@@ -82,11 +94,14 @@ pub const MAX_FRAME_PAYLOAD: usize = 256 * 1024;
 /// One decoded relay frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// Relayed application bytes to forward on to the browser/origin.
+    /// Relayed application bytes to forward on to the browser/origin. Empty = meaningless
+    /// no-op, never an EOF signal.
     Data(Vec<u8>),
-    /// A keepalive; answer via the writer iff [`FrameReader::should_ack`] said so.
-    Keepalive { counter: u64 },
-    /// The keepalive echo; consumed for liveness accounting, never answered.
+    /// A keepalive. `should_ack` is the reader's own bounded-ACK verdict (module contract):
+    /// when `true`, send the ACK through the direction's [`FrameWriter`] owner — never
+    /// directly on the stream. When `false` (repeated/regressing counter), do nothing.
+    Keepalive { counter: u64, should_ack: bool },
+    /// The keepalive echo; feed it to [`KeepaliveTracker::ack`], never answer it.
     KeepaliveAck { counter: u64 },
     /// The peer is done sending application data (half-close); keepalives may still follow.
     Fin,
@@ -165,11 +180,23 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.w.write_all(&[FRAME_FIN]).await?;
         self.w.flush().await
     }
+
+    /// Shut the underlying writer down (delegates `poll_shutdown` — for a TLS stream this
+    /// sends close_notify instead of an abrupt drop, the #229-follow class). This is how the
+    /// termination contract's "closes its TCP connection promptly" is actually executed.
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.w.shutdown().await
+    }
+
+    /// Unwrap the underlying writer (e.g. to hand the stream to a different phase).
+    pub fn into_inner(self) -> W {
+        self.w
+    }
 }
 
 /// The reading side of a direction: yields frames, enforces the peer's FIN rules (DATA after
 /// FIN and a double FIN are `InvalidData`), distinguishes a clean EOF from a torn frame, and
-/// implements the bounded-ACK rule ([`Self::should_ack`]).
+/// evaluates the bounded-ACK verdict into each [`Frame::Keepalive`] it yields.
 pub struct FrameReader<R> {
     r: R,
     peer_fin: bool,
@@ -186,17 +213,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         self.peer_fin
     }
 
-    /// Bounded-ACK rule (module contract): ACK only a counter strictly greater than the last
-    /// one acked. Call it on every [`Frame::Keepalive`]; when it returns `true` the caller
-    /// sends the ACK through its [`FrameWriter`] owner (never directly on the stream).
-    pub fn should_ack(&mut self, counter: u64) -> bool {
-        match self.last_acked {
-            Some(last) if counter <= last => false,
-            _ => {
-                self.last_acked = Some(counter);
-                true
-            }
-        }
+    /// Unwrap the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.r
     }
 
     /// Read exactly one [`Frame`], or `Ok(None)` on a clean EOF **at a frame boundary** —
@@ -222,7 +241,20 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             FRAME_KEEPALIVE => {
                 let mut c = [0u8; 8];
                 self.r.read_exact(&mut c).await?;
-                Ok(Some(Frame::Keepalive { counter: u64::from_be_bytes(c) }))
+                let counter = u64::from_be_bytes(c);
+                // Bounded-ACK rule evaluated HERE so a caller cannot forget it: ack only a
+                // counter strictly greater than the last one marked for ack. Marking before
+                // the caller's ack write is the safe order — if that write fails, the
+                // connection is ending anyway, and the cumulative-ACK rule absorbs any
+                // single lost ack (a later, higher ack covers it).
+                let should_ack = match self.last_acked {
+                    Some(last) if counter <= last => false,
+                    _ => {
+                        self.last_acked = Some(counter);
+                        true
+                    }
+                };
+                Ok(Some(Frame::Keepalive { counter, should_ack }))
             }
             FRAME_KEEPALIVE_ACK => {
                 let mut c = [0u8; 8];
@@ -252,6 +284,39 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
+/// The injector-side liveness bookkeeping the module contract requires, shared by both
+/// endpoints so the ~30 lines of time-keeping logic exist ONCE (review finding M4) instead of
+/// as two divergent copies. Time is caller-supplied milliseconds (any monotonic source), so
+/// the tracker is clock-free and trivially testable.
+#[derive(Debug, Default)]
+pub struct KeepaliveTracker {
+    /// Outstanding (counter, sent_at_ms), oldest first (counters are sent monotonically).
+    outstanding: Vec<(u64, u64)>,
+}
+
+impl KeepaliveTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a keepalive as sent at `now_ms`.
+    pub fn sent(&mut self, counter: u64, now_ms: u64) {
+        self.outstanding.push((counter, now_ms));
+    }
+
+    /// Apply a received ACK: **cumulative** — it settles every counter ≤ `counter` (the module
+    /// contract's crossing-ack rule, one tested line instead of two interpretations).
+    pub fn ack(&mut self, counter: u64) {
+        self.outstanding.retain(|(c, _)| *c > counter);
+    }
+
+    /// Age in ms of the OLDEST still-outstanding keepalive, or `None` when nothing is
+    /// outstanding. The caller declares the peer dead when this exceeds ~3× the cadence.
+    pub fn oldest_outstanding_age_ms(&self, now_ms: u64) -> Option<u64> {
+        self.outstanding.first().map(|(_, sent)| now_ms.saturating_sub(*sent))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,20 +338,30 @@ mod tests {
                 w.keepalive_ack(7).await.unwrap();
                 w.data(&p2).await.unwrap();
                 w.fin().await.unwrap();
-                // Keepalives after own FIN stay legal (the long-silent tail).
+                // Keepalives AND acks after own FIN stay legal (the long-silent tail).
                 w.keepalive(8).await.unwrap();
-                // Drop -> EOF exactly at a frame boundary.
+                w.keepalive_ack(8).await.unwrap();
+                w.shutdown().await.unwrap();
             })
         };
         let mut r = FrameReader::new(b);
         assert_eq!(r.next().await.unwrap(), Some(Frame::Data(payload)));
-        assert_eq!(r.next().await.unwrap(), Some(Frame::Keepalive { counter: 7 }));
+        assert_eq!(r.next().await.unwrap(), Some(Frame::Keepalive { counter: 7, should_ack: true }));
         assert_eq!(r.next().await.unwrap(), Some(Frame::KeepaliveAck { counter: 7 }));
         assert_eq!(r.next().await.unwrap(), Some(Frame::Data(p2)));
         assert_eq!(r.next().await.unwrap(), Some(Frame::Fin));
         assert!(r.peer_fin());
-        assert_eq!(r.next().await.unwrap(), Some(Frame::Keepalive { counter: 8 }), "keepalive after FIN is legal");
-        assert_eq!(r.next().await.unwrap(), None, "EOF at a frame boundary is a CLEAN end");
+        assert_eq!(
+            r.next().await.unwrap(),
+            Some(Frame::Keepalive { counter: 8, should_ack: true }),
+            "keepalive after FIN is legal"
+        );
+        assert_eq!(
+            r.next().await.unwrap(),
+            Some(Frame::KeepaliveAck { counter: 8 }),
+            "ack after FIN is legal too"
+        );
+        assert_eq!(r.next().await.unwrap(), None, "shutdown lands as a CLEAN end at a frame boundary");
         writer.await.unwrap();
     }
 
@@ -320,14 +395,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_ack_is_strictly_monotonic() {
-        let (_a, b) = tokio::io::duplex(64);
+    async fn keepalive_ack_verdict_is_strictly_monotonic_and_unforgettable() {
+        // M6: the reader evaluates the bound itself — repeated/regressing counters arrive with
+        // should_ack=false, so a caller cannot ack a flood even by naively acking every frame
+        // it is told to.
+        let (mut a, b) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            for counter in [1u64, 1, 0, 5, 3] {
+                let mut buf = [0u8; 9];
+                buf[0] = FRAME_KEEPALIVE;
+                buf[1..9].copy_from_slice(&counter.to_be_bytes());
+                let _ = a.write_all(&buf).await;
+            }
+        });
         let mut r = FrameReader::new(b);
-        assert!(r.should_ack(1));
-        assert!(!r.should_ack(1), "a repeated counter earns no ACK (flood bound)");
-        assert!(!r.should_ack(0), "a regressing counter earns no ACK");
-        assert!(r.should_ack(5));
-        assert!(!r.should_ack(3));
+        let verdicts: Vec<(u64, bool)> = {
+            let mut v = Vec::new();
+            for _ in 0..5 {
+                match r.next().await.unwrap() {
+                    Some(Frame::Keepalive { counter, should_ack }) => v.push((counter, should_ack)),
+                    other => panic!("expected keepalive, got {other:?}"),
+                }
+            }
+            v
+        };
+        assert_eq!(
+            verdicts,
+            vec![(1, true), (1, false), (0, false), (5, true), (3, false)],
+            "only strictly-increasing counters earn an ACK"
+        );
+    }
+
+    #[test]
+    fn keepalive_tracker_is_cumulative_and_ages_from_the_oldest() {
+        // M4: the liveness bookkeeping exists once, clock-free.
+        let mut t = KeepaliveTracker::new();
+        assert_eq!(t.oldest_outstanding_age_ms(1_000), None);
+        t.sent(1, 1_000);
+        t.sent(2, 9_000);
+        t.sent(3, 17_000);
+        assert_eq!(t.oldest_outstanding_age_ms(18_000), Some(17_000), "age counts from the OLDEST");
+        // A cumulative ack for 2 settles 1 and 2 — a crossing ack can't leave a stale oldest.
+        t.ack(2);
+        assert_eq!(t.oldest_outstanding_age_ms(18_000), Some(1_000), "only 3 (sent 17_000) is left");
+        t.ack(3);
+        assert_eq!(t.oldest_outstanding_age_ms(99_000), None, "all settled");
     }
 
     #[tokio::test]
@@ -356,10 +468,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_data_frame_round_trips() {
+    async fn empty_data_frame_round_trips_as_a_noop_not_an_eof() {
         let (a, b) = tokio::io::duplex(64);
-        let w = tokio::spawn(async move { FrameWriter::new(a).data(b"").await.unwrap() });
-        assert_eq!(FrameReader::new(b).next().await.unwrap(), Some(Frame::Data(Vec::new())));
+        let w = tokio::spawn(async move {
+            let mut w = FrameWriter::new(a);
+            w.data(b"").await.unwrap();
+            w.data(b"real").await.unwrap();
+        });
+        let mut r = FrameReader::new(b);
+        assert_eq!(r.next().await.unwrap(), Some(Frame::Data(Vec::new())));
+        assert_eq!(r.next().await.unwrap(), Some(Frame::Data(b"real".to_vec())), "the stream continues after an empty DATA");
         w.await.unwrap();
     }
 
