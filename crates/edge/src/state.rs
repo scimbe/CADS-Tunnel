@@ -408,6 +408,11 @@ pub struct EdgeState<H> {
     /// by a Client; `tcp_parked_gauge` is how many are waiting right now.
     tcp_parks: Counter,
     tcp_deliveries: Counter,
+    /// #522: TCP-fallback parks reaped as dead by the periodic sweep since start.
+    /// Its RATE is the orphan rate -- a spike means agents are abandoning parks
+    /// (crash loop, respawn storm) faster than usual; a return to a high sustained
+    /// rate after the #522 fix is the regression signal to watch on `/metrics`.
+    tcp_reaped: Counter,
     tcp_parked_gauge: AtomicU64,
     /// #517 V1: per-plane relay byte tallies (browser / QUIC data plane / TCP
     /// fallback) -- their sum equals `relay_bytes`, keeping the historical total
@@ -481,6 +486,7 @@ impl<H: Clone> EdgeState<H> {
             relays: Counter::default(),
             tcp_parks: Counter::default(),
             tcp_deliveries: Counter::default(),
+            tcp_reaped: Counter::default(),
             tcp_parked_gauge: AtomicU64::new(0),
             relay_bytes_browser: AtomicU64::new(0),
             relay_bytes_dataplane: AtomicU64::new(0),
@@ -791,6 +797,11 @@ impl<H: Clone> EdgeState<H> {
     /// parked connections keep dying and being re-established — the signal that
     /// was completely unavailable before, and whose absence made a fallback-only
     /// Agent indistinguishable from one that never connects at all.
+    /// #522: cumulative dead TCP-fallback parks reaped since start (see `tcp_reaped`).
+    pub fn tcp_reaped_total(&self) -> u64 {
+        self.tcp_reaped.get()
+    }
+
     pub fn tcp_parks_total(&self) -> u64 {
         self.tcp_parks.get()
     }
@@ -908,6 +919,9 @@ impl<H: Clone> EdgeState<H> {
             reaped += (before - queue.len()) as u64;
             !queue.is_empty()
         });
+        for _ in 0..reaped {
+            self.tcp_reaped.inc();
+        }
         drop(agents);
         for _ in 0..reaped {
             let _ = self
@@ -2004,6 +2018,7 @@ mod tests {
 
         let reaped = state.reap_dead_tcp_parks();
         assert_eq!(reaped, 2, "exactly the two dropped receivers are reaped");
+        assert_eq!(state.tcp_reaped_total(), 2, "the reaped counter tracks it for /metrics");
         assert_eq!(state.tcp_parked(), 2, "gauge reflects only the live pool now");
         assert!(state.has_tcp_agent(&token(30)), "the live park on token 30 survives");
         assert!(state.has_tcp_agent(&token(31)), "the untouched token stays");

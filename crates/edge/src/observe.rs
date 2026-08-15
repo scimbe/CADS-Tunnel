@@ -72,6 +72,11 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          the fallback pool's churn rate (each park is one agent-side connection joining the pool).\n\
          # TYPE ct_edge_tcp_fallback_parks_total counter\n\
          ct_edge_tcp_fallback_parks_total {tcp_parks}\n\
+         # HELP ct_edge_tcp_fallback_reaped_total Dead TLS-TCP fallback parks reaped by the\n\
+         # periodic sweep since start (#522). Its RATE is the park-orphan rate; a sustained\n\
+         # rise is the regression signal that agents are abandoning parks faster than usual.\n\
+         # TYPE ct_edge_tcp_fallback_reaped_total counter\n\
+         ct_edge_tcp_fallback_reaped_total {tcp_reaped}\n\
          # HELP ct_edge_tcp_fallback_deliveries_total TLS-TCP fallback parks consumed by a client.\n\
          # TYPE ct_edge_tcp_fallback_deliveries_total counter\n\
          ct_edge_tcp_fallback_deliveries_total {tcp_deliveries}\n",
@@ -88,6 +93,7 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         failovers = state.failovers_total(),
         tcp_parked = state.tcp_parked(),
         tcp_parks = state.tcp_parks_total(),
+        tcp_reaped = state.tcp_reaped_total(),
         tcp_deliveries = state.tcp_deliveries_total(),
     );
     // #497 slice 2: broker-loop liveness. Raw unix seconds (0 = loop never started); a
