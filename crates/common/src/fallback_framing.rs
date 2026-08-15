@@ -43,10 +43,11 @@
 //!   directions each side closes promptly via [`FrameWriter::shutdown`] — two mutually-FINed
 //!   sides must not ping each other forever (the registration is single-use; the worker
 //!   redials).
-//! - **Keepalive cadence + liveness.** Inject after the park phase's measured interval
-//!   (`TCP_PING_INTERVAL`, 8 s — calibrated against a real middlebox that kills idle flows in
+//! - **Keepalive cadence + liveness.** Inject after [`KEEPALIVE_INTERVAL`] (8 s — the park
+//!   phase's measured interval, calibrated against a real middlebox that kills idle flows in
 //!   ~10–15 s). Track sent counters in a [`KeepaliveTracker`]; the peer is dead when the
-//!   OLDEST outstanding counter is older than ~3× the cadence (24 s — independently justified:
+//!   OLDEST outstanding counter is older than [`KEEPALIVE_DEAD_AFTER`] (3× the cadence, 24 s —
+//!   independently justified:
 //!   it tolerates two lost keepalives before the verdict; for reference, the *agent*-side TCP
 //!   keepalive kills at ~40 s today while the edge side takes ~200 s, so the framed verdict
 //!   fires first either way). **An ACK acknowledges every counter ≤ the acked value**
@@ -65,7 +66,8 @@
 //!   `InvalidData` today, so a future frame type fails loudly instead of desynchronising.
 //! - **Flushing.** Keepalive/ack/FIN writes flush inline (a keepalive sitting in a buffer never
 //!   reaches the middlebox). Bulk DATA does not auto-flush; the caller applies the house
-//!   short-read heuristic (#338, see `crates/edge/src/relay.rs` `relay_streams`): flush after a
+//!   short-read heuristic (#338, see `crates/edge/src/relay.rs` `pump_dir` — the
+//!   `if n < buf.len()` there is the normative shape): flush after a
 //!   read that returned FEWER bytes than the buffer holds — a short read marks a likely
 //!   message boundary the far side is waiting on — not after every chunk. This is a LATENCY
 //!   rule, not a throughput knob: the failure mode is response bytes stranded in a buffer
@@ -90,6 +92,18 @@ pub const FRAME_FIN: u8 = 0xFE;
 /// able to make the reader allocate an arbitrary buffer from a claimed length; 256 KiB
 /// comfortably exceeds a max TLS record (~16 KiB) so real relay chunks never approach it.
 pub const MAX_FRAME_PAYLOAD: usize = 256 * 1024;
+
+/// The keepalive injection cadence (module contract): inject after this much OWN send silence.
+/// MUST match `crates/edge/src/serve.rs`'s private `TCP_PING_INTERVAL` (the park phase's
+/// measured 8 s — textual coupling, checked by an edge-side test): the relay phase reuses the
+/// park phase's calibrated interval rather than guessing a new one.
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The dead-peer verdict bound (module contract): the peer is dead when the oldest outstanding
+/// keepalive counter has been unacked for longer than this — 3× [`KEEPALIVE_INTERVAL`], which
+/// tolerates two lost keepalives and still fires before either side's kernel TCP-keepalive
+/// death window.
+pub const KEEPALIVE_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(24);
 
 /// One decoded relay frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +192,15 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         }
         self.sent_fin = true;
         self.w.write_all(&[FRAME_FIN]).await?;
+        self.w.flush().await
+    }
+
+    /// Flush the underlying writer. This is how the caller executes the module contract's
+    /// DATA-flush duty (the #338 short-read heuristic): [`Self::data`] deliberately does not
+    /// auto-flush, so bulk chunks can coalesce, and the caller flushes exactly after a short
+    /// read marked a likely message boundary. Keepalive/ack/FIN flush inline already; flushing
+    /// again after those is a harmless no-op.
+    pub async fn flush(&mut self) -> std::io::Result<()> {
         self.w.flush().await
     }
 
@@ -299,8 +322,15 @@ impl KeepaliveTracker {
         Self::default()
     }
 
-    /// Record a keepalive as sent at `now_ms`.
+    /// Record a keepalive as sent at `now_ms`. The buffer is hard-capped (64 entries; on
+    /// overflow the oldest is dropped): the tracker is the module's only unbounded buffer, and
+    /// it grows exactly when the non-type-checked contract half (the dead verdict) is
+    /// forgotten — bounded so that mistake shows up as a capped list, not as a silent leak.
     pub fn sent(&mut self, counter: u64, now_ms: u64) {
+        const OUTSTANDING_CAP: usize = 64;
+        if self.outstanding.len() >= OUTSTANDING_CAP {
+            self.outstanding.remove(0);
+        }
         self.outstanding.push((counter, now_ms));
     }
 
