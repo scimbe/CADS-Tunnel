@@ -2430,6 +2430,12 @@ async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(chann
     // #514: a RETURNING member sees its claimed identities and any deposited grant
     // right on this page -- re-fetchable delivery, the point of the deposit flow.
     let mut existing_block = String::new();
+    // #523: the holders THIS account already claimed on this channel. The claim
+    // script compares the browser's current identity against these -- a fresh
+    // browser (new localStorage identity) shown a grant deposited for a DIFFERENT,
+    // earlier holder must NOT be allowed to pair its new private key with that
+    // grant (it can't authenticate, and fails silently much later at pairing).
+    let mut claimed_holders: Vec<String> = Vec::new();
     if let Some(channel) = crate::service::hex_decode_32(&channel_hex) {
         if let Ok(rows) = st
             .channels
@@ -2440,6 +2446,7 @@ async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(chann
                 existing_block.push_str("<h2>Your identities on this channel</h2>");
                 for (holder, grant) in &rows {
                     let holder_hex: String = holder.iter().map(|b| format!("{b:02x}")).collect();
+                    claimed_holders.push(holder_hex.clone());
                     match grant {
                         Some(g) => existing_block.push_str(&channel_onboarding_html(&channel_hex, &holder_hex, &dep, Some(g))),
                         None => existing_block.push_str(&format!(
@@ -2451,6 +2458,16 @@ async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(chann
                 }
             }
         }
+    }
+    // #523: hand the claim script the claimed-holder list (public hex only, no
+    // secret) so it can detect the fresh-browser mismatch client-side -- the
+    // browser is the only place that knows which private holder it currently holds.
+    if !claimed_holders.is_empty() {
+        let json: Vec<String> = claimed_holders.iter().map(|h| format!("\"{h}\"")).collect();
+        existing_block.push_str(&format!(
+            r#"<script id="claimed-holders" type="application/json">[{}]</script>"#,
+            json.join(",")
+        ));
     }
     Html(claim_html(&channel_hex, None, claims.email.as_deref(), None, None, None, &existing_block)).into_response()
 }
@@ -2809,6 +2826,28 @@ function showNote(text, kind) {
   noteEl.dataset.kind = kind || "";
 }
 
+// #523: a grant deposited for an EARLIER identity is useless with this browser's
+// current private key, and pairing it fails silently much later. If the page shows
+// deposited grants (claimed-holders) and NONE is this browser's holder, warn loudly:
+// the private key that matches those grants lives only in another browser.
+function checkIdentityMismatch(holderPub) {
+  const el = document.getElementById("claimed-holders");
+  const warn = document.getElementById("identity-mismatch");
+  if (!el || !warn) return;
+  let claimed = [];
+  try { claimed = JSON.parse(el.textContent || "[]"); } catch (_) { return; }
+  if (claimed.length === 0 || claimed.includes(holderPub)) { warn.style.display = "none"; return; }
+  warn.innerHTML =
+    "<strong>This browser holds a DIFFERENT identity than the grant(s) shown below.</strong> " +
+    "This browser's holder is <code>" + holderPub.slice(0, 16) + "…</code>; the grant(s) above were " +
+    "issued for another identity you claimed in a different browser. The matching private key lives ONLY " +
+    "in that original browser and never left it — so those <code>.env</code> blocks will NOT " +
+    "authenticate with this browser's key. Either open this page in the browser you first claimed from, " +
+    "or claim again here and ask the channel owner to deposit a new grant for <code>" +
+    holderPub.slice(0, 16) + "…</code>.";
+  warn.style.display = "block";
+}
+
 async function boot() {
   submitBtn.disabled = true;
   identityBox.innerHTML = '<p class="help">generating your channel identity…</p>';
@@ -2817,6 +2856,7 @@ async function boot() {
     await ensureWasmInit();
     const identity = loadOrCreateIdentity();
     renderIdentity(identity);
+    checkIdentityMismatch(identity.holderPub);
     const preimage = memberNoiseAttestBytes(CHANNEL_HEX, identity.holderPub, identity.noisePub);
     const signature = wasm.holderSign(identity.holderPriv, preimage);
     fHolder.value = identity.holderPub;
@@ -2884,6 +2924,7 @@ fn claim_html(
 you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it isn't yet).</p>
 {banner}
 {existing_block}
+<div id="identity-mismatch" class="warn" style="display:none"></div>
 {onboarding}
 <label>Channel<input type="text" value="{channel}" disabled></label>
 <div id="identity-box" class="help">generating your channel identity…</div>
@@ -4789,6 +4830,16 @@ mod tests {
         assert!(
             html.contains("CT_CHANNEL_ROLE=accept"),
             "the deposited grant's accept direction prefills the role"
+        );
+        // #523: the returning member's page carries the claimed-holder list (so the
+        // claim script can detect a fresh-browser mismatch) and the hidden warn box.
+        assert!(
+            html.contains(&format!(r#"<script id="claimed-holders" type="application/json">["{}"]"#, hex(&holder_bytes))),
+            "the claimed holder is embedded for client-side mismatch detection"
+        );
+        assert!(
+            html.contains(r#"<div id="identity-mismatch" class="warn" style="display:none"></div>"#),
+            "the (hidden) mismatch warn box is present for the script to fill"
         );
         assert!(
             !html.contains("CT_CHANNEL_ROLE=PASTE_INITIATE_OR_ACCEPT"),
