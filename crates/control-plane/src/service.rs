@@ -4203,29 +4203,29 @@ const LANDING_HTML: &str = r#"<!doctype html>
   <div class="section-head"><h2>See it live</h2><a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" target="_blank" rel="noopener">All demos on GitHub &rarr;</a></div>
   <div class="demo-carousel">
    <div class="demo-card reveal" style="transition-delay:0ms">
+    <div class="demo-card-top"><span class="demo-name">sort-arena</span><span class="demo-badge live"><i></i>live</span></div>
+    <p>Sorting-strategy arena — bring your own LLM-generated sorter, join over the Agent-Fabric channel, race it live.</p>
+    <div class="demo-links"><a class="btn" href="https://sort.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-DEMO-sort" target="_blank" rel="noopener">Source</a></div>
+   </div>
+   <div class="demo-card reveal" style="transition-delay:60ms">
     <div class="demo-card-top"><span class="demo-name">flappy-demo</span><span class="demo-badge live"><i></i>live</span></div>
     <p>Flappy Pipeline Studio — customize and generate your own Flappy Bird game over the Agent-Fabric channel.</p>
     <div class="demo-links"><a class="btn" href="https://flappy-demo.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-flappy-demo" target="_blank" rel="noopener">Source</a></div>
    </div>
-   <div class="demo-card reveal" style="transition-delay:60ms">
-    <div class="demo-card-top"><span class="demo-name">cookbook-demo</span><span class="demo-badge"><i></i>source</span></div>
-    <p>Recipe generator with photo input, wired over the Agent-Fabric channel — a reference pipeline. Live instance coming soon.</p>
-    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-cookbook-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
-   </div>
    <div class="demo-card reveal" style="transition-delay:120ms">
-    <div class="demo-card-top"><span class="demo-name">a2a-demo</span><span class="demo-badge"><i></i>source</span></div>
-    <p>Live dashboard over a real Agent-Fabric channel call between two independent ct-agent processes.</p>
-    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-a2a-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
+    <div class="demo-card-top"><span class="demo-name">webconference</span><span class="demo-badge live"><i></i>live</span></div>
+    <p>Browser-to-browser video conferencing — the channel does the signaling, the media flows peer-to-peer.</p>
+    <div class="demo-links"><a class="btn" href="https://webconference.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-webconference-demo" target="_blank" rel="noopener">Source</a></div>
    </div>
    <div class="demo-card reveal" style="transition-delay:180ms">
-    <div class="demo-card-top"><span class="demo-name">auction-demo</span><span class="demo-badge"><i></i>source</span></div>
-    <p>Live dashboard over CADS-Tunnel's real workflow-pipeline auction algorithm (ct_common::pipeline).</p>
-    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-auction-demo" target="_blank" rel="noopener">Source &rarr;</a></div>
+    <div class="demo-card-top"><span class="demo-name">a2a-demo</span><span class="demo-badge live"><i></i>live</span></div>
+    <p>Live dashboard over a real Agent-Fabric channel call between two independent ct-agent processes.</p>
+    <div class="demo-links"><a class="btn" href="https://a2a-demo.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-a2a-demo" target="_blank" rel="noopener">Source</a></div>
    </div>
    <div class="demo-card reveal" style="transition-delay:240ms">
-    <div class="demo-card-top"><span class="demo-name">p2p-vault</span><span class="demo-badge"><i></i>source</span></div>
-    <p>Encrypted, CRDT-versioned, gossip-converging P2P file share for CADS-Tunnel-connected agents — the core only coordinates, it never touches file bytes.</p>
-    <div class="demo-links"><a class="plain" href="https://github.com/scimbe/CADS-p2p-vault" target="_blank" rel="noopener">Source &rarr;</a></div>
+    <div class="demo-card-top"><span class="demo-name">auction-demo</span><span class="demo-badge live"><i></i>live</span></div>
+    <p>Live dashboard over CADS-Tunnel's real workflow-pipeline auction algorithm (ct_common::pipeline).</p>
+    <div class="demo-links"><a class="btn" href="https://auction-demo.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-auction-demo" target="_blank" rel="noopener">Source</a></div>
    </div>
   </div>
  </div>
