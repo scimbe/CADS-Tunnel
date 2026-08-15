@@ -1764,7 +1764,20 @@ where
                 }
             }
             _ = tokio::time::sleep(TCP_PING_INTERVAL) => {
-                send_ping_and_await_pong(stream, counter).await.map_err(ParkAndPingError::NoClient)?;
+                // #528 review finding 7: a cadence ping that FAILS must not silently
+                // drop a Client that was delivered into the oneshot during this round
+                // trip's (up to TCP_PING_PONG_TIMEOUT) window -- that lost the request
+                // outright. Before giving up, check the slot: a Client already waiting
+                // there is rescued via the SAME AgentDead failover the pre-STOP verify
+                // ping uses (the parked agent is provably dead, but the Client's stream
+                // is handed to the next parked slot instead of vanishing); only a
+                // genuinely empty/closed slot is the terminal NoClient.
+                if let Err(source) = send_ping_and_await_pong(stream, counter).await {
+                    return Err(match parked.as_mut().get_mut().try_recv() {
+                        Ok(client) => ParkAndPingError::AgentDead { client, source },
+                        Err(_) => ParkAndPingError::NoClient(source),
+                    });
+                }
                 counter = counter.wrapping_add(1);
                 // Straddle (found by tcp_fallback_role_k_hands_off_cleanly_...: a Client that
                 // arrives while THIS round trip is in flight): the PONG that just landed
@@ -5301,6 +5314,53 @@ mod tests {
             err.to_string().contains("superseded"),
             "the error names the real cause (superseded/dropped registration), got: {err}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn park_and_ping_rescues_a_client_delivered_while_the_cadence_ping_then_fails_528_finding_7() {
+        // #528 finding 7: a Client delivered into the oneshot DURING a cadence
+        // round trip must not be lost if that ping then fails. Here the parked
+        // agent is dead (it reads the PING but never PONGs, so the round trip
+        // times out); a Client that arrives mid-round-trip must be RESCUED as
+        // AgentDead{client} (the 'K'/'L' failover then hands it to the next parked
+        // slot), never dropped as a terminal NoClient. Before the fix the cadence
+        // arm returned NoClient on the ping failure and the delivered Client
+        // vanished.
+        let (mut agent, edge_side) = tokio::io::duplex(64);
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::state::BoxedStream>();
+        let (mut client_peer, client_edge) = tokio::io::duplex(64);
+
+        let edge_task = tokio::spawn(async move {
+            let mut edge = edge_side;
+            park_and_ping(&mut edge, rx).await
+        });
+
+        // Auto-advanced paused time fires the first cadence ping; read it but do
+        // NOT reply -- this is the dead-but-still-connected middlebox case.
+        let mut ping = [0u8; 9];
+        agent.read_exact(&mut ping).await.unwrap();
+        assert_eq!(ping[0], TCP_PING_MAGIC, "the cadence probe was sent");
+
+        // A Client is delivered while that ping is still awaiting its (never-coming) PONG.
+        tx.send(Box::new(client_edge) as crate::state::BoxedStream)
+            .map_err(|_| "the parked receiver was already gone")
+            .unwrap();
+
+        // The ping times out (dead agent); the outcome must carry the delivered
+        // Client as AgentDead, not lose it as NoClient.
+        let err = edge_task.await.unwrap().err().expect("a dead parked agent is an error");
+        match err {
+            ParkAndPingError::AgentDead { mut client, .. } => {
+                client.write_all(b"rescued").await.unwrap();
+                client.flush().await.unwrap();
+                let mut got = [0u8; 7];
+                client_peer.read_exact(&mut got).await.unwrap();
+                assert_eq!(&got, b"rescued", "the rescued stream is the real delivered Client");
+            }
+            ParkAndPingError::NoClient(e) => {
+                panic!("the in-flight Client was lost as NoClient instead of rescued: {e}")
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
