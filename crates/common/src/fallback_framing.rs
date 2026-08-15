@@ -49,8 +49,11 @@
 //!   any verdict then would be a guaranteed false positive. The surviving direction is
 //!   protected by its own DATA traffic and, ultimately, by write errors after TCP retransmit
 //!   escalation (minutes, not seconds — the 8 s injection itself keeps the connection's idle
-//!   timer reset, so the kernel keepalive window never even starts; do not mistake this
-//!   backstop for a reason to skip a real timeout).
+//!   timer reset, so the kernel keepalive window never even starts; and as long as the peer
+//!   HOST is up, its TCP stack keeps ACKing the keepalive segments, so even retransmit
+//!   escalation never fires). The real timeout for this phase is
+//!   [`POST_PEER_FIN_IDLE_BOUND`] (#528 review N2): the relay ends the connection cleanly
+//!   once the surviving direction has written no DATA for that long after the peer's FIN.
 //!   Injection, however, CONTINUES until FIN has passed in BOTH directions: a keepalive sent
 //!   after the peer's FIN is middlebox state refresh for the still-open sending direction, not
 //!   a probe — deliberately untracked and not ACK-obliged; do NOT "simplify" it away. An
@@ -118,6 +121,24 @@ pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// tolerates two lost keepalives and still fires before either side's kernel TCP-keepalive
 /// death window.
 pub const KEEPALIVE_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(24);
+
+/// Progress-idle bound for the post-peer-FIN phase (module contract, #528 review N2 —
+/// 180 s, the middle of the review's 2–5 min corridor): once the peer has FINed while the
+/// own direction is still open (`peer_fin && !own_fin`), the relay MUST end the connection
+/// cleanly (own FIN + `shutdown`) when no DATA frame has been written in the surviving
+/// direction for this long; every written DATA frame resets the clock.
+///
+/// Why this phase needs its own timeout at all: after the peer's FIN the dead verdict is
+/// contractually over (I3), the continuing 8 s injection permanently resets the connection's
+/// TCP idle timer (the kernel keepalive window never starts), and a live peer host keeps
+/// ACKing the keepalive segments, so even TCP retransmit escalation (~13–30 min at
+/// `tcp_retries2=15`) never fires — a data-idle half-closed relay would be held open
+/// FOREVER by its own keepalives. And why the bound gates progress instead of wall time: an
+/// absolute bound would also kill a legitimate long upload (an origin may HTTP-legally
+/// respond early and FIN while the client is still uploading — the exact case the post-FIN
+/// injection exists to protect). In the pure-idle case an idle bound behaves identically to
+/// the review's absolute one; in the active-upload case it breaks nothing.
+pub const POST_PEER_FIN_IDLE_BOUND: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// One decoded relay frame.
 #[derive(Debug, Clone, PartialEq, Eq)]

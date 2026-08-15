@@ -7,6 +7,7 @@
 
 use ct_common::fallback_framing::{
     Frame, FrameReader, FrameWriter, KeepaliveTracker, KEEPALIVE_DEAD_AFTER, KEEPALIVE_INTERVAL,
+    POST_PEER_FIN_IDLE_BOUND,
 };
 use quinn::{RecvStream, SendStream};
 use tokio::io::{
@@ -360,7 +361,15 @@ async fn maybe_deadline(d: Option<tokio::time::Instant>) {
 ///   false positive); injection does NOT end -- post-peer-FIN keepalives keep
 ///   flowing untracked as pure middlebox state refresh for the still-open
 ///   sending direction, until FIN has passed both ways (codec contract, #528
-///   review I3). Peer keepalives are ACKed iff the reader's own `should_ack`
+///   review I3). The post-peer-FIN phase itself is bounded by
+///   [`POST_PEER_FIN_IDLE_BOUND`] (codec contract, #528 review N2): once no
+///   browser DATA has been written for that long after the peer's FIN, the
+///   relay FINs its own direction and terminates cleanly -- without it, the
+///   untracked injection would hold a data-idle half-closed relay open forever
+///   (the keepalives reset the TCP idle timer and keep earning transport-level
+///   ACKs, so neither the kernel keepalive nor retransmit escalation ever
+///   fires). DATA progress resets the clock, so a legitimate long upload past
+///   an early-FINning origin is never cut. Peer keepalives are ACKed iff the reader's own `should_ack`
 ///   verdict says so and are never forwarded -- a keepalive must not corrupt
 ///   the raw browser stream.
 /// - **DATA flushing** applies the #338 short-read heuristic on both legs: the
@@ -476,6 +485,12 @@ where
         let epoch = tokio::time::Instant::now();
         let now_ms = |epoch: tokio::time::Instant| epoch.elapsed().as_millis() as u64;
         let mut last_send = tokio::time::Instant::now();
+        // The post-peer-FIN progress clock (#528 review N2): the moment of the
+        // last browser DATA write -- reset to "now" when the peer's FIN lands,
+        // so the N2 bound measures idleness WITHIN the post-peer-FIN phase.
+        // Distinct from `last_send` on purpose: keepalives/ACKs refresh the
+        // middlebox (last_send) but are NOT progress -- only DATA is.
+        let mut last_fwd_data = tokio::time::Instant::now();
         loop {
             if own_fin && peer_fin {
                 // Termination rule: FIN has passed in both directions -- close
@@ -500,6 +515,7 @@ where
                     } else {
                         fwd_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         writer.data(&buf[..n]).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        last_fwd_data = tokio::time::Instant::now();
                         if n < buf.len() {
                             // #338 short-read heuristic (the codec contract's
                             // caller duty): a short read marks a likely message
@@ -522,6 +538,13 @@ where
                     }
                     Some(FramedEvent::AckSeen(counter)) => tracker.ack(counter),
                     Some(FramedEvent::PeerFin) => {
+                        // N2: the idle bound measures from the START of the
+                        // post-peer-FIN phase (or the last DATA within it) --
+                        // guarded so a duplicate PeerFin (explicit FIN followed
+                        // by the clean-EOF notification) cannot extend it.
+                        if !peer_fin {
+                            last_fwd_data = tokio::time::Instant::now();
+                        }
                         peer_fin = true;
                         // Liveness ends at the peer's FIN (codec contract,
                         // #528 review I3): a peer is not ACK-obliged after its
@@ -541,6 +564,9 @@ where
                     // clear the tracker so the dead verdict cannot misfire.
                     None => {
                         events_open = false;
+                        if !peer_fin {
+                            last_fwd_data = tokio::time::Instant::now();
+                        }
                         peer_fin = true;
                         tracker = KeepaliveTracker::new();
                     }
@@ -567,6 +593,27 @@ where
                     writer.keepalive(counter).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
                     last_send = tokio::time::Instant::now();
                 }
+                _ = tokio::time::sleep_until(last_fwd_data + POST_PEER_FIN_IDLE_BOUND), if peer_fin && !own_fin => {
+                    // #528 review N2: the post-peer-FIN progress-idle bound.
+                    // The peer has FINed, and this direction has written no
+                    // DATA for the whole bound -- only the untracked keepalives
+                    // above have kept the connection alive, and they would keep
+                    // it alive FOREVER (they reset the TCP idle timer and keep
+                    // earning transport ACKs, so neither the kernel keepalive
+                    // nor retransmit escalation ever fires). End cleanly: own
+                    // FIN now, then the loop-top both-FINs rule performs the
+                    // shutdown (close_notify) and the clean return. No A2-style
+                    // event drain before THIS verdict, deliberately: every
+                    // input (peer_fin -- monotone and already true per the
+                    // guard -- plus last_fwd_data and own_fin, both owned by
+                    // this leg) is unfalsifiable by a queued event, so a drain
+                    // would document a safeguard that does not exist (the A2
+                    // comment's own warning). A browser read racing this arm in
+                    // the unbiased select does not falsify it either: at firing
+                    // time "no DATA written for the whole bound" is a fact.
+                    writer.fin().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                    own_fin = true;
+                }
                 _ = maybe_deadline(dead_deadline) => {
                     // A2 (both-sided review find): this select is deliberately
                     // unbiased, so the deadline arm can win over a
@@ -589,6 +636,9 @@ where
                             }
                             Ok(FramedEvent::AckSeen(counter)) => tracker.ack(counter),
                             Ok(FramedEvent::PeerFin) => {
+                                if !peer_fin {
+                                    last_fwd_data = tokio::time::Instant::now();
+                                }
                                 peer_fin = true;
                                 tracker = KeepaliveTracker::new();
                             }
@@ -1324,5 +1374,151 @@ mod tests {
         assert_eq!(far_reader.next().await.unwrap(), Some(Frame::Fin), "own FIN still goes out");
         let (fwd, _rev) = relay.await.unwrap().unwrap();
         assert_eq!(fwd, b"late upload".len() as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn framed_relay_ends_the_data_idle_post_peer_fin_phase_at_the_n2_bound() {
+        // #528 review N2: after the peer's FIN, a data-idle surviving direction
+        // must not be held open forever by the relay's own untracked keepalives
+        // (they reset the TCP idle timer and keep earning transport ACKs, so no
+        // kernel backstop ever fires). After POST_PEER_FIN_IDLE_BOUND without a
+        // DATA write the relay FINs its own direction and terminates cleanly.
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter, POST_PEER_FIN_IDLE_BOUND};
+        use tokio::io::AsyncReadExt;
+
+        let (agent_far, mut browser_far, relay) = spawn_framed_relay();
+        let (far_r, far_w) = tokio::io::split(agent_far);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        let start = tokio::time::Instant::now();
+        // The agent FINs immediately; the browser stays open but sends NOTHING
+        // -- the exact hazard-class shape.
+        far_writer.fin().await.unwrap();
+        let mut eof = Vec::new();
+        browser_far.read_to_end(&mut eof).await.unwrap();
+        assert!(eof.is_empty(), "the peer's FIN surfaces as a clean browser EOF");
+
+        // The relay keeps refreshing the middlebox for the whole idle window
+        // (untracked keepalives), then ends it: own FIN, then close_notify.
+        let mut keepalives = 0u32;
+        loop {
+            match far_reader.next().await.unwrap() {
+                Some(Frame::Keepalive { .. }) => keepalives += 1,
+                Some(Frame::Fin) => break,
+                other => panic!("expected keepalives then the N2 FIN, got {other:?}"),
+            }
+        }
+        assert!(
+            keepalives >= 20,
+            "the idle window stays middlebox-protected until the bound (got {keepalives} keepalives)"
+        );
+        assert_eq!(far_reader.next().await.unwrap(), None, "FIN is followed by a clean shutdown");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= POST_PEER_FIN_IDLE_BOUND,
+            "the relay must not end before the bound (ended after {elapsed:?})"
+        );
+        assert!(
+            elapsed < POST_PEER_FIN_IDLE_BOUND + KEEPALIVE_INTERVAL,
+            "the relay must end promptly AT the bound (ended after {elapsed:?})"
+        );
+        let (fwd, rev) = relay.await.unwrap().unwrap();
+        assert_eq!((fwd, rev), (0, 0), "the N2 ending is a clean return, not an error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn framed_relay_keeps_a_progressing_upload_alive_past_the_n2_bound() {
+        // #528 review N2, the reason the bound gates PROGRESS instead of wall
+        // time: an origin may HTTP-legally reply early and FIN while the client
+        // is still uploading. Chunks spaced inside the bound but totalling far
+        // beyond it must keep the relay alive; every DATA write resets the clock.
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter, POST_PEER_FIN_IDLE_BOUND};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (agent_far, mut browser_far, relay) = spawn_framed_relay();
+        let (far_r, far_w) = tokio::io::split(agent_far);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        far_writer.fin().await.unwrap();
+        let mut eof = Vec::new();
+        browser_far.read_to_end(&mut eof).await.unwrap();
+        assert!(eof.is_empty());
+
+        // Three chunks, each 120s (2/3 of the bound) apart: 360s total in the
+        // post-peer-FIN phase, twice the bound, never 180s idle.
+        for i in 0..3u32 {
+            tokio::time::sleep(2 * POST_PEER_FIN_IDLE_BOUND / 3).await;
+            browser_far.write_all(b"chunk").await.unwrap();
+            loop {
+                match far_reader.next().await.unwrap() {
+                    Some(Frame::Keepalive { .. }) => {}
+                    Some(Frame::Data(d)) => {
+                        assert_eq!(d, b"chunk", "chunk {i} still relayed past the bound");
+                        break;
+                    }
+                    other => panic!("upload chunk {i} must still be relayed, got {other:?}"),
+                }
+            }
+        }
+
+        // The upload's own natural end still terminates the relay cleanly.
+        browser_far.shutdown().await.unwrap();
+        loop {
+            match far_reader.next().await.unwrap() {
+                Some(Frame::Keepalive { .. }) => {}
+                Some(Frame::Fin) => break,
+                other => panic!("expected the upload's own FIN, got {other:?}"),
+            }
+        }
+        assert_eq!(far_reader.next().await.unwrap(), None);
+        let (fwd, rev) = relay.await.unwrap().unwrap();
+        assert_eq!(fwd, 3 * b"chunk".len() as u64, "all upload bytes made it");
+        assert_eq!(rev, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn framed_relay_n2_bound_leaves_the_own_fin_only_phase_alone() {
+        // The mirror phase (own FIN sent, peer NOT FINed) is governed by the
+        // keepalive dead verdict, not the N2 bound: a healthy, acking agent may
+        // stay DATA-silent far longer than the bound before its late reply
+        // (#388 class -- the exact case the framed keepalive exists for).
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
+        use tokio::io::AsyncReadExt;
+
+        let (agent_far, mut browser_far, relay) = spawn_framed_relay();
+        let (far_r, far_w) = tokio::io::split(agent_far);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        // The browser is done uploading immediately -> own FIN toward the agent.
+        browser_far.shutdown().await.unwrap();
+        assert_eq!(far_reader.next().await.unwrap(), Some(Frame::Fin));
+
+        // The agent acks the edge's tracked keepalives for 40 cadences (320s,
+        // well past the 180s bound) without sending any DATA...
+        let mut acked = 0u32;
+        while acked < 40 {
+            match far_reader.next().await.unwrap() {
+                Some(Frame::Keepalive { counter, should_ack }) => {
+                    assert!(should_ack, "injected counters are strictly increasing");
+                    far_writer.keepalive_ack(counter).await.unwrap();
+                    acked += 1;
+                }
+                other => panic!("expected tracked keepalives only, got {other:?}"),
+            }
+        }
+
+        // ...and its late reply still goes through: the bound never fired here.
+        far_writer.data(b"late reply").await.unwrap();
+        far_writer.flush().await.unwrap();
+        far_writer.fin().await.unwrap();
+        let mut got = Vec::new();
+        browser_far.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"late reply", "the late reply survives 320s of own-FIN-only silence");
+        let (fwd, rev) = relay.await.unwrap().unwrap();
+        assert_eq!(fwd, 0);
+        assert_eq!(rev, b"late reply".len() as u64);
     }
 }
