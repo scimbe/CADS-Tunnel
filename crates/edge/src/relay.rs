@@ -568,13 +568,51 @@ where
                     last_send = tokio::time::Instant::now();
                 }
                 _ = maybe_deadline(dead_deadline) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "framed relay: peer dead -- oldest keepalive unacked for \
-                             {FRAMED_KEEPALIVE_DEAD_AFTER_MS}ms"
-                        ),
-                    ));
+                    // A2 (both-sided review find): this select is deliberately
+                    // unbiased, so the deadline arm can win over a
+                    // simultaneously-ready `recv` -- i.e. over an ACK that is
+                    // already DELIVERED into the event channel but not yet
+                    // applied to the tracker. Drain and apply every queued
+                    // event FIRST, then judge. (A bare re-check without
+                    // draining would be provably always-true: one arm body per
+                    // iteration, and the deadline arithmetic guarantees
+                    // age == DEAD_AFTER at firing time -- it would document a
+                    // safeguard that does not exist.)
+                    loop {
+                        match ev_rx.try_recv() {
+                            Ok(FramedEvent::Ack(counter)) => {
+                                writer
+                                    .keepalive_ack(counter)
+                                    .await
+                                    .map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                                last_send = tokio::time::Instant::now();
+                            }
+                            Ok(FramedEvent::AckSeen(counter)) => tracker.ack(counter),
+                            Ok(FramedEvent::PeerFin) => {
+                                peer_fin = true;
+                                tracker = KeepaliveTracker::new();
+                            }
+                            // Empty or Disconnected: nothing more is queued
+                            // (a Disconnected channel is the implicit-FIN path;
+                            // its tracker clearing happens via the recv arm or
+                            // already cleared the deadline above).
+                            Err(_) => break,
+                        }
+                    }
+                    if tracker
+                        .oldest_outstanding_age_ms(now_ms(epoch))
+                        .is_some_and(|age| age >= FRAMED_KEEPALIVE_DEAD_AFTER_MS)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "framed relay: peer dead -- oldest keepalive unacked for \
+                                 {FRAMED_KEEPALIVE_DEAD_AFTER_MS}ms"
+                            ),
+                        ));
+                    }
+                    // A queued cumulative ACK (or PeerFin) settled the oldest
+                    // counter in time -- no verdict, keep relaying.
                 }
             }
         }
