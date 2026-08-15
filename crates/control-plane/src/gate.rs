@@ -88,6 +88,18 @@ struct GateState {
     /// `gate_check`'s own doc comment for why this doesn't widen the gate's
     /// actual security property.
     verifier: OidcVerifierHandle,
+    /// Whether an email-**allow-list** match must additionally carry the IdP's
+    /// `email_verified: true` claim (`CT_GATE_REQUIRE_VERIFIED_EMAIL`). The
+    /// allow-list keys on email, but with an open-self-registration realm and no
+    /// `verifyEmail` (ct-demo today: `registrationAllowed=true`, `verifyEmail=false`),
+    /// a self-asserted email is not proof of ownership — so an unverified account
+    /// registering an allow-listed address would pass the gate. Off by default: with
+    /// no real confirmation flow wired up, requiring it would lock out every
+    /// self-registered user; flip on once allow-listed accounts are provisioned with
+    /// a verified email (admin-set, or a genuine confirmation flow). The
+    /// `allow_any_login` path is deliberately unaffected — it never consults the
+    /// email at all, so it carries no ownership claim to weaken.
+    require_verified_email: bool,
 }
 
 /// Build the Browser-Plane login-gate router: `GET /gate/check` (Caddy
@@ -107,9 +119,13 @@ pub fn gate_router(
         .filter(|s| !s.is_empty())
         .map(Arc::from);
     let exchange = default_gate_exchanger();
-    gate_router_with(tunnels, oidc, session_key, exchange, cookie_domain, verifier)
+    let require_verified_email = crate::portal::is_truthy_env("CT_GATE_REQUIRE_VERIFIED_EMAIL");
+    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, require_verified_email)
 }
 
+/// Existing 6-arg builder: keeps the pre-`CT_GATE_REQUIRE_VERIFIED_EMAIL` behavior
+/// (email-allow-list match does NOT additionally require a verified email), so every
+/// caller that doesn't opt in is byte-for-byte unchanged.
 fn gate_router_with(
     tunnels: Arc<SqliteTunnelStore>,
     oidc: Option<PortalOidc>,
@@ -118,6 +134,19 @@ fn gate_router_with(
     cookie_domain: Option<Arc<str>>,
     verifier: OidcVerifierHandle,
 ) -> Router {
+    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gate_router_full(
+    tunnels: Arc<SqliteTunnelStore>,
+    oidc: Option<PortalOidc>,
+    session_key: &[u8],
+    exchange: GateExchanger,
+    cookie_domain: Option<Arc<str>>,
+    verifier: OidcVerifierHandle,
+    require_verified_email: bool,
+) -> Router {
     let state = GateState {
         tunnels,
         oidc,
@@ -125,6 +154,7 @@ fn gate_router_with(
         session_key: Arc::from(session_key.to_vec()),
         cookie_domain,
         verifier,
+        require_verified_email,
     };
     Router::new()
         .route("/gate/check", get(gate_check))
@@ -445,8 +475,16 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
             // successful OIDC exchange above IS the legitimation then. Checked first so an
             // empty allow-list no longer means "nobody" for self-service tunnels; with the
             // flag off (the default), behavior is byte-for-byte the strict membership check.
-            let allowed = st.tunnels.allow_any_login_for_hostname(host).unwrap_or(false)
-                || st.tunnels.email_allowed_for_hostname(host, &email).unwrap_or(false);
+            //
+            // CT_GATE_REQUIRE_VERIFIED_EMAIL: the allow-list keys on email, but in an
+            // open-self-registration realm with no verifyEmail a self-asserted email is not
+            // proof of ownership -- so under the flag an allow-list match ALSO requires the
+            // IdP's `email_verified`. `allow_any_login` is untouched: it never reads the
+            // email, so there is no ownership claim to protect there.
+            let email_allowlisted = st.tunnels.email_allowed_for_hostname(host, &email).unwrap_or(false)
+                && (!st.require_verified_email || identity.email_verified);
+            let allowed =
+                st.tunnels.allow_any_login_for_hostname(host).unwrap_or(false) || email_allowlisted;
             if !allowed {
                 let mut resp = (StatusCode::FORBIDDEN, Html(access_denied_html(host))).into_response();
                 set_cookie(&mut resp, &cleared_gate_state_cookie());
@@ -885,6 +923,22 @@ mod tests {
                     subject: "test-subject".to_string(),
                     email: Some(email),
                     email_verified: true,
+                })
+            })
+        })
+    }
+
+    /// Like [`stub_exchanger`] but the IdP does NOT assert `email_verified` — a
+    /// self-registered account in an open-registration, no-verifyEmail realm.
+    fn stub_exchanger_unverified(email: &str) -> GateExchanger {
+        let email = email.to_string();
+        Arc::new(move |_code: String| {
+            let email = email.clone();
+            Box::pin(async move {
+                Ok(ExchangedIdentity {
+                    subject: "test-subject".to_string(),
+                    email: Some(email),
+                    email_verified: false,
                 })
             })
         })
@@ -1342,6 +1396,73 @@ mod tests {
                 .iter()
                 .any(|c| c.to_str().unwrap().starts_with(&format!("{GATE_SESSION_COOKIE}="))),
             "no gate session is minted for a successful-but-unlisted login"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_requires_verified_email_under_the_flag_but_allow_any_is_unaffected() {
+        // CT_GATE_REQUIRE_VERIFIED_EMAIL: an allow-listed but UNVERIFIED email is rejected
+        // when the flag is on (an open-self-registration, no-verifyEmail realm makes a
+        // self-asserted email no proof of ownership); a verified one passes; the flag OFF is
+        // the existing behavior; and `allow_any_login` never consults the email, so an
+        // unverified account still passes there.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", now_secs()).unwrap());
+
+        async fn status(
+            tunnels: Arc<SqliteTunnelStore>,
+            exchange: GateExchanger,
+            require_verified: bool,
+        ) -> StatusCode {
+            let app = gate_router_full(
+                tunnels,
+                Some(cfg()),
+                TEST_KEY,
+                exchange,
+                Some(Arc::from(".bunsenbrenner.org")),
+                OidcVerifierHandle::empty(),
+                require_verified,
+            );
+            app.oneshot(
+                Request::get("/gate/callback?code=abc&state=xyz")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+
+        // Flag ON + allow-listed but UNVERIFIED -> rejected.
+        assert_eq!(
+            status(tunnels.clone(), stub_exchanger_unverified("bob@example.com"), true).await,
+            StatusCode::FORBIDDEN,
+            "an unverified allow-listed email must not pass the gate under the flag"
+        );
+        // Flag ON + allow-listed AND verified -> passes.
+        assert_eq!(
+            status(tunnels.clone(), stub_exchanger("bob@example.com"), true).await,
+            StatusCode::SEE_OTHER,
+            "a verified allow-listed email passes"
+        );
+        // Flag OFF + allow-listed but UNVERIFIED -> passes (pre-flag behavior preserved).
+        assert_eq!(
+            status(tunnels.clone(), stub_exchanger_unverified("bob@example.com"), false).await,
+            StatusCode::SEE_OTHER,
+            "flag off keeps the existing byte-for-byte behavior"
+        );
+        // allow_any_login + UNVERIFIED + flag ON -> passes (email never consulted).
+        assert!(tunnels.set_allow_any_login("alice", &t.id, true).unwrap());
+        assert_eq!(
+            status(tunnels.clone(), stub_exchanger_unverified("nobody@example.com"), true).await,
+            StatusCode::SEE_OTHER,
+            "allow_any_login carries no email claim, so the verified-email flag never applies to it"
         );
     }
 

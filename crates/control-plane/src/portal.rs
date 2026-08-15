@@ -292,7 +292,7 @@ pub fn portal_router(oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
 /// Any non-empty value other than `"0"`/`"false"` (case-insensitive) counts as
 /// truthy — matches this project's other opt-in-flag env vars
 /// (`CT_EDGE_REQUIRE_HOST_AUTH` etc.).
-fn is_truthy_env(key: &str) -> bool {
+pub(crate) fn is_truthy_env(key: &str) -> bool {
     std::env::var(key)
         .ok()
         .map(|v| {
