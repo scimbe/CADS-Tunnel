@@ -113,6 +113,17 @@ services:
   edge:
     image: ct-testbed
     command: ["ct-edge"]
+    # 2026-08-15 outage (15 min, :443 fully down): the daemon's DEFAULT soft
+    # nofile limit of 1024 is far below what the edge terminates under a real
+    # reconnect herd -- every accepted socket is an fd, and once EMFILE hit,
+    # the accept loops hot-spun and the herd self-sustained (every starved
+    # client retried). The edge is the single public termination point for
+    # every tunnel, channel and portal connection on this host; give it the
+    # hard limit outright.
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 524288
     # #305: see control-plane's own comment above. /shared must be owned by (or
     # group-writable for) this uid, including the CA signing key file it writes
     # there on first boot (edge-ca-key.pem, 0600) -- the file permissions
