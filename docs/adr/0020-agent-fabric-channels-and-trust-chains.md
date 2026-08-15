@@ -110,6 +110,24 @@ same (`:443`) pairer.
   completers; and a `SessionSource` abstraction (`SameStream` for `:443`/WS,
   `EndpointSwap` for QUIC rendezvous) so a pair with any EndpointSwap side completes
   ack-then-close.
+
+**Member-ack wire grammar (normative — `write_member_ack`/`member_ack_suffix`).** The ack
+a joining member reads before its session is a single `\n`-terminated, space-separated line:
+
+```
+OK <endpoint-or-mode> [<peer_noise_hex64> <peer_holder_hex64> <peer_attest_hex128>] r=<reflexive> sp=<0|1>
+```
+
+- The `<peer_noise> <peer_holder> <peer_attest>` triple is **optional and all-or-nothing** —
+  present only when the registry holds the peer's attested Noise key (#101); absent otherwise
+  (then "no peer Noise key" is a real registration state, not a parse failure).
+- `r=` (own edge-observed reflexive, #121) and `sp=` (same-public-IP fact, #276) are **tagged,
+  order-independent, and appended** — the line is deliberately **additively extensible**. A
+  conformant parser reads positional fields up to the optional triple, then reads any trailing
+  `key=value` tokens **by name** and ignores unknown ones. It must **never** assert a fixed
+  field count: a consumer that hard-checked `length == 5` broke on the U1 `r=`/`sp=` addition
+  (webconference-demo outage, 2026-08-15) although every tag-based parser (ct-agent ≥ v0.4.13)
+  was unaffected. Anything not beginning `OK ` is a refusal.
 - **U2 (next, relay-first — decided 2026-08-15):** unify the **QUIC relay** endpoint
   (`:4436`) into the shared pairer. Chosen over rendezvous-first because cross-transport
   completion is then unambiguous — the edge **relays** between the `:443` stream and the
