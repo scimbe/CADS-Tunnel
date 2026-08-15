@@ -1314,6 +1314,30 @@ pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
 /// attested key in the ack (#122) — exactly as the rendezvous path does. Without them a
 /// `:443`-only pair (both members forced onto the relay) could never learn each other's
 /// Noise key and the join failed at the pin step; carrying them here closes that gap.
+/// #495-U1: where a member's **session** lives once its admission ack is written —
+/// the one semantic that genuinely differs per transport and therefore the pivot of
+/// the unified pairer:
+///
+/// - [`SessionSource::SameStream`] (`:443` TLS-TCP, WS): the Noise session continues
+///   on the very stream the join was admitted over — a paired member is spliced.
+/// - [`SessionSource::EndpointSwap`] (QUIC rendezvous, U2): the admission stream ends
+///   after the ack (the client `finish()`ed its half at the possession signature and
+///   expects ack-then-`finish()` back); the members then dial each other / their
+///   relay fallback using the endpoints exchanged in the acks. A pair with ANY
+///   EndpointSwap side must therefore complete ack-then-close even where the phases
+///   alone would splice — splicing an EOF'd admission stream would resurrect the
+///   phase-mixed early-eof class (#495 2a) for cross-transport pairs.
+///
+/// U3 adds the third variant (QUIC relay: session on the connection's NEXT bi-stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSource {
+    /// The session continues on the admission stream (splice on pairing).
+    SameStream,
+    /// The admission stream ends after the ack; the session forms out-of-band via
+    /// the exchanged endpoints (ack-then-close on pairing).
+    EndpointSwap,
+}
+
 pub struct AdmittedStreamMember<S> {
     stream: S,
     req: ChannelJoinRequest,
@@ -1328,6 +1352,10 @@ pub struct AdmittedStreamMember<S> {
     /// over (a QUIC member pairing via the shared pairer must not lose its punch
     /// address).
     observed: std::net::SocketAddr,
+    /// #495-U1: where this member's SESSION lives after the ack — the transport
+    /// difference the unified pairer must respect at completion time (see
+    /// [`SessionSource`]).
+    session: SessionSource,
     /// #451: the [`crate::state::ConnectionCap`] permit admitting this connection, carried on
     /// the value that owns the live stream (same rationale as [`AdmittedMember::_permit`]) —
     /// `admit_and_pair_on_stream`'s caller (the `:443` front door's `ChannelBroker` arm,
@@ -1530,6 +1558,15 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    // #495-U1: a pair with ANY EndpointSwap side completes ack-then-close regardless
+    // of what the phases alone decided -- there is no stream to splice on that side,
+    // and splicing its EOF'd admission stream against a live partner would hand the
+    // partner an instant early-eof (the resurrected 2a mixed-phase class).
+    let completion = if a.session == SessionSource::SameStream && b.session == SessionSource::SameStream {
+        completion
+    } else {
+        StreamPairCompletion::RendezvousClose
+    };
     match authorize_channel_pair(&a.operator, &a.req.grant, &b.req.grant, now) {
         Ok(pairing) => {
             // Each side learns the OTHER's advertised endpoint + attested Noise key + holder +
@@ -1669,7 +1706,7 @@ where
     // the relay finisher relays each side the PEER's, so a `:443`-only pair can pin each other.
     let (stream, req, operator, noise, attest, _observed) =
         admit_channel_join_on_duplex(stream, observed, now, join_timeout, authorize).await?;
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, _permit: permit };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: permit };
     // Unmarked: this generic path (WS + tests) has no phase peek -- historical behavior.
     Ok(offer_admitted_stream_member(pairer, deadline, member, ParkLiveness::default(), ParkPhase::Unmarked, Some(observed.ip()))
         .await?
@@ -1941,7 +1978,7 @@ where
     // the NUL ticks.
     let (liveness, dead) = ParkLiveness::monitored();
     let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
-    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, _permit: permit };
+    let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: permit };
     offer_admitted_stream_member(pairer, deadline, member, liveness, phase, Some(observed.ip())).await
 }
 
@@ -2652,6 +2689,7 @@ mod tests {
             noise: None,
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
+            session: SessionSource::SameStream,
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -2664,6 +2702,7 @@ mod tests {
             noise: None,
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
+            session: SessionSource::SameStream,
             _permit: None,
         };
 
@@ -3077,6 +3116,7 @@ mod tests {
             noise: None,
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
+            session: SessionSource::SameStream,
             _permit: None,
         };
         member.notify_park_expired().await;
@@ -3315,6 +3355,67 @@ mod tests {
         })
         .await
         .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
+    }
+
+    /// #495-U1: a pair with an EndpointSwap side (a QUIC-rendezvous member, whose
+    /// admission stream carries no session) completes ack-then-close even where the
+    /// PHASES alone would splice — driven here through the RELAY completer exactly
+    /// as serve.rs would for an Unmarked pairing. Both sides must receive the rich
+    /// ack (incl. `r=`/`sp=`) and then EOF; a splice would instead hand the
+    /// same-stream member the EndpointSwap side's EOF as an instant early-eof (the
+    /// resurrected 2a mixed-phase class).
+    #[tokio::test]
+    async fn an_endpoint_swap_member_forces_ack_then_close_over_splice_495_u1() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pk = operator_pubkey();
+        let channel = [0x71u8; 32];
+        let swap_sk = holder_sk(0x11);
+        let same_sk = holder_sk(0x12);
+        let (mut swap_client, swap_edge) = tokio::io::duplex(4096);
+        let (mut same_client, same_edge) = tokio::io::duplex(4096);
+        let a = AdmittedStreamMember {
+            stream: swap_edge,
+            req: ChannelJoinRequest {
+                grant: grant_h(channel, &swap_sk, Direction::Accept, 1_000),
+                endpoint: "203.0.113.4:4004".to_string(),
+            },
+            operator: pk,
+            noise: None,
+            attest: None,
+            observed: "203.0.113.4:4004".parse().unwrap(),
+            session: SessionSource::EndpointSwap,
+            _permit: None,
+        };
+        let b = AdmittedStreamMember {
+            stream: same_edge,
+            req: ChannelJoinRequest {
+                grant: grant_h(channel, &same_sk, Direction::Initiate, 1_000),
+                endpoint: "203.0.113.5:5005".to_string(),
+            },
+            operator: pk,
+            noise: None,
+            attest: None,
+            observed: "203.0.113.5:5005".parse().unwrap(),
+            session: SessionSource::SameStream,
+            _permit: None,
+        };
+        let done = tokio::spawn(finish_relay_pair_over_streams(a, b, 500));
+
+        for (c, who) in [(&mut swap_client, "endpoint-swap"), (&mut same_client, "same-stream")] {
+            let mut buf = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{who}: ack-then-CLOSE must EOF the stream"))
+                .expect("read");
+            let text = String::from_utf8_lossy(&buf);
+            assert!(text.starts_with("OK "), "{who}: rich ack first, got {text:?}");
+            assert!(
+                text.contains(" r=") && text.contains(" sp="),
+                "{who}: the unified ack carries r=/sp= (#121/#276), got {text:?}"
+            );
+            let _ = c.shutdown().await; // let the edge-side graceful drain finish promptly
+        }
+        done.await.expect("completer task").expect("pairing completes");
     }
 
     /// #508 persistence tuning (field-falsified 2026-08-14 evening: the per-sighting
@@ -4192,8 +4293,8 @@ mod tests {
                     .await
                     .expect("admit 2");
             finish_relay_pair_over_streams(
-                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, observed: "203.0.113.1:1111".parse().unwrap(), _permit: None },
-                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, observed: "203.0.113.2:2222".parse().unwrap(), _permit: None },
+                AdmittedStreamMember { stream: s1, req: r1, operator: op1, noise: None, attest: None, observed: "203.0.113.1:1111".parse().unwrap(), session: SessionSource::SameStream, _permit: None },
+                AdmittedStreamMember { stream: s2, req: r2, operator: op2, noise: None, attest: None, observed: "203.0.113.2:2222".parse().unwrap(), session: SessionSource::SameStream, _permit: None },
                 500,
             )
             .await
@@ -5492,6 +5593,7 @@ mod tests {
             noise: None,
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
+            session: SessionSource::SameStream,
             _permit: None,
         };
         let b = AdmittedStreamMember {
@@ -5504,6 +5606,7 @@ mod tests {
             noise: None,
             attest: None,
             observed: "203.0.113.9:9999".parse().unwrap(),
+            session: SessionSource::SameStream,
             _permit: None,
         };
 
