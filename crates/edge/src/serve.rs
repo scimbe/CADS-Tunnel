@@ -822,6 +822,26 @@ const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// reaper [`ChannelFrontDoor::new`] spawns (#256) — this constant alone only marks eligibility.
 const CHANNEL_PARK_TTL_SECS: u64 = 30;
 
+/// #506: park TTL for a **KA-negotiated** `:443` leg, from `CT_EDGE_KA_PARK_TTL_SECS`.
+/// The 30 s default TTL predates the KA contract — it was the only bound when parks
+/// were blind; since #499b/#500 a KA park is OBSERVED (10 s NUL ticks, corpse
+/// detection ≤10 s), so a long TTL is no resource risk and ends the idle EX/re-park
+/// cycle. Defaults to [`CHANNEL_PARK_TTL_SECS`] (i.e. **unchanged**) because the
+/// deployed client fleet must first carry the tick-based wait contract (ct-agent
+/// v0.4.19): an older client's 45 s admission-exchange bound fires before a long
+/// park's EX, cycling at 45 s with stale parks holding permits — flip the env only
+/// once the fleet is ready (rollout order documented in #506). Non-KA legs always
+/// keep the short TTL: without ticks, the short bound IS their corpse control.
+fn ka_park_ttl_secs_from(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(CHANNEL_PARK_TTL_SECS)
+}
+
+fn ka_park_ttl_secs() -> u64 {
+    ka_park_ttl_secs_from(std::env::var("CT_EDGE_KA_PARK_TTL_SECS").ok().as_deref())
+}
+
 /// Bound how long a public `:443` client may take to deliver its complete TLS ClientHello
 /// (#111 Slowloris defense). A real browser ships the ClientHello in its first TCP
 /// segment(s); a Slowloris client instead dribbles or stalls mid-record to pin the
@@ -1153,7 +1173,9 @@ pub async fn serve_front_door(
                 now,
                 CHANNEL_JOIN_TIMEOUT,
                 &authorize,
-                now + CHANNEL_PARK_TTL_SECS,
+                // #506: an observed (KA) park may outlive the blind 30 s default —
+                // TTL choice is per-leg, driven by the negotiated ALPN generation.
+                now + if keepalive { ka_park_ttl_secs() } else { CHANNEL_PARK_TTL_SECS },
                 &ctx.pairer,
                 permit,
                 keepalive,
@@ -3422,6 +3444,19 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    /// #506: the KA park TTL is env-driven and DEFAULTS to the unchanged 30 s — the
+    /// long-park flip must be an explicit operator decision gated on the client
+    /// fleet carrying the v0.4.19 tick-based wait contract (an older client's 45 s
+    /// exchange bound would fire before a long park's EX). Garbage/zero stays safe.
+    #[test]
+    fn ka_park_ttl_defaults_to_the_short_ttl_and_parses_the_env_506() {
+        assert_eq!(ka_park_ttl_secs_from(None), CHANNEL_PARK_TTL_SECS, "unset: unchanged");
+        assert_eq!(ka_park_ttl_secs_from(Some("900")), 900, "explicit long TTL");
+        assert_eq!(ka_park_ttl_secs_from(Some(" 60 ")), 60, "trimmed");
+        assert_eq!(ka_park_ttl_secs_from(Some("0")), CHANNEL_PARK_TTL_SECS, "zero is not a TTL");
+        assert_eq!(ka_park_ttl_secs_from(Some("abc")), CHANNEL_PARK_TTL_SECS, "garbage falls back");
+    }
 
     /// #505: stale DEAD TCP-fallback parks (an edge-flap leftover: agents fall back,
     /// park, then recover to QUIC — the dead parks linger) must not brick delivery.
