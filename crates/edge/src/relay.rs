@@ -355,10 +355,14 @@ async fn maybe_deadline(d: Option<tokio::time::Instant>) {
 /// - **Liveness.** Injected counters are tracked in the codec's
 ///   [`KeepaliveTracker`] (cumulative acks); the relay fails `TimedOut` when
 ///   the oldest outstanding exceeds [`FRAMED_KEEPALIVE_DEAD_AFTER_MS`] (24s).
-///   Injection stops once the peer has FINed -- keepalives exist to protect the
-///   counter-direction's in-flight data, and there is none anymore. Peer
-///   keepalives are ACKed iff the reader's own `should_ack` verdict says so and
-///   are never forwarded -- a keepalive must not corrupt the raw browser stream.
+///   Liveness ends at the peer's FIN (tracker discarded -- a peer is not
+///   ACK-obliged after its own FIN, so a verdict then would be a guaranteed
+///   false positive); injection does NOT end -- post-peer-FIN keepalives keep
+///   flowing untracked as pure middlebox state refresh for the still-open
+///   sending direction, until FIN has passed both ways (codec contract, #528
+///   review I3). Peer keepalives are ACKed iff the reader's own `should_ack`
+///   verdict says so and are never forwarded -- a keepalive must not corrupt
+///   the raw browser stream.
 /// - **DATA flushing** applies the #338 short-read heuristic on both legs: the
 ///   agent-bound writer flushes after a short browser read (a likely message
 ///   boundary the far side waits on), full-buffer chunks coalesce; the codec
@@ -399,7 +403,11 @@ where
         // upvars are dropped when the FUTURE is dropped, not when its body
         // completes -- and this future stays pinned (completed) until the whole
         // relay returns. Without the rebind, `ev_rx.recv()` in the other leg
-        // would never observe the channel closing.
+        // would never observe the channel closing (a real hang caught by the
+        // implicit-FIN test). The allow is load-bearing (#528 review I7):
+        // clippy flags this as a redundant local, and a future "cleanup" would
+        // silently resurrect the hang.
+        #[allow(clippy::redundant_locals)]
         let ev_tx = ev_tx;
         loop {
             match reader.next().await.map_err(|e| relay_io_error(e, "agent->browser", "framed"))? {
@@ -429,14 +437,19 @@ where
                 Some(Frame::Keepalive { counter, should_ack }) => {
                     // The reader evaluated the bounded-ACK rule already; a
                     // repeated/regressing counter earns nothing (flood bound).
-                    if should_ack && ev_tx.send(FramedEvent::Ack(counter)).await.is_err() {
-                        return Ok(());
+                    // #528 review I4: `try_send`, never a blocking send -- a
+                    // full event channel must not wedge this leg (and with it
+                    // the agent read side). A dropped Ack is absorbed by the
+                    // cumulative-ACK rule (the next, higher ack covers it) and
+                    // the 24s verdict tolerance.
+                    if should_ack {
+                        let _ = ev_tx.try_send(FramedEvent::Ack(counter));
                     }
                 }
                 Some(Frame::KeepaliveAck { counter }) => {
-                    if ev_tx.send(FramedEvent::AckSeen(counter)).await.is_err() {
-                        return Ok(());
-                    }
+                    // Same I4 reasoning: a dropped AckSeen is covered by the
+                    // next cumulative ack well inside the verdict bound.
+                    let _ = ev_tx.try_send(FramedEvent::AckSeen(counter));
                 }
                 Some(Frame::Fin) => {
                     // In-band data-EOF: half-close toward the browser; keep
@@ -510,12 +523,13 @@ where
                     Some(FramedEvent::AckSeen(counter)) => tracker.ack(counter),
                     Some(FramedEvent::PeerFin) => {
                         peer_fin = true;
-                        // The dead verdict protects the counter-direction's
-                        // in-flight data; after its FIN there is none, and a
-                        // peer that stops acking pre-FIN keepalives now must
-                        // not be misdeclared dead while the browser still
-                        // uploads -- a genuinely dead connection surfaces as a
-                        // DATA write error instead.
+                        // Liveness ends at the peer's FIN (codec contract,
+                        // #528 review I3): a peer is not ACK-obliged after its
+                        // own FIN, so counters still outstanding at this
+                        // moment would mature into a guaranteed-false dead
+                        // verdict over a healthy half-closed peer at t=24s.
+                        // Injection continues (see the timer arm) -- only the
+                        // verdict ends here.
                         tracker = KeepaliveTracker::new();
                     }
                     // The reader leg finished: the agent's clean EOF, i.e. the
@@ -531,13 +545,25 @@ where
                         tracker = KeepaliveTracker::new();
                     }
                 },
-                _ = tokio::time::sleep_until(last_send + KEEPALIVE_INTERVAL), if !peer_fin => {
-                    // Inject on own send-silence -- only while the peer's FIN is
-                    // still outstanding (keepalives protect the peer's in-flight
-                    // reply; after its FIN there is nothing left to protect).
+                _ = tokio::time::sleep_until(last_send + KEEPALIVE_INTERVAL) => {
+                    // Inject on own send-silence until FIN has passed BOTH ways
+                    // (the loop-top check ends this leg then). Before the
+                    // peer's FIN this is a liveness probe: tracked, ACK-obliged.
+                    // AFTER the peer's FIN it is pure middlebox state refresh
+                    // for the still-open sending direction (#528 review I3: an
+                    // origin closing early must not strip a still-running
+                    // browser upload of its protection; on a blackholing
+                    // middlebox, write errors surface only after minutes of
+                    // retransmit escalation) -- deliberately UNTRACKED and not
+                    // ACK-obliged, per the codec contract: the peer may no
+                    // longer be able to answer, so tracking it would
+                    // manufacture a false dead verdict. Do not "simplify" the
+                    // untracked send away.
                     let counter = next_counter;
                     next_counter += 1;
-                    tracker.sent(counter, now_ms(epoch));
+                    if !peer_fin {
+                        tracker.sent(counter, now_ms(epoch));
+                    }
                     writer.keepalive(counter).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
                     last_send = tokio::time::Instant::now();
                 }
