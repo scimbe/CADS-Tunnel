@@ -1857,6 +1857,20 @@ impl SqliteTunnelStore {
         // the allow-list is ignored while this is on. Off by default for every existing
         // tunnel on upgrade, same explicit-owner-action-only posture as require_login.
         ensure_column(&conn, "subject_tunnels", "allow_any_login", "INTEGER NOT NULL DEFAULT 0")?;
+        // #517 V3 (traffic offload, slice 2): direct-serving state per tunnel.
+        // `direct_endpoint` is the agent-advertised "ip:port" a reachable Green-tier
+        // agent serves browsers on directly; `direct_enabled` is the OWNER's opt-in
+        // switch (off by default -- direct serving is never turned on silently);
+        // `direct_advertised` + `direct_failures` are the live probe state the
+        // `direct_serving::fold_probe` hysteresis machine drives, persisted so a CP
+        // restart resumes mid-hysteresis instead of re-flapping a live DNS record;
+        // `direct_probed_at` is the last probe's unix seconds. All off/NULL/0 by
+        // default for every existing tunnel on upgrade.
+        ensure_column(&conn, "subject_tunnels", "direct_endpoint", "TEXT")?;
+        ensure_column(&conn, "subject_tunnels", "direct_enabled", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "subject_tunnels", "direct_advertised", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "subject_tunnels", "direct_failures", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "subject_tunnels", "direct_probed_at", "INTEGER")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -2243,6 +2257,101 @@ impl SqliteTunnelStore {
             params![enabled as i64, tunnel_id, subject],
         )?;
         Ok(n > 0)
+    }
+
+    /// #517 V3: the OWNER opts a tunnel into (or out of) direct serving, supplying
+    /// the endpoint (`ip:port`) their agent is reachable on. Owner-scoped (`false`
+    /// if unknown/foreign). Enabling only ARMS the feature -- the direct DNS record
+    /// is published later, and only after an external reachability probe actually
+    /// succeeds (the `fold_probe` hysteresis, slice 3+). Disabling clears the probe
+    /// state so a re-enable starts fresh.
+    pub fn set_direct_serving(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+        enabled: bool,
+        endpoint: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.writer.lock_safe();
+        let n = if enabled {
+            conn.execute(
+                "UPDATE subject_tunnels SET direct_enabled = 1, direct_endpoint = ?1 \
+                 WHERE id = ?2 AND subject = ?3",
+                params![endpoint, tunnel_id, subject],
+            )?
+        } else {
+            // Disabling resets the whole probe state -- a later re-enable must not
+            // resume a stale hysteresis streak or a lingering advertised flag.
+            conn.execute(
+                "UPDATE subject_tunnels SET direct_enabled = 0, direct_advertised = 0, \
+                 direct_failures = 0, direct_probed_at = NULL WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+            )?
+        };
+        Ok(n > 0)
+    }
+
+    /// #517 V3: a tunnel's direct-serving config as the portal renders it --
+    /// `(enabled, endpoint, advertised)`; `None` for an unknown/foreign tunnel.
+    pub fn direct_serving(
+        &self,
+        subject: &str,
+        tunnel_id: &str,
+    ) -> rusqlite::Result<Option<(bool, Option<String>, bool)>> {
+        self.read()
+            .query_row(
+                "SELECT direct_enabled, direct_endpoint, direct_advertised \
+                 FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()
+    }
+
+    /// #517 V3: every direct-serving-ENABLED tunnel with an endpoint, as
+    /// `(tunnel_id, hostname, endpoint, DirectServingState)` -- the probe loop's
+    /// work list. Not owner-scoped (this is the CP's own background sweep, not a
+    /// user request). A row with no hostname is skipped (nothing to publish a
+    /// record for).
+    pub fn direct_serving_candidates(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, String, String, crate::direct_serving::DirectServingState)>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT id, hostname, direct_endpoint, direct_advertised, direct_failures \
+             FROM subject_tunnels \
+             WHERE direct_enabled = 1 AND direct_endpoint IS NOT NULL AND hostname IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                crate::direct_serving::DirectServingState {
+                    advertised: r.get::<_, i64>(3)? != 0,
+                    consecutive_failures: r.get::<_, i64>(4)? as u32,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// #517 V3: persist the post-probe hysteresis state for one tunnel (the CP
+    /// loop calls this after `fold_probe`), stamping the probe time. Not
+    /// owner-scoped -- same background-sweep rationale as
+    /// [`direct_serving_candidates`](Self::direct_serving_candidates).
+    pub fn record_direct_probe(
+        &self,
+        tunnel_id: &str,
+        state: crate::direct_serving::DirectServingState,
+        now: u64,
+    ) -> rusqlite::Result<()> {
+        self.writer.lock_safe().execute(
+            "UPDATE subject_tunnels SET direct_advertised = ?1, direct_failures = ?2, \
+             direct_probed_at = ?3 WHERE id = ?4",
+            params![state.advertised as i64, state.consecutive_failures as i64, now as i64, tunnel_id],
+        )?;
+        Ok(())
     }
 
     /// #501: whether "any authenticated account" mode is on for a tunnel the caller
@@ -5963,6 +6072,59 @@ mod tests {
     /// hostname already exists surfaced as a 500 "internal error" (UNIQUE
     /// constraint) instead of a clean answer. The create gate now answers with
     /// three distinct shapes: Created / OverLimit / HostnameTaken.
+    /// #517 V3 slice 2: direct-serving is owner-opt-in, its probe state persists
+    /// across the fold_probe hysteresis, and disabling wipes it clean.
+    #[test]
+    fn direct_serving_opt_in_and_probe_state_roundtrip_517() {
+        use crate::direct_serving::{fold_probe, DirectServingState};
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = match store
+            .create_if_under_owned_limit("subj-d", "svc", Some("svc-x.example"), 2)
+            .unwrap()
+        {
+            CreateTunnelOutcome::Created(t) => t,
+            other => panic!("create: {other:?}"),
+        };
+
+        // Off by default; a foreign subject can't read or toggle it.
+        assert_eq!(store.direct_serving("subj-d", &t.id).unwrap(), Some((false, None, false)));
+        assert_eq!(store.direct_serving("someone-else", &t.id).unwrap(), None);
+        assert!(!store.set_direct_serving("someone-else", &t.id, true, Some("1.2.3.4:443")).unwrap());
+
+        // Owner opts in with an endpoint -> armed but not yet advertised, and it
+        // shows up as a probe candidate.
+        assert!(store.set_direct_serving("subj-d", &t.id, true, Some("1.2.3.4:443")).unwrap());
+        assert_eq!(
+            store.direct_serving("subj-d", &t.id).unwrap(),
+            Some((true, Some("1.2.3.4:443".to_string()), false))
+        );
+        let cands = store.direct_serving_candidates().unwrap();
+        assert_eq!(cands.len(), 1);
+        let (tid, host, ep, state) = &cands[0];
+        assert_eq!((tid.as_str(), host.as_str(), ep.as_str()), (t.id.as_str(), "svc-x.example", "1.2.3.4:443"));
+
+        // Drive fold_probe and persist: first success publishes, and it survives a reload.
+        let (state, action) = fold_probe(*state, true);
+        assert_eq!(action, crate::direct_serving::DirectServingAction::Publish);
+        store.record_direct_probe(&t.id, state, 1_000).unwrap();
+        assert_eq!(
+            store.direct_serving("subj-d", &t.id).unwrap(),
+            Some((true, Some("1.2.3.4:443".to_string()), true)),
+            "advertised state persisted"
+        );
+        // A single failure holds; the persisted failure streak carries.
+        let reloaded = store.direct_serving_candidates().unwrap()[0].3;
+        assert_eq!(reloaded, DirectServingState { advertised: true, consecutive_failures: 0 });
+        let (state, _) = fold_probe(reloaded, false);
+        store.record_direct_probe(&t.id, state, 1_030).unwrap();
+        assert_eq!(store.direct_serving_candidates().unwrap()[0].3.consecutive_failures, 1);
+
+        // Disable wipes the probe state (and drops it from the candidate list).
+        assert!(store.set_direct_serving("subj-d", &t.id, false, None).unwrap());
+        assert_eq!(store.direct_serving("subj-d", &t.id).unwrap(), Some((false, Some("1.2.3.4:443".to_string()), false)));
+        assert!(store.direct_serving_candidates().unwrap().is_empty(), "disabled tunnels aren't probed");
+    }
+
     #[test]
     fn create_gate_distinguishes_quota_from_hostname_collision() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
