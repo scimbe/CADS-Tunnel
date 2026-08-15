@@ -45,6 +45,22 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          # HELP ct_edge_relay_bytes_total Bytes relayed (both directions) since start.\n\
          # TYPE ct_edge_relay_bytes_total counter\n\
          ct_edge_relay_bytes_total {relay_bytes}\n\
+         # HELP ct_edge_relay_bytes_kind_total Relayed bytes split by plane (#517 V1: the\n\
+         # traffic-offload measurement base -- browser = SNI/Gelb browser traffic,\n\
+         # dataplane = QUIC client relays, tcp_fallback = the :4433 client path;\n\
+         # the three sum to ct_edge_relay_bytes_total).\n\
+         # TYPE ct_edge_relay_bytes_kind_total counter\n\
+         ct_edge_relay_bytes_kind_total{{kind=\"browser\"}} {relay_bytes_browser}\n\
+         ct_edge_relay_bytes_kind_total{{kind=\"dataplane\"}} {relay_bytes_dataplane}\n\
+         ct_edge_relay_bytes_kind_total{{kind=\"tcp_fallback\"}} {relay_bytes_tcp_fallback}\n\
+         # HELP ct_edge_channel_relay_bytes_total Bytes relayed through CHANNEL splices\n\
+         # (both directions, both completer families) since start -- previously not\n\
+         # counted anywhere (#517 V1).\n\
+         # TYPE ct_edge_channel_relay_bytes_total counter\n\
+         ct_edge_channel_relay_bytes_total {channel_relay_bytes}\n\
+         # HELP ct_edge_channel_splices_total Completed channel relay splices since start.\n\
+         # TYPE ct_edge_channel_splices_total counter\n\
+         ct_edge_channel_splices_total {channel_splices}\n\
          # HELP ct_edge_failovers_total Relays that failed over to a non-primary agent.\n\
          # TYPE ct_edge_failovers_total counter\n\
          ct_edge_failovers_total {failovers}\n\
@@ -64,6 +80,11 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         registrations = state.registrations_total(),
         relays = state.relays_total(),
         relay_bytes = state.relay_bytes_total(),
+        relay_bytes_browser = state.relay_bytes_by_kind().0,
+        relay_bytes_dataplane = state.relay_bytes_by_kind().1,
+        relay_bytes_tcp_fallback = state.relay_bytes_by_kind().2,
+        channel_relay_bytes = crate::channel_broker::channel_relay_totals().0,
+        channel_splices = crate::channel_broker::channel_relay_totals().1,
         failovers = state.failovers_total(),
         tcp_parked = state.tcp_parked(),
         tcp_parks = state.tcp_parks_total(),
@@ -188,6 +209,7 @@ pub async fn serve_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::RelayKind;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use ct_common::RoutingToken;
@@ -218,13 +240,21 @@ mod tests {
         let state: EdgeState<u32> = EdgeState::new();
         state.register(token(1), 10);
         state.register(token(1), 11); // redundant → 2 registrations
-        state.note_relay(&token(1), 100, 50);
+        state.note_relay(&token(1), 100, 50, RelayKind::DataPlane);
         state.note_failover();
+        // #517 V1: the per-plane split renders alongside the historical total.
+        state.note_relay(&token(1), 7, 3, RelayKind::Browser);
+        state.note_relay(&token(1), 1, 1, RelayKind::TcpFallback);
         let body = render_edge_metrics(&state, None);
         assert!(body.contains("ct_edge_registrations_total 2"), "{body}");
-        assert!(body.contains("ct_edge_relays_total 1"), "{body}");
-        assert!(body.contains("ct_edge_relay_bytes_total 150"), "{body}");
+        assert!(body.contains("ct_edge_relays_total 3"), "{body}");
+        assert!(body.contains("ct_edge_relay_bytes_total 162"), "{body}");
         assert!(body.contains("ct_edge_failovers_total 1"), "{body}");
+        assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="browser"} 10"#), "{body}");
+        assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="dataplane"} 150"#), "{body}");
+        assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="tcp_fallback"} 2"#), "{body}");
+        assert!(body.contains("ct_edge_channel_relay_bytes_total"), "{body}");
+        assert!(body.contains("ct_edge_channel_splices_total"), "{body}");
     }
 
     #[tokio::test]

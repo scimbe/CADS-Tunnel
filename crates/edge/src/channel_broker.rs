@@ -989,6 +989,27 @@ where
 /// This is the typed seam the per-IP penalty (`crate::state::JoinRefusalPenalty`)
 /// keys on: the accept loops downcast the admission error to decide whether to count
 /// it, instead of string-matching log text. Calibrated against the 2026-08-13 storm,
+/// #517 V1: process-wide tally of CHANNEL relay bytes (both directions) and
+/// completed splices -- the channel plane's counterpart to the state-held
+/// per-plane relay counters. Statics rather than state plumbing because the
+/// completers deliberately have no EdgeState handle (they are transport-generic
+/// and test-driven standalone); same precedent as the #508 rate-limit gate.
+static CHANNEL_SPLICE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CHANNEL_SPLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #517 V1: `(channel_relay_bytes_total, channel_splices_total)` for `/metrics`.
+pub fn channel_relay_totals() -> (u64, u64) {
+    (
+        CHANNEL_SPLICE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        CHANNEL_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn note_channel_splice(bytes: (u64, u64)) {
+    CHANNEL_SPLICE_BYTES.fetch_add(bytes.0.saturating_add(bytes.1), std::sync::atomic::Ordering::Relaxed);
+    CHANNEL_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// where one stale client retried two `[not-member]` channels at 25-75ms cadence for
 /// ~10 hours through a NAT shared with innocent tenants.
 #[derive(Debug)]
@@ -1203,11 +1224,12 @@ async fn finish_quic_pair_inner(
                     };
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
-                    crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay")
+                    let bytes = crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay")
                         .await
                         .map_err(|e| -> BoxError {
                             format!("channel relay splice ended after both sides acked: {e}").into()
                         })?;
+                    note_channel_splice(bytes); // #517 V1
                 }
             }
             Ok(pairing)
@@ -1607,11 +1629,12 @@ where
                 StreamPairCompletion::Splice => {
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
-                    crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443")
+                    let bytes = crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443")
                         .await
                         .map_err(|e| -> BoxError {
                             format!("channel relay splice ended after both sides acked: {e}").into()
                         })?;
+                    note_channel_splice(bytes); // #517 V1
                 }
                 StreamPairCompletion::RendezvousClose => {
                     // #495 2b: the rendezvous contract ends the stream after the ack —

@@ -91,6 +91,19 @@ impl ConnectionCap {
 /// TCP-fallback agent rendezvous (issue #3 / P1.2c-3), where a single stream
 /// cannot be cloned/multiplexed like a QUIC connection.
 pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
+/// #517 V1: WHICH relay plane a byte tally belongs to -- the per-plane split that
+/// makes the traffic-offload work measurable (where do the central host's relayed
+/// bytes actually come from?).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayKind {
+    /// Browser-Plane: SNI passthrough / Gelb-terminated browser traffic to an agent.
+    Browser,
+    /// QUIC data plane: a ct-client relaying to an agent (route_and_relay / the 'C' arm).
+    DataPlane,
+    /// The :4433 TLS-TCP fallback client path.
+    TcpFallback,
+}
+
 /// #502-follow (#513): WHY a hostname bind was refused. The 'H' arm's operator log
 /// used to collapse "already bound to a different token" and "token revoked" into
 /// one line, leaving exactly the revoke case -- the one an operator can act on
@@ -396,6 +409,12 @@ pub struct EdgeState<H> {
     tcp_parks: Counter,
     tcp_deliveries: Counter,
     tcp_parked_gauge: AtomicU64,
+    /// #517 V1: per-plane relay byte tallies (browser / QUIC data plane / TCP
+    /// fallback) -- their sum equals `relay_bytes`, keeping the historical total
+    /// untouched while making the offload split visible.
+    relay_bytes_browser: AtomicU64,
+    relay_bytes_dataplane: AtomicU64,
+    relay_bytes_tcp_fallback: AtomicU64,
     /// #359: live gauges maintained incrementally at every real mutation of
     /// `agents` (`register_locked`/`remove_registration`/`remove`, the only
     /// three call sites that ever insert into or remove from that map -- all
@@ -463,6 +482,9 @@ impl<H: Clone> EdgeState<H> {
             tcp_parks: Counter::default(),
             tcp_deliveries: Counter::default(),
             tcp_parked_gauge: AtomicU64::new(0),
+            relay_bytes_browser: AtomicU64::new(0),
+            relay_bytes_dataplane: AtomicU64::new(0),
+            relay_bytes_tcp_fallback: AtomicU64::new(0),
             relay_bytes: Counter::default(),
             failovers: Counter::default(),
             tunnel_bytes: Mutex::new(HashMap::new()),
@@ -715,7 +737,13 @@ impl<H: Clone> EdgeState<H> {
     /// are the two directions' byte counts (#10 O2's fleet-wide total, plus
     /// the per-token split added for the monitoring feature's byte counters,
     /// 2026-08-01).
-    pub fn note_relay(&self, token: &RoutingToken, client_to_agent: u64, agent_to_client: u64) {
+    pub fn note_relay(&self, token: &RoutingToken, client_to_agent: u64, agent_to_client: u64, kind: RelayKind) {
+        let total = client_to_agent.saturating_add(agent_to_client);
+        match kind {
+            RelayKind::Browser => self.relay_bytes_browser.fetch_add(total, Ordering::Relaxed),
+            RelayKind::DataPlane => self.relay_bytes_dataplane.fetch_add(total, Ordering::Relaxed),
+            RelayKind::TcpFallback => self.relay_bytes_tcp_fallback.fetch_add(total, Ordering::Relaxed),
+        };
         self.relays.inc();
         self.relay_bytes.add(client_to_agent + agent_to_client);
         let mut bytes = self.tunnel_bytes.lock_safe();
@@ -729,6 +757,15 @@ impl<H: Clone> EdgeState<H> {
     /// `(0, 0)` for a token that has never relayed anything. The per-tunnel
     /// counterpart to [`relay_bytes_total`](Self::relay_bytes_total)'s
     /// fleet-wide aggregate.
+    /// #517 V1: the per-plane relay byte split `(browser, dataplane, tcp_fallback)`.
+    pub fn relay_bytes_by_kind(&self) -> (u64, u64, u64) {
+        (
+            self.relay_bytes_browser.load(Ordering::Relaxed),
+            self.relay_bytes_dataplane.load(Ordering::Relaxed),
+            self.relay_bytes_tcp_fallback.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn tunnel_bytes(&self, token: &RoutingToken) -> (u64, u64) {
         self.tunnel_bytes.lock_safe().get(token).copied().unwrap_or((0, 0))
     }
@@ -1282,13 +1319,13 @@ mod tests {
         // (note_relay never touches `agents`).
         let state: EdgeState<u32> = EdgeState::new();
         assert_eq!(state.tunnel_bytes(&token(1)), (0, 0), "never relayed -> (0, 0)");
-        state.note_relay(&token(1), 100, 40);
+        state.note_relay(&token(1), 100, 40, RelayKind::DataPlane);
         assert_eq!(state.tunnel_bytes(&token(1)), (100, 40));
-        state.note_relay(&token(1), 25, 5);
+        state.note_relay(&token(1), 25, 5, RelayKind::DataPlane);
         assert_eq!(state.tunnel_bytes(&token(1)), (125, 45), "accumulates across relays");
         // A different token has its own independent counters.
         assert_eq!(state.tunnel_bytes(&token(2)), (0, 0));
-        state.note_relay(&token(2), 7, 3);
+        state.note_relay(&token(2), 7, 3, RelayKind::DataPlane);
         assert_eq!(state.tunnel_bytes(&token(2)), (7, 3));
         assert_eq!(state.tunnel_bytes(&token(1)), (125, 45), "token 1 unaffected by token 2's relay");
         // The fleet-wide total (#10 O2) still reflects both directions of both tokens.

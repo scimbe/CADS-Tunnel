@@ -212,6 +212,7 @@ fn parse_token_hex(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::RelayKind;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -407,7 +408,7 @@ mod tests {
         // registration/connected-ness fields are unaffected by relay activity
         // alone -- `note_relay` never registers/deregisters an agent).
         let t = RoutingToken(parse_token_hex(&tok_hex).unwrap());
-        state.note_relay(&t, 300, 120);
+        state.note_relay(&t, 300, 120, RelayKind::DataPlane);
         let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();

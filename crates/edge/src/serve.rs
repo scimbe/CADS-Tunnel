@@ -173,7 +173,7 @@ pub async fn route_and_relay(
     let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
     let mut th_buf = [0u8; 8];
     let (a, b) = relay_quic(client_send, client_recv, agent_send, agent_recv, token_hex(token, &mut th_buf)).await?;
-    state.note_relay(token, a, b); // #10 O2
+    state.note_relay(token, a, b, crate::state::RelayKind::DataPlane); // #10 O2
     Ok(())
 }
 
@@ -277,7 +277,7 @@ where
             // read, so the browser<->origin TLS handshake completes end-to-end.
             let mut agent = join(agent_recv, agent_send);
             let (a, b) = relay(&mut stream, &mut agent).await?;
-            state.note_relay(&token, a, b);
+            state.note_relay(&token, a, b, crate::state::RelayKind::Browser);
             Ok(())
         }
         Err(e) => {
@@ -355,7 +355,7 @@ where
         Ok((agent_send, agent_recv)) => {
             let mut agent = join(agent_recv, agent_send);
             let (a, b) = relay(&mut stream, &mut agent).await?;
-            state.note_relay(&token, a, b);
+            state.note_relay(&token, a, b, crate::state::RelayKind::Browser);
             Ok(())
         }
         Err(e) => {
@@ -1356,7 +1356,7 @@ pub async fn serve_connection(
                         let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut client, &mut agent).await?;
-                        state.note_relay(&token, a, b);
+                        state.note_relay(&token, a, b, crate::state::RelayKind::DataPlane);
                         return Ok(None);
                     }
                 }
@@ -1366,7 +1366,7 @@ pub async fn serve_connection(
                     let mut th_buf = [0u8; 8];
                     let (a, b) =
                         relay_quic(send, recv, agent_send, agent_recv, token_hex(&token, &mut th_buf)).await?;
-                    state.note_relay(&token, a, b); // #10 O2
+                    state.note_relay(&token, a, b, crate::state::RelayKind::DataPlane); // #10 O2
                     Ok(None)
                 }
                 Err(e) => {
@@ -2084,7 +2084,7 @@ where
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut stream, &mut agent).await?;
-                        state.note_relay(&token, a, b); // #10 O2
+                        state.note_relay(&token, a, b, crate::state::RelayKind::TcpFallback); // #10 O2
                         Ok(())
                     }
                     Err(e) => {
@@ -2151,7 +2151,7 @@ where
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut stream, &mut agent).await?;
-                        state.note_relay(&token, a, b);
+                        state.note_relay(&token, a, b, crate::state::RelayKind::TcpFallback);
                         Ok(())
                     }
                     Err(e) => {
