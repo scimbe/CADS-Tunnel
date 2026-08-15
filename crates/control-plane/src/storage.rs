@@ -3684,8 +3684,9 @@ impl SqliteChannelStore {
         owner: &str,
         holder: &[u8; 32],
     ) -> rusqlite::Result<bool> {
-        let conn = self.writer.lock_safe();
-        let is_owner: bool = conn
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let is_owner: bool = tx
             .query_row(
                 "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
                 params![&channel.0[..], owner],
@@ -3694,12 +3695,30 @@ impl SqliteChannelStore {
             .optional()?
             .is_some();
         if !is_owner {
-            return Ok(false);
+            return Ok(false); // tx rolls back on drop -- nothing was written
         }
-        conn.execute(
+        // Revocation must be COMPLETE, in one transaction. Deleting only the
+        // `channel_members` row left the holder's deposited grant re-fetchable
+        // (`channel_grant_deposits`) and its subject->holder claim link
+        // (`channel_member_subjects`) intact -- so a revoked member could still pull
+        // their grant from their portal session (`GET /portal/channels/:channel/grant`)
+        // and, since the edge honours any validly-signed unexpired grant independent of
+        // CP membership, keep joining. All three rows are keyed by (channel, holder), so
+        // this removes exactly this holder and leaves any sibling holder the same subject
+        // claimed on the same channel untouched.
+        tx.execute(
             "DELETE FROM channel_members WHERE channel = ?1 AND holder = ?2",
             params![&channel.0[..], &holder[..]],
         )?;
+        tx.execute(
+            "DELETE FROM channel_grant_deposits WHERE channel = ?1 AND holder = ?2",
+            params![&channel.0[..], &holder[..]],
+        )?;
+        tx.execute(
+            "DELETE FROM channel_member_subjects WHERE channel = ?1 AND holder = ?2",
+            params![&channel.0[..], &holder[..]],
+        )?;
+        tx.commit()?;
         Ok(true)
     }
 
@@ -7326,6 +7345,50 @@ mod tests {
             vec![(holder, Some("deadbeef02".to_string()))]
         );
         assert!(s.deposited_grants_for_subject(&ch, "subj-other").unwrap().is_empty());
+    }
+
+    /// Removing a member is a COMPLETE revocation: it pulls the membership row AND the
+    /// holder's deposited grant AND its subject->holder claim link, so a revoked member
+    /// can no longer re-fetch its grant. A sibling holder the SAME subject claimed on the
+    /// SAME channel (the real two-identity case: an account that re-claimed with a fresh
+    /// persistent browser identity) must survive untouched.
+    #[test]
+    fn remove_member_is_a_complete_revocation_and_spares_siblings() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0xe2u8; 32]);
+        let stale = [0x8au8; 32]; // the redacted first identity
+        let good = [0xdeu8; 32]; // the persistent re-claim, same subject
+        assert!(s.register_channel(&ch, &[0x11u8; 32], "owner").unwrap());
+        assert!(s.allowlist_add(&ch, "owner", "tester@example.com", 1_000).unwrap());
+        // One subject claims BOTH holders on this channel.
+        assert!(s
+            .claim_via_allowlist(&ch, "tester@example.com", &stale, &[0xc1u8; 32], &[0u8; 64], 2_000, Some("subj-t"))
+            .unwrap());
+        assert!(s
+            .claim_via_allowlist(&ch, "tester@example.com", &good, &[0xc2u8; 32], &[0u8; 64], 2_100, Some("subj-t"))
+            .unwrap());
+        assert_eq!(s.deposit_grant(&ch, "owner", &stale, "aaaa", 2_200).unwrap(), GrantDepositOutcome::Deposited);
+        assert_eq!(s.deposit_grant(&ch, "owner", &good, "bbbb", 2_300).unwrap(), GrantDepositOutcome::Deposited);
+        // Both fetchable before revocation.
+        let mut before = s.deposited_grants_for_subject(&ch, "subj-t").unwrap();
+        before.sort();
+        // sorted ascending by holder bytes: stale (0x8a) precedes good (0xde)
+        assert_eq!(before, vec![(stale, Some("aaaa".to_string())), (good, Some("bbbb".to_string()))]);
+
+        // Non-owner cannot revoke (and writes nothing).
+        assert!(!s.remove_member(&ch, "mallory", &stale).unwrap());
+        assert_eq!(s.deposited_grants_for_subject(&ch, "subj-t").unwrap().len(), 2, "a rejected revoke is a no-op");
+
+        // Owner revokes the stale identity: membership, deposit, AND subject link all gone.
+        assert!(s.remove_member(&ch, "owner", &stale).unwrap());
+        assert!(!s.is_member(&ch, &stale).unwrap());
+        // The revoked holder can no longer re-fetch its grant; the sibling survives whole.
+        assert_eq!(
+            s.deposited_grants_for_subject(&ch, "subj-t").unwrap(),
+            vec![(good, Some("bbbb".to_string()))],
+            "revoked holder's deposit + subject link are gone; the sibling identity is untouched"
+        );
+        assert!(s.is_member(&ch, &good).unwrap(), "the sibling holder is still a member");
     }
 
     #[test]
