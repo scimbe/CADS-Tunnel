@@ -316,7 +316,7 @@ where
 ///
 /// Handles a parked TCP-fallback agent (UDP/QUIC blocked) the same as
 /// [`serve_sni_passthrough`] does — hand it the stream directly via
-/// [`EdgeState::deliver_to_tcp_agent`] rather than [`open_agent_stream`],
+/// [`EdgeState::deliver_to_tcp_agent_draining`] rather than [`open_agent_stream`],
 /// which only ever looks at the QUIC registration and would otherwise fail
 /// "no agent tunnel for token" for a live but QUIC-less agent (found live,
 /// #229: an agent behind a UDP-blocking network hit exactly this before the
@@ -1348,7 +1348,7 @@ pub async fn serve_connection(
             // (cross-transport QUIC↔TCP relay); otherwise keep the QUIC→QUIC
             // relay_quic path unchanged.
             if state.has_tcp_agent(&token) {
-                match state.deliver_to_tcp_agent(&token, Box::new(join(recv, send))) {
+                match state.deliver_to_tcp_agent_draining(&token, Box::new(join(recv, send))) {
                     Ok(()) => return Ok(None),
                     // Raced (the parked agent was consumed between check and
                     // deliver) → relay this client to a QUIC agent instead.
@@ -1375,7 +1375,7 @@ pub async fn serve_connection(
                     // may be reaching an agent that is TCP-fallback-only.
                     if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
                         && state
-                            .deliver_to_tcp_agent(&token, Box::new(join(recv, send)))
+                            .deliver_to_tcp_agent_draining(&token, Box::new(join(recv, send)))
                             .is_ok()
                     {
                         return Ok(None);
@@ -1969,7 +1969,7 @@ where
                     eprintln!(
                         "ct-edge: tcp-fallback 'K' verify-ping caught a dead parked agent at delivery ({source}); failing the client over to the next parked slot"
                     );
-                    let _ = state.deliver_to_tcp_agent(&token, client);
+                    let _ = state.deliver_to_tcp_agent_draining(&token, client);
                     let _ = stream.shutdown().await;
                     Ok(())
                 }
@@ -2046,7 +2046,7 @@ where
                     eprintln!(
                         "ct-edge: tcp-fallback 'L' verify-ping caught a dead parked agent at delivery ({source}); failing the client over to the next parked slot"
                     );
-                    let _ = state.deliver_to_tcp_agent(&token, client);
+                    let _ = state.deliver_to_tcp_agent_draining(&token, client);
                     let _ = stream.shutdown().await;
                     Ok(())
                 }
@@ -2090,7 +2090,7 @@ where
             .map_err(|_| "tcp-fallback: role 'C' admission timed out")??;
 
             // Prefer a parked TCP-fallback agent; else relay to a QUIC agent.
-            match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
+            match state.deliver_to_tcp_agent_draining(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
                 Err(stream) => match open_agent_stream(state, &token).await {
                     Ok((agent_send, agent_recv)) => {
@@ -2105,7 +2105,7 @@ where
                         // give a burst of parallel browser connections a brief
                         // window to find a freed-up TCP-fallback slot.
                         if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
-                            && state.deliver_to_tcp_agent(&token, stream).is_ok()
+                            && state.deliver_to_tcp_agent_draining(&token, stream).is_ok()
                         {
                             return Ok(());
                         }
@@ -2157,7 +2157,7 @@ where
             .await
             .map_err(|_| "tcp-fallback: role 'M' admission timed out")??;
 
-            match state.deliver_to_tcp_agent(&token, Box::new(stream)) {
+            match state.deliver_to_tcp_agent_draining(&token, Box::new(stream)) {
                 Ok(()) => Ok(()),
                 Err(stream) => match open_agent_stream(state, &token).await {
                     Ok((agent_send, agent_recv)) => {
@@ -2171,7 +2171,7 @@ where
                         // Momentarily-exhausted pool recovery (#229 follow-up),
                         // same as the 'C' arm above.
                         if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
-                            && state.deliver_to_tcp_agent(&token, stream).is_ok()
+                            && state.deliver_to_tcp_agent_draining(&token, stream).is_ok()
                         {
                             return Ok(());
                         }
@@ -4727,7 +4727,7 @@ mod tests {
         }
         let (mut client_peer, client_edge) = tokio::io::duplex(1024);
         state
-            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
             .map_err(|_| "deliver failed")
             .unwrap();
 
@@ -4817,7 +4817,7 @@ mod tests {
         }
         let (mut client_peer, client_edge) = tokio::io::duplex(1024);
         state
-            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
             .map_err(|_| "deliver failed")
             .unwrap();
 
@@ -4945,11 +4945,11 @@ mod tests {
         let (a_client, a_edge) = tokio::io::duplex(64);
         let (b_client, b_edge) = tokio::io::duplex(64);
         state
-            .deliver_to_tcp_agent(&token, Box::new(a_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(a_edge))
             .map_err(|_| "first delivery failed")
             .unwrap();
         state
-            .deliver_to_tcp_agent(&token, Box::new(b_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(b_edge))
             .map_err(|_| "second delivery failed")
             .unwrap();
         assert!(!state.has_tcp_agent(&token), "both slots consumed, pool now empty");
@@ -5364,6 +5364,68 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_role_k_failover_drains_a_dead_park_and_rescues_the_client_528_findings_8_9() {
+        // #528 findings 8/9: the 'K' verify-at-delivery failover used the
+        // NON-draining single-shot delivery -- if the next parked slot in the
+        // FIFO was a corpse (dropped receiver), the attempt handed the stream
+        // back and `let _ =` discarded it, losing the request even though a
+        // LIVE park sat right behind the dead one. The failover must drain.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x58; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        // The 'K' agent registers and parks (FIFO slot A).
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
+        let state_k = state.clone();
+        let edge = tokio::spawn(async move {
+            serve_tcp_connection(agent_edge, &state_k, &challenge, None).await
+        });
+        let mut hdr = vec![b'K'];
+        hdr.extend_from_slice(&token.0);
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK");
+
+        // Behind it: a DEAD park (slot B -- receiver dropped, e.g. a crashed
+        // worker) and then a LIVE one (slot C, the rescue target).
+        drop(state.park_tcp_agent(token.clone()));
+        let live_rx = state.park_tcp_agent(token.clone());
+
+        // A Client is delivered; FIFO hands it to the 'K' slot (A) first.
+        let (mut client_peer, client_edge) = tokio::io::duplex(4096);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+
+        // The agent reads its PING but stays SILENT -- the round trip times out
+        // (paused time auto-advances), so the delivery becomes AgentDead and the
+        // failover must hand the Client onward. (Whether the Client landed before
+        // the verify ping or mid-cadence-ping is interleaving-dependent and both
+        // are correct: either path carries the rescued Client into the failover.)
+        let mut ping = [0u8; 9];
+        agent_peer.read_exact(&mut ping).await.unwrap();
+        assert_eq!(ping[0], TCP_PING_MAGIC, "the delivery-verify probe was sent");
+
+        // The failover DRAINS: dead slot B is consumed, live slot C receives the
+        // rescued Client. Before the fix, nothing ever arrived here.
+        let mut rescued = tokio::time::timeout(Duration::from_secs(60), live_rx)
+            .await
+            .expect("the failover must re-deliver promptly, not drop the client")
+            .expect("the live park behind the corpse receives the rescued client");
+        rescued.write_all(b"rescued").await.unwrap();
+        rescued.flush().await.unwrap();
+        let mut got = [0u8; 7];
+        client_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"rescued", "the rescued stream is the real delivered Client");
+
+        drop(agent_peer);
+        let _ = edge.await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn tcp_fallback_role_k_admits_exactly_like_a_then_pings_then_relays_end_to_end() {
         // The full 'K' lifecycle through the real `serve_tcp_connection`
         // dispatch: identical admission to 'A', REAL ping/pong cycles over the
@@ -5414,7 +5476,7 @@ mod tests {
         assert!(state.has_tcp_agent(&token), "the 'K' registration is parked and routable");
         let (mut client_peer, client_edge) = tokio::io::duplex(4096);
         state
-            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
             .map_err(|_| "deliver failed")
             .unwrap();
 
@@ -5518,7 +5580,7 @@ mod tests {
         assert!(state.has_tcp_agent(&token));
         let (mut client_peer, client_edge) = tokio::io::duplex(4096);
         state
-            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
             .map_err(|_| "deliver failed")
             .unwrap();
 
@@ -5647,7 +5709,7 @@ mod tests {
         // Still held once a Client is spliced in and bytes are actually moving.
         let (mut client_peer, client_edge) = tokio::io::duplex(4096);
         state
-            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
             .map_err(|_| "deliver failed")
             .unwrap();
         loop {
@@ -5709,7 +5771,7 @@ mod tests {
         assert!(state.has_tcp_agent(&token), "the legacy 'A' registration is still parked");
         let (mut client_peer, client_edge) = tokio::io::duplex(4096);
         state
-            .deliver_to_tcp_agent(&token, Box::new(client_edge))
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
             .map_err(|_| "deliver failed")
             .unwrap();
 
