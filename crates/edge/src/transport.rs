@@ -126,6 +126,19 @@ pub(crate) async fn serve_listener<F, Fut>(
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("ct-edge: {label} accept error: {e}");
+                    // 2026-08-15 outage: on RESOURCE exhaustion (EMFILE/ENFILE --
+                    // "Too many open files") an immediate retry cannot succeed and
+                    // hot-spins the loop at 100% CPU with a log line per iteration,
+                    // which both sustains the very fd pressure it suffers from and
+                    // floods the disk (the 15-minute :443 outage's amplifier). Back
+                    // off briefly so in-flight connections can close and return fds;
+                    // every other accept error keeps the immediate-retry behavior
+                    // (transient per-connection failures are the common case).
+                    // EMFILE=24 / ENFILE=23 (Linux, the only deploy target) -- matched
+                    // by raw value to avoid a libc dependency for two constants.
+                    if matches!(e.raw_os_error(), Some(24) | Some(23)) {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                     continue;
                 }
             },
