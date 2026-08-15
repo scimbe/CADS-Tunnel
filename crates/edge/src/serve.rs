@@ -1668,9 +1668,9 @@ where
 }
 
 /// The Browser-Plane counterpart to [`admit_tcp_agent_a`]: the admission body
-/// shared by roles `'B'` and `'L'`, byte-identical between them so the only
-/// difference between those two arms is what happens *after* parking (plain
-/// await vs [`park_and_ping`]).
+/// shared by roles `'B'`, `'L'` and `'F'` (#528), byte-identical between them
+/// so the only difference between those arms is what happens *after* parking
+/// (plain await vs [`park_and_ping`], raw [`relay`] vs [`framed_relay`]).
 ///
 /// Browser register (#41 FB1): registers the tunnel AND binds a public hostname in
 /// ONE message, because the TLS-TCP fallback has a single stream and cannot carry
@@ -1864,14 +1864,16 @@ impl std::fmt::Debug for ParkAndPingError {
 ///   receives a single ping-protocol byte. Opt-in only -- see those
 ///   functions' docs for the exact wire format and the race-free hand-off to
 ///   [`relay`] once a Client arrives.
-/// * `'F'` (#528; "F" for Framed) — the framed-capable variant of `'K'`:
-///   byte-identical admission and park-phase keepalive, but once a Client is
-///   delivered the relay phase speaks the `ct_common::fallback_framing` codec on
-///   the edge↔agent hop ([`framed_relay`]) instead of a raw byte pump, so an
-///   in-flight request whose origin goes silent past the middlebox idle floor
-///   keeps keepalive frames flowing and survives. Opt-in only; a legacy Agent
-///   never sends `'F'`, and an old edge's `unknown role byte` drop is the
-///   refusal an `'F'`-capable Agent downgrades on (`'F'`→`'L'`→`'B'`).
+/// * `'F'` (#528; "F" for Framed) — the framed-capable variant of `'L'`:
+///   byte-identical Browser-Plane admission (`role | token(32) | host_len(2 BE)
+///   | host`, hostname bound atomically) and the same park-phase keepalive, but
+///   once a Client is delivered the relay phase speaks the
+///   `ct_common::fallback_framing` codec on the edge↔agent hop
+///   ([`framed_relay`]) instead of a raw byte pump, so an in-flight request
+///   whose origin goes silent past the middlebox idle floor keeps keepalive
+///   frames flowing and survives. Opt-in only; a legacy Agent never sends
+///   `'F'`, and an old edge's `unknown role byte` drop is the refusal an
+///   `'F'`-capable Agent downgrades on (`'F'`→`'L'`→`'B'`).
 /// * `'C'` — a Client runs the `'C'` rendezvous (challenge → PoW) and is delivered
 ///   to a parked TCP agent if one exists, else relayed to a QUIC-registered agent.
 ///
@@ -1999,28 +2001,35 @@ where
             }
         }
         b'F' => {
-            // #528: the FRAMED-capable variant of 'K'. Admission, cap/revoke
-            // checks, park, and the whole park-phase PING/PONG keepalive are
-            // BYTE-IDENTICAL to 'K' (`admit_tcp_agent_a` + `park_and_ping`) --
-            // a legacy Agent never sends 'F', so this arm is unreachable for
-            // any already-deployed client, and an edge WITHOUT this arm hits
-            // the `unknown role byte` error below and drops, which is exactly
-            // the refusal signal the Agent's 'F'->'L'->'B' downgrade ladder
-            // expects. The ONLY difference from 'K' is what runs AFTER the
-            // `TCP_PING_STOP` hand-off byte: the relay phase speaks the
-            // `ct_common::fallback_framing` codec on the edge<->agent hop
-            // (`framed_relay`) instead of a raw byte pump, so an in-flight
-            // request whose origin falls silent past the middlebox idle floor
-            // keeps keepalive frames flowing and survives (#388 class). The
-            // browser side stays raw; `framed_relay` unframes agent bytes
-            // before forwarding to the browser and frames browser bytes before
-            // they reach the agent. `_sub_permit` is held for the whole
-            // parked-and-relaying life exactly as in 'A'/'K' -- see
-            // `admit_tcp_agent_a`'s doc.
+            // #528: the FRAMED-capable variant of 'L' (Browser-Plane). Admission
+            // is BYTE-IDENTICAL to 'B'/'L' -- `role | token(32) | host_len(2 BE)
+            // | host`, same cap/hostname gates (`host_bind_allowed` +
+            // `register_host`), same OK/NO ack, via `admit_tcp_agent_b` -- and
+            // the park phase runs the same PING/PONG keepalive as 'L'
+            // (`park_and_ping`). A legacy Agent never sends 'F', so this arm is
+            // unreachable for any already-deployed client, and an edge WITHOUT
+            // this arm hits the `unknown role byte` error below and drops,
+            // which is exactly the refusal signal the Agent's 'F'->'L'->'B'
+            // downgrade ladder expects. The ONLY difference from 'L' is what
+            // runs AFTER the `TCP_PING_STOP` hand-off byte: the relay phase
+            // speaks the `ct_common::fallback_framing` codec on the
+            // edge<->agent hop (`framed_relay`) instead of a raw byte pump, so
+            // an in-flight request whose origin falls silent past the middlebox
+            // idle floor keeps keepalive frames flowing and survives (#388
+            // class). The browser side stays raw; `framed_relay` unframes agent
+            // bytes before forwarding to the browser and frames browser bytes
+            // before they reach the agent. `_sub_permit` is held for the whole
+            // parked-and-relaying life exactly as in 'B'/'L'.
+            //
+            // Integration-review I1: this arm briefly used the 'K'-shaped
+            // `admit_tcp_agent_a` (token only, no hostname) -- against the
+            // 'L'-shaped frame the Agent actually sends. The hostname was never
+            // bound (silent routing failure) and its 2+len trailing bytes
+            // poisoned the first PING round trip ("malformed PONG"), driving an
+            // endless redial loop.
             let Some((token, parked, _sub_permit)) =
-                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "F").await?
+                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "F").await?
             else {
-                let _ = stream.shutdown().await;
                 return Ok(());
             };
             match park_and_ping(&mut stream, parked).await {
@@ -5508,14 +5517,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn tcp_fallback_role_f_admits_and_pings_like_k_then_relays_framed_end_to_end_528() {
+    async fn tcp_fallback_role_f_admits_and_pings_like_l_then_relays_framed_end_to_end_528() {
         // #528 (iii): the full 'F' lifecycle through the real
-        // `serve_tcp_connection` dispatch. Byte-identical to 'K' up to and
-        // including the STOP sentinel (admission, park-phase PING/PONG); after
-        // STOP the edge<->agent hop speaks the frame codec: raw client bytes
-        // arrive as DATA frames, agent DATA is unframed toward the client, an
-        // agent keepalive is ACKed and discarded -- never leaked into the raw
-        // client stream.
+        // `serve_tcp_connection` dispatch, driven by EXACTLY the bytes
+        // ct-agent's register_tunnel_stream_browser_with_role(b'F') sends:
+        // `'F' | token(32) | host_len(2 BE) | host` -- the 'L'-shaped
+        // Browser-Plane registration (integration-review I1: an earlier
+        // 'K'-shaped reading of this frame never bound the hostname and let
+        // the trailing host bytes poison the first PING round trip). After
+        // the STOP sentinel the edge<->agent hop speaks the frame codec: raw
+        // client bytes arrive as DATA frames, agent DATA is unframed toward
+        // the client, an agent keepalive is ACKed and discarded -- never
+        // leaked into the raw client stream.
         use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
 
         let state = Arc::new(EdgeState::<Connection>::new());
@@ -5527,14 +5540,23 @@ mod tests {
         let edge =
             tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None).await });
 
-        // Admission: identical wire to 'A'/'K' -- role byte + 32-byte token in, OK out.
+        // Admission: identical wire to 'B'/'L' -- role, token, then the
+        // length-prefixed hostname, OK out, hostname routable.
+        let host = "framed.bunsenbrenner.org";
         let mut hdr = vec![b'F'];
         hdr.extend_from_slice(&token.0);
+        hdr.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        hdr.extend_from_slice(host.as_bytes());
         agent_peer.write_all(&hdr).await.unwrap();
         agent_peer.flush().await.unwrap();
         let mut ok = [0u8; 2];
         agent_peer.read_exact(&mut ok).await.unwrap();
-        assert_eq!(&ok, b"OK", "'F' admission is byte-identical to 'K'");
+        assert_eq!(&ok, b"OK", "'F' admission is byte-identical to 'B'/'L'");
+        assert_eq!(
+            state.route_host(host),
+            Some(token.clone()),
+            "the 'F' registration binds the hostname atomically, exactly like 'B'/'L'"
+        );
 
         // One real park-phase PING/PONG round trip, exactly as 'K' -- framing
         // begins only AFTER the STOP sentinel, never during the park phase.
