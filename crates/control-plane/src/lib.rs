@@ -13,6 +13,7 @@ pub mod billing;
 pub mod client;
 pub mod credential;
 pub mod dns01_challenge;
+pub mod direct_serving;
 pub mod edge_mesh;
 pub mod enrollment;
 pub mod gate;
