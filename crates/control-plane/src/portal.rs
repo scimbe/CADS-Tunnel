@@ -489,7 +489,7 @@ pub(crate) fn identity_from_verified_id_token(
 /// email" hits `/portal/login`, which reports [`sso_unconfigured`] the same way),
 /// whereas redirecting straight into a login flow that doesn't exist would leave
 /// the site's own landing page showing nothing at all.
-async fn portal_home(State(st): State<PortalState>) -> Response {
+async fn portal_home(State(st): State<PortalState>, Query(q): Query<LoginQuery>) -> Response {
     match st.oidc {
         Some(cfg) => {
             // Same CSRF-state-cookie dance portal_login already does -- this and
@@ -498,6 +498,11 @@ async fn portal_home(State(st): State<PortalState>) -> Response {
             let state = random_state();
             let mut resp = Redirect::to(&cfg.authorize_redirect(&state, None, None, false)).into_response();
             set_cookie(&mut resp, &state_cookie(&state));
+            // #521: an unauthenticated deep link (e.g. a claim page) redirects here
+            // with ?next=<portal path>; carry it across the OIDC round-trip.
+            if let Some(next) = sanitized_next(q.next.as_deref()) {
+                set_cookie(&mut resp, &next_cookie(&next));
+            }
             resp
         }
         None => Html(portal_home_html(std::env::var("CT_PORTAL_SOCIAL_PROVIDERS").ok().as_deref())).into_response(),
@@ -570,6 +575,8 @@ struct LoginQuery {
     kc_idp_hint: Option<String>,
     login_hint: Option<String>,
     register: Option<String>,
+    /// #521: portal-internal post-login target (see [`sanitized_next`]).
+    next: Option<String>,
 }
 
 fn known_idp_hint(hint: Option<&str>) -> Option<&str> {
@@ -592,6 +599,9 @@ async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>
             ))
             .into_response();
             set_cookie(&mut resp, &state_cookie(&state));
+            if let Some(next) = sanitized_next(q.next.as_deref()) {
+                set_cookie(&mut resp, &next_cookie(&next));
+            }
             resp
         }
         None => sso_unconfigured(),
@@ -672,9 +682,16 @@ async fn portal_callback(
                 verified_email.as_deref(),
                 now + SESSION_TTL_SECS,
             );
-            let mut resp = Redirect::to("/portal/home").into_response();
+            // #521: honor the deep-link target the login started from (sanitized
+            // AGAIN on the way out -- the cookie is client-influenced input).
+            let target = cookie_value(&headers, NEXT_COOKIE)
+                .as_deref()
+                .and_then(|v| sanitized_next(Some(v)))
+                .unwrap_or_else(|| "/portal/home".to_string());
+            let mut resp = Redirect::to(&target).into_response();
             set_cookie(&mut resp, &session_cookie(&token));
             set_cookie(&mut resp, &cleared_state_cookie());
+            set_cookie(&mut resp, &cleared_next_cookie());
             resp
         }
         Err(e) => {
@@ -999,6 +1016,39 @@ fn state_cookie(state: &str) -> String {
 /// The same cookie with an immediate expiry, to retire it after the callback.
 fn cleared_state_cookie() -> String {
     format!("{STATE_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+}
+
+/// #521: the post-login return target, carried across the OIDC round-trip in its
+/// own single-use cookie (same lifetime/flags as the CSRF state cookie). Without
+/// it, an unauthenticated deep link -- the claim page is the field case -- landed
+/// on the portal home after sign-in and the participant had to find their way
+/// back (measured as real first-contact friction by the docs tester).
+const NEXT_COOKIE: &str = "ct_portal_next";
+
+fn next_cookie(next: &str) -> String {
+    format!("{NEXT_COOKIE}={next}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
+}
+
+fn cleared_next_cookie() -> String {
+    format!("{NEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+}
+
+/// #521: accept only portal-internal paths as post-login targets -- anything else
+/// (absolute URLs, protocol-relative `//host`, backslash tricks, control chars,
+/// oversized values) is dropped, never "fixed": this value becomes a redirect
+/// Location, so the only safe failure mode is falling back to the default home.
+fn sanitized_next(raw: Option<&str>) -> Option<String> {
+    let v = raw?.trim();
+    if v.starts_with("/portal")
+        && !v.starts_with("//")
+        && v.len() <= 512
+        && !v.contains('\\')
+        && v.chars().all(|c| !c.is_control())
+    {
+        Some(v.to_string())
+    } else {
+        None
+    }
 }
 
 /// Read a named cookie from the request `Cookie` header, if present.
@@ -1582,6 +1632,22 @@ mod tests {
             sh.contains(":4433/tcp") && !sh.contains("127.0.0.1:${EDGE_PORT:-4433}:4433"),
             "the :4433 tunnel data plane stays publicly reachable"
         );
+    }
+
+    /// #521: only portal-internal paths survive as post-login targets -- this
+    /// value becomes a redirect Location, so everything suspicious drops to the
+    /// default home instead of being "fixed".
+    #[test]
+    fn sanitized_next_accepts_only_portal_internal_paths() {
+        assert_eq!(sanitized_next(Some("/portal/channels/ab12/claim")).as_deref(), Some("/portal/channels/ab12/claim"));
+        assert_eq!(sanitized_next(Some(" /portal/tunnels ")).as_deref(), Some("/portal/tunnels"));
+        assert_eq!(sanitized_next(Some("https://evil.example/portal")), None, "absolute URL");
+        assert_eq!(sanitized_next(Some("//evil.example/portal")), None, "protocol-relative");
+        assert_eq!(sanitized_next(Some("/admin/revoke/x")), None, "outside the portal tree");
+        assert_eq!(sanitized_next(Some("/portal\\evil")), None, "backslash trick");
+        assert_eq!(sanitized_next(Some("/portal/\r\nSet-Cookie: x=1")), None, "control chars");
+        assert_eq!(sanitized_next(Some(&format!("/portal/{}", "a".repeat(600)))), None, "oversized");
+        assert_eq!(sanitized_next(None), None);
     }
 
     #[tokio::test]

@@ -2415,7 +2415,17 @@ async fn claim_channel(
 /// method+extractor on the same route.
 async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(channel_hex): Path<String>) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to("/portal").into_response();
+        // #521: carry the deep link through the login round-trip -- without this,
+        // a not-yet-signed-in participant landed on the portal home after OIDC
+        // and had to find the claim page again (the field first-contact friction).
+        // Only a VALID channel id rides into the redirect target (this is a
+        // Location header; hex is URL-safe by construction, anything else drops
+        // to the plain shell).
+        let target = match crate::service::hex_decode_32(&channel_hex) {
+            Some(_) => format!("/portal?next=/portal/channels/{}/claim", channel_hex.to_ascii_lowercase()),
+            None => "/portal".to_string(),
+        };
+        return Redirect::to(&target).into_response();
     };
     // #514: a RETURNING member sees its claimed identities and any deposited grant
     // right on this page -- re-fetchable delivery, the point of the deposit flow.
