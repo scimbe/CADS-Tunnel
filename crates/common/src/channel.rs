@@ -367,6 +367,95 @@ impl SignedChannelGrant {
 /// goes straight to the relay.
 pub const CHANNEL_ENDPOINT_RELAY_ONLY: &str = "relay-only";
 
+/// The channel-plane refusal sentinel (#524): every channel-join / relay-gate /
+/// pairing refusal starts with exactly these two bytes on the wire. They have been
+/// the *entire* refusal since the protocol existed, which is what keeps the #524
+/// category extension backward-compatible: every deployed reader either reads
+/// exactly these two bytes and stops (relay-gate client, browser JS members), or
+/// reads a bounded tail and classifies on the `NO` *prefix* (`starts_with`, never
+/// an exact-equality parse) — verified against ct-agent v0.4.14
+/// (`present_channel_join_on_stream`, `present_channel_relay_join_on_stream`,
+/// `dial_relay_gate_over_443`) and the wasm/JS join readers before shipping.
+pub const CHANNEL_REFUSAL_SENTINEL: &[u8; 2] = b"NO";
+
+/// The **closed vocabulary** of refusal category tokens (#524). After the
+/// [`CHANNEL_REFUSAL_SENTINEL`], the edge appends ONE length-framed token from this
+/// set (`len(u8) | token(ascii)`), telling the presenter *which class* of check
+/// refused it — never free text: the detailed reason (grant fields, expiry values,
+/// signature errors) stays in the edge's server-side log, so the category can help a
+/// legitimate member self-diagnose (wrong holder key vs. membership vs. expired
+/// grant) without becoming a fingerprinting/data-exfiltration channel. These are
+/// exactly the server-side log tags (`ct-edge: channel-join NO [<tag>]`, #124) of
+/// the checkpoints that write a `NO` ack, plus `pairing` for a post-admission
+/// pair-authorization refusal. Clients MUST treat an unknown token generically
+/// (future vocabulary), and MUST tolerate the token being absent entirely (an
+/// old edge).
+pub const CHANNEL_REFUSAL_CATEGORIES: &[&str] = &[
+    "len-oob",      // join request length prefix out of range
+    "malformed",    // join request did not decode
+    "endpoint",     // advertised endpoint unsafe/undialable
+    "not-member",   // unknown channel, or holder not currently a member
+    "grant-verify", // grant signature/expiry verification failed
+    "possession",   // holder-possession proof failed (wrong holder private key)
+    "pairing",      // admitted, but pairing the two members was refused
+];
+
+/// Upper bound on a category token's length (#524). Hard wire-compat constraint,
+/// not taste: ct-agent v0.4.14's pre-challenge reader
+/// (`present_channel_join_on_stream`) does `take(32).read_to_end` and treats any
+/// response of exactly 32 bytes as the possession challenge — so the whole refusal
+/// (`NO` + len byte + token) must stay strictly under 32 bytes, i.e. token ≤ 28.
+/// 24 leaves margin and is plenty for short ASCII tags.
+pub const CHANNEL_REFUSAL_CATEGORY_MAX_LEN: usize = 24;
+
+/// Is `token` a plausible refusal-category token on the wire (#524): non-empty,
+/// at most [`CHANNEL_REFUSAL_CATEGORY_MAX_LEN`], lowercase ASCII / digits / `-`?
+/// Shared by the writer's sanity check and the reader's frame validation. This is
+/// a *shape* check, deliberately not a vocabulary check — readers must accept
+/// future tokens they don't know and render them generically.
+pub fn is_channel_refusal_token_shape(token: &[u8]) -> bool {
+    !token.is_empty()
+        && token.len() <= CHANNEL_REFUSAL_CATEGORY_MAX_LEN
+        && token.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Encode a channel-plane refusal for the wire (#524):
+/// `NO | len(u8) | category(ascii)`. The ONE way any edge code is allowed to put a
+/// refusal on a channel-plane stream — never write a bare `b"NO"` literal (guarded
+/// by a source-scan test in `ct-edge`). `category` must come from
+/// [`CHANNEL_REFUSAL_CATEGORIES`] (debug-asserted, so adding a checkpoint tag
+/// means deliberately extending the vocabulary); if a release build is ever handed
+/// a token that is not even wire-shaped, it degrades to the bare sentinel rather
+/// than corrupting the frame.
+pub fn encode_channel_refusal(category: &str) -> Vec<u8> {
+    debug_assert!(
+        CHANNEL_REFUSAL_CATEGORIES.contains(&category),
+        "refusal category {category:?} is not in the closed vocabulary — extend \
+         CHANNEL_REFUSAL_CATEGORIES deliberately, never send ad-hoc tokens",
+    );
+    let mut out = Vec::with_capacity(2 + 1 + category.len());
+    out.extend_from_slice(CHANNEL_REFUSAL_SENTINEL);
+    if is_channel_refusal_token_shape(category.as_bytes()) {
+        out.push(category.len() as u8);
+        out.extend_from_slice(category.as_bytes());
+    }
+    out
+}
+
+/// Decode the optional category token that follows the [`CHANNEL_REFUSAL_SENTINEL`]
+/// (#524): `rest` is everything a bounded read yielded *after* the two `NO` bytes.
+/// `None` for an old edge (empty), a truncated tail (the token raced the stream
+/// teardown), or a malformed frame — callers fall back to today's generic message.
+pub fn decode_channel_refusal_category(rest: &[u8]) -> Option<&str> {
+    let (&len, tail) = rest.split_first()?;
+    let token = tail.get(..len as usize)?;
+    if !is_channel_refusal_token_shape(token) {
+        return None;
+    }
+    // Charset-checked ASCII above, so utf8 cannot fail.
+    std::str::from_utf8(token).ok()
+}
+
 /// What an agent presents to the edge to join/operate a channel: its signed
 /// [`ChannelGrant`] plus the direct endpoint it advertises for the peer to reach it
 /// (host:port — the edge brokers the two advertised endpoints, ADR-0015), or the
@@ -2810,6 +2899,58 @@ fn hex32(b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn channel_refusal_round_trips_every_vocabulary_token() {
+        // #524: the writer/reader pair is the wire contract — every closed-vocabulary
+        // token must survive encode → strip sentinel → decode unchanged.
+        for cat in CHANNEL_REFUSAL_CATEGORIES {
+            let wire = encode_channel_refusal(cat);
+            assert_eq!(&wire[..2], CHANNEL_REFUSAL_SENTINEL, "sentinel first, always");
+            assert_eq!(
+                decode_channel_refusal_category(&wire[2..]),
+                Some(*cat),
+                "category {cat:?} must round-trip",
+            );
+        }
+    }
+
+    #[test]
+    fn channel_refusal_never_reaches_32_bytes_the_v0414_challenge_ambiguity() {
+        // #524 back-compat (frozen): ct-agent v0.4.14's pre-challenge reader does
+        // `take(32).read_to_end` and treats EXACTLY 32 arrived bytes as the possession
+        // challenge — a refusal that padded out to 32 bytes would be misread as a
+        // challenge by every deployed old client. The whole frame must stay < 32.
+        for cat in CHANNEL_REFUSAL_CATEGORIES {
+            let wire = encode_channel_refusal(cat);
+            assert!(
+                wire.len() < 32,
+                "refusal for {cat:?} is {} bytes — must stay strictly under 32",
+                wire.len(),
+            );
+        }
+        assert!(2 + 1 + CHANNEL_REFUSAL_CATEGORY_MAX_LEN < 32, "the cap itself guarantees it");
+    }
+
+    #[test]
+    fn channel_refusal_decode_tolerates_old_edges_truncation_and_garbage() {
+        // Old edge: bare NO, nothing after the sentinel.
+        assert_eq!(decode_channel_refusal_category(&[]), None);
+        // Truncated frame: length byte promises more than arrived (teardown race).
+        assert_eq!(decode_channel_refusal_category(&[10, b'p', b'o', b's']), None);
+        // Zero-length token.
+        assert_eq!(decode_channel_refusal_category(&[0]), None);
+        // Non-token bytes (uppercase / control chars) are rejected, not surfaced.
+        assert_eq!(decode_channel_refusal_category(&[2, b'N', b'O']), None);
+        assert_eq!(decode_channel_refusal_category(&[1, 0x00]), None);
+        // A future token this build doesn't know still decodes (shape check only —
+        // the vocabulary is closed on the WRITER side, open on the reader side).
+        assert_eq!(decode_channel_refusal_category(&[8, b'f', b'u', b't', b'u', b'r', b'e', b'-', b'x']), Some("future-x"));
+        // Trailing bytes after the framed token don't confuse the decode.
+        let mut wire = encode_channel_refusal("possession");
+        wire.extend_from_slice(b"tail");
+        assert_eq!(decode_channel_refusal_category(&wire[2..]), Some("possession"));
+    }
 
     /// #252: every hand-built golden-vector `expected` below starts with a domain tag; since
     /// `Preimage::new` now length-prefixes it (`u32-LE len || domain`), this is the one place that

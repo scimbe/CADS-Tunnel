@@ -11,8 +11,8 @@
 
 use ct_common::sync::MutexExt;
 use ct_common::channel::{
-    verify_holder_possession, verify_stateless, ChannelId, ChannelJoinRequest, Direction,
-    GrantError, SignedChannelGrant, UnixSeconds,
+    encode_channel_refusal, verify_holder_possession, verify_stateless, ChannelId,
+    ChannelJoinRequest, Direction, GrantError, SignedChannelGrant, UnixSeconds,
 };
 use quinn::Endpoint;
 use rand::RngCore;
@@ -674,12 +674,18 @@ where
 {
     // #124 observability: refuse an admission by logging the per-checkpoint reason
     // server-side with a stable, greppable tag (`ct-edge: channel-join NO [<tag>]`), then
-    // sending the OPAQUE `b"NO"` on the wire. The client ack is deliberately the bare `NO`
-    // and never carries the reason: telling an unauthenticated presenter *which* check
-    // failed is an admission oracle, so the diagnosis lives only in the operator's edge
-    // logs. `context` (empty for the framing checks) carries the public grant fields
-    // (channel/holder hex, advertised endpoint) that let a live operator pin a refusal —
-    // never a private key or the possession challenge/signature bytes.
+    // sending the refusal on the wire. #524 (superseding #124's bare-`NO`-only wire): the
+    // ack now carries the CATEGORY too — `NO` + one length-framed token from the closed
+    // vocabulary (`ct_common::channel::CHANNEL_REFUSAL_CATEGORIES`, exactly these `tag`s)
+    // — so a legitimate member can self-diagnose "wrong holder key" vs. "not a member"
+    // vs. "expired grant" without an operator reading edge logs (the 2026-08-15 live
+    // incident: a `[possession]` refusal cost a CP-DB + edge-log escalation to diagnose).
+    // Deliberately still NEVER the free-text reason: the category names the checkpoint
+    // class only, while the detailed reason — with grant fields, expiry values, signature
+    // errors — stays in the operator's server-side log. `context` (empty for the framing
+    // checks) carries the public grant fields (channel/holder hex, advertised endpoint)
+    // that let a live operator pin a refusal — never a private key or the possession
+    // challenge/signature bytes.
     async fn refuse<W: AsyncWrite + Unpin>(
         send: &mut W,
         tag: &str,
@@ -698,7 +704,7 @@ where
         } else {
             eprintln!("ct-edge: channel-join NO [{tag}] peer={peer} {context}: {reason}");
         }
-        let _ = send.write_all(b"NO").await;
+        let _ = send.write_all(&encode_channel_refusal(tag)).await;
         let _ = send.shutdown().await;
         reason
     }
@@ -1235,8 +1241,13 @@ async fn finish_quic_pair_inner(
             Ok(pairing)
         }
         Err(e) => {
-            let _ = a.send.write_all(b"NO").await;
-            let _ = b.send.write_all(b"NO").await;
+            // #524: `pairing` — post-admission pair authorization refused. A distinct
+            // category from the admission checkpoints: the member's grant/possession were
+            // fine, the PAIR was not, which needs a different self-diagnosis (partner
+            // mismatch) than "fix your grant".
+            let refusal = encode_channel_refusal("pairing");
+            let _ = a.send.write_all(&refusal).await;
+            let _ = b.send.write_all(&refusal).await;
             let _ = a.send.finish();
             let _ = b.send.finish();
             Err(format!("{refusal_label}: {e}").into())
@@ -1726,8 +1737,12 @@ where
             Ok(pairing)
         }
         Err(e) => {
-            let _ = a.stream.write_all(b"NO").await;
-            let _ = b.stream.write_all(b"NO").await;
+            // #524: same `pairing` category as the QUIC pair-refusal above — the old
+            // client's line reader stops at the first 0x0A/EOF and still classifies on
+            // the `NO` prefix, so the framed token is back-compatible here too.
+            let refusal = encode_channel_refusal("pairing");
+            let _ = a.stream.write_all(&refusal).await;
+            let _ = b.stream.write_all(&refusal).await;
             let _ = a.stream.shutdown().await;
             let _ = b.stream.shutdown().await;
             let refusal_label = match completion {
@@ -3070,14 +3085,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_join_refusal_wire_carries_the_category_token() {
+        // #524: a refusal is no longer the bare `NO` — it is `NO` + one length-framed
+        // category token from the closed vocabulary, so the client can self-diagnose the
+        // CLASS of failure (the free-text reason still never leaves the edge log). Drive
+        // the two client-visible flagship checkpoints end to end and pin the exact wire
+        // bytes; every frame must also stay strictly under 32 bytes (ct-agent v0.4.14
+        // reads the pre-challenge response with `take(32)` and would mistake an exactly-
+        // 32-byte refusal for the possession challenge).
+        use ct_common::channel::decode_channel_refusal_category;
+        use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
+        let pk = operator_pubkey();
+        let channel = [0xE3u8; 32];
+        let holder = holder_sk(0x0b);
+        let req = ChannelJoinRequest {
+            grant: grant_h(channel, &holder, Direction::Initiate, 1_000),
+            endpoint: "203.0.113.9:6022".to_string(),
+        };
+
+        // (1) possession: challenge answered under the WRONG key -> `NO` + `possession`.
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = split(server_end);
+        let server_task = tokio::spawn(async move {
+            let observed: std::net::SocketAddr = "203.0.113.50:40002".parse().unwrap();
+            read_channel_join_on_stream(
+                srv_w,
+                srv_r,
+                observed,
+                500,
+                std::time::Duration::from_secs(5),
+                &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) },
+            )
+            .await
+            .map(|_| ())
+        });
+        let (mut cli_r, mut cli_w) = split(client_end);
+        let req_bytes = req.encode();
+        cli_w.write_all(&(req_bytes.len() as u16).to_be_bytes()).await.expect("write length");
+        cli_w.write_all(&req_bytes).await.expect("write request");
+        let mut challenge = [0u8; 32];
+        cli_r.read_exact(&mut challenge).await.expect("read challenge");
+        let thief = holder_sk(0x77);
+        let sig = thief.sign(&challenge).to_bytes();
+        cli_w.write_all(&sig).await.expect("write bad possession sig");
+        let mut refusal = Vec::new();
+        cli_r.read_to_end(&mut refusal).await.expect("read refusal to EOF");
+        assert_eq!(refusal, encode_channel_refusal("possession"), "NO + framed `possession`");
+        assert_eq!(decode_channel_refusal_category(&refusal[2..]), Some("possession"));
+        assert!(refusal.len() < 32, "v0.4.14 take(32) challenge-ambiguity guard");
+        assert!(server_task.await.expect("task").is_err(), "the join itself was refused");
+
+        // (2) not-member: authorize says no -> pre-challenge `NO` + `not-member`.
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        let (srv_r, srv_w) = split(server_end);
+        let server_task = tokio::spawn(async move {
+            let observed: std::net::SocketAddr = "203.0.113.50:40003".parse().unwrap();
+            read_channel_join_on_stream(
+                srv_w,
+                srv_r,
+                observed,
+                500,
+                std::time::Duration::from_secs(5),
+                &move |_c, _h| async move { None },
+            )
+            .await
+            .map(|_| ())
+        });
+        let (mut cli_r, mut cli_w) = split(client_end);
+        cli_w.write_all(&(req_bytes.len() as u16).to_be_bytes()).await.expect("write length");
+        cli_w.write_all(&req_bytes).await.expect("write request");
+        let mut refusal = Vec::new();
+        cli_r.read_to_end(&mut refusal).await.expect("read refusal to EOF");
+        assert_eq!(refusal, encode_channel_refusal("not-member"), "NO + framed `not-member`");
+        assert!(refusal.len() < 32, "v0.4.14 take(32) challenge-ambiguity guard");
+        assert!(server_task.await.expect("task").is_err(), "the join itself was refused");
+    }
+
+    #[test]
+    fn no_channel_plane_refusal_site_writes_a_bare_no_literal() {
+        // #524 regression guard: every channel-plane refusal must go through
+        // `ct_common::channel::encode_channel_refusal` (sentinel + framed category), so a
+        // future checkpoint can't quietly reintroduce the diagnosis-free bare `NO`. Source
+        // scan of the two channel-plane files; the pattern is assembled at runtime so this
+        // test doesn't match itself.
+        let broker = include_str!("channel_broker.rs");
+        let relay_gate = include_str!("relay_gate.rs");
+        let bare_write = format!("write_all(b\"{}\")", "NO");
+        for (file, src) in [("channel_broker.rs", broker), ("relay_gate.rs", relay_gate)] {
+            assert_eq!(
+                src.matches(&bare_write).count(),
+                0,
+                "{file} writes a bare NO literal — route it through encode_channel_refusal (#524)",
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn channel_join_refusal_reason_is_distinct_per_checkpoint() {
-        // #124 observability contract (frozen): `read_channel_join_on_stream` sends the
-        // opaque `b"NO"` at six admission checkpoints, but each must return a DISTINCT,
+        // #124 observability contract (frozen): `read_channel_join_on_stream` refuses at
+        // six admission checkpoints, and each must return a DISTINCT,
         // checkpoint-identifying `Err` so the operator's server-side `[<tag>]` log can pin
         // a live refusal (e.g. the #103 :443 sink↔source stall) to the exact check that
         // fired. Drive each checkpoint by mutating one thing off the happy path and assert
-        // the returned reason names it. (The wire ack stays the bare opaque `NO`; only the
-        // Err/log carries the reason — telling the presenter which check failed is an oracle.)
+        // the returned reason names it. (#524 updated the wire half of #124: the ack now
+        // carries the checkpoint CATEGORY as a framed closed-vocabulary token after `NO` —
+        // see `channel_join_refusal_wire_carries_the_category_token` — while the free-text
+        // reason still lives only in the Err/log, never on the wire.)
         use std::future::Future;
         use std::time::Duration;
         use tokio::io::{split, AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -5897,7 +6010,12 @@ mod tests {
         let client2 = build_client_endpoint(cert2).expect("client");
         let conn2 = client2.connect(addr2, "localhost").expect("cfg").await.expect("conn");
         let ack2 = present_join(&conn2, &req.encode(), &thief).await;
-        assert_ne!(ack2, b"OK", "a stolen grant without holder possession is refused");
+        assert_eq!(
+            ack2,
+            encode_channel_refusal("possession"),
+            "a stolen grant without holder possession is refused — and over the real QUIC \
+             path the refusal carries the framed `possession` category (#524)",
+        );
         let _ = task2.await;
     }
 

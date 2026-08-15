@@ -134,11 +134,15 @@ impl RelayGateContext {
 
 /// Refuse the pre-auth: log (public grant fields only — channel/holder hex, same
 /// discipline as the channel broker's own `refuse`, never a private key or signature)
-/// and write a one-byte `NO` marker so a well-behaved client can tell "refused" apart
-/// from "connection just died".
+/// and write the `NO` marker so a well-behaved client can tell "refused" apart
+/// from "connection just died". #524: the marker now carries `tag` as a length-framed
+/// category token from the closed vocabulary (`CHANNEL_REFUSAL_CATEGORIES`) — the old
+/// client reads exactly the two `NO` bytes and stops (verified: ct-agent v0.4.14
+/// `dial_relay_gate_over_443` does `read_exact(&mut [0u8; 2])` and never reads on after
+/// a non-`OK`), a new client opportunistically reads the category for a helpful message.
 async fn refuse<W: AsyncWrite + Unpin>(send: &mut W, tag: &str, context: &str, reason: BoxError) -> BoxError {
     eprintln!("ct-edge: relay-gate NO [{tag}] {context}: {reason}");
-    let _ = send.write_all(b"NO").await;
+    let _ = send.write_all(&ct_common::channel::encode_channel_refusal(tag)).await;
     let _ = send.shutdown().await;
     reason
 }
@@ -312,12 +316,19 @@ mod tests {
         let server_task = tokio::spawn(async move { admit_relay_gate(server, &resolver, "relay-peer-test", 1_000).await.map(|_| ()) });
         let (mut c_r, mut c_w) = tokio::io::split(client);
         c_w.write_all(&grant.encode()).await.unwrap();
-        let mut ack = [0u8; 2];
-        let read = c_r.read_exact(&mut ack).await;
+        // #524: read the whole refusal to EOF — the `NO` sentinel now carries the framed
+        // category token (the old client reads only the first 2 bytes and stops, which
+        // stays valid: the sentinel is still exactly the first two bytes).
+        let mut refusal = Vec::new();
+        let read = c_r.read_to_end(&mut refusal).await;
 
         assert!(server_task.await.unwrap().is_err(), "an unknown holder is refused");
-        if read.is_ok() {
-            assert_eq!(&ack, b"NO");
+        if read.is_ok() && !refusal.is_empty() {
+            assert_eq!(
+                refusal,
+                ct_common::channel::encode_channel_refusal("not-member"),
+                "the relay-gate refusal carries the framed `not-member` category (#524)",
+            );
         }
     }
 
