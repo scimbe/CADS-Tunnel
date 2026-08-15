@@ -123,9 +123,11 @@ pub fn gate_router(
     gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, require_verified_email)
 }
 
-/// Existing 6-arg builder: keeps the pre-`CT_GATE_REQUIRE_VERIFIED_EMAIL` behavior
-/// (email-allow-list match does NOT additionally require a verified email), so every
-/// caller that doesn't opt in is byte-for-byte unchanged.
+/// Test-only 6-arg builder: keeps the pre-`CT_GATE_REQUIRE_VERIFIED_EMAIL` behavior
+/// (email-allow-list match does NOT additionally require a verified email). Production
+/// goes through [`gate_router`] → [`gate_router_full`]; only the tests below still use
+/// this thin `require_verified_email = false` shim, so it is `#[cfg(test)]`.
+#[cfg(test)]
 fn gate_router_with(
     tunnels: Arc<SqliteTunnelStore>,
     oidc: Option<PortalOidc>,
