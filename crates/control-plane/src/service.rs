@@ -30,6 +30,7 @@ use crate::storage::{
     PaymentOpError, RedeemError, SqliteAgentDirectory, SqliteBootstrap, SqliteChannelStore,
     SqliteEnrollment,
     SqliteLedger, SqliteNetworkStore, SqlitePipelineRegistry, SqliteRegistry, SqliteServiceAccountStore, SqliteTopologyStore,
+    SqliteTunnelStore,
 };
 use ct_common::channel::ChannelId;
 use ct_common::ratelimit::KeyedRateLimiter;
@@ -799,6 +800,17 @@ pub struct AuthedChannelState {
     session_key: Arc<[u8]>,
 }
 
+/// State for the #525 bearer-authed tunnel login-allow-list router: the tunnel store
+/// plus the same OIDC verifier + portal session-cookie key the channel allow-list
+/// router carries, so a portal session cookie OR a service-account bearer both
+/// resolve to the owner subject (via [`subject_of_channel`]'s shared extractor).
+#[derive(Clone)]
+pub struct AuthedTunnelState {
+    tunnels: Arc<SqliteTunnelStore>,
+    verifier: OidcVerifierHandle,
+    session_key: Arc<[u8]>,
+}
+
 /// Build the **authenticated** Agent-Fabric channel-registry router (#81 SEC81c-b):
 /// owner-scoped channel registration + membership management, backed by
 /// [`SqliteChannelStore`]. Like `/me/*`, mounted only when an OIDC verifier is
@@ -854,6 +866,31 @@ pub fn authed_channel_router(
             post(channel_allowlist_remove),
         )
         .with_state(AuthedChannelState { channels, verifier, session_key })
+}
+
+/// Build the **service-account / bearer** tunnel login-allow-list router (#525): the
+/// `/me/*` OIDC-bearer, owner-scoped counterpart to the portal-session-only
+/// `/portal/tunnels/:id/login-allowlist` form. Automation (a bridge, a test harness,
+/// a provisioning job) can manage a tunnel's login gate over a `client_credentials`
+/// bearer, exactly as [`authed_channel_router`] already allows for channel
+/// allow-lists -- closing the channel/tunnel asymmetry that forced automation onto an
+/// ephemeral portal cookie. Owner = verified subject (session cookie OR bearer, via
+/// [`subject_of_channel`]'s shared extractor), never a request field.
+pub fn authed_tunnel_login_allowlist_router(
+    tunnels: Arc<SqliteTunnelStore>,
+    verifier: OidcVerifierHandle,
+    session_key: Arc<[u8]>,
+) -> Router {
+    Router::new()
+        .route(
+            "/me/tunnels/:id/login-allowlist",
+            post(tunnel_login_allowlist_add).get(tunnel_login_allowlist_list),
+        )
+        .route(
+            "/me/tunnels/:id/login-allowlist/:email/remove",
+            post(tunnel_login_allowlist_remove),
+        )
+        .with_state(AuthedTunnelState { tunnels, verifier, session_key })
 }
 
 /// Shared state for the authenticated declarative **network** API (#102-rest): the
@@ -3202,6 +3239,71 @@ async fn channel_allowlist_remove(
     }
 }
 
+/// `POST /me/tunnels/:id/login-allowlist` `{email}` (#525): owner-scoped, add an email
+/// to a tunnel's login gate -- the bearer/SA counterpart to the portal form. The
+/// underlying storage is already subject-scoped, so a caller can only touch a tunnel
+/// they own.
+async fn tunnel_login_allowlist_add(
+    State(state): State<AuthedTunnelState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AllowlistEmailReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Shared session-cookie-or-bearer subject extractor (named for its first use on
+    // channels; the impl is transport-generic).
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
+    if !plausible_email(&req.email) {
+        return Err((StatusCode::BAD_REQUEST, "malformed email".to_string()));
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let ok = state
+        .tunnels
+        .login_allowlist_add(&owner, &id, &req.email, now)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the tunnel owner".to_string()))
+    }
+}
+
+/// `GET /me/tunnels/:id/login-allowlist` (#525): owner-scoped list of a tunnel's
+/// login-gate allow-listed emails.
+async fn tunnel_login_allowlist_list(
+    State(state): State<AuthedTunnelState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<AllowlistResp>, (StatusCode, String)> {
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
+    let emails = state
+        .tunnels
+        .login_allowlist_list(&owner, &id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match emails {
+        Some(emails) => Ok(Json(AllowlistResp { emails })),
+        None => Err((StatusCode::FORBIDDEN, "not the tunnel owner".to_string())),
+    }
+}
+
+/// `POST /me/tunnels/:id/login-allowlist/:email/remove` (#525): owner-scoped removal.
+/// Path-encoded email (axum percent-decodes the segment), mirroring the channel route.
+async fn tunnel_login_allowlist_remove(
+    State(state): State<AuthedTunnelState>,
+    headers: HeaderMap,
+    Path((id, email)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
+    let ok = state
+        .tunnels
+        .login_allowlist_remove(&owner, &id, &email)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "not the tunnel owner".to_string()))
+    }
+}
+
 /// Build the **cross-user channel invitation redemption** router (#72 AF3-redeem-cp):
 /// `POST /channel/invite/redeem`, backed by the durable [`SqliteChannelStore`].
 ///
@@ -5456,6 +5558,10 @@ pub fn persistent_control_plane_router(
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
             .merge(authed_channel_router(channels, oidc.clone(), Arc::from(session_key)))
+            // #525: the bearer/service-account counterpart to the portal-session-only
+            // tunnel login-allowlist form -- lets automation manage a tunnel's login
+            // gate, owner-scoped, closing the channel/tunnel asymmetry.
+            .merge(authed_tunnel_login_allowlist_router(tunnels.clone(), oidc.clone(), Arc::from(session_key)))
             // Self-service pipeline publish (owner = verified subject) — see
             // `authed_pipeline_router`'s doc comment for why this exists alongside
             // the admin-gated `/registry/pipelines`.
@@ -9041,6 +9147,102 @@ mod tests {
         );
         let resp = get(format!("/me/channels/{ch}/allowlist"), Some(alice)).await.unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["emails"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn tunnel_login_allowlist_routes_are_owner_scoped_and_bearer_authed_525() {
+        // #525: the /me/tunnels/:id/login-allowlist routes give automation a
+        // bearer/service-account path to a tunnel's login gate, owner-scoped exactly
+        // like the channel allow-list -- and a non-owner bearer is refused (403, no leak).
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        // alice owns a tunnel WITH a hostname -- the login gate is keyed by hostname.
+        let id = match tunnels
+            .create_if_under_owned_limit("alice", "wc", Some("wc.example.org"), 10)
+            .unwrap()
+        {
+            crate::storage::CreateTunnelOutcome::Created(t) => t.id,
+            _ => panic!("expected Created"),
+        };
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = authed_tunnel_login_allowlist_router(
+            tunnels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+        );
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let alice = jwt_for("alice");
+        let mallory = jwt_for("mallory");
+        let post = |path: String, bearer: String, body: String| {
+            app.clone().oneshot(
+                Request::post(&path)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let get = |path: String, bearer: String| {
+            app.clone().oneshot(
+                Request::get(&path)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        // Non-owner bearer: cannot add, cannot list (403, not an empty list -- no leak).
+        assert_eq!(
+            post(format!("/me/tunnels/{id}/login-allowlist"), mallory.clone(), r#"{"email":"nat@example.com"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(format!("/me/tunnels/{id}/login-allowlist"), mallory.clone()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Malformed email rejected before storage.
+        assert_eq!(
+            post(format!("/me/tunnels/{id}/login-allowlist"), alice.clone(), r#"{"email":"nope"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // Owner (service-account bearer) adds, then lists it back (stored lowercased).
+        assert_eq!(
+            post(format!("/me/tunnels/{id}/login-allowlist"), alice.clone(), r#"{"email":"Nat@Example.com"}"#.into())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let resp = get(format!("/me/tunnels/{id}/login-allowlist"), alice.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["emails"], serde_json::json!(["nat@example.com"]));
+
+        // Owner removes; list is empty again.
+        assert_eq!(
+            post(format!("/me/tunnels/{id}/login-allowlist/nat@example.com/remove"), alice.clone(), String::new())
+                .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let resp = get(format!("/me/tunnels/{id}/login-allowlist"), alice.clone()).await.unwrap();
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["emails"], serde_json::json!([]));
     }
