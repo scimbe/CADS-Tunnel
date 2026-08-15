@@ -887,6 +887,36 @@ impl<H: Clone> EdgeState<H> {
         self.tcp_agents.lock_safe().get(token).is_some_and(|q| !q.is_empty())
     }
 
+    /// #522: proactively drop every DEAD TCP-fallback park (its Agent-side
+    /// receiver was dropped -- the process exited, the connection ladder leaked
+    /// it, a watchdog respawn abandoned it) and return how many were reaped.
+    /// Until this existed, dead parks were only ever cleared lazily on a Browser
+    /// delivery (#505/#510) -- so a burst that leaves many dead parks (a crash
+    /// loop, a duplicate-process flood) accumulated them indefinitely between
+    /// deliveries, and once EVERY park for a token was a corpse, a browser
+    /// draining them all found nothing live and 000'd on the UDP-blocked path
+    /// with no QUIC fallback. `oneshot::Sender::is_closed()` detects a dropped
+    /// receiver without consuming the slot, so this is a pure sweep: no live
+    /// park is ever touched. The gauge is decremented per reaped slot (saturating,
+    /// like delivery) so `/metrics` reflects the live pool, not the corpse pile.
+    pub fn reap_dead_tcp_parks(&self) -> u64 {
+        let mut agents = self.tcp_agents.lock_safe();
+        let mut reaped = 0u64;
+        agents.retain(|_token, queue| {
+            let before = queue.len();
+            queue.retain(|tx| !tx.is_closed());
+            reaped += (before - queue.len()) as u64;
+            !queue.is_empty()
+        });
+        drop(agents);
+        for _ in 0..reaped {
+            let _ = self
+                .tcp_parked_gauge
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |g| Some(g.saturating_sub(1)));
+        }
+        reaped
+    }
+
     /// Wait up to `timeout` for a TCP-fallback registration to appear for
     /// `token`, returning `true` as soon as one does (or immediately, if one
     /// is already parked) and `false` if `timeout` elapses first. For a
@@ -1954,6 +1984,39 @@ mod tests {
         let extra: BoxedStream = Box::new(tokio::io::duplex(16).0);
         let _ = state.deliver_to_tcp_agent(&token(23), extra); // no slot: Err, no decrement
         assert_eq!(state.tcp_parked(), 0, "saturated, not wrapped");
+    }
+
+    /// #522: the periodic reaper drops DEAD TCP-fallback parks (dropped receivers)
+    /// without touching live ones, keeping the gauge honest -- the fix for corpse
+    /// accumulation between browser deliveries (a crash-loop / duplicate-process
+    /// flood that eventually left a token with only dead parks and 000'd it).
+    #[tokio::test]
+    async fn reap_dead_tcp_parks_drops_corpses_keeps_live_and_fixes_the_gauge_522() {
+        let state: EdgeState<u32> = EdgeState::new();
+        // Two tokens: token 30 gets 3 parks (2 will die), token 31 gets 1 (stays live).
+        let d1 = state.park_tcp_agent(token(30));
+        let live30 = state.park_tcp_agent(token(30));
+        let d2 = state.park_tcp_agent(token(30));
+        let live31 = state.park_tcp_agent(token(31));
+        assert_eq!(state.tcp_parked(), 4);
+        drop(d1);
+        drop(d2); // two corpses on token 30
+
+        let reaped = state.reap_dead_tcp_parks();
+        assert_eq!(reaped, 2, "exactly the two dropped receivers are reaped");
+        assert_eq!(state.tcp_parked(), 2, "gauge reflects only the live pool now");
+        assert!(state.has_tcp_agent(&token(30)), "the live park on token 30 survives");
+        assert!(state.has_tcp_agent(&token(31)), "the untouched token stays");
+
+        // A live park still delivers after a reap -- the reaper never harmed it.
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(state.deliver_to_tcp_agent(&token(30), client).is_ok());
+        assert!(live30.await.is_ok());
+        // Reaping again with everything either delivered or live is a no-op.
+        drop(live31); // now token 31's only park is a corpse
+        assert_eq!(state.reap_dead_tcp_parks(), 1);
+        assert!(!state.has_tcp_agent(&token(31)), "the emptied token's queue is dropped");
+        assert_eq!(state.tcp_parked(), 0);
     }
 
     #[tokio::test]

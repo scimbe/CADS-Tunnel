@@ -2471,6 +2471,32 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     save_cert(cert_out, &ca_root)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
+    // #522: periodic reaper for DEAD TCP-fallback parks. Until this, dead parks
+    // were only cleared lazily on a browser delivery, so a crash-loop / duplicate-
+    // process flood accumulated corpses that eventually left a token with only dead
+    // parks -- a browser then drained them all, found nothing live, and 000'd on the
+    // UDP-blocked fallback path (no QUIC). Ten seconds matches the channel pairer's
+    // own sweep cadence; the sweep is a cheap is_closed() scan, logged only when it
+    // actually reaps so a healthy edge stays quiet.
+    {
+        let reaper_state = state.clone();
+        let reaper_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = reaper_shutdown.cancelled() => return,
+                    _ = tick.tick() => {
+                        let reaped = reaper_state.reap_dead_tcp_parks();
+                        if reaped > 0 {
+                            eprintln!("ct-edge: reaped {reaped} dead TCP-fallback park(s) (#522)");
+                        }
+                    }
+                }
+            }
+        });
+    }
     // #86/#95 (ADR-0018): per-token rendezvous rate limit — at most N rendezvous per
     // routing token per minute. On by DEFAULT now (#95: a public edge must not ship
     // flood-exposed); CT_EDGE_RENDEZVOUS_MAX_PER_MIN tunes it, and `0`/`off` disables
