@@ -2608,10 +2608,24 @@ fn channel_onboarding_html(
         ),
         None => "CT_CHANNEL_GRANT=PASTE_YOUR_CT_CHANNEL_GRANT_HERE   # your channel owner signs this, see \"Get your grant\" below -- this server never holds the operator key and cannot issue it".to_string(),
     };
+    // #517-follow / tester finding (15.08.): once the owner has DEPOSITED the grant,
+    // the participant's role is no longer a "ask your owner" placeholder -- the grant
+    // wire-encoding carries the direction byte (hex chars 256..258 of the 278-hex
+    // grant: sig64‖channel32‖holder32‖DIR‖…). Prefill CT_CHANNEL_ROLE from it so the
+    // arena's always-`accept` participant needs no out-of-band question. `Both` (3)
+    // legitimately serves either side, so it keeps the choose-your-side placeholder.
+    let role_line = deposited_grant
+        .and_then(|g| g.get(256..258))
+        .and_then(|dir| match dir {
+            "01" => Some("CT_CHANNEL_ROLE=initiate   # from your deposited grant"),
+            "02" => Some("CT_CHANNEL_ROLE=accept   # from your deposited grant"),
+            _ => None, // Both (03) or unparseable: keep the explicit choice
+        })
+        .unwrap_or("CT_CHANNEL_ROLE=PASTE_INITIATE_OR_ACCEPT   # ask your channel owner which side you are");
     let env_block = format!(
         "CT_CHANNEL_BROKER={broker}\n\
          CT_CHANNEL_RELAY={relay}{front_door_env}\n\
-         CT_CHANNEL_ROLE=PASTE_INITIATE_OR_ACCEPT   # ask your channel owner which side you are\n\
+         {role_line}\n\
          {grant_line}\n\
          CT_CHANNEL_HOLDER_KEY=PASTE_YOUR_PRIVATE_HOLDER_KEY_HERE   # from 'ct-agent channel member-material' -- never share this, never sent to or stored by this server\n\
          CT_CHANNEL_NOISE_KEY=PASTE_YOUR_PRIVATE_NOISE_KEY_HERE   # from 'ct-agent channel member-material' -- never share this, never sent to or stored by this server\n\
@@ -4721,7 +4735,10 @@ mod tests {
         assert!(v["identities"][0]["grant"].is_null(), "no deposit yet: waiting state");
 
         // Owner deposits; the member's next fetch carries the grant bytes.
-        let grant_hex = format!("{}{}{}{}", "ab".repeat(64), hex(&ch.0), hex(&holder_bytes), "cd".repeat(11));
+        // sig(128 hex) ‖ channel(64) ‖ holder(64) ‖ DIR ‖ rights ‖ deleg ‖ expires:
+        // byte 128 (hex 256..258) is the direction -- 02 = Accept, so the page
+        // prefills CT_CHANNEL_ROLE=accept (the #517-follow tester finding).
+        let grant_hex = format!("{}{}{}02{}", "ab".repeat(64), hex(&ch.0), hex(&holder_bytes), "cd".repeat(10));
         assert_eq!(grant_hex.len(), 278, "wire-encoding length the endpoint validates");
         assert_eq!(
             channels.deposit_grant(&ch, "alice-owner", &holder_bytes, &grant_hex, 3_000).unwrap(),
@@ -4766,6 +4783,16 @@ mod tests {
         assert!(
             html.contains(&format!("CT_CHANNEL_GRANT={grant_hex}")),
             "the returning member's page fills the deposited grant into the env block"
+        );
+        // #517-follow: the grant's direction byte (accept = "02" at hex 256..258)
+        // prefills CT_CHANNEL_ROLE instead of the ask-your-owner placeholder.
+        assert!(
+            html.contains("CT_CHANNEL_ROLE=accept"),
+            "the deposited grant's accept direction prefills the role"
+        );
+        assert!(
+            !html.contains("CT_CHANNEL_ROLE=PASTE_INITIATE_OR_ACCEPT"),
+            "no placeholder once the role is known from the grant"
         );
         assert!(
             !html.contains("PASTE_YOUR_CT_CHANNEL_GRANT_HERE") || html.contains("Your identities on this channel"),
