@@ -2404,7 +2404,32 @@ async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(chann
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
-    Html(claim_html(&channel_hex, None, claims.email.as_deref(), None, None)).into_response()
+    // #514: a RETURNING member sees its claimed identities and any deposited grant
+    // right on this page -- re-fetchable delivery, the point of the deposit flow.
+    let mut existing_block = String::new();
+    if let Some(channel) = crate::service::hex_decode_32(&channel_hex) {
+        if let Ok(rows) = st
+            .channels
+            .deposited_grants_for_subject(&ct_common::channel::ChannelId(channel), &claims.subject)
+        {
+            if !rows.is_empty() {
+                let dep = channel_deployment(&st.portal_base, &st.edge_cert_path).await;
+                existing_block.push_str("<h2>Your identities on this channel</h2>");
+                for (holder, grant) in &rows {
+                    let holder_hex: String = holder.iter().map(|b| format!("{b:02x}")).collect();
+                    match grant {
+                        Some(g) => existing_block.push_str(&channel_onboarding_html(&channel_hex, &holder_hex, &dep, Some(g))),
+                        None => existing_block.push_str(&format!(
+                            r#"<p class="help">Holder <code>{}…</code>: claimed -- waiting for your channel
+ owner to deposit the grant; reload this page once they have (no need to claim again).</p>"#,
+                            escape(&holder_hex[..16])
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    Html(claim_html(&channel_hex, None, claims.email.as_deref(), None, None, None, &existing_block)).into_response()
 }
 
 async fn claim_page_submit(
@@ -2423,16 +2448,32 @@ async fn claim_page_submit(
         // accepted it (malformed input already errored out above).
         Ok(()) => {
             let deployment = channel_deployment(&st.portal_base, &st.edge_cert_path).await;
+            // #514: a re-claim of an already-granted holder ships the deposited grant
+            // immediately (a fresh first claim almost never has one yet -- the page
+            // then shows the reload-to-pick-it-up hint instead).
+            let deposited = crate::service::hex_decode_32(&channel_hex)
+                .and_then(|ch| {
+                    st.channels
+                        .deposited_grants_for_subject(&ct_common::channel::ChannelId(ch), &claims.subject)
+                        .ok()
+                })
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|(h, _)| h.iter().map(|b| format!("{b:02x}")).collect::<String>() == req.holder.to_ascii_lowercase())
+                        .and_then(|(_, g)| g)
+                });
             Html(claim_html(
                 &channel_hex,
                 Some(Ok(())),
                 claims.email.as_deref(),
                 Some(&req.holder),
                 Some(&deployment),
+                deposited.as_deref(),
+                "",
             ))
             .into_response()
         }
-        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)), claims.email.as_deref(), None, None)).into_response(),
+        Err((_, msg)) => Html(claim_html(&channel_hex, Some(Err(msg)), claims.email.as_deref(), None, None, None, "")).into_response(),
     }
 }
 
@@ -2510,7 +2551,12 @@ async fn channel_deployment(portal_base: &str, edge_cert_path: &str) -> ChannelD
 /// pre-filled with the now-known channel id and this member's just-submitted
 /// holder key, so the owner only has to paste one value back instead of
 /// hand-assembling a whole onboarding bundle from scratch.
-fn channel_onboarding_html(channel_hex: &str, holder_hex: &str, dep: &ChannelDeployment) -> String {
+fn channel_onboarding_html(
+    channel_hex: &str,
+    holder_hex: &str,
+    dep: &ChannelDeployment,
+    deposited_grant: Option<&str>,
+) -> String {
     let channel_hex = escape(channel_hex);
     let holder_hex = escape(holder_hex);
     let (front_door_env, front_door_note) = match &dep.front_door {
@@ -2527,11 +2573,23 @@ fn channel_onboarding_html(channel_hex: &str, holder_hex: &str, dep: &ChannelDep
  fallback for a restrictive network isn't available here -- only the direct broker/relay ports below.</p>"#,
         ),
     };
+    // #514: when the channel owner has already DEPOSITED this member's signed grant
+    // (POST /me/channels/:channel/grants/:holder), the env block ships it filled in --
+    // re-fetchable from this page any time, which is the whole point of the deposit
+    // flow (the sort#26 class: one-shot delivery stranding a grant forever). Without
+    // a deposit the placeholder stays, plus the "reload later" hint below.
+    let grant_line = match deposited_grant {
+        Some(g) => format!(
+            "CT_CHANNEL_GRANT={}   # deposited by your channel owner -- re-fetch it from this page anytime",
+            escape(g)
+        ),
+        None => "CT_CHANNEL_GRANT=PASTE_YOUR_CT_CHANNEL_GRANT_HERE   # your channel owner signs this, see \"Get your grant\" below -- this server never holds the operator key and cannot issue it".to_string(),
+    };
     let env_block = format!(
         "CT_CHANNEL_BROKER={broker}\n\
          CT_CHANNEL_RELAY={relay}{front_door_env}\n\
          CT_CHANNEL_ROLE=PASTE_INITIATE_OR_ACCEPT   # ask your channel owner which side you are\n\
-         CT_CHANNEL_GRANT=PASTE_YOUR_CT_CHANNEL_GRANT_HERE   # your channel owner signs this, see \"Get your grant\" below -- this server never holds the operator key and cannot issue it\n\
+         {grant_line}\n\
          CT_CHANNEL_HOLDER_KEY=PASTE_YOUR_PRIVATE_HOLDER_KEY_HERE   # from 'ct-agent channel member-material' -- never share this, never sent to or stored by this server\n\
          CT_CHANNEL_NOISE_KEY=PASTE_YOUR_PRIVATE_NOISE_KEY_HERE   # from 'ct-agent channel member-material' -- never share this, never sent to or stored by this server\n\
          CT_CHANNEL_RELAY_ONLY=1   # safe default behind a restrictive network; unset and set CT_CHANNEL_LISTEN=host:port instead if you can accept inbound connections",
@@ -2547,6 +2605,33 @@ fn channel_onboarding_html(channel_hex: &str, holder_hex: &str, dep: &ChannelDep
          ct-agent channel grant",
     );
     let run_cmd = "set -a; source .env; set +a\nct-agent channel";
+    // #514: with a deposited grant the owner-side minting walkthrough is noise --
+    // replace it with the re-fetch note; without one, keep the walkthrough and add
+    // the deposit hint so the member knows a reload (not a re-claim) picks it up.
+    let grant_section = match deposited_grant {
+        Some(_) => r#"<p class="help"><code>CT_CHANNEL_GRANT</code> above was deposited by your channel
+ owner and is filled in for real -- come back to this page (or <code>GET
+ /portal/channels/&lt;channel&gt;/grant</code>) anytime to re-fetch it, e.g. after a grant rotation.
+ The private keys were never here and stay yours alone.</p>"#
+            .to_string(),
+        None => format!(
+            r#"<details open>
+ <summary>Get your grant</summary>
+ <p class="help"><code>CT_CHANNEL_GRANT</code> is signed by your channel owner's own OPERATOR private
+ key, which this server has never held either (only the operator's PUBLIC key) -- the same
+ never-store-a-private-key boundary as your own holder/Noise keys above. Send your channel owner your
+ holder public key (<code>{holder_hex}</code>, already captured from your claim above) and ask them to
+ run this locally, then paste back what it prints as your <code>CT_CHANNEL_GRANT</code>:</p>
+ <div class="code-block">
+  <div class="code-block-head"><span>owner runs this</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+  <pre><code>{grant_cmd}</code></pre>
+ </div>
+ <p class="help">Owners with an automated bridge instead DEPOSIT the grant here (<code>POST
+ /me/channels/&lt;channel&gt;/grants/&lt;holder&gt;</code>) -- once that happened, simply RELOAD this
+ page: the block above then ships your grant filled in. No need to claim again.</p>
+</details>"#
+        ),
+    };
     let run_cmd_ps = "Get-Content .env | ForEach-Object {\n  if ($_ -match '^\\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {\n    $value = $matches[2] -replace '\\s+#.*$', ''\n    [System.Environment]::SetEnvironmentVariable($matches[1], $value.Trim(), 'Process')\n  }\n}\n.\\ct-agent.exe channel";
     format!(
         r#"<h2>Connect as this member</h2>
@@ -2560,18 +2645,7 @@ this server generated neither and cannot generate them; they came from your own 
  <pre><code>{env_block}</code></pre>
 </div>
 {front_door_note}
-<details open>
- <summary>Get your grant</summary>
- <p class="help"><code>CT_CHANNEL_GRANT</code> is signed by your channel owner's own OPERATOR private
- key, which this server has never held either (only the operator's PUBLIC key) -- the same
- never-store-a-private-key boundary as your own holder/Noise keys above. Send your channel owner your
- holder public key (<code>{holder_hex}</code>, already captured from your claim above) and ask them to
- run this locally, then paste back what it prints as your <code>CT_CHANNEL_GRANT</code>:</p>
- <div class="code-block">
-  <div class="code-block-head"><span>owner runs this</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
-  <pre><code>{grant_cmd}</code></pre>
- </div>
-</details>
+{grant_section}
 <details>
  <summary>Run it</summary>
  <div class="tab-row">
@@ -2743,6 +2817,8 @@ fn claim_html(
     email: Option<&str>,
     claimed_holder_hex: Option<&str>,
     deployment: Option<&ChannelDeployment>,
+    deposited_grant: Option<&str>,
+    existing_block: &str,
 ) -> String {
     let banner = match &result {
         Some(Ok(())) => r#"<div class="warn" style="border-color:#238636;background:#0d2818;color:#3fb950">Claimed -- you're now a member of this channel.</div>"#.to_string(),
@@ -2761,7 +2837,7 @@ fn claim_html(
     }
 
     let onboarding = match (claimed_holder_hex, deployment) {
-        (Some(holder_hex), Some(dep)) => channel_onboarding_html(channel_hex, holder_hex, dep),
+        (Some(holder_hex), Some(dep)) => channel_onboarding_html(channel_hex, holder_hex, dep, deposited_grant),
         _ => String::new(),
     };
     let script = CLAIM_SCRIPT_TEMPLATE.replace("__CHANNEL_HEX__", channel_hex);
@@ -2770,6 +2846,7 @@ fn claim_html(
 <p class="k">Your signed-in e-mail must already be on this channel's allow-list (ask its owner to add
 you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it isn't yet).</p>
 {banner}
+{existing_block}
 {onboarding}
 <label>Channel<input type="text" value="{channel}" disabled></label>
 <div id="identity-box" class="help">generating your channel identity…</div>
@@ -4641,6 +4718,36 @@ mod tests {
         let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["identities"][0]["grant"], serde_json::json!(grant_hex));
+
+        // #514 slice 2: the RETURNING member's claim PAGE ships the deposited grant
+        // filled into the onboarding block -- re-fetchable delivery in the UI, not
+        // only the JSON endpoint.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/portal/channels/{ch_hex}/claim"))
+                    .header(
+                        "cookie",
+                        format!(
+                            "ct_portal_session={}",
+                            sign_session_with_email_for_test(KEY, "subj-nat", "nat@example.com")
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(
+            html.contains(&format!("CT_CHANNEL_GRANT={grant_hex}")),
+            "the returning member's page fills the deposited grant into the env block"
+        );
+        assert!(
+            !html.contains("PASTE_YOUR_CT_CHANNEL_GRANT_HERE") || html.contains("Your identities on this channel"),
+            "the existing-identity block renders"
+        );
     }
 
     #[tokio::test]
