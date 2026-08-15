@@ -61,6 +61,14 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          # HELP ct_edge_channel_splices_total Completed channel relay splices since start.\n\
          # TYPE ct_edge_channel_splices_total counter\n\
          ct_edge_channel_splices_total {channel_splices}\n\
+         # HELP ct_edge_channel_park_reaped_total Channel-pairer parks reaped past their TTL\n\
+         # with no partner since start (#530) -- the channel plane's counterpart to\n\
+         # ct_edge_tcp_fallback_reaped_total. Counts EVERY reap (including ones whose log\n\
+         # line the bounded reap logging suppresses); a steady rate is the designed\n\
+         # serve-loop re-park cycle (ct-agent#21), a sustained CHANGE in the rate is the\n\
+         # regression signal.\n\
+         # TYPE ct_edge_channel_park_reaped_total counter\n\
+         ct_edge_channel_park_reaped_total {channel_park_reaped}\n\
          # HELP ct_edge_failovers_total Relays that failed over to a non-primary agent.\n\
          # TYPE ct_edge_failovers_total counter\n\
          ct_edge_failovers_total {failovers}\n\
@@ -90,6 +98,7 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         relay_bytes_tcp_fallback = state.relay_bytes_by_kind().2,
         channel_relay_bytes = crate::channel_broker::channel_relay_totals().0,
         channel_splices = crate::channel_broker::channel_relay_totals().1,
+        channel_park_reaped = crate::channel_broker::channel_park_reaped_total(),
         failovers = state.failovers_total(),
         tcp_parked = state.tcp_parked(),
         tcp_parks = state.tcp_parks_total(),
@@ -261,6 +270,9 @@ mod tests {
         assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="tcp_fallback"} 2"#), "{body}");
         assert!(body.contains("ct_edge_channel_relay_bytes_total"), "{body}");
         assert!(body.contains("ct_edge_channel_splices_total"), "{body}");
+        // #530: the channel-pairer reap counter renders (value is a process-wide
+        // static shared with other tests, so assert presence, not a number).
+        assert!(body.contains("ct_edge_channel_park_reaped_total"), "{body}");
     }
 
     #[tokio::test]

@@ -260,6 +260,14 @@ impl WsChannelState {
         let reaper_pairer = pairer.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(WS_CHANNEL_PARK_TTL_SECS / 3));
+            // #530: same bounded reap logging as the front-door reaper — first reap per
+            // (channel,holder) pair per window logs in full, repeats aggregate into one
+            // summary line per window (a permanently re-parking serve-loop otherwise
+            // repeats the identical line forever).
+            let mut throttle = crate::channel_broker::ReapLogThrottle::new(
+                crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
+                crate::channel_broker::REAP_LOG_MAX_TRACKED_PAIRS,
+            );
             loop {
                 tick.tick().await;
                 let now = std::time::SystemTime::now()
@@ -271,14 +279,36 @@ impl WsChannelState {
                 // channel/holder hex are public grant fields, and a repeated lone-member
                 // reap is only diagnosable if the operator can see WHO keeps half-joining.
                 for m in expired {
-                    eprintln!(
-                        "ct-edge: ws-channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
-                        crate::serve::hex_of_bytes(&m.channel.0),
-                        crate::serve::hex_of_bytes(&m.holder),
-                    );
+                    crate::channel_broker::note_channel_park_reaped();
+                    if throttle.note_reap(
+                        now,
+                        &crate::serve::hex_of_bytes(&m.channel.0),
+                        &crate::serve::hex_of_bytes(&m.holder),
+                    ) == crate::channel_broker::ReapLogDecision::LogFull
+                    {
+                        eprintln!(
+                            "ct-edge: ws-channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
+                            crate::serve::hex_of_bytes(&m.channel.0),
+                            crate::serve::hex_of_bytes(&m.holder),
+                        );
+                    }
                     // ct-agent#21: name the expiry to the live client (EX token) so it
                     // re-parks instead of misreading a silent close as a failure.
                     tokio::spawn(m.payload.notify_park_expired());
+                }
+                if let Some(s) = throttle.window_summary(now) {
+                    eprintln!(
+                        "ct-edge: ws-channel pairer reap summary (#530) — {} reap(s) of {} distinct (channel,holder) pair(s) in the last {}s ({} beyond the tracking cap); repeats after each pair's first full line are aggregated here; top: {}",
+                        s.total,
+                        s.distinct_pairs,
+                        crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
+                        s.untracked,
+                        s.top
+                            .iter()
+                            .map(|(c, h, n)| format!("channel={c} holder={h} x{n}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
                 }
             }
         });

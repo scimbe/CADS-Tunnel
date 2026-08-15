@@ -1016,6 +1016,168 @@ fn note_channel_splice(bytes: (u64, u64)) {
     CHANNEL_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// #530: process-wide tally of channel-pairer parks reaped past their TTL with no
+/// partner (every reaper: the `:443` front-door/shared reaper in `serve.rs` and the
+/// ws-channel standalone reaper). The channel plane's counterpart to
+/// `ct_edge_tcp_fallback_reaped_total` (#522): its RATE is the lone-park churn rate,
+/// and a sustained CHANGE in that rate is the regression signal the log line alone
+/// could never provide (it drowned in its own steady-state repetition). Static rather
+/// than state plumbing for the same reason as `CHANNEL_SPLICE_BYTES` above: the
+/// reapers deliberately have no `EdgeState` handle.
+static CHANNEL_PARK_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #530: `ct_edge_channel_park_reaped_total` for `/metrics`.
+pub fn channel_park_reaped_total() -> u64 {
+    CHANNEL_PARK_REAPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #530: count one reaped lone park. Called for EVERY reap, including reaps whose
+/// per-member log line the [`ReapLogThrottle`] suppresses — the metric is the
+/// complete record, the log is the bounded diagnostic sample.
+pub(crate) fn note_channel_park_reaped() {
+    CHANNEL_PARK_REAPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// #530: how long one reap-log summary window lasts. Within a window, each
+/// (channel,holder) pair gets ONE full per-member log line (its first reap); further
+/// reaps of the same pair only feed the window's aggregate, spoken as a single
+/// summary line when the window rolls over.
+pub(crate) const REAP_LOG_SUMMARY_WINDOW_SECS: u64 = 600;
+
+/// #530: hard cap on the (channel,holder) pairs a [`ReapLogThrottle`] tracks per
+/// window. Pairs arriving beyond the cap are counted WITHOUT identity (`untracked`
+/// in the summary) and get no full line — this bounds both the map's memory and the
+/// log volume against an attacker cycling many distinct channels. Far above the
+/// steady-state reality (4 pairs measured live, 2026-08-15) so a legitimate
+/// deployment never hits it.
+pub(crate) const REAP_LOG_MAX_TRACKED_PAIRS: usize = 64;
+
+/// #530: how many of the busiest pairs a window summary names explicitly.
+pub(crate) const REAP_LOG_TOP_PAIRS: usize = 3;
+
+/// #530: what the reaper should do with one reap's per-member log line.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReapLogDecision {
+    /// First reap of this (channel,holder) pair in the current window — log the
+    /// full existing per-member line (diagnostic value unchanged).
+    LogFull,
+    /// A repeat (or a pair beyond the tracking cap) — say nothing now; it is
+    /// aggregated into the window summary.
+    Suppress,
+}
+
+/// #530: one summary window's aggregate, returned by
+/// [`ReapLogThrottle::window_summary`] for the reaper to speak as ONE line.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReapWindowSummary {
+    /// Every reap noted in the window (full-logged + suppressed + untracked).
+    pub total: u64,
+    /// Distinct (channel,holder) pairs tracked in the window (≤ the cap).
+    pub distinct_pairs: usize,
+    /// Reaps of pairs beyond the tracking cap (identity dropped, count kept).
+    pub untracked: u64,
+    /// The busiest tracked pairs, `(channel_hex, holder_hex, reap_count)`,
+    /// descending by count, at most [`REAP_LOG_TOP_PAIRS`].
+    pub top: Vec<(String, String, u64)>,
+}
+
+/// #530: pure, memory-bounded decision core for the channel-pairer reap logs.
+///
+/// Live-measured finding (2026-08-15): demo serve-loops park BY DESIGN forever, are
+/// reaped every park-TTL cycle (~35 s) and immediately re-park (ct-agent#21 —
+/// correct, untouched), so the per-member reap line repeated identically ~70x/10 min
+/// (~10k/day) from the same 4 pairs and drowned real signals (e.g. the #508 line).
+/// This throttle keeps the first reap of each pair fully logged, aggregates repeats,
+/// and hands the reaper one [`ReapWindowSummary`] per window.
+///
+/// Pure in the `broker_loops_health`/`note_sibling_sightings` style: the caller
+/// injects `now`, so tests need no clock. Memory is bounded two ways: at most
+/// `max_tracked` pairs are ever held, and the whole map resets on every window
+/// rollover — an attacker cycling many channels can neither grow this map nor mint
+/// unbounded full log lines.
+pub(crate) struct ReapLogThrottle {
+    window_secs: u64,
+    max_tracked: usize,
+    /// Unix time the current window opened; 0 = no window open (opens lazily on the
+    /// first reap, so an idle edge carries no state and emits no summaries).
+    window_start: UnixSeconds,
+    /// (channel_hex, holder_hex) -> reaps of that pair in this window.
+    pairs: std::collections::HashMap<(String, String), u64>,
+    total: u64,
+    suppressed: u64,
+    untracked: u64,
+}
+
+impl ReapLogThrottle {
+    pub fn new(window_secs: u64, max_tracked: usize) -> Self {
+        Self {
+            window_secs,
+            max_tracked,
+            window_start: 0,
+            pairs: std::collections::HashMap::new(),
+            total: 0,
+            suppressed: 0,
+            untracked: 0,
+        }
+    }
+
+    /// Note one reap of `(channel_hex, holder_hex)` at `now` and decide its log fate.
+    pub fn note_reap(&mut self, now: UnixSeconds, channel_hex: &str, holder_hex: &str) -> ReapLogDecision {
+        if self.window_start == 0 {
+            self.window_start = now;
+        }
+        self.total = self.total.saturating_add(1);
+        if let Some(count) = self.pairs.get_mut(&(channel_hex.to_owned(), holder_hex.to_owned())) {
+            *count = count.saturating_add(1);
+            self.suppressed = self.suppressed.saturating_add(1);
+            return ReapLogDecision::Suppress;
+        }
+        if self.pairs.len() >= self.max_tracked {
+            self.untracked = self.untracked.saturating_add(1);
+            self.suppressed = self.suppressed.saturating_add(1);
+            return ReapLogDecision::Suppress;
+        }
+        self.pairs.insert((channel_hex.to_owned(), holder_hex.to_owned()), 1);
+        ReapLogDecision::LogFull
+    }
+
+    /// Roll the window over once `window_secs` have passed since it opened: returns
+    /// the aggregate to log — `Some` only when at least one reap was SUPPRESSED (a
+    /// window where every pair reaped exactly once was already fully logged line by
+    /// line; a summary would add nothing) — and resets ALL state either way (the
+    /// reset IS the eviction: together with the cap it bounds the map). Call on
+    /// every reaper tick; `None` while the window is still open or was never opened.
+    pub fn window_summary(&mut self, now: UnixSeconds) -> Option<ReapWindowSummary> {
+        if self.window_start == 0 || now.saturating_sub(self.window_start) < self.window_secs {
+            return None;
+        }
+        let summary = if self.suppressed > 0 {
+            let mut top: Vec<(String, String, u64)> = self
+                .pairs
+                .iter()
+                .map(|((c, h), n)| (c.clone(), h.clone(), *n))
+                .collect();
+            // Count descending; hex keys as a deterministic tie-break.
+            top.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1))));
+            top.truncate(REAP_LOG_TOP_PAIRS);
+            Some(ReapWindowSummary {
+                total: self.total,
+                distinct_pairs: self.pairs.len(),
+                untracked: self.untracked,
+                top,
+            })
+        } else {
+            None
+        };
+        self.window_start = 0;
+        self.pairs.clear();
+        self.total = 0;
+        self.suppressed = 0;
+        self.untracked = 0;
+        summary
+    }
+}
+
 /// where one stale client retried two `[not-member]` channels at 25-75ms cadence for
 /// ~10 hours through a NAT shared with innocent tenants.
 #[derive(Debug)]
@@ -2404,6 +2566,99 @@ mod tests {
 
     fn operator_pubkey() -> [u8; 32] {
         SigningKey::from_bytes(&OP_SEED).verifying_key().to_bytes()
+    }
+
+    /// #530: first reap of a pair logs in full; repeats of the SAME pair are suppressed
+    /// (they only feed the window aggregate). Pure — injected times, no clock.
+    #[test]
+    fn reap_throttle_first_reap_logs_full_and_repeats_are_suppressed_530() {
+        let mut t = ReapLogThrottle::new(600, 64);
+        assert_eq!(t.note_reap(100, "aa", "01"), ReapLogDecision::LogFull, "first reap of a pair");
+        assert_eq!(t.note_reap(135, "aa", "01"), ReapLogDecision::Suppress, "repeat of the same pair");
+        assert_eq!(t.note_reap(170, "aa", "01"), ReapLogDecision::Suppress);
+        // A DIFFERENT pair (same channel, other holder) is its own first sighting.
+        assert_eq!(t.note_reap(170, "aa", "02"), ReapLogDecision::LogFull);
+        // Mid-window there is no summary yet.
+        assert_eq!(t.window_summary(100 + 599), None, "window still open -> no summary");
+    }
+
+    #[test]
+    fn reap_throttle_window_summary_carries_correct_counts_and_top_pairs_530() {
+        // #530: the steady-state shape measured live — a few pairs reaped every TTL
+        // cycle. After the window elapses, ONE summary carries the totals and the
+        // busiest pairs, ordered by count.
+        let mut t = ReapLogThrottle::new(600, 64);
+        for i in 0..5 {
+            t.note_reap(100 + i * 35, "aa", "01"); // 5 reaps
+        }
+        for i in 0..3 {
+            t.note_reap(100 + i * 35, "bb", "02"); // 3 reaps
+        }
+        t.note_reap(200, "cc", "03"); // 1 reap
+        t.note_reap(210, "dd", "04"); // 1 reap
+        let s = t.window_summary(100 + 600).expect("window elapsed with repeats -> summary");
+        assert_eq!(s.total, 10);
+        assert_eq!(s.distinct_pairs, 4);
+        assert_eq!(s.untracked, 0);
+        assert_eq!(s.top.len(), REAP_LOG_TOP_PAIRS, "top list is capped");
+        assert_eq!(s.top[0], ("aa".into(), "01".into(), 5), "busiest pair first");
+        assert_eq!(s.top[1], ("bb".into(), "02".into(), 3));
+        assert_eq!(s.top[2].2, 1, "third slot holds one of the single-reap pairs");
+    }
+
+    #[test]
+    fn reap_throttle_resets_after_each_window_so_pairs_log_full_again_530() {
+        // The window reset IS the eviction strategy: the next window starts clean, so a
+        // persistent pair gets exactly one full line + (at most) one summary mention per
+        // window — bounded log volume forever — and the map never outlives a window.
+        let mut t = ReapLogThrottle::new(600, 64);
+        t.note_reap(100, "aa", "01");
+        t.note_reap(135, "aa", "01");
+        assert!(t.window_summary(700).is_some(), "repeats happened -> summary");
+        assert_eq!(
+            t.note_reap(710, "aa", "01"),
+            ReapLogDecision::LogFull,
+            "after the reset the pair's next reap logs in full again"
+        );
+        // A window in which every pair reaped exactly once was already fully logged
+        // line by line — no summary, but the state still resets.
+        assert_eq!(t.window_summary(710 + 600), None, "no repeats -> no summary line");
+        assert_eq!(t.note_reap(1400, "aa", "01"), ReapLogDecision::LogFull, "state was still reset");
+    }
+
+    #[test]
+    fn reap_throttle_caps_tracked_pairs_and_counts_the_overflow_530() {
+        // #530 security aspect: an attacker cycling many distinct channels must neither
+        // grow the map beyond the cap nor mint unbounded full log lines — beyond the
+        // cap, reaps are counted WITHOUT identity and suppressed.
+        let mut t = ReapLogThrottle::new(600, 2);
+        assert_eq!(t.note_reap(100, "aa", "01"), ReapLogDecision::LogFull);
+        assert_eq!(t.note_reap(101, "bb", "02"), ReapLogDecision::LogFull);
+        assert_eq!(t.note_reap(102, "cc", "03"), ReapLogDecision::Suppress, "beyond the cap -> no full line");
+        assert_eq!(t.note_reap(103, "dd", "04"), ReapLogDecision::Suppress);
+        assert_eq!(t.pairs.len(), 2, "the map never exceeds the cap");
+        // A pair that IS tracked still aggregates normally alongside the overflow.
+        assert_eq!(t.note_reap(104, "aa", "01"), ReapLogDecision::Suppress);
+        let s = t.window_summary(100 + 600).expect("summary");
+        assert_eq!(s.total, 5, "every reap counted, tracked or not");
+        assert_eq!(s.distinct_pairs, 2);
+        assert_eq!(s.untracked, 2, "overflow reaps are counted without identity");
+        assert_eq!(s.top.len(), 2);
+    }
+
+    #[test]
+    fn channel_park_reaped_counter_is_monotonic_530() {
+        // The global counter (rendered as ct_edge_channel_park_reaped_total) counts
+        // every reap. Other tests may increment it concurrently, so assert a DELTA
+        // lower bound, not an absolute value.
+        let before = channel_park_reaped_total();
+        note_channel_park_reaped();
+        note_channel_park_reaped();
+        note_channel_park_reaped();
+        assert!(
+            channel_park_reaped_total() >= before + 3,
+            "3 notes must raise the total by at least 3"
+        );
     }
 
     /// Cross-repo wire contract: ct-agent's `error_names_park_expiry` classifies a QUIC

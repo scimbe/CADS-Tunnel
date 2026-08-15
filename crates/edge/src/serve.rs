@@ -773,37 +773,69 @@ fn spawn_front_door_pairer_reaper<T, N, R>(
 {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // #530: bounded reap logging. A serve-loop client parks by design forever and is
+        // reaped+re-parked every TTL cycle (ct-agent#21 — correct), so the per-member
+        // line below repeated identically ~10k/day from a handful of pairs and drowned
+        // real signals. First reap per (channel,holder) pair per window still logs in
+        // full; repeats surface as ONE summary line per window.
+        let mut throttle = crate::channel_broker::ReapLogThrottle::new(
+            crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
+            crate::channel_broker::REAP_LOG_MAX_TRACKED_PAIRS,
+        );
         loop {
             ticker.tick().await;
+            let now = now_fn();
             // #497: poison-resilient; #499 slice B: drain also silently discards corpse
             // parks (client died while queued) -- surface the per-sweep count so silent
             // discards stay operator-visible without per-corpse identity spam.
             let (expired, dead_dropped) = {
                 let mut p = pairer.lock_safe();
-                (p.drain_expired(now_fn()), p.take_dead_dropped())
+                (p.drain_expired(now), p.take_dead_dropped())
             };
             if dead_dropped > 0 {
                 eprintln!(
                     "ct-edge: front-door channel pairer dropped {dead_dropped} corpse park(s) — client died while queued (#499)"
                 );
             }
-            // One line PER member, naming the public grant fields (channel/holder hex --
-            // never a secret) plus the count: a live operator watching repeated lone-member
-            // reaps (a client whose PARTNER never arrives, e.g. still stuck on a blocked
-            // QUIC rung while this side came in via :443) could previously see only that it
-            // was happening, never WHICH channel kept half-joining. Same identification
-            // fields the admission refusals already log (#124/#248-follow).
+            // One full line per (channel,holder) pair PER SUMMARY WINDOW (#530), naming
+            // the public grant fields (channel/holder hex -- never a secret): a live
+            // operator watching repeated lone-member reaps (a client whose PARTNER never
+            // arrives, e.g. still stuck on a blocked QUIC rung while this side came in
+            // via :443) could previously see only that it was happening, never WHICH
+            // channel kept half-joining. Same identification fields the admission
+            // refusals already log (#124/#248-follow). Steady-state repeats of the same
+            // pair are aggregated into the window summary below instead of repeating the
+            // line unboundedly.
             for m in expired {
-                eprintln!(
-                    "ct-edge: front-door channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
-                    hex_of_bytes(&m.channel.0),
-                    hex_of_bytes(&m.holder),
-                );
+                crate::channel_broker::note_channel_park_reaped();
+                if throttle.note_reap(now, &hex_of_bytes(&m.channel.0), &hex_of_bytes(&m.holder))
+                    == crate::channel_broker::ReapLogDecision::LogFull
+                {
+                    eprintln!(
+                        "ct-edge: front-door channel pairer reaped a member parked past its TTL with no partner — channel={} holder={}",
+                        hex_of_bytes(&m.channel.0),
+                        hex_of_bytes(&m.holder),
+                    );
+                }
                 // ct-agent#21: the caller decides how a reaped member is torn down --
                 // production notifies the live client with the EX token (so it re-parks on
                 // the same rung instead of misreading a silent close as a rung failure);
                 // tests pass a no-op.
                 on_reap(m);
+            }
+            if let Some(s) = throttle.window_summary(now) {
+                eprintln!(
+                    "ct-edge: front-door channel pairer reap summary (#530) — {} reap(s) of {} distinct (channel,holder) pair(s) in the last {}s ({} beyond the tracking cap); repeats after each pair's first full line are aggregated here; top: {}",
+                    s.total,
+                    s.distinct_pairs,
+                    crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
+                    s.untracked,
+                    s.top
+                        .iter()
+                        .map(|(c, h, n)| format!("channel={c} holder={h} x{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
             }
         }
     });
@@ -3799,6 +3831,10 @@ mod tests {
 
         let pairer: Arc<std::sync::Mutex<ChannelPairer<u8>>> =
             Arc::new(std::sync::Mutex::new(ChannelPairer::new()));
+        // #530: every reap must also raise the process-wide counter behind
+        // ct_edge_channel_park_reaped_total. Delta-based because other tests may
+        // increment it concurrently.
+        let reaped_before = crate::channel_broker::channel_park_reaped_total();
 
         // Park one lone member whose deadline is already in the past relative to the fake
         // clock's first tick — it has no partner, so it must be reaped, not held forever.
@@ -3832,6 +3868,10 @@ mod tests {
             pairer.lock().unwrap().len(),
             0,
             "the reaper must have evicted the expired lone member by now"
+        );
+        assert!(
+            crate::channel_broker::channel_park_reaped_total() >= reaped_before + 1,
+            "#530: the reap must raise ct_edge_channel_park_reaped_total"
         );
     }
 
