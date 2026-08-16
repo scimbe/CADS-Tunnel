@@ -657,17 +657,31 @@ mod tests {
         assert!(win.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
     }
 
+    /// Serialises the two tests that touch `CT_AGENT_SETUP_*`. An environment
+    /// variable is process-wide, and `cargo test` runs tests in parallel THREADS
+    /// of one process -- so while the override test held those variables set,
+    /// `install_routes_redirect_to_the_ct_agent_setup_scripts` could read them
+    /// and assert the default against `https://mirror.example/...`. That is not
+    /// hypothetical: it turned CI red on 2026-08-16 and went green on the next
+    /// push without a code change, which is what a scheduling race looks like.
+    ///
+    /// The old comment here reasoned that the test binary "runs single-process"
+    /// -- true, and beside the point: single-process is exactly the condition
+    /// under which threads share the environment.
+    static SETUP_URL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn setup_script_urls_are_overridable_for_self_hosting_operators_448() {
         // #448: a self-hosting operator must be able to point this at their own
         // mirror without patching the crate. Unset -> today's exact default
         // (matches install_routes_redirect_to_the_ct_agent_setup_scripts above,
         // which sets neither and still asserts the raw.githubusercontent.com URL).
+        let _guard = SETUP_URL_ENV.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(ct_agent_setup_sh_url(), CT_AGENT_SETUP_SH);
         assert_eq!(ct_agent_setup_ps1_url(), CT_AGENT_SETUP_PS1);
 
-        // SAFETY: this crate's test binary runs single-process; scoped strictly to
-        // this test's own two reads immediately below, restored before returning.
+        // SAFETY: the guard above keeps every other test that reads these
+        // variables out of this window; they are restored before it drops.
         unsafe {
             std::env::set_var("CT_AGENT_SETUP_URL", "https://mirror.example/setup.sh");
             std::env::set_var("CT_AGENT_SETUP_PS1_URL", "https://mirror.example/setup.ps1");
@@ -697,6 +711,10 @@ mod tests {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
+
+        // Reads CT_AGENT_SETUP_* indirectly through the router, so it has to take
+        // the same lock as the test that sets them -- see SETUP_URL_ENV.
+        let _guard = SETUP_URL_ENV.lock().unwrap_or_else(|e| e.into_inner());
 
         let app = installer_router(
             "https://portal.example".to_string(),
