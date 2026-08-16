@@ -52,6 +52,22 @@
   --pf-v5-global--active-color--100: var(--ct-accent);
 }
 
+/* DataList re-declares the global text colour ON ITSELF, so remapping the token
+   at :root never reaches it -- measured in the browser: the variable is
+   #e6edf3 all the way down the tree and flips to #151515 exactly at
+   `ul.pf-v5-c-data-list`. That is what made the credential rows ("My password",
+   "Created ...") render 1.06:1 against the card, i.e. invisible. A component
+   that overrides a global token has to be corrected at the component, not at
+   the root; the earlier :root-level fix was aimed one level too high. */
+.pf-v5-c-data-list,
+.pf-v5-c-data-list__item,
+.pf-v5-c-data-list__item-row,
+.pf-v5-c-data-list__item-content,
+.pf-v5-c-data-list__cell {
+  --pf-v5-global--Color--100: var(--ct-text);
+  --pf-v5-global--Color--200: var(--ct-muted);
+}
+
 .pf-v5-c-page__main-section h1,
 .pf-v5-c-page__main-section h2,
 .pf-v5-c-title {
