@@ -66,6 +66,18 @@ Ausfall auch die Pruefung mitnehmen. Und bewusst gegen das Ergebnis statt gegen 
 Prozess -- ein Host, der aus ist, meldet keinen Fehlschlag, aber sein fehlender Snapshot
 faellt auf.
 
+Die Pruefung vergleicht zusaetzlich die Groesse des neuesten Snapshots mit der des
+vorigen und schlaegt bei einem Rueckgang um mehr als 40 % an. Grund: ein abgebrochener
+`pg_dump` liefert eine Datei, die zu klein ist, aber weit ueber jeder absoluten Schranke
+liegt -- gegen genau diesen Fall hilft nur der Vergleich mit dem Vorgaenger.
+
+**Nach einer absichtlichen Aenderung am Umfang** (etwas wird bewusst aus der Sicherung
+herausgenommen) schlaegt die Pruefung einmal an. Das ist beabsichtigt: die Meldung nennt
+beide Moeglichkeiten und ueberlaesst die Entscheidung dem Menschen. Wer sie beenden will,
+laesst einen zweiten Lauf folgen -- dann sind die beiden juengsten Snapshots wieder
+vergleichbar. Die aelteren bleiben als Wiederherstellungspunkte erhalten; sie wegzuwerfen,
+nur damit ein Alarm verstummt, waere die falsche Reihenfolge.
+
 ## Wurde der Restore je ausprobiert?
 
 Ja, am 2026-08-16 gegen einen echten Snapshot, in Wegwerf-Containern (ohne Risiko fuer den

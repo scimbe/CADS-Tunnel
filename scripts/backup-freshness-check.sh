@@ -45,6 +45,20 @@ if [ -z "${ALARM:-}" ]; then
     # der es bis in das Repository geschafft hat.
     [ -z "${ALARM:-}" ] && [ "$SIZE" -lt 100000 ] && \
       ALARM="Der neueste Snapshot ist nur $((SIZE/1024)) KB gross -- das ist zu klein fuer einen vollstaendigen Stand."
+
+    # Absolute Schranke allein reicht nicht: ein abgebrochener pg_dump liefert
+    # eine Datei, die kleiner ist als sie sein sollte und trotzdem weit ueber
+    # 100 KB liegt. Deshalb zusaetzlich der Vergleich mit dem VORIGEN Snapshot.
+    # Am 16.08. halbierte sich die Groesse (2,4M -> 1,2M) -- damals harmlos (ein
+    # herausgenommener Cache), aber dieselbe Signatur haette auch ein
+    # abgeschnittenes Backup gehabt, und die absolute Schranke haette geschwiegen.
+    PREV=$(ls -1 "$WORK/r/snapshots"/*.tar.gz.gpg 2>/dev/null | sort | tail -2 | head -1)
+    if [ -z "${ALARM:-}" ] && [ -n "$PREV" ] && [ "$PREV" != "$NEWEST" ]; then
+      PSIZE=$(stat -c%s "$PREV" 2>/dev/null || echo 0)
+      if [ "$PSIZE" -gt 0 ] && [ "$((SIZE * 100 / PSIZE))" -lt 60 ]; then
+        ALARM="Der neueste Snapshot ist $((SIZE/1024)) KB, der vorige war $((PSIZE/1024)) KB -- ein Rueckgang um $((100 - SIZE * 100 / PSIZE)) %. Entweder wurde absichtlich etwas herausgenommen, oder eine Sicherung ist unvollstaendig."
+      fi
+    fi
   fi
 fi
 
