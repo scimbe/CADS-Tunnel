@@ -27,6 +27,10 @@ pub struct KeycloakAdminConfig {
     pub admin_password: String,
 }
 
+/// Realm used when `CT_OIDC_REALM` is unset -- the realm this project's own
+/// deploy manifests ship.
+const DEFAULT_REALM: &str = "ct-demo";
+
 impl KeycloakAdminConfig {
     pub fn from_env() -> Option<Self> {
         Self::from_lookup(|k| std::env::var(k).ok())
@@ -36,7 +40,7 @@ impl KeycloakAdminConfig {
         let nonempty = |k: &str| get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Some(Self {
             base_url: nonempty("KEYCLOAK_PUBLIC_URL")?,
-            realm: nonempty("CT_OIDC_REALM").unwrap_or_else(|| "ct-demo".to_string()),
+            realm: nonempty("CT_OIDC_REALM").unwrap_or_else(|| DEFAULT_REALM.to_string()),
             admin_user: nonempty("KC_ADMIN_USER")?,
             admin_password: nonempty("KC_ADMIN_PASSWORD")?,
         })
@@ -397,6 +401,289 @@ pub async fn delete_client(client: &reqwest::Client, cfg: &KeycloakAdminConfig, 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// #535: startup diagnosis for the verified-email gate.
+//
+// `CT_GATE_REQUIRE_VERIFIED_EMAIL=1` (see `gate.rs`) only lets an allow-list hit
+// through when the ID token carries `email_verified: true`. That is a security
+// property exactly when the realm *enforces* the confirmation. On 2026-08-16 it
+// did not: the realm carried `verifyEmail=true`, but the required-action provider
+// `VERIFY_EMAIL` was never registered, so the flag was inert -- accounts could be
+// created AND used without ever confirming an address, and nothing said a word.
+// The gate rejected a `false` and believed a `true`; neither path can notice that
+// nobody ever redeems the promise.
+//
+// This is pure diagnosis: nothing below is read at request time, and the auth
+// path is unchanged. It cannot abort startup either -- a deployment whose IdP is
+// secured differently (social login with `trustEmail`, say) must keep running.
+// ---------------------------------------------------------------------------
+
+/// The one field of Keycloak's (very large) `RealmRepresentation` this check
+/// cares about; every other field is ignored by serde.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RealmEmailPolicy {
+    #[serde(rename = "verifyEmail", default)]
+    pub verify_email: bool,
+}
+
+/// One entry of `GET /admin/realms/{realm}/authentication/required-actions`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RequiredActionProvider {
+    #[serde(default)]
+    pub alias: String,
+    #[serde(rename = "providerId", default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// One entry of `GET /admin/realms/{realm}/identity-provider/instances`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityProviderInstance {
+    #[serde(default)]
+    pub alias: String,
+    /// Defaults to `true` when absent: this feeds an *informational* listing, and
+    /// an IdP wrongly omitted from it would be the silent direction again.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(rename = "trustEmail", default)]
+    pub trust_email: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Keycloak's built-in required action that actually sends the confirmation mail
+/// and blocks the login until it is answered. Its *registration* -- not the realm
+/// flag -- is what makes `verifyEmail=true` do anything.
+const VERIFY_EMAIL_ACTION: &str = "VERIFY_EMAIL";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyEmailActionState {
+    /// Registered in the realm and enabled -- the flag has an enforcer behind it.
+    Registered,
+    /// Registered but switched off: same practical effect as missing.
+    Disabled,
+    /// Not registered at all -- the 2026-08-16 shape.
+    Missing,
+}
+
+/// What the realm actually enforces, derived from the three admin-API reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedEmailEnforcement {
+    pub realm_verify_email: bool,
+    pub verify_email_action: VerifyEmailActionState,
+    /// Aliases of *enabled* identity providers that vouch for the address
+    /// themselves (`trustEmail: true`); logins through them never see the realm's
+    /// own confirmation step.
+    pub trust_email_idps: Vec<String>,
+}
+
+impl VerifiedEmailEnforcement {
+    /// Both halves in place: the realm asks for a confirmation *and* something
+    /// registered actually asks for it.
+    pub fn is_enforced(&self) -> bool {
+        self.realm_verify_email && self.verify_email_action == VerifyEmailActionState::Registered
+    }
+}
+
+/// Pure classification over the parsed admin-API structures -- no HTTP, so the
+/// judgement itself is testable without a server.
+pub fn classify_verified_email_enforcement(
+    realm: &RealmEmailPolicy,
+    actions: &[RequiredActionProvider],
+    idps: &[IdentityProviderInstance],
+) -> VerifiedEmailEnforcement {
+    let matches_verify_email =
+        |a: &&RequiredActionProvider| a.alias == VERIFY_EMAIL_ACTION || a.provider_id == VERIFY_EMAIL_ACTION;
+    let verify_email_action = match actions.iter().find(matches_verify_email) {
+        None => VerifyEmailActionState::Missing,
+        Some(a) if a.enabled => VerifyEmailActionState::Registered,
+        Some(_) => VerifyEmailActionState::Disabled,
+    };
+    VerifiedEmailEnforcement {
+        realm_verify_email: realm.verify_email,
+        verify_email_action,
+        trust_email_idps: idps
+            .iter()
+            .filter(|i| i.enabled && i.trust_email)
+            .map(|i| i.alias.clone())
+            .collect(),
+    }
+}
+
+/// The outcome of the startup check. `NotChecked` is deliberately its own state
+/// rather than a defaulted-to-fine `Checked`: a check that could not run must not
+/// read like one that passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedEmailCheck {
+    Checked(VerifiedEmailEnforcement),
+    NotChecked(String),
+}
+
+impl VerifiedEmailCheck {
+    /// The exact stderr lines this check emits, in order (`ct-cp:` prefix, matching
+    /// the control plane's other startup/operational messages). Kept separate from
+    /// the printing so the wording itself is under test.
+    pub fn report_lines(&self, realm: &str) -> Vec<String> {
+        let enforcement = match self {
+            VerifiedEmailCheck::NotChecked(why) => {
+                return vec![format!(
+                    "ct-cp: WARNING -- #535: CT_GATE_REQUIRE_VERIFIED_EMAIL is on, but whether realm \
+                     '{realm}' really enforces email confirmation could not be checked: {why}. This is \
+                     NOT an all-clear -- confirm by hand that Realm settings -> Login -> Verify email is \
+                     On AND that Authentication -> Required actions lists {VERIFY_EMAIL_ACTION} as enabled."
+                )];
+            }
+            VerifiedEmailCheck::Checked(e) => e,
+        };
+
+        let mut lines = Vec::new();
+        if !enforcement.realm_verify_email {
+            lines.push(format!(
+                "ct-cp: WARNING -- #535: CT_GATE_REQUIRE_VERIFIED_EMAIL is on, but realm '{realm}' has \
+                 verifyEmail=false -- Keycloak never asks anyone to confirm their address, so the gate \
+                 checks a promise nobody redeems. Fix: Keycloak admin console -> Realm settings -> Login \
+                 -> Verify email = On."
+            ));
+        }
+        match enforcement.verify_email_action {
+            VerifyEmailActionState::Missing => lines.push(format!(
+                "ct-cp: WARNING -- #535: CT_GATE_REQUIRE_VERIFIED_EMAIL is on, but the required-action \
+                 provider {VERIFY_EMAIL_ACTION} is NOT REGISTERED in realm '{realm}' -- the realm's \
+                 verifyEmail flag is inert without it (this is exactly the 2026-08-16 incident: accounts \
+                 were created AND used without ever confirming an address). Fix: Keycloak admin console \
+                 -> Authentication -> Required actions -> register {VERIFY_EMAIL_ACTION}, then enable it."
+            )),
+            VerifyEmailActionState::Disabled => lines.push(format!(
+                "ct-cp: WARNING -- #535: CT_GATE_REQUIRE_VERIFIED_EMAIL is on, but the required-action \
+                 provider {VERIFY_EMAIL_ACTION} is registered-but-DISABLED in realm '{realm}' -- a \
+                 disabled action enforces exactly as much as a missing one, so the realm's verifyEmail \
+                 flag is inert. Fix: Keycloak admin console -> Authentication -> Required actions -> set \
+                 {VERIFY_EMAIL_ACTION} to Enabled."
+            )),
+            VerifyEmailActionState::Registered => {}
+        }
+        if enforcement.is_enforced() {
+            // Say so out loud even when everything is fine: silence is what the
+            // 2026-08-16 realm produced too, and a log that only ever speaks up on
+            // failure can't distinguish "checked and healthy" from "never checked".
+            lines.push(format!(
+                "ct-cp: #535: verified-email gate checked -- realm '{realm}' enforces it (verifyEmail=true, \
+                 required action {VERIFY_EMAIL_ACTION} registered and enabled)."
+            ));
+        }
+        if !enforcement.trust_email_idps.is_empty() {
+            lines.push(format!(
+                "ct-cp: #535: realm '{realm}' has enabled identity provider(s) with trustEmail=true: {} -- \
+                 logins through them are accepted as verified on the provider's word and deliberately skip \
+                 the realm's own confirmation step. Legitimate, but 'verified email only' therefore covers \
+                 more accounts than it reads.",
+                enforcement.trust_email_idps.join(", ")
+            ));
+        }
+        lines
+    }
+}
+
+async fn admin_get_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    token: &str,
+    url: &str,
+) -> Result<T, KcError> {
+    let resp = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(KcError::Http(format!("GET {url} returned {}", resp.status())));
+    }
+    resp.json::<T>().await.map_err(|e| KcError::Http(e.to_string()))
+}
+
+/// Read the realm's actual email-confirmation enforcement over the Admin REST API
+/// (the same credentials `ensure_user` already uses). Read-only: three GETs, no
+/// mutation of any realm state.
+pub async fn check_verified_email_enforcement(
+    client: &reqwest::Client,
+    cfg: &KeycloakAdminConfig,
+) -> VerifiedEmailCheck {
+    match fetch_verified_email_enforcement(client, cfg).await {
+        Ok(e) => VerifiedEmailCheck::Checked(e),
+        Err(e) => VerifiedEmailCheck::NotChecked(e.to_string()),
+    }
+}
+
+async fn fetch_verified_email_enforcement(
+    client: &reqwest::Client,
+    cfg: &KeycloakAdminConfig,
+) -> Result<VerifiedEmailEnforcement, KcError> {
+    let token = cached_admin_token(client, cfg, false).await?;
+    let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
+    let realm: RealmEmailPolicy = admin_get_json(client, &token, &realm_url).await?;
+    let actions: Vec<RequiredActionProvider> =
+        admin_get_json(client, &token, &format!("{realm_url}/authentication/required-actions")).await?;
+    let idps: Vec<IdentityProviderInstance> =
+        admin_get_json(client, &token, &format!("{realm_url}/identity-provider/instances")).await?;
+    Ok(classify_verified_email_enforcement(&realm, &actions, &idps))
+}
+
+/// Bounded client for the startup check: a Keycloak that accepts the connection
+/// but never answers must not keep this task alive forever (#295 saw exactly that
+/// shape block `main()` on the JWKS fetch). Same bounds as `main.rs`'s
+/// `jwks_fetch_client`.
+fn startup_check_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Startup entry point (#535), called once from `main()`: if the gate's
+/// verified-email requirement is on, check that the realm actually enforces it and
+/// report the outcome on stderr. Never aborts, never panics, and touches no state
+/// anything reads at runtime.
+///
+/// Runs in a background task rather than inline: the check costs a password-grant
+/// (a real bcrypt verification server-side) plus three admin GETs, i.e. four
+/// sequential round trips to Keycloak, and an unreachable or slow IdP would
+/// otherwise push that latency straight into the control plane's time-to-serving.
+/// A diagnosis must not be able to delay -- let alone block -- booting.
+///
+/// Must be called from inside a Tokio runtime (`main()` is `#[tokio::main]`).
+pub fn spawn_startup_verified_email_check() {
+    if !crate::portal::is_truthy_env("CT_GATE_REQUIRE_VERIFIED_EMAIL") {
+        return;
+    }
+    let Some(cfg) = KeycloakAdminConfig::from_env() else {
+        // No admin credentials is a check that cannot run, not a passing one.
+        let realm = std::env::var("CT_OIDC_REALM")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_REALM.to_string());
+        let check = VerifiedEmailCheck::NotChecked(
+            "no Keycloak admin configuration (KEYCLOAK_PUBLIC_URL / KC_ADMIN_USER / KC_ADMIN_PASSWORD)"
+                .to_string(),
+        );
+        for line in check.report_lines(&realm) {
+            eprintln!("{line}");
+        }
+        return;
+    };
+    tokio::spawn(async move {
+        let client = startup_check_http_client();
+        let check = check_verified_email_enforcement(&client, &cfg).await;
+        for line in check.report_lines(&cfg.realm) {
+            eprintln!("{line}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +879,305 @@ mod tests {
 
         let err = create_service_account_client(&client, &cfg, "sa-dup", "Test bot").await.unwrap_err();
         assert!(err.to_string().contains("409") || err.to_string().to_lowercase().contains("conflict"), "a real 409 must surface as a real error, not a fabricated success: {err}");
+    }
+
+    // --- #535: verified-email gate startup diagnosis --------------------------
+
+    fn action(alias: &str, enabled: bool) -> RequiredActionProvider {
+        RequiredActionProvider {
+            alias: alias.to_string(),
+            provider_id: alias.to_string(),
+            enabled,
+        }
+    }
+
+    fn idp(alias: &str, enabled: bool, trust_email: bool) -> IdentityProviderInstance {
+        IdentityProviderInstance {
+            alias: alias.to_string(),
+            enabled,
+            trust_email,
+        }
+    }
+
+    fn warnings(lines: &[String]) -> Vec<&String> {
+        lines.iter().filter(|l| l.contains("WARNING")).collect()
+    }
+
+    #[test]
+    fn an_enforcing_realm_is_confirmed_out_loud_and_warns_about_nothing() {
+        let e = classify_verified_email_enforcement(
+            &RealmEmailPolicy { verify_email: true },
+            &[action("UPDATE_PASSWORD", true), action(VERIFY_EMAIL_ACTION, true)],
+            &[idp("google", false, true)], // disabled IdP: not part of what is live
+        );
+        assert!(e.is_enforced());
+        assert!(e.trust_email_idps.is_empty(), "a disabled IdP must not be listed as active");
+
+        let lines = VerifiedEmailCheck::Checked(e).report_lines("ct-demo");
+        assert!(warnings(&lines).is_empty(), "a healthy realm must not warn: {lines:?}");
+        assert_eq!(lines.len(), 1, "exactly one confirmation line, so the log proves the check ran: {lines:?}");
+        assert!(lines[0].contains("ct-demo") && lines[0].contains("verifyEmail=true"));
+    }
+
+    #[test]
+    fn a_realm_flag_that_is_off_is_named_as_the_missing_part() {
+        let e = classify_verified_email_enforcement(
+            &RealmEmailPolicy { verify_email: false },
+            &[action(VERIFY_EMAIL_ACTION, true)],
+            &[],
+        );
+        assert!(!e.is_enforced());
+        let lines = VerifiedEmailCheck::Checked(e).report_lines("ct-demo");
+        let w = warnings(&lines);
+        assert_eq!(w.len(), 1, "only the part that is actually broken is reported: {lines:?}");
+        assert!(w[0].contains("verifyEmail=false"), "names the realm flag: {}", w[0]);
+        assert!(w[0].contains("Realm settings -> Login"), "says where to fix it: {}", w[0]);
+        assert!(
+            !w[0].contains("NOT REGISTERED"),
+            "must not blame the required action, which is fine here: {}",
+            w[0]
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("verified-email gate checked")),
+            "no confirmation line when the realm does not enforce: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_verify_email_action_is_named_as_the_missing_part_the_2026_08_16_shape() {
+        // The real incident: the realm flag WAS set, and it did nothing because the
+        // provider behind it was never registered.
+        let e = classify_verified_email_enforcement(
+            &RealmEmailPolicy { verify_email: true },
+            &[action("UPDATE_PASSWORD", true), action("CONFIGURE_TOTP", true)],
+            &[],
+        );
+        assert_eq!(e.verify_email_action, VerifyEmailActionState::Missing);
+        assert!(!e.is_enforced(), "verifyEmail=true alone is not enforcement");
+
+        let lines = VerifiedEmailCheck::Checked(e).report_lines("ct-demo");
+        let w = warnings(&lines);
+        assert_eq!(w.len(), 1, "{lines:?}");
+        assert!(w[0].contains("VERIFY_EMAIL") && w[0].contains("NOT REGISTERED"), "{}", w[0]);
+        assert!(w[0].contains("Authentication -> Required actions"), "says where to fix it: {}", w[0]);
+        assert!(!w[0].contains("verifyEmail=false"), "must not blame the realm flag, which is set: {}", w[0]);
+    }
+
+    #[test]
+    fn a_registered_but_disabled_verify_email_action_is_reported_as_no_enforcement() {
+        let e = classify_verified_email_enforcement(
+            &RealmEmailPolicy { verify_email: true },
+            &[action(VERIFY_EMAIL_ACTION, false)],
+            &[],
+        );
+        assert_eq!(e.verify_email_action, VerifyEmailActionState::Disabled);
+        assert!(!e.is_enforced(), "a disabled action enforces exactly as much as a missing one");
+        let lines = VerifiedEmailCheck::Checked(e).report_lines("ct-demo");
+        let w = warnings(&lines);
+        assert_eq!(w.len(), 1, "{lines:?}");
+        assert!(w[0].contains("DISABLED"), "{}", w[0]);
+    }
+
+    #[test]
+    fn trust_email_identity_providers_are_enumerated_alongside_a_healthy_realm() {
+        let e = classify_verified_email_enforcement(
+            &RealmEmailPolicy { verify_email: true },
+            &[action(VERIFY_EMAIL_ACTION, true)],
+            &[
+                idp("google", true, true),
+                idp("github", true, true),
+                idp("gitlab", true, true),
+                idp("saml-corp", true, false), // no trustEmail: nothing to report
+            ],
+        );
+        assert_eq!(e.trust_email_idps, ["google", "github", "gitlab"]);
+        let lines = VerifiedEmailCheck::Checked(e).report_lines("ct-demo");
+        assert!(warnings(&lines).is_empty(), "trustEmail is legitimate, not a warning: {lines:?}");
+        let listing = lines
+            .iter()
+            .find(|l| l.contains("trustEmail=true"))
+            .unwrap_or_else(|| panic!("the trustEmail IdPs must be reported: {lines:?}"));
+        assert!(listing.contains("google, github, gitlab"), "{listing}");
+        assert!(!listing.contains("saml-corp"), "an IdP without trustEmail must not be listed: {listing}");
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_never_reads_like_a_passing_one() {
+        let lines = VerifiedEmailCheck::NotChecked("connection refused".to_string()).report_lines("ct-demo");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("could not be checked"), "{}", lines[0]);
+        assert!(lines[0].contains("connection refused"), "the real cause must survive: {}", lines[0]);
+        assert!(lines[0].contains("NOT an all-clear"), "{}", lines[0]);
+        assert!(
+            !lines[0].contains("verified-email gate checked"),
+            "must never emit the confirmation wording: {}",
+            lines[0]
+        );
+    }
+
+    /// The wire half: real Keycloak field names (`verifyEmail`, `providerId`,
+    /// `trustEmail`) parsed off a mock admin API, so the classification above is
+    /// fed by the shapes Keycloak actually returns.
+    #[tokio::test]
+    async fn check_verified_email_enforcement_reads_the_real_admin_api_shapes() {
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn realm() -> Json<serde_json::Value> {
+            // A trimmed but realistically-shaped RealmRepresentation: the check must
+            // pick its one field out of a document full of unrelated ones.
+            Json(json!({
+                "id": "ct-demo",
+                "realm": "ct-demo",
+                "enabled": true,
+                "registrationAllowed": true,
+                "verifyEmail": true,
+                "resetPasswordAllowed": true,
+            }))
+        }
+        async fn required_actions() -> Json<serde_json::Value> {
+            Json(json!([
+                { "alias": "CONFIGURE_TOTP", "name": "Configure OTP", "providerId": "CONFIGURE_TOTP", "enabled": true, "defaultAction": false, "priority": 10 },
+                { "alias": "VERIFY_EMAIL", "name": "Verify Email", "providerId": "VERIFY_EMAIL", "enabled": true, "defaultAction": false, "priority": 50 },
+            ]))
+        }
+        async fn idps() -> Json<serde_json::Value> {
+            Json(json!([
+                { "alias": "google", "providerId": "google", "enabled": true, "trustEmail": true },
+                { "alias": "saml-corp", "providerId": "saml", "enabled": true, "trustEmail": false },
+            ]))
+        }
+
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo", get(realm))
+            .route("/admin/realms/ct-demo/authentication/required-actions", get(required_actions))
+            .route("/admin/realms/ct-demo/identity-provider/instances", get(idps));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let check = check_verified_email_enforcement(&reqwest::Client::new(), &cfg).await;
+        assert_eq!(
+            check,
+            VerifiedEmailCheck::Checked(VerifiedEmailEnforcement {
+                realm_verify_email: true,
+                verify_email_action: VerifyEmailActionState::Registered,
+                trust_email_idps: vec!["google".to_string()],
+            })
+        );
+        let lines = check.report_lines(&cfg.realm);
+        assert!(warnings(&lines).is_empty(), "{lines:?}");
+        assert_eq!(lines.len(), 2, "confirmation + the trustEmail listing: {lines:?}");
+    }
+
+    /// The realm on 2026-08-16, end to end over HTTP: `verifyEmail=true` with no
+    /// `VERIFY_EMAIL` provider anywhere in the required-actions list.
+    #[tokio::test]
+    async fn check_verified_email_enforcement_catches_the_inert_realm_flag_over_http() {
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn realm() -> Json<serde_json::Value> {
+            Json(json!({ "realm": "ct-demo", "verifyEmail": true }))
+        }
+        async fn required_actions() -> Json<serde_json::Value> {
+            Json(json!([
+                { "alias": "UPDATE_PASSWORD", "providerId": "UPDATE_PASSWORD", "enabled": true },
+            ]))
+        }
+        async fn idps() -> Json<serde_json::Value> {
+            Json(json!([]))
+        }
+
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo", get(realm))
+            .route("/admin/realms/ct-demo/authentication/required-actions", get(required_actions))
+            .route("/admin/realms/ct-demo/identity-provider/instances", get(idps));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let lines = check_verified_email_enforcement(&reqwest::Client::new(), &cfg)
+            .await
+            .report_lines(&cfg.realm);
+        let w = warnings(&lines);
+        assert_eq!(w.len(), 1, "{lines:?}");
+        assert!(w[0].contains("VERIFY_EMAIL") && w[0].contains("NOT REGISTERED"), "{}", w[0]);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_or_forbidden_admin_api_reports_not_checked_not_all_clear() {
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        // (a) Admin API answers, but the account may not read the realm (403).
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn forbidden() -> axum::http::StatusCode {
+            axum::http::StatusCode::FORBIDDEN
+        }
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo", get(forbidden));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let check = check_verified_email_enforcement(&reqwest::Client::new(), &cfg).await;
+        match &check {
+            VerifiedEmailCheck::NotChecked(why) => assert!(why.contains("403"), "the real status must survive: {why}"),
+            other => panic!("a 403 must not be classified as an enforcement verdict: {other:?}"),
+        }
+        let lines = check.report_lines(&cfg.realm);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("could not be checked") && lines[0].contains("NOT an all-clear"), "{}", lines[0]);
+
+        // (b) Nothing listening at all: bind, learn the port, then drop the listener.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{dead_addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let lines = check_verified_email_enforcement(&reqwest::Client::new(), &cfg)
+            .await
+            .report_lines(&cfg.realm);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("could not be checked"), "{}", lines[0]);
+        assert!(
+            !lines[0].contains("verified-email gate checked"),
+            "an unreachable Keycloak must never produce the confirmation line: {}",
+            lines[0]
+        );
     }
 }

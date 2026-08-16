@@ -198,6 +198,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
+    // #535: if the Browser-Plane gate requires a verified email, check that the
+    // realm actually enforces the confirmation instead of trusting the claim
+    // blind. On 2026-08-16 it did not (realm `verifyEmail=true`, required-action
+    // provider `VERIFY_EMAIL` never registered), the flag was inert, and nothing
+    // in the system said a word. Pure diagnosis on stderr -- it never blocks or
+    // aborts boot, and runs in the background so an unreachable Keycloak can't
+    // push four admin round trips into this process's time-to-serving.
+    ct_control_plane::keycloak_admin::spawn_startup_verified_email_check();
+
     // #68: the customer-facing install one-liner (/portal/tunnels/{id}/install)
     // embeds this base URL. If it's unset it silently falls back to
     // https://localhost — useless for a real customer — so warn loudly at startup.
