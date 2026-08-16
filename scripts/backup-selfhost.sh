@@ -60,8 +60,14 @@ for v in ct-selfhost_shared ct-selfhost_keycloak_data \
          cads-auction-demo_auction_demo_agent_state; do
   if docker volume inspect "$v" >/dev/null 2>&1; then
     log "Volume $v"
+    # `tmp/` ausschliessen: Keycloak legt dort seinen gzip-Cache fuer
+    # Theme-Ressourcen ab (data/tmp/kc-gzip-cache) -- regenerierbar, aber er
+    # war groesser als alle echten Daten dieses Volumes zusammen. Am 16.08.
+    # halbierte sich die Snapshot-Groesse, nachdem der Cache geleert wurde:
+    # eine Schwankung, die wie ein Backup-Fehler aussieht und keiner war.
     docker run --rm -v "$v":/d -v "$STAGE/volumes":/out alpine \
-      tar czf "/out/$v.tar.gz" -C /d . || die "tar für $v fehlgeschlagen"
+      tar czf "/out/$v.tar.gz" --exclude='./tmp' --exclude='./tmp/*' -C /d . \
+      || die "tar für $v fehlgeschlagen"
   else
     log "Volume $v fehlt — übersprungen"
   fi
