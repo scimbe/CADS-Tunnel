@@ -33,6 +33,14 @@
   --pf-v5-global--Color--light-100: var(--ct-text);
   --pf-v5-global--Color--200: var(--ct-muted);
   --pf-v5-global--Color--light-200: var(--ct-muted);
+  /* PatternFly's `dark-*` colour tokens are DARK TEXT meant for LIGHT surfaces
+     (#151515 / #3d3d3d), not "colours for dark mode" -- the name reads backwards
+     for a dark theme. Leaving them at their defaults is what made the account
+     console's credential rows ("Mein Passwort", the created-at date) render
+     near-black on our dark card: unreadable, reported 2026-08-16. The background
+     twin below was remapped from the start; these two were missed. */
+  --pf-v5-global--Color--dark-100: var(--ct-text);
+  --pf-v5-global--Color--dark-200: var(--ct-muted);
   --pf-v5-global--BorderColor--100: var(--ct-border);
   --pf-v5-global--BorderColor--light-100: var(--ct-border);
   --pf-v5-global--primary-color--100: var(--ct-accent);
