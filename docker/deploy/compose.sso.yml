@@ -253,6 +253,14 @@ services:
       CT_OIDC_CLIENT_SECRET: "${KC_PORTAL_CLIENT_SECRET:?set KC_PORTAL_CLIENT_SECRET=<random hex; same value Keycloak imports>}"
       # The email-domain access-list (#43) is optional; set it in .env to restrict
       # who may register: CT_PORTAL_ALLOWED_EMAIL_DOMAINS=becke.biz
+      # #527: an email-allow-list match must ALSO carry the IdP's `email_verified`
+      # claim. The realm allows open self-registration, so without this an account
+      # that merely types an allow-listed address passes the gate. Committed as "1"
+      # rather than left to .env so a fresh deployment cannot silently come up
+      # without it. Safe since 2026-08-16, when ct-demo got `verifyEmail=true` with
+      # a working SMTP sender — before that, requiring it would have locked out
+      # every self-registered user (which is why it shipped defaulting to off).
+      CT_GATE_REQUIRE_VERIFIED_EMAIL: "1"
     depends_on:
       keycloak:
         condition: service_healthy

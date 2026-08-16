@@ -16,7 +16,7 @@
   "registrationAllowed": true,
   "registrationEmailAsUsername": true,
   "loginWithEmailAllowed": true,
-  "verifyEmail": false,
+  "verifyEmail": true,
   "resetPasswordAllowed": true,
   "bruteForceProtected": true,
   "failureFactor": 10,

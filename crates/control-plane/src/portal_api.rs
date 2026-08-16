@@ -2070,11 +2070,19 @@ async fn login_allowlist_add_route(
             let _ = st.tunnels.dismiss_access_request(&subject, &id, email);
             // Best-effort account provisioning (#382-follow): never blocks the
             // allow-list add itself, matching `authorize_hostname`'s own
-            // "side effect, logged not surfaced" convention above. This realm has
-            // no outbound-email mechanism (see `portal.rs`'s
-            // `require_verified_email` doc comment for the same gap), so a fresh
-            // account's one-time temporary password is only ever logged
-            // server-side -- the operator relays it to the invitee out of band.
+            // "side effect, logged not surfaced" convention above. The one-time
+            // temporary password is only ever logged server-side -- the operator
+            // relays it to the invitee out of band.
+            //
+            // The account is created UNVERIFIED (`emailVerified: false` in
+            // `keycloak_admin`), which since 2026-08-16 is load-bearing rather than
+            // incidental: the realm carries `verifyEmail=true` over a working SMTP
+            // sender, so the invitee proves ownership of the address by confirming
+            // Keycloak's mail before the account is usable -- and #527's gate
+            // (`CT_GATE_REQUIRE_VERIFIED_EMAIL`) refuses the allow-list match until
+            // they have. An earlier version of this comment claimed the realm had
+            // "no outbound-email mechanism"; that stopped being true once SMTP was
+            // configured, and the claim outlived its truth for a while.
             if let Some(kc) = &st.kc_admin {
                 let client = keycloak_admin_http_client();
                 match crate::keycloak_admin::ensure_user(&client, kc, email).await {

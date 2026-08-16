@@ -91,12 +91,15 @@ struct GateState {
     /// Whether an email-**allow-list** match must additionally carry the IdP's
     /// `email_verified: true` claim (`CT_GATE_REQUIRE_VERIFIED_EMAIL`). The
     /// allow-list keys on email, but with an open-self-registration realm and no
-    /// `verifyEmail` (ct-demo today: `registrationAllowed=true`, `verifyEmail=false`),
-    /// a self-asserted email is not proof of ownership — so an unverified account
-    /// registering an allow-listed address would pass the gate. Off by default: with
-    /// no real confirmation flow wired up, requiring it would lock out every
-    /// self-registered user; flip on once allow-listed accounts are provisioned with
-    /// a verified email (admin-set, or a genuine confirmation flow). The
+    /// `verifyEmail`, a self-asserted email is not proof of ownership — so an
+    /// unverified account registering an allow-listed address would pass the gate.
+    ///
+    /// The code default stays `false` (an operator whose realm has no confirmation
+    /// flow must not be locked out by upgrading), but **the shipped deployment sets
+    /// it to `1`** in `docker/deploy/compose.sso.yml`: since 2026-08-16 ct-demo runs
+    /// `verifyEmail=true` over a working SMTP sender, which is exactly the
+    /// precondition this doc used to name as missing. Requiring it before that would
+    /// have locked out every self-registered user. The
     /// `allow_any_login` path is deliberately unaffected — it never consults the
     /// email at all, so it carries no ownership claim to weaken.
     require_verified_email: bool,
