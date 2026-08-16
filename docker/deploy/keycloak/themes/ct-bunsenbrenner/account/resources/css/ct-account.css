@@ -232,6 +232,14 @@ img[alt="logo" i] {
   color: var(--ct-accent) !important;
 }
 
+/* Wie im Login-Theme: das Pflicht-Sternchen (#c9190b) misst 2.99:1 gegen die
+   Karte und ist damit unter der Schwelle fuer normalen Text, obwohl es die
+   einzige Kennzeichnung eines Pflichtfelds ist. #ff7b72 -> 6.86:1. */
+.pf-v5-c-form__label-required,
+.pf-v5-c-form__label .pf-v5-c-form__label-required {
+  color: #ff7b72;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }

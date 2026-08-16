@@ -173,6 +173,16 @@ a:hover {
   color: var(--ct-accent, #5fb8ab);
 }
 
+/* Das Pflichtfeld-Sternchen ist die EINZIGE Kennzeichnung eines Pflichtfelds --
+   Keycloaks Rot (#a30000) misst darauf 2.11:1 gegen unsere dunkle Karte, also
+   praktisch unsichtbar. #ff7b72 erreicht 6.86:1 und bleibt als Warnfarbe lesbar.
+   Gemessen am 16.08. im Browser, nicht geschaetzt. */
+.required,
+#kc-form .required,
+label .required {
+  color: #ff7b72;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
