@@ -116,7 +116,10 @@ async fn open_agent_stream_with(
     let agents = state.routes(token);
     if agents.is_empty() {
         edge_trace(format_args!("route token={th} -> MISS (no registration)"));
-        return Err("no agent tunnel for token".into());
+        // The token prefix makes the operator-visible line attributable: during the
+        // 2026-08-16 llm-path incident two same-day "no agent tunnel" bursts could
+        // not be told apart because this line named no tunnel at all.
+        return Err(format!("no agent tunnel for token {th}").into());
     }
     // Failover (#8 R2): try each live agent, newest first, until one opens a relay
     // stream. This covers redundant agents AND the race where the chosen agent's
