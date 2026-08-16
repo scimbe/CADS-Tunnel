@@ -143,6 +143,36 @@ a:hover {
   border-radius: 8px;
 }
 
+/* The locale switcher inherits PatternFly's light-theme secondary text
+   (#6a6e73), which measures 3.37:1 on this dark card -- below the 4.5:1 the
+   rest of this page clears comfortably. It is the only control on the sign-in
+   page that failed, and it is the one a visitor uses before they can read
+   anything else. The dropdown items get the same treatment: the menu paints
+   itself on a light surface, so its own text must stay dark there. */
+/* Selector mirrors Keycloak's own `#kc-locale-dropdown button` from login.css
+   (ID + element, specificity 1-0-1). A plain `#kc-current-locale-link` is
+   1-0-0 and loses to it -- measured, not assumed: the browser reported both
+   rules matching and theirs winning. This file loads after login.css, so equal
+   specificity is enough. */
+#kc-locale-dropdown button,
+#kc-locale-dropdown button#kc-current-locale-link,
+#kc-locale .pf-c-dropdown__toggle-text {
+  color: var(--ct-text, #e6edf3);
+}
+#kc-locale .pf-c-dropdown__menu {
+  background-color: var(--ct-surface, #161b22);
+  border: 1px solid var(--ct-border, #30363d);
+}
+#kc-locale .pf-c-dropdown__menu-item {
+  color: var(--ct-text, #e6edf3);
+  background-color: transparent;
+}
+#kc-locale .pf-c-dropdown__menu-item:hover,
+#kc-locale .pf-c-dropdown__menu-item:focus {
+  background-color: rgba(95, 184, 171, .12);
+  color: var(--ct-accent, #5fb8ab);
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
