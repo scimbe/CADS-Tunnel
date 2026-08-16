@@ -16,8 +16,13 @@ const measure = async (page, label) => {
     const out = [];
     const opaque = v => { const m = v.match(/rgba?\(([^)]+)\)/); if (!m) return false; const p = m[1].split(',').map(Number); return p.length < 4 || p[3] >= 0.95; };
     document.querySelectorAll('body *').forEach(c => {
-      const t = (c.innerText || '').trim();
-      if (!t || t.length > 70 || c.children.length) return;
+      // Direkter Textinhalt statt innerText des ganzen Teilbaums, und KEIN
+      // "nur Blattelemente"-Filter: ein <a> mit <span> darin wurde damit
+      // uebersprungen, was zu einer Entwarnung fuehrte, die den Zustand nie
+      // angesehen hatte (Sprachmenue, 16.08.). Ein Element zaehlt, sobald es
+      // eigenen Text traegt.
+      const t = [...c.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+      if (!t || t.length > 70) return;
       const cs = getComputedStyle(c);
       if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) < .1) return;
       let bg = 'rgba(0, 0, 0, 0)', p = c;
