@@ -94,13 +94,29 @@ pub trait DuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
 /// #517 V1: WHICH relay plane a byte tally belongs to -- the per-plane split that
 /// makes the traffic-offload work measurable (where do the central host's relayed
 /// bytes actually come from?).
+///
+/// #534 made the partition rule explicit, because the two axes it mixes (plane
+/// vs. transport) are what let the counters drift apart: **`TcpFallback` wins
+/// whenever EITHER leg of the relay ran over the TLS-TCP fallback** -- the
+/// agent leg (an agent whose UDP is blocked, parked via `park_tcp_agent` and
+/// served by `serve_tcp_connection`'s 'A'/'K'/'B'/'L'/'F' arms) or the client
+/// leg (a ct-client or a peer edge dialing the :4433 listener's 'C'/'M' roles).
+/// `Browser` and `DataPlane` therefore describe QUIC-to-QUIC-or-:443 traffic
+/// only. That is what makes the counter answer the operator's actual question
+/// ("how much of my traffic is on the DPI/NAT fallback?") with a single label,
+/// and it keeps the three kinds a genuine partition of `relay_bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayKind {
-    /// Browser-Plane: SNI passthrough / Gelb-terminated browser traffic to an agent.
+    /// Browser-Plane: SNI passthrough / Gelb-terminated browser traffic to a
+    /// QUIC-registered agent (a browser served by a PARKED fallback agent is
+    /// `TcpFallback`, booked in the park arm that actually relays it -- #534).
     Browser,
-    /// QUIC data plane: a ct-client relaying to an agent (route_and_relay / the 'C' arm).
+    /// QUIC data plane: a ct-client relaying to an agent (route_and_relay / the 'C' arm),
+    /// both legs QUIC.
     DataPlane,
-    /// The :4433 TLS-TCP fallback client path.
+    /// The TLS-TCP fallback (:4433, or the :443 front door's EdgeRelay dispatch):
+    /// either the parked-agent hop or the fallback client/peer-edge hop. See the
+    /// enum doc for the "either leg wins" rule.
     TcpFallback,
 }
 
@@ -416,7 +432,11 @@ pub struct EdgeState<H> {
     tcp_parked_gauge: AtomicU64,
     /// #517 V1: per-plane relay byte tallies (browser / QUIC data plane / TCP
     /// fallback) -- their sum equals `relay_bytes`, keeping the historical total
-    /// untouched while making the offload split visible.
+    /// untouched while making the offload split visible. The sum invariant holds
+    /// by construction: `note_relay` is the ONLY writer of both, and it always
+    /// writes exactly one kind. #534: it is also the only writer, full stop --
+    /// a relay that forgets to call it is missing from the total AND from every
+    /// kind, which is how the fallback's bytes went unreported for so long.
     relay_bytes_browser: AtomicU64,
     relay_bytes_dataplane: AtomicU64,
     relay_bytes_tcp_fallback: AtomicU64,

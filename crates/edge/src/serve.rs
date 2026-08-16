@@ -2085,6 +2085,38 @@ impl std::fmt::Debug for ParkAndPingError {
     }
 }
 
+/// Account a completed **park-phase** relay (a Client served by a parked
+/// TLS-TCP fallback agent) as [`RelayKind::TcpFallback`](crate::state::RelayKind::TcpFallback).
+///
+/// #534: every park arm below used to discard the relay's byte counts
+/// (`relay(..).await?;` with the tuple dropped) and book nothing at all, so
+/// `ct_edge_relay_bytes_kind_total{kind="tcp_fallback"}` stayed at 0 while an
+/// agent that was 100% on the fallback served real traffic — and
+/// `ct_edge_relay_bytes_total` under-counted by exactly those bytes, since
+/// `note_relay` is the only writer of both. The delivery counter
+/// (`ct_edge_tcp_fallback_deliveries_total`) moved correctly the whole time,
+/// which is what made the byte gap look like a mislabel rather than a miss.
+///
+/// **Direction mapping** (the easy thing to get backwards, hence this
+/// wrapper's two named parameters instead of a positional tuple hand-off):
+/// the park arms hold the AGENT side of the connection and call
+/// `relay(agent, client)`, so [`relay`]'s documented `(a→b, b→a)` is
+/// `(agent_to_client, client_to_agent)` — the mirror image of the
+/// browser-plane sites, which call `relay(client, agent)`.
+/// [`framed_relay`], by contrast, already returns
+/// `(browser→agent, agent→browser)` for its `(agent, browser)` arguments.
+/// Only the total matters for the fleet-wide counters, but
+/// [`EdgeState::note_relay`] also feeds the PER-TUNNEL in/out split the
+/// monitoring view shows, where a swap would be visible as inverted traffic.
+fn note_parked_fallback_relay(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+    client_to_agent: u64,
+    agent_to_client: u64,
+) {
+    state.note_relay(token, client_to_agent, agent_to_client, crate::state::RelayKind::TcpFallback);
+}
+
 /// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
 /// by dispatching on the first byte's role:
 ///
@@ -2163,7 +2195,7 @@ where
             // connection for its whole life, not inside `admit_tcp_agent_a` --
             // #410's bound only means anything while the registration is still
             // parked, so the permit has to outlive admission.
-            let Some((_token, parked, _sub_permit)) =
+            let Some((token, parked, _sub_permit)) =
                 admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "A").await?
             else {
                 let _ = stream.shutdown().await;
@@ -2172,7 +2204,11 @@ where
             // Await the parked Client, then relay this agent stream to it.
             match parked.await {
                 Ok(mut client) => {
-                    relay(&mut stream, &mut client).await?;
+                    // #534: this relay's bytes ARE the fallback's traffic -- see
+                    // `note_parked_fallback_relay` for why they used to go
+                    // uncounted and for the (mirrored) direction mapping.
+                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
                 // Never matched with a Client (edge shutdown / registration
@@ -2213,7 +2249,9 @@ where
                     // the Agent sees it first.
                     stream.write_all(&[TCP_PING_STOP]).await?;
                     stream.flush().await?;
-                    relay(&mut stream, &mut client).await?;
+                    // #534, as in the 'A' arm above.
+                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
                 // Verify-at-delivery failover: the final pre-STOP ping caught a
@@ -2283,7 +2321,16 @@ where
                     // way back to a park phase.
                     stream.write_all(&[TCP_PING_STOP]).await?;
                     stream.flush().await?;
-                    framed_relay(&mut stream, &mut client).await?;
+                    // #534: `framed_relay(agent, browser)` already returns
+                    // `(browser->agent, agent->browser)`, i.e. the direction
+                    // order `note_relay` wants -- unlike the raw `relay(agent,
+                    // client)` arms, which return it mirrored. Application
+                    // bytes only: frame overhead and the codec's keepalives are
+                    // excluded by `framed_relay` itself, which is the right
+                    // basis for a traffic-volume metric (the raw arms count the
+                    // same payload, un-framed).
+                    let (client_to_agent, agent_to_client) = framed_relay(&mut stream, &mut client).await?;
+                    note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
                 // Verify-at-delivery failover, identical to 'K': the rescued
@@ -2308,14 +2355,16 @@ where
             }
         }
         b'B' => {
-            let Some((_token, parked, _sub_permit)) =
+            let Some((token, parked, _sub_permit)) =
                 admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "B").await?
             else {
                 return Ok(());
             };
             match parked.await {
                 Ok(mut client) => {
-                    relay(&mut stream, &mut client).await?;
+                    // #534, as in the 'A' arm above.
+                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
                 // See the 'A' arm above (#229 follow-up): graceful shutdown
@@ -2359,7 +2408,9 @@ where
                     // ping phase's end BEFORE any relayed byte can reach this stream.
                     stream.write_all(&[TCP_PING_STOP]).await?;
                     stream.flush().await?;
-                    relay(&mut stream, &mut client).await?;
+                    // #534, as in the 'A' arm above.
+                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
                 // Verify-at-delivery failover, same as 'K': rescue the Client to
@@ -2419,7 +2470,22 @@ where
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut stream, &mut agent).await?;
-                        state.note_relay(&token, a, b, crate::state::RelayKind::TcpFallback); // #10 O2
+                        // #10 O2. #534 reviewed and DELIBERATELY LEFT AS
+                        // `TcpFallback` (the issue proposed flipping it to
+                        // `Browser` on the theory that the label was inverted):
+                        // this Client reached the edge over the :4433 TLS-TCP
+                        // fallback and only the AGENT leg is QUIC, so one leg of
+                        // this relay really did run over the fallback transport
+                        // -- which is exactly what the kind partitions on (see
+                        // `RelayKind`). `Browser` would be doubly wrong here:
+                        // role 'C' is the ct-client rendezvous, never a browser
+                        // (browsers enter via `serve_sni_passthrough` /
+                        // `serve_gelb_terminated`, which have no :4433 leg and
+                        // therefore correctly book `Browser`). This site's true
+                        // structural twin is the QUIC 'C' arm's identical
+                        // race-fallthrough in `serve_connection`, which books
+                        // `DataPlane` because BOTH its legs are QUIC.
+                        state.note_relay(&token, a, b, crate::state::RelayKind::TcpFallback);
                         Ok(())
                     }
                     Err(e) => {
@@ -2486,6 +2552,11 @@ where
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
                         let (a, b) = relay(&mut stream, &mut agent).await?;
+                        // #534, same reasoning as the 'C' arm above: the PEER
+                        // EDGE dialed this role over the :4433 TLS-TCP fallback
+                        // listener, so the inbound leg is fallback transport
+                        // even though the agent leg is QUIC. Kept as
+                        // `TcpFallback` on purpose.
                         state.note_relay(&token, a, b, crate::state::RelayKind::TcpFallback);
                         Ok(())
                     }
@@ -5025,9 +5096,27 @@ mod tests {
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"tcp-tunnel-data", "TCP fallback client relayed to the QUIC agent");
 
+        // #534: pin WHICH kind this fallthrough books. The issue proposed
+        // flipping it to `browser` on the theory that the labels were inverted;
+        // they are not -- this Client reached the edge over the :4433 TLS-TCP
+        // fallback and only the AGENT leg is QUIC, so one leg really did run
+        // over the fallback transport, which is what `RelayKind` partitions on.
+        // `browser` would be doubly wrong: role 'C' is the ct-client rendezvous,
+        // never a browser. (The real bug was the PARKED-agent success path
+        // booking nothing at all -- see the two `..._books_its_bytes_as_
+        // tcp_fallback_534` tests.)
+        client.shutdown().await.unwrap(); // close_notify -> the relay returns Ok
+        tcp_edge.await.unwrap();
+        let payload = 2 * b"tcp-tunnel-data".len() as u64;
+        assert_eq!(
+            state.relay_bytes_by_kind(),
+            (0, 0, payload),
+            "a Client on the :4433 fallback is tcp_fallback even when the agent leg is QUIC",
+        );
+        assert_eq!(state.relay_bytes_total(), payload, "the kinds partition the total");
+
         agent.await.unwrap();
         quic_edge.abort();
-        tcp_edge.abort();
     }
 
     #[tokio::test]
@@ -6113,6 +6202,200 @@ mod tests {
         let _ = edge.await;
     }
 
+    /// Drive `park_and_ping`'s pre-STOP phase from the agent side: answer every
+    /// well-formed PING with its PONG until the STOP sentinel ends the phase.
+    /// Shared by the #534 accounting tests, which care about what happens AFTER
+    /// STOP, not about the ping cadence itself.
+    async fn drain_park_pings_until_stop<S: AsyncRead + AsyncWrite + Unpin>(agent_peer: &mut S) {
+        loop {
+            let mut lead = [0u8; 1];
+            agent_peer.read_exact(&mut lead).await.unwrap();
+            if lead[0] == TCP_PING_STOP {
+                return;
+            }
+            assert_eq!(lead[0], TCP_PING_MAGIC, "every pre-STOP byte belongs to a PING frame");
+            let mut ping = [0u8; 9];
+            ping[0] = lead[0];
+            agent_peer.read_exact(&mut ping[1..]).await.unwrap();
+            agent_peer.write_all(&pong_echoing(&ping)).await.unwrap();
+            agent_peer.flush().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn parked_framed_fallback_relay_books_its_bytes_as_tcp_fallback_534() {
+        // #534 (field-measured): `ct_edge_relay_bytes_kind_total{kind=
+        // "tcp_fallback"}` stayed at 0 while an agent forced onto the framed
+        // 'F' fallback (CT_AGENT_REGISTER_TCP_ONLY=1 + CT_AGENT_FRAMED_FALLBACK=1)
+        // served 60 real requests -- `ct_edge_tcp_fallback_deliveries_total`
+        // moved by exactly 60, the bytes did not move at all. Cause: this arm
+        // dropped `framed_relay`'s byte counts on the floor and called
+        // `note_relay` NOWHERE, so those bytes were missing from the kind split
+        // AND from `ct_edge_relay_bytes_total` (`note_relay` is the sole writer
+        // of both). The counter that answers "how much of my traffic is on the
+        // DPI/NAT fallback?" therefore answered 0 for an agent that was 100% on
+        // it.
+        //
+        // Real time, deliberately NOT `start_paused`: the 8s ping/keepalive
+        // cadences cannot fire inside a millisecond-scale test, so exactly one
+        // verify-at-delivery PING precedes STOP and no injected keepalive can
+        // race the teardown into an I/O error (which would skip the accounting
+        // this test is about).
+        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter};
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x53; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
+        let state_f = state.clone();
+        let edge =
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None).await });
+
+        let host = "kinds-framed.bunsenbrenner.org";
+        let mut hdr = vec![b'F'];
+        hdr.extend_from_slice(&token.0);
+        hdr.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        hdr.extend_from_slice(host.as_bytes());
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK", "'F' admission succeeded");
+
+        // A Browser stream is handed to the parked agent -- the exact success
+        // path the field measurement exercised.
+        let (mut client_peer, client_edge) = tokio::io::duplex(1 << 16);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+        drain_park_pings_until_stop(&mut agent_peer).await;
+
+        let (far_r, far_w) = tokio::io::split(agent_peer);
+        let mut far_reader = FrameReader::new(far_r);
+        let mut far_writer = FrameWriter::new(far_w);
+
+        const FROM_CLIENT: &[u8] = b"browser-request-11"; // 18 bytes
+        const FROM_AGENT: &[u8] = b"origin-reply"; // 12 bytes
+        client_peer.write_all(FROM_CLIENT).await.unwrap();
+        client_peer.flush().await.unwrap();
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Data(FROM_CLIENT.to_vec())),
+            "the browser's bytes reach the agent as one DATA frame",
+        );
+        far_writer.data(FROM_AGENT).await.unwrap();
+        far_writer.flush().await.unwrap();
+        let mut back = [0u8; FROM_AGENT.len()];
+        client_peer.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back[..], FROM_AGENT, "the agent's reply reaches the browser unframed");
+
+        // Clean bilateral teardown so the relay RETURNS: accounting happens on
+        // the Ok path, exactly like every other `note_relay` site in this file.
+        drop(client_peer); // browser EOF -> the edge FINs toward the agent
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Fin),
+            "the browser's EOF is forwarded as the codec's in-band FIN",
+        );
+        far_writer.fin().await.unwrap();
+        far_writer.flush().await.unwrap();
+        edge.await.unwrap().expect("the 'F' park relay ends cleanly once FIN passed both ways");
+
+        let payload = (FROM_CLIENT.len() + FROM_AGENT.len()) as u64;
+        assert_eq!(
+            state.relay_bytes_by_kind(),
+            (0, 0, payload),
+            "#534: a request served by a PARKED framed fallback agent is tcp_fallback -- \
+             not browser (the label the field measurement found moving instead), and not \
+             silently uncounted (what the code actually did)",
+        );
+        assert_eq!(
+            state.relay_bytes_total(),
+            payload,
+            "the fallback's bytes reach the fleet-wide total too -- the three kinds partition it",
+        );
+        assert_eq!(
+            state.tunnel_bytes(&token),
+            (FROM_CLIENT.len() as u64, FROM_AGENT.len() as u64),
+            "the per-tunnel in/out split is not mirrored: framed_relay returns \
+             (browser->agent, agent->browser) already in note_relay's order",
+        );
+    }
+
+    #[tokio::test]
+    async fn parked_raw_fallback_relay_books_its_bytes_as_tcp_fallback_534() {
+        // #534, the RAW ('L') half of the same gap: the ping-capable
+        // Browser-Plane park arm relays with `relay` instead of `framed_relay`
+        // and had the identical missing-`note_relay` bug. Also pins the
+        // direction mapping, which is MIRRORED here: the park arms call
+        // `relay(agent, client)`, so `relay`'s `(a->b, b->a)` is
+        // `(agent_to_client, client_to_agent)` -- swapping it would leave the
+        // fleet totals right and the per-tunnel in/out split inverted.
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let token = RoutingToken([0x54; 32]);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+
+        let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
+        let state_l = state.clone();
+        let edge =
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_l, &challenge, None).await });
+
+        let host = "kinds-raw.bunsenbrenner.org";
+        let mut hdr = vec![b'L'];
+        hdr.extend_from_slice(&token.0);
+        hdr.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        hdr.extend_from_slice(host.as_bytes());
+        agent_peer.write_all(&hdr).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut ok = [0u8; 2];
+        agent_peer.read_exact(&mut ok).await.unwrap();
+        assert_eq!(&ok, b"OK", "'L' admission succeeded");
+
+        let (mut client_peer, client_edge) = tokio::io::duplex(1 << 16);
+        state
+            .deliver_to_tcp_agent_draining(&token, Box::new(client_edge))
+            .map_err(|_| "deliver failed")
+            .unwrap();
+        drain_park_pings_until_stop(&mut agent_peer).await;
+
+        const FROM_CLIENT: &[u8] = b"raw-browser-request"; // 19 bytes
+        const FROM_AGENT: &[u8] = b"raw-reply"; // 9 bytes
+        client_peer.write_all(FROM_CLIENT).await.unwrap();
+        client_peer.flush().await.unwrap();
+        let mut seen = [0u8; FROM_CLIENT.len()];
+        agent_peer.read_exact(&mut seen).await.unwrap();
+        assert_eq!(&seen[..], FROM_CLIENT, "'L' stays a raw byte pump");
+        agent_peer.write_all(FROM_AGENT).await.unwrap();
+        agent_peer.flush().await.unwrap();
+        let mut back = [0u8; FROM_AGENT.len()];
+        client_peer.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back[..], FROM_AGENT);
+
+        // Both halves close, so `copy_bidirectional` returns its counts.
+        drop(client_peer);
+        let mut tail = Vec::new();
+        agent_peer.read_to_end(&mut tail).await.unwrap();
+        assert!(tail.is_empty(), "the browser's EOF is a shutdown, not stray bytes");
+        drop(agent_peer);
+        edge.await.unwrap().expect("the 'L' park relay ends cleanly once both halves closed");
+
+        let payload = (FROM_CLIENT.len() + FROM_AGENT.len()) as u64;
+        assert_eq!(
+            state.relay_bytes_by_kind(),
+            (0, 0, payload),
+            "#534: the raw park path books tcp_fallback as well",
+        );
+        assert_eq!(state.relay_bytes_total(), payload);
+        assert_eq!(
+            state.tunnel_bytes(&token),
+            (FROM_CLIENT.len() as u64, FROM_AGENT.len() as u64),
+            "in = browser->agent, out = agent->browser: `relay(agent, client)`'s mirrored \
+             tuple is un-mirrored at the call site, not passed through positionally",
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn tcp_fallback_role_k_relay_stays_a_raw_byte_pump_not_framed_regression_528() {
         // #528 regression (iv): adding the framed 'F' path must NOT change 'K'.
@@ -6650,7 +6933,22 @@ mod tests {
             "HTTPS 200 through the tunnel via SNI passthrough: {page}"
         );
 
-        pass.abort();
+        // #534 control case: a browser request served by a QUIC-registered
+        // agent has NO TLS-TCP fallback leg anywhere, so its bytes stay
+        // `browser` -- the label the parked-fallback arms must NOT reuse. Exact
+        // counts are not asserted (a real TLS session's byte count is not a
+        // stable constant); the SPLIT is what this pins.
+        tls.shutdown().await.unwrap();
+        pass.await.unwrap().expect("the passthrough relay ends cleanly");
+        let (browser, dataplane, tcp_fallback) = state.relay_bytes_by_kind();
+        assert!(browser > 0, "the browser plane booked its bytes");
+        assert_eq!(
+            (dataplane, tcp_fallback),
+            (0, 0),
+            "a QUIC-agent browser request is neither data plane nor TLS-TCP fallback",
+        );
+        assert_eq!(browser, state.relay_bytes_total(), "the three kinds partition the total");
+
         agent_task.abort();
         edge_srv.abort();
         origin.abort();

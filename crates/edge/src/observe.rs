@@ -46,9 +46,10 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          # TYPE ct_edge_relay_bytes_total counter\n\
          ct_edge_relay_bytes_total {relay_bytes}\n\
          # HELP ct_edge_relay_bytes_kind_total Relayed bytes split by plane (#517 V1: the\n\
-         # traffic-offload measurement base -- browser = SNI/Gelb browser traffic,\n\
-         # dataplane = QUIC client relays, tcp_fallback = the :4433 client path;\n\
-         # the three sum to ct_edge_relay_bytes_total).\n\
+         # traffic-offload measurement base -- browser = SNI/Gelb browser traffic to a QUIC\n\
+         # agent, dataplane = QUIC client relays, tcp_fallback = every relay with a TLS-TCP\n\
+         # fallback leg, agent-side (a parked fallback agent, #534) or client-side (the :4433\n\
+         # 'C'/'M' roles); the three sum to ct_edge_relay_bytes_total).\n\
          # TYPE ct_edge_relay_bytes_kind_total counter\n\
          ct_edge_relay_bytes_kind_total{{kind=\"browser\"}} {relay_bytes_browser}\n\
          ct_edge_relay_bytes_kind_total{{kind=\"dataplane\"}} {relay_bytes_dataplane}\n\
