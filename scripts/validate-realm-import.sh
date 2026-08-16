@@ -27,6 +27,13 @@ FILE="${1:-$(dirname "$0")/../docker/deploy/keycloak/ct-demo-realm.json}"
 IMAGE="${KC_IMAGE:-quay.io/keycloak/keycloak:25.0}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
+command -v docker >/dev/null || {
+  # Ohne Docker kann nur Keycloak selbst nicht befragt werden -- und eine
+  # Pruefung, die nicht laufen kann, darf nicht wie eine bestandene aussehen.
+  echo "FEHLER: docker fehlt -- die Schema-Pruefung braucht das Keycloak-Image."
+  echo "        (Eine uebersprungene Pruefung ist kein Freispruch.)"
+  exit 1
+}
 [ -r "$FILE" ] || { echo "FEHLER: $FILE nicht lesbar"; exit 1; }
 python3 -c "import json,sys; json.load(open('$FILE'))" || { echo "FEHLER: kein gültiges JSON"; exit 1; }
 
