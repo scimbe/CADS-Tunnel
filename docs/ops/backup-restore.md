@@ -54,6 +54,32 @@ lesbar, wuerde der Versand die Geheimnisse verschieben, ohne das Risiko zu versc
 ./scripts/mail-recovery-bundle.sh               # bauen, verschluesseln, senden
 ```
 
+## Wird die Sicherung ueberwacht?
+
+Ja: `scripts/backup-freshness-check.sh` laeuft per Cron um 09:42 UTC und prueft das
+**Ergebnis** -- liegt im Backup-Repository ein Snapshot, der juenger als 30 Stunden und
+groesser als 100 KB ist? Schlaegt das fehl, geht eine Mail an den Operator und der
+Exit-Code ist 1.
+
+Bewusst als eigener Job zu anderer Zeit: pruefte die Sicherung sich selbst, wuerde ihr
+Ausfall auch die Pruefung mitnehmen. Und bewusst gegen das Ergebnis statt gegen den
+Prozess -- ein Host, der aus ist, meldet keinen Fehlschlag, aber sein fehlender Snapshot
+faellt auf.
+
+## Wurde der Restore je ausprobiert?
+
+Ja, am 2026-08-16 gegen einen echten Snapshot, in Wegwerf-Containern (ohne Risiko fuer den
+laufenden Stack):
+
+```
+pg_restore in ein frisches Postgres  -> 73 Benutzer, 2 Realms, 67 Credentials
+sqlite pragma integrity_check        -> ok, 32 Tunnel, 111 Kanaele
+```
+
+Das ist der Unterschied zwischen einer Sicherung und der Hoffnung auf eine: eine
+Wiederherstellung, die nie gelaufen ist, ist unbewiesen. Der Test ist billig genug, um ihn
+nach groesseren Schema-Aenderungen zu wiederholen.
+
 ## Was NICHT gesichert wird
 
 Docker-Images (werden aus den Quellen neu gebaut), die Cargo-Build-Caches, und die
