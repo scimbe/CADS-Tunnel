@@ -68,3 +68,29 @@ jobs:
         run: |
           cargo install cargo-audit --locked || true
           cargo audit
+
+  # Der Realm-Import laeuft bei JEDEM Keycloak-Start; eine schema-ungueltige Datei
+  # verhindert ihn (2026-08-16: hinzugefuegte `_comment`-Felder nahmen die
+  # Auth-Ebene fuer ~6 Minuten offline). Syntaxpruefung reicht nicht -- die Datei
+  # WAR gueltiges JSON. Nur Keycloak kennt das Schema, also fragt dieser Job
+  # Keycloak. Laeuft nur, wenn die Datei oder ihr Pruefer sich geaendert hat;
+  # braucht kein Geheimnis und keine laufende Umgebung.
+  realm-import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nur bei Aenderung an Realm-Datei oder Pruefer
+        id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"   # erster Push / unbekannte Basis: lieber pruefen
+          elif git diff --name-only "$base" "${{ github.sha }}" \
+               | grep -qE 'docker/deploy/keycloak/.*\.json|scripts/validate-realm-import\.sh'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Realm-Importdatei validieren
+        if: steps.changed.outputs.run == 'true'
+        run: ./scripts/validate-realm-import.sh
