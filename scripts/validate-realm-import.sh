@@ -15,6 +15,11 @@
 # sind für die Schema-Frage ohne Belang, aber unaufgelöst scheitert die
 # Validierung an "Root URL is not a valid URL" statt am echten Fehler.
 #
+# Wird von CI aufgerufen (.github/workflows/ci.yml, Job `realm-import`), aber nur
+# wenn die Realm-JSON oder dieses Skript sich geändert hat -- der Lauf zieht das
+# Keycloak-Image und kostet ~30 s. Die Run-Summary schreibt in BEIDEN Fällen eine
+# Zeile, damit "nicht geprüft" nicht wie "bestanden" aussieht.
+#
 # Exit 0 = importierbar. Exit 1 = würde den Start verhindern.
 set -euo pipefail
 

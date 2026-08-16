@@ -91,6 +91,18 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
+      # Ein uebersprungener Schritt meldet einen gruenen Job -- von einer
+      # bestandenen Pruefung ist das nicht zu unterscheiden. (Genau darauf bin
+      # ich am 16.08. selbst hereingefallen und habe "Job gruen" als "Guard
+      # laeuft" gelesen.) Beide Faelle schreiben deshalb in die Run-Summary,
+      # sodass die Uebersicht sagt, ob geprueft wurde oder nicht.
+      - name: Ergebnis in der Zusammenfassung vermerken
+        run: |
+          if [ "${{ steps.changed.outputs.run }}" = "true" ]; then
+            echo "Realm-Import: **wird validiert** (Realm-Datei oder Pruefer geaendert)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Realm-Import: **nicht geprueft** -- keine Aenderung an \`docker/deploy/keycloak/*.json\` oder \`scripts/validate-realm-import.sh\`. Das ist kein Freispruch, nur eine ausgelassene Pruefung." >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Realm-Importdatei validieren
         if: steps.changed.outputs.run == 'true'
         run: ./scripts/validate-realm-import.sh
