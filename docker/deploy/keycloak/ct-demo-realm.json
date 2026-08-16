@@ -40,6 +40,26 @@
       "defaultAction": false,
       "priority": 60,
       "config": {}
+    },
+    {
+      "_comment": "Without this entry the realm-level verifyEmail flag above is INERT: Keycloak only enforces email confirmation when the VERIFY_EMAIL required-action provider is registered AND enabled. It was missing here, so accounts could be created and used with an unconfirmed address even after verifyEmail was switched on (found in production 2026-08-16 by registering an account and getting straight in).",
+      "alias": "VERIFY_EMAIL",
+      "name": "Verify Email",
+      "providerId": "VERIFY_EMAIL",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 50,
+      "config": {}
+    },
+    {
+      "_comment": "Registered so an admin-provisioned account's temporary password can force a change at first login (portal_api's ensure_user path). Was likewise unregistered.",
+      "alias": "UPDATE_PASSWORD",
+      "name": "Update Password",
+      "providerId": "UPDATE_PASSWORD",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 30,
+      "config": {}
     }
   ],
   "defaultSignatureAlgorithm": "RS256",
@@ -89,7 +109,10 @@
       "defaultClientScopes": [
         "email",
         "profile"
-      ]
+      ],
+      "_comment_urls": "Keycloak's info pages (notably the one after clicking a verification link) only offer a way back into the app when the client has a base URL -- without these two fields the user was left on a bare 'your email has been verified' page with no link and no redirect. Kept as the same ${PORTAL_PUBLIC_URL} placeholder the redirect URIs use, so this stays portable across deployments.",
+      "rootUrl": "${PORTAL_PUBLIC_URL}",
+      "baseUrl": "/portal/tunnels"
     },
     {
       "clientId": "webconference-bridge",
