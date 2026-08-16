@@ -79,17 +79,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Der Standard ist ein flacher Klon (Tiefe 1) -- darin existiert die
+          # Vergleichsbasis nicht, `git diff` scheitert, und die Erkennung
+          # unten hielt das faelschlich fuer "nichts geaendert". Genau daran
+          # ist dieser Job zweimal vorbeigelaufen, ohne je zu pruefen.
+          fetch-depth: 0
       - name: Nur bei Aenderung an Realm-Datei oder Pruefer
         id: changed
         run: |
+          set -u
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          pattern='docker/deploy/keycloak/.*\.json|scripts/validate-realm-import\.sh'
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"   # erster Push / unbekannte Basis: lieber pruefen
-          elif git diff --name-only "$base" "${{ github.sha }}" \
-               | grep -qE 'docker/deploy/keycloak/.*\.json|scripts/validate-realm-import\.sh'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "unbestimmbare Basis -> pruefen"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Kann der Vergleich nicht ausgefuehrt werden, wird GEPRUEFT statt
+          # uebersprungen: eine Bedingung, die sich nicht beantworten laesst,
+          # darf einen Guard nicht stillschweigend abschalten.
+          if ! files=$(git diff --name-only "$base" "${{ github.sha }}" 2>&1); then
+            echo "git diff fehlgeschlagen ($files) -> pruefen"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if printf '%s\n' "$files" | grep -qE "$pattern"; then
+            echo "relevante Aenderung -> pruefen"; echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "keine relevante Aenderung -> ueberspringen"; echo "run=false" >> "$GITHUB_OUTPUT"
           fi
       # Ein uebersprungener Schritt meldet einen gruenen Job -- von einer
       # bestandenen Pruefung ist das nicht zu unterscheiden. (Genau darauf bin
