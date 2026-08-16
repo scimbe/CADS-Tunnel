@@ -25,6 +25,16 @@
 #     ./serve-role-container.sh
 #
 #   ./serve-role-container.sh --selftest   # verify docker/image/claude/handler resolvable, no network, no container started
+#
+# Alternate LLM backend (opt-in, additive — leave both unset for byte-identical old behavior):
+#   LLM_SHIM_HOST=/abs/path/to/some-cli-shim  LLM_ENV_FILE=/abs/path/to/llm.env  ...
+# When LLM_SHIM_HOST is set, the claude binary + CLAUDE_HOME/.claude.json mounts are skipped
+# entirely (the role-serve container never sees Claude Code credentials at all — closes the
+# #320 comment's residual credential-exposure note for whichever role opts in) and the shim is
+# bind-mounted + wired via CT_LLM_CMD instead. LLM_ENV_FILE is a plain KEY=VALUE file (e.g.
+# LITELLM_BASE_URL/LITELLM_API_KEY/LITELLM_MODEL) merged into the container's env — kept
+# generic/nameless here so this script doesn't need to know about any particular backend's
+# variable names.
 set -euo pipefail
 
 die() { printf 'serve-role-container: %s\n' "$*" >&2; exit 1; }
@@ -47,15 +57,22 @@ CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.claude.json}"
 HANDLER_CMD_HOST="${HANDLER_CMD_HOST:?set HANDLER_CMD_HOST (host path to the role handler script)}"
 CONTAINER_NAME="${CONTAINER_NAME:?set CONTAINER_NAME (unique docker container name for this role)}"
+LLM_SHIM_HOST="${LLM_SHIM_HOST:-}"
+LLM_ENV_FILE="${LLM_ENV_FILE:-}"
 
 if [ "${1:-}" = "--selftest" ]; then
   command -v docker >/dev/null 2>&1 || die "docker not found"
-  [ -n "$CLAUDE_BIN_PATH" ] || die "claude CLI not resolvable — set CLAUDE_BIN_PATH"
-  [ -x "$CLAUDE_BIN_PATH" ] || die "CLAUDE_BIN_PATH=$CLAUDE_BIN_PATH not executable"
-  [ -d "$CLAUDE_HOME" ] || die "CLAUDE_HOME=$CLAUDE_HOME not found (expected e.g. .credentials.json inside)"
+  if [ -n "$LLM_SHIM_HOST" ]; then
+    [ -x "$LLM_SHIM_HOST" ] || die "LLM_SHIM_HOST=$LLM_SHIM_HOST not found or not executable"
+    [ -n "$LLM_ENV_FILE" ] && [ -f "$LLM_ENV_FILE" ] || die "LLM_ENV_FILE=$LLM_ENV_FILE not found (required alongside LLM_SHIM_HOST)"
+  else
+    [ -n "$CLAUDE_BIN_PATH" ] || die "claude CLI not resolvable — set CLAUDE_BIN_PATH"
+    [ -x "$CLAUDE_BIN_PATH" ] || die "CLAUDE_BIN_PATH=$CLAUDE_BIN_PATH not executable"
+    [ -d "$CLAUDE_HOME" ] || die "CLAUDE_HOME=$CLAUDE_HOME not found (expected e.g. .credentials.json inside)"
+  fi
   [ -x "$HANDLER_CMD_HOST" ] || die "HANDLER_CMD_HOST=$HANDLER_CMD_HOST not found or not executable"
   docker image inspect "$IMAGE" >/dev/null 2>&1 || die "IMAGE=$IMAGE not found locally (docker image inspect failed)"
-  echo "serve-role-container: docker + image + claude + handler all resolvable — selftest passed (no CP/edge calls made, no container started)"
+  echo "serve-role-container: docker + image + $([ -n "$LLM_SHIM_HOST" ] && echo "llm-shim" || echo "claude") + handler all resolvable — selftest passed (no CP/edge calls made, no container started)"
   exit 0
 fi
 
@@ -66,9 +83,14 @@ fi
 : "${GRANT:?set GRANT (hex signed grant for this role, accept direction)}"
 : "${SERVICE:?set SERVICE (text_generation | safety_check | code_generation | security_review)}"
 
-[ -n "$CLAUDE_BIN_PATH" ] || die "claude CLI not resolvable — set CLAUDE_BIN_PATH"
-CLAUDE_REAL_BIN="$(resolve_real_path "$CLAUDE_BIN_PATH")"
-[ -x "$CLAUDE_REAL_BIN" ] || die "resolved claude binary $CLAUDE_REAL_BIN not executable"
+if [ -n "$LLM_SHIM_HOST" ]; then
+  [ -x "$LLM_SHIM_HOST" ] || die "LLM_SHIM_HOST=$LLM_SHIM_HOST not found or not executable"
+  [ -n "$LLM_ENV_FILE" ] && [ -f "$LLM_ENV_FILE" ] || die "LLM_ENV_FILE=$LLM_ENV_FILE not found (required alongside LLM_SHIM_HOST)"
+else
+  [ -n "$CLAUDE_BIN_PATH" ] || die "claude CLI not resolvable — set CLAUDE_BIN_PATH"
+  CLAUDE_REAL_BIN="$(resolve_real_path "$CLAUDE_BIN_PATH")"
+  [ -x "$CLAUDE_REAL_BIN" ] || die "resolved claude binary $CLAUDE_REAL_BIN not executable"
+fi
 [ -x "$HANDLER_CMD_HOST" ] || die "HANDLER_CMD_HOST=$HANDLER_CMD_HOST not found or not executable"
 
 # The handler script itself is bind-mounted in (not baked into IMAGE), same reasoning as
@@ -111,19 +133,40 @@ trap 'rm -f "$RUNTIME_ENV"' EXIT
   printf 'CT_AGENT_SERVICE_HANDLER_CMD=%s\n' "$HANDLER_CMD_IN_CONTAINER"
   printf 'CT_AGENT_SERVICES=%s\n' "$SERVICE"
   printf 'HOME=%s\n' "$RUNTIME_HOME"
+  if [ -n "$LLM_SHIM_HOST" ]; then
+    printf 'CT_LLM_CMD=/usr/local/bin/llm-shim\n'
+    cat "$LLM_ENV_FILE"
+    printf '\n'
+  fi
 } > "$RUNTIME_ENV"
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER_NAME" \
-  --restart unless-stopped \
-  --network "${DOCKER_NETWORK:-bridge}" \
-  --user "$RUNTIME_UID:$RUNTIME_GID" \
-  --env-file "$RUNTIME_ENV" \
-  -v "$CLAUDE_REAL_BIN:/usr/local/bin/claude:ro" \
-  -v "$CLAUDE_HOME:$RUNTIME_HOME/.claude:ro" \
-  $([ -f "$CLAUDE_JSON" ] && printf -- '-v %s:%s/.claude.json:ro' "$CLAUDE_JSON" "$RUNTIME_HOME") \
-  -v "$HANDLER_CMD_HOST:$HANDLER_CMD_IN_CONTAINER:ro" \
-  "$IMAGE" \
-  ct-agent channel
+if [ -n "$LLM_SHIM_HOST" ]; then
+  # Shim path: no claude binary, no $CLAUDE_HOME/.claude.json mount at all — this role-serve
+  # container never sees Claude Code credentials (narrows the #320 comment's blast radius for
+  # whichever role opts into this, since a compromised handler here has nothing of that shape
+  # to exfiltrate in the first place).
+  docker run -d --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --network "${DOCKER_NETWORK:-bridge}" \
+    --user "$RUNTIME_UID:$RUNTIME_GID" \
+    --env-file "$RUNTIME_ENV" \
+    -v "$LLM_SHIM_HOST:/usr/local/bin/llm-shim:ro" \
+    -v "$HANDLER_CMD_HOST:$HANDLER_CMD_IN_CONTAINER:ro" \
+    "$IMAGE" \
+    ct-agent channel
+else
+  docker run -d --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --network "${DOCKER_NETWORK:-bridge}" \
+    --user "$RUNTIME_UID:$RUNTIME_GID" \
+    --env-file "$RUNTIME_ENV" \
+    -v "$CLAUDE_REAL_BIN:/usr/local/bin/claude:ro" \
+    -v "$CLAUDE_HOME:$RUNTIME_HOME/.claude:ro" \
+    $([ -f "$CLAUDE_JSON" ] && printf -- '-v %s:%s/.claude.json:ro' "$CLAUDE_JSON" "$RUNTIME_HOME") \
+    -v "$HANDLER_CMD_HOST:$HANDLER_CMD_IN_CONTAINER:ro" \
+    "$IMAGE" \
+    ct-agent channel
+fi
 
 echo "serve-role-container: $CONTAINER_NAME started — 'docker logs -f $CONTAINER_NAME' to watch it" >&2
