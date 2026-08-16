@@ -784,6 +784,7 @@ fn spawn_front_door_pairer_reaper<T, N, R>(
         let mut throttle = crate::channel_broker::ReapLogThrottle::new(
             crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
             crate::channel_broker::REAP_LOG_MAX_TRACKED_PAIRS,
+            crate::channel_broker::REAP_LOG_TOP_PAIRS,
         );
         loop {
             ticker.tick().await;
@@ -830,12 +831,12 @@ fn spawn_front_door_pairer_reaper<T, N, R>(
                 eprintln!(
                     "ct-edge: front-door channel pairer reap summary (#530) — {} reap(s) of {} distinct (channel,holder) pair(s) in the last {}s ({} beyond the tracking cap); repeats after each pair's first full line are aggregated here; top: {}",
                     s.total,
-                    s.distinct_pairs,
+                    s.distinct_keys,
                     crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
                     s.untracked,
                     s.top
                         .iter()
-                        .map(|(c, h, n)| format!("channel={c} holder={h} x{n}"))
+                        .map(|((c, h), n)| format!("channel={c} holder={h} x{n}"))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -983,6 +984,211 @@ async fn read_client_hello_bytes_bounded<S: AsyncRead + Unpin>(
         .await
         .map_err(|_| "front door: ClientHello read timed out")?
         .ok_or_else(|| "front door: not a TLS ClientHello".into())
+}
+
+/// #533: the classes of `:443` front-door failure that are just a client hanging up —
+/// normal, expected browser/HTTP-client behavior, not an edge-side fault.
+///
+/// Measured on `help.bunsenbrenner.org` (2026-08-16 load test, 340 requests, **zero
+/// failed requests**): 143 `ECONNRESET` + 15 missing-`close_notify` lines in the same
+/// five minutes, against exactly 2 real signals (a scanner's hostname miss and a
+/// non-TLS handshake). The real signals were unfindable in the noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ClientAbortClass {
+    /// `ECONNRESET` — the client sent an RST. The overwhelming majority case: a
+    /// browser/`curl` that closes a keep-alive connection with unread data still in
+    /// its receive buffer makes the kernel answer subsequent bytes with an RST.
+    ConnectionReset,
+    /// `EPIPE`/`BrokenPipe` — the client's half went away while the edge was writing.
+    BrokenPipe,
+    /// rustls' "peer closed connection without sending TLS close_notify": the client
+    /// dropped the TCP connection instead of shutting the TLS session down cleanly.
+    /// Ubiquitous among real HTTP clients.
+    TlsCloseNotifyMissing,
+}
+
+impl ClientAbortClass {
+    /// Stable, greppable label for the summary line (never an operator-visible
+    /// error message — those keep their original wording).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ConnectionReset => "connection-reset",
+            Self::BrokenPipe => "broken-pipe",
+            Self::TlsCloseNotifyMissing => "tls-close-notify-missing",
+        }
+    }
+}
+
+/// #533: rustls' message for "the peer just dropped the TCP connection instead of
+/// sending `close_notify`" (`rustls::conn` `UNEXPECTED_EOF_MESSAGE`, surfaced through
+/// `tokio-rustls` as an `io::Error` of kind `UnexpectedEof` carrying exactly this
+/// text). See [`classify_io_client_abort`] for why the text — not just the kind — is
+/// the discriminator here.
+const RUSTLS_MISSING_CLOSE_NOTIFY: &str = "peer closed connection without sending TLS close_notify";
+
+/// #533: how far [`classify_client_abort`] walks an error's `source()` chain looking
+/// for the underlying `io::Error`. The measured lines are bare boxed `io::Error`s
+/// (depth 0), but an arm that wraps its transport error (hyper, a framing layer)
+/// must not silently lose the classification. Bounded so a pathological/cyclic chain
+/// can never spin this cold path.
+const CLIENT_ABORT_SOURCE_CHAIN_DEPTH: usize = 8;
+
+/// #533: does this `io::Error` mean "the client hung up", as opposed to a real
+/// edge-side failure?
+///
+/// **Typed, not string-matched**, for the two socket classes: `ErrorKind` is the
+/// contract, so a libc/OS message reword cannot silently re-enable the noise (nor,
+/// worse, silently start suppressing something else).
+///
+/// The rustls class is the one exception, and deliberately so: rustls reports it as a
+/// plain `io::Error` (`ErrorKind::UnexpectedEof` + a fixed message) rather than a
+/// downcastable `rustls::Error`, so there is no type to match on — and `UnexpectedEof`
+/// **alone** is NOT a benign-abort signal in this codebase (a torn frame mid-protocol
+/// surfaces as exactly that kind, and is a genuine connection error the fallback
+/// framing documents as such — see `ct_common::fallback_framing`). The substring is
+/// therefore used to NARROW a typed check, never to replace one: it can only ever
+/// shrink what is treated as benign. Same documented-fallback pattern as ct-agent's
+/// `is_definitive_admission_refusal`, and it fails safe in the same direction — if
+/// rustls ever rewords the message, this class simply reverts to being logged loudly
+/// line by line (the pre-#533 behavior), never the reverse.
+fn classify_io_client_abort(e: &std::io::Error) -> Option<ClientAbortClass> {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionReset => Some(ClientAbortClass::ConnectionReset),
+        std::io::ErrorKind::BrokenPipe => Some(ClientAbortClass::BrokenPipe),
+        std::io::ErrorKind::UnexpectedEof if e.to_string().contains(RUSTLS_MISSING_CLOSE_NOTIFY) => {
+            Some(ClientAbortClass::TlsCloseNotifyMissing)
+        }
+        _ => None,
+    }
+}
+
+/// #533: pure classifier — is this front-door error a benign client abort, and which
+/// class? `None` means "not provably benign", which is the ONLY verdict that matters
+/// for #127: anything unclassified stays loud, line for line, unchanged.
+pub fn classify_client_abort(e: &BoxError) -> Option<ClientAbortClass> {
+    let root: &(dyn std::error::Error + 'static) = e.as_ref();
+    let mut cur = Some(root);
+    for _ in 0..CLIENT_ABORT_SOURCE_CHAIN_DEPTH {
+        let err = cur?;
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if let Some(class) = classify_io_client_abort(io) {
+                return Some(class);
+            }
+        }
+        cur = err.source();
+    }
+    None
+}
+
+/// #533: the boolean spelling of [`classify_client_abort`], for call sites that only
+/// need "may this be condensed?".
+pub fn is_benign_client_abort(e: &BoxError) -> bool {
+    classify_client_abort(e).is_some()
+}
+
+/// #533: `ct_edge_front_door_client_aborts_total` — every benign `:443` front-door
+/// client abort, INCLUDING the ones whose log line the throttle suppresses. Sibling of
+/// `ct_edge_channel_park_reaped_total` (#530) and static for the same reason: the
+/// front-door connection handler deliberately has no `EdgeState` handle for this.
+/// The counter is the complete record; the log is the bounded diagnostic sample.
+static FRONT_DOOR_CLIENT_ABORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #533: `ct_edge_front_door_client_aborts_total` for `/metrics`.
+pub fn front_door_client_aborts_total() -> u64 {
+    FRONT_DOOR_CLIENT_ABORTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #533: how long one front-door client-abort summary window lasts. Same 10 min as the
+/// reap throttle's window (#530) — long enough that a busy edge condenses hundreds of
+/// lines into one, short enough that a rate change is still visible in the log alone.
+pub(crate) const FRONT_DOOR_ABORT_LOG_WINDOW_SECS: u64 = 600;
+
+/// #533: cap on the abort classes tracked per window. The key space is a closed enum
+/// today (3 variants), so the cap can never bite in production — it exists because the
+/// shared throttle's memory bound is a property of the core, not of the caller, and it
+/// keeps the invariant true if the classifier ever gains a data-derived key.
+pub(crate) const FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES: usize = 8;
+
+/// #533: how many classes a window summary names explicitly.
+pub(crate) const FRONT_DOOR_ABORT_LOG_TOP_CLASSES: usize = 3;
+
+/// #533: what [`log_front_door_error`] did with one front-door error — returned so a
+/// test can pin the decision without capturing stderr.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FrontDoorErrorLog {
+    /// NOT a provably benign client abort: logged in full, unconditionally, exactly as
+    /// before #533. This is the #127 property ("nothing fails invisibly") and it is
+    /// never throttled — no window, no cap, no aggregation.
+    Loud,
+    /// A benign abort, first of its class this window: logged in full (annotated).
+    BenignFirst(ClientAbortClass),
+    /// A benign abort, a repeat this window: not logged (only under `CT_EDGE_TRACE`);
+    /// counted in the metric and in the window summary.
+    BenignSuppressed(ClientAbortClass),
+}
+
+/// #533: log one `:443` front-door handler error, condensing the benign client-abort
+/// classes and leaving everything else exactly as loud as #127 made it.
+///
+/// Event-driven rather than tick-driven (unlike the #530 reapers, this path has no
+/// periodic loop to hang a window rollover on): each abort first rolls the previous
+/// window over if it has elapsed, then notes itself. Consequence, deliberately
+/// accepted: on an edge that goes quiet, the last window's summary waits for the next
+/// abort. That costs nothing in fidelity — `ct_edge_front_door_client_aborts_total`
+/// counts every abort the moment it happens and is the complete record.
+fn log_front_door_error(
+    log: &std::sync::Mutex<crate::log_throttle::WindowLogThrottle<ClientAbortClass>>,
+    now: ct_common::channel::UnixSeconds,
+    e: &BoxError,
+) -> FrontDoorErrorLog {
+    // #127: log any front-door failure (TLS accept, routing, every arm) — the whole
+    // handler's `Result` used to be discarded, so a connection that reached the edge
+    // but failed anywhere in serve_front_door was completely invisible to the
+    // operator. Unclassified == loud, always, first thing.
+    let Some(class) = classify_client_abort(e) else {
+        eprintln!("ct-edge: :443 front-door connection error: {e}");
+        return FrontDoorErrorLog::Loud;
+    };
+    FRONT_DOOR_CLIENT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (summary, decision) = {
+        let mut t = log.lock_safe(); // #497-style poison resilience; no await under the lock
+        (t.window_summary(now), t.note(now, class))
+    };
+    if let Some(s) = summary {
+        eprintln!(
+            "ct-edge: :443 front-door benign client-abort summary (#533) — {} abort(s) of {} distinct class(es) in the last {}s ({} beyond the tracking cap); repeats after each class's first full line are aggregated here; top: {}",
+            s.total,
+            s.distinct_keys,
+            FRONT_DOOR_ABORT_LOG_WINDOW_SECS,
+            s.untracked,
+            s.top
+                .iter()
+                .map(|(c, n)| format!("{} x{n}", c.label()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    match decision {
+        crate::log_throttle::LogDecision::LogFull => {
+            // Same leading text as before #533 (operators grep it; it is the line the
+            // issue was filed about) plus the classification, so it is obvious that
+            // further aborts of this class are being aggregated rather than lost.
+            eprintln!(
+                "ct-edge: :443 front-door connection error: {e} (benign client abort, class={}; further ones this window are aggregated — #533)",
+                class.label()
+            );
+            FrontDoorErrorLog::BenignFirst(class)
+        }
+        crate::log_throttle::LogDecision::Suppress => {
+            // The per-occurrence view the issue asked to keep reachable: still
+            // available on demand, just not in the default operator log.
+            edge_trace(format_args!(
+                ":443 front-door benign client abort (class={}): {e}",
+                class.label()
+            ));
+            FrontDoorErrorLog::BenignSuppressed(class)
+        }
+    }
 }
 
 pub async fn serve_front_door(
@@ -3138,6 +3344,19 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     // lifetime, which a whole-handler timeout here would incorrectly bound.
                     let browser_tunnel_cap_fd = browser_tunnel_cap.clone();
                     let tcp_agent_cap_fd = tcp_agent_cap.clone();
+                    // #533: shared, memory-bounded state for condensing the benign
+                    // client-abort log lines (see `log_front_door_error`). One per
+                    // listener rather than a process-wide static, so it is scoped to the
+                    // thing it describes; behind a `std::sync::Mutex` because — unlike the
+                    // #530 reapers, which are single tasks — this is touched from every
+                    // concurrently spawned connection handler. Never held across an await.
+                    let front_door_abort_log = Arc::new(std::sync::Mutex::new(
+                        crate::log_throttle::WindowLogThrottle::<ClientAbortClass>::new(
+                            FRONT_DOOR_ABORT_LOG_WINDOW_SECS,
+                            FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES,
+                            FRONT_DOOR_ABORT_LOG_TOP_CLASSES,
+                        ),
+                    ));
                     tokio::spawn(crate::transport::serve_listener(
                         fl,
                         conn_cap.clone(),
@@ -3155,6 +3374,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             let relay_gate_ctx = relay_gate_ctx.clone();
                             let browser_tunnel_cap = browser_tunnel_cap_fd.clone();
                             let tcp_agent_cap = tcp_agent_cap_fd.clone();
+                            let abort_log = front_door_abort_log.clone();
                             async move {
                                 let mut nonce = [0u8; 16];
                                 rand::rngs::OsRng.fill_bytes(&mut nonce);
@@ -3163,6 +3383,10 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 // every arm) — the whole handler's `Result` was discarded, so
                                 // a connection that reached the edge but failed anywhere in
                                 // serve_front_door was completely invisible to the operator.
+                                // #533: that property is unchanged for every error that is
+                                // not PROVABLY a benign client abort; the benign classes are
+                                // counted (ct_edge_front_door_client_aborts_total) and
+                                // condensed instead of repeated per occurrence.
                                 if let Err(e) = serve_front_door(
                                     tcp,
                                     &state,
@@ -3180,7 +3404,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 )
                                 .await
                                 {
-                                    eprintln!("ct-edge: :443 front-door connection error: {e}");
+                                    log_front_door_error(&abort_log, unix_now(), &e);
                                 }
                             }
                         },
@@ -3599,6 +3823,205 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    /// #533: build the front-door abort throttle a test drives by hand.
+    fn front_door_abort_log(
+        window_secs: u64,
+        max_tracked: usize,
+    ) -> std::sync::Mutex<crate::log_throttle::WindowLogThrottle<ClientAbortClass>> {
+        std::sync::Mutex::new(crate::log_throttle::WindowLogThrottle::new(
+            window_secs,
+            max_tracked,
+            FRONT_DOOR_ABORT_LOG_TOP_CLASSES,
+        ))
+    }
+
+    /// #533: the classifier separates the three benign client-abort classes from
+    /// everything else, TYPED (`io::ErrorKind`), not by matching the OS message — so a
+    /// libc/OS reword can neither re-enable the noise nor start hiding something else.
+    #[test]
+    fn client_abort_classifier_separates_the_benign_classes_typed_533() {
+        let reset: BoxError = Box::new(std::io::Error::from_raw_os_error(104)); // ECONNRESET
+        assert!(
+            reset.to_string().contains("Connection reset by peer"),
+            "the exact line measured in the load test: {reset}"
+        );
+        assert_eq!(
+            classify_client_abort(&reset),
+            Some(ClientAbortClass::ConnectionReset),
+            "143/158 of the measured noise"
+        );
+        let pipe: BoxError = Box::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "whatever"));
+        assert_eq!(
+            classify_client_abort(&pipe),
+            Some(ClientAbortClass::BrokenPipe),
+            "EPIPE is classified by KIND, regardless of message"
+        );
+        assert!(is_benign_client_abort(&reset) && is_benign_client_abort(&pipe));
+    }
+
+    /// #533: the rustls "no close_notify" class. rustls surfaces it as a plain
+    /// `io::Error(UnexpectedEof, <fixed text>)` — there is no `rustls::Error` to
+    /// downcast to — so the text NARROWS the typed kind check. That narrowing is the
+    /// point: a bare `UnexpectedEof` (e.g. a torn frame, which
+    /// `ct_common::fallback_framing` documents as a real connection error) must stay
+    /// loud.
+    #[test]
+    fn client_abort_classifier_narrows_unexpected_eof_to_the_rustls_close_notify_case_533() {
+        let close_notify: BoxError = Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            RUSTLS_MISSING_CLOSE_NOTIFY,
+        ));
+        assert_eq!(
+            classify_client_abort(&close_notify),
+            Some(ClientAbortClass::TlsCloseNotifyMissing),
+            "15/158 of the measured noise"
+        );
+        let torn_frame: BoxError = Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ));
+        assert_eq!(
+            classify_client_abort(&torn_frame),
+            None,
+            "UnexpectedEof alone is NOT benign — a torn frame is a real connection error"
+        );
+    }
+
+    /// #533: an `io::Error` reached through a wrapping error's `source()` chain is
+    /// still classified (an arm that wraps its transport error must not silently lose
+    /// the classification), and the walk is depth-bounded.
+    #[test]
+    fn client_abort_classifier_walks_the_source_chain_533() {
+        #[derive(Debug)]
+        struct Wrap(std::io::Error);
+        impl std::fmt::Display for Wrap {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "front door: {}", self.0)
+            }
+        }
+        impl std::error::Error for Wrap {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let wrapped: BoxError = Box::new(Wrap(std::io::Error::from_raw_os_error(104)));
+        assert_eq!(
+            classify_client_abort(&wrapped),
+            Some(ClientAbortClass::ConnectionReset),
+            "a wrapped ECONNRESET is the same benign abort"
+        );
+    }
+
+    /// #533 / #127 GUARD: the two real signals the load test drowned — and any other
+    /// unrecognized error — must stay LOUD, line for line, unthrottled. This is the
+    /// property #127 bought and #533 must not spend: `Loud` every time, no window, no
+    /// suppression, and no contribution to the client-abort counter.
+    #[test]
+    fn real_front_door_errors_are_never_suppressed_127() {
+        let log = front_door_abort_log(FRONT_DOOR_ABORT_LOG_WINDOW_SECS, FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES);
+        let before = front_door_client_aborts_total();
+        for real in [
+            // The two real signals measured in the same window as the 158 benign lines.
+            "no tunnel registered for host 'scanner.example'",
+            "front door: not a TLS ClientHello",
+            // ... and a few other genuine failures from this handler's arms.
+            "front door: ClientHello read timed out",
+            "channel join admission exchange stalled (#140)",
+        ] {
+            let e: BoxError = real.into();
+            assert!(!is_benign_client_abort(&e), "{real} must not classify as benign");
+            // Repeated 5x: a benign class would be condensed after the first; a real
+            // error must produce `Loud` EVERY time.
+            for i in 0..5 {
+                assert_eq!(
+                    log_front_door_error(&log, 1_000 + i, &e),
+                    FrontDoorErrorLog::Loud,
+                    "occurrence {i} of '{real}' must stay loud"
+                );
+            }
+        }
+        assert_eq!(
+            front_door_client_aborts_total(),
+            before,
+            "a real error must never raise ct_edge_front_door_client_aborts_total"
+        );
+    }
+
+    /// #533: the condensing itself — first abort of a class logs full, repeats are
+    /// suppressed, and the metric counts EVERY abort including the suppressed ones.
+    #[test]
+    fn benign_client_aborts_are_condensed_but_all_counted_533() {
+        let log = front_door_abort_log(FRONT_DOOR_ABORT_LOG_WINDOW_SECS, FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES);
+        // Delta-based: the counter is a process-wide static other tests also touch.
+        let before = front_door_client_aborts_total();
+        let reset: BoxError = Box::new(std::io::Error::from_raw_os_error(104));
+        assert_eq!(
+            log_front_door_error(&log, 1_000, &reset),
+            FrontDoorErrorLog::BenignFirst(ClientAbortClass::ConnectionReset),
+            "first of its class this window -> full line"
+        );
+        for i in 1..143u64 {
+            assert_eq!(
+                log_front_door_error(&log, 1_000 + i, &reset),
+                FrontDoorErrorLog::BenignSuppressed(ClientAbortClass::ConnectionReset),
+                "repeat {i} is condensed"
+            );
+        }
+        // A different class is its own first sighting (the two classes measured live).
+        let close_notify: BoxError = Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            RUSTLS_MISSING_CLOSE_NOTIFY,
+        ));
+        assert_eq!(
+            log_front_door_error(&log, 1_100, &close_notify),
+            FrontDoorErrorLog::BenignFirst(ClientAbortClass::TlsCloseNotifyMissing),
+        );
+        assert_eq!(
+            front_door_client_aborts_total(),
+            before + 144,
+            "the counter rises for suppressed aborts too — it is the complete record"
+        );
+        // 144 occurrences produced exactly 2 log lines: the measured 158-from-340 noise
+        // collapses to one line per class per window.
+        let s = log
+            .lock_safe()
+            .window_summary(1_000 + FRONT_DOOR_ABORT_LOG_WINDOW_SECS)
+            .expect("the window elapsed with repeats -> one summary");
+        assert_eq!(s.total, 144, "the summary accounts for every abort in the window");
+        assert_eq!(s.distinct_keys, 2);
+        assert_eq!(s.untracked, 0);
+        assert_eq!(s.top[0], (ClientAbortClass::ConnectionReset, 143), "busiest class first");
+        assert_eq!(s.top[1], (ClientAbortClass::TlsCloseNotifyMissing, 1));
+    }
+
+    /// #533: the window rolls over event-driven (this path has no periodic tick), and
+    /// the tracking cap bounds the state even though today's key space is a closed
+    /// enum — the memory bound is a property of the shared core, not of this caller.
+    #[test]
+    fn front_door_abort_window_rolls_over_and_the_cap_bounds_the_state_533() {
+        let log = front_door_abort_log(FRONT_DOOR_ABORT_LOG_WINDOW_SECS, 1);
+        let reset: BoxError = Box::new(std::io::Error::from_raw_os_error(104));
+        let pipe: BoxError = Box::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"));
+        assert_eq!(
+            log_front_door_error(&log, 1_000, &reset),
+            FrontDoorErrorLog::BenignFirst(ClientAbortClass::ConnectionReset)
+        );
+        assert_eq!(
+            log_front_door_error(&log, 1_001, &pipe),
+            FrontDoorErrorLog::BenignSuppressed(ClientAbortClass::BrokenPipe),
+            "beyond the tracking cap -> no full line, counted without identity"
+        );
+        assert_eq!(log.lock_safe().tracked_len(), 1, "the map never exceeds the cap");
+        // The next abort AFTER the window elapsed rolls it over: state resets (the
+        // reset IS the eviction) and the class logs in full again.
+        assert_eq!(
+            log_front_door_error(&log, 1_000 + FRONT_DOOR_ABORT_LOG_WINDOW_SECS, &reset),
+            FrontDoorErrorLog::BenignFirst(ClientAbortClass::ConnectionReset),
+            "after the rollover the class logs in full again"
+        );
+        assert_eq!(log.lock_safe().tracked_len(), 1, "the rolled-over window starts clean");
+    }
 
     /// #506: the KA park TTL is env-driven and DEFAULTS to the unchanged 30 s — the
     /// long-park flip must be an explicit operator decision gated on the client

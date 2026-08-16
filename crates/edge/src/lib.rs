@@ -7,6 +7,7 @@ pub mod channel_authorize;
 pub mod channel_broker;
 pub mod config;
 pub mod edge_mesh_client;
+pub mod log_throttle;
 pub mod observe;
 pub mod pki;
 pub mod relay;

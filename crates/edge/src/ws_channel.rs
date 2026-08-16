@@ -267,6 +267,7 @@ impl WsChannelState {
             let mut throttle = crate::channel_broker::ReapLogThrottle::new(
                 crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
                 crate::channel_broker::REAP_LOG_MAX_TRACKED_PAIRS,
+                crate::channel_broker::REAP_LOG_TOP_PAIRS,
             );
             loop {
                 tick.tick().await;
@@ -300,12 +301,12 @@ impl WsChannelState {
                     eprintln!(
                         "ct-edge: ws-channel pairer reap summary (#530) — {} reap(s) of {} distinct (channel,holder) pair(s) in the last {}s ({} beyond the tracking cap); repeats after each pair's first full line are aggregated here; top: {}",
                         s.total,
-                        s.distinct_pairs,
+                        s.distinct_keys,
                         crate::channel_broker::REAP_LOG_SUMMARY_WINDOW_SECS,
                         s.untracked,
                         s.top
                             .iter()
-                            .map(|(c, h, n)| format!("channel={c} holder={h} x{n}"))
+                            .map(|((c, h), n)| format!("channel={c} holder={h} x{n}"))
                             .collect::<Vec<_>>()
                             .join(", "),
                     );

@@ -69,6 +69,16 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          # regression signal.\n\
          # TYPE ct_edge_channel_park_reaped_total counter\n\
          ct_edge_channel_park_reaped_total {channel_park_reaped}\n\
+         # HELP ct_edge_front_door_client_aborts_total :443 front-door connections that ended\n\
+         # in a BENIGN client abort (ECONNRESET, EPIPE, or a peer that dropped the connection\n\
+         # without sending TLS close_notify) since start (#533) -- normal client behavior, not\n\
+         # an edge fault: a 2026-08-16 load test produced 158 of these from 340 SUCCESSFUL\n\
+         # requests. Counts EVERY such abort, including the ones whose log line the bounded\n\
+         # front-door abort logging suppresses, so the rate stays fully visible while the log\n\
+         # keeps only a bounded sample. Errors that are NOT provably benign are never counted\n\
+         # here and are still logged line by line (#127).\n\
+         # TYPE ct_edge_front_door_client_aborts_total counter\n\
+         ct_edge_front_door_client_aborts_total {front_door_client_aborts}\n\
          # HELP ct_edge_failovers_total Relays that failed over to a non-primary agent.\n\
          # TYPE ct_edge_failovers_total counter\n\
          ct_edge_failovers_total {failovers}\n\
@@ -99,6 +109,7 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         channel_relay_bytes = crate::channel_broker::channel_relay_totals().0,
         channel_splices = crate::channel_broker::channel_relay_totals().1,
         channel_park_reaped = crate::channel_broker::channel_park_reaped_total(),
+        front_door_client_aborts = crate::serve::front_door_client_aborts_total(),
         failovers = state.failovers_total(),
         tcp_parked = state.tcp_parked(),
         tcp_parks = state.tcp_parks_total(),
@@ -273,6 +284,8 @@ mod tests {
         // #530: the channel-pairer reap counter renders (value is a process-wide
         // static shared with other tests, so assert presence, not a number).
         assert!(body.contains("ct_edge_channel_park_reaped_total"), "{body}");
+        // #533: same for the front-door benign client-abort counter.
+        assert!(body.contains("ct_edge_front_door_client_aborts_total"), "{body}");
     }
 
     #[tokio::test]
