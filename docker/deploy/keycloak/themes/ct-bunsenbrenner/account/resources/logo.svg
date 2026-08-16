@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 172 32" height="32" role="img" aria-label="Bunsenbrenner.org">
-  <!-- Matches the portal's own .brand mark exactly: a soft amber dot (--accent:#d98a4f,
-       glow rgba(217,138,79,.22)) + bold serif "Bunsenbrenner" (--text:#eef1f7) + muted
-       ".org" (--muted:#8a93ad), see service.rs .brand/.flame/.tld. -->
+  <!-- Matches the portal's own .brand mark exactly: a soft amber dot (accent:#d98a4f,
+       glow rgba(217,138,79,.22)) + bold serif "Bunsenbrenner" (text:#eef1f7) + muted
+       ".org" (muted:#8a93ad), see service.rs .brand/.flame/.tld. -->
   <circle cx="10" cy="16" r="4.5" fill="#d98a4f"/>
   <circle cx="10" cy="16" r="7.5" fill="none" stroke="#d98a4f" stroke-opacity=".22" stroke-width="6"/>
   <text x="26" y="21" font-family="ui-serif, Georgia, 'Iowan Old Style', 'Palatino Linotype', serif" font-size="17" font-weight="700" letter-spacing="-.2" fill="#eef1f7">Bunsenbrenner<tspan fill="#8a93ad" font-weight="400"> .org</tspan></text>
