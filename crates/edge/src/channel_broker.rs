@@ -5708,9 +5708,15 @@ mod tests {
     }
 
     /// #555: and a resolver that CAN tell, and says the membership is gone, does cut.
+    ///
+    /// The resolver answers for ONE channel and says "still a member" for every other. That
+    /// is not test decoration -- a blanket "everyone is revoked" resolver is not a thing a
+    /// real control plane can be, and because the splice registry is process-wide, such a
+    /// resolver reaches the legs of every other test running at that moment. The first
+    /// version of this test did exactly that and made all three #555 tests flaky.
     #[tokio::test]
     async fn a_definitive_removal_cuts_the_splice_555() {
-        struct Authoritative;
+        struct Authoritative(ChannelId);
         impl crate::serve::ChannelMemberResolver for Authoritative {
             fn resolve_member<'a>(
                 &'a self,
@@ -5721,10 +5727,11 @@ mod tests {
             }
             fn membership_revoked<'a>(
                 &'a self,
-                _c: ChannelId,
+                c: ChannelId,
                 _h: [u8; 32],
             ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-                Box::pin(async { true })
+                let mine = self.0.0 == c.0;
+                Box::pin(async move { mine })
             }
         }
 
@@ -5732,8 +5739,11 @@ mod tests {
         let holder = [0xdd; 32];
         let guard = register_live_splice(&chan, &holder);
 
-        let resolver: std::sync::Arc<dyn crate::serve::ChannelMemberResolver> = std::sync::Arc::new(Authoritative);
-        assert_eq!(sweep_live_splice_memberships(&resolver).await, 1, "one leg cut");
+        let resolver: std::sync::Arc<dyn crate::serve::ChannelMemberResolver> =
+            std::sync::Arc::new(Authoritative(chan.clone()));
+        // Assert about OUR leg, not the sweep's total: the registry is process-wide, so a
+        // count is a statement about whatever else happens to be running.
+        assert!(sweep_live_splice_memberships(&resolver).await >= 1, "our leg was cut");
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), guard.cut()).await.is_ok(),
             "and the splice actually learns about it"

@@ -2435,19 +2435,28 @@ async fn claim_channel(
 /// form) to [`claim_page_submit`] on a distinct path, `.../claim-form`, so the
 /// browser form and the JSON API client above never contend over the same
 /// method+extractor on the same route.
+/// #521: where an unauthenticated visitor to a claim URL is sent, so the login round-trip
+/// brings them back to the page they actually wanted instead of the portal root.
+///
+/// Only a **valid** channel id rides into the target. This value lands in a `Location`
+/// header and then in `?next=`, so it must not be able to carry anything else: 32-byte hex
+/// is URL-safe by construction, and anything that fails to decode drops to the plain shell
+/// rather than being reflected. `sanitized_next` rejects non-portal targets independently on
+/// the receiving side — this is the near half of that pair, not a substitute for it.
+///
+/// Shared by the GET page and the POST submit. The GET is the deep link the issue was filed
+/// about; the POST is the same friction reached from the other direction, when a session
+/// expires while the participant is filling in the form.
+fn claim_login_target(channel_hex: &str) -> String {
+    match crate::service::hex_decode_32(channel_hex) {
+        Some(_) => format!("/portal?next=/portal/channels/{}/claim", channel_hex.to_ascii_lowercase()),
+        None => "/portal".to_string(),
+    }
+}
+
 async fn claim_page(State(st): State<ClaimState>, headers: HeaderMap, Path(channel_hex): Path<String>) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        // #521: carry the deep link through the login round-trip -- without this,
-        // a not-yet-signed-in participant landed on the portal home after OIDC
-        // and had to find the claim page again (the field first-contact friction).
-        // Only a VALID channel id rides into the redirect target (this is a
-        // Location header; hex is URL-safe by construction, anything else drops
-        // to the plain shell).
-        let target = match crate::service::hex_decode_32(&channel_hex) {
-            Some(_) => format!("/portal?next=/portal/channels/{}/claim", channel_hex.to_ascii_lowercase()),
-            None => "/portal".to_string(),
-        };
-        return Redirect::to(&target).into_response();
+        return Redirect::to(&claim_login_target(&channel_hex)).into_response();
     };
     // #514: a RETURNING member sees its claimed identities and any deposited grant
     // right on this page -- re-fetchable delivery, the point of the deposit flow.
@@ -2501,7 +2510,10 @@ async fn claim_page_submit(
     Form(req): Form<ClaimReq>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to("/portal").into_response();
+        // #521: the GET path already carried the deep link through login; a session that
+        // expires mid-form used to drop the participant on the portal root, which is the
+        // same friction reached from the other side.
+        return Redirect::to(&claim_login_target(&channel_hex)).into_response();
     };
     match do_claim(&st, &headers, &channel_hex, &req).await {
         // Live onboarding material only ever computed on the SUCCESS path -- an
@@ -2975,6 +2987,35 @@ you with <code>ct-agent channel allowlist add &lt;your-email&gt;</code> if it is
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #521: both claim entry points send an unauthenticated visitor back to the page they
+    /// wanted, and neither lets an unvalidated channel id into the `Location` header.
+    #[test]
+    fn claim_login_target_carries_only_a_valid_channel_id_521() {
+        let good = "ab".repeat(32);
+        assert_eq!(
+            claim_login_target(&good),
+            format!("/portal?next=/portal/channels/{good}/claim"),
+            "a real channel id rides through, so the login round-trip returns here"
+        );
+        assert_eq!(
+            claim_login_target(&good.to_ascii_uppercase()),
+            format!("/portal?next=/portal/channels/{good}/claim"),
+            "normalised to lowercase so the returned path matches the route"
+        );
+
+        // Anything that is not a 32-byte hex id falls back to the plain shell instead of
+        // being reflected -- this value ends up in a Location header and then in `?next=`.
+        let long = "ab".repeat(64);
+        for bad in ["", "zz", "../../admin", "ab12/../../admin", "https://evil.example", &long] {
+            assert_eq!(claim_login_target(bad), "/portal", "{bad:?} must not reach the target");
+        }
+        assert_eq!(
+            claim_login_target("ab\r\nSet-Cookie: x=1"),
+            "/portal",
+            "a header-injection attempt must not survive into a Location header"
+        );
+    }
     use crate::portal::sign_session_for_test;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
