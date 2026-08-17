@@ -174,6 +174,31 @@ its own. `cross_family` is ordinary dual-stack.\n\
         relay = state.relay_broker_heartbeat().expected_since(),
         rendezvous = state.rendezvous_broker_heartbeat().expected_since(),
     ));
+    // #551: the per-IP join-refusal penalty (#414/#542/#547) had no surface at all. Both
+    // numbers are needed and they answer different questions: `sheds_total` says whether
+    // the penalty has ever done anything, `tracked_ips` says whether it still CAN.
+    let penalty = state.join_refusal_penalty();
+    out.push_str(&format!(
+        "# HELP ct_edge_channel_join_penalty_sheds_total Channel-join connections shed \
+         pre-handshake because their source IP exhausted its definitive-refusal budget.\n\
+         # TYPE ct_edge_channel_join_penalty_sheds_total counter\n\
+         ct_edge_channel_join_penalty_sheds_total {sheds}\n\
+         # HELP ct_edge_channel_join_penalty_tracked_ips Distinct source IPs currently \
+         tracked by the penalty. Read this against ..._max: the table evicts oldest-first \
+         at the bound, so a value AT the bound means entries are being pushed out before \
+         they can reach the per-IP budget and the penalty is degraded -- which is what a \
+         refusal storm spread across many sources looks like. A high value is not \
+         reassurance.\n\
+         # TYPE ct_edge_channel_join_penalty_tracked_ips gauge\n\
+         ct_edge_channel_join_penalty_tracked_ips {tracked}\n\
+         # HELP ct_edge_channel_join_penalty_tracked_ips_max Capacity of that table, so a \
+         scraper can alert on the ratio instead of a hard-coded bound.\n\
+         # TYPE ct_edge_channel_join_penalty_tracked_ips_max gauge\n\
+         ct_edge_channel_join_penalty_tracked_ips_max {tracked_max}\n",
+        sheds = penalty.shed_total(),
+        tracked = penalty.tracked_ips(),
+        tracked_max = penalty.max_tracked_ips(),
+    ));
     if let Some(cap) = ws_channel_cap {
         out.push_str(&format!(
             "# HELP ct_edge_ws_channel_connections Browser WebSocket Agent-Fabric channel \
@@ -551,5 +576,39 @@ mod tests {
         assert!(body.contains("ct_edge_ws_channel_connections 2"), "{body}");
         assert!(body.contains("ct_edge_ws_channel_connections_max 3"), "{body}");
         assert!(body.contains("ct_edge_ws_channel_shed_total 1"), "{body}");
+    }
+
+    /// #551: the join-penalty numbers must track the penalty's REAL state, not just render.
+    #[test]
+    fn join_penalty_metrics_reflect_real_sheds_and_tracked_ips_551() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let penalty = state.join_refusal_penalty();
+
+        // Nothing has happened yet: both numbers present and zero. The zero matters -- an
+        // absent metric and a quiet penalty must not look the same to a scraper.
+        let body = render_edge_metrics(&state, None);
+        assert!(body.contains("ct_edge_channel_join_penalty_sheds_total 0"), "{body}");
+        assert!(body.contains("ct_edge_channel_join_penalty_tracked_ips 0"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "ct_edge_channel_join_penalty_tracked_ips_max {}",
+                penalty.max_tracked_ips()
+            )),
+            "the bound must be exported so the gauge can be read as a ratio: {body}"
+        );
+
+        penalty.note_shed();
+        penalty.note_shed();
+        penalty.note_shed();
+        for ip in ["203.0.113.1", "203.0.113.2"] {
+            let _ = penalty.note_definitive_refusal(ip.parse().unwrap(), 60);
+        }
+
+        let body = render_edge_metrics(&state, None);
+        assert!(body.contains("ct_edge_channel_join_penalty_sheds_total 3"), "{body}");
+        assert!(
+            body.contains("ct_edge_channel_join_penalty_tracked_ips 2"),
+            "two distinct sources refused, so two are tracked: {body}"
+        );
     }
 }

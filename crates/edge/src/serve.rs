@@ -3085,7 +3085,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         eprintln!("ct-edge: max {n} concurrent channel-broker connections (CT_EDGE_MAX_CHANNEL_BROKER_CONNECTIONS, #450)");
         ConnectionCap::new(n as usize)
     });
-    // #546/#551: say which way endpoint attestation is set, in BOTH directions. Every cap
+    // #546/#552: say which way endpoint attestation is set, in BOTH directions. Every cap
     // above prints its resolved value, but this one used to print nothing at all -- and a
     // security control that is silent when off is indistinguishable from one that is on.
     // That is the whole failure mode worth guarding here: an operator arms it in `.env`,

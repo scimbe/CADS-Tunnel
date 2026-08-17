@@ -1076,7 +1076,7 @@ fn require_attested_endpoint() -> bool {
     std::env::var("CT_EDGE_REQUIRE_ATTESTED_ENDPOINT").ok().as_deref() == Some("1")
 }
 
-/// #551: the startup line for [`require_attested_endpoint`], stated in both directions.
+/// #552: the startup line for [`require_attested_endpoint`], stated in both directions.
 ///
 /// A control that logs a line when armed and nothing when off cannot be checked by reading
 /// the log: silence means "off" and "this build predates the line" and "the log scrolled",
@@ -6998,7 +6998,7 @@ mod tests {
         );
     }
 
-    /// #551: the startup line must state the setting in BOTH directions, and must report
+    /// #552: the startup line must state the setting in BOTH directions, and must report
     /// what was actually PARSED rather than echo what was written.
     #[test]
     fn attested_endpoint_startup_line_speaks_when_off_too_551() {

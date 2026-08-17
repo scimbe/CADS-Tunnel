@@ -440,6 +440,9 @@ Exposed series (metadata only — the edge stays provider-blind):
 |--------|------|---------|
 | `ct_edge_active_tunnels` | gauge | distinct routing tokens with ≥1 live agent |
 | `ct_edge_active_agents` | gauge | live agent registrations (redundant agents #8 counted) |
+| `ct_edge_channel_join_penalty_sheds_total` | counter | channel-join connections shed pre-handshake because their source IP burned its definitive-refusal budget (#414/#542/#547). Zero means the penalty has never engaged — which is the normal state, not a fault |
+| `ct_edge_channel_join_penalty_tracked_ips` | gauge | distinct source IPs the penalty currently tracks. **Read against the max below, never alone** — see the warning under this table |
+| `ct_edge_channel_join_penalty_tracked_ips_max` | gauge | capacity of that table, exported so an alert can use the ratio instead of a hard-coded bound |
 | `ct_edge_registrations_total` | counter | agent registrations accepted since start |
 | `ct_edge_relays_total` | counter | client relays served |
 | `ct_edge_relay_bytes_total` | counter | bytes relayed (both directions) |
@@ -448,6 +451,20 @@ Exposed series (metadata only — the edge stays provider-blind):
 The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
+
+**A high `..._tracked_ips` is a warning, not reassurance (#551).** The penalty budgets
+definitive join refusals *per source IP* (30/minute), and tracks a bounded number of IPs,
+evicting oldest-first at the bound. A storm from one address therefore trips it in about a
+second — but a storm spread across **more distinct sources than the bound** pushes each entry
+out before any single one reaches its budget, and the penalty never engages at all. The
+metric that shows this is the ratio: `tracked_ips` sitting at `tracked_ips_max` means eviction
+is in progress and the defence is degraded. Alert on
+`ct_edge_channel_join_penalty_tracked_ips / ct_edge_channel_join_penalty_tracked_ips_max > 0.9`
+rather than on the shed counter, which stays at zero in exactly that scenario.
+
+Reading the two together: `sheds_total > 0` with a low `tracked_ips` is the penalty working
+as designed (a few noisy sources, absorbed). `sheds_total == 0` with `tracked_ips` at the
+bound is the failure mode above — many sources, none individually over budget, nothing shed.
 
 ### Per-listener connection caps
 
@@ -510,7 +527,7 @@ unobservable=153, no_address=539` — i.e. deliberately ahead of the first judge
 
 Arming is per-deployment: the shipped compose leaves `CT_EDGE_REQUIRE_ATTESTED_ENDPOINT`
 unset, and an operator sets it in their own `.env`. It takes effect at edge start, and the
-edge states which way it is set **in both directions** (#551):
+edge states which way it is set **in both directions** (#552):
 
 ```
 ct-edge: endpoint attestation ENFORCED -- ... (CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1, #546)

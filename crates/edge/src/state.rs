@@ -277,6 +277,36 @@ impl JoinRefusalPenalty {
     pub fn note_shed(&self) -> u64 {
         self.sheds.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
+
+    /// #551: read the running shed total, the half of [`ConnectionCap`]'s pattern this
+    /// type was missing. The counter above was incremented from the start but had no
+    /// reader, so it could never reach `/metrics` -- the penalty absorbed storms with
+    /// nothing to show for it, and "never fired" was indistinguishable from "not wired
+    /// up". Occasional power-of-two log lines are not a substitute: they are lost to log
+    /// rotation and cannot be graphed or alerted on.
+    pub fn shed_total(&self) -> u64 {
+        self.sheds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #551: how many distinct source IPs are currently tracked, bounded by
+    /// [`JOIN_REFUSAL_MAX_TRACKED_IPS`].
+    ///
+    /// This is the number that says whether the penalty can still *work*. The table
+    /// evicts FIFO at the bound, so an attacker spreading definitive refusals across more
+    /// than that many sources within one window pushes each entry out before it reaches
+    /// the per-IP budget -- the penalty then never engages. That is the defence failing
+    /// under precisely the conditions it exists for, and without this it fails silently:
+    /// a saturated table and an idle one both report nothing at all.
+    pub fn tracked_ips(&self) -> usize {
+        self.limiter.lock_safe().tracked_keys()
+    }
+
+    /// #551: the capacity the gauge above is read against. Exported rather than left as a
+    /// private constant so a scraper can alert on the RATIO instead of a hard-coded 4096
+    /// that silently becomes wrong if the bound is ever retuned.
+    pub fn max_tracked_ips(&self) -> usize {
+        JOIN_REFUSAL_MAX_TRACKED_IPS
+    }
 }
 
 impl Default for JoinRefusalPenalty {
@@ -2342,5 +2372,54 @@ mod tests {
         }
         assert!(state.join_penalized(ip, 60), "recorded via the state...");
         assert!(handle.penalized(ip, 60), "...and enforced via the broker loop's Arc handle");
+    }
+
+    /// #551: the penalty's two observable numbers, and — the point of the exercise — proof
+    /// that the tracked-IP bound is a REAL degradation and not a theoretical one.
+    #[test]
+    fn join_refusal_penalty_exposes_sheds_and_shows_the_table_bound_evicting_a_penalized_ip_551() {
+        let p = JoinRefusalPenalty::new();
+        let window = 60;
+
+        assert_eq!(p.shed_total(), 0, "a fresh penalty has shed nothing");
+        assert_eq!(p.tracked_ips(), 0, "...and tracks nobody");
+        p.note_shed();
+        p.note_shed();
+        assert_eq!(p.shed_total(), 2, "the counter that had no reader now has one");
+
+        // An offender earns its penalty the honest way.
+        let victim: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..=JOIN_REFUSALS_PER_MINUTE {
+            let _ = p.note_definitive_refusal(victim, window);
+        }
+        assert!(p.penalized(victim, window), "over budget, so it is shed");
+        assert_eq!(p.tracked_ips(), 1);
+
+        // Now a storm from many DISTINCT sources in the same window. Each one is a single
+        // refusal -- far under the per-IP budget, so none of them is ever penalized itself.
+        for i in 0..JOIN_REFUSAL_MAX_TRACKED_IPS {
+            let ip: std::net::IpAddr =
+                std::net::Ipv4Addr::from(0x0a00_0000u32 + i as u32).into();
+            let _ = p.note_definitive_refusal(ip, window);
+        }
+
+        assert_eq!(
+            p.tracked_ips(),
+            JOIN_REFUSAL_MAX_TRACKED_IPS,
+            "the table is capped, which is the memory bound working as designed"
+        );
+        assert_eq!(p.max_tracked_ips(), JOIN_REFUSAL_MAX_TRACKED_IPS);
+
+        // ...and this is the cost of that bound: the genuinely abusive IP was pushed out
+        // FIFO by traffic that was individually harmless, so it is no longer shed even
+        // though its behaviour has not changed and the window has not turned over. The
+        // penalty is degraded exactly when it is needed most, which is why the gauge above
+        // must be read against its max rather than reported as a bare number.
+        assert!(
+            !p.penalized(victim, window),
+            "a saturated table drops an already-penalized IP -- if this ever starts passing \
+             as `true`, the eviction policy changed and the #551 metric's documented meaning \
+             must change with it"
+        );
     }
 }
