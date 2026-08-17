@@ -670,8 +670,23 @@ Two things worth knowing before touching them:
 | `CT_EDGE_ID` | `primary` | stable per-deployment identifier in the multi-edge ownership registry (which edge owns which token/hostname). The default keeps a single-edge deployment consistent rather than keyed on an empty string; it only starts to matter once a **second** edge reports in |
 | `CT_EDGE_PUBLIC_ADDR` | `unknown` | the address this edge reports for itself in that registry. A single-edge deployment needs no value — rehydration after a restart works off the default id |
 | `CT_EDGE_KA_PARK_TTL_SECS` | `30` (= `CHANNEL_PARK_TTL_SECS`) | park TTL for a **keepalive-negotiated** `:443` leg. See the warning below before raising it |
+| `CT_EDGE_MESH_RELAY_ENABLED` | **off** | ADR-0021 Part 1: on a hostname this edge has no local route for, ask the registry which edge owns it and relay the raw bytes there. Off by default and a no-op until a **second** edge actually exists. See the failure modes below before turning it on |
 | `CT_DNS_STORE_PATH` | — | zone store for the standalone `ct-dns` service (not deployed here; `ct-dns` runs no container in this stack) |
 | `CT_AGENT_SETUP_URL` / `CT_AGENT_SETUP_PS1_URL` | upstream raw URL | where `/install` redirects for the shell and PowerShell setup scripts. Exists so a self-hosting operator can point at their own mirror instead of a single chokepoint on `raw.githubusercontent.com` — the product's own audience should not need to patch the crate for that (#448) |
+
+**Reading a mesh-relay failure (#549).** Once `CT_EDGE_MESH_RELAY_ENABLED` is on, a browser
+request for a peer-owned hostname can fail in two ways that look identical from the browser
+(both are a 000) but have opposite causes. The edge log distinguishes them, and each is bounded
+at 10 s — neither can hold the connection open indefinitely any more:
+
+| log line contains | what it means | where to look |
+|---|---|---|
+| `did not complete the dial+TLS handshake` | the peer edge is **not reachable** — no TCP, or TCP but no TLS | network path, firewall, or a stale `peer_addr` in the ownership registry (the peer edge's `CT_EDGE_PUBLIC_ADDR`) |
+| `sent no acknowledgement` | the peer edge **is reachable but is not answering the mesh-relay role** | the peer edge process itself: hung, or not configured with the same shared admin token |
+
+A *wrong* admin token is a third, distinct case: it is refused immediately with
+`peer edge refused mesh-relay`, not a timeout. Silence and refusal are different symptoms —
+do not treat a timeout as an authorization problem.
 
 **`CT_EDGE_KA_PARK_TTL_SECS` has a rollout order, not just a value.** A KA-negotiated park is
 observed (10 s NUL ticks, corpse detection ≤10 s), so a longer TTL is no resource risk and
