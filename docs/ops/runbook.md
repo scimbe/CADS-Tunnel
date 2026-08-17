@@ -440,6 +440,8 @@ Exposed series (metadata only — the edge stays provider-blind):
 |--------|------|---------|
 | `ct_edge_active_tunnels` | gauge | distinct routing tokens with ≥1 live agent |
 | `ct_edge_active_agents` | gauge | live agent registrations (redundant agents #8 counted) |
+| `ct_edge_listener_loop_last_seen_seconds{listener=…}` | gauge | last iteration of each TCP accept loop (10s idle tick included, so a quiet edge stays fresh). **No row means the listener was never registered** — i.e. this edge does not run it — which is not the same as healthy. Absence and freshness are different statements |
+| `ct_edge_listener_loop_expected_since_seconds{listener=…}` | gauge | when the edge decided to run it. Paired with the row above: expected but never seen = failed to bind |
 | `ct_edge_channel_join_penalty_sheds_total` | counter | channel-join connections shed pre-handshake because their source IP burned its definitive-refusal budget (#414/#542/#547). Zero means the penalty has never engaged — which is the normal state, not a fault |
 | `ct_edge_channel_join_penalty_tracked_ips` | gauge | distinct source IPs the penalty currently tracks. **Read against the max below, never alone** — see the warning under this table |
 | `ct_edge_channel_join_penalty_tracked_ips_max` | gauge | capacity of that table, exported so an alert can use the ratio instead of a hard-coded bound |
