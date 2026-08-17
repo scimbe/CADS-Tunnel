@@ -1495,13 +1495,45 @@ pub async fn serve_front_door(
                     "front door: relay gate not configured (set CT_EDGE_RELAY_UPSTREAM)".into(),
                 );
             };
+            // #547: the last of the four channel-join paths to consult the shared per-IP
+            // budget. A refused attempt costs MORE here than anywhere else -- TLS with the
+            // gate's own acceptor, a control-plane member lookup, an Ed25519 verify, fresh
+            // challenge bytes and a write, all before anything is refused -- so shedding
+            // early is worth more here, not less. Same budget as the QUIC loops, the
+            // ChannelBroker arm and the WS listener (#542), never a fourth one beside them.
+            {
+                let now = unix_now();
+                if state.join_penalized(observed.ip(), now) {
+                    let total = state.join_refusal_penalty().note_shed();
+                    if total.is_power_of_two() || total % 1000 == 0 {
+                        eprintln!(
+                            "ct-edge: channel-join penalty shedding {} pre-handshake (relay-gate) — {total} connection(s) shed since start",
+                            observed.ip()
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             let joined = Prepend {
                 pre: hello,
                 pos: 0,
                 inner: inbound,
             };
             let now = unix_now();
-            crate::relay_gate::serve_relay_gate(joined, ctx, now).await
+            let out = crate::relay_gate::serve_relay_gate(joined, ctx, now).await;
+            // A definitive refusal here is the same class the budget was built for
+            // (not-member / grant-verify / possession), typed rather than string-matched.
+            if let Err(e) = &out {
+                if crate::channel_broker::is_definitive_join_refusal(e)
+                    && state.note_definitive_join_refusal(observed.ip(), now)
+                {
+                    eprintln!(
+                        "ct-edge: channel-join penalty engaged for {} (relay-gate) — definitive-refusal budget exhausted; shedding its joins pre-handshake for the rest of the window",
+                        observed.ip()
+                    );
+                }
+            }
+            out
         }
         crate::sni::FrontDoorRoute::Reject => Ok(()),
     }
@@ -8393,6 +8425,42 @@ mod tests {
             log_front_door_error_on(LEG_TCP_FALLBACK, &log2, 1_002, &odd),
             FrontDoorErrorLog::Loud
         ));
+    }
+
+    #[test]
+    fn every_channel_join_path_shares_one_per_ip_budget_547() {
+        // #547: the budget only works if ALL paths feed and consult it. Three did; the
+        // relay-gate arm of the `:443` front door did not, and a refused attempt is more
+        // expensive there than anywhere else (TLS, a control-plane member lookup, an
+        // Ed25519 verify, fresh challenge bytes) -- so it is the last place that should
+        // have been left unmetered.
+        //
+        // Asserted at the budget itself rather than through a live TLS handshake: the
+        // property is that one IP's refusals on ANY path exhaust the same budget that every
+        // path checks, and that is a property of the shared JoinRefusalPenalty.
+        let penalty = crate::state::JoinRefusalPenalty::new();
+        let ip: std::net::IpAddr = [198, 51, 100, 7].into();
+        let now = 1_000u64;
+        assert!(!penalty.penalized(ip, now), "an unseen IP starts unpenalised");
+
+        // Refusals accumulate regardless of which path reported them.
+        let mut engaged = false;
+        for _ in 0..64 {
+            engaged |= penalty.note_definitive_refusal(ip, now);
+        }
+        assert!(engaged, "a definitive-refusal run must engage the budget");
+        assert!(penalty.penalized(ip, now), "and the SAME budget is what every path reads");
+
+        // A different source is unaffected -- the budget is per IP, not global, so one
+        // hostile peer cannot shed everyone else's joins.
+        let other: std::net::IpAddr = [203, 0, 113, 9].into();
+        assert!(!penalty.penalized(other, now), "the penalty must not be collective");
+
+        // And it is a window, not a life sentence: a later window starts clean.
+        assert!(
+            !penalty.penalized(ip, now + 10_000),
+            "the budget is per window -- a peer that misbehaved once is not banned forever"
+        );
     }
 
 }
