@@ -528,6 +528,7 @@ Läuft per Cron alle 10 Minuten und meldet sich nur bei einer Störung — gepr�
 | `refused-111`-Signatur im Log (15-Minuten-Fenster) | #522: Auslieferung an einen toten Park |
 | Broker-Loop-Schlag älter als 60 s | Channel-Joins über diesen Transport bleiben stehen |
 | Ein kanonischer Hostname liefert nicht seinen erwarteten Code | verlorener Hostname-Anspruch (#502), Agent mit veralteter Edge-IP, fehlgeschlagene Rehydrierung |
+| Portal (`bunsenbrenner.org/`) oder Keycloak-**Realm** (`auth…/realms/ct-demo`) antwortet falsch | die beiden Kernadressen; der Realm-Pfad ist bewusst gewählt (siehe unten) |
 
 Zwei Entwurfsentscheidungen, beide aus Fehlschlägen gelernt:
 
@@ -547,6 +548,17 @@ Tunnel totgelegt. Zwei Vorkehrungen gegen Falschalarme, beide aus Fehlern gelern
   übersprungen zu werden.
 - **Zwei Durchgänge mit 30 s Abstand statt einer Salve.** Nur was beide Male fällt, ist ein
   Alarm; dichtes Nachfassen hat am 15.08. einen 70-Prozent-Ausfall vollständig verdeckt.
+
+**Warum die Realm-URL und nicht die Keycloak-Startseite:** gemessen am 17.08. antwortet
+`auth.bunsenbrenner.org/` mit 302, `…/realms/ct-demo` mit 200 und ein nicht existierender
+Realm mit 404. Nur der Realm-Pfad unterscheidet also den Fall, der hier tatsächlich eingetreten
+ist — am 16.08. lag die Auth-Ebene ~6 Minuten, weil die Realm-Importdatei den Start verhinderte.
+Eine Sonde auf die Startseite hätte dabei geschwiegen.
+
+**Der Hinweistext richtet sich nach der Klasse.** Fällt eine Kernadresse, verweist die Meldung
+auf Keycloak-Start und Realm-Import; fällt ein Demo-Tunnel, auf Hostname-Anspruch, Agent-IP und
+Rehydrierung. Ein Hinweis, der bei einem Keycloak-Ausfall nach dem Hostname-Anspruch suchen
+lässt, schickt in die falsche Richtung und ist schlechter als gar keiner.
 
 Ein sinkender Neustartzähler gilt als Deploy (der Container wurde neu erzeugt) und setzt nur
 den Bezugspunkt neu. Gleiche Meldungen werden für 6 Stunden nicht erneut gemailt; Logzeile

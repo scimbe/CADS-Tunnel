@@ -121,6 +121,14 @@ fi
 SITES="${CT_WATCH_SITES:-sort=200 help=200 llm-34a13a96=200 game2048=200 a2a-demo=200 auction-demo=200 cookbook=200 flappy-demo=200 devsystem-demo=302}"
 ZONE="${CT_WATCH_ZONE:-bunsenbrenner.org}"
 SETTLE="${CT_WATCH_SETTLE_SECS:-90}"
+# Vollstaendige URLs, die keine Demo-Subdomain sind -- und die beiden wichtigsten
+# Adressen ueberhaupt: das Portal (das Produkt selbst) und die Realm-Auskunft von
+# Keycloak. Letztere ist mit Bedacht die Realm-URL und nicht die Startseite: am
+# 16.08. lag die Auth-Ebene ~6 Minuten, weil die Realm-Importdatei den Start
+# verhinderte -- ein Zustand, in dem Keycloak durchaus antworten kann, der Realm
+# aber fehlt. Ohne diese beiden Zeilen haette der Waechter jenen Ausfall nicht
+# gesehen (die Liste oben enthaelt nur die Demo-Tunnel).
+URLS="${CT_WATCH_URLS:-https://bunsenbrenner.org/=200 https://auth.bunsenbrenner.org/realms/ct-demo=200}"
 
 # Nur die kanonischen Namen aus dem Runbook -- Kurznamen wie `llm` haben keinen
 # DNS-Eintrag, und ein "konnte nicht aufloesen" darauf waere ein Falschalarm
@@ -136,11 +144,19 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
     # "geprueft und in Ordnung" liest.
     log "Dienste NICHT geprueft: der Edge lief erst ${AGE}s (Rehydrierung bis ~${SETTLE}s) -- das ist kein Freispruch"
   else
-    DOWN=""
+    # Eine gemeinsame Liste "url=code", damit Demo-Tunnel und Kernadressen durch
+    # denselben Pruef- und Nachfass-Pfad laufen (zwei Schleifen driften auseinander).
+    TARGETS=""
     for ENTRY in $SITES; do
-      HOST="${ENTRY%%=*}"; WANT="${ENTRY##*=}"
-      GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "https://$HOST.$ZONE/" 2>/dev/null || echo 000)
-      [ "$GOT" = "$WANT" ] || DOWN="$DOWN $HOST:$GOT(erwartet $WANT)"
+      TARGETS="$TARGETS https://${ENTRY%%=*}.$ZONE/=${ENTRY##*=}"
+    done
+    TARGETS="$TARGETS $URLS"
+
+    DOWN=""
+    for ENTRY in $TARGETS; do
+      URL="${ENTRY%=*}"; WANT="${ENTRY##*=}"
+      GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$URL" 2>/dev/null || echo 000)
+      [ "$GOT" = "$WANT" ] || DOWN="$DOWN $URL:$GOT(erwartet $WANT)"
       SITES_CHECKED=$((SITES_CHECKED + 1))
     done
     # Zweiter Durchgang mit echtem Abstand statt einer Salve: eine Momentaufnahme
@@ -150,14 +166,27 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
     if [ -n "$DOWN" ]; then
       sleep 30
       STILL=""
-      for ENTRY in $SITES; do
-        HOST="${ENTRY%%=*}"; WANT="${ENTRY##*=}"
-        case "$DOWN" in *" $HOST:"*) ;; *) continue;; esac
-        GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "https://$HOST.$ZONE/" 2>/dev/null || echo 000)
-        [ "$GOT" = "$WANT" ] || STILL="$STILL $HOST:$GOT(erwartet $WANT)"
+      for ENTRY in $TARGETS; do
+        URL="${ENTRY%=*}"; WANT="${ENTRY##*=}"
+        case "$DOWN" in *" $URL:"*) ;; *) continue;; esac
+        GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$URL" 2>/dev/null || echo 000)
+        [ "$GOT" = "$WANT" ] || STILL="$STILL $URL:$GOT(erwartet $WANT)"
       done
       if [ -n "$STILL" ]; then
-        ALARMS+=("Dienste nicht erreichbar (zweimal im Abstand von 30s geprueft):$STILL. Der Edge selbst laeuft -- typische Ursachen: verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, fehlgeschlagene Rehydrierung.")
+        # Der Hinweis muss zur Sache passen. Ein ausgefallener Demo-Tunnel und eine
+        # ausgefallene Kernadresse haben nichts miteinander zu tun, und ein Text, der
+        # bei einem Keycloak-Ausfall nach dem Hostname-Anspruch suchen laesst, schickt
+        # den Betreiber in die falsche Richtung -- schlechter als gar kein Hinweis.
+        HINT=""
+        for U in $URLS; do
+          case "$STILL" in *" ${U%=*}:"*) HINT="Betroffen ist eine KERNADRESSE (Portal bzw. Keycloak-Realm), nicht ein Demo-Tunnel: zuerst Keycloak-Start und Realm-Import pruefen (eine unbrauchbare Realm-Datei verhindert den Start).";; esac
+        done
+        for E in $SITES; do
+          case "$STILL" in *" https://${E%%=*}.$ZONE/:"*)
+            HINT="$HINT${HINT:+ }Betroffen ist mindestens ein Demo-Tunnel, waehrend der Edge laeuft: verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, oder eine fehlgeschlagene Rehydrierung.";;
+          esac
+        done
+        ALARMS+=("Dienste nicht erreichbar (zweimal im Abstand von 30s geprueft):$STILL. ${HINT:-Der Edge selbst laeuft.}")
       else
         log "voruebergehender Aussetzer, beim zweiten Durchgang wieder erreichbar:$DOWN"
       fi
