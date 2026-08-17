@@ -1227,6 +1227,170 @@ fn note_channel_rendezvous_pair() {
     CHANNEL_RENDEZVOUS_PAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// #555: process-wide registry of channel splices that are **currently carrying bytes**.
+///
+/// Membership is checked once, at admission. After that `finish_quic_pair_inner` /
+/// `finish_stream_pair_inner` copy bytes and consult nothing, so removing a member from a
+/// channel had no effect on their live connection — measured: the removed member kept
+/// receiving and answering indefinitely. `channel_remove_member` is a real routed endpoint,
+/// so that is a control an operator can exercise and watch do nothing.
+///
+/// Process-wide rather than threaded through the completers on purpose. The resolver lives
+/// far from the splice — passing it down would touch every completer, wrapper and caller,
+/// and a signature sweep that wide is exactly where a path gets missed. The same reasoning
+/// (and the same `static`) as the splice/park counters above.
+static LIVE_SPLICES: std::sync::Mutex<Option<LiveSplices>> = std::sync::Mutex::new(None);
+
+/// #555: what a cut splice reports. One shared constant so both completer families say the
+/// same thing — a member reading their logs should not have to know which transport they
+/// were on to recognise the same event.
+pub(crate) const SPLICE_CUT_BY_REMOVAL: &str =
+    "channel splice cut: this member is no longer authorized on the channel (#555)";
+
+/// #555: how often a live splice's membership is re-checked.
+///
+/// One `CACHE_TTL` (30s, `channel_authorize.rs`). Deliberately equal rather than a multiple:
+/// that module's own promise is that a revoked member rides a stale entry for seconds, not
+/// minutes, and a re-check slower than the cache it reads through would quietly break that
+/// promise for live sessions while appearing to honour it for new joins. The cost is one
+/// control-plane round trip per distinct `(channel, holder)` with a live splice per interval
+/// -- proportional to concurrent calls, not to traffic.
+const MEMBERSHIP_RECHECK_SECS: u64 = 30;
+
+type SpliceKey = ([u8; 32], [u8; 32]);
+
+#[derive(Default)]
+struct LiveSplices {
+    next_id: u64,
+    entries: std::collections::HashMap<SpliceKey, Vec<(u64, tokio::sync::watch::Sender<bool>)>>,
+}
+
+/// Registration handle for one member's leg of a live splice. Deregisters on drop, so a
+/// splice that ends normally leaves nothing behind for the poller to ask about.
+pub(crate) struct SpliceGuard {
+    key: SpliceKey,
+    id: u64,
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl SpliceGuard {
+    /// Resolves when this leg has been cut because its membership went away.
+    pub(crate) async fn cut(&self) {
+        let mut rx = self.rx.clone();
+        loop {
+            if *rx.borrow() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+impl Drop for SpliceGuard {
+    fn drop(&mut self) {
+        let mut g = LIVE_SPLICES.lock_safe();
+        if let Some(live) = g.as_mut() {
+            if let Some(v) = live.entries.get_mut(&self.key) {
+                v.retain(|(id, _)| *id != self.id);
+                if v.is_empty() {
+                    live.entries.remove(&self.key);
+                }
+            }
+        }
+    }
+}
+
+/// #555: register one member of a splice that is about to start carrying bytes.
+pub(crate) fn register_live_splice(channel: &ChannelId, holder: &[u8; 32]) -> SpliceGuard {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let key = (channel.0, *holder);
+    let mut g = LIVE_SPLICES.lock_safe();
+    let live = g.get_or_insert_with(LiveSplices::default);
+    live.next_id += 1;
+    let id = live.next_id;
+    live.entries.entry(key).or_default().push((id, tx));
+    SpliceGuard { key, id, rx }
+}
+
+/// #555: every `(channel, holder)` with at least one live splice leg — what the membership
+/// poller has to ask the control plane about.
+pub(crate) fn live_splice_members() -> Vec<SpliceKey> {
+    let g = LIVE_SPLICES.lock_safe();
+    g.as_ref().map(|l| l.entries.keys().copied().collect()).unwrap_or_default()
+}
+
+/// #555: cut every live splice leg held by `holder` on `channel`. Returns how many legs
+/// were signalled, so the caller can log a real number instead of "probably did something".
+pub(crate) fn cut_live_splices(channel: &[u8; 32], holder: &[u8; 32]) -> usize {
+    let g = LIVE_SPLICES.lock_safe();
+    match g.as_ref().and_then(|l| l.entries.get(&(*channel, *holder))) {
+        Some(v) => {
+            for (_, tx) in v {
+                let _ = tx.send(true);
+            }
+            v.len()
+        }
+        None => 0,
+    }
+}
+
+/// #555: first four bytes as hex -- the channel/holder fields are public identifiers, the
+/// same shortening the pairer reapers already log.
+fn short_hex(bytes: &[u8]) -> String {
+    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// #555: one sweep — ask the resolver about every `(channel, holder)` that currently has a
+/// live splice, and cut the ones it no longer authorizes. Returns the number of legs cut.
+///
+/// Split out from the spawning loop so the decision is testable without a timer: the whole
+/// risk here is the OVER-firing direction (cutting a healthy call), and that must be provable
+/// rather than observed to not have happened yet.
+pub(crate) async fn sweep_live_splice_memberships(
+    resolver: &std::sync::Arc<dyn crate::serve::ChannelMemberResolver>,
+) -> usize {
+    let mut cut = 0;
+    for (channel, holder) in live_splice_members() {
+        // A transport failure must NOT cut. `resolve` already fails closed for ADMISSION,
+        // where refusing an unproven claim is right; here the membership was proven once
+        // and a CP blip is not evidence against it. Only a definitive "not a member"
+        // ends a call in progress -- anything else and one control-plane restart would
+        // drop every conversation on the edge.
+        if resolver.membership_revoked(ChannelId(channel), holder).await {
+                let n = cut_live_splices(&channel, &holder);
+                if n > 0 {
+                    eprintln!(
+                        "ct-edge: cutting {n} live splice leg(s) for holder {} on channel {} -- \
+                         membership was removed (#555)",
+                        short_hex(&holder),
+                        short_hex(&channel)
+                    );
+                }
+            cut += n;
+        }
+    }
+    cut
+}
+
+/// #555: run [`sweep_live_splice_memberships`] forever. Spawned once where the resolver
+/// lives; does nothing at all until some splice registers, so an edge with no channel
+/// traffic never talks to the control plane on this account.
+pub async fn run_membership_recheck_loop(
+    resolver: std::sync::Arc<dyn crate::serve::ChannelMemberResolver>,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(MEMBERSHIP_RECHECK_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if live_splice_members().is_empty() {
+            continue;
+        }
+        sweep_live_splice_memberships(&resolver).await;
+    }
+}
+
 fn note_channel_splice(bytes: (u64, u64)) {
     CHANNEL_SPLICE_BYTES.fetch_add(bytes.0.saturating_add(bytes.1), std::sync::atomic::Ordering::Relaxed);
     CHANNEL_SPLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1520,13 +1684,24 @@ async fn finish_quic_pair_inner(
                     } else {
                         (&b.conn, &a.conn)
                     };
+                    // #555: both legs are registered for the lifetime of the copy, and the
+                    // copy loses to either one being cut. Registered per MEMBER, not per
+                    // pair: removing one participant must end that participant's session,
+                    // and since a splice has exactly two ends, ending either ends both --
+                    // which is correct, the remaining side is no longer talking to anyone.
+                    let _ga = register_live_splice(&a.req.grant.grant.channel, &a.req.grant.grant.holder);
+                    let _gb = register_live_splice(&b.req.grant.grant.channel, &b.req.grant.grant.holder);
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
-                    let bytes = crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay")
-                        .await
-                        .map_err(|e| -> BoxError {
-                            format!("channel relay splice ended after both sides acked: {e}").into()
-                        })?;
+                    let bytes = tokio::select! {
+                        r = crate::relay::relay_initiator_to_acceptor(init_conn, acc_conn, "channel-relay") => {
+                            r.map_err(|e| -> BoxError {
+                                format!("channel relay splice ended after both sides acked: {e}").into()
+                            })?
+                        }
+                        _ = _ga.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                        _ = _gb.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                    };
                     note_channel_splice(bytes); // #517 V1
                 }
             }
@@ -2010,13 +2185,23 @@ where
             .await?;
             match completion {
                 StreamPairCompletion::Splice => {
+                    // #555: same registration as the QUIC completer. Both families are wired
+                    // because a membership removal that ends the session on one transport and
+                    // not the other is worse than one that ends it nowhere -- an operator
+                    // cannot tell which transport a given participant arrived on.
+                    let _ga = register_live_splice(&a.req.grant.grant.channel, &a.req.grant.grant.holder);
+                    let _gb = register_live_splice(&b.req.grant.grant.channel, &b.req.grant.grant.holder);
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
-                    let bytes = crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443")
-                        .await
-                        .map_err(|e| -> BoxError {
-                            format!("channel relay splice ended after both sides acked: {e}").into()
-                        })?;
+                    let bytes = tokio::select! {
+                        r = crate::relay::relay_streams(a.stream, b.stream, "channel-relay-443") => {
+                            r.map_err(|e| -> BoxError {
+                                format!("channel relay splice ended after both sides acked: {e}").into()
+                            })?
+                        }
+                        _ = _ga.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                        _ = _gb.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                    };
                     note_channel_splice(bytes); // #517 V1
                 }
                 StreamPairCompletion::RendezvousClose => {
@@ -5432,6 +5617,121 @@ mod tests {
         let ack2 = present_join(&conn2, &expired.encode(), &holder_sk(0x0c)).await;
         assert_ne!(ack2, b"OK", "an expired grant must be refused");
         let _ = server2_task.await;
+    }
+
+    /// #555: the registry cuts exactly the removed member's legs and nothing else.
+    #[tokio::test]
+    async fn cutting_a_members_splice_leaves_every_other_leg_alone_555() {
+        let chan_a = ChannelId([0x11; 32]);
+        let chan_b = ChannelId([0x22; 32]);
+        let alice = [0xaa; 32];
+        let bob = [0xbb; 32];
+
+        let g_alice = register_live_splice(&chan_a, &alice);
+        let g_bob = register_live_splice(&chan_a, &bob);
+        let g_alice_other_channel = register_live_splice(&chan_b, &alice);
+
+        // The registry is process-wide and tests run concurrently, so assert about OUR
+        // keys rather than the total -- a global count here would fail for reasons that
+        // have nothing to do with what is being tested.
+        let members = live_splice_members();
+        for k in [(chan_a.0, alice), (chan_a.0, bob), (chan_b.0, alice)] {
+            assert!(members.contains(&k), "our three legs must be registered: {members:?}");
+        }
+
+        assert_eq!(cut_live_splices(&chan_a.0, &alice), 1, "exactly Alice's leg on channel A");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), g_alice.cut()).await.is_ok(),
+            "the removed member's leg must be cut"
+        );
+        // The same holder on a DIFFERENT channel is a different membership: removing her
+        // from one conversation must not end the other.
+        for (g, who) in [(&g_bob, "Bob on the same channel"), (&g_alice_other_channel, "Alice on another channel")] {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), g.cut()).await.is_err(),
+                "{who} must be untouched"
+            );
+        }
+
+        drop(g_alice);
+        drop(g_bob);
+        drop(g_alice_other_channel);
+        let after = live_splice_members();
+        for k in [(chan_a.0, alice), (chan_a.0, bob), (chan_b.0, alice)] {
+            assert!(!after.contains(&k), "guards deregister on drop: {after:?}");
+        }
+    }
+
+    /// #555, the direction that matters more: a control plane that cannot answer must NOT
+    /// end calls. `resolve_member` flattens "not a member" and "could not ask" into `None`
+    /// because admission fails closed; reusing that here would drop every conversation on
+    /// the edge the moment the CP restarted.
+    #[tokio::test]
+    async fn an_unreachable_control_plane_never_cuts_a_live_splice_555() {
+        struct Silent;
+        impl crate::serve::ChannelMemberResolver for Silent {
+            fn resolve_member<'a>(
+                &'a self,
+                _c: ChannelId,
+                _h: [u8; 32],
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send + 'a>> {
+                // What an unreachable CP looks like to admission: refuse, fail closed.
+                Box::pin(async { None })
+            }
+            // `membership_revoked` deliberately NOT overridden -- this resolver cannot tell
+            // the two cases apart, so it must never cause a cut. That is the default.
+        }
+
+        let chan = ChannelId([0x33; 32]);
+        let holder = [0xcc; 32];
+        let guard = register_live_splice(&chan, &holder);
+
+        let resolver: std::sync::Arc<dyn crate::serve::ChannelMemberResolver> = std::sync::Arc::new(Silent);
+        let cut = sweep_live_splice_memberships(&resolver).await;
+
+        assert_eq!(
+            cut, 0,
+            "a resolver that answers None for BOTH 'removed' and 'unreachable' must cut \
+             nothing -- otherwise one CP restart ends every call on this edge"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), guard.cut()).await.is_err(),
+            "the live splice must still be running"
+        );
+    }
+
+    /// #555: and a resolver that CAN tell, and says the membership is gone, does cut.
+    #[tokio::test]
+    async fn a_definitive_removal_cuts_the_splice_555() {
+        struct Authoritative;
+        impl crate::serve::ChannelMemberResolver for Authoritative {
+            fn resolve_member<'a>(
+                &'a self,
+                _c: ChannelId,
+                _h: [u8; 32],
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send + 'a>> {
+                Box::pin(async { None })
+            }
+            fn membership_revoked<'a>(
+                &'a self,
+                _c: ChannelId,
+                _h: [u8; 32],
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+                Box::pin(async { true })
+            }
+        }
+
+        let chan = ChannelId([0x44; 32]);
+        let holder = [0xdd; 32];
+        let guard = register_live_splice(&chan, &holder);
+
+        let resolver: std::sync::Arc<dyn crate::serve::ChannelMemberResolver> = std::sync::Arc::new(Authoritative);
+        assert_eq!(sweep_live_splice_memberships(&resolver).await, 1, "one leg cut");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), guard.cut()).await.is_ok(),
+            "and the splice actually learns about it"
+        );
     }
 
     #[tokio::test]

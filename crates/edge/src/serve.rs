@@ -666,6 +666,24 @@ pub trait ChannelMemberResolver: Send + Sync {
                 + 'a,
         >,
     >;
+
+    /// #555: has this holder's membership been **definitively** withdrawn — as opposed to
+    /// "this resolver could not find out"? Used to end a splice that is already carrying
+    /// bytes, never to admit one.
+    ///
+    /// The default answers `false`, and that default is the safety property: a resolver
+    /// that cannot tell the two apart must never cause a live conversation to be cut. Only
+    /// an implementation that can distinguish an authoritative refusal from an unreachable
+    /// control plane (`ChannelAuthorizer`) overrides it. Admission keeps using
+    /// `resolve_member` and keeps failing closed; the two directions want opposite defaults
+    /// and now have them.
+    fn membership_revoked<'a>(
+        &'a self,
+        _channel: ct_common::channel::ChannelId,
+        _holder: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async { false })
+    }
 }
 
 impl ChannelMemberResolver for crate::channel_authorize::ChannelAuthorizer {
@@ -686,6 +704,14 @@ impl ChannelMemberResolver for crate::channel_authorize::ChannelAuthorizer {
                 .map(|m| (m.operator_pubkey, m.noise_pubkey, m.noise_attestation))
         })
     }
+    fn membership_revoked<'a>(
+        &'a self,
+        channel: ct_common::channel::ChannelId,
+        holder: [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move { self.definitively_not_a_member(&channel, &holder).await })
+    }
+
 }
 
 /// The concrete stream the `:443` front door hands the channel broker: the buffered
@@ -1016,6 +1042,11 @@ const FRONT_DOOR_TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// registry), while a missing ACK means it is reachable but not answering the mesh-relay
 /// role (hung, wrong admin token, not serving 'M'). 10s each, matching every other
 /// front-door bound in this file.
+/// #555: guards the membership re-check loop against a second spawn -- the authorizer is
+/// constructed at four places and more than one of them can run in a single configuration.
+static MEMBERSHIP_RECHECK_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const MESH_RELAY_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MESH_RELAY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -3480,6 +3511,24 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         (Some(cp_url), Some(admin_tok)) => {
                             let authorizer =
                                 crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                            // #555: start the membership re-check exactly once. A splice is
+                            // authorized at admission and then never again, so removing a
+                            // member had no effect on their live connection (measured). This
+                            // loop is the only thing that asks; without it the registry and
+                            // the cut path are dead weight. Its own authorizer, so it is not
+                            // entangled with the front door's lifetime, and it idles for free
+                            // while no splice is registered.
+                            if !MEMBERSHIP_RECHECK_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                let recheck: std::sync::Arc<dyn ChannelMemberResolver> =
+                                    std::sync::Arc::new(
+                                        crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok),
+                                    );
+                                eprintln!(
+                                    "ct-edge: channel membership re-check active -- a member removed \
+                                     from a channel loses their LIVE splice, not just future joins (#555)"
+                                );
+                                tokio::spawn(crate::channel_broker::run_membership_recheck_loop(recheck));
+                            }
                             // #118: dedicated channel acceptor advertising `ct-edge-channel`
                             // (a CA-signed leaf; the same `ca` that issued the shared edge
                             // leaf) so the `:443` channel leg negotiates the ALPN. The shared

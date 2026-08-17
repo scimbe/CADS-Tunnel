@@ -350,6 +350,25 @@ impl ChannelAuthorizer {
     /// currently-legitimate member just because one lookup couldn't complete. A holder
     /// with no prior successful resolution still fails closed on a transport failure —
     /// this never admits anyone the CP hasn't actually vouched for at some point.
+    /// #555: is this holder **definitively** no longer a member — a clean, authoritative
+    /// refusal, as opposed to "we could not ask"?
+    ///
+    /// [`Self::resolve`] flattens both into `None`, which is right where it is used: an
+    /// ADMISSION must fail closed, and an unproven claim is refused. Ending a call already
+    /// in progress is the opposite situation. The membership was proven once; a control-plane
+    /// blip is not evidence against it, and treating it as such would drop every conversation
+    /// on the edge the moment the CP restarted. So only `Outcome::Refused` counts here —
+    /// `Unresolved` deliberately answers `false`.
+    pub async fn definitively_not_a_member(&self, channel: &ChannelId, holder: &[u8; 32]) -> bool {
+        let key: CacheKey = (*channel, *holder);
+        if let Ok(neg) = self.negative_cache.lock() {
+            if neg.get(&key).is_some_and(|at| at.elapsed() < self.negative_cache_ttl) {
+                return true;
+            }
+        }
+        matches!(self.query(channel, holder).await, Outcome::Refused)
+    }
+
     pub async fn resolve(&self, channel: &ChannelId, holder: &[u8; 32]) -> Option<MemberResolution> {
         self.maybe_sweep_expired();
         let key: CacheKey = (*channel, *holder);

@@ -454,6 +454,27 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
 
+**Removing a channel member now ends their live call too (#555).** Membership used to be
+checked once, at admission; after that the splice copied bytes and consulted nothing, so
+`channel_remove_member` had no effect on a conversation already in progress — the removed
+member kept sending and receiving indefinitely (measured). A live splice is now re-checked
+every 30 s (one `CACHE_TTL`), and a withdrawn membership tears down that member's legs with
+
+```
+ct-edge: cutting N live splice leg(s) for holder <hex> on channel <hex> -- membership was removed (#555)
+```
+
+The startup line `channel membership re-check active …` says the loop is running; without
+it, removal only affects future joins.
+
+**Only an authoritative refusal cuts.** A control plane that cannot be reached answers the
+same `None` as "not a member" on the admission path, because admission fails closed. Reusing
+that here would end every conversation on the edge the moment the control plane restarted, so
+the cut asks a separate question that only a resolver able to tell the two apart may answer
+yes to — and the default answer is no. Cost: one control-plane round trip per distinct
+`(channel, holder)` with a live splice per interval, i.e. proportional to concurrent calls,
+not to traffic; an edge with no channel traffic makes none.
+
 **Revoking a tunnel now cuts live sessions too (#554).** `POST /admin/revoke/:token` always
 dropped the registration and blocked re-registration; it did **not** stop a relay that was
 already flowing, so an open WebSocket, transfer, or interactive session on a compromised
