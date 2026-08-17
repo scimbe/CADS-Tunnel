@@ -865,6 +865,16 @@ impl<H: Clone> EdgeState<H> {
         self.tcp_parked_gauge.load(Ordering::Relaxed)
     }
 
+    /// #544: TLS-TCP fallback registrations parked right now **for one token**. The
+    /// per-token counterpart to [`registration_count`](Self::registration_count), which
+    /// only ever counted QUIC registrations -- so a tunnel served entirely over the
+    /// fallback reported zero everywhere and was indistinguishable from a dead one, even
+    /// while it was relaying bytes. Cheap: one map lookup, same lock the park/deliver
+    /// paths already take at connection setup, never per relayed byte.
+    pub fn tcp_parked_for(&self, token: &RoutingToken) -> usize {
+        self.tcp_agents.lock_safe().get(token).map_or(0, |q| q.len())
+    }
+
     /// Park a TCP-fallback agent for `token`: returns a receiver that resolves to
     /// a Client's stream once one rendezvouses for this token. Additive -- an
     /// existing parked registration for the same token is NOT evicted (#229:

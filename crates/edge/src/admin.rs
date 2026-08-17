@@ -155,8 +155,18 @@ async fn host_auth_dump(
 
 #[derive(Serialize, serde::Deserialize)]
 struct TunnelStatusResp {
+    /// #544: true when the tunnel can be served over **either** transport. It used to
+    /// mean "has a QUIC registration", which reported a fallback-served tunnel as
+    /// disconnected while it was actively relaying -- the customer's portal said their
+    /// agent was down, and an operator could not tell that apart from a real outage.
     connected: bool,
+    /// QUIC registrations only, unchanged in meaning (#8 counts redundant agents here).
     registrations: usize,
+    /// #544: TLS-TCP fallback registrations parked for this token. Reported BESIDE
+    /// `registrations` rather than folded into it: the two transports fail differently
+    /// and the operator response differs, so collapsing them would trade one ambiguity
+    /// for another.
+    fallback_parked: usize,
     /// Cumulative bytes received from / sent to this tunnel's clients since
     /// this Edge process started (monitoring-feature byte counters,
     /// 2026-08-01) -- `0` for a tunnel that has never relayed anything.
@@ -187,10 +197,12 @@ async fn tunnel_status(
     };
     let token = RoutingToken(t);
     let registrations = state.registration_count(&token);
+    let fallback_parked = state.tcp_parked_for(&token);
     let (bytes_received, bytes_sent) = state.tunnel_bytes(&token);
     Ok(Json(TunnelStatusResp {
-        connected: registrations > 0,
+        connected: registrations > 0 || fallback_parked > 0,
         registrations,
+        fallback_parked,
         bytes_received,
         bytes_sent,
     }))
@@ -414,6 +426,25 @@ mod tests {
         let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.bytes_received, 300, "client->agent direction");
         assert_eq!(status.bytes_sent, 120, "agent->client direction");
+
+        // #544, the case this endpoint used to get wrong: an agent that reaches the edge
+        // over the TLS-TCP fallback parks instead of registering over QUIC. Before this
+        // fix `connected` was `registrations > 0`, so such a tunnel reported disconnected
+        // while it was actively relaying -- the customer's portal (which deserialises this
+        // very field) told them their agent was down, and an operator could not tell it
+        // apart from a real outage. Observed live on 2026-08-17 with kali.bunsenbrenner.org,
+        // which answered real HTTP while this endpoint said connected=false.
+        let _park = state.park_tcp_agent(t.clone());
+        let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
+        assert!(status.connected, "a fallback-served tunnel is connected");
+        assert_eq!(status.fallback_parked, 1, "and the transport is visible, not merged away");
+        assert_eq!(
+            status.registrations, 0,
+            "`registrations` keeps its QUIC-only meaning -- the two transports are reported \
+             beside each other because they fail differently"
+        );
 
         // Malformed token hex -> 400, not a panic.
         assert_eq!(
