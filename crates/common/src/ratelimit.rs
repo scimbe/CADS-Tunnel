@@ -116,7 +116,7 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
     /// check itself would push a borderline key over the limit it is checking.
     ///
     /// A key from a strictly-earlier window is never over-limit (its count would reset on the
-    /// next [`allow`] anyway); an unknown key never is.
+    /// next [`allow`](Self::allow) anyway); an unknown key never is.
     pub fn over_limit(&self, key: &K, window: u64) -> bool {
         match self.counters.get(key) {
             Some((w, count)) => *w == window && *count >= self.max_per_window,
