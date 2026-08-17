@@ -111,6 +111,33 @@ pub(crate) fn require_admin(
     }
 }
 
+/// #543: the startup statement about the admin gate, as a pure function of "is a token
+/// configured" so both branches are testable and cannot quietly drift back into silence.
+///
+/// It speaks in BOTH cases on purpose. [`require_admin`] returns `Ok(())` when no token is
+/// configured, so an unset `CT_CP_EDGE_ADMIN_TOKEN` does not fail anything -- it drops the
+/// gate, and from outside that is indistinguishable from a correctly gated deployment until
+/// somebody probes a route. Silence in the good case would be worth nothing either: it could
+/// equally mean "gated" or "this build has no such check" (#535's lesson).
+///
+/// The warning names the capabilities one by one rather than saying "admin routes are open",
+/// because the operator response depends on WHICH of them is reachable.
+pub(crate) fn admin_gate_startup_line(configured: bool) -> String {
+    if configured {
+        "ct-cp: #543: admin gate ACTIVE -- enrollment issue, registry register, bootstrap mint, \
+         agent-directory write, pipeline publish and edge-mesh require x-ct-admin-token."
+            .to_string()
+    } else {
+        "ct-cp: #543: WARNUNG -- CT_CP_EDGE_ADMIN_TOKEN ist nicht gesetzt. Die \
+         Abrechnungs-Schreibrouten sind deshalb GAR NICHT eingehaengt (#194), aber diese \
+         Faehigkeiten stehen OHNE Nachweis offen: Join-Token ausstellen (/enroll/issue), \
+         Routing-Registry schreiben (/registry/register), Bootstrap-Token praegen \
+         (/bootstrap/mint), Agentenverzeichnis schreiben, Pipelines veroeffentlichen, \
+         edge-mesh. Fuer einen oeffentlich erreichbaren Betrieb ist das falsch."
+            .to_string()
+    }
+}
+
 /// #87 SEC87b-auth / #145: gate join-token issuance behind the configured admin token. Shared by
 /// single (`/enroll/issue`) and batch (`/enroll/issue-batch`) issuance so both enforce the exact same
 /// gate. Thin wrapper over [`require_admin`] (#186).
@@ -5371,6 +5398,15 @@ pub fn persistent_control_plane_router(
     } else {
         Router::new()
     };
+    // #543: say which state this process is in, in BOTH cases. `require_admin` returns
+    // Ok(()) when no token is configured, so an unset CT_CP_EDGE_ADMIN_TOKEN does not fail
+    // anything -- it silently drops the gate, and the result is indistinguishable from a
+    // correctly gated deployment unless somebody probes a route. #194 already drew this
+    // conclusion for the billing writers and made them absent rather than open; its
+    // siblings still mount open, so the operator has to be told rather than left to find
+    // out. Silence in the good case would be worth nothing here: it could equally mean
+    // "gated" or "this build has no such check" (#535's lesson).
+    eprintln!("{}", admin_gate_startup_line(admin_token.is_some()));
     let mut app = enrollment_router_sqlite_with_admin(enrollment.clone(), admin_token)
         .merge(registry_router_sqlite_gated(registry, admin_token))
         .merge(billing_writers)
@@ -5852,6 +5888,29 @@ mod tests {
         assert!(!admin_token_ok(&h, &expected), "wrong token → false");
         h.insert("x-ct-admin-token", hex(&expected).parse().unwrap());
         assert!(admin_token_ok(&h, &expected), "correct token → true");
+    }
+
+    #[test]
+    fn the_admin_gate_states_which_mode_it_is_in_543() {
+        // #543: `require_admin` fails OPEN when no token is configured -- it returns Ok(())
+        // rather than refusing -- so an unset CT_CP_EDGE_ADMIN_TOKEN looks exactly like a
+        // gated deployment from outside. The startup line is the only thing that
+        // distinguishes them, which makes its CONTENT load-bearing, not decoration.
+        let on = admin_gate_startup_line(true);
+        assert!(on.contains("ACTIVE"), "the good case must be stated, not implied: {on}");
+        assert!(!on.contains("WARNUNG"), "{on}");
+
+        let off = admin_gate_startup_line(false);
+        assert!(off.contains("WARNUNG"), "an ungated deployment must say so: {off}");
+        // Named capabilities, not a vague "admin routes are open" -- the operator's response
+        // differs per route, and the two credential-minting ones are the reason this matters.
+        for route in ["/enroll/issue", "/registry/register", "/bootstrap/mint"] {
+            assert!(off.contains(route), "the warning must name {route}: {off}");
+        }
+        assert!(
+            off.contains("CT_CP_EDGE_ADMIN_TOKEN"),
+            "and it must name the knob that fixes it: {off}"
+        );
     }
 
     #[tokio::test]
