@@ -460,11 +460,11 @@ data-plane path (`route_and_relay`): a revocation wakes live relays, each re-che
 token, and a match tears down both streams with
 `relay cut: this tunnel's token was revoked mid-session (#554)` in the log.
 
-**Not yet covered**, and named here rather than left to be discovered: the TCP-fallback splice
-and the `:443` front-door arms carry their own `relay(...)` calls that do not consult the
-revocation signal. A revocation still stops new connections on those paths and drops the
-registration — but a session already in flight there survives. Treat a revocation as complete
-only for the QUIC data plane until those are wired too.
+**Coverage:** every token-carrying relay in `serve.rs` now goes through the guard — the QUIC
+data plane, the Browser-Plane SNI passthrough and Gelb-terminate legs, and all seven
+TCP-fallback arms. A test asserts at build time that no relay call site bypasses it, so the
+next one added cannot silently miss it. The mesh leg to a peer edge is deliberately exempt:
+that tunnel belongs to the peer, which applies its own revocation.
 
 **What `/healthz` actually covers (#498/#539/#553).** The endpoint the container healthcheck
 consumes reports 503 when any accept loop the edge *meant* to run has stopped iterating. Since

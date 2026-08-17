@@ -167,6 +167,29 @@ async fn open_agent_stream(
 /// Route a resolved Client stream to the Agent tunnel serving `token` and relay
 /// bytes between them. Opens a fresh stream on the Agent's registered connection
 /// and pipes the two together (provider-blind).
+/// #554: run a relay future, but lose to this token's revocation.
+///
+/// Every tunnel-carrying relay in this module goes through here, because covering only
+/// some of them would leave a revocation that works on one transport and silently does
+/// not on another — and an operator has no way to tell which path a given session took.
+///
+/// Losing the race returns `Err`, which drops both stream halves at the call site: that
+/// drop is what actually stops the bytes. The relay's byte counts are deliberately not
+/// recorded for a cut session — `note_relay` runs only on a clean end, so the traffic
+/// figures keep meaning "a relay that finished", not "a relay that was killed".
+async fn until_revoked<T>(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+    fut: impl std::future::Future<Output = std::io::Result<T>>,
+) -> Result<T, BoxError> {
+    tokio::select! {
+        r = fut => Ok(r?),
+        _ = state.revoked_signal(token) => {
+            Err("relay cut: this tunnel's token was revoked mid-session (#554)".into())
+        }
+    }
+}
+
 pub async fn route_and_relay(
     state: &EdgeState<Connection>,
     token: &RoutingToken,
@@ -180,13 +203,12 @@ pub async fn route_and_relay(
     // traffic for a revoked tunnel (measured). Losing the race drops both streams, which
     // is what actually stops the bytes; the byte counts of a cut relay are not recorded
     // because `relay_quic` only reports them on a clean end.
-    let relayed = tokio::select! {
-        r = relay_quic(client_send, client_recv, agent_send, agent_recv, token_hex(token, &mut th_buf)) => r?,
-        _ = state.revoked_signal(token) => {
-            return Err("relay cut: this tunnel's token was revoked mid-session (#554)".into());
-        }
-    };
-    let (a, b) = relayed;
+    let (a, b) = until_revoked(
+        state,
+        token,
+        relay_quic(client_send, client_recv, agent_send, agent_recv, token_hex(token, &mut th_buf)),
+    )
+    .await?;
     state.note_relay(token, a, b, crate::state::RelayKind::DataPlane); // #10 O2
     Ok(())
 }
@@ -290,7 +312,7 @@ where
             // The buffered ClientHello replays from the Prepend wrapper on first
             // read, so the browser<->origin TLS handshake completes end-to-end.
             let mut agent = join(agent_recv, agent_send);
-            let (a, b) = relay(&mut stream, &mut agent).await?;
+            let (a, b) = until_revoked(state, &token, relay(&mut stream, &mut agent)).await?; // #554
             state.note_relay(&token, a, b, crate::state::RelayKind::Browser);
             Ok(())
         }
@@ -368,7 +390,7 @@ where
     match open_agent_stream(state, &token).await {
         Ok((agent_send, agent_recv)) => {
             let mut agent = join(agent_recv, agent_send);
-            let (a, b) = relay(&mut stream, &mut agent).await?;
+            let (a, b) = until_revoked(state, &token, relay(&mut stream, &mut agent)).await?; // #554
             state.note_relay(&token, a, b, crate::state::RelayKind::Browser);
             Ok(())
         }
@@ -1679,7 +1701,7 @@ pub async fn serve_connection(
                     Err(mut client) => {
                         let (agent_send, agent_recv) = open_agent_stream(state, &token).await?;
                         let mut agent = join(agent_recv, agent_send);
-                        let (a, b) = relay(&mut client, &mut agent).await?;
+                        let (a, b) = until_revoked(state, &token, relay(&mut client, &mut agent)).await?; // #554
                         state.note_relay(&token, a, b, crate::state::RelayKind::DataPlane);
                         return Ok(None);
                     }
@@ -2285,7 +2307,7 @@ where
                     // #534: this relay's bytes ARE the fallback's traffic -- see
                     // `note_parked_fallback_relay` for why they used to go
                     // uncounted and for the (mirrored) direction mapping.
-                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    let (agent_to_client, client_to_agent) = until_revoked(state, &token, relay(&mut stream, &mut client)).await?; // #554
                     note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
@@ -2328,7 +2350,7 @@ where
                     stream.write_all(&[TCP_PING_STOP]).await?;
                     stream.flush().await?;
                     // #534, as in the 'A' arm above.
-                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    let (agent_to_client, client_to_agent) = until_revoked(state, &token, relay(&mut stream, &mut client)).await?; // #554
                     note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
@@ -2407,7 +2429,7 @@ where
                     // excluded by `framed_relay` itself, which is the right
                     // basis for a traffic-volume metric (the raw arms count the
                     // same payload, un-framed).
-                    let (client_to_agent, agent_to_client) = framed_relay(&mut stream, &mut client).await?;
+                    let (client_to_agent, agent_to_client) = until_revoked(state, &token, framed_relay(&mut stream, &mut client)).await?; // #554
                     note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
@@ -2441,7 +2463,7 @@ where
             match parked.await {
                 Ok(mut client) => {
                     // #534, as in the 'A' arm above.
-                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    let (agent_to_client, client_to_agent) = until_revoked(state, &token, relay(&mut stream, &mut client)).await?; // #554
                     note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
@@ -2487,7 +2509,7 @@ where
                     stream.write_all(&[TCP_PING_STOP]).await?;
                     stream.flush().await?;
                     // #534, as in the 'A' arm above.
-                    let (agent_to_client, client_to_agent) = relay(&mut stream, &mut client).await?;
+                    let (agent_to_client, client_to_agent) = until_revoked(state, &token, relay(&mut stream, &mut client)).await?; // #554
                     note_parked_fallback_relay(state, &token, client_to_agent, agent_to_client);
                     Ok(())
                 }
@@ -2547,7 +2569,7 @@ where
                     Ok((agent_send, agent_recv)) => {
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
-                        let (a, b) = relay(&mut stream, &mut agent).await?;
+                        let (a, b) = until_revoked(state, &token, relay(&mut stream, &mut agent)).await?; // #554
                         // #10 O2. #534 reviewed and DELIBERATELY LEFT AS
                         // `TcpFallback` (the issue proposed flipping it to
                         // `Browser` on the theory that the label was inverted):
@@ -2629,7 +2651,7 @@ where
                     Ok((agent_send, agent_recv)) => {
                         let mut stream = stream;
                         let mut agent = join(agent_recv, agent_send);
-                        let (a, b) = relay(&mut stream, &mut agent).await?;
+                        let (a, b) = until_revoked(state, &token, relay(&mut stream, &mut agent)).await?; // #554
                         // #534, same reasoning as the 'C' arm above: the PEER
                         // EDGE dialed this role over the :4433 TLS-TCP fallback
                         // listener, so the inbound leg is fallback transport
@@ -5361,6 +5383,125 @@ mod tests {
         // the healthy one and returns a stream.
         let r = open_agent_stream_with(&state, &token, Duration::from_millis(300)).await;
         assert!(r.is_ok(), "failed over to the surviving agent: {:?}", r.err());
+    }
+
+    /// #554 drift guard: a NEW tunnel-carrying relay call site must not silently skip the
+    /// revocation check.
+    ///
+    /// This is the failure mode that produced the finding in the first place and that has
+    /// recurred all session: a protection gets added on one path, and the next call site
+    /// written next to it quietly does not get it. Behaviour tests cover the two paths
+    /// that exist today; this one covers the path somebody adds tomorrow.
+    #[test]
+    fn every_token_carrying_relay_goes_through_the_revocation_guard_554() {
+        let src = include_str!("serve.rs");
+        // Only production code -- test modules legitimately call `relay` directly to stand
+        // in for an agent or origin.
+        let prod = src.split("\n#[cfg(test)]\n").next().unwrap();
+
+        let unguarded: Vec<&str> = prod
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("let (") && (l.contains("= relay(&mut") || l.contains("= framed_relay(&mut")))
+            .collect();
+
+        assert!(
+            unguarded.is_empty(),
+            "these relay call sites bypass `until_revoked`, so a revocation would not cut \
+             sessions on their transport while it does on every other one -- wrap them or, \
+             if the traffic genuinely is not token-routed (e.g. the mesh leg, which the peer \
+             edge revokes itself), say so at the call site: {unguarded:#?}"
+        );
+    }
+
+    /// #554 on a SECOND transport family: the TCP-fallback client leg. The first test
+    /// covers the QUIC data plane; this one exists because "the call site now mentions
+    /// `until_revoked`" is a textual claim, not a behavioural one — the wiring has to be
+    /// shown to actually cut bytes on a path that reaches the relay through a completely
+    /// different arm (`serve_tcp_connection`'s 'C' rendezvous, agent leg over QUIC).
+    #[tokio::test]
+    async fn revocation_cuts_a_live_tcp_fallback_relay_too_554() {
+        use crate::transport::{
+            build_client_endpoint, build_server_endpoint_with_cert, build_tcp_tls_listener_at,
+            tcp_tls_connect,
+        };
+        use ct_common::pow::build_request;
+        use std::net::Ipv4Addr;
+
+        let token = RoutingToken([0x67; 32]);
+        let challenge = Challenge { nonce: [0x44; 16], difficulty: 8 };
+        let state = Arc::new(EdgeState::<Connection>::new());
+
+        let (server, qcert) = build_server_endpoint_with_cert().expect("quic edge");
+        let qaddr = server.local_addr().unwrap();
+        let (tcp_listener, acceptor, tcert) =
+            build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into()).await.expect("tcp edge");
+        let taddr = tcp_listener.local_addr().unwrap();
+
+        let state_q = state.clone();
+        tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            register_agent(&agent_conn, &state_q).await.unwrap();
+            agent_conn.closed().await;
+        });
+
+        let agent_ep = build_client_endpoint(qcert).expect("agent ep");
+        let aconn = agent_ep.connect(qaddr, "localhost").unwrap().await.unwrap();
+        let (mut rs, mut rr) = aconn.open_bi().await.unwrap();
+        rs.write_all(b"A").await.unwrap();
+        rs.write_all(&token.0).await.unwrap();
+        rs.finish().unwrap();
+        assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
+
+        // Agent echoes twice, so a surviving relay would visibly deliver the second chunk.
+        tokio::spawn(async move {
+            let (mut s, mut r) = aconn.accept_bi().await.unwrap();
+            for _ in 0..2 {
+                let mut buf = [0u8; 3];
+                if r.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                if s.write_all(&buf).await.is_err() {
+                    break;
+                }
+            }
+            aconn.closed().await;
+        });
+
+        let state_t = state.clone();
+        let chal_t = challenge.clone();
+        tokio::spawn(async move {
+            let (tcp, _) = tcp_listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
+        });
+
+        let mut client = tcp_tls_connect(taddr, tcert).await.expect("tcp connect");
+        client.write_all(b"C").await.unwrap();
+        let mut chal = [0u8; 17];
+        client.read_exact(&mut chal).await.unwrap();
+        let ch = Challenge { nonce: chal[..16].try_into().unwrap(), difficulty: chal[16] };
+        client.write_all(&build_request(&ch, &token).unwrap()).await.unwrap();
+
+        client.write_all(b"one").await.unwrap();
+        client.flush().await.unwrap();
+        let mut echo = [0u8; 3];
+        client.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"one", "the relay is live before the revocation");
+
+        state.revoke_token(&token);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let _ = client.write_all(b"two").await;
+        let _ = client.flush().await;
+        let mut echo2 = [0u8; 3];
+        let got = tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut echo2)).await;
+        let delivered = matches!(&got, Ok(Ok(_)) if &echo2 == b"two");
+        assert!(
+            !delivered,
+            "the TCP-fallback leg kept relaying after revocation -- the guard is wired on the \
+             QUIC path only, which is the half-coverage this test exists to prevent"
+        );
     }
 
     #[tokio::test]
