@@ -1136,7 +1136,14 @@ pub(crate) enum FrontDoorErrorLog {
 /// accepted: on an edge that goes quiet, the last window's summary waits for the next
 /// abort. That costs nothing in fidelity — `ct_edge_front_door_client_aborts_total`
 /// counts every abort the moment it happens and is the complete record.
-fn log_front_door_error(
+/// #533-follow: `leg` names which listener is reporting. The classifier and the throttle
+/// are shared; only the prefix differs. The `:4433` TCP-fallback arm logged every failure
+/// as a flat "connection error" -- 44 such lines in three hours on 2026-08-17, all of them
+/// ordinary client aborts, in exactly the log an operator greps while investigating
+/// ct-agent#15's "the edge drops connections" symptom. Classifying one arm and not its
+/// sibling left the noise that made the fault look real.
+fn log_front_door_error_on(
+    leg: &str,
     log: &std::sync::Mutex<crate::log_throttle::WindowLogThrottle<ClientAbortClass>>,
     now: ct_common::channel::UnixSeconds,
     e: &BoxError,
@@ -1146,7 +1153,7 @@ fn log_front_door_error(
     // but failed anywhere in serve_front_door was completely invisible to the
     // operator. Unclassified == loud, always, first thing.
     let Some(class) = classify_client_abort(e) else {
-        eprintln!("ct-edge: :443 front-door connection error: {e}");
+        eprintln!("ct-edge: {leg} connection error: {e}");
         return FrontDoorErrorLog::Loud;
     };
     FRONT_DOOR_CLIENT_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1156,7 +1163,7 @@ fn log_front_door_error(
     };
     if let Some(s) = summary {
         eprintln!(
-            "ct-edge: :443 front-door benign client-abort summary (#533) — {} abort(s) of {} distinct class(es) in the last {}s ({} beyond the tracking cap); repeats after each class's first full line are aggregated here; top: {}",
+            "ct-edge: {leg} benign client-abort summary (#533) — {} abort(s) of {} distinct class(es) in the last {}s ({} beyond the tracking cap); repeats after each class's first full line are aggregated here; top: {}",
             s.total,
             s.distinct_keys,
             FRONT_DOOR_ABORT_LOG_WINDOW_SECS,
@@ -1174,7 +1181,7 @@ fn log_front_door_error(
             // issue was filed about) plus the classification, so it is obvious that
             // further aborts of this class are being aggregated rather than lost.
             eprintln!(
-                "ct-edge: :443 front-door connection error: {e} (benign client abort, class={}; further ones this window are aggregated — #533)",
+                "ct-edge: {leg} connection error: {e} (benign client abort, class={}; further ones this window are aggregated — #533)",
                 class.label()
             );
             FrontDoorErrorLog::BenignFirst(class)
@@ -1183,12 +1190,26 @@ fn log_front_door_error(
             // The per-occurrence view the issue asked to keep reachable: still
             // available on demand, just not in the default operator log.
             edge_trace(format_args!(
-                ":443 front-door benign client abort (class={}): {e}",
+                "{leg} benign client abort (class={}): {e}",
                 class.label()
             ));
             FrontDoorErrorLog::BenignSuppressed(class)
         }
     }
+}
+
+/// The `:443` front door's leg label, kept as a named constant so the two call sites cannot
+/// drift into differently-worded prefixes that an operator's grep would then miss.
+const LEG_FRONT_DOOR: &str = ":443 front-door";
+/// The direct `:4433` TCP-fallback listener (a client that bypasses the unified front door).
+const LEG_TCP_FALLBACK: &str = "TCP fallback (:4433)";
+
+fn log_front_door_error(
+    log: &std::sync::Mutex<crate::log_throttle::WindowLogThrottle<ClientAbortClass>>,
+    now: ct_common::channel::UnixSeconds,
+    e: &BoxError,
+) -> FrontDoorErrorLog {
+    log_front_door_error_on(LEG_FRONT_DOOR, log, now, e)
 }
 
 pub async fn serve_front_door(
@@ -3528,6 +3549,16 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     }
 
     // TCP fallback accept loop (for Clients whose outbound UDP is blocked).
+    // #533-follow: the `:4433` arm gets its OWN throttle window, not a share of the front
+    // door's. Merging them would put two different listeners' aborts in one summary, and the
+    // whole point of the classification is that an operator can tell which leg is talking.
+    let tcp_fallback_abort_log = Arc::new(std::sync::Mutex::new(
+        crate::log_throttle::WindowLogThrottle::<ClientAbortClass>::new(
+            FRONT_DOOR_ABORT_LOG_WINDOW_SECS,
+            FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES,
+            FRONT_DOOR_ABORT_LOG_TOP_CLASSES,
+        ),
+    ));
     let state_tcp = state.clone();
     // #86 SEC86c: the TCP fallback is the same rendezvous surface as QUIC, so it
     // shares the one connection cap (a clone — the budget is global, not per-loop).
@@ -3547,6 +3578,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
             let tcp_agent_cap = tcp_agent_cap_loop.clone();
+            let abort_log_tcp = tcp_fallback_abort_log.clone();
             async move {
                 let _permit = permit; // held for the connection's lifetime
                 // #258: bound the handshake too, not just the admission reads inside
@@ -3565,7 +3597,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 // idle TCP-fallback connection mid-session, previously left zero log
                 // output explaining why.
                 if let Err(e) = serve_tcp_connection(tls, &state, &challenge, tcp_agent_cap.as_ref()).await {
-                    eprintln!("ct-edge: TCP fallback (:4433) connection error: {e}");
+                    // #533-follow: same classifier and throttle as the `:443` arm. A client
+                    // that closes without close_notify is ordinary, not a fault -- logging
+                    // it flat produced 44 error-shaped lines in three hours, in exactly the
+                    // log read while chasing ct-agent#15's "the edge drops connections".
+                    log_front_door_error_on(LEG_TCP_FALLBACK, &abort_log_tcp, unix_now(), &e);
                 }
             }
         },
@@ -8313,4 +8349,50 @@ mod tests {
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fd_task).await;
     }
+    #[test]
+    fn both_legs_share_one_classifier_and_label_themselves_533_follow() {
+        // #533 classified benign client aborts on the `:443` arm and left the `:4433`
+        // TCP-fallback arm logging every failure flat. Measured on 2026-08-17: 44
+        // error-shaped lines in three hours, all ordinary aborts -- in exactly the log an
+        // operator reads while investigating ct-agent#15's "the edge drops connections".
+        // The noise was part of why the fault looked real.
+        let log = front_door_abort_log(FRONT_DOOR_ABORT_LOG_WINDOW_SECS, FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES);
+        let eof: BoxError = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        )
+        .into();
+
+        // Same input, both legs: classified benign, first occurrence logged in full.
+        assert!(matches!(
+            log_front_door_error_on(LEG_FRONT_DOOR, &log, 1_000, &eof),
+            FrontDoorErrorLog::BenignFirst(_)
+        ));
+        let log2 = front_door_abort_log(FRONT_DOOR_ABORT_LOG_WINDOW_SECS, FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES);
+        assert!(matches!(
+            log_front_door_error_on(LEG_TCP_FALLBACK, &log2, 1_000, &eof),
+            FrontDoorErrorLog::BenignFirst(_)
+        ));
+        // Repeats within the window are aggregated on the fallback leg too -- otherwise the
+        // classification would only rename the flood instead of condensing it.
+        assert!(matches!(
+            log_front_door_error_on(LEG_TCP_FALLBACK, &log2, 1_001, &eof),
+            FrontDoorErrorLog::BenignSuppressed(_)
+        ));
+        // The two legs keep SEPARATE windows: one leg's aborts must not silence the other's
+        // first line, or an operator loses the ability to tell which listener is talking.
+        assert!(matches!(
+            log_front_door_error_on(LEG_FRONT_DOOR, &log, 1_001, &eof),
+            FrontDoorErrorLog::BenignSuppressed(_)
+        ));
+
+        // An unclassified error stays loud on both legs -- the classification must never
+        // become a way to lose a real fault.
+        let odd: BoxError = "something genuinely unexpected".into();
+        assert!(matches!(
+            log_front_door_error_on(LEG_TCP_FALLBACK, &log2, 1_002, &odd),
+            FrontDoorErrorLog::Loud
+        ));
+    }
+
 }
