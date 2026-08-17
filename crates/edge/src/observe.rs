@@ -312,14 +312,16 @@ async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<Co
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    match broker_loops_health(
-        &[
-            BrokerLoopStatus::of("relay", &state.relay_broker_heartbeat()),
-            BrokerLoopStatus::of("rendezvous", &state.rendezvous_broker_heartbeat()),
-        ],
-        now,
-        BROKER_HEALTH_MAX_AGE_SECS,
-    ) {
+    // #553: the TCP accept loops are checked by the SAME classifier as the QUIC brokers.
+    // Kept as one list on purpose -- two parallel health paths drift, and the listener that
+    // carries every public hostname is precisely the one that must not be the exception.
+    let listeners = state.listener_heartbeats();
+    let mut loops = vec![
+        BrokerLoopStatus::of("relay", &state.relay_broker_heartbeat()),
+        BrokerLoopStatus::of("rendezvous", &state.rendezvous_broker_heartbeat()),
+    ];
+    loops.extend(listeners.iter().map(|(label, hb)| BrokerLoopStatus::of(label, hb)));
+    match broker_loops_health(&loops, now, BROKER_HEALTH_MAX_AGE_SECS) {
         Ok(()) => (axum::http::StatusCode::OK, "ok\n".to_string()),
         Err(why) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
     }
@@ -576,6 +578,88 @@ mod tests {
         assert!(body.contains("ct_edge_ws_channel_connections 2"), "{body}");
         assert!(body.contains("ct_edge_ws_channel_connections_max 3"), "{body}");
         assert!(body.contains("ct_edge_ws_channel_shed_total 1"), "{body}");
+    }
+
+    /// #553: a dead TCP accept loop must flip `/healthz`, not just the QUIC brokers.
+    ///
+    /// The gap this closes: both broker heartbeats fresh, `:443` gone. Every public
+    /// hostname is dark, and before this the endpoint answered 200 — so the container
+    /// healthcheck stayed green and `restart: unless-stopped` never fired.
+    #[tokio::test]
+    async fn healthz_reports_503_when_a_registered_tcp_listener_goes_stale_553() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.relay_broker_heartbeat().beat(now);
+        state.rendezvous_broker_heartbeat().beat(now);
+
+        // The front door is registered and beating: healthy.
+        let fd = state.expect_listener(":443 front door", now);
+        fd.beat(now);
+        let resp = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "brokers and listener all fresh");
+
+        // Its task dies. The BROKERS ARE STILL FINE -- that is the whole point, and the
+        // reason checking only them was not enough.
+        fd.beat(now - BROKER_HEALTH_MAX_AGE_SECS - 120);
+        let resp = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a dead :443 accept loop must not be reported as healthy just because the \
+             QUIC brokers are alive"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(":443 front door"),
+            "the response must NAME the dead loop -- an operator cannot act on a bare 503: {body}"
+        );
+    }
+
+    /// #553: a listener declared expected that never starts must also fail, not pass as
+    /// "this edge simply does not run one" (#539's distinction, applied to listeners).
+    #[tokio::test]
+    async fn healthz_reports_503_for_a_registered_listener_that_never_started_553() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.relay_broker_heartbeat().beat(now);
+        state.rendezvous_broker_heartbeat().beat(now);
+
+        // Configured long enough ago to be past the grace window, and it never beat once —
+        // a bind failure looks exactly like this.
+        let _ = state.expect_listener("TCP fallback", now - BROKER_HEALTH_MAX_AGE_SECS - 120);
+        let resp = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // ...and an edge that never registered one at all stays healthy: not running a
+        // listener is a configuration choice, not a fault.
+        let bare = Arc::new(EdgeState::<Connection>::new());
+        bare.relay_broker_heartbeat().beat(now);
+        bare.rendezvous_broker_heartbeat().beat(now);
+        let resp = metrics_router(bare, None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an unregistered listener must not be confused with a broken one"
+        );
     }
 
     /// #551: the join-penalty numbers must track the penalty's REAL state, not just render.

@@ -552,6 +552,7 @@ async fn serve_with_optional_tls(
     cap: Option<crate::state::ConnectionCap>,
     shutdown: crate::shutdown::ShutdownSignal,
     penalty: Option<Arc<crate::state::JoinRefusalPenalty>>,
+    heartbeat: Option<Arc<crate::state::BrokerHeartbeat>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::transport::serve_listener(
         inner,
@@ -559,6 +560,7 @@ async fn serve_with_optional_tls(
         "ws-channel",
         Some(WS_CHANNEL_HANDSHAKE_TIMEOUT),
         shutdown,
+        heartbeat,
         move |stream, addr, permit| {
             // #542: shed a penalised source BEFORE the TLS handshake and the HTTP upgrade,
             // exactly where the `:443` front door does it -- the point of the budget is that
@@ -632,13 +634,14 @@ pub async fn serve_ws_channel_with_pairer(
     tls: Option<tokio_rustls::TlsAcceptor>,
     shutdown: crate::shutdown::ShutdownSignal,
     penalty: Option<Arc<crate::state::JoinRefusalPenalty>>,
+    heartbeat: Option<Arc<crate::state::BrokerHeartbeat>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = match &penalty {
         Some(p) => WsChannelState::new(resolver, pairer, cap.clone()).with_penalty(Arc::clone(p)),
         None => WsChannelState::new(resolver, pairer, cap.clone()),
     };
     let inner = tokio::net::TcpListener::bind(listen).await?;
-    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap, shutdown, penalty).await
+    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap, shutdown, penalty, heartbeat).await
 }
 
 #[cfg(test)]
@@ -847,7 +850,7 @@ mod tests {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe); // free the port for serve_ws_channel_with_pairer to bind for real
-        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor), crate::shutdown::ShutdownSignal::never(), None));
+        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor), crate::shutdown::ShutdownSignal::never(), None, None));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         async fn join_tls(
@@ -1097,6 +1100,7 @@ mod tests {
             None,
             shutdown,
             Some(Arc::clone(&penalty)),
+            None,
         ));
 
         // The connection is dropped without a WebSocket handshake ever completing.

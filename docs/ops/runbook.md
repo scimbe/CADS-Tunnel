@@ -452,6 +452,23 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
 
+**What `/healthz` actually covers (#498/#539/#553).** The endpoint the container healthcheck
+consumes reports 503 when any accept loop the edge *meant* to run has stopped iterating. Since
+#553 that is six loops, not two: the QUIC `relay` and `rendezvous` brokers plus the four TCP
+accept loops (`:443 front door`, `Browser-Plane SNI listener`, `TCP fallback`, `ws-channel`).
+The body names the offending loop, so a 503 is directly actionable.
+
+Two deliberate exclusions, both so the cure stays smaller than the disease:
+
+- The `:80 redirect` loop is **not** health-gated. Losing it costs a convenience redirect;
+  restarting the edge would tear down every live tunnel to recover it.
+- A listener that was never registered is healthy, not broken — not running one is a
+  configuration choice. Only "declared expected, then silent" is a fault.
+
+Each TCP loop stamps its heartbeat on a 10s idle tick, so a completely quiet edge stays
+fresh. That tick is load-bearing: without it, "last accept" would measure how busy the edge
+is rather than whether it is alive, and a quiet night would restart it in a loop.
+
 **A high `..._tracked_ips` is a warning, not reassurance (#551).** The penalty budgets
 definitive join refusals *per source IP* (30/minute), and tracks a bounded number of IPs,
 evicting oldest-first at the bound. A storm from one address therefore trips it in about a

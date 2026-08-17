@@ -71,6 +71,16 @@ pub(crate) fn apply_tcp_keepalive(stream: &TcpStream) {
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
+/// #553: how often a [`serve_listener`] loop stamps its heartbeat while idle.
+///
+/// This tick is the entire reason the heartbeat is safe to health-gate on. A broker loop
+/// can beat per iteration because its `select!` already wakes on a timer; an accept loop
+/// parks in `listener.accept()` until traffic arrives, so "last accept" is a measure of
+/// how busy the edge is, NOT of whether the loop is alive. Health-gating that would 503 a
+/// perfectly healthy quiet edge and — since the container healthcheck consumes it — restart
+/// it in a loop. Well under `BROKER_HEALTH_MAX_AGE_SECS` so a live loop is never stale.
+const LISTENER_HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Shared accept-loop policy for every plain-TCP public listener (#452): admission
 /// (acquire-or-shed against a [`crate::state::ConnectionCap`], with a uniform occasional
 /// shed-event log), TCP keepalive ([`apply_tcp_keepalive`]), and spawning — the steps
@@ -109,19 +119,65 @@ pub(crate) async fn serve_listener<F, Fut>(
     label: &'static str,
     handshake_timeout: Option<std::time::Duration>,
     shutdown: crate::shutdown::ShutdownSignal,
+    heartbeat: Option<Arc<crate::state::BrokerHeartbeat>>,
+    handler: F,
+) where
+    F: Fn(TcpStream, SocketAddr, Option<tokio::sync::OwnedSemaphorePermit>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    serve_listener_with_tick(
+        listener,
+        cap,
+        label,
+        handshake_timeout,
+        shutdown,
+        heartbeat,
+        LISTENER_HEARTBEAT_TICK,
+        handler,
+    )
+    .await
+}
+
+/// [`serve_listener`] with an explicit heartbeat tick — exposed so a test can use a short
+/// interval instead of waiting out the real 10s constant, the same split
+/// `WsByteStream::new_with_keepalive` uses for its own timer. The heartbeat stamps whole
+/// unix seconds from the system clock (not tokio's), so a paused-clock test cannot exercise
+/// this: the tick has to actually elapse.
+#[allow(clippy::too_many_arguments)]
+async fn serve_listener_with_tick<F, Fut>(
+    listener: TcpListener,
+    cap: Option<crate::state::ConnectionCap>,
+    label: &'static str,
+    handshake_timeout: Option<std::time::Duration>,
+    shutdown: crate::shutdown::ShutdownSignal,
+    heartbeat: Option<Arc<crate::state::BrokerHeartbeat>>,
+    tick: std::time::Duration,
     handler: F,
 ) where
     F: Fn(TcpStream, SocketAddr, Option<tokio::sync::OwnedSemaphorePermit>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let handler = Arc::new(handler);
+    let mut idle = tokio::time::interval(tick);
+    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if let Some(hb) = &heartbeat {
+            hb.beat(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+        }
         let (stream, addr) = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 eprintln!("ct-edge: {label} stopping new accepts (shutdown)");
                 return;
             }
+            // Wakes the loop on a quiet edge purely so the beat above lands. Nothing else
+            // to do here: `continue` re-enters and re-stamps.
+            _ = idle.tick() => continue,
             accepted = listener.accept() => match accepted {
                 Ok(v) => v,
                 Err(e) => {
@@ -517,7 +573,7 @@ mod tests {
         // The handler holds the connection open (never returns) until told to, so the cap's
         // one slot stays occupied for as long as the test needs it to.
         let (hold_tx, hold_rx) = tokio::sync::watch::channel(false);
-        tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, crate::shutdown::ShutdownSignal::never(), move |_s, _addr, permit| {
+        tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, crate::shutdown::ShutdownSignal::never(), None, move |_s, _addr, permit| {
             let admitted_h = admitted_h.clone();
             let mut hold_rx = hold_rx.clone();
             async move {
@@ -565,7 +621,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(1);
-        tokio::spawn(serve_listener(listener, None, "test-listener", None, crate::shutdown::ShutdownSignal::never(), move |stream, _addr, _permit| {
+        tokio::spawn(serve_listener(listener, None, "test-listener", None, crate::shutdown::ShutdownSignal::never(), None, move |stream, _addr, _permit| {
             let tx = tx.clone();
             async move {
                 let sock = socket2::SockRef::from(&stream);
@@ -663,6 +719,7 @@ mod tests {
             "test-listener",
             Some(std::time::Duration::from_millis(150)),
             crate::shutdown::ShutdownSignal::never(),
+            None, // #553: this test exercises the accept path, not liveness
             move |_s, _addr, permit| {
                 let completed_h = completed_h.clone();
                 async move {
@@ -685,6 +742,51 @@ mod tests {
         );
     }
 
+    /// #553: an accept loop with NO traffic at all must keep its heartbeat fresh.
+    ///
+    /// This is the test that makes the feature safe rather than the one that makes it
+    /// work. `/healthz` gates the container healthcheck, so a heartbeat that only advanced
+    /// on accepted connections would mark every quiet edge as wedged and restart it in a
+    /// loop — turning an observability gap into an outage. Against a `serve_listener`
+    /// without the idle tick this fails: `last_seen` never moves past the first beat.
+    #[tokio::test]
+    async fn serve_listener_heartbeat_stays_fresh_on_a_listener_with_no_traffic_553() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let hb = Arc::new(crate::state::BrokerHeartbeat::new());
+        let hb_loop = hb.clone();
+        // 50ms tick, real time. The clock cannot be paused here: the heartbeat stamps
+        // `SystemTime::now()`, which tokio's test clock does not move — a paused-clock
+        // version of this test would pass against a loop that never beats again.
+        tokio::spawn(serve_listener_with_tick(
+            listener,
+            None,
+            "test-listener",
+            None,
+            crate::shutdown::ShutdownSignal::never(),
+            Some(hb_loop),
+            std::time::Duration::from_millis(50),
+            move |_s, _addr, _permit| async move {},
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(hb.last_seen() > 0, "the loop must beat on entry, before any connection");
+
+        // Nothing connects for well over a second. A loop that only beat per accepted
+        // connection would still be sitting on its entry timestamp by now, i.e. visibly
+        // stale — which is precisely what would 503 a healthy quiet edge.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let age = now.saturating_sub(hb.last_seen());
+        assert!(
+            age <= 1,
+            "an idle accept loop must stay fresh; heartbeat is {age}s old after 2.5s of \
+             silence — without the idle tick it would be ~2.5s and climbing"
+        );
+    }
+
     #[tokio::test]
     async fn serve_listener_stops_accepting_promptly_once_shutdown_is_triggered_400() {
         // #400 property (a): once shutdown fires, `serve_listener` must stop admitting NEW
@@ -698,7 +800,7 @@ mod tests {
         let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let admitted_h = admitted.clone();
         let (ctl, shutdown) = crate::shutdown::ShutdownController::new();
-        let task = tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, shutdown, move |_s, _addr, _permit| {
+        let task = tokio::spawn(serve_listener(listener, Some(cap.clone()), "test-listener", None, shutdown, None, move |_s, _addr, _permit| {
             let admitted_h = admitted_h.clone();
             async move {
                 admitted_h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

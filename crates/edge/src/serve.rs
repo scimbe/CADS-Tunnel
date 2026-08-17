@@ -3300,6 +3300,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         "Browser-Plane SNI listener",
                         None,
                         shutdown.clone(),
+                        Some(state.expect_listener("Browser-Plane SNI listener", unix_now())),
                         move |tcp, _addr, permit| {
                             let state = bstate.clone();
                             let browser_tunnel_cap = browser_tunnel_cap_bl.clone();
@@ -3575,6 +3576,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         ":443 front door",
                         None,
                         shutdown.clone(),
+                        Some(state.expect_listener(":443 front door", unix_now())),
                         move |tcp, _addr, permit| {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
@@ -3655,6 +3657,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         ":80 redirect",
                         Some(HTTP_REDIRECT_READ_TIMEOUT),
                         shutdown.clone(),
+                        // #553: deliberately NOT health-gated. The other three accept loops
+                        // carry the data plane, so their death is an outage worth restarting
+                        // the edge for. This one only 308s plain http:// to https://; losing
+                        // it costs a convenience redirect, and tearing down every live tunnel
+                        // to recover it would do far more damage than the fault. Omitted on
+                        // purpose, not by oversight.
+                        None,
                         move |tcp, _addr, permit| async move {
                             let _permit = permit; // held for the connection's lifetime
                             let _ = serve_http_redirect(tcp).await;
@@ -3694,6 +3703,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         "TCP fallback",
         None,
         shutdown.clone(),
+        Some(state.expect_listener("TCP fallback", unix_now())),
         move |tcp, _addr, permit| {
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
@@ -3948,6 +3958,10 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 // #542: the SAME budget the QUIC loops and the `:443` arm consult -- one
                 // per-IP budget across every channel-join transport, not a third one.
                 let ws_penalty = state.join_refusal_penalty();
+                // #553: the fifth accept loop. Declared expected HERE, where the listener is
+                // configured -- a bind failure below then reads as "expected, never started"
+                // rather than "not wanted", which is the whole point of `expect_start`.
+                let ws_heartbeat = state.expect_listener("ws-channel", unix_now());
                 tokio::spawn(async move {
                     if let Err(e) = crate::ws_channel::serve_ws_channel_with_pairer(
                         ws_addr,
@@ -3957,6 +3971,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         ws_channel_tls,
                         shutdown_ws,
                         Some(ws_penalty),
+                        Some(ws_heartbeat),
                     )
                     .await
                     {

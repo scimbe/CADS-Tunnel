@@ -456,6 +456,12 @@ pub struct EdgeState<H> {
     /// `/metrics`. See [`BrokerHeartbeat`].
     relay_broker_heartbeat: std::sync::Arc<BrokerHeartbeat>,
     rendezvous_broker_heartbeat: std::sync::Arc<BrokerHeartbeat>,
+    /// #553: liveness for the TCP accept loops (`transport::serve_listener`). The two
+    /// heartbeats above cover the QUIC channel brokers only, so a dead `:443` accept task
+    /// left `/healthz` answering 200 with every public hostname dark -- the #497 outage
+    /// class on the listener with the widest blast radius. Keyed by the loop's own label
+    /// so `/healthz` can name which one is gone.
+    listener_heartbeats: RwLock<HashMap<&'static str, std::sync::Arc<BrokerHeartbeat>>>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -560,6 +566,7 @@ impl<H: Clone> EdgeState<H> {
             join_refusal: std::sync::Arc::new(JoinRefusalPenalty::new()),
             relay_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             rendezvous_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
+            listener_heartbeats: RwLock::new(HashMap::new()),
             registrations: Counter::default(),
             relays: Counter::default(),
             tcp_parks: Counter::default(),
@@ -766,6 +773,31 @@ impl<H: Clone> EdgeState<H> {
     }
 
     /// #497 slice 2: the rendezvous broker loop's liveness heartbeat.
+    /// #553: register a TCP accept loop as **expected**, returning the heartbeat it must
+    /// stamp. Call this where the listener is CONFIGURED, not where it first accepts —
+    /// `expect_start()` (#539) is what lets `/healthz` tell "this edge runs no front door"
+    /// apart from "the front door was supposed to start and never did". Registering at
+    /// first-accept would make a listener that never binds look like one that was never
+    /// wanted, which is the failure being closed here.
+    pub fn expect_listener(&self, label: &'static str, now: u64) -> std::sync::Arc<BrokerHeartbeat> {
+        let mut map = self.listener_heartbeats.write_safe();
+        let hb = map
+            .entry(label)
+            .or_insert_with(|| std::sync::Arc::new(BrokerHeartbeat::new()))
+            .clone();
+        hb.expect_start(now);
+        hb
+    }
+
+    /// #553: every registered accept loop, for `/healthz` and `/metrics`.
+    pub fn listener_heartbeats(&self) -> Vec<(&'static str, std::sync::Arc<BrokerHeartbeat>)> {
+        self.listener_heartbeats
+            .read_safe()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
     pub fn rendezvous_broker_heartbeat(&self) -> std::sync::Arc<BrokerHeartbeat> {
         self.rendezvous_broker_heartbeat.clone()
     }
