@@ -3085,6 +3085,12 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         eprintln!("ct-edge: max {n} concurrent channel-broker connections (CT_EDGE_MAX_CHANNEL_BROKER_CONNECTIONS, #450)");
         ConnectionCap::new(n as usize)
     });
+    // #546/#551: say which way endpoint attestation is set, in BOTH directions. Every cap
+    // above prints its resolved value, but this one used to print nothing at all -- and a
+    // security control that is silent when off is indistinguishable from one that is on.
+    // That is the whole failure mode worth guarding here: an operator arms it in `.env`,
+    // a later redeploy loses the line, and nothing in the log says the door reopened.
+    eprintln!("{}", crate::channel_broker::attested_endpoint_startup_line());
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.

@@ -1076,6 +1076,43 @@ fn require_attested_endpoint() -> bool {
     std::env::var("CT_EDGE_REQUIRE_ATTESTED_ENDPOINT").ok().as_deref() == Some("1")
 }
 
+/// #551: the startup line for [`require_attested_endpoint`], stated in both directions.
+///
+/// A control that logs a line when armed and nothing when off cannot be checked by reading
+/// the log: silence means "off" and "this build predates the line" and "the log scrolled",
+/// which is precisely the failure this exists to catch -- an operator arms it in `.env`,
+/// a later redeploy drops the line, and the door reopens with no trace. So the OFF case is
+/// the one that must speak.
+///
+/// It also reports the value that was actually parsed, not the raw string: only the literal
+/// `1` arms this, so an operator who wrote `true` or `yes` has enforcement OFF while their
+/// config file reads as though it were on. That mistake is invisible everywhere else.
+pub fn attested_endpoint_startup_line() -> String {
+    attested_endpoint_startup_line_for(std::env::var("CT_EDGE_REQUIRE_ATTESTED_ENDPOINT").ok().as_deref())
+}
+
+/// Pure core of [`attested_endpoint_startup_line`], so the wording is testable without
+/// mutating process-global environment state from a test (same split as
+/// `admin_gate_startup_line`).
+fn attested_endpoint_startup_line_for(raw: Option<&str>) -> String {
+    match raw.map(|s| s.to_string()) {
+        Some(v) if v == "1" => {
+            "ct-edge: endpoint attestation ENFORCED -- a channel join observed on a global \
+             address that advertises a different one of the same family is refused \
+             (CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1, #546)"
+                .to_string()
+        }
+        Some(v) => format!(
+            "ct-edge: endpoint attestation OFF -- CT_EDGE_REQUIRE_ATTESTED_ENDPOINT is set to \
+             {v:?}, and ONLY the literal \"1\" arms it. Mismatches are counted, not refused \
+             (#546)"
+        ),
+        None => "ct-edge: endpoint attestation OFF -- mismatches are counted, not refused. Set \
+                 CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1 to enforce (#546)"
+            .to_string(),
+    }
+}
+
 /// #546: how a member's ADVERTISED endpoint relates to the address the edge actually
 /// observed it connect from. Counting only -- nothing is refused on this basis yet.
 ///
@@ -6959,6 +6996,37 @@ mod tests {
             !require_attested_endpoint(),
             "enforcement must stay off until an operator sets CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1"
         );
+    }
+
+    /// #551: the startup line must state the setting in BOTH directions, and must report
+    /// what was actually PARSED rather than echo what was written.
+    #[test]
+    fn attested_endpoint_startup_line_speaks_when_off_too_551() {
+        let armed = attested_endpoint_startup_line_for(Some("1"));
+        assert!(armed.contains("ENFORCED"), "armed must say so: {armed}");
+
+        // The case this exists for: a redeploy loses the `.env` line. Silence here would be
+        // indistinguishable from an armed edge, so "off" has to be an affirmative statement.
+        let unset = attested_endpoint_startup_line_for(None);
+        assert!(
+            unset.contains("OFF") && unset.contains("counted, not refused"),
+            "unset must state plainly that nothing is being refused: {unset}"
+        );
+
+        // And the trap: only the literal "1" arms it. An operator who wrote a word that
+        // reads as true has enforcement OFF while their config file looks armed -- so the
+        // line must name the offending value instead of just saying "off".
+        for near_miss in ["true", "yes", "on", "TRUE", " 1", "1 "] {
+            let line = attested_endpoint_startup_line_for(Some(near_miss));
+            assert!(
+                line.contains("OFF"),
+                "{near_miss:?} does not arm enforcement, so the line must say OFF: {line}"
+            );
+            assert!(
+                line.contains(&format!("{near_miss:?}")),
+                "the line must quote back the value that failed to arm it: {line}"
+            );
+        }
     }
 
 }

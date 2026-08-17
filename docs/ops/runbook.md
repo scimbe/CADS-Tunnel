@@ -489,6 +489,40 @@ advertising the host's real address. The naive "must be equal" rule would have r
 them. A different address family is allowed too (dual-stack: reach the edge over v4, advertise
 the v6 listener).
 
+**Read all five counters before arming, not just `mismatch`.** Only three of the classes are
+ones the rule can judge at all:
+
+| `ct_edge_channel_endpoint_attestation_total{result=…}` | judgeable? | refused when armed |
+|---|---|---|
+| `matches` | yes | no |
+| `cross_family` | yes (ordinary dual-stack) | no |
+| `mismatch` | yes | **yes — the only one** |
+| `unobservable` (member seen on a private address) | no | no |
+| `no_address` (relay-only member, advertises none) | no | no |
+
+`mismatch = 0` is the safety condition — it says arming refuses nothing that is happening
+today. It is **not** evidence that the rule is doing any work. For that, read `matches` and
+`cross_family`: if those are zero too, then no join has ever reached a state the rule can
+judge, and arming is a door closed ahead of anyone arriving rather than a defence catching
+something. Both are legitimate reasons to arm; they are different claims, and only the first
+one is about safety. This deployment armed it at `matches=0, cross_family=0, mismatch=0,
+unobservable=153, no_address=539` — i.e. deliberately ahead of the first judgeable join.
+
+Arming is per-deployment: the shipped compose leaves `CT_EDGE_REQUIRE_ATTESTED_ENDPOINT`
+unset, and an operator sets it in their own `.env`. It takes effect at edge start, and the
+edge states which way it is set **in both directions** (#551):
+
+```
+ct-edge: endpoint attestation ENFORCED -- ... (CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1, #546)
+ct-edge: endpoint attestation OFF -- mismatches are counted, not refused. Set ... to enforce
+```
+
+Read that line after every redeploy. The failure it exists to catch is a redeploy that loses
+the `.env` entry: enforcement reverts to off, and without an affirmative "OFF" line the log of
+an unprotected edge is identical to that of a protected one. The same line also catches the
+quieter mistake — only the literal `1` arms this, so `=true` or `=yes` leaves enforcement off
+while the config file reads as though it were on; the line then quotes the value back.
+
 **The go/no-go is one number.** `ct_edge_channel_endpoint_attestation_total{result="mismatch"}`
 counts exactly what enforcement refuses — observed on a global address, advertised a different
 one of the same family. Members the edge saw on a private address land in `unobservable`

@@ -173,6 +173,15 @@ services:
       # terminating front (Caddy or the edge's own TLS) in front of it, for a real
       # browser page to reach it as wss://, is a separate follow-up.
       CT_EDGE_WS_CHANNEL_LISTEN: "0.0.0.0:${EDGE_WS_CHANNEL_PORT:-4437}"
+      # #546 endpoint attestation. Refuses a channel join that was OBSERVED on a global
+      # address while advertising a different one of the same family -- and only that.
+      # Members seen on a private address (`unobservable`) and relay-only members that
+      # advertise no address at all (`no_address`) are never refused: equality is
+      # structurally impossible for them, so there is nothing to corroborate.
+      # Unset here on purpose -- the shipped default stays OFF for every deployment, and
+      # an operator arms it in their own `.env` once their own field counters show
+      # `mismatch` at zero. See docs/ops/runbook.md before setting it.
+      CT_EDGE_REQUIRE_ATTESTED_ENDPOINT: "${CT_EDGE_REQUIRE_ATTESTED_ENDPOINT:-}"
     volumes:
       - shared:/shared
     ports:
