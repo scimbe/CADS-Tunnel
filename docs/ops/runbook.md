@@ -589,6 +589,29 @@ Two things worth knowing before touching them:
   502 because the realm's `google`/`github` entries were absent — the allowlist advertised a
   login path that did not exist. Add the provider in the realm first, then to this list.
 
+### The control plane's two background loops
+
+Both are **off unless switched on**, and both are switched on by the literal `1`:
+
+| variable | default | meaning |
+|---|---|---|
+| `CT_CP_ACME_BROKER_ENABLED` | off | the Rot/Gelb/Grün certificate-admission broker. A deployment that never sets it simply never promotes a tunnel past Rot — turning the feature on is a deliberate operator action, not a side effect of upgrading |
+| `CT_CP_ACME_BROKER_TICK_SECS` | `60` | how often that broker runs |
+| `CT_CP_DIRECT_PROBE` | off | the direct-serving reachability probe (#517 V3, slice 3). It **only probes and records** the hysteresis state — no DNS is touched, so enabling it changes no live routing; it makes the probe decisions observable before a later slice wires them to records |
+| `CT_CP_DIRECT_PROBE_TICK_SECS` | `30` | how often that probe runs |
+
+**Only the exact string `1` counts.** `true`, `yes` and `on` leave the loop off, silently — the
+vocabulary differs from the flood-control limits, which do accept `off`/`false`/`none` as an
+opt-out. Do not assume one convention covers both.
+
+Because a mistyped value fails quietly, **confirm from the log rather than from the
+environment**: each loop prints one line at startup when it is on
+(`ct-cp: acme_broker …`, `ct-cp: direct-serving reachability probe loop ON (…s, CT_CP_DIRECT_PROBE)`).
+No line means off — whether that was intended or a typo.
+
+Current deployment (checked 2026-08-17): broker **on** at the 60 s default, direct probe
+**off**.
+
 ## Escalation & scope
 
 Availability against a **funded** abuser and censorship/lawful-process handling
