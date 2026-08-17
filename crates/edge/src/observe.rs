@@ -174,6 +174,21 @@ its own. `cross_family` is ordinary dual-stack.\n\
         relay = state.relay_broker_heartbeat().expected_since(),
         rendezvous = state.rendezvous_broker_heartbeat().expected_since(),
     ));
+    // #558: which `:443` channel legs the park-keepalive and the longer park TTL actually
+    // apply to. Both are gated on the negotiated ALPN, so without this split neither #500's
+    // NUL ticks nor #506's TTL can be confirmed to be reaching anything.
+    let (ka_legs, plain_legs) = crate::channel_broker::channel_park_leg_totals();
+    out.push_str(&format!(
+        "# HELP ct_edge_channel_park_legs_total :443 channel legs admitted to the pairer, split \
+         by whether the client negotiated the park-keepalive ALPN. `keepalive=\"no\"` is NOT an \
+         error -- a browser member on :4437 cannot choose an ALPN at all -- it is the answer to \
+         \"who does the long park TTL apply to\". Read this BEFORE raising \
+         CT_EDGE_KA_PARK_TTL_SECS: with `keepalive=\"yes\"` at 0 the value changes nothing, \
+         however high it is set.\n\
+         # TYPE ct_edge_channel_park_legs_total counter\n\
+         ct_edge_channel_park_legs_total{{keepalive=\"yes\"}} {ka_legs}\n\
+         ct_edge_channel_park_legs_total{{keepalive=\"no\"}} {plain_legs}\n",
+    ));
     // #553 follow-up: the TCP accept loops are health-gated but were not observable, and a
     // 200 from `/healthz` could not tell "all four registered and beating" from "none
     // registered at all" -- an empty map passes the same check. Found while verifying the
@@ -691,6 +706,28 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "an unregistered listener must not be confused with a broken one"
+        );
+    }
+
+    /// #558: both park-leg rows must always be present, including at zero.
+    ///
+    /// An absent `keepalive="yes"` row and a zero one mean very different things to an
+    /// operator about to raise `CT_EDGE_KA_PARK_TTL_SECS` — absent reads as "this edge does
+    /// not report it", zero reads as "nothing would be affected". Only the second is a
+    /// finding, and it is the one that explains a setting that changes nothing.
+    #[test]
+    fn park_leg_rows_are_emitted_in_both_flavours_even_at_zero_558() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let body = render_edge_metrics(&state, None);
+        for flavour in ["yes", "no"] {
+            assert!(
+                body.contains(&format!("ct_edge_channel_park_legs_total{{keepalive=\"{flavour}\"}}")),
+                "the {flavour} row must exist even before any leg parks: {body}"
+            );
+        }
+        assert!(
+            body.contains("Read this BEFORE raising"),
+            "the HELP text must carry the reading, or the number gets used the wrong way round"
         );
     }
 

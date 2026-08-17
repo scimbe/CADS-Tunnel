@@ -1411,6 +1411,33 @@ pub fn channel_park_reaped_total() -> u64 {
     CHANNEL_PARK_REAPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #558: `:443` channel legs that reached the pairer, split by whether the client negotiated
+/// the park-keepalive ALPN (`ct-edge-channel-ka`) or the plain one.
+///
+/// Both #500's NUL ticks and #506's longer park TTL apply **only** to a keepalive-negotiated
+/// leg. Without this split there is no way to tell, from outside a running edge, whether any
+/// leg is negotiated at all -- and an operator who raises `CT_EDGE_KA_PARK_TTL_SECS` and sees
+/// no change cannot distinguish "the setting was ignored" from "the setting had nothing to
+/// apply to", which are opposite problems with opposite fixes.
+static CHANNEL_PARK_LEGS_KA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CHANNEL_PARK_LEGS_PLAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #558: `(keepalive_negotiated, plain)`.
+pub fn channel_park_leg_totals() -> (u64, u64) {
+    (
+        CHANNEL_PARK_LEGS_KA.load(std::sync::atomic::Ordering::Relaxed),
+        CHANNEL_PARK_LEGS_PLAIN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// #558: count one admitted `:443` leg. Taken from the SAME `keepalive` value that drives the
+/// pump and the TTL choice, rather than re-derived — a counter that decided for itself what
+/// "negotiated" means could disagree with the behaviour it is supposed to describe.
+fn note_channel_park_leg(keepalive: bool) {
+    let c = if keepalive { &CHANNEL_PARK_LEGS_KA } else { &CHANNEL_PARK_LEGS_PLAIN };
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// #530: count one reaped lone park. Called for EVERY reap, including reaps whose
 /// per-member log line the [`ReapLogThrottle`] suppresses — the metric is the
 /// complete record, the log is the bounded diagnostic sample.
@@ -2584,6 +2611,8 @@ where
     // regardless of whether its client spoke the keepalive ALPN. `keepalive` only gates
     // the NUL ticks.
     let (liveness, dead) = ParkLiveness::monitored();
+    // #558: counted here, from the same flag the pump and the TTL read.
+    note_channel_park_leg(keepalive);
     let stream: BoxedChannelStream = Box::pin(spawn_park_keepalive_pump(stream, keepalive, dead));
     let member = AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: permit };
     offer_admitted_stream_member(pairer, deadline, member, liveness, phase, Some(observed.ip())).await

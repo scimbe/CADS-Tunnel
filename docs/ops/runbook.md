@@ -793,6 +793,20 @@ A *wrong* admin token is a third, distinct case: it is refused immediately with
 `peer edge refused mesh-relay`, not a timeout. Silence and refusal are different symptoms —
 do not treat a timeout as an authorization problem.
 
+**Read `ct_edge_channel_park_legs_total` before you raise it (#558).** The longer TTL and
+#500's keepalive ticks both apply *only* to a leg whose client negotiated the
+`ct-edge-channel-ka` ALPN. The counter splits admitted `:443` legs by exactly that flag:
+
+```
+ct_edge_channel_park_legs_total{keepalive="yes"} …   <- the long TTL applies to these
+ct_edge_channel_park_legs_total{keepalive="no"}  …   <- these keep the 30s default
+```
+
+With `yes` at zero, raising the value changes nothing however high you set it, and the
+absence of any effect would otherwise be indistinguishable from the setting not being picked
+up — opposite problems with opposite fixes. `no` is not a fault: a browser member on `:4437`
+cannot choose an ALPN at all.
+
 **`CT_EDGE_KA_PARK_TTL_SECS` has a rollout order, not just a value.** A KA-negotiated park is
 observed (10 s NUL ticks, corpse detection ≤10 s), so a longer TTL is no resource risk and
 ends the idle re-park cycle. But raising it before the deployed agents carry the tick-based
