@@ -527,6 +527,7 @@ Läuft per Cron alle 10 Minuten und meldet sich nur bei einer Störung — gepr�
 | Park-Gauge > 80 | #522: Leichen sammeln sich, TCP-Park-Reaper arbeitet nicht mehr |
 | `refused-111`-Signatur im Log (15-Minuten-Fenster) | #522: Auslieferung an einen toten Park |
 | Broker-Loop-Schlag älter als 60 s | Channel-Joins über diesen Transport bleiben stehen |
+| Ein kanonischer Hostname liefert nicht seinen erwarteten Code | verlorener Hostname-Anspruch (#502), Agent mit veralteter Edge-IP, fehlgeschlagene Rehydrierung |
 
 Zwei Entwurfsentscheidungen, beide aus Fehlschlägen gelernt:
 
@@ -536,6 +537,16 @@ Zwei Entwurfsentscheidungen, beide aus Fehlschlägen gelernt:
 - **Antwortet die Sonde nicht, obwohl der Container läuft, ist das ein Befund** und kein
   Grund zu schweigen. Eine Prüfung, die nicht laufen konnte, darf nicht wie eine bestandene
   aussehen.
+
+Die Dienstprüfung ist bewusst der wichtigste Punkt der Liste: Die Zeilen darüber prüfen den
+**Prozess**, und jeder reale Ausfall dieses Betriebs hat den Edge gesund gelassen und die
+Tunnel totgelegt. Zwei Vorkehrungen gegen Falschalarme, beide aus Fehlern gelernt:
+
+- **Kein Urteil im Rehydrations-Fenster.** Lief der Edge weniger als 90 s, wird nicht
+  geprüft — und das wird ausdrücklich gesagt („das ist kein Freispruch"), statt still
+  übersprungen zu werden.
+- **Zwei Durchgänge mit 30 s Abstand statt einer Salve.** Nur was beide Male fällt, ist ein
+  Alarm; dichtes Nachfassen hat am 15.08. einen 70-Prozent-Ausfall vollständig verdeckt.
 
 Ein sinkender Neustartzähler gilt als Deploy (der Container wurde neu erzeugt) und setzt nur
 den Bezugspunkt neu. Gleiche Meldungen werden für 6 Stunden nicht erneut gemailt; Logzeile

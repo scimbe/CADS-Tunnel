@@ -7,7 +7,7 @@
 # "alles in Ordnung" aussieht. Dieselbe Klasse, gegen die die geprüften Signale
 # selbst gerichtet sind (#539, #541).
 #
-# Geprüft werden fünf Dinge, jedes davon aus einem echten Vorfall abgeleitet:
+# Geprüft werden sechs Dinge, jedes davon aus einem echten Vorfall abgeleitet:
 #
 #   1. Container läuft / Neustartzähler  (verlässliches Down-Signal; ein
 #      fehlgeschlagenes `docker exec` allein ist KEINES -- der Vorgänger hat
@@ -17,6 +17,10 @@
 #   3. Park-Gauge > 80                   (#522: Leichen-Ansammlung, Reaper tot)
 #   4. refused-111 im Log                (#522: Auslieferung an toten Park)
 #   5. Broker-Loop-Stillstand            (letzter Schlag älter als 60s)
+#   6. Die Dienste selbst                (die kanonischen Hostnamen; 1.-5. prüfen
+#                                         nur den Prozess, und die realen Ausfälle
+#                                         dieses Betriebs liessen den Edge gesund
+#                                         und die Tunnel tot)
 #
 # Exit 0 = still, Exit 1 = Alarm (Mail + Logzeile).
 set -euo pipefail
@@ -106,8 +110,63 @@ else
     ALARMS+=("$REFUSED Zeile(n) mit der refused-111-Signatur in den letzten 15 Minuten (Basiswert 0) -- Browser-Auslieferung an einen toten Park (#522).")
 fi
 
+# --- 6. Die Dienste selbst -------------------------------------------------
+# Warum das hier dazugehoert: Alles oben prueft den PROZESS. Genau die Ausfaelle,
+# die diesen Betrieb bisher getroffen haben, liessen den Edge gesund und die
+# Tunnel tot -- der verlorene Hostname-Anspruch (#502), Agenten mit
+# zwischengespeicherter Edge-IP nach einem Recreate, eine fehlgeschlagene
+# Rehydrierung. In all diesen Faellen haette dieser Waechter "Edge in Ordnung"
+# gemeldet, waehrend die Seiten nicht erreichbar waren. Ein Waechter, der nur den
+# Prozess kennt, prueft nicht das, wofuer es die Anlage gibt.
+SITES="${CT_WATCH_SITES:-sort=200 help=200 llm-34a13a96=200 game2048=200 a2a-demo=200 auction-demo=200 cookbook=200 flappy-demo=200 devsystem-demo=302}"
+ZONE="${CT_WATCH_ZONE:-bunsenbrenner.org}"
+SETTLE="${CT_WATCH_SETTLE_SECS:-90}"
+
+# Nur die kanonischen Namen aus dem Runbook -- Kurznamen wie `llm` haben keinen
+# DNS-Eintrag, und ein "konnte nicht aufloesen" darauf waere ein Falschalarm
+# (zweimal am 15.08. passiert).
+SITES_CHECKED=0
+if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
+  STARTED=$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null || true)
+  AGE=$(( $(date +%s) - $(date -d "${STARTED:-now}" +%s 2>/dev/null || date +%s) ))
+  if [ "$AGE" -lt "$SETTLE" ]; then
+    # Uebersprungen -- und das wird GESAGT. Nach einem Deploy brauchen die Tunnel
+    # rund 25-45 s zur Rehydrierung; eine Messung darin erzeugt einen Falschalarm.
+    # Schweigen waere hier aber schlimmer als der Falschalarm, weil es sich wie
+    # "geprueft und in Ordnung" liest.
+    log "Dienste NICHT geprueft: der Edge lief erst ${AGE}s (Rehydrierung bis ~${SETTLE}s) -- das ist kein Freispruch"
+  else
+    DOWN=""
+    for ENTRY in $SITES; do
+      HOST="${ENTRY%%=*}"; WANT="${ENTRY##*=}"
+      GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "https://$HOST.$ZONE/" 2>/dev/null || echo 000)
+      [ "$GOT" = "$WANT" ] || DOWN="$DOWN $HOST:$GOT(erwartet $WANT)"
+      SITES_CHECKED=$((SITES_CHECKED + 1))
+    done
+    # Zweiter Durchgang mit echtem Abstand statt einer Salve: eine Momentaufnahme
+    # unterscheidet einen Aussetzer nicht von einem Ausfall, und dichtes Nachfassen
+    # hat am 15.08. einen 70-Prozent-Ausfall komplett verdeckt. Nur was BEIDE Male
+    # faellt, ist ein Alarm.
+    if [ -n "$DOWN" ]; then
+      sleep 30
+      STILL=""
+      for ENTRY in $SITES; do
+        HOST="${ENTRY%%=*}"; WANT="${ENTRY##*=}"
+        case "$DOWN" in *" $HOST:"*) ;; *) continue;; esac
+        GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "https://$HOST.$ZONE/" 2>/dev/null || echo 000)
+        [ "$GOT" = "$WANT" ] || STILL="$STILL $HOST:$GOT(erwartet $WANT)"
+      done
+      if [ -n "$STILL" ]; then
+        ALARMS+=("Dienste nicht erreichbar (zweimal im Abstand von 30s geprueft):$STILL. Der Edge selbst laeuft -- typische Ursachen: verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, fehlgeschlagene Rehydrierung.")
+      else
+        log "voruebergehender Aussetzer, beim zweiten Durchgang wieder erreichbar:$DOWN"
+      fi
+    fi
+  fi
+fi
+
 if [ "${#ALARMS[@]}" -eq 0 ]; then
-  log "Edge in Ordnung"
+  log "Edge in Ordnung (Dienste geprueft: $SITES_CHECKED)"
   rm -f "$STATE_DIR/last-alarm"
   exit 0
 fi
