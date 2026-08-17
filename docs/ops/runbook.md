@@ -793,6 +793,17 @@ A *wrong* admin token is a third, distinct case: it is refused immediately with
 `peer edge refused mesh-relay`, not a timeout. Silence and refusal are different symptoms —
 do not treat a timeout as an authorization problem.
 
+**Corpse detection is keepalive-only for a clean exit.** A parked `:443` leg whose client
+dies **hard** (RST) is flagged on any client version. A leg whose client exits **cleanly** is
+flagged only when it negotiated the keepalive ALPN — on a plain leg the same EOF is
+indistinguishable from a legacy half-close, so the edge deliberately tolerates it rather than
+tear down a healthy old client. Such a park then lives until its TTL and can still be paired
+in that window.
+
+The `keepalive="no"` row above is therefore also the size of the population this does not
+cover. It is not a fault to fix here: without the ALPN the two cases are the same bytes on
+the wire.
+
 **Read `ct_edge_channel_park_legs_total` before you raise it (#558).** The longer TTL and
 #500's keepalive ticks both apply *only* to a leg whose client negotiated the
 `ct-edge-channel-ka` ALPN. The counter splits admitted `:443` legs by exactly that flag:

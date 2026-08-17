@@ -145,6 +145,23 @@ pub struct ParkLiveness(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
 
 impl ParkLiveness {
     /// A monitored flag: the pump holds the returned handle and sets it on client death.
+    ///
+    /// **The guarantee is conditional, and the condition is the negotiated ALPN.** In
+    /// [`spawn_park_keepalive_pump`]:
+    ///
+    /// - A **hard** error (RST-class) sets this on any client version.
+    /// - A clean `EOF` sets it **only on a keepalive-negotiated leg**, where the contract says
+    ///   a parked leg stays fully open, so EOF can only mean death. On a plain leg the same
+    ///   EOF is deliberately tolerated as a legacy half-close (`read_open = false`) and this
+    ///   flag stays clear — the two are wire-ambiguous, and guessing wrong would tear down a
+    ///   healthy old client.
+    ///
+    /// So a plain-ALPN park whose client exits cleanly is NOT flagged; it lives until its
+    /// TTL, and can win a pairing in that window. That is a deliberate trade, not an
+    /// oversight, but anything reasoning about corpse detection has to know it holds for one
+    /// population and not the other. `ct_edge_channel_park_legs_total{keepalive=…}` (#558)
+    /// reports how large each population currently is; ct-agent#22's accept-vs-relay design
+    /// turns on exactly this distinction.
     pub fn monitored() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         (Self(Some(flag.clone())), flag)
