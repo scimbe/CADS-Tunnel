@@ -449,6 +449,28 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
 
+### Per-listener connection caps
+
+`CT_EDGE_MAX_CONNECTIONS` (8192, documented in the threat model) bounds the edge as a whole.
+Four **sub-caps** bound the individual public listeners; each defaults to **half** the global
+default (**4096**) so no single listener can consume the whole budget:
+
+| variable | bounds | issue |
+|---|---|---|
+| `CT_EDGE_MAX_BROWSER_TUNNEL_CONNECTIONS` | Browser-Plane tunnel connections | #254 |
+| `CT_EDGE_MAX_TCP_AGENT_CONNECTIONS` | TLS-TCP fallback agent registrations (reachable with a bare token, no PoW) | #410 |
+| `CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS` | browser WebSocket channel joins (`:4437`) | #451 |
+| `CT_EDGE_MAX_CHANNEL_BROKER_CONNECTIONS` | `:443` front-door channel-broker arm | #450 |
+
+**`0` does not mean "allow nothing" — it switches the cap OFF.** `0`, `off`, `false` and
+`none` all disable the control entirely; that is the deliberate opt-out. An *unset* variable
+gives the safe default, and an unparseable value also falls back to the default rather than
+disabling protection — a typo must never open the flood gate. Reading `0` as "block
+everything" is the misunderstanding this paragraph exists to prevent.
+
+Each cap prints its resolved value at startup (`ct-edge: max N concurrent …`), so the running
+configuration is readable from the log rather than inferred from the environment.
+
 ### How much channel traffic actually bypasses the edge (#517 V1)
 
 The offload figure is a **pair of counters**, never a single number:
