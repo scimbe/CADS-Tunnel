@@ -950,6 +950,10 @@ where
         .map_err(|e| format!("[quic-handshake] {e}"))?;
     match read_join_on_connection(&conn, now, JOIN_READ_TIMEOUT, authorize).await {
         Ok((send, req, operator, noise, attest, observed)) => {
+            // #546: measure before deciding. Refusing an uncorroborated endpoint would be a
+            // wire-behaviour change that could lock out legitimate members (dual-stack, or
+            // shapes nobody has enumerated yet), so this counts first and refuses nothing.
+            note_endpoint_attestation(classify_endpoint(&req.endpoint, observed.ip()));
             Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed, _permit: permit })
         }
         Err(e) => {
@@ -1016,6 +1020,80 @@ pub fn channel_relay_totals() -> (u64, u64) {
         CHANNEL_SPLICE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
         CHANNEL_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// #546: how a member's ADVERTISED endpoint relates to the address the edge actually
+/// observed it connect from. Counting only -- nothing is refused on this basis yet.
+///
+/// Why it matters: `is_global_unicast` (#94/#121/#267) keeps a member from pointing its
+/// partner at anything INTERNAL -- loopback, RFC1918, CGNAT, link-local, cloud metadata,
+/// including the IPv4-in-IPv6 forms. It does not keep it from pointing at an arbitrary
+/// PUBLIC host: an admitted-but-compromised member can name any global address and have
+/// its counterpart dial it once per pairing. The address the edge observed is attested by
+/// an independent party (the connection itself); the advertised one is a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointAttestation {
+    /// Advertised IP equals the observed source IP -- the claim is corroborated.
+    Matches,
+    /// Different address families (member connected over v4 and advertises v6, or vice
+    /// versa). A dual-stack host legitimately does this, so it must NOT be treated as a
+    /// mismatch -- it is counted separately precisely so the two never get conflated.
+    CrossFamily,
+    /// Same family, different address. Nothing corroborates this claim.
+    Mismatch,
+    /// The relay-only sentinel or an unparseable endpoint -- not an address at all.
+    NoAddress,
+}
+
+/// Pure classifier for [`EndpointAttestation`] -- caller supplies both values, so this is
+/// testable without a live connection.
+pub fn classify_endpoint(advertised: &str, observed: std::net::IpAddr) -> EndpointAttestation {
+    let Ok(addr) = advertised.parse::<std::net::SocketAddr>() else {
+        return EndpointAttestation::NoAddress;
+    };
+    let adv = addr.ip();
+    if adv == observed {
+        EndpointAttestation::Matches
+    } else if adv.is_ipv4() != observed.is_ipv4() {
+        EndpointAttestation::CrossFamily
+    } else {
+        EndpointAttestation::Mismatch
+    }
+}
+
+static ENDPOINT_MATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ENDPOINT_CROSS_FAMILY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ENDPOINT_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ENDPOINT_NO_ADDRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #546: `(matches, cross_family, mismatch, no_address)` for `/metrics`.
+pub fn endpoint_attestation_totals() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        ENDPOINT_MATCHES.load(Relaxed),
+        ENDPOINT_CROSS_FAMILY.load(Relaxed),
+        ENDPOINT_MISMATCH.load(Relaxed),
+        ENDPOINT_NO_ADDRESS.load(Relaxed),
+    )
+}
+
+fn note_endpoint_attestation(a: EndpointAttestation) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = match a {
+        EndpointAttestation::Matches => &ENDPOINT_MATCHES,
+        EndpointAttestation::CrossFamily => &ENDPOINT_CROSS_FAMILY,
+        EndpointAttestation::Mismatch => &ENDPOINT_MISMATCH,
+        EndpointAttestation::NoAddress => &ENDPOINT_NO_ADDRESS,
+    };
+    let n = c.fetch_add(1, Relaxed) + 1;
+    // Only the uncorroborated case is worth a line, and only occasionally: a member that
+    // re-parks every park-TTL would otherwise repeat it forever (the #530 lesson).
+    if a == EndpointAttestation::Mismatch && (n.is_power_of_two() || n % 1000 == 0) {
+        eprintln!(
+            "ct-edge: #546 advertised endpoint does not match the observed source address \
+             ({n} so far) -- counting only, nothing refused"
+        );
+    }
 }
 
 /// #517 V1 (Nachtrag): completed rendezvous pairings for `/metrics`.
@@ -6715,4 +6793,35 @@ mod tests {
         drop(src_task);
         drop(snk_task);
     }
+    #[test]
+    fn classify_endpoint_separates_corroborated_dual_stack_and_uncorroborated_546() {
+        use std::net::IpAddr;
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        let v6: IpAddr = "2001:db8::7".parse().unwrap();
+
+        // Corroborated: the advertised IP is the one the edge saw. The port may differ --
+        // a member advertises its listener, not the ephemeral source port of this join.
+        assert_eq!(classify_endpoint("203.0.113.7:9000", v4), EndpointAttestation::Matches);
+
+        // Dual-stack is NOT a mismatch. A member reaching the edge over v4 while offering
+        // its v6 listener is ordinary; conflating it with the uncorroborated case would
+        // make the interesting counter useless the moment IPv6 is in play.
+        assert_eq!(classify_endpoint("[2001:db8::7]:9000", v4), EndpointAttestation::CrossFamily);
+        assert_eq!(classify_endpoint("203.0.113.7:9000", v6), EndpointAttestation::CrossFamily);
+
+        // Same family, different address: nothing corroborates this. THIS is the case that
+        // lets an admitted member point its partner at an arbitrary public host --
+        // is_global_unicast only rules out internal targets.
+        assert_eq!(classify_endpoint("198.51.100.9:443", v4), EndpointAttestation::Mismatch);
+        assert_eq!(classify_endpoint("[2001:db8::99]:443", v6), EndpointAttestation::Mismatch);
+
+        // The relay-only sentinel is not an address and must not land in any of the three
+        // address buckets -- otherwise every NAT'd member would be counted as something.
+        assert_eq!(
+            classify_endpoint(ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY, v4),
+            EndpointAttestation::NoAddress
+        );
+        assert_eq!(classify_endpoint("not-an-address", v4), EndpointAttestation::NoAddress);
+    }
+
 }

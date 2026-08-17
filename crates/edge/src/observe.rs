@@ -138,6 +138,24 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         relay = state.relay_broker_heartbeat().last_seen(),
         rendezvous = state.rendezvous_broker_heartbeat().last_seen(),
     ));
+    // #546: does a member's ADVERTISED endpoint match the source address the edge actually
+    // observed? Counting only -- nothing is refused on this basis. `cross_family` is broken
+    // out because a dual-stack member legitimately advertises the other family, and folding
+    // it into `mismatch` would bury the signal in a legitimate case.
+    {
+        let (m, cf, mm, na) = crate::channel_broker::endpoint_attestation_totals();
+        out.push_str(&format!(
+            "# HELP ct_edge_channel_endpoint_attestation_total Channel joins by how the \
+advertised endpoint relates to the edge-observed source address (#546). `mismatch` is the \
+uncorroborated case: internal targets are already refused (#94/#121/#267), but an arbitrary \
+PUBLIC address is not. Counting only -- nothing is refused on this basis.\n\
+         # TYPE ct_edge_channel_endpoint_attestation_total counter\n\
+         ct_edge_channel_endpoint_attestation_total{{result=\"matches\"}} {m}\n\
+         ct_edge_channel_endpoint_attestation_total{{result=\"cross_family\"}} {cf}\n\
+         ct_edge_channel_endpoint_attestation_total{{result=\"mismatch\"}} {mm}\n\
+         ct_edge_channel_endpoint_attestation_total{{result=\"no_address\"}} {na}\n",
+        ));
+    }
     // #539: the companion gauge, without which the one above is ambiguous at 0 -- a loop the
     // edge never meant to run and one that was meant to run and never came up both read as 0.
     // Alert on `expected_since > 0 AND last_seen == 0` for longer than a boot; that is a loop
