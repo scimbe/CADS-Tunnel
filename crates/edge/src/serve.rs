@@ -3138,16 +3138,63 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 // #513: count what was actually AUTHORIZED -- `pairs` includes
                 // hostname-less (mesh-only) entries, and the old `pairs.len()` line
                 // overstated the rehydration by exactly those.
+                // #548: an unavailable registry and an empty one are opposite situations and
+                // must not produce the same line. Every Browser-Plane hostname routes off
+                // this replay, so a silent failure here serves nothing while looking normal.
+                let unavailable = match &pairs {
+                    crate::edge_mesh_client::Rehydration::Unavailable(why) => Some(why.clone()),
+                    crate::edge_mesh_client::Rehydration::Answered(_) => None,
+                };
                 let mut authorized = 0usize;
-                for pair in pairs {
+                for pair in pairs.pairs() {
                     if let Some(host) = pair.hostname {
                         state.authorize_host(&host, RoutingToken(pair.token));
                         authorized += 1;
                     }
                 }
-                eprintln!(
-                    "ct-edge: rehydrated {authorized} hostname authorization(s) from {cp_url} (edge_id={edge_id})"
-                );
+                match &unavailable {
+                    None => eprintln!(
+                        "ct-edge: rehydrated {authorized} hostname authorization(s) from {cp_url} (edge_id={edge_id})"
+                    ),
+                    Some(why) => eprintln!(
+                        "ct-edge: #548 REHYDRATION FAILED ({why}) -- no hostname authorization was \
+                         replayed, so every Browser-Plane hostname will fail to route until a retry \
+                         succeeds. Retrying in the background."
+                    ),
+                }
+                // Retry until ONE attempt answers. Without this a single hiccup at boot --
+                // the control plane restarting alongside the edge is the ordinary case --
+                // left the edge permanently unauthorized until someone restarted it again.
+                if unavailable.is_some() {
+                    let (rurl, rtok, rid, rstate) = (cp_url.clone(), tok, edge_id.clone(), state.clone());
+                    tokio::spawn(async move {
+                        let mut delay = std::time::Duration::from_secs(5);
+                        loop {
+                            tokio::time::sleep(delay).await;
+                            match crate::edge_mesh_client::rehydrate(&rurl, &rtok, &rid).await {
+                                crate::edge_mesh_client::Rehydration::Answered(pairs) => {
+                                    let mut n = 0usize;
+                                    for pair in pairs {
+                                        if let Some(host) = pair.hostname {
+                                            rstate.authorize_host(&host, RoutingToken(pair.token));
+                                            n += 1;
+                                        }
+                                    }
+                                    // The recovery is logged too: an operator who saw the
+                                    // failure needs to see it end without having to probe.
+                                    eprintln!(
+                                        "ct-edge: #548 rehydration recovered -- replayed {n} hostname authorization(s)"
+                                    );
+                                    return;
+                                }
+                                crate::edge_mesh_client::Rehydration::Unavailable(why) => {
+                                    eprintln!("ct-edge: #548 rehydration retry failed ({why}); next attempt in {delay:?}");
+                                    delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                                }
+                            }
+                        }
+                    });
+                }
                 let revoked_count = revoked.len();
                 state.seed_revoked_tokens(revoked.into_iter().map(RoutingToken));
                 eprintln!("ct-edge: replayed {revoked_count} revoked token(s) from {cp_url}");

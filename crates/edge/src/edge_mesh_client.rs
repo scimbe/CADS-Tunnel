@@ -117,20 +117,47 @@ pub struct RehydratedPair {
 /// any transport/auth/parse failure — a fresh/unreachable registry just means
 /// this boot starts with nothing to replay, the same as before this feature
 /// existed. Malformed individual token hex strings are skipped, not fatal.
-pub async fn rehydrate(cp_url: &str, admin_token: &[u8; 32], edge_id: &str) -> Vec<RehydratedPair> {
+/// #548: the outcome of a rehydration attempt, because "0 pairs" has two opposite meanings.
+/// An empty registry is a normal fresh deployment; an unreachable or unreadable one means
+/// every Browser-Plane hostname will fail to route until a later attempt succeeds. Both used
+/// to produce the identical `rehydrated 0 hostname authorization(s)` line, which gives an
+/// operator watching a deploy no reason to act while nothing is being served.
+pub enum Rehydration {
+    /// The registry answered. `pairs` may legitimately be empty.
+    Answered(Vec<RehydratedPair>),
+    /// The registry could not be reached or its answer could not be read. `why` is for the
+    /// log line, not for control flow -- the caller retries regardless of the reason.
+    Unavailable(String),
+}
+
+impl Rehydration {
+    /// The pairs to replay; empty when the registry was unavailable. Keeps the call site's
+    /// replay loop unchanged -- the distinction drives logging and retry, not the replay.
+    pub fn pairs(self) -> Vec<RehydratedPair> {
+        match self {
+            Self::Answered(p) => p,
+            Self::Unavailable(_) => Vec::new(),
+        }
+    }
+}
+
+pub async fn rehydrate(cp_url: &str, admin_token: &[u8; 32], edge_id: &str) -> Rehydration {
     let url = format!("{}/internal/edges/rehydrate/{}", cp_url.trim_end_matches('/'), edge_id);
     let resp = match SHARED_CLIENT.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
+        Ok(r) => return Rehydration::Unavailable(format!("registry answered {}", r.status())),
+        Err(e) => return Rehydration::Unavailable(format!("registry unreachable: {e}")),
     };
     let pairs: Vec<RehydratePair> = match resp.json().await {
         Ok(p) => p,
-        Err(_) => return Vec::new(),
+        Err(e) => return Rehydration::Unavailable(format!("registry answer unreadable: {e}")),
     };
-    pairs
-        .into_iter()
-        .filter_map(|p| hex_decode_32(&p.token).map(|token| RehydratedPair { token, hostname: p.hostname }))
-        .collect()
+    Rehydration::Answered(
+        pairs
+            .into_iter()
+            .filter_map(|p| hex_decode_32(&p.token).map(|token| RehydratedPair { token, hostname: p.hostname }))
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -269,7 +296,7 @@ mod tests {
         )
         .await;
 
-        let got = rehydrate(&base, &secret, "primary").await;
+        let got = rehydrate(&base, &secret, "primary").await.pairs();
         assert_eq!(got.len(), 2, "the malformed-token row is skipped, not fatal to the others");
         assert_eq!(got[0].hostname.as_deref(), Some("a.example.com"));
         assert_eq!(got[1].hostname, None, "a Mesh-Plane-only token (no hostname) round-trips as None");
@@ -282,10 +309,38 @@ mod tests {
         let base = spawn_mock_cp(secret, r#"[]"#, hits).await;
 
         let wrong = rehydrate(&base, &[0u8; 32], "primary").await;
-        assert!(wrong.is_empty(), "wrong admin token -> empty, not a panic");
+        assert!(wrong.pairs().is_empty(), "wrong admin token -> empty, not a panic");
 
         let down = rehydrate("http://127.0.0.1:1", &secret, "primary").await;
-        assert!(down.is_empty(), "unreachable CP -> empty, not a panic");
+        assert!(down.pairs().is_empty(), "unreachable CP -> empty, not a panic");
+    }
+
+    #[tokio::test]
+    async fn rehydrate_distinguishes_an_empty_registry_from_an_unavailable_one_548() {
+        // #548: both used to be an empty Vec, so the boot line read `rehydrated 0` either
+        // way. One is a normal fresh deployment; the other means NO Browser-Plane hostname
+        // routes at all. An operator watching a deploy could not tell them apart, and the
+        // boot-time call is never retried -- so a single hiccup served nothing until the
+        // next restart.
+        let secret = [0x24u8; 32];
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_mock_cp(secret, r#"[]"#, hits).await;
+
+        // A registry that answers with nothing: legitimately empty, not a failure.
+        assert!(
+            matches!(rehydrate(&base, &secret, "primary").await, Rehydration::Answered(p) if p.is_empty()),
+            "an empty registry ANSWERED -- it must not be reported as unavailable"
+        );
+
+        // Refused and unreachable are both unavailable, and each says why, because the two
+        // need different operator responses (a token/permission problem vs. a down CP).
+        let refused = rehydrate(&base, &[0u8; 32], "primary").await;
+        let Rehydration::Unavailable(why) = refused else { panic!("wrong token must be Unavailable") };
+        assert!(why.contains("answered"), "a refusal names the status: {why}");
+
+        let down = rehydrate("http://127.0.0.1:1", &secret, "primary").await;
+        let Rehydration::Unavailable(why) = down else { panic!("unreachable CP must be Unavailable") };
+        assert!(why.contains("unreachable"), "an unreachable CP says so: {why}");
     }
 
     #[tokio::test]
