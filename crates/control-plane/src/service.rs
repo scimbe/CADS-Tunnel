@@ -3734,8 +3734,12 @@ async fn me_issue(
 }
 
 /// Build the health/readiness router (M21.1a): `GET /healthz` (liveness, always
-/// `200`) and `GET /readyz` (readiness — `200` if the database is reachable,
-/// else `503`). Used by orchestrator liveness/readiness probes.
+/// `200`) and `GET /readyz` (readiness — `200` if this process can actually READ its
+/// database, else `503`). Used by orchestrator liveness/readiness probes.
+///
+/// #541: the readiness answer is only worth what its probe reads. See
+/// [`SqliteLedger::ping`] for what it does and does not establish — in particular that
+/// it says nothing about writability, and deliberately nothing about Keycloak.
 pub fn health_router(ledger: Arc<SqliteLedger>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))

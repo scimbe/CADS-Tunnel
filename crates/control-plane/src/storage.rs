@@ -1362,11 +1362,36 @@ impl SqliteLedger {
         Ok(account)
     }
 
-    /// Cheap liveness check that the database is reachable (readiness probe).
+    /// Readiness probe: can this process actually read its database?
+    ///
+    /// #541: this used to run `SELECT 1`, which reads no page of the database file at all --
+    /// no table, no schema, no disk. SQLite answers it from the expression itself, so it
+    /// proved "a connection object exists", never "the database is usable", while `/readyz`
+    /// advertised the latter. Demonstrated: with the file's header zeroed (the damage a
+    /// failed restore or a bad disk leaves behind), a fresh connection opens fine -- SQLite
+    /// opens lazily -- `SELECT 1` still returns Ok, and only a real table read fails with
+    /// "file is not a database". The probe reported ready for a database nothing could be
+    /// read from.
+    ///
+    /// Reading from a real table forces at least the schema page off the file, so a
+    /// destroyed header, a missing schema and an unreadable file all surface. `LIMIT 1`
+    /// keeps it constant-cost: this runs every 15s under the container healthcheck, and a
+    /// `count(*)` would be linear in the number of accounts -- a probe that becomes a load
+    /// source as the deployment grows.
+    ///
+    /// What it deliberately does NOT cover: **writability** (a read-only filesystem passes
+    /// this), and the reachability of Keycloak. The latter is a decision, not an oversight --
+    /// tying readiness to a downstream service turns that service's outage into this one's.
     pub fn ping(&self) -> rusqlite::Result<()> {
         self.conn
             .lock_safe()
-            .query_row("SELECT 1", [], |_| Ok(()))
+            .query_row("SELECT 1 FROM accounts LIMIT 1", [], |_| Ok(()))
+            .or_else(|e| match e {
+                // An empty `accounts` table is a perfectly ready database -- the read
+                // reached the file, which is the whole question. Only a real error is one.
+                rusqlite::Error::QueryReturnedNoRows => Ok(()),
+                other => Err(other),
+            })
     }
 
     /// Number of open accounts — for the status view (F4.1).
@@ -7880,6 +7905,52 @@ mod tests {
         );
 
         drop(dir);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[test]
+    fn ping_fails_when_the_database_can_no_longer_be_read_541() {
+        // The readiness probe claims "the database is reachable". #541: `SELECT 1` cannot
+        // test that -- it reads no page of the file, so it is answered from the expression
+        // itself and stays Ok no matter what happened to the data.
+        //
+        // Scope, established by experiment rather than assumed: a file corrupted *before
+        // startup* is already caught, because `open` applies the schema and fails outright
+        // ("file is not a database"), so the process never comes up. What no amount of
+        // startup checking covers is a database that stops being readable **while the
+        // process runs** -- an I/O error on read, or the store being replaced or emptied
+        // underneath a live connection, as a botched restore or a remounted volume does.
+        // That is what this test models, and it is the case the old probe reported ready for.
+        let path = std::env::temp_dir()
+            .join(format!("ct-cp-ping-{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+
+        let ledger = SqliteLedger::open(&path).expect("a fresh ledger opens");
+        ledger
+            .ping()
+            .expect("an intact but empty ledger is ready -- no rows is not a failure");
+
+        // Pull the ledger's own table out from under the live connection.
+        {
+            let other = rusqlite::Connection::open(&path).expect("second connection");
+            other
+                .execute("DROP TABLE accounts", [])
+                .expect("drop the table this process needs");
+        }
+
+        let err = ledger
+            .ping()
+            .expect_err("a ledger whose accounts table is gone must not report ready");
+        assert!(
+            err.to_string().contains("no such table"),
+            "the failure names what is actually missing: {err}"
+        );
+
+        drop(ledger);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
