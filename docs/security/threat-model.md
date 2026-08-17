@@ -37,6 +37,7 @@ claim is "we can't read what you send", not anonymity.
 | State loss on restart | Durable SQLite (enrollment/registry/ledger) | shipped (M18) |
 | Poisoned local build (gate write-mount) | Server-side CI (`.github/workflows/ci.yml`) re-runs build+test+audit+secret-guard on `main`, independent of the local gate | accepted residual (#78 SEC78c; mitigated by SEC78b) |
 | Funded sybil / billing fraud | **unresolved** — PoW does not deter a paying adversary | open (SPEC §9.1) |
+| Capability holder registers as the Agent (#540) | **none today** — agent registration is `role='A' \| token(32)` and every TLS context is `with_no_client_auth()`, so the client capability already contains everything registration requires. Confidentiality/authenticity hold (Noise_IK to the pinned `OriginIdentity`); **availability does not** | open (#540, residual risk 7) |
 
 ## Secrets inventory & handling
 
@@ -122,3 +123,40 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    against a runbook procedure live pipeline maintainers currently depend on. Until that's
    done: accepted residual, now honestly documented instead of silently contradicting
    ADR-0001/0003.
+
+7. **A capability holder can silence a tunnel (#540)** — the routing token is deliberately a
+   bearer credential (ADR-0014: *"possession is sufficient to reach and authenticate an
+   Origin"*), and that statement is about the **Client** side. The same 32 bytes also
+   authorize the **Agent** side: `register_agent` (`crates/edge/src/serve.rs`) reads
+   `role='A' | token(32)` and asks for nothing further, and every TLS context on the edge is
+   built `with_no_client_auth()` (`pki.rs`, `transport.rs`, `relay_gate.rs`), so no
+   certificate binds a registration to a particular agent either. A client capability carries
+   `{token, origin, edge_addr}` — that is, **everything registration requires is already in
+   the credential the customer hands to every legitimate user**. This was never decided; it
+   follows from both roles resting on one secret.
+
+   The routing rule sharpens it: `EdgeState::route` returns `v.last()` and `routes` orders
+   registrations most-recently-first (the #8 failover order), so the newest registrant takes
+   **all** of a tunnel's traffic, not a share, and can stay newest by re-registering. The #8
+   failover does not rescue this — it triggers on a failed `open_bi()`, i.e. against a *dead*
+   agent, whereas a hostile registrant answers at the transport layer and simply lets the
+   Noise handshake go nowhere. The genuine agent is still registered and never tried.
+
+   **Bounded deliberately**: confidentiality and authenticity are unaffected. The client runs
+   Noise_IK against the pinned `OriginIdentity`; without the origin's private key the
+   registrant completes no handshake, decrypts nothing and impersonates no one. The
+   zero-knowledge property of the data path holds. What fails is **availability** — anyone
+   holding a capability can take a customer's tunnel down completely, using a credential they
+   are supposed to have, with no privilege escalation and no exploit.
+
+   **The real fix is an agent-side possession proof** (the private origin key, which a
+   capability holder does not have), bound to the registration through the control plane —
+   the same place that already answers `is_revoked`. It is not a change to slip in: it alters
+   the registration wire format, requires every agent to be rolled out *before* the edge may
+   demand it (otherwise the edge locks out legitimate agents and causes the very outage the
+   measure prevents), and needs a count-then-enforce transition whose cut-over is the
+   operator's call. #495/#524 already built these pieces for the channel path; the
+   Browser-Plane registration is the remaining path with no possession proof, so it belongs
+   there as a slice rather than as a second parallel mechanism. **Open, pending an operator
+   decision (#540)** — documented here rather than left as a gap the model silently implies
+   is covered.
