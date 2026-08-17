@@ -1471,6 +1471,81 @@ mod tests {
         );
     }
 
+    /// The gate's fail-closed property, pinned instead of merely intended.
+    ///
+    /// Both membership checks discard the error (`unwrap_or(false)` / `matches!(.., Ok(true))`),
+    /// so a database that cannot be read is treated as "not allowed". That is the right
+    /// direction and it is written down nowhere a test can defend -- a later refactor to
+    /// `?` or `unwrap_or(true)` would still pass every existing gate test, because they all
+    /// use a healthy store. This one takes the store away mid-flight.
+    #[tokio::test]
+    async fn an_unreadable_store_denies_the_gate_instead_of_admitting() {
+        let dir = std::env::temp_dir().join(format!("ct-gate-failclosed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tunnels.db").to_string_lossy().into_owned();
+
+        let tunnels = Arc::new(SqliteTunnelStore::open(&path).unwrap());
+        let t = tunnels
+            .create("alice", "demo", Some("demo.bunsenbrenner.org"))
+            .unwrap()
+            .created()
+            .expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        // Deliberately permissive to begin with: without the sabotage below this login WOULD
+        // be admitted, so a pass here cannot come from the account simply not being allowed.
+        assert!(tunnels.set_allow_any_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.allow_any_login_for_hostname("demo.bunsenbrenner.org").unwrap());
+
+        // Pull both tables the gate consults out from under the live connection.
+        {
+            let other = rusqlite::Connection::open(&path).expect("second connection");
+            other.execute("DROP TABLE tunnel_login_allowlist", []).expect("drop allowlist");
+            other.execute("DROP TABLE subject_tunnels", []).expect("drop tunnels");
+        }
+        assert!(
+            tunnels.allow_any_login_for_hostname("demo.bunsenbrenner.org").is_err(),
+            "the store must now be genuinely broken -- otherwise this test proves nothing"
+        );
+
+        let app = gate_router_with(
+            tunnels.clone(),
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("fresh@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
+        let resp = app
+            .oneshot(
+                Request::get("/gate/callback?code=abc&state=xyz")
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a store that cannot answer must DENY -- an error here must never read as \
+             'no restriction configured'"
+        );
+        assert!(
+            !resp
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|c| c.to_str().unwrap_or_default().starts_with(&format!("{GATE_SESSION_COOKIE}="))),
+            "and it must mint no session cookie"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn allow_any_login_admits_a_fresh_account_and_off_keeps_the_strict_list_501() {
         // #501: with "allow any signed-in account" ON, a successful login whose email is
