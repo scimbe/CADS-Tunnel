@@ -1858,7 +1858,12 @@ pub fn new_shared_channel_pairer() -> SharedChannelPairer {
 /// (measured: 271 "rung failures" that were just idle park expiries). `EX` names the event so
 /// a current client re-parks on the SAME rung immediately; an older client sees it as the
 /// same EOF-ish close it always did (no behavior change).
-pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
+/// #557: re-exported from [`ct_common::channel::PARK_EXPIRED_TOKEN`], which is now the single
+/// definition. ct-agent compared against its own bare `"EX"` literal and each side pinned its
+/// own copy with its own test -- two self-consistent tests cannot see the copies drift apart.
+/// Kept as a re-export rather than replaced at ~30 call sites: the name is what this module
+/// reads as, and the aliasing makes a divergence impossible rather than merely tested.
+pub use ct_common::channel::PARK_EXPIRED_TOKEN;
 
 /// The QUIC-leg park-expiry close-reason PREFIX -- the `quinn::Connection::close` analog of
 /// the stream-leg [`PARK_EXPIRED_TOKEN`] (`EX`). When the edge reaps an idle QUIC park it closes
@@ -1870,7 +1875,8 @@ pub const PARK_EXPIRED_TOKEN: &[u8] = b"EX";
 /// so a reword can't silently decouple that cross-repo client classification; both reasons are
 /// built via [`quic_park_expired_reason`], and `quic_park_expiry_reasons_carry_the_wire_prefix`
 /// pins the contract so a breaking edit fails the edge's own gate.
-pub const QUIC_PARK_EXPIRED_REASON_PREFIX: &str = "park-expired:";
+/// #557: likewise re-exported from [`ct_common::channel::PARK_EXPIRED_REASON_PREFIX`].
+pub use ct_common::channel::PARK_EXPIRED_REASON_PREFIX as QUIC_PARK_EXPIRED_REASON_PREFIX;
 
 /// Build a QUIC park-expiry close reason: the [`QUIC_PARK_EXPIRED_REASON_PREFIX`] the client
 /// classifies on, plus an honest human-readable `why` suffix (logged, never parsed).

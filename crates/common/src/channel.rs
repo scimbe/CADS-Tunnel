@@ -378,6 +378,32 @@ pub const CHANNEL_ENDPOINT_RELAY_ONLY: &str = "relay-only";
 /// `dial_relay_gate_over_443`) and the wasm/JS join readers before shipping.
 pub const CHANNEL_REFUSAL_SENTINEL: &[u8; 2] = b"NO";
 
+/// #557: the **park-expiry** sentinel on a stream leg — the counterpart to
+/// [`CHANNEL_REFUSAL_SENTINEL`], and it belongs beside it for the same reason.
+///
+/// The edge writes this when it reaps an idle park; the presenter must read it as "your park
+/// is gone through no fault of your grant, re-park on the same rung" and NOT as a refusal.
+/// Getting that wrong is not cosmetic: a refusal advances ct-agent's rung ladder and applies
+/// refusal backoff, so a waiting acceptor would lose a rung on every TTL cycle instead of
+/// holding its place.
+///
+/// It lives here, in the crate BOTH repos depend on, because it used to live in two: the edge
+/// had a named constant and ct-agent compared against a bare `"EX"` literal, each side pinned
+/// by its own test against its own copy. Two self-consistent tests cannot notice the two
+/// copies drifting apart — only one shared definition can, and it does so at compile time.
+/// The refusal sentinel next door was already shared; this one simply had not been carried
+/// over with it.
+pub const PARK_EXPIRED_TOKEN: &[u8; 2] = b"EX";
+
+/// #557: the **park-expiry** marker a QUIC leg carries instead of [`PARK_EXPIRED_TOKEN`].
+///
+/// A reaped QUIC park has no stream left to write a token on, so the edge puts the same
+/// meaning in the connection's ApplicationClose reason: this prefix followed by an honest
+/// human-readable suffix (`park-expired: no partner within the park TTL`). A reader matches
+/// the PREFIX and tolerates any suffix — the suffix is for an operator, the prefix is the
+/// contract. Same shared-definition reasoning as the token above.
+pub const PARK_EXPIRED_REASON_PREFIX: &str = "park-expired:";
+
 /// The **closed vocabulary** of refusal category tokens (#524). After the
 /// [`CHANNEL_REFUSAL_SENTINEL`], the edge appends ONE length-framed token from this
 /// set (`len(u8) | token(ascii)`), telling the presenter *which class* of check
@@ -2899,6 +2925,39 @@ fn hex32(b: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// #557: the park-expiry signals are a WIRE contract with readers this crate cannot
+    /// compile against -- ct-agent (its own repo, its own release cadence) and the browser
+    /// join readers. Sharing the definition removed the drift between the two Rust copies;
+    /// this pins the bytes themselves, which is the part no type system reaches.
+    ///
+    /// A change here is a protocol break, not a rename: an older ct-agent classifies the new
+    /// wording as a refusal, which advances its rung ladder and applies refusal backoff
+    /// instead of re-parking. If this test ever needs updating, the fleet needs a migration.
+    #[test]
+    fn park_expiry_wire_signals_are_exactly_what_the_other_repo_matches_557() {
+        assert_eq!(PARK_EXPIRED_TOKEN, b"EX", "the stream-leg token is two ASCII bytes, nothing else");
+        assert_eq!(
+            PARK_EXPIRED_REASON_PREFIX, "park-expired:",
+            "the QUIC-leg close reason begins with exactly this"
+        );
+
+        // The reader on the other side matches the colon-less stem, so the prefix must keep
+        // starting with it -- dropping or reordering the words would pass a naive equality
+        // check on this constant alone while breaking that match.
+        assert!(
+            PARK_EXPIRED_REASON_PREFIX.starts_with("park-expired"),
+            "ct-agent matches the stem `park-expired` as a substring of the close reason"
+        );
+
+        // And the two park signals must stay distinguishable from the refusal sentinel next
+        // door -- they mean opposite things to a presenter (re-park vs. back off).
+        assert_ne!(
+            &PARK_EXPIRED_TOKEN[..],
+            &CHANNEL_REFUSAL_SENTINEL[..],
+            "a park expiry must never be readable as a refusal"
+        );
+    }
 
     #[test]
     fn channel_refusal_round_trips_every_vocabulary_token() {
