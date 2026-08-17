@@ -514,3 +514,32 @@ works regardless.
 Availability against a **funded** abuser and censorship/lawful-process handling
 are operational/jurisdictional, not covered by the software — see
 [SPEC §9](../SPEC.md) and the [threat model](../security/threat-model.md).
+
+## Edge-Wächter (`scripts/edge-watch.sh`)
+
+Läuft per Cron alle 10 Minuten und meldet sich nur bei einer Störung — geprüft wird der
+**laufende** Edge, nicht die Konfiguration:
+
+| Signal | Anlass |
+|---|---|
+| Container weg / nicht laufend / Neustartzähler gestiegen | verlässliches Down-Signal |
+| `/healthz` antwortet nicht oder meldet Fehler | hängender Prozess; seit #539 auch „vorgesehener Broker-Loop nie angelaufen" |
+| Park-Gauge > 80 | #522: Leichen sammeln sich, TCP-Park-Reaper arbeitet nicht mehr |
+| `refused-111`-Signatur im Log (15-Minuten-Fenster) | #522: Auslieferung an einen toten Park |
+| Broker-Loop-Schlag älter als 60 s | Channel-Joins über diesen Transport bleiben stehen |
+
+Zwei Entwurfsentscheidungen, beide aus Fehlschlägen gelernt:
+
+- **Ein fehlgeschlagenes `docker exec` ist kein Down-Signal.** Der Vorgänger hat damit
+  zweimal bei gesundem Edge fehlgefeuert; maßgeblich ist `State.Running` bzw. der
+  Neustartzähler.
+- **Antwortet die Sonde nicht, obwohl der Container läuft, ist das ein Befund** und kein
+  Grund zu schweigen. Eine Prüfung, die nicht laufen konnte, darf nicht wie eine bestandene
+  aussehen.
+
+Ein sinkender Neustartzähler gilt als Deploy (der Container wurde neu erzeugt) und setzt nur
+den Bezugspunkt neu. Gleiche Meldungen werden für 6 Stunden nicht erneut gemailt; Logzeile
+und Exit-Code bleiben davon unberührt.
+
+    tail /var/tmp/cads-edge-watch/cron.log     # Verlauf
+    ./scripts/edge-watch.sh                    # von Hand, Exit 0 = still
