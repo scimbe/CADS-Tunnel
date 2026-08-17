@@ -98,3 +98,32 @@ Docker-Images (werden aus den Quellen neu gebaut), die Cargo-Build-Caches, und d
 Zustaende der Demo-Origins (Caddy-Daten) — alles reproduzierbar. Neue Volumes mit
 echtem Zustand muessen bewusst in die Liste in `backup-selfhost.sh` aufgenommen
 werden; die Aufzaehlung ist absichtlich explizit statt globbend.
+
+## Ist die Sicherung wiederherstellbar? (`scripts/backup-verify.sh`)
+
+Die Frischeprüfung beantwortet „liegt eine aktuelle Sicherung vor". Das ist nicht dieselbe
+Frage wie „lässt sie sich zurückspielen" — und nur die zweite zählt an dem Tag, an dem es
+darauf ankommt. Eine Datei kann frisch und normal groß sein und trotzdem unbrauchbar: falsche
+Passphrase, abgebrochener Upload, abgeschnittener Datenstrom.
+
+Läuft täglich um 04:40 und **verändert nichts** am Betrieb — es wird ausschließlich gelesen:
+
+1. entschlüsseln (Passphrase passt, Datenstrom unversehrt)
+2. Archiv auflisten (kein abgeschnittener tar-Strom)
+3. Pflichtdateien: Keycloak-Dump, Control-Plane-DB, Manifest
+4. `pg_restore --list` auf den Keycloak-Dump — liest dessen Inhaltsverzeichnis; ein
+   abgeschnittener Dump scheitert hier, **ohne dass irgendetwas eingespielt wird**
+5. `pragma integrity_check` auf die Control-Plane-DB plus Nachweis der Kerntabellen
+
+Zu den Zahlen: Zeilenzahlen werden **berichtet, nicht als Schwelle benutzt**. `tunnels` steht
+in diesem Betrieb legitim auf 1 — die Hostnamen-Ansprüche liegen in `mesh_ownership` (57).
+Eine Schwelle auf der falschen Tabelle wäre ein Dauerfehlalarm oder, schlimmer, ein
+Dauer-Freispruch. Geprüft wird deshalb auf *Struktur* (Kerntabellen vorhanden), was eine
+lesbare, aber leere Datei auffliegen lässt.
+
+Alle fünf Fehlerpfade wurden einmal ausgelöst, bevor die Prüfung in den Cron kam — darunter
+der wichtigste: ein abgeschnittener `pg_dump` in einem einwandfreien, richtig großen Archiv.
+Genau den sieht keine Größen- oder Altersprüfung.
+
+    tail /var/tmp/cads-backup/verify.log
+    ./scripts/backup-verify.sh          # von Hand, Exit 0 = wiederherstellbar
