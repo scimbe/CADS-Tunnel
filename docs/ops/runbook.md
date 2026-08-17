@@ -592,7 +592,21 @@ Realm mit 404. Nur der Realm-Pfad unterscheidet also den Fall, der hier tatsäch
 ist — am 16.08. lag die Auth-Ebene ~6 Minuten, weil die Realm-Importdatei den Start verhinderte.
 Eine Sonde auf die Startseite hätte dabei geschwiegen.
 
-**Der Hinweistext richtet sich nach der Klasse.** Fällt eine Kernadresse, verweist die Meldung
+**Der Hinweistext richtet sich auch nach der ART des Fehlschlags**, nicht nur nach der
+Adresse — der Unterschied entscheidet, wo man sucht:
+
+| beobachtet | Bedeutung | wo suchen |
+|---|---|---|
+| `000` | keine Antwort | Transportebene: Hostname-Anspruch, Agent mit veralteter Edge-IP, fehlgeschlagene Rehydrierung |
+| `5xx` | der Tunnel hat **zugestellt**, der Origin meldet einen Fehler | beim Dienst hinter dem Agenten — der gehört oft einem Peer, nicht diesem Host |
+| sonstige Abweichung | weder Transport noch Origin | meist geänderte Weiterleitung oder Login-Gate; erwarteten Wert prüfen |
+
+Am 17.08. um 06:00 schlug der Wächter zum ersten Mal echt an: `llm-34a13a96` lieferte zweimal
+im Abstand von 30 s eine `500`. Der damalige Hinweis riet zu Tunnel-Ursachen — die erzeugen
+aber eine `000` und niemals eine `500`. Wer daraufhin am Tunnel gesucht hätte, hätte an der
+falschen Stelle gesucht; daher die Aufschlüsselung oben.
+
+**Der Hinweistext richtet sich außerdem nach der Klasse der Adresse.** Fällt eine Kernadresse, verweist die Meldung
 auf Keycloak-Start und Realm-Import; fällt ein Demo-Tunnel, auf Hostname-Anspruch, Agent-IP und
 Rehydrierung. Ein Hinweis, der bei einem Keycloak-Ausfall nach dem Hostname-Anspruch suchen
 lässt, schickt in die falsche Richtung und ist schlechter als gar keiner.

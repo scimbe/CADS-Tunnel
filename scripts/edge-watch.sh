@@ -155,7 +155,12 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
     DOWN=""
     for ENTRY in $TARGETS; do
       URL="${ENTRY%=*}"; WANT="${ENTRY##*=}"
-      GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$URL" 2>/dev/null || echo 000)
+      # `curl -w '%{http_code}'` gibt bei einem Verbindungsfehler bereits "000" aus. Ein
+      # zusaetzliches `|| echo 000` haengte ein zweites an ("000000") -- die Einstufung
+      # unten fand darin ihr Muster nicht mehr und riet falsch. Beim ersten Probelauf so
+      # aufgefallen.
+      GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$URL" 2>/dev/null || true)
+      [ -n "$GOT" ] || GOT=000
       [ "$GOT" = "$WANT" ] || DOWN="$DOWN $URL:$GOT(erwartet $WANT)"
       SITES_CHECKED=$((SITES_CHECKED + 1))
     done
@@ -169,7 +174,8 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
       for ENTRY in $TARGETS; do
         URL="${ENTRY%=*}"; WANT="${ENTRY##*=}"
         case "$DOWN" in *" $URL:"*) ;; *) continue;; esac
-        GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$URL" 2>/dev/null || echo 000)
+        GOT=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$URL" 2>/dev/null || true)
+        [ -n "$GOT" ] || GOT=000
         [ "$GOT" = "$WANT" ] || STILL="$STILL $URL:$GOT(erwartet $WANT)"
       done
       if [ -n "$STILL" ]; then
@@ -181,11 +187,27 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
         for U in $URLS; do
           case "$STILL" in *" ${U%=*}:"*) HINT="Betroffen ist eine KERNADRESSE (Portal bzw. Keycloak-Realm), nicht ein Demo-Tunnel: zuerst Keycloak-Start und Realm-Import pruefen (eine unbrauchbare Realm-Datei verhindert den Start).";; esac
         done
-        for E in $SITES; do
-          case "$STILL" in *" https://${E%%=*}.$ZONE/:"*)
-            HINT="$HINT${HINT:+ }Betroffen ist mindestens ein Demo-Tunnel, waehrend der Edge laeuft: verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, oder eine fehlgeschlagene Rehydrierung.";;
-          esac
-        done
+        # Der Hinweis muss zur ART des Fehlschlags passen, nicht nur zur Adresse.
+        # Am 17.08. schlug der Waechter zum ersten Mal echt an (llm-34a13a96 lieferte
+        # zweimal 500) und riet zu "verlorener Hostname-Anspruch / veraltete Edge-IP /
+        # fehlgeschlagene Rehydrierung" -- lauter Ursachen, die eine 000 erzeugen und
+        # niemals eine 500. Eine 5xx heisst das Gegenteil: der Tunnel HAT zugestellt,
+        # und der Origin dahinter hat mit einem Fehler geantwortet. Wer daraufhin am
+        # Tunnel sucht, sucht an der falschen Stelle.
+        case "$STILL" in
+          *":000("*)
+            HINT="$HINT${HINT:+ }Mindestens ein Ziel antwortet gar nicht (000): das ist die Transportebene — verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, oder eine fehlgeschlagene Rehydrierung." ;;
+        esac
+        case "$STILL" in
+          *":5"[0-9][0-9]"("*)
+            HINT="$HINT${HINT:+ }Mindestens ein Ziel antwortet mit 5xx: der Tunnel hat ZUGESTELLT und der Origin dahinter meldet einen Fehler. Nicht am Tunnel suchen, sondern beim Dienst hinter dem Agenten (er gehoert oft einem Peer, nicht diesem Host)." ;;
+        esac
+        # Alles andere (z. B. 302 statt 200) ist weder Transport noch Origin-Fehler,
+        # sondern meist eine Gate-/Weiterleitungsaenderung.
+        case "$STILL" in
+          *":000("*|*":5"[0-9][0-9]"("*) ;;
+          *) HINT="$HINT${HINT:+ }Der Code weicht ab, ist aber weder 000 noch 5xx — meist eine geaenderte Weiterleitung oder ein Login-Gate; erwarteten Wert in CT_WATCH_SITES pruefen." ;;
+        esac
         ALARMS+=("Dienste nicht erreichbar (zweimal im Abstand von 30s geprueft):$STILL. ${HINT:-Der Edge selbst laeuft.}")
       else
         log "voruebergehender Aussetzer, beim zweiten Durchgang wieder erreichbar:$DOWN"
