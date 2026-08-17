@@ -77,6 +77,13 @@ else
     # 5. Broker-Loop-Stillstand; #539 unterscheidet dabei "nie vorgesehen" von
     #    "vorgesehen, aber nie angelaufen" -- beides steht in den Gauges.
     NOW=$(date +%s)
+    # Ein Edge, der das #539-Gauge nicht kennt, ist aelter als der Fix. Ohne diese
+    # Pruefung liefe die Schleife unten in `EXP=0` = "nicht vorgesehen" und bliebe
+    # still -- ein Waechterzweig, der nicht feuern KANN, sieht aus wie einer, der
+    # nichts findet. Genau die Verwechslung, gegen die #539 gebaut wurde.
+    if ! printf '%s' "$MET" | grep -q "^ct_edge_channel_broker_loop_expected_since_seconds"; then
+      ALARMS+=("Der laufende Edge kennt das Gauge 'expected_since' nicht (Stand vor #539). Der Waechter kann einen nie angelaufenen Broker-Loop deshalb NICHT erkennen -- das ist kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
+    fi
     for LOOP in relay rendezvous; do
       LAST=$(printf '%s' "$MET" | awk -v l="$LOOP" '$0 ~ "^ct_edge_channel_broker_loop_last_seen_seconds\\{loop=\""l"\"\\}" {print $2}' | head -1)
       EXP=$(printf '%s' "$MET" | awk -v l="$LOOP" '$0 ~ "^ct_edge_channel_broker_loop_expected_since_seconds\\{loop=\""l"\"\\}" {print $2}' | head -1)
