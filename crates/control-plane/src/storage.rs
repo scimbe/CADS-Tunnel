@@ -6709,6 +6709,22 @@ mod tests {
             store.list_grants("bob", &t.id),
             Err(GrantError::NotOwner),
         ), "non-owner cannot even enumerate grants");
+        // The third sibling: `revoke_grant` had the same `owner_of` prologue as the two
+        // above and no test asserting it. The three prologues are near-identical, which is
+        // exactly the shape that invites being factored out -- and if this one lost its
+        // check, the whole suite would still have gone green while any logged-in subject
+        // could strip another owner's grantee of access to a shared tunnel. The property is
+        // cheap to state and was the only one of the trio left standing on prose alone.
+        store.grant("alice", &t.id, "dave").unwrap();
+        assert!(matches!(
+            store.revoke_grant("bob", &t.id, "dave"),
+            Err(GrantError::NotOwner),
+        ), "a non-owner must not be able to revoke someone else's grantee");
+        assert!(
+            store.is_authorized("dave", &t.id).unwrap(),
+            "and the refused revoke must not have taken effect anyway"
+        );
+        assert!(store.revoke_grant("alice", &t.id, "dave").unwrap(), "the owner still can");
 
         // Owner grants bob -> bob becomes authorized; carol still is not.
         store.grant("alice", &t.id, "bob").unwrap();
