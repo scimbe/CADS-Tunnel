@@ -568,6 +568,27 @@ override and takes precedence when set. With `CT_OIDC_ISSUER` unset the endpoint
 are absent (any `/me/*` request → `404`); the unauthenticated billing/webhook flow
 works regardless.
 
+### The gate and portal login knobs
+
+Four more variables shape login and the tunnel gate. All were read from the code for this
+entry rather than inferred from their names:
+
+| variable | default | meaning |
+|---|---|---|
+| `CT_OIDC_REALM` | the project's own realm (`ct-demo`) | which Keycloak realm the admin client works against (`keycloak_admin.rs`); an empty value falls back to the default rather than to an empty realm name |
+| `CT_GATE_COOKIE_DOMAIN` | unset | the gate's session-cookie domain, set to the zone so **one** login covers every `*.<zone>` subdomain. **Until it is set, every gate handler answers `503`** — the gate is opt-in-until-configured, not silently open |
+| `CT_GATE_REDIRECT_URI` | derived | the gate's OIDC redirect target. Unset, it is the portal's `redirect_uri` with `/portal/callback` swapped for `/gate/callback` — correct whenever both live on the same host, so it usually needs no value at all |
+| `CT_PORTAL_SOCIAL_PROVIDERS` | unset ⇒ **none shown** | comma-separated allowlist (`google`, `github`) of social-login buttons on the logged-out portal |
+
+Two things worth knowing before touching them:
+
+- **`CT_GATE_COOKIE_DOMAIN` unset means the gate refuses, not that it waves traffic through.**
+  A `503` from `/gate/*` on a fresh deployment is that state, not a fault.
+- **Listing a social provider does not create it.** The buttons are gated on this variable, but
+  each provider must also exist in the Keycloak realm. On 2026-08-02 both buttons led to a raw
+  502 because the realm's `google`/`github` entries were absent — the allowlist advertised a
+  login path that did not exist. Add the provider in the realm first, then to this list.
+
 ## Escalation & scope
 
 Availability against a **funded** abuser and censorship/lawful-process handling
