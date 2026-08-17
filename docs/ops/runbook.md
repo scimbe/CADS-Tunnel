@@ -449,6 +449,43 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
 
+### How much channel traffic actually bypasses the edge (#517 V1)
+
+The offload figure is a **pair of counters**, never a single number:
+
+| metric | meaning |
+|---|---|
+| `ct_edge_channel_rendezvous_pairs_total` | pairings where the edge handed each side the other's endpoint and left the data path |
+| `ct_edge_channel_splices_total` | pairings the edge ended up relaying itself |
+
+| reading | meaning |
+|---|---|
+| `pairs > 0`, `splices == 0` | the channel plane offloaded completely |
+| `pairs > 0`, `splices > 0` | mixed; the ratio is the offload figure over the window |
+| **both `0`** | **nothing was measured** — not evidence of successful offload |
+
+The last row is the reason the pair exists. `splices == 0` on its own means both
+"everything went direct" and "nothing happened", which are opposite conclusions.
+
+Caveat, stated rather than hidden: a peer whose direct dial fails re-joins over the relay,
+so a fallback appears in *both* counters. This is a figure over a window, not a partition.
+
+**Two traps when measuring** (both hit on 2026-08-17):
+
+- **It counts pairings, not runs.** A run over an already-established session pairs nothing,
+  and a participant that is served in-process (the sort arena's `reference-sorter`) never
+  opens a channel at all. To see the counter move, drive a **remote** participant after a
+  fresh session — e.g. `POST /run/<remote-participant>` following an edge restart.
+- **Which pairer carries the traffic.** The `:443` front door runs the **stream** completer
+  family (`finish_stream_pair_inner`), the QUIC broker ports run the **quic** family
+  (`finish_quic_pair_inner`). Since agents are pinned to `CT_CHANNEL_FRONT_DOOR_ONLY=1`
+  until #495 unifies the pairers, the QUIC family carries almost nothing in this deployment
+  — instrumenting only that side measures a near-empty path, which is exactly what the first
+  version of this counter did.
+
+First field measurement (2026-08-17, remote participant `fbsd-0816`): `pairs=1, splices=0` —
+that session was paired at the edge and then ran entirely past it.
+
 ## Incident response
 
 | Symptom | Likely cause | Action |
