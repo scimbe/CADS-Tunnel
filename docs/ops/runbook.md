@@ -559,6 +559,45 @@ that session was paired at the edge and then ran entirely past it.
 | Fresh channel first contacts stall 45–100 s while held sessions are fast | clients older than **ct-agent v0.4.16**: their rendezvous-ack read waits for an EOF the `:443` edge never sends (CADS-Tunnel#494) | upgrade clients to ≥ v0.4.16 (one fixed side heals each pair); edge-side, #495-2b additionally closes marked rendezvous pairs |
 | One IP hammering doomed channel joins (`channel-join NO [not-member]` storm) | stale/orphaned client retrying a dead grant | the per-IP penalty (30 definitive refusals/min, 2026-08-13) sheds it pre-handshake automatically; `grep penalty` in the edge log to confirm engagement |
 
+## Migrate the demo agents to a new ct-agent release
+
+Done on 2026-08-17 for v0.5.4. The procedure below is written in the order that survives,
+because doing it in a different order broke it three times in one hour — the services stayed
+up only because their previous registrations lingered, which is luck, not a safety net.
+
+**1. Capture the ORIGINAL container's spec before touching anything.**
+
+    docker inspect <agent> --format '{{range .Config.Env}}{{println .}}{{end}}' > env.txt
+    docker inspect <agent> --format '{{range .Mounts}}{{.Name}}|{{.Destination}}{{println}}{{end}}'
+
+Once the container is gone, its environment is gone with it — including the routing token. (It
+can be recovered from `subject_tunnels.routing_token` for that hostname, but that is a rescue,
+not a plan.) **Capture from the original, never from a container you already recreated**: the
+second attempt reads back your own placeholder values and you debug your own artefact.
+
+**2. Check for a state volume and mount it.** An agent with `CT_AGENT_STATE_DIR` keeps its
+onboarded identity there (#141). Recreating without the volume discards it — the same mistake
+that once cost a 409 outage.
+
+**3. Do not inject a join token the original did not have.** Several compose files declare
+`CT_AGENT_JOIN_TOKEN=${..:?single-use join token}`, so a plain `compose up` forces one in. An
+agent that already holds its identity then tries to onboard and crash-loops on `404`. If the
+original env has no `CT_AGENT_JOIN_TOKEN`, recreate with `docker run --env-file` from the
+captured file instead of via compose.
+
+**4. Rebuild the right image.** The demos do not share one: `help-site` and `devsystem` use
+`help-site-help-agent`, `a2a-demo` and `auction-demo` build their own from their own
+`Agent.Dockerfile` with their own `CT_AGENT_REF`. A `compose up` without `--build` silently
+reuses the old image, and `ct-agent --version` is the only thing that will tell you.
+
+**5. One agent at a time, verify before the next.** Serialised restarts avoid the hostname-bind
+race (14.08.); a `curl` until the expected code is the gate between steps.
+
+**A refused hostname bind after recreation is not an outage.** The edge rehydrates every
+hostname authorisation from the control plane at startup (56 of them on 2026-08-17), so
+routing lives in `mesh_ownership` and survives both the bind refusal and an edge restart.
+Verify with a real request rather than reacting to the log line.
+
 ## Redeploy the edge — aftermath checklist
 
 Since 2026-08-14, edge redeploys are **self-healing for Browser-Plane tunnels**: hostname
