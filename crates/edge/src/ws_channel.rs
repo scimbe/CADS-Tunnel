@@ -222,6 +222,11 @@ pub struct WsChannelState {
     /// unbounded (the default for [`Self::standalone`]/tests; production always sets
     /// one, see `serve.rs`'s `CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS`).
     cap: Option<crate::state::ConnectionCap>,
+    /// #542: the SAME per-IP definitive-refusal budget the QUIC broker loops and the
+    /// `:443` front door consult -- shared, not a second one beside it, so a client that
+    /// walks the transports finds one budget rather than three fresh ones. `None` only in
+    /// [`Self::standalone`]/tests, matching `cap`'s convention; production always sets it.
+    penalty: Option<Arc<crate::state::JoinRefusalPenalty>>,
 }
 
 /// How long a browser member's join stays parked waiting for its channel partner
@@ -243,7 +248,14 @@ impl WsChannelState {
         pairer: crate::channel_broker::SharedChannelPairer,
         cap: Option<crate::state::ConnectionCap>,
     ) -> Self {
-        Self { pairer, resolver, cap }
+        Self { pairer, resolver, cap, penalty: None }
+    }
+
+    /// #542: attach the shared per-IP refusal budget (builder-style so the existing
+    /// `new`/`standalone` callers and every test keep compiling unchanged).
+    pub fn with_penalty(mut self, penalty: Arc<crate::state::JoinRefusalPenalty>) -> Self {
+        self.penalty = Some(penalty);
+        self
     }
 
     /// Like [`Self::new`], but builds its OWN standalone pairer + reaper and has NO
@@ -346,6 +358,15 @@ const WS_MAX_MESSAGE_BYTES: usize = ct_common::a2a::MAX_MESSAGE_BYTES;
 #[derive(Clone)]
 struct AcceptPermit(Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
 
+/// #542: the connection's real source IP, threaded from the accept loop the same way
+/// [`AcceptPermit`] is. Deliberately SEPARATE from the `observed` address the admission
+/// path uses: `observed` stays `0.0.0.0:0` on this transport (a browser leg is relay-only,
+/// and inventing a dialable-looking address would feed `same_public_ip` and the `r=` ack a
+/// lie). This value is for the per-IP refusal budget and the log line only -- never for
+/// pairing.
+#[derive(Clone, Copy)]
+struct PeerIp(std::net::IpAddr);
+
 impl AcceptPermit {
     fn new(permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Self {
         Self(Arc::new(std::sync::Mutex::new(permit)))
@@ -361,6 +382,7 @@ impl AcceptPermit {
 async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
     accept_permit: Option<axum::extract::Extension<AcceptPermit>>,
+    peer_ip: Option<axum::extract::Extension<PeerIp>>,
     State(state): State<WsChannelState>,
 ) -> Response {
     let ws = ws.max_message_size(WS_MAX_MESSAGE_BYTES).max_frame_size(WS_MAX_MESSAGE_BYTES);
@@ -392,13 +414,15 @@ async fn ws_upgrade_handler(
             None => None,
         },
     };
-    ws.on_upgrade(move |socket| handle_ws_channel_join(socket, state, permit))
+    let ip = peer_ip.map(|axum::extract::Extension(PeerIp(ip))| ip);
+    ws.on_upgrade(move |socket| handle_ws_channel_join(socket, state, permit, ip))
 }
 
 async fn handle_ws_channel_join(
     socket: WebSocket,
     state: WsChannelState,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    peer_ip: Option<std::net::IpAddr>,
 ) {
     // Boxed into the shared cross-transport stream type so this browser member
     // correlates through the SAME pairer a `:443`/QUIC member offers itself to --
@@ -449,7 +473,31 @@ async fn handle_ws_channel_join(
             }
         }
         Ok(None) => {} // parked, waiting for its channel partner (or already handed off)
-        Err(e) => eprintln!("ct-edge: ws-channel join refused: {e}"),
+        Err(e) => {
+            // #542: charge a DEFINITIVE refusal to the same shared per-IP budget the QUIC
+            // loops and the `:443` front door use. `is_definitive_join_refusal` is the
+            // typed seam (not log-text matching): a timeout or an I/O drop must not spend a
+            // legitimate peer's budget, only "this can never succeed by retrying".
+            if let (Some(p), Some(ip)) = (&state.penalty, peer_ip) {
+                if crate::channel_broker::is_definitive_join_refusal(&e) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if p.note_definitive_refusal(ip, now) {
+                        eprintln!(
+                            "ct-edge: channel-join penalty engaged for {ip} (ws) — definitive-refusal budget exhausted; shedding its joins pre-handshake for the rest of the window"
+                        );
+                    }
+                }
+            }
+            // Name the source, as the other two transports' refusal lines do -- an
+            // unattributable refusal cannot be correlated with anything (#268d40e).
+            match peer_ip {
+                Some(ip) => eprintln!("ct-edge: ws-channel join refused peer={ip}: {e}"),
+                None => eprintln!("ct-edge: ws-channel join refused: {e}"),
+            }
+        }
     }
 }
 
@@ -503,6 +551,7 @@ async fn serve_with_optional_tls(
     router: Router,
     cap: Option<crate::state::ConnectionCap>,
     shutdown: crate::shutdown::ShutdownSignal,
+    penalty: Option<Arc<crate::state::JoinRefusalPenalty>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     crate::transport::serve_listener(
         inner,
@@ -511,9 +560,32 @@ async fn serve_with_optional_tls(
         Some(WS_CHANNEL_HANDSHAKE_TIMEOUT),
         shutdown,
         move |stream, addr, permit| {
-            let router = router.clone().layer(axum::Extension(AcceptPermit::new(permit)));
+            // #542: shed a penalised source BEFORE the TLS handshake and the HTTP upgrade,
+            // exactly where the `:443` front door does it -- the point of the budget is that
+            // a shed costs the edge almost nothing. Until this existed, :4437 was the one
+            // publicly reachable channel-join transport with no per-IP budget at all.
+            if let Some(p) = &penalty {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if p.penalized(addr.ip(), now) {
+                    let total = p.note_shed();
+                    if total.is_power_of_two() || total % 1000 == 0 {
+                        eprintln!(
+                            "ct-edge: channel-join penalty shedding {} pre-handshake (ws) — {total} connection(s) shed since start",
+                            addr.ip()
+                        );
+                    }
+                    return futures_util::future::Either::Left(async {});
+                }
+            }
+            let router = router
+                .clone()
+                .layer(axum::Extension(AcceptPermit::new(permit)))
+                .layer(axum::Extension(PeerIp(addr.ip())));
             let tls = tls.clone();
-            async move {
+            futures_util::future::Either::Right(async move {
                 let service = hyper_util::service::TowerToHyperService::new(router);
                 let result = match tls {
                     None => {
@@ -537,7 +609,7 @@ async fn serve_with_optional_tls(
                 if let Err(e) = result {
                     eprintln!("ct-edge: ws-channel connection from {addr} ended: {e}");
                 }
-            }
+            })
         },
     )
     .await;
@@ -559,10 +631,14 @@ pub async fn serve_ws_channel_with_pairer(
     cap: Option<crate::state::ConnectionCap>,
     tls: Option<tokio_rustls::TlsAcceptor>,
     shutdown: crate::shutdown::ShutdownSignal,
+    penalty: Option<Arc<crate::state::JoinRefusalPenalty>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = WsChannelState::new(resolver, pairer, cap.clone());
+    let state = match &penalty {
+        Some(p) => WsChannelState::new(resolver, pairer, cap.clone()).with_penalty(Arc::clone(p)),
+        None => WsChannelState::new(resolver, pairer, cap.clone()),
+    };
     let inner = tokio::net::TcpListener::bind(listen).await?;
-    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap, shutdown).await
+    serve_with_optional_tls(inner, tls, ws_channel_router(state), cap, shutdown, penalty).await
 }
 
 #[cfg(test)]
@@ -771,7 +847,7 @@ mod tests {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe); // free the port for serve_ws_channel_with_pairer to bind for real
-        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor), crate::shutdown::ShutdownSignal::never()));
+        tokio::spawn(serve_ws_channel_with_pairer(addr, resolver, pairer, None, Some(acceptor), crate::shutdown::ShutdownSignal::never(), None));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         async fn join_tls(
@@ -979,5 +1055,58 @@ mod tests {
         assert!(second.is_err(), "a full cap must refuse the WS upgrade, not just admit-then-drop: {second:?}");
 
         drop(first_ws);
+    }
+
+    #[tokio::test]
+    async fn a_penalized_ip_is_shed_before_the_ws_handshake_542() {
+        // #542: until this existed, :4437 was the ONE publicly reachable channel-join
+        // transport with no per-IP refusal budget -- the QUIC loops and the `:443` front
+        // door both consult one, and both feed it. A client that walked to the WebSocket
+        // therefore found a fresh, unmetered path.
+        //
+        // Driven end to end over real TCP through `serve_with_optional_tls`, because the
+        // point of the gate is WHERE it sits: before TLS, before the HTTP upgrade, before
+        // any control-plane resolve. A test that only called `penalized()` would prove the
+        // budget works, not that this listener consults it.
+        let penalty = Arc::new(crate::state::JoinRefusalPenalty::new());
+        let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Exhaust the budget the way real refusals would, then confirm the precondition --
+        // otherwise a gate that never fires would look like a gate that works.
+        for _ in 0..64 {
+            penalty.note_definitive_refusal(ip, now);
+        }
+        assert!(penalty.penalized(ip, now), "precondition: the budget is actually spent");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = WsChannelState::standalone(Arc::new(FixedResolver {
+            operator_pubkey: [9u8; 32],
+            channel: ChannelId([1u8; 32]),
+            holders: Vec::new(),
+        }))
+        .with_penalty(Arc::clone(&penalty));
+        let shutdown = crate::shutdown::ShutdownSignal::never();
+        tokio::spawn(serve_with_optional_tls(
+            listener,
+            None,
+            ws_channel_router(state),
+            None,
+            shutdown,
+            Some(Arc::clone(&penalty)),
+        ));
+
+        // The connection is dropped without a WebSocket handshake ever completing.
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws/channel")),
+        )
+        .await
+        .expect("the gate must answer promptly, not hang the client");
+        assert!(res.is_err(), "a penalized source must not reach the WS handshake");
+        assert!(penalty.note_shed() >= 2, "the shed was counted (this call makes it >= 2)");
     }
 }

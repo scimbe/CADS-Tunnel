@@ -3789,6 +3789,9 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 let ws_channel_cap = ws_channel_cap.clone();
                 let ws_channel_tls = build_ws_channel_cert();
                 let shutdown_ws = shutdown.clone();
+                // #542: the SAME budget the QUIC loops and the `:443` arm consult -- one
+                // per-IP budget across every channel-join transport, not a third one.
+                let ws_penalty = state.join_refusal_penalty();
                 tokio::spawn(async move {
                     if let Err(e) = crate::ws_channel::serve_ws_channel_with_pairer(
                         ws_addr,
@@ -3797,6 +3800,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         ws_channel_cap,
                         ws_channel_tls,
                         shutdown_ws,
+                        Some(ws_penalty),
                     )
                     .await
                     {
