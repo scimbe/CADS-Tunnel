@@ -236,7 +236,7 @@ mod tests {
     /// durable routing token to match, not just mesh_ownership's record; some
     /// tests also need `.id` to revoke it).
     fn admit(tunnels: &SqliteTunnelStore, hostname: &str) -> SubjectTunnel {
-        let t = tunnels.create("subject", hostname, Some(hostname)).unwrap();
+        let t = tunnels.create("subject", hostname, Some(hostname)).unwrap().created().expect("hostname is free in this test");
         tunnels.enter_gelb_queue(hostname, 0).unwrap();
         tunnels.offer_claim(hostname, "letsencrypt", 0, 1).unwrap();
         tunnels.record_issuance_complete(hostname, "example.com", 0).unwrap();
@@ -372,7 +372,7 @@ mod tests {
         // in an admitted window (or already gruen).
         let edge_mesh = store();
         let tunnels = tunnels();
-        let t = tunnels.create("subject", "app.example.com", Some("app.example.com")).unwrap();
+        let t = tunnels.create("subject", "app.example.com", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         // Deliberately left `rot` -- never entered the Gelb queue, never offered.
         let dns_store = Arc::new(AcmeDnsStore::new());

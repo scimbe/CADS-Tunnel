@@ -232,7 +232,21 @@ async fn admin_provision_tunnel(
         return (StatusCode::BAD_REQUEST, "subject and name are required").into_response();
     }
     let tunnel = match st.tunnels.create(req.subject.trim(), name, Some(&hostname)) {
-        Ok(t) => t,
+        Ok(crate::storage::CreateTunnelOutcome::Created(t)) => t,
+        // #545: a taken hostname is a conflict the operator can act on, not an internal
+        // error. It used to arrive as the unique index's failure and surface as a 500,
+        // which says only "something broke" -- the same poor diagnosis reported for the
+        // self-service path on 15.08. Name the hostname so the collision is readable.
+        Ok(crate::storage::CreateTunnelOutcome::HostnameTaken) => {
+            return (StatusCode::CONFLICT, format!("hostname already taken: {hostname}")).into_response()
+        }
+        Ok(crate::storage::CreateTunnelOutcome::OverLimit) => {
+            // Unreachable here: this path deliberately bypasses the per-account limit
+            // (that is what makes it the operator escape hatch). Answered explicitly
+            // rather than with a catch-all, so a future change to `create` cannot make
+            // this arm silently mean something else.
+            return internal_error("admin_provision_tunnel/create", "unexpected OverLimit").into_response()
+        }
         Err(e) => return internal_error("admin_provision_tunnel/create", e).into_response(),
     };
     authorize_hostname(&st, &tunnel).await;
@@ -3381,7 +3395,7 @@ mod tests {
         let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
 
         // Alice's own stuff.
-        tunnels.create("kc-alice", "my-tunnel", None).unwrap();
+        tunnels.create("kc-alice", "my-tunnel", None).unwrap().created().expect("hostname is free in this test");
         let alice_chan = ChannelId([0xA1; 32]);
         channels.register_channel(&alice_chan, &[0x01; 32], "kc-alice").unwrap();
         channels.allowlist_add(&alice_chan, "kc-alice", "friend@example.com", 1).unwrap();
@@ -3787,7 +3801,7 @@ mod tests {
         // Seed the tunnel directly with a hostname (no DNS backend configured
         // in this harness, so the page's own auto-provision wouldn't assign one).
         let hostname = "site-abc.example.com".to_string();
-        tunnels.create("alice", "site", Some(&hostname)).unwrap();
+        tunnels.create("alice", "site", Some(&hostname)).unwrap().created().expect("hostname is free in this test");
 
         // Rot (freshly created, not yet queued): the badge shows, no disclosure.
         let (_, html) = get(&app, "/portal/tunnels", Some("alice")).await;
@@ -3823,7 +3837,7 @@ mod tests {
         // its old position.
         let (app, tunnels) = test_app_with_tunnels();
         let alice_hostname = "alice-site.example.com".to_string();
-        let alice_id = tunnels.create("alice", "site", Some(&alice_hostname)).unwrap().id;
+        let alice_id = tunnels.create("alice", "site", Some(&alice_hostname)).unwrap().created().expect("hostname is free in this test").id;
 
         // Not lapsed yet (still rot) -> reclaim is a no-op, still rot.
         let status = post_form(&app, &format!("/portal/tunnels/{alice_id}/reclaim-cert-slot"), "alice", "").await;
@@ -3886,7 +3900,7 @@ mod tests {
         let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
-        let created = tunnels.create("alice", "web", None).unwrap();
+        let created = tunnels.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
         // Pre-seed an edge_mesh ownership record, as authorize_hostname would have
         // written when the tunnel was created -- revoke must clean it up too.
         let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
@@ -5411,7 +5425,7 @@ mod tests {
         // login_allowlist_list already existed in the storage layer with zero
         // changes needed, so this is purely the HTTP wrapper being proven.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap().created().expect("hostname is free in this test");
         tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 1000).unwrap();
         tunnels.login_allowlist_add("alice", &t.id, "carol@example.com", 2000).unwrap();
 
@@ -5445,7 +5459,7 @@ mod tests {
     #[tokio::test]
     async fn login_allowlist_get_route_404s_for_a_tunnel_owned_by_someone_else() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap().created().expect("hostname is free in this test");
         tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 1000).unwrap();
 
         let app = login_gate_portal_router(KEY, tunnels, None);
@@ -5464,7 +5478,7 @@ mod tests {
     #[tokio::test]
     async fn login_allowlist_get_route_returns_an_empty_list_honestly_not_an_error() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap();
+        let t = tunnels.create("alice", "site", Some("alice.example")).unwrap().created().expect("hostname is free in this test");
         let app = login_gate_portal_router(KEY, tunnels, None);
         let resp = app
             .oneshot(

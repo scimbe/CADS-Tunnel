@@ -1630,6 +1630,19 @@ pub enum CreateTunnelOutcome {
     HostnameTaken,
 }
 
+impl CreateTunnelOutcome {
+    /// The created tunnel, or `None` when the create was refused. Keeps call sites that
+    /// legitimately expect success (tests with a known-free hostname) readable without
+    /// re-matching the whole enum -- and, unlike a second "just insert it" constructor,
+    /// leaves no path that can produce a duplicate (#545).
+    pub fn created(self) -> Option<SubjectTunnel> {
+        match self {
+            Self::Created(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
 /// One tunnel owned by a customer, as shown in the portal listing (#27). Holds
 /// **no secret**: the routing token and capability are minted and shown once at
 /// creation (a later sub-packet) and never persisted here, so listing a tunnel
@@ -2004,12 +2017,22 @@ impl SqliteTunnelStore {
     /// token is minted and persisted server-side so a revocation can later find
     /// and invalidate the tunnel's edge registration (#27 RB1). The `id` is a
     /// random hex string; `created_at` is the current Unix time.
+    /// #545: answers a taken hostname with a typed [`CreateTunnelOutcome::HostnameTaken`]
+    /// instead of letting the insert fail on the unique index.
+    ///
+    /// Duplicates were never possible: `idx_subject_tunnels_hostname_unique` (partial,
+    /// `WHERE hostname IS NOT NULL`) enforces that in the schema and in the deployed
+    /// database. What was wrong is only the ANSWER -- the operator path relied on the
+    /// constraint error, which surfaced as `500 internal error`, the same poor diagnosis
+    /// an operator reported for the self-service path on 15.08. and which was fixed there.
+    /// The check here runs under the same writer lock as the insert, so its answer cannot
+    /// race a concurrent create; the unique index remains the backstop underneath.
     pub fn create(
         &self,
         subject: &str,
         name: &str,
         hostname: Option<&str>,
-    ) -> rusqlite::Result<SubjectTunnel> {
+    ) -> Result<CreateTunnelOutcome, rusqlite::Error> {
         let mut idb = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut idb);
         let id: String = idb.iter().map(|b| format!("{b:02x}")).collect();
@@ -2020,18 +2043,28 @@ impl SqliteTunnelStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.writer.lock_safe().execute(
+        let conn = self.writer.lock_safe();
+        if let Some(h) = hostname {
+            let taken: bool = conn
+                .query_row("SELECT 1 FROM subject_tunnels WHERE hostname = ?1", params![h], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if taken {
+                return Ok(CreateTunnelOutcome::HostnameTaken);
+            }
+        }
+        conn.execute(
             "INSERT INTO subject_tunnels (id, subject, name, hostname, created_at, routing_token)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, subject, name, hostname, created_at, routing_token],
         )?;
-        Ok(SubjectTunnel {
+        Ok(CreateTunnelOutcome::Created(SubjectTunnel {
             id,
             name: name.to_string(),
             hostname: hostname.map(str::to_string),
             created_at,
             routing_token,
-        })
+        }))
     }
 
     /// Like [`Self::create`], but the owned-tunnel-count check and the insert run
@@ -2060,8 +2093,11 @@ impl SqliteTunnelStore {
             return Ok(CreateTunnelOutcome::OverLimit);
         }
         // Operator bug report (15.08.): re-creating a name whose derived hostname
-        // already exists hit the UNIQUE(hostname) constraint and surfaced as a 500
-        // "internal error" in the portal. auto_hostname is deterministic per
+        // already exists surfaced as a 500 "internal error" in the portal.
+        // The constraint referred to is `idx_subject_tunnels_hostname_unique` (a partial
+        // UNIQUE index, not a column constraint -- easy to miss when reading only the
+        // table definition). This check exists to turn that error into a clean answer,
+        // not to be the only thing preventing duplicates. auto_hostname is deterministic per
         // (name, account), so the same account re-using a name ALWAYS collides --
         // checked here under the same writer lock the insert runs under, so the
         // answer can't race a concurrent create.
@@ -6200,9 +6236,9 @@ mod tests {
         // #27 PP1: a customer creates, lists and revokes only their OWN tunnels.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
 
-        let a1 = store.create("alice", "web", Some("app.example")).unwrap();
-        let _a2 = store.create("alice", "ssh", None).unwrap();
-        let b1 = store.create("bob", "db", None).unwrap();
+        let a1 = store.create("alice", "web", Some("app.example")).unwrap().created().expect("hostname is free in this test");
+        let _a2 = store.create("alice", "ssh", None).unwrap().created().expect("hostname is free in this test");
+        let b1 = store.create("bob", "db", None).unwrap().created().expect("hostname is free in this test");
 
         // Listing is scoped to the subject — alice sees her two, bob sees his one.
         let alice = store.list_for_subject("alice").unwrap();
@@ -6233,17 +6269,27 @@ mod tests {
         // hostname, and every hostname-keyed lookup would then silently read whichever
         // row SQLite happened to return first.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "web", Some("shared.example")).unwrap();
+        store.create("alice", "web", Some("shared.example")).unwrap().created().expect("hostname is free in this test");
 
         // Cross-subject collision: bob claiming alice's exact hostname must fail, not
         // silently create a second row for the same hostname.
+        // #545: the refusal is now a TYPED answer rather than the unique index's error.
+        // The property this test guards is unchanged -- no second row for one hostname --
+        // but the caller can tell a collision from a database fault, which is what let the
+        // operator path answer 500 for a perfectly ordinary conflict.
         assert!(
-            store.create("bob", "other", Some("shared.example")).is_err(),
+            matches!(
+                store.create("bob", "other", Some("shared.example")),
+                Ok(CreateTunnelOutcome::HostnameTaken)
+            ),
             "a second subject claiming an already-owned hostname must be rejected"
         );
         // Same-subject collision (the auto_hostname(name, subject) determinism case).
         assert!(
-            store.create("alice", "web-again", Some("shared.example")).is_err(),
+            matches!(
+                store.create("alice", "web-again", Some("shared.example")),
+                Ok(CreateTunnelOutcome::HostnameTaken)
+            ),
             "the SAME subject claiming a hostname they already own a row for must also be rejected"
         );
         // Only the original row exists — no partial/duplicate state from the failed inserts.
@@ -6252,12 +6298,12 @@ mod tests {
 
         // Mesh-Plane-only tunnels (no hostname at all) are unaffected — the index is
         // partial (`WHERE hostname IS NOT NULL`), so multiple NULLs are never a conflict.
-        store.create("alice", "ssh-1", None).unwrap();
-        store.create("alice", "ssh-2", None).unwrap();
+        store.create("alice", "ssh-1", None).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "ssh-2", None).unwrap().created().expect("hostname is free in this test");
         assert_eq!(store.list_for_subject("alice").unwrap().len(), 3, "two NULL-hostname tunnels + the original");
 
         // A different hostname is, of course, completely unaffected.
-        store.create("bob", "own", Some("bob-owns-this.example")).unwrap();
+        store.create("bob", "own", Some("bob-owns-this.example")).unwrap().created().expect("hostname is free in this test");
         assert_eq!(store.list_for_subject("bob").unwrap().len(), 1);
     }
 
@@ -6323,7 +6369,9 @@ mod tests {
         let store = SqliteTunnelStore::open(&path).unwrap();
         let created = store
             .create("alice", "web", Some("app.example"))
-            .expect("create must not 500 on a migrated older DB");
+            .expect("create must not 500 on a migrated older DB")
+            .created()
+            .expect("hostname is free in this test");
         assert_eq!(created.routing_token.len(), 64, "routing_token column present + minted");
         let listed = store.list_for_subject("alice").unwrap();
         assert_eq!(listed.len(), 1);
@@ -6342,8 +6390,8 @@ mod tests {
         // persists (survives a re-read) and is returned when the tunnel is revoked
         // — the linkage a later cycle uses to invalidate the edge registration.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        let a = store.create("alice", "web", None).unwrap();
-        let b = store.create("alice", "ssh", None).unwrap();
+        let a = store.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
+        let b = store.create("alice", "ssh", None).unwrap().created().expect("hostname is free in this test");
         assert_eq!(a.routing_token.len(), 64, "32-byte hex routing token");
         assert_ne!(a.routing_token, b.routing_token, "distinct per tunnel");
 
@@ -6362,8 +6410,8 @@ mod tests {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
         assert_eq!(store.list_revoked_tokens().unwrap(), Vec::<String>::new(), "nothing revoked yet");
 
-        let a = store.create("alice", "web", None).unwrap();
-        let b = store.create("alice", "api", None).unwrap();
+        let a = store.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
+        let b = store.create("alice", "api", None).unwrap().created().expect("hostname is free in this test");
         assert_eq!(store.revoke("alice", &a.id, 1_000).unwrap(), Some(a.routing_token.clone()));
 
         let revoked = store.list_revoked_tokens().unwrap();
@@ -6385,7 +6433,7 @@ mod tests {
     #[test]
     fn routing_token_for_hostname_is_unscoped_and_none_for_unknown_hosts() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = store.create("alice", "web", Some("app.example")).unwrap();
+        let t = store.create("alice", "web", Some("app.example")).unwrap().created().expect("hostname is free in this test");
         assert_eq!(store.routing_token_for_hostname("app.example").unwrap(), Some(t.routing_token));
         assert_eq!(store.routing_token_for_hostname("no-such-host").unwrap(), None);
     }
@@ -6393,7 +6441,7 @@ mod tests {
     #[test]
     fn a_fresh_tunnel_starts_rot_with_no_admission_state() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "web", Some("app.example")).unwrap();
+        store.create("alice", "web", Some("app.example")).unwrap().created().expect("hostname is free in this test");
         let a = store.cert_admission_for_hostname("app.example").unwrap().unwrap();
         assert_eq!(a.status, "rot");
         assert_eq!(a.assigned_ca, None);
@@ -6406,9 +6454,9 @@ mod tests {
     #[test]
     fn entering_the_gelb_queue_is_fifo_and_wont_clobber_a_hostname_thats_moved_on() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
-        store.create("alice", "b", Some("b.example")).unwrap();
-        store.create("alice", "c", Some("c.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "c", Some("c.example")).unwrap().created().expect("hostname is free in this test");
 
         assert!(store.enter_gelb_queue("a.example", 100).unwrap());
         assert!(store.enter_gelb_queue("b.example", 200).unwrap());
@@ -6432,10 +6480,10 @@ mod tests {
         // Vec + partition_point) reproduces the per-row `COUNT(*) WHERE queued_at < ?`
         // semantics exactly, ties included, not just for the easy strictly-increasing case.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
-        store.create("alice", "b", Some("b.example")).unwrap();
-        store.create("alice", "c", Some("c.example")).unwrap();
-        store.create("alice", "d", Some("d.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "c", Some("c.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "d", Some("d.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
         store.enter_gelb_queue("b.example", 200).unwrap();
         store.enter_gelb_queue("c.example", 200).unwrap(); // tie with b
@@ -6467,7 +6515,7 @@ mod tests {
     #[test]
     fn offering_a_claim_assigns_a_ca_permanently_and_leaves_the_queue() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
 
         assert!(store.offer_claim("a.example", "letsencrypt", 500, 500 + 48 * 3600).unwrap());
@@ -6486,7 +6534,7 @@ mod tests {
     #[test]
     fn an_expired_unclaimed_offer_lapses_and_frees_its_ca_assignment() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
         store.offer_claim("a.example", "letsencrypt", 500, 1000).unwrap();
 
@@ -6502,8 +6550,8 @@ mod tests {
     #[test]
     fn reclaiming_a_lapsed_slot_goes_to_the_back_of_the_queue_not_its_old_position() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
-        store.create("alice", "b", Some("b.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
         store.enter_gelb_queue("b.example", 200).unwrap();
         store.offer_claim("a.example", "letsencrypt", 300, 400).unwrap();
@@ -6522,7 +6570,7 @@ mod tests {
     #[test]
     fn a_completed_issuance_uses_the_stores_own_assigned_ca_not_a_caller_supplied_one() {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
         store.offer_claim("a.example", "google-trust-services", 200, 999_999).unwrap();
 
@@ -6559,7 +6607,7 @@ mod tests {
         // other tenant. Real proof: many repeat calls, all within
         // MIN_ISSUANCE_LOG_INTERVAL_SECS (24h) of the first, must log exactly once.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example")).unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
         store.offer_claim("a.example", "google-trust-services", 200, 999_999).unwrap();
 
@@ -6574,7 +6622,7 @@ mod tests {
 
         // A different hostname's own flood is tracked independently -- the floor is
         // per-hostname, not a single global gate that would starve unrelated tenants.
-        store.create("bob", "b", Some("b.example")).unwrap();
+        store.create("bob", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("b.example", 100).unwrap();
         store.offer_claim("b.example", "google-trust-services", 200, 999_999).unwrap();
         store.record_issuance_complete("b.example", "example.com", 300).unwrap();
@@ -6592,8 +6640,8 @@ mod tests {
         // "b.example", not "example.com", so the pre-fix accidental scope-free `reserved`
         // count happened to still match this test's own assertions by coincidence.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example.com")).unwrap();
-        store.create("alice", "b", Some("b.example.com")).unwrap();
+        store.create("alice", "a", Some("a.example.com")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "b", Some("b.example.com")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example.com", 100).unwrap();
         store.enter_gelb_queue("b.example.com", 200).unwrap();
         store.offer_claim("a.example.com", "zerossl", 300, 999_999).unwrap();
@@ -6612,8 +6660,8 @@ mod tests {
         // consume the FIRST zone's budget headroom. Real proof: an open offer under
         // "other-zone.org" must not count toward "example.com"'s reserved figure.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        store.create("alice", "a", Some("a.example.com")).unwrap();
-        store.create("bob", "z", Some("z.other-zone.org")).unwrap();
+        store.create("alice", "a", Some("a.example.com")).unwrap().created().expect("hostname is free in this test");
+        store.create("bob", "z", Some("z.other-zone.org")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example.com", 100).unwrap();
         store.enter_gelb_queue("z.other-zone.org", 200).unwrap();
         store.offer_claim("a.example.com", "zerossl", 300, 999_999).unwrap();
@@ -6666,7 +6714,7 @@ mod tests {
         // #29 fix: a grant gives real effect — the grantee sees the tunnel and can
         // obtain its routing token; a non-grantee gets neither.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = store.create("alice", "web", None).unwrap();
+        let t = store.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
         store.grant("alice", &t.id, "bob").unwrap();
 
         // Grantee: authorized for the token, and sees it flagged not-owned.
@@ -6693,7 +6741,7 @@ mod tests {
     fn tunnel_grants_are_owner_managed_and_gate_authorization() {
         // #29 PP1: only the owner manages grants; is_authorized = owner or grantee.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = store.create("alice", "web", None).unwrap();
+        let t = store.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
 
         // Owner is authorized; strangers are not.
         assert!(store.is_authorized("alice", &t.id).unwrap(), "owner authorized");

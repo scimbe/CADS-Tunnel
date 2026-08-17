@@ -980,7 +980,7 @@ mod tests {
         // /gate/check unconditionally, so an ungated hostname must never 401 just
         // because no session cookie is present.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap();
+        tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         // Deliberately never call set_require_login.
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
@@ -999,7 +999,7 @@ mod tests {
     #[tokio::test]
     async fn gate_check_requires_a_session_cookie_matching_the_requested_host() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
@@ -1070,7 +1070,7 @@ mod tests {
         // -- a value a client-supplied header can be overwritten with but
         // never be genuinely mistaken for, regardless of proxy copy semantics.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap();
+        tunnels.create("alice", "demo", Some("not-gated.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
@@ -1108,7 +1108,7 @@ mod tests {
         let verifier = std::sync::Arc::new(crate::oidc::OidcVerifier::from_hs_secret(secret, issuer));
 
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         assert!(tunnels
             .login_allowlist_add("alice", &t.id, "svc-android-build@clients", now_secs())
@@ -1154,7 +1154,7 @@ mod tests {
         let verifier = std::sync::Arc::new(crate::oidc::OidcVerifier::from_hs_secret(secret, issuer));
 
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         // Deliberately never allow-list this subject.
 
@@ -1194,7 +1194,7 @@ mod tests {
         let verifier = std::sync::Arc::new(crate::oidc::OidcVerifier::from_hs_secret(secret, issuer));
 
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app = gate_router_with(
@@ -1234,7 +1234,7 @@ mod tests {
     #[tokio::test]
     async fn gate_start_mints_csrf_and_target_cookies_and_redirects_to_keycloak_for_a_gated_hostname() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app =
@@ -1284,7 +1284,7 @@ mod tests {
     // is the one place `gate_start` can still force a real credentials check.
     async fn gate_start_forces_a_real_reauth_instead_of_silently_reusing_an_existing_sso_session_devsystem_20() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app =
@@ -1375,7 +1375,7 @@ mod tests {
     #[tokio::test]
     async fn gate_callback_denies_a_successful_login_whose_email_is_not_allow_listed() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         // Deliberately do NOT allow-list bob@example.com.
 
@@ -1412,7 +1412,7 @@ mod tests {
         // the existing behavior; and `allow_any_login` never consults the email, so an
         // unverified account still passes there.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", now_secs()).unwrap());
 
@@ -1478,7 +1478,7 @@ mod tests {
         // with the flag OFF the very same account is rejected exactly as before -- the
         // issue's pre-registered falsification criterion, both directions.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         assert!(tunnels.set_allow_any_login("alice", &t.id, true).unwrap());
         assert_eq!(tunnels.allow_any_login("alice", &t.id).unwrap(), Some(true));
@@ -1543,7 +1543,7 @@ mod tests {
     #[tokio::test]
     async fn gate_callback_admits_a_successful_login_whose_email_is_allow_listed() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", now_secs()).unwrap());
 
@@ -1591,7 +1591,7 @@ mod tests {
     #[tokio::test]
     async fn gate_callback_shows_bad_gateway_on_a_failed_exchange_and_mints_no_session() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app = gate_router_with(tunnels, Some(cfg()), TEST_KEY, failing_exchanger(), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
@@ -1618,7 +1618,7 @@ mod tests {
     #[tokio::test]
     async fn gate_logout_clears_the_session_cookie_and_redirects_back_to_the_gated_host() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
@@ -1669,7 +1669,7 @@ mod tests {
         // `evil.example` is not, and must fall back to the safe default
         // (the control plane's own public host) instead of redirecting there.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
 
@@ -1708,7 +1708,7 @@ mod tests {
         use axum::body::to_bytes;
 
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app =
@@ -1749,7 +1749,7 @@ mod tests {
     #[tokio::test]
     async fn gate_request_access_submit_records_a_real_request_the_owner_can_see_and_rejects_a_bad_email() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app =
@@ -1790,7 +1790,7 @@ mod tests {
     #[tokio::test]
     async fn record_access_request_is_idempotent_per_hostname_and_email_and_rejects_an_ungated_host() {
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
 
         // Not yet gated -- rejected outright, not silently recorded.
         assert!(!tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "hi", 100).unwrap());
@@ -1815,7 +1815,7 @@ mod tests {
         // email_allowed_for_hostname would have returned `false` even for a
         // correctly allow-listed email (a real lockout).
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", 100).unwrap());
 
@@ -1844,7 +1844,7 @@ mod tests {
         // via the tunnel's canonical (owner-facing) hostname -- these two must
         // never be assumed to agree in casing.
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         assert!(tunnels
@@ -1871,7 +1871,7 @@ mod tests {
         // send). Before this fix this returned 200 with no X-Gate-Email header
         // set -- the exact "admitted with no authentication at all" shape.
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("Demo.Bunsenbrenner.Org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
 
         let app = gate_router_with(
@@ -1911,7 +1911,7 @@ mod tests {
         // here at the storage layer -- the route's own auto-dismiss call is a
         // thin, untestable-in-isolation wrapper around exactly this method.
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
-        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap();
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
         assert!(tunnels.record_access_request("demo.bunsenbrenner.org", "carol@example.com", "", 100).unwrap());
 

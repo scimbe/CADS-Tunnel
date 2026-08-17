@@ -561,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn admission_requires_the_owning_token_and_reports_rot_by_default() {
         let (edge_mesh, tunnels) = stores();
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         let app = acme_broker_router(edge_mesh, tunnels, None);
         let path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
@@ -588,7 +588,7 @@ mod tests {
         // every response (secrets present or not) must tell a shared/intermediary
         // cache never to persist it.
         let (edge_mesh, tunnels) = stores();
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         let app = acme_broker_router(edge_mesh, tunnels, None);
         let path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
@@ -605,7 +605,7 @@ mod tests {
         // mesh_ownership still (incorrectly) claims a token owns a hostname, the
         // durable subject_tunnels record must ALSO agree, or admission is refused.
         let (edge_mesh, tunnels) = stores();
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         // Revoke the tunnel at the durable layer WITHOUT touching mesh_ownership --
         // simulating exactly the failure mode #286 describes (forget()'s DELETE
@@ -629,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn admission_reports_may_issue_now_only_within_an_open_offer_or_once_gruen() {
         let (edge_mesh, tunnels) = stores();
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         tunnels.enter_gelb_queue("app.example.com", 100).unwrap();
         let admission_path = format!("/agent/acme-admission/{}/app.example.com", t.routing_token);
@@ -691,14 +691,14 @@ mod tests {
     fn pick_ca_favors_the_least_utilized_ca_and_returns_none_when_all_are_exhausted() {
         let rotation = hypothetical_multi_ca_rotation();
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
-        tunnels.create("alice", "a", Some("a.example.com")).unwrap();
-        tunnels.create("alice", "b", Some("b.example.com")).unwrap();
+        tunnels.create("alice", "a", Some("a.example.com")).unwrap().created().expect("hostname is free in this test");
+        tunnels.create("alice", "b", Some("b.example.com")).unwrap().created().expect("hostname is free in this test");
         tunnels.enter_gelb_queue("a.example.com", 1).unwrap();
         tunnels.enter_gelb_queue("b.example.com", 2).unwrap();
         // Burn most of Let's Encrypt's budget (40) so ZeroSSL/GTS look relatively fresher.
         for i in 0..35 {
             let host = format!("burn{i}.example.com");
-            tunnels.create("alice", &host, Some(&host)).unwrap();
+            tunnels.create("alice", &host, Some(&host)).unwrap().created().expect("hostname is free in this test");
             tunnels.enter_gelb_queue(&host, 3).unwrap();
             tunnels.offer_claim(&host, "letsencrypt", 3, 999_999_999).unwrap();
             tunnels.record_issuance_complete(&host, "example.com", 3).unwrap();
@@ -713,7 +713,7 @@ mod tests {
             let budget = budget_for(ca);
             for i in 0..budget {
                 let host = format!("{ca}-{i}.example.com");
-                tunnels2.create("alice", &host, Some(&host)).unwrap();
+                tunnels2.create("alice", &host, Some(&host)).unwrap().created().expect("hostname is free in this test");
                 tunnels2.enter_gelb_queue(&host, 1).unwrap();
                 tunnels2.offer_claim(&host, ca, 1, 999_999_999).unwrap();
                 tunnels2.record_issuance_complete(&host, "example.com", 1).unwrap();
@@ -761,7 +761,7 @@ mod tests {
     async fn sweep_once_promotes_rot_to_gelb_lapses_offers_and_admits_the_queue() {
         let edge_mesh = SqliteEdgeMesh::open_in_memory().unwrap();
         let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
-        tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         // Not yet edge-authorized -> stays rot through a sweep. No edge_admin
         // configured (None) -- proves the sweep still runs to completion and
         // simply skips (logs) the channel-tier push, rather than failing the tick.
@@ -817,7 +817,7 @@ mod tests {
 
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", None, now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
 
@@ -869,7 +869,7 @@ mod tests {
 
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", None, now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         // Deliberately no sweep_once() / no offer_claim() -- this hostname is
@@ -904,7 +904,7 @@ mod tests {
 
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", None, now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         tunnels.enter_gelb_queue("app.example.com", 0).unwrap();
@@ -966,7 +966,7 @@ mod tests {
 
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", None, now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
         sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap(); // Rot -> Gelb
@@ -1024,7 +1024,7 @@ mod tests {
 
         let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
-        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
         edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", None, now_secs()).unwrap();
         edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
 

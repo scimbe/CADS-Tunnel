@@ -8559,7 +8559,9 @@ mod tests {
         let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
         let portal_tunnel = tunnels
             .create("subject-504", "demo", Some("demo-504.example.org"))
-            .unwrap();
+            .unwrap()
+            .created()
+            .expect("hostname is free in this test");
         let app = edge_authorize_host_router(
             format!("http://{addr}"),
             edge_admin_token.to_string(),
@@ -9774,8 +9776,8 @@ mod tests {
 
         let admin = [0x7au8; 32];
         let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
-        let a = tunnels.create("alice", "web", None).unwrap();
-        let b = tunnels.create("alice", "api", None).unwrap();
+        let a = tunnels.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
+        let b = tunnels.create("alice", "api", None).unwrap().created().expect("hostname is free in this test");
         tunnels.revoke("alice", &a.id, 1_000).unwrap();
 
         let app = internal_revoked_tokens_router(tunnels.clone(), admin);
