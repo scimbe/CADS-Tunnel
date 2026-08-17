@@ -135,7 +135,7 @@ per `docs/agent-onboarding.md`'s handler I/O contract).
 `CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY` accept a `host:port` directly since #214
 (`6d85644`) — a bare IP is no longer required.
 
-### The relay-**gate** is a third, separate thing (#330) — and its admission runs over TLS-TCP on `:443`, not QUIC
+### The relay-**gate** is a third, separate thing (#330) — and it does **not** replace the QUIC channel admission
 
 `CT_CHANNEL_RELAY_GATE` (+ `CT_CHANNEL_RELAY_GATE_CERT`) configures the **:443 front
 door's relay-gate leg** (`crates/edge/src/relay_gate.rs`) — a *different protocol* from
@@ -148,7 +148,8 @@ both have "relay" in the name:
   Circuit-Relay-v2 + DCUtR hole-punch** path (`ct-agent`'s `p2p.rs` client side): a
   member behind NAT that cannot reach the broker/relay ports directly presents its
   grant **over the TLS-TCP front door on `:443`** (the gate's own dedicated ALPN — no
-  UDP involved), proves possession with the same `verify_stateless` +
+  UDP involved *for this leg*; see the two-authentications note below), proves possession
+  with the same `verify_stateless` +
   challenge-signature primitives channel admission uses, and only then is byte-spliced
   to the internal-only relay-node. The relay-node itself is never publicly reachable;
   the gate IS its only door — that is what makes running a relay safe (an unguarded
@@ -159,6 +160,23 @@ address is the deployment's unified front-door host with
 `GET /network-info` → `channel_relay_gate_port` (same host as `CT_AGENT_CP_URL`), and
 `CT_CHANNEL_RELAY_GATE_CERT` is the DER from `GET /pki/ca` — the same CA fetch every
 other leg uses.
+
+**Two authentications, on two different ports — this is the part that misleads.** An
+earlier version of this heading said the gate's admission "runs over TLS-TCP on `:443`, not
+QUIC". That reads as "the gate path needs no QUIC reachability", and it is wrong. Traced in
+`ct-agent`'s `join_via_relay_gate_dcutr` (`native/src/channel_run/mod.rs`), the order is:
+
+1. **Channel admission over QUIC `:4436`** — `present_channel_join` on the connection from
+   `dial_relay_preferring_direct(cfg.relay_addr…)`, i.e. the plain QUIC relay port. This is
+   the step that yields the peer's Noise key; **without reachable `:4436` the gate path does
+   not start at all.**
+2. **Gate pre-auth over TLS-TCP `:443`** — only afterwards, `dial_relay_gate_over_443`
+   presents the grant under ALPN `ct-edge-relay` and signs the edge's fresh 32-byte
+   challenge. That authorises the **circuit**, not the channel membership.
+
+So the gate has its own possession check, and it is genuinely on `:443` — but it is the
+second of two, not a replacement for the first. Closing `:4436` because "the gate is on 443"
+produces exactly the silent, downstream `early-eof` this section warns about below.
 
 **When you need it:** only when a deployment pairs members through the DCUtR
 hole-punch path and your member sits behind NAT without direct broker/relay
