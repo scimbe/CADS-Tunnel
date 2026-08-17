@@ -4124,6 +4124,76 @@ mod tests {
         );
     }
 
+    /// #550: the enforcer for [`RUSTLS_MISSING_CLOSE_NOTIFY`].
+    ///
+    /// The two tests around it build the error from OUR OWN constant, which only ever
+    /// proves that our classifier recognises our own string — a statement about us, not
+    /// about rustls. This test makes **rustls produce the error itself**: a real TLS
+    /// session over a real socket, whose client half is dropped after the handshake so
+    /// the peer sees a FIN with no `close_notify` — exactly the case the constant names.
+    ///
+    /// Without this, a rustls patch release that rewords the message (it is a display
+    /// string, not a public contract) would leave the gate green while the classification
+    /// silently stopped matching in production. That failure is invisible by construction:
+    /// it looks exactly like the normal state. Now it fails here instead.
+    #[tokio::test]
+    async fn rustls_still_words_the_missing_close_notify_error_the_way_we_match_it_550() {
+        use tokio::io::AsyncReadExt;
+
+        let (listener, acceptor, cert) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 64];
+            // The client is gone by now; this read is what surfaces rustls's verdict.
+            tls.read(&mut buf).await
+        });
+
+        // Complete a real handshake, then close the WRITE half only: a FIN with no
+        // `close_notify` ahead of it. Deliberately not a plain `drop` -- the server sends
+        // TLS 1.3 session tickets right after the handshake, and closing a socket that
+        // still has unread bytes in its receive buffer emits RST, not FIN. That yields
+        // `ConnectionReset` (a different, separately-handled benign class) and would test
+        // the wrong thing. The stream is held alive until the server has read.
+        let mut client = crate::transport::tcp_tls_connect(addr, cert).await.unwrap();
+        {
+            let (tcp, _conn) = client.get_mut();
+            tokio::io::AsyncWriteExt::shutdown(tcp).await.unwrap();
+        }
+
+        let err = server
+            .await
+            .unwrap()
+            .expect_err("a peer that vanishes without close_notify must surface an error");
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "the typed half of the check: rustls still reports this as UnexpectedEof (got {:?})",
+            err.kind()
+        );
+        assert!(
+            err.to_string().contains(RUSTLS_MISSING_CLOSE_NOTIFY),
+            "rustls reworded its missing-close_notify message. RUSTLS_MISSING_CLOSE_NOTIFY no \
+             longer matches, so `classify_io_client_abort` has silently stopped recognising this \
+             class and #533's log condensation is off for it. Update the constant to rustls's \
+             new wording. rustls said: {err}"
+        );
+
+        // And the classifier must actually accept the genuine article, not just our replica.
+        let boxed: BoxError = Box::new(err);
+        assert_eq!(
+            classify_client_abort(&boxed),
+            Some(ClientAbortClass::TlsCloseNotifyMissing),
+            "a REAL rustls close_notify-less abort must classify, not only the hand-built one"
+        );
+    }
+
     /// #533: an `io::Error` reached through a wrapping error's `source()` chain is
     /// still classified (an arm that wraps its transport error must not silently lose
     /// the classification), and the walk is depth-bounded.
