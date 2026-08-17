@@ -143,17 +143,20 @@ completely, while both at 0 means nothing was measured, not that offload succeed
     // out because a dual-stack member legitimately advertises the other family, and folding
     // it into `mismatch` would bury the signal in a legitimate case.
     {
-        let (m, cf, mm, na) = crate::channel_broker::endpoint_attestation_totals();
+        let (m, cf, mm, na, un) = crate::channel_broker::endpoint_attestation_totals();
         out.push_str(&format!(
             "# HELP ct_edge_channel_endpoint_attestation_total Channel joins by how the \
 advertised endpoint relates to the edge-observed source address (#546). `mismatch` is the \
-uncorroborated case: internal targets are already refused (#94/#121/#267), but an arbitrary \
-PUBLIC address is not. Counting only -- nothing is refused on this basis.\n\
+one enforcement refuses: observed on a GLOBAL address, advertised a different one of the \
+same family. `unobservable` is a member the edge saw on a private address, where equality is \
+structurally impossible -- kept separate so `mismatch` answers the enforcement question on \
+its own. `cross_family` is ordinary dual-stack.\n\
          # TYPE ct_edge_channel_endpoint_attestation_total counter\n\
          ct_edge_channel_endpoint_attestation_total{{result=\"matches\"}} {m}\n\
          ct_edge_channel_endpoint_attestation_total{{result=\"cross_family\"}} {cf}\n\
          ct_edge_channel_endpoint_attestation_total{{result=\"mismatch\"}} {mm}\n\
-         ct_edge_channel_endpoint_attestation_total{{result=\"no_address\"}} {na}\n",
+         ct_edge_channel_endpoint_attestation_total{{result=\"no_address\"}} {na}\n\
+         ct_edge_channel_endpoint_attestation_total{{result=\"unobservable\"}} {un}\n",
         ));
     }
     // #539: the companion gauge, without which the one above is ambiguous at 0 -- a loop the

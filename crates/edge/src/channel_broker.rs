@@ -1061,13 +1061,11 @@ pub fn channel_relay_totals() -> (u64, u64) {
 /// Not an address at all (the relay-only sentinel) is not this check's business --
 /// `admissible_endpoint` already ruled on it.
 pub fn endpoint_is_attested(advertised: &str, observed: std::net::IpAddr) -> bool {
-    if !ct_common::channel::is_global_unicast(std::net::SocketAddr::new(observed, 0)) {
-        return true; // observed address says nothing -- no judgement to make
-    }
-    !matches!(
-        classify_endpoint(advertised, observed),
-        EndpointAttestation::Mismatch
-    )
+    // One classifier, one rule: `Mismatch` is by construction the only outcome where the
+    // observed address was global AND the advertised one differed in the same family.
+    // Deriving the decision from the classification (rather than re-testing the same
+    // conditions here) is what keeps metric and enforcement from drifting apart.
+    classify_endpoint(advertised, observed) != EndpointAttestation::Mismatch
 }
 
 /// #546: is enforcement switched on? Default **off** -- the measurement runs first, and
@@ -1095,8 +1093,17 @@ pub enum EndpointAttestation {
     /// versa). A dual-stack host legitimately does this, so it must NOT be treated as a
     /// mismatch -- it is counted separately precisely so the two never get conflated.
     CrossFamily,
-    /// Same family, different address. Nothing corroborates this claim.
+    /// Same family, different address, and the edge observed the member on a **global**
+    /// address -- so equality was meaningful and did not hold. This is the case the whole
+    /// measurement exists for, and the only one enforcement refuses.
     Mismatch,
+    /// Same family, different address, but the edge observed the member on a **private**
+    /// address (co-located, or behind a NAT). Equality is structurally impossible there, so
+    /// this is not evidence of anything. Split from `Mismatch` because merging them makes
+    /// the counter unable to answer the question it was collected for: with one bucket, an
+    /// operator reading `mismatch=29` cannot tell whether enforcing would refuse 29 members
+    /// or none.
+    Unobservable,
     /// The relay-only sentinel or an unparseable endpoint -- not an address at all.
     NoAddress,
 }
@@ -1112,8 +1119,10 @@ pub fn classify_endpoint(advertised: &str, observed: std::net::IpAddr) -> Endpoi
         EndpointAttestation::Matches
     } else if adv.is_ipv4() != observed.is_ipv4() {
         EndpointAttestation::CrossFamily
-    } else {
+    } else if ct_common::channel::is_global_unicast(std::net::SocketAddr::new(observed, 0)) {
         EndpointAttestation::Mismatch
+    } else {
+        EndpointAttestation::Unobservable
     }
 }
 
@@ -1121,15 +1130,17 @@ static ENDPOINT_MATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 static ENDPOINT_CROSS_FAMILY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ENDPOINT_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ENDPOINT_NO_ADDRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ENDPOINT_UNOBSERVABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// #546: `(matches, cross_family, mismatch, no_address)` for `/metrics`.
-pub fn endpoint_attestation_totals() -> (u64, u64, u64, u64) {
+/// #546: `(matches, cross_family, mismatch, no_address, unobservable)` for `/metrics`.
+pub fn endpoint_attestation_totals() -> (u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         ENDPOINT_MATCHES.load(Relaxed),
         ENDPOINT_CROSS_FAMILY.load(Relaxed),
         ENDPOINT_MISMATCH.load(Relaxed),
         ENDPOINT_NO_ADDRESS.load(Relaxed),
+        ENDPOINT_UNOBSERVABLE.load(Relaxed),
     )
 }
 
@@ -1140,11 +1151,21 @@ fn note_endpoint_attestation_with(a: EndpointAttestation, advertised: &str, obse
         EndpointAttestation::CrossFamily => &ENDPOINT_CROSS_FAMILY,
         EndpointAttestation::Mismatch => &ENDPOINT_MISMATCH,
         EndpointAttestation::NoAddress => &ENDPOINT_NO_ADDRESS,
+        EndpointAttestation::Unobservable => &ENDPOINT_UNOBSERVABLE,
     };
     let n = c.fetch_add(1, Relaxed) + 1;
     // Only the uncorroborated case is worth a line, and only occasionally: a member that
     // re-parks every park-TTL would otherwise repeat it forever (the #530 lesson).
-    if a == EndpointAttestation::Mismatch && (n.is_power_of_two() || n % 1000 == 0) {
+    // The two shapes get DIFFERENT log policies. `Unobservable` is steady-state noise from
+    // co-located agents and is throttled hard; `Mismatch` is the actionable one and every
+    // occurrence is logged until it becomes frequent. Sharing one throttle meant a rare
+    // actionable case could fall between the powers of two and never be printed at all.
+    let should_log = match a {
+        EndpointAttestation::Mismatch => n <= 20 || n % 100 == 0,
+        EndpointAttestation::Unobservable => n.is_power_of_two() || n % 1000 == 0,
+        _ => false,
+    };
+    if should_log {
         // Both addresses named: a bare count cannot be acted on. The two shapes behind
         // this bucket need opposite responses -- a member behind a NAT the edge sees as
         // private simply CANNOT match (equality is meaningless there), while a member the
@@ -6878,6 +6899,12 @@ mod tests {
         // is_global_unicast only rules out internal targets.
         assert_eq!(classify_endpoint("198.51.100.9:443", v4), EndpointAttestation::Mismatch);
         assert_eq!(classify_endpoint("[2001:db8::99]:443", v6), EndpointAttestation::Mismatch);
+        // The same advertised address observed from behind a NAT is a DIFFERENT outcome --
+        // this is the split that lets `mismatch` be read as "enforcement would refuse this".
+        assert_eq!(
+            classify_endpoint("198.51.100.9:443", "10.0.0.5".parse::<IpAddr>().unwrap()),
+            EndpointAttestation::Unobservable
+        );
 
         // The relay-only sentinel is not an address and must not land in any of the three
         // address buckets -- otherwise every NAT'd member would be counted as something.
@@ -6901,6 +6928,12 @@ mod tests {
         // them exactly this shape, and the naive rule would have refused all of them.
         assert!(endpoint_is_attested("57.131.133.91:5333", behind_nat));
         assert!(endpoint_is_attested("198.51.100.9:443", behind_nat));
+        // ...and it lands in its OWN bucket, not in the one enforcement reads.
+        assert_eq!(
+            classify_endpoint("198.51.100.9:443", behind_nat),
+            EndpointAttestation::Unobservable,
+            "a privately-observed member must never inflate the actionable counter"
+        );
 
         // Observed on a global address: an advertised address of the same family must be it.
         assert!(endpoint_is_attested("203.0.113.7:9000", global), "same address, other port");

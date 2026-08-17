@@ -489,10 +489,17 @@ advertising the host's real address. The naive "must be equal" rule would have r
 them. A different address family is allowed too (dual-stack: reach the edge over v4, advertise
 the v6 listener).
 
-Before switching it on, read `ct_edge_channel_endpoint_attestation_total` and the throttled
-`#546` log lines, which name both addresses and whether the observed one was global. Enforcing
-refuses exactly the `mismatch` cases whose observed address was global — if that count is 0,
+**The go/no-go is one number.** `ct_edge_channel_endpoint_attestation_total{result="mismatch"}`
+counts exactly what enforcement refuses — observed on a global address, advertised a different
+one of the same family. Members the edge saw on a private address land in `unobservable`
+instead, because equality is structurally impossible there and counting them would make the
+decisive number unreadable. `cross_family` is ordinary dual-stack. If `mismatch` is 0,
 switching on costs nothing.
+
+The log policies differ on purpose: `unobservable` is steady-state noise from co-located
+agents and is throttled hard, while every one of the first twenty `mismatch` events is
+printed. Sharing one throttle meant a rare actionable case could fall between the powers of
+two and never appear at all.
 
 Residual, stated so the flag is not oversold: even enforced, a member can still have its
 partner make **one** TCP connect to **one** port on the machine that just proved it holds the
