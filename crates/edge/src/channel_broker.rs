@@ -1003,12 +1003,28 @@ where
 static CHANNEL_SPLICE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CHANNEL_SPLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// #517 V1 (Nachtrag): completed RENDEZVOUS pairings -- the ones where the edge handed
+/// each side the other's endpoint and left the data path. The counterpart the splice
+/// counter needs to be readable at all: on its own, `splices == 0` means both "every
+/// session went direct" and "no session happened", and the offload question turns on
+/// exactly that difference.
+static CHANNEL_RENDEZVOUS_PAIRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// #517 V1: `(channel_relay_bytes_total, channel_splices_total)` for `/metrics`.
 pub fn channel_relay_totals() -> (u64, u64) {
     (
         CHANNEL_SPLICE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
         CHANNEL_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// #517 V1 (Nachtrag): completed rendezvous pairings for `/metrics`.
+pub fn channel_rendezvous_pairs_total() -> u64 {
+    CHANNEL_RENDEZVOUS_PAIRS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_channel_rendezvous_pair() {
+    CHANNEL_RENDEZVOUS_PAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn note_channel_splice(bytes: (u64, u64)) {
@@ -1288,6 +1304,13 @@ async fn finish_quic_pair_inner(
             quic_ack_member(&mut b.send, b_ack.as_bytes(), PairSide::B).await?;
             match completion {
                 QuicPairCompletion::EndpointSwap => {
+                    // #517 V1 (Nachtrag): counted HERE, right after both acks land -- this
+                    // is the moment the edge hands each side the other's endpoint and steps
+                    // out of the data path. Without it the splice counter alone is
+                    // ambiguous: zero splices reads as "everything went direct" and as
+                    // "nothing happened at all", which are opposite conclusions from the
+                    // same number. Paired with the splice counter it is the offload figure.
+                    note_channel_rendezvous_pair();
                     a.conn.closed().await;
                     b.conn.closed().await;
                 }
@@ -5892,6 +5915,13 @@ mod tests {
         // loop uses (`offer` -> `Paired(a, b)` -> spawn the finisher). The completion
         // must match the monolithic broker: each side learns the OTHER's endpoint and
         // roles follow the grants — proving the extraction is behaviour-preserving.
+        // #517 V1 (Nachtrag): the offload figure is read as a PAIR of counters, so this
+        // test also proves the rendezvous side is counted -- a successful pairing that the
+        // edge steps out of must show up somewhere, or "0 splices" stays unreadable.
+        // Measured as a delta, not an absolute: the counters are process-wide and other
+        // tests in this binary run concurrently. That makes the bound one-sided on purpose
+        // (>= 1), which is still discriminating -- without the increment it would be 0.
+        let pairs_before = channel_rendezvous_pairs_total();
         let pk = operator_pubkey();
         let channel = [0xD5u8; 32];
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
@@ -5942,6 +5972,11 @@ mod tests {
         assert!(ack_a.contains("203.0.113.2:7052"), "A learns B's endpoint via the finisher, got {ack_a:?}");
         assert!(ack_b.contains("203.0.113.1:7051"), "B learns A's endpoint via the finisher, got {ack_b:?}");
         assert_eq!(paired, (ia, ib), "the finisher decides roles from the grants, same as the monolithic broker");
+        assert!(
+            channel_rendezvous_pairs_total() > pairs_before,
+            "a completed rendezvous pairing must be counted -- otherwise a fully offloaded \
+             channel plane is indistinguishable from one that never ran (#517 V1)"
+        );
     }
 
     #[tokio::test]

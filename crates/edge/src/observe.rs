@@ -62,6 +62,12 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          # HELP ct_edge_channel_splices_total Completed channel relay splices since start.\n\
          # TYPE ct_edge_channel_splices_total counter\n\
          ct_edge_channel_splices_total {channel_splices}\n\
+         # HELP ct_edge_channel_rendezvous_pairs_total Completed rendezvous pairings since \
+start -- the edge handed both sides the other's endpoint and left the data path (#517 V1). \
+Read WITH _splices_total: pairs>0 and splices==0 means the channel plane offloaded \
+completely, while both at 0 means nothing was measured, not that offload succeeded.\n\
+         # TYPE ct_edge_channel_rendezvous_pairs_total counter\n\
+         ct_edge_channel_rendezvous_pairs_total {channel_pairs}\n\
          # HELP ct_edge_channel_park_reaped_total Channel-pairer parks reaped past their TTL\n\
          # with no partner since start (#530) -- the channel plane's counterpart to\n\
          # ct_edge_tcp_fallback_reaped_total. Counts EVERY reap (including ones whose log\n\
@@ -109,6 +115,7 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         relay_bytes_tcp_fallback = state.relay_bytes_by_kind().2,
         channel_relay_bytes = crate::channel_broker::channel_relay_totals().0,
         channel_splices = crate::channel_broker::channel_relay_totals().1,
+        channel_pairs = crate::channel_broker::channel_rendezvous_pairs_total(),
         channel_park_reaped = crate::channel_broker::channel_park_reaped_total(),
         front_door_client_aborts = crate::serve::front_door_client_aborts_total(),
         failovers = state.failovers_total(),
