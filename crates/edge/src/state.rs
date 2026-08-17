@@ -462,6 +462,15 @@ pub struct EdgeState<H> {
     /// class on the listener with the widest blast radius. Keyed by the loop's own label
     /// so `/healthz` can name which one is gone.
     listener_heartbeats: RwLock<HashMap<&'static str, std::sync::Arc<BrokerHeartbeat>>>,
+    /// #554: bumped by [`Self::revoke_token`] to wake live relays.
+    ///
+    /// Deliberately ONE global counter rather than a per-token registry of cancel handles.
+    /// A woken relay re-checks `is_revoked` for its own token, so the wake-up carries no
+    /// identity and needs no bookkeeping that could leak an entry per token ever revoked.
+    /// It is also race-free in the direction that matters: `watch` retains its latest
+    /// value, so a relay that subscribes *after* a revocation still sees a changed value
+    /// and re-checks — and the pre-relay `is_revoked` check covers the rest.
+    revocation_tick: tokio::sync::watch::Sender<u64>,
     /// Cumulative data-plane counters for observability (#10 O2).
     registrations: Counter,
     relays: Counter,
@@ -567,6 +576,7 @@ impl<H: Clone> EdgeState<H> {
             relay_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             rendezvous_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             listener_heartbeats: RwLock::new(HashMap::new()),
+            revocation_tick: tokio::sync::watch::channel(0).0,
             registrations: Counter::default(),
             relays: Counter::default(),
             tcp_parks: Counter::default(),
@@ -779,6 +789,27 @@ impl<H: Clone> EdgeState<H> {
     /// apart from "the front door was supposed to start and never did". Registering at
     /// first-accept would make a listener that never binds look like one that was never
     /// wanted, which is the failure being closed here.
+    /// #554: resolves once `token` has been revoked — for a live relay to race against its
+    /// own byte copying. Returns immediately if it is revoked already.
+    ///
+    /// Re-checks on every tick rather than trusting the wake-up, because the tick is
+    /// shared: a revocation of some *other* token wakes this relay too, and it must go
+    /// back to waiting rather than cut a tunnel nobody revoked.
+    pub async fn revoked_signal(&self, token: &RoutingToken) {
+        let mut rx = self.revocation_tick.subscribe();
+        loop {
+            if self.is_revoked(token) {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives in `EdgeState`, which outlives any relay it routed, so
+                // this is unreachable in practice. Park forever rather than return: a
+                // spurious "revoked" verdict would tear down a healthy tunnel.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     pub fn expect_listener(&self, label: &'static str, now: u64) -> std::sync::Arc<BrokerHeartbeat> {
         let mut map = self.listener_heartbeats.write_safe();
         let hb = map
@@ -1302,6 +1333,11 @@ impl<H: Clone> EdgeState<H> {
         let _guard = self.registration_lock.lock_safe();
         self.revoked.write_safe().insert(token.clone());
         self.remove_locked(token); // also clears the token's hostname routes (#23 BP4a)
+        // #554: wake every live relay so it can re-check its own token and cut itself.
+        // Dropping the registration above only stops NEW connections; an already-spliced
+        // `copy_bidirectional` consults nothing and would keep carrying traffic for a
+        // tunnel the customer just revoked -- measured, not assumed.
+        self.revocation_tick.send_modify(|n| *n += 1);
         // #281: also drop any host_auth grant(s) for this token, so a revoked
         // token can never re-authorize a hostname bind on a later reconnect --
         // clear_hosts_for (inside remove_locked()) only wipes the *active*

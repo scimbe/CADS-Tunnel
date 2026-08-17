@@ -175,7 +175,18 @@ pub async fn route_and_relay(
 ) -> Result<(), BoxError> {
     let (agent_send, agent_recv) = open_agent_stream(state, token).await?;
     let mut th_buf = [0u8; 8];
-    let (a, b) = relay_quic(client_send, client_recv, agent_send, agent_recv, token_hex(token, &mut th_buf)).await?;
+    // #554: race the copy against this token's revocation. Dropping the registration is
+    // not enough on its own -- an already-spliced relay consults nothing and kept carrying
+    // traffic for a revoked tunnel (measured). Losing the race drops both streams, which
+    // is what actually stops the bytes; the byte counts of a cut relay are not recorded
+    // because `relay_quic` only reports them on a clean end.
+    let relayed = tokio::select! {
+        r = relay_quic(client_send, client_recv, agent_send, agent_recv, token_hex(token, &mut th_buf)) => r?,
+        _ = state.revoked_signal(token) => {
+            return Err("relay cut: this tunnel's token was revoked mid-session (#554)".into());
+        }
+    };
+    let (a, b) = relayed;
     state.note_relay(token, a, b, crate::state::RelayKind::DataPlane); // #10 O2
     Ok(())
 }
@@ -5449,6 +5460,145 @@ mod tests {
 
         agent.await.unwrap();
         quic_edge.abort();
+    }
+
+    /// #554: revoking a token must cut a relay that is ALREADY flowing, not only stop new
+    /// ones. `admin.rs` promises the edge "tears the tunnel down"; before this it dropped
+    /// the registration and let the live splice carry on. Measured that way first: bytes
+    /// written after `revoke_token` still reached the agent.
+    ///
+    /// A customer revokes because the tunnel is compromised, so the long-lived sessions
+    /// are exactly the ones that matter.
+    #[tokio::test]
+    async fn revoking_a_token_cuts_a_relay_that_is_already_flowing_554() {
+        let token = RoutingToken([0x5b; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let state_e = state.clone();
+        tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            register_agent(&agent_conn, &state_e).await.unwrap();
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            let (c_send, mut c_recv) = client_conn.accept_bi().await.unwrap();
+            let mut tok = [0u8; 32];
+            c_recv.read_exact(&mut tok).await.unwrap();
+            let _ = route_and_relay(&state_e, &RoutingToken(tok), c_send, c_recv).await;
+        });
+
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut reg_send, mut reg_recv) = agent_conn.open_bi().await.unwrap();
+        let mut reg = vec![b'A'];
+        reg.extend_from_slice(&token.0);
+        reg_send.write_all(&reg).await.unwrap();
+        reg_send.finish().unwrap();
+        assert_eq!(reg_recv.read_to_end(8).await.unwrap(), b"OK");
+
+        let agent_task = tokio::spawn(async move {
+            let (_s, mut r) = agent_conn.accept_bi().await.unwrap();
+            let mut first = [0u8; 6];
+            r.read_exact(&mut first).await.unwrap();
+            // Second read AFTER the revocation happens on the edge.
+            let mut second = [0u8; 6];
+            let got = tokio::time::timeout(Duration::from_secs(3), r.read_exact(&mut second)).await;
+            (first, got.map(|res| res.map(|_| second)))
+        });
+
+        let client_ep = build_client_endpoint(cert).expect("client ep");
+        let client_conn = client_ep.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut c_send, _c_recv) = client_conn.open_bi().await.unwrap();
+        let mut opening = Vec::new();
+        opening.extend_from_slice(&token.0);
+        opening.extend_from_slice(b"first!");
+        c_send.write_all(&opening).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The customer revokes the tunnel while this stream is live.
+        state.revoke_token(&token);
+        assert!(state.is_revoked(&token), "revocation recorded");
+        assert_eq!(state.registration_count(&token), 0, "registration dropped");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = c_send.write_all(b"after!").await;
+        let (first, second) = agent_task.await.unwrap();
+        assert_eq!(&first, b"first!", "the pre-revocation bytes arrive");
+
+        let still_flowing = matches!(&second, Ok(Ok(b)) if b == b"after!");
+        assert!(
+            !still_flowing,
+            "bytes written after revoke_token still reached the agent -- the live splice was \
+             not cut, so revocation only stops NEW connections and every long-lived session \
+             on a compromised tunnel keeps being served"
+        );
+    }
+
+    /// #554, the other direction: the wake-up is a SHARED tick, so revoking some other
+    /// customer's token wakes every live relay. Each must re-check its own token and go
+    /// back to work. A guard that over-fires here would tear down healthy tunnels on every
+    /// unrelated revocation — worse than the gap it closes.
+    #[tokio::test]
+    async fn revoking_a_different_token_leaves_this_relay_untouched_554() {
+        let token = RoutingToken([0x5c; 32]);
+        let unrelated = RoutingToken([0xee; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+
+        let state_e = state.clone();
+        tokio::spawn(async move {
+            let agent_conn = server.accept().await.unwrap().await.unwrap();
+            register_agent(&agent_conn, &state_e).await.unwrap();
+            let client_conn = server.accept().await.unwrap().await.unwrap();
+            let (c_send, mut c_recv) = client_conn.accept_bi().await.unwrap();
+            let mut tok = [0u8; 32];
+            c_recv.read_exact(&mut tok).await.unwrap();
+            let _ = route_and_relay(&state_e, &RoutingToken(tok), c_send, c_recv).await;
+        });
+
+        let agent_ep = build_client_endpoint(cert.clone()).expect("agent ep");
+        let agent_conn = agent_ep.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut reg_send, mut reg_recv) = agent_conn.open_bi().await.unwrap();
+        let mut reg = vec![b'A'];
+        reg.extend_from_slice(&token.0);
+        reg_send.write_all(&reg).await.unwrap();
+        reg_send.finish().unwrap();
+        assert_eq!(reg_recv.read_to_end(8).await.unwrap(), b"OK");
+
+        let agent_task = tokio::spawn(async move {
+            let (_s, mut r) = agent_conn.accept_bi().await.unwrap();
+            let mut first = [0u8; 6];
+            r.read_exact(&mut first).await.unwrap();
+            let mut second = [0u8; 6];
+            let got = tokio::time::timeout(Duration::from_secs(3), r.read_exact(&mut second)).await;
+            got.map(|res| res.map(|_| second))
+        });
+
+        let client_ep = build_client_endpoint(cert).expect("client ep");
+        let client_conn = client_ep.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut c_send, _c_recv) = client_conn.open_bi().await.unwrap();
+        let mut opening = Vec::new();
+        opening.extend_from_slice(&token.0);
+        opening.extend_from_slice(b"first!");
+        c_send.write_all(&opening).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Somebody else's tunnel is revoked. Three times, so a single missed re-check
+        // cannot pass by luck.
+        for _ in 0..3 {
+            state.revoke_token(&unrelated);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(state.is_revoked(&unrelated));
+        assert!(!state.is_revoked(&token), "ours was never revoked");
+
+        c_send.write_all(b"after!").await.unwrap();
+        let second = agent_task.await.unwrap();
+        assert!(
+            matches!(&second, Ok(Ok(b)) if b == b"after!"),
+            "an unrelated revocation must not disturb this relay, got {second:?}"
+        );
     }
 
     #[tokio::test]

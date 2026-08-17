@@ -452,6 +452,20 @@ The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
 
+**Revoking a tunnel now cuts live sessions too (#554).** `POST /admin/revoke/:token` always
+dropped the registration and blocked re-registration; it did **not** stop a relay that was
+already flowing, so an open WebSocket, transfer, or interactive session on a compromised
+tunnel kept being served until one side closed by itself. That gap is closed on the QUIC
+data-plane path (`route_and_relay`): a revocation wakes live relays, each re-checks its own
+token, and a match tears down both streams with
+`relay cut: this tunnel's token was revoked mid-session (#554)` in the log.
+
+**Not yet covered**, and named here rather than left to be discovered: the TCP-fallback splice
+and the `:443` front-door arms carry their own `relay(...)` calls that do not consult the
+revocation signal. A revocation still stops new connections on those paths and drops the
+registration — but a session already in flight there survives. Treat a revocation as complete
+only for the QUIC data plane until those are wired too.
+
 **What `/healthz` actually covers (#498/#539/#553).** The endpoint the container healthcheck
 consumes reports 503 when any accept loop the edge *meant* to run has stopped iterating. Since
 #553 that is six loops, not two: the QUIC `relay` and `rendezvous` brokers plus the four TCP
