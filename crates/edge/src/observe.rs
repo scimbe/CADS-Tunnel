@@ -174,6 +174,38 @@ its own. `cross_family` is ordinary dual-stack.\n\
         relay = state.relay_broker_heartbeat().expected_since(),
         rendezvous = state.rendezvous_broker_heartbeat().expected_since(),
     ));
+    // #553 follow-up: the TCP accept loops are health-gated but were not observable, and a
+    // 200 from `/healthz` could not tell "all four registered and beating" from "none
+    // registered at all" -- an empty map passes the same check. Found while verifying the
+    // deploy that shipped the gating: there was no way to confirm from outside that it was
+    // doing anything. Each registered listener gets a row here, so registration itself is
+    // visible and staleness is graphable before it turns into a hard 503.
+    let listeners = state.listener_heartbeats();
+    out.push_str(
+        "# HELP ct_edge_listener_loop_last_seen_seconds Unix time of each TCP accept loop's \
+         last iteration (10s idle tick included, so a quiet edge stays fresh). A row exists \
+         only for a listener this edge decided to run; no rows at all means none were \
+         registered, which is NOT the same as all of them being healthy.\n\
+         # TYPE ct_edge_listener_loop_last_seen_seconds gauge\n",
+    );
+    for (label, hb) in &listeners {
+        out.push_str(&format!(
+            "ct_edge_listener_loop_last_seen_seconds{{listener=\"{label}\"}} {}\n",
+            hb.last_seen()
+        ));
+    }
+    out.push_str(
+        "# HELP ct_edge_listener_loop_expected_since_seconds Unix time at which the edge \
+         decided to run each TCP accept loop. Paired with _last_seen_seconds: expected but \
+         never seen = the listener failed to bind.\n\
+         # TYPE ct_edge_listener_loop_expected_since_seconds gauge\n",
+    );
+    for (label, hb) in &listeners {
+        out.push_str(&format!(
+            "ct_edge_listener_loop_expected_since_seconds{{listener=\"{label}\"}} {}\n",
+            hb.expected_since()
+        ));
+    }
     // #551: the per-IP join-refusal penalty (#414/#542/#547) had no surface at all. Both
     // numbers are needed and they answer different questions: `sheds_total` says whether
     // the penalty has ever done anything, `tracked_ips` says whether it still CAN.
@@ -659,6 +691,41 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "an unregistered listener must not be confused with a broken one"
+        );
+    }
+
+    /// #553 follow-up: a registered listener must be VISIBLE, and an edge with none must be
+    /// visibly different from one where all are healthy. `/healthz` cannot tell those apart
+    /// — an empty map passes it — which is exactly what made the deploy unverifiable.
+    #[test]
+    fn listener_heartbeats_are_visible_in_metrics_553() {
+        let now = 1_700_000_000u64;
+        let bare: EdgeState<u32> = EdgeState::new();
+        let body = render_edge_metrics(&bare, None);
+        assert!(
+            !body.contains("ct_edge_listener_loop_last_seen_seconds{listener="),
+            "an edge that registered no listener must emit no rows, so 'none' cannot be \
+             mistaken for 'all fine': {body}"
+        );
+
+        let state: EdgeState<u32> = EdgeState::new();
+        let fd = state.expect_listener(":443 front door", now);
+        let _tcp = state.expect_listener("TCP fallback", now);
+        fd.beat(now + 5);
+
+        let body = render_edge_metrics(&state, None);
+        assert!(
+            body.contains("ct_edge_listener_loop_last_seen_seconds{listener=\":443 front door\"} 1700000005"),
+            "a beating listener must report its beat: {body}"
+        );
+        assert!(
+            body.contains("ct_edge_listener_loop_last_seen_seconds{listener=\"TCP fallback\"} 0"),
+            "one that never beat must report 0, not be absent: {body}"
+        );
+        assert!(
+            body.contains("ct_edge_listener_loop_expected_since_seconds{listener=\"TCP fallback\"} 1700000000"),
+            "...and pair it with the intent, which is what separates 'never came up' from \
+             'never wanted': {body}"
         );
     }
 
