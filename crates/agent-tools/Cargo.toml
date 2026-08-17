@@ -28,13 +28,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 nat-lab = ["ct-agent/nat-lab"]
 
 [dependencies.ct-agent]
-# Pinned by commit (no tagged release exists yet -- cutting one triggers ct-agent's
-# release.yml matrix build/publish, a deliberate, separately-confirmed step). Bump
-# this rev deliberately, in lockstep with ct-client's dev-dependency below, once a
-# real release exists switch both to `tag = "vX.Y.Z"`. natlab's nat_lab_relay/
-# listen/dial live here and nowhere else.
+# #507: pinned by TAG since 2026-08-17. The old note here said no tagged release
+# existed -- that stopped being true long ago, and the rev it pinned (86ab198) was
+# from the v0.3.0 era, i.e. two majors behind what this project actually deploys.
+# The point of the pin is that these tests exercise the agent side of the wire; a
+# stale one means they were exercising a peer nobody runs. Bump in lockstep with
+# ct-client's dev-dependency. natlab's nat_lab_relay/listen/dial live here and
+# nowhere else.
 git = "https://github.com/scimbe/ct-agent"
-rev = "86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408"
+tag = "v0.5.4"
 optional = true
 
 [[bin]]

@@ -500,8 +500,8 @@ dependencies = [
 
 [[package]]
 name = "ct-agent"
-version = "0.3.0"
-source = "git+https://github.com/scimbe/ct-agent?rev=86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408#86ab198ffc70d6dcb9ee1bb55efa2191dbd8d408"
+version = "0.5.4"
+source = "git+https://github.com/scimbe/ct-agent?tag=v0.5.4#991eebb39c681065c9bf618052f6137d33777277"
 dependencies = [
  "axum",
  "base64",
