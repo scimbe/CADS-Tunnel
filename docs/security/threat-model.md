@@ -80,19 +80,20 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    `verify_fresh` primitive (#88 SEC88a/b) is available for any future live
    `SignedCredential` path, and enrollment now requires proof-of-possession (#88
    SEC88c). accepted residual.
-5. **Unverified-email / open-registration accounts (#89 SEC89b)** — the Keycloak
-   realm runs with `verifyEmail=false` + `registrationAllowed=true` (and
-   `trustEmail=true` for social IDPs), so an account can be created without a
-   verified email address. This is **accepted as residual**: the deployment has
-   **no SMTP** to send verification mail, so email verification cannot be enforced
-   operationally, and — critically — **email is not the billing identity**. Billing
-   and all per-subject authorization key off the Keycloak `sub` (#82/#92 sub
-   mapper), never the email claim, and free token issuance is closed (#87 SEC87a:
-   a routing token costs ≥ `TOKEN_PRICE`; #87 SEC87b-auth: the durable-writer
-   surface is gated). So an unverified-email account still cannot mint value for
-   free; the exposure it adds over a verified-email realm is bounded to **funded
-   sybil abuse**, which is already residual #1 above. If SMTP is added later,
-   flip `verifyEmail=true` to raise the bar; until then, accepted residual.
+5. **~~Unverified-email / open-registration accounts~~ (#89 SEC89b) — CLOSED 2026-08-16
+   (#535/#536)**. This entry used to accept unverified email as residual, on the grounds
+   that the deployment had **no SMTP** and so could not enforce verification. Both premises
+   are now false: SMTP is configured, and the realm runs `verifyEmail=true` with a registered
+   `VERIFY_EMAIL` required-action provider. The provider matters as much as the flag — the
+   flag alone is inert without it, which is precisely how an unverified account was still
+   created *after* the flag was set (#535). The gate `CT_GATE_REQUIRE_VERIFIED_EMAIL=1` is
+   committed in `docker/deploy/compose.sso.yml` rather than left to `.env`, and a startup
+   check asserts the enforcement independently instead of trusting the realm import
+   (`keycloak_admin.rs`, `RealmEnforcement`) — a setting that is not read back is a claim.
+   Retained here rather than deleted because the reasoning it recorded is still worth
+   knowing: even while unenforced, the exposure was bounded to **funded sybil abuse**
+   (residual #1), since billing and all per-subject authorization key off the Keycloak `sub`
+   (#82/#92 sub mapper) and never the email claim, and free issuance is closed (#87 SEC87a/b).
 6. **Operator-generated TLS keys for headless pipelines (#322)** — `docs/ops/runbook.md`'s
    "Authorize a new pipeline hostname (headless agents)" procedure has the operator run
    ACME DNS-01 (via their own `DESEC_TOKEN`) and generate a real Let's Encrypt cert +
