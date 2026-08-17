@@ -624,6 +624,23 @@ Two things worth knowing before touching them:
   502 because the realm's `google`/`github` entries were absent — the allowlist advertised a
   login path that did not exist. Add the provider in the realm first, then to this list.
 
+### The remaining edge/mesh knobs
+
+| variable | default | meaning |
+|---|---|---|
+| `CT_EDGE_ID` | `primary` | stable per-deployment identifier in the multi-edge ownership registry (which edge owns which token/hostname). The default keeps a single-edge deployment consistent rather than keyed on an empty string; it only starts to matter once a **second** edge reports in |
+| `CT_EDGE_PUBLIC_ADDR` | `unknown` | the address this edge reports for itself in that registry. A single-edge deployment needs no value — rehydration after a restart works off the default id |
+| `CT_EDGE_KA_PARK_TTL_SECS` | `30` (= `CHANNEL_PARK_TTL_SECS`) | park TTL for a **keepalive-negotiated** `:443` leg. See the warning below before raising it |
+| `CT_DNS_STORE_PATH` | — | zone store for the standalone `ct-dns` service (not deployed here; `ct-dns` runs no container in this stack) |
+| `CT_AGENT_SETUP_URL` / `CT_AGENT_SETUP_PS1_URL` | upstream raw URL | where `/install` redirects for the shell and PowerShell setup scripts. Exists so a self-hosting operator can point at their own mirror instead of a single chokepoint on `raw.githubusercontent.com` — the product's own audience should not need to patch the crate for that (#448) |
+
+**`CT_EDGE_KA_PARK_TTL_SECS` has a rollout order, not just a value.** A KA-negotiated park is
+observed (10 s NUL ticks, corpse detection ≤10 s), so a longer TTL is no resource risk and
+ends the idle re-park cycle. But raising it before the deployed agents carry the tick-based
+wait contract (**ct-agent ≥ v0.4.19**) makes an older client's 45 s admission bound fire
+first: the pair then cycles at 45 s with stale parks holding cap permits. Roll the fleet
+first, then raise this — the reverse order buys the cycling it was meant to end.
+
 ### The control plane's two background loops
 
 Both are **off unless switched on**, and both are switched on by the literal `1`:
