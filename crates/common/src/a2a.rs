@@ -236,8 +236,19 @@ pub async fn a2a_recv<R: AsyncRead + Unpin>(
 /// A2A frame tags for the **#104 relay→direct cutover (H2)**: application DATA vs the inline
 /// CUTOVER control marker. Tagging every frame is what makes the cutover **byte-exact** — the
 /// marker travels *in order, on the same reliable framed session* as the application data, so a
-/// receiver draining until the marker loses and duplicates nothing at the seam. (This is the
-/// standalone seam primitive; wiring it into the live `run_channel_session` is H3.)
+/// receiver draining until the marker loses and duplicates nothing at the seam.
+///
+/// **H3 landed elsewhere, and this is not on the live path (#476).** The doc here used to say
+/// "wiring it into the live `run_channel_session` is H3", which read as a pending step. H3
+/// shipped: [`crate::upgrade::run_upgradable_session_initiator`]/`_responder` carry the
+/// `Offer`/`Ready` coordination in-band over [`crate::noise::noise_pump_multiplexed`]'s control
+/// channel, and ct-agent drives those in production. Nothing — not `upgrade.rs`, not ct-agent —
+/// calls [`a2a_send_framed`]/[`a2a_recv_framed`] or reads these tags.
+///
+/// Kept for the same reason as [`crate::noise::noise_pump_switchable`], whose doc says so of
+/// itself: a focused, frozen proof that a byte-exact seam works, useful to read when changing
+/// the live one. It is **not** a second wire format in service, and a future cutover change
+/// belongs in the multiplexed pump, not here.
 pub const A2A_TAG_DATA: u8 = 0;
 pub const A2A_TAG_CUTOVER: u8 = 1;
 
