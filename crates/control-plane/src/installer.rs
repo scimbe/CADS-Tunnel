@@ -453,11 +453,33 @@ const CT_AGENT_SETUP_PS1: &str = "https://raw.githubusercontent.com/scimbe/ct-ag
 /// which doesn't exist yet (this workspace's other git-dependency pins are all by
 /// commit rev for the same reason); tracked separately, not attempted in this pass.
 fn ct_agent_setup_sh_url() -> String {
-    std::env::var("CT_AGENT_SETUP_URL").unwrap_or_else(|_| CT_AGENT_SETUP_SH.to_string())
+    setup_url_or_default(std::env::var("CT_AGENT_SETUP_URL").ok().as_deref(), CT_AGENT_SETUP_SH)
 }
 
 fn ct_agent_setup_ps1_url() -> String {
-    std::env::var("CT_AGENT_SETUP_PS1_URL").unwrap_or_else(|_| CT_AGENT_SETUP_PS1.to_string())
+    setup_url_or_default(std::env::var("CT_AGENT_SETUP_PS1_URL").ok().as_deref(), CT_AGENT_SETUP_PS1)
+}
+
+/// #538: the override rule itself, as a pure function of the value — so testing it needs no
+/// process-global environment at all.
+///
+/// The flake this closes was real: one test set `CT_AGENT_SETUP_*` while another read it
+/// through the router, and CI went red once and green on the next push with no code change.
+/// It was fixed with a mutex both tests take, which works but is **discipline**: the next
+/// test that exercises `/install.sh` without remembering the lock brings the race back, and
+/// it will again look like a fluke rather than a defect.
+///
+/// A pure rule cannot be raced. The env read stays in the two callers above, where it belongs
+/// and where nothing tests it; everything worth asserting about the OVERRIDE is here.
+///
+/// An empty value counts as unset: an operator who writes `CT_AGENT_SETUP_URL=` in a compose
+/// file means "I did not configure this", and redirecting installs to the empty string would
+/// be a broken download rather than an honest default.
+fn setup_url_or_default(configured: Option<&str>, default: &str) -> String {
+    match configured.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => default.to_string(),
+    }
 }
 
 async fn serve_install_sh() -> Redirect {
@@ -657,40 +679,38 @@ mod tests {
         assert!(win.trim_end().ends_with("ct-agent channel"), "ps invokes the subcommand");
     }
 
-    /// Serialises the two tests that touch `CT_AGENT_SETUP_*`. An environment
-    /// variable is process-wide, and `cargo test` runs tests in parallel THREADS
-    /// of one process -- so while the override test held those variables set,
-    /// `install_routes_redirect_to_the_ct_agent_setup_scripts` could read them
-    /// and assert the default against `https://mirror.example/...`. That is not
-    /// hypothetical: it turned CI red on 2026-08-16 and went green on the next
-    /// push without a code change, which is what a scheduling race looks like.
+    /// #448 via #538: the same property, asserted without touching the process environment.
     ///
-    /// The old comment here reasoned that the test binary "runs single-process"
-    /// -- true, and beside the point: single-process is exactly the condition
-    /// under which threads share the environment.
-    static SETUP_URL_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// This test used to set `CT_AGENT_SETUP_*` and read them back, which raced with the
+    /// router test that reads the same variables — CI went red once and green on the next
+    /// push with no code change. A mutex made that safe, but only for the tests that
+    /// remember to take it. Asserting the rule as a pure function removes the shared state
+    /// instead of scheduling around it, so no future test can reintroduce the race.
     #[test]
     fn setup_script_urls_are_overridable_for_self_hosting_operators_448() {
-        // #448: a self-hosting operator must be able to point this at their own
-        // mirror without patching the crate. Unset -> today's exact default
-        // (matches install_routes_redirect_to_the_ct_agent_setup_scripts above,
-        // which sets neither and still asserts the raw.githubusercontent.com URL).
-        let _guard = SETUP_URL_ENV.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(ct_agent_setup_sh_url(), CT_AGENT_SETUP_SH);
-        assert_eq!(ct_agent_setup_ps1_url(), CT_AGENT_SETUP_PS1);
+        // Unset -> today's exact default, unchanged.
+        assert_eq!(setup_url_or_default(None, CT_AGENT_SETUP_SH), CT_AGENT_SETUP_SH);
+        assert_eq!(setup_url_or_default(None, CT_AGENT_SETUP_PS1), CT_AGENT_SETUP_PS1);
 
-        // SAFETY: the guard above keeps every other test that reads these
-        // variables out of this window; they are restored before it drops.
-        unsafe {
-            std::env::set_var("CT_AGENT_SETUP_URL", "https://mirror.example/setup.sh");
-            std::env::set_var("CT_AGENT_SETUP_PS1_URL", "https://mirror.example/setup.ps1");
-        }
-        assert_eq!(ct_agent_setup_sh_url(), "https://mirror.example/setup.sh");
-        assert_eq!(ct_agent_setup_ps1_url(), "https://mirror.example/setup.ps1");
-        unsafe {
-            std::env::remove_var("CT_AGENT_SETUP_URL");
-            std::env::remove_var("CT_AGENT_SETUP_PS1_URL");
+        // Set -> the operator's mirror wins.
+        assert_eq!(
+            setup_url_or_default(Some("https://mirror.example/setup.sh"), CT_AGENT_SETUP_SH),
+            "https://mirror.example/setup.sh"
+        );
+        assert_eq!(
+            setup_url_or_default(Some("https://mirror.example/setup.ps1"), CT_AGENT_SETUP_PS1),
+            "https://mirror.example/setup.ps1"
+        );
+
+        // An empty or whitespace-only value is "not configured", not "redirect installs to
+        // nowhere" -- `CT_AGENT_SETUP_URL=` in a compose file is an operator leaving a knob
+        // blank, and honouring it literally would serve a broken download.
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                setup_url_or_default(Some(blank), CT_AGENT_SETUP_SH),
+                CT_AGENT_SETUP_SH,
+                "{blank:?} must fall back to the default"
+            );
         }
     }
 
@@ -712,10 +732,9 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use tower::ServiceExt;
 
-        // Reads CT_AGENT_SETUP_* indirectly through the router, so it has to take
-        // the same lock as the test that sets them -- see SETUP_URL_ENV.
-        let _guard = SETUP_URL_ENV.lock().unwrap_or_else(|e| e.into_inner());
-
+        // #538: no lock needed any more. Nothing in this crate sets CT_AGENT_SETUP_* --
+        // the override rule is asserted as a pure function (`setup_url_or_default`), so this
+        // test reads the real defaults and cannot race anyone.
         let app = installer_router(
             "https://portal.example".to_string(),
             "http://release.invalid/base".to_string(),
