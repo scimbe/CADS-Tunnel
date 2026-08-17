@@ -953,7 +953,11 @@ where
             // #546: measure before deciding. Refusing an uncorroborated endpoint would be a
             // wire-behaviour change that could lock out legitimate members (dual-stack, or
             // shapes nobody has enumerated yet), so this counts first and refuses nothing.
-            note_endpoint_attestation(classify_endpoint(&req.endpoint, observed.ip()));
+            note_endpoint_attestation_with(
+                classify_endpoint(&req.endpoint, observed.ip()),
+                &req.endpoint,
+                observed.ip(),
+            );
             Ok(AdmittedMember { conn, send, req, operator, noise, attest, observed, _permit: permit })
         }
         Err(e) => {
@@ -1077,7 +1081,7 @@ pub fn endpoint_attestation_totals() -> (u64, u64, u64, u64) {
     )
 }
 
-fn note_endpoint_attestation(a: EndpointAttestation) {
+fn note_endpoint_attestation_with(a: EndpointAttestation, advertised: &str, observed: std::net::IpAddr) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = match a {
         EndpointAttestation::Matches => &ENDPOINT_MATCHES,
@@ -1089,9 +1093,17 @@ fn note_endpoint_attestation(a: EndpointAttestation) {
     // Only the uncorroborated case is worth a line, and only occasionally: a member that
     // re-parks every park-TTL would otherwise repeat it forever (the #530 lesson).
     if a == EndpointAttestation::Mismatch && (n.is_power_of_two() || n % 1000 == 0) {
+        // Both addresses named: a bare count cannot be acted on. The two shapes behind
+        // this bucket need opposite responses -- a member behind a NAT the edge sees as
+        // private simply CANNOT match (equality is meaningless there), while a member the
+        // edge sees on a global address that advertises a different global address is the
+        // case the whole measurement is about. Without the addresses the operator cannot
+        // tell which one they have, and the number is unusable for the enforcement
+        // decision it exists to inform.
         eprintln!(
-            "ct-edge: #546 advertised endpoint does not match the observed source address \
-             ({n} so far) -- counting only, nothing refused"
+            "ct-edge: #546 advertised {advertised} but observed source {observed} \
+             (observed_global={}, {n} so far) -- counting only, nothing refused",
+            ct_common::channel::is_global_unicast(std::net::SocketAddr::new(observed, 0))
         );
     }
 }
