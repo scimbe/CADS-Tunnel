@@ -972,6 +972,20 @@ const TCP_PING_STOP: u8 = 0xFB;
 /// real TLS handshake is a handful of round trips, not a long-lived exchange.
 const FRONT_DOOR_TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// #549: the mesh-relay leg's counterparts to [`FRONT_DOOR_TLS_ACCEPT_TIMEOUT`] -- same
+/// class as #422, one leg over. [`relay_via_peer_edge`] dials a peer edge and waits for
+/// its 2-byte `OK`; both waits were unbounded, so a peer edge that accepts the TCP
+/// connection and then goes silent held the browser connection (and the
+/// `browser_tunnel_cap` sub-permit taken by the `BrowserTunnel` arm, #254) forever. The
+/// two are kept SEPARATE rather than folded into one bound because they fail for
+/// different reasons and an operator has to tell them apart: a dial that never completes
+/// means the peer edge is unreachable (network, firewall, wrong `peer_addr` in the
+/// registry), while a missing ACK means it is reachable but not answering the mesh-relay
+/// role (hung, wrong admin token, not serving 'M'). 10s each, matching every other
+/// front-door bound in this file.
+const MESH_RELAY_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+const MESH_RELAY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read the raw front-door ClientHello under [`CLIENT_HELLO_READ_TIMEOUT`] (#111): the
 /// timeout-bounded seam wrapping the panic-free parser [`crate::sni::read_client_hello_bytes`]
 /// so a client that stalls mid-record is dropped (freeing its #119 cap permit) instead of
@@ -2717,7 +2731,19 @@ pub async fn relay_via_peer_edge<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut peer = crate::transport::tcp_tls_connect(target, edge_cert).await?;
+    // #549: both waits on the peer edge are bounded -- see `MESH_RELAY_DIAL_TIMEOUT`.
+    let mut peer = tokio::time::timeout(
+        MESH_RELAY_DIAL_TIMEOUT,
+        crate::transport::tcp_tls_connect(target, edge_cert),
+    )
+    .await
+    .map_err(|_| -> BoxError {
+        format!(
+            "mesh-relay: peer edge {target} did not complete the dial+TLS handshake within \
+             {MESH_RELAY_DIAL_TIMEOUT:?} -- treating it as unreachable (#549)"
+        )
+        .into()
+    })??;
 
     let host_bytes = host.as_bytes();
     let host_len: u16 = host_bytes.len().try_into().map_err(|_| "hostname too long for the mesh-relay frame")?;
@@ -2729,7 +2755,16 @@ where
     peer.flush().await?;
 
     let mut ack = [0u8; 2];
-    peer.read_exact(&mut ack).await?;
+    tokio::time::timeout(MESH_RELAY_ACK_TIMEOUT, peer.read_exact(&mut ack))
+        .await
+        .map_err(|_| -> BoxError {
+            format!(
+                "mesh-relay: peer edge {target} accepted the connection but sent no \
+                 acknowledgement within {MESH_RELAY_ACK_TIMEOUT:?} -- it is reachable but not \
+                 serving the mesh-relay role (#549)"
+            )
+            .into()
+        })??;
     if &ack != b"OK" {
         return Err(format!("peer edge refused mesh-relay for '{host}'").into());
     }
@@ -4884,6 +4919,82 @@ mod tests {
         let wrong_token = [0x99u8; 32]; // != the [0x42; 32] edge B is configured with
         let result = relay_via_peer_edge(edge_a_inbound, addr_b, host, cert_b, wrong_token).await;
         assert!(result.is_err(), "wrong admin token must be refused, not relayed");
+    }
+
+    #[tokio::test]
+    async fn mesh_relay_dial_times_out_against_a_peer_that_never_speaks_tls_549() {
+        // #549: a peer edge that accepts the TCP connection and then never completes the
+        // TLS handshake must not hold the browser connection (and its `browser_tunnel_cap`
+        // sub-permit) forever. Deliberately a PLAIN listener, not a TLS one: it accepts and
+        // stays silent, which is exactly the half-open state that used to hang here.
+        let (_l, _a, cert) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(); // borrowed only for a well-formed root cert
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and hold: never send a ServerHello, never close.
+            let held = silent.accept().await;
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let (_client_side, edge_a_inbound) = tokio::io::duplex(4096);
+        let start = tokio::time::Instant::now();
+        let res = relay_via_peer_edge(edge_a_inbound, addr, "app.example.test", cert, [0x42u8; 32]).await;
+        let err = res.expect_err("a peer edge that never completes TLS must not hang the caller");
+        assert!(
+            err.to_string().contains("did not complete the dial+TLS handshake"),
+            "the error must name the DIAL stage so an operator reads 'unreachable', not \
+             'not answering': {err}"
+        );
+        assert!(
+            start.elapsed() >= MESH_RELAY_DIAL_TIMEOUT && start.elapsed() < Duration::from_secs(30),
+            "must fail at the dial bound (~{MESH_RELAY_DIAL_TIMEOUT:?}), not hang: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_relay_ack_times_out_against_a_peer_that_never_acknowledges_549() {
+        // #549, second wait: this peer edge is fully reachable -- real TLS, reads the whole
+        // 'M' frame -- and then simply never answers. Distinct from the dial case above and
+        // from the wrong-token case (which gets a definitive refusal); silence is the one
+        // failure that used to be unbounded.
+        use tokio::io::AsyncReadExt;
+
+        let (listener_b, acceptor_b, cert_b) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener_b.accept().await.unwrap();
+            if let Ok(mut tls) = acceptor_b.accept(tcp).await {
+                // Consume the 'M' frame so the failure is provably the MISSING ACK and not
+                // an unread socket, then go silent without closing.
+                let mut sink = [0u8; 64];
+                let _ = tls.read(&mut sink).await;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let (_client_side, edge_a_inbound) = tokio::io::duplex(4096);
+        let start = tokio::time::Instant::now();
+        let res =
+            relay_via_peer_edge(edge_a_inbound, addr_b, "app.example.test", cert_b, [0x42u8; 32]).await;
+        let err = res.expect_err("a peer edge that never acknowledges must not hang the caller");
+        assert!(
+            err.to_string().contains("sent no acknowledgement"),
+            "the error must name the ACK stage so an operator reads 'reachable but not serving \
+             the role', not 'unreachable': {err}"
+        );
+        assert!(
+            start.elapsed() >= MESH_RELAY_ACK_TIMEOUT && start.elapsed() < Duration::from_secs(30),
+            "must fail at the ACK bound (~{MESH_RELAY_ACK_TIMEOUT:?}), not hang: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
