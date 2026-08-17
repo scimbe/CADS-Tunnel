@@ -163,19 +163,47 @@ const JOIN_REFUSAL_MAX_TRACKED_IPS: usize = 4096;
 /// exposes it as `ct_edge_channel_broker_loop_last_seen_seconds{loop=...}`, so a scraper (or
 /// a hardened container healthcheck) can alert on staleness: with the loop's own 10s idle
 /// tick, anything older than ~30s means the loop is genuinely wedged, not idle.
-pub struct BrokerHeartbeat(std::sync::atomic::AtomicU64);
+pub struct BrokerHeartbeat {
+    last_seen: std::sync::atomic::AtomicU64,
+    /// #539: when the edge DECIDED to run this loop (unix seconds); 0 = it never intended to.
+    /// Without this, `last_seen == 0` conflates two opposite situations -- a loop the edge
+    /// deliberately does not run (the #103 address-collision guard) and a loop that was
+    /// supposed to run and failed to come up (a bind error, which only reaches an `eprintln!`).
+    /// Health cannot tell them apart from the beat alone, so the intent has to be recorded
+    /// where it is known: at the spawn site.
+    expected_since: std::sync::atomic::AtomicU64,
+}
 
 impl BrokerHeartbeat {
     pub fn new() -> Self {
-        Self(std::sync::atomic::AtomicU64::new(0))
+        Self {
+            last_seen: std::sync::atomic::AtomicU64::new(0),
+            expected_since: std::sync::atomic::AtomicU64::new(0),
+        }
     }
     /// Record one loop iteration at `now` (unix seconds).
     pub fn beat(&self, now: u64) {
-        self.0.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.last_seen.store(now, std::sync::atomic::Ordering::Relaxed);
     }
-    /// The last recorded iteration time (unix seconds); 0 = this loop never started.
+    /// The last recorded iteration time (unix seconds); 0 = this loop never beat.
     pub fn last_seen(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.last_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// #539: declare that this loop is supposed to run, as of `now`. Call it immediately
+    /// before spawning -- after any deliberate decision NOT to run the loop, and before the
+    /// listener is bound, so that a failure to bind still counts as "expected but absent".
+    /// First call wins: a re-declaration must not reset the clock a health check measures against.
+    pub fn expect_start(&self, now: u64) {
+        let _ = self.expected_since.compare_exchange(
+            0,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    /// When this loop was declared expected (unix seconds); 0 = the edge never intended to run it.
+    pub fn expected_since(&self) -> u64 {
+        self.expected_since.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

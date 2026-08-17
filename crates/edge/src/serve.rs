@@ -3611,6 +3611,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             eprintln!("ct-edge: NOT starting the channel relay — {e}");
                         }
                         if let Ok(relay_addr) = relay_addr {
+                        // #539: the intent is recorded HERE -- past the #103 guard (so a
+                        // deliberate no-relay stays healthy) but before the listener is bound,
+                        // so a bind failure below is "expected but absent" rather than
+                        // indistinguishable from "never wanted". Without this line, that
+                        // failure reaches only the `eprintln!` in the Err arm and `/healthz`
+                        // keeps answering 200 while both-NAT'd peers cannot pair at all.
+                        state.relay_broker_heartbeat().expect_start(unix_now());
                         match build_server_endpoint_from_ca(&ca, relay_addr, vec!["localhost".to_string()]) {
                             Ok((relay_ep, _)) => {
                                 let relay_az = authorizer.clone();
@@ -3680,6 +3687,10 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         // across every channel-join transport).
                         let rendezvous_penalty = state.join_refusal_penalty();
                         let rendezvous_heartbeat = state.rendezvous_broker_heartbeat();
+                        // #539: same as the relay above. The rendezvous loop has no
+                        // "deliberately off" case today, which is exactly why its silence
+                        // would be pure failure -- and just as invisible without this.
+                        rendezvous_heartbeat.expect_start(unix_now());
                         // #400: same reasoning as the relay pairer above -- constructed here so
                         // `run_edge` can keep its own clone alive independently of the loop's
                         // own lifetime.
