@@ -471,6 +471,34 @@ everything" is the misunderstanding this paragraph exists to prevent.
 Each cap prints its resolved value at startup (`ct-edge: max N concurrent …`), so the running
 configuration is readable from the log rather than inferred from the environment.
 
+### Corroborating a member's advertised address (#546)
+
+`CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1` (default **off**) refuses a channel join whose
+advertised endpoint is not corroborated by the source address the edge observed.
+
+The existing filter (#94/#121/#267) already refuses **internal** targets — loopback, RFC1918,
+CGNAT, link-local, cloud metadata, including the IPv4-in-IPv6 forms. It does not refuse an
+arbitrary **public** one: without this flag, an admitted member can name any global address
+and have its partner dial it once per pairing.
+
+The rule judges **only when the observed source is itself global-unicast**. A member the edge
+sees on a private address is behind a NAT or co-located, and its observed address then says
+nothing about its public identity. This is not a loophole, it is what the first measurement
+forced: 4 mismatches, 0 matches, every one of them an agent behind the Docker bridge
+advertising the host's real address. The naive "must be equal" rule would have refused all of
+them. A different address family is allowed too (dual-stack: reach the edge over v4, advertise
+the v6 listener).
+
+Before switching it on, read `ct_edge_channel_endpoint_attestation_total` and the throttled
+`#546` log lines, which name both addresses and whether the observed one was global. Enforcing
+refuses exactly the `mismatch` cases whose observed address was global — if that count is 0,
+switching on costs nothing.
+
+Residual, stated so the flag is not oversold: even enforced, a member can still have its
+partner make **one** TCP connect to **one** port on the machine that just proved it holds the
+channel key. That is no longer a tool against third parties. Under CGNAT that address is
+shared with other subscribers, so it is not strictly zero.
+
 ### How much channel traffic actually bypasses the edge (#517 V1)
 
 The offload figure is a **pair of counters**, never a single number:

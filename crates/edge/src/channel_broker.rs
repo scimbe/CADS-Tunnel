@@ -759,6 +759,23 @@ where
         )
         .await);
     }
+    // #546: the check above rules out INTERNAL targets; this one rules out third parties.
+    // Same refusal category on the wire ("endpoint" already means "advertised endpoint
+    // unsafe/undialable"), so no new token and no risk to the <32-byte refusal frame (#524).
+    // Off by default -- see `require_attested_endpoint`.
+    if require_attested_endpoint()
+        && !req.is_relay_only()
+        && !endpoint_is_attested(&req.endpoint, observed.ip())
+    {
+        return Err(refuse(
+            &mut send,
+            "endpoint",
+            &format!("endpoint={} observed={}", req.endpoint, observed.ip()),
+            "advertised endpoint not corroborated by the observed source address".into(),
+            observed,
+        )
+        .await);
+    }
     // #81 gap 2: the holder must be a current member; `authorize` yields the
     // operator key only then, so a revoked member is refused here.
     let (operator, member_noise, member_attest) =
@@ -1024,6 +1041,41 @@ pub fn channel_relay_totals() -> (u64, u64) {
         CHANNEL_SPLICE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
         CHANNEL_SPLICES.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// #546 enforcement: may `advertised` be dialed, given the source address the edge observed?
+///
+/// The rule, refined by the first field measurement (which refuted the naive form): compare
+/// **only when the observed source is itself global-unicast**. A member the edge sees on a
+/// private address is behind a NAT or co-located with the edge, and its observed address then
+/// carries no information about its public identity -- demanding equality there would refuse
+/// perfectly ordinary members. The first reading was 4 mismatches, 0 matches, every one of
+/// them `advertised <public> / observed 172.18.0.1` (an agent behind the Docker bridge).
+///
+/// Where the observed address IS global, an advertised address of the same family must equal
+/// it. That removes the primitive rather than filtering it: with the IP fixed to what the
+/// edge saw, a member can only ever point its partner at a port on the machine that just
+/// proved it holds the channel key -- never at a third party. A different family is allowed
+/// (dual-stack: reach the edge over v4, advertise the v6 listener) and counted separately.
+///
+/// Not an address at all (the relay-only sentinel) is not this check's business --
+/// `admissible_endpoint` already ruled on it.
+pub fn endpoint_is_attested(advertised: &str, observed: std::net::IpAddr) -> bool {
+    if !ct_common::channel::is_global_unicast(std::net::SocketAddr::new(observed, 0)) {
+        return true; // observed address says nothing -- no judgement to make
+    }
+    !matches!(
+        classify_endpoint(advertised, observed),
+        EndpointAttestation::Mismatch
+    )
+}
+
+/// #546: is enforcement switched on? Default **off** -- the measurement runs first, and
+/// flipping this is an operator decision with the counters in hand. Only the literal `1`
+/// enables it, matching the control plane's background-loop flags rather than the flood
+/// limits' `off/false/none` vocabulary (the two differ; see the runbook).
+fn require_attested_endpoint() -> bool {
+    std::env::var("CT_EDGE_REQUIRE_ATTESTED_ENDPOINT").ok().as_deref() == Some("1")
 }
 
 /// #546: how a member's ADVERTISED endpoint relates to the address the edge actually
@@ -6834,6 +6886,46 @@ mod tests {
             EndpointAttestation::NoAddress
         );
         assert_eq!(classify_endpoint("not-an-address", v4), EndpointAttestation::NoAddress);
+    }
+
+    #[test]
+    fn endpoint_is_attested_only_judges_when_the_observed_address_says_something_546() {
+        use std::net::IpAddr;
+        let global: IpAddr = "203.0.113.7".parse().unwrap();
+        let behind_nat: IpAddr = "172.18.0.1".parse().unwrap();
+
+        // Observed on a private address -- co-located or behind a NAT. The observed value
+        // carries no information about the member's public identity, so there is nothing to
+        // corroborate against and NOTHING may be refused on this basis. This is not a
+        // concession: the first field reading was 4 mismatches / 0 matches, every one of
+        // them exactly this shape, and the naive rule would have refused all of them.
+        assert!(endpoint_is_attested("57.131.133.91:5333", behind_nat));
+        assert!(endpoint_is_attested("198.51.100.9:443", behind_nat));
+
+        // Observed on a global address: an advertised address of the same family must be it.
+        assert!(endpoint_is_attested("203.0.113.7:9000", global), "same address, other port");
+        assert!(
+            !endpoint_is_attested("198.51.100.9:443", global),
+            "a third party's address is exactly what this closes"
+        );
+
+        // Dual-stack stays allowed -- reaching the edge over v4 while advertising the v6
+        // listener is ordinary, and refusing it would break real members for no gain.
+        assert!(endpoint_is_attested("[2001:db8::7]:9000", global));
+        let global_v6: IpAddr = "2001:db8::7".parse().unwrap();
+        assert!(endpoint_is_attested("203.0.113.7:9000", global_v6));
+        assert!(!endpoint_is_attested("[2001:db8::99]:443", global_v6), "same family, other host");
+    }
+
+    #[test]
+    fn attested_endpoint_enforcement_is_off_unless_explicitly_enabled_546() {
+        // The flag is read from the process environment, so this asserts the DEFAULT that
+        // ships: absent means off. A guard that silently switched itself on would be a wire
+        // behaviour change nobody chose -- the same count-then-enforce discipline as #540.
+        assert!(
+            !require_attested_endpoint(),
+            "enforcement must stay off until an operator sets CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1"
+        );
     }
 
 }
