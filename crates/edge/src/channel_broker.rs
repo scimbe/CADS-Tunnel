@@ -1820,6 +1820,12 @@ where
                     note_channel_splice(bytes); // #517 V1
                 }
                 StreamPairCompletion::RendezvousClose => {
+                    // #517 V1 (Nachtrag): the SAME count as the QUIC family's EndpointSwap,
+                    // and the one that matters most in this deployment -- the `:443` front
+                    // door is the pairer real channel traffic uses (agents are forced to
+                    // FRONT_DOOR_ONLY until #495 unifies the pairers), so counting only the
+                    // QUIC family would have measured a path that carries almost nothing.
+                    note_channel_rendezvous_pair();
                     // #495 2b: the rendezvous contract ends the stream after the ack —
                     // gracefully (#511): for this completer the ack IS the in-flight
                     // final record the RST race would discard, see [`graceful_close`].
@@ -3810,6 +3816,11 @@ mod tests {
             .expect("admit B");
         let ((a, pa), (b, pb)) = r.expect("B pairs with parked A");
         assert_eq!((pa, pb), (ParkPhase::Rendezvous, ParkPhase::Rendezvous));
+        // #517 V1 (Nachtrag): this is the completer the `:443` front door uses, i.e. the
+        // one carrying real channel traffic in this deployment -- counting only the QUIC
+        // family would have measured a near-empty path. Delta, not absolute: the counter is
+        // process-wide and the suite runs concurrently.
+        let pairs_before = channel_rendezvous_pairs_total();
         tokio::spawn(async move {
             let _ = finish_rendezvous_pair_over_streams(a, b, 500).await;
         });
@@ -3820,6 +3831,11 @@ mod tests {
         })
         .await
         .expect("ack-then-close must complete EOF-waiting readers promptly (#495 2b)");
+        assert!(
+            channel_rendezvous_pairs_total() > pairs_before,
+            "a front-door rendezvous pairing must be counted too -- otherwise the offload \
+             figure ignores the pairer that actually carries the traffic (#517 V1)"
+        );
     }
 
     /// #495-U1: a pair with an EndpointSwap side (a QUIC-rendezvous member, whose
