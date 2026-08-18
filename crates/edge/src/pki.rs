@@ -281,6 +281,31 @@ impl Ca {
 /// Build a QUIC server [`Endpoint`] bound to `addr` using a CA-issued leaf for
 /// `sans`; returns the endpoint and the CA root (which Clients trust). This is
 /// the production replacement for the self-signed `build_server_endpoint_at`.
+/// Wie [`build_server_endpoint_from_ca`], aber mit einer ALPN-Liste auf dem QUIC-Server.
+///
+/// Getrennt gehalten und heute NUR von der Wire-Probe benutzt: der ausgelieferte Kanal-
+/// Endpunkt fuehrt bewusst keine Liste, und ob er je eine bekommt, ist die offene Frage
+/// aus #495 U2. Der Helfer existiert, damit diese Frage MESSBAR ist, statt beantwortet zu
+/// werden -- die erste Antwort darauf war geraten und falsch.
+pub fn build_server_endpoint_from_ca_with_alpn(
+    ca: &Ca,
+    addr: SocketAddr,
+    sans: Vec<String>,
+    alpn: Vec<Vec<u8>>,
+) -> Result<(Endpoint, CertificateDer<'static>), BoxError> {
+    install_crypto_provider();
+    let (cert, key) = ca.issue(sans)?;
+    let mut tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    tls.alpn_protocols = alpn;
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls)?));
+    server_config.transport_config(edge_server_transport()?);
+    let endpoint = Endpoint::server(server_config, addr)?;
+    Ok((endpoint, ca.root_der()))
+}
+
 pub fn build_server_endpoint_from_ca(
     ca: &Ca,
     addr: SocketAddr,
@@ -478,6 +503,99 @@ mod tests {
     /// negotiation -- prove all four old/new x plain/boring combinations against a REAL
     /// TLS handshake: a KA-capable plain client lands on `-ka`, an old plain client on
     /// the bare id; a KA-capable boring client's [h2, http/1.1] offer is deliberately
+    /// Wire-Probe (#495 U2): ALPN taugt auf dem QUIC-Kanal-Pfad NICHT als Faehigkeits-Traeger.
+    ///
+    /// Der Server (`build_server_endpoint_from_ca`) setzt heute KEINE `alpn_protocols`. Die
+    /// Frage entscheidet, ob eine zweite ALPN als Faehigkeits-Traeger fuer #495 U2 taugt --
+    /// so wie #500 K2 sie auf dem `:443`-TLS-Pfad benutzt. Falls rustls hier mit
+    /// `no_application_protocol` abbricht, wuerde ein Client, der zuerst ausgerollt wird,
+    /// JEDEN Join gegen den laufenden Edge brechen: derselbe Fehler wie beim Praeambel-Byte,
+    /// nur eine Ebene tiefer.
+    #[tokio::test]
+    async fn quic_channel_endpoint_and_an_alpn_offering_client_495_u2() {
+        use quinn::{ClientConfig, Endpoint};
+        let ca = Ca::load_or_create(&format!("{}/probe-ca.key", std::env::temp_dir().display()), "probe-ca").expect("ca");
+        let (server, cert) = build_server_endpoint_from_ca(&ca, "127.0.0.1:0".parse().unwrap(), vec!["localhost".to_string()]).expect("server");
+        let addr = server.local_addr().expect("addr");
+        // Die eingehende Verbindung muss ANGENOMMEN werden -- ein verworfenes `Incoming`
+        // antwortet mit CONNECTION_REFUSED, was sich wie eine ALPN-Ablehnung liest. Genau
+        // daran ist der erste Anlauf dieser Probe gescheitert.
+        tokio::spawn(async move {
+            while let Some(inc) = server.accept().await {
+                tokio::spawn(async move { let _ = inc.await; });
+            }
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).expect("root");
+        let mut crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![b"ct-edge-channel-ss".to_vec(), b"ct-edge-channel".to_vec()];
+        let cfg = ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic cfg"),
+        ));
+        let mut ep = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client ep");
+        ep.set_default_client_config(cfg);
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ep.connect(addr, "localhost").expect("connect"),
+        )
+        .await
+        .expect("no timeout");
+        eprintln!("A) Client MIT ALPN gegen Server OHNE: {:?}",
+                  r.as_ref().map(|_| "verbunden").map_err(|e| e.to_string()));
+        assert!(
+            r.is_err(),
+            "Ein ALPN-anbietender Client kommt gegen den heutigen ALPN-losen QUIC-Edge NICHT \
+             durch (rustls: no_application_protocol). Wenn das hier je gruen wird, hat sich \
+             die Bibliothek geaendert und die Rollout-Reihenfolge unten darf neu bewertet \
+             werden -- bis dahin gilt: Client zuerst ausrollen bricht JEDEN Join."
+        );
+
+        // B) Die Gegenrichtung, und die entscheidet die Reihenfolge: ein Server, der eine
+        //    ALPN-Liste FUEHRT, gegen einen Bestandsclient, der keine anbietet.
+        let (server_b, cert_b) = build_server_endpoint_from_ca_with_alpn(
+            &ca,
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["localhost".to_string()],
+            vec![b"ct-edge-channel-ss".to_vec(), b"ct-edge-channel".to_vec()],
+        )
+        .expect("server mit alpn");
+        let addr_b = server_b.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Some(inc) = server_b.accept().await {
+                tokio::spawn(async move { let _ = inc.await; });
+            }
+        });
+        let mut roots_b = rustls::RootCertStore::empty();
+        roots_b.add(cert_b).expect("root");
+        let crypto_b = rustls::ClientConfig::builder()
+            .with_root_certificates(roots_b)
+            .with_no_client_auth();          // KEINE alpn_protocols -- wie jeder heutige Client
+        let cfg_b = ClientConfig::new(std::sync::Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto_b).expect("quic cfg"),
+        ));
+        let mut ep_b = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client ep");
+        ep_b.set_default_client_config(cfg_b);
+        let rb = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ep_b.connect(addr_b, "localhost").expect("connect"),
+        )
+        .await
+        .expect("no timeout");
+        eprintln!("B) Client OHNE ALPN gegen Server MIT: {:?}",
+                  rb.as_ref().map(|_| "verbunden").map_err(|e| e.to_string()));
+        assert!(
+            rb.is_err(),
+            "Auch die Gegenrichtung scheitert: ein Bestandsclient OHNE ALPN kommt gegen einen \
+             ALPN-fuehrenden QUIC-Edge nicht durch. QUIC verlangt eine ausgehandelte ALPN \
+             (RFC 9001), also ist jede Einfuehrung hier ein STICHTAG und kein additiver \
+             Schritt -- in keiner Rollout-Reihenfolge. Wird das hier je gruen, ist ALPN als \
+             Faehigkeits-Traeger fuer #495 U2 wieder im Spiel: {:?}",
+            rb.ok().map(|_| "verbunden")
+        );
+    }
     /// answered with `http/1.1` (the camouflage-preserving KA signal), an old boring
     /// client's [h2]-only offer stays on `h2`.
     #[tokio::test]
