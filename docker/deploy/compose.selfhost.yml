@@ -182,6 +182,12 @@ services:
       # an operator arms it in their own `.env` once their own field counters show
       # `mismatch` at zero. See docs/ops/runbook.md before setting it.
       CT_EDGE_REQUIRE_ATTESTED_ENDPOINT: "${CT_EDGE_REQUIRE_ATTESTED_ENDPOINT:-}"
+      # #506: park TTL for keepalive-negotiated legs. Unset keeps the edge's own 30s default.
+      # The knob existed in the edge and was documented in the runbook, but no compose file
+      # forwarded it -- setting it in the deploy environment therefore did nothing at all,
+      # silently. Found by reading the value back out of the running container instead of
+      # trusting the deploy (`docker exec ... echo $CT_EDGE_KA_PARK_TTL_SECS` came back empty).
+      CT_EDGE_KA_PARK_TTL_SECS: "${CT_EDGE_KA_PARK_TTL_SECS:-}"
     volumes:
       - shared:/shared
     ports:
