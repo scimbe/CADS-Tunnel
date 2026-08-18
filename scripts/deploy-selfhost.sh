@@ -16,6 +16,13 @@
 #   ./scripts/deploy-selfhost.sh --frontdoor --staging     # LE staging certs (no rate-limit risk)
 #   ./scripts/deploy-selfhost.sh --frontdoor --skip-cert   # reuse existing certs, don't re-issue
 #
+# Safeguards that are armed only through the environment of the deploy call are
+# checked before anything is recreated: if the running stack has one armed and
+# this call would leave it unset, the deploy REFUSES rather than quietly
+# recreating a less protected system. Pass --allow-security-downgrade to turn
+# one off on purpose. Currently checked: CT_EDGE_REQUIRE_ATTESTED_ENDPOINT
+# (#546), CT_CP_EDGE_ADMIN_TOKEN (#543).
+#
 # --sso and --help-site both imply/require --frontdoor (Keycloak and the demo
 # are both served through it). Each optional piece issues its own Let's
 # Encrypt cert (front door: PORTAL_PUBLIC_HOST; SSO: AUTH_PUBLIC_HOST) via the
@@ -47,6 +54,7 @@ SSO=0
 HELP_SITE=0
 STAGING=0
 SKIP_CERT=0
+ALLOW_SEC_DOWNGRADE=0
 PORTAL_PUBLIC_HOST="${PORTAL_PUBLIC_HOST:-bunsenbrenner.org}"
 PORTAL_CERT_DIR="${PORTAL_CERT_DIR:-$HOME/ct-certs/portal}"
 AUTH_PUBLIC_HOST="${AUTH_PUBLIC_HOST:-auth.$PORTAL_PUBLIC_HOST}"
@@ -68,6 +76,10 @@ die()  { printf "${C_R}error:${C_0} %s\n" "$*" >&2; exit 1; }
 
 usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
+# Kept verbatim so an error message can hand the operator the exact command to
+# re-run. Inside a function `$*` would be that function's arguments, not these.
+SCRIPT_ARGS=("$@")
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh)       FRESH=1 ;;
@@ -76,6 +88,7 @@ while [ $# -gt 0 ]; do
     --help-site)   HELP_SITE=1 ;;
     --staging)     STAGING=1 ;;
     --skip-cert)   SKIP_CERT=1 ;;
+    --allow-security-downgrade) ALLOW_SEC_DOWNGRADE=1 ;;
     -h|--help)     usage 0 ;;
     *)             die "unknown argument: $1 (try --help)" ;;
   esac
@@ -238,6 +251,71 @@ ensure_auth_cert() {
     "$ACME_EMAIL"
 }
 
+# --- 3b. refuse to silently disarm a safeguard that is currently armed --------
+#
+# Some safeguards are configured only through the environment of the deploy
+# CALL, not through the .env file. Re-running this script without that variable
+# then recreates the container with the safeguard OFF -- the deployment looks
+# identical, comes up healthy, and is quietly less protected than it was a
+# minute earlier.
+#
+# This is not hypothetical. On 2026-08-18 three consecutive redeploys turned
+# CT_EDGE_REQUIRE_ATTESTED_ENDPOINT (#546) back off, unnoticed; the only reason
+# it surfaced at all is that #552 makes the edge SAY which way it came up. The
+# relay-gate overlay above carries a comment about the very same class of
+# accident from 2026-08-13. Two independent occurrences are a pattern, so the
+# script now checks instead of relying on whoever types the command.
+#
+# The rule is deliberately narrow: it never decides policy, it only refuses to
+# take away something that is running right now. Turning a safeguard off stays
+# possible -- with --allow-security-downgrade, i.e. on purpose and in writing.
+effective_setting() {   # what THIS deploy would set: shell env wins over .env
+  local name="$1" from_shell="${!1:-}"
+  if [ -n "$from_shell" ]; then printf '%s' "$from_shell"; return 0; fi
+  sed -n "s/^${name}=//p" "$ENV_FILE" 2>/dev/null | tail -1
+}
+running_setting() {     # what the container that is up right now actually has
+  local cid
+  cid=$(compose_ ps -q "$1" 2>/dev/null | head -1)
+  [ -n "$cid" ] || return 1
+  docker_ inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null \
+    | sed -n "s/^${2}=//p" | tail -1
+}
+check_no_silent_security_downgrade() {
+  # service | variable | how "armed" is spelled | what is lost
+  local rows=(
+    "edge|CT_EDGE_REQUIRE_ATTESTED_ENDPOINT|exactly-1|endpoint attestation (#546): a channel join from an address that contradicts the advertised one is refused"
+    "control-plane|CT_CP_EDGE_ADMIN_TOKEN|non-empty|the control plane's admin gate (#543): without a token it does not fail -- it is simply absent"
+  )
+  local downgrades=() row svc var how what now next armed_now armed_next
+  for row in "${rows[@]}"; do
+    IFS='|' read -r svc var how what <<<"$row"
+    now=$(running_setting "$svc" "$var") || continue   # nothing running -> nothing to lose
+    next=$(effective_setting "$var")
+    case "$how" in
+      exactly-1) [ "$now" = "1" ] && armed_now=1 || armed_now=0
+                 [ "$next" = "1" ] && armed_next=1 || armed_next=0 ;;
+      *)         [ -n "$now" ] && armed_now=1 || armed_now=0
+                 [ -n "$next" ] && armed_next=1 || armed_next=0 ;;
+    esac
+    # Only the arming direction matters. Values are never printed: one of these
+    # is a secret, and the answer the operator needs is on/off, not its content.
+    if [ "$armed_now" = "1" ] && [ "$armed_next" != "1" ]; then
+      downgrades+=("$var is armed on the running $svc, and this deploy would leave it unset -- losing $what")
+    fi
+  done
+  [ ${#downgrades[@]} -eq 0 ] && return 0
+  local d
+  for d in "${downgrades[@]}"; do warn "$d"; done
+  if [ "$ALLOW_SEC_DOWNGRADE" = "1" ]; then
+    warn "proceeding anyway: --allow-security-downgrade was passed"
+    return 0
+  fi
+  die "refusing to disarm a safeguard that is currently armed. Re-run with the variable(s) set, e.g.
+       CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1 $0 ${SCRIPT_ARGS[*]}
+     or, if turning it off is really intended, pass --allow-security-downgrade."
+}
+
 # --- 4. bring the stack up ----------------------------------------------------
 compose_up() {
   if [ "$FRESH" = "1" ]; then
@@ -317,6 +395,10 @@ main() {
   ensure_env
   ensure_portal_cert
   ensure_auth_cert
+  # Before anything is recreated: a deploy must not take away a safeguard that
+  # the running stack has armed. Placed after ensure_env so .env exists, and
+  # before compose_up so the refusal costs nothing.
+  check_no_silent_security_downgrade
   compose_up
   wait_healthy
   restart_control_plane_for_jwks
