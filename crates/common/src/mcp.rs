@@ -13,18 +13,26 @@
 //! for request/response correlation inside the body, so no richer wire envelope is required here; any
 //! version/type framing (the open L2.2 question) remains additive underneath this.
 //!
-//! **#476 — NOT YET WIRED into any production caller.** This module (and most of
-//! [`crate::a2a`] beyond [`crate::a2a::a2a_initiate`]/[`crate::a2a::a2a_respond`]) is reachable
-//! only from tests today — real, tested code, but nothing in this workspace's shipped binaries
-//! actually calls it yet. The security properties documented throughout this module (identity-
-//! keyed rate limiting, an input-size cap, schema-typed arguments, an idle timeout) describe what
-//! this dispatcher WILL enforce once wired up, not something protecting a live system right now
-//! — don't read a doc comment here as "this is happening in production today." Also worth noting
-//! for whoever wires this in: [`register_service_tools`]'s `MAX_SERVICE_INPUT_BYTES` (4 MiB) is
-//! currently unrepresentable on the `u16`-length-prefixed transport this module's own envelope
-//! note above describes (max ~64 KiB) — either that cap is dead policy sized for a different,
-//! not-yet-built transport, or the transport needs to change before this can carry real service
-//! input at that size. Resolve that mismatch as part of the wiring, not before.
+//! **This module IS wired, and its production caller lives in another repository.**
+//!
+//! An earlier banner here (#476) said the opposite: "NOT YET WIRED into any production caller …
+//! not something protecting a live system right now". That was drawn from a caller survey that
+//! stopped at this workspace's edge. It does not stop there: `ct-agent` — the shipped agent
+//! binary, a separate repository that depends on this crate — calls
+//! [`register_service_tools`], [`register_auction_tools`], [`default_registry`] and
+//! [`encode_request`] from its own production path (`channel_run/service_calls.rs`). Every
+//! `service/<slug>` call on a deployed agent goes through the dispatcher below.
+//!
+//! The direction of that error is what makes it worth this paragraph: the identity-keyed rate
+//! limiting, the input-size cap, the schema-typed arguments and the idle timeout were described
+//! as future intentions when they are live controls. A reader trusting the banner could have
+//! weakened or deleted one of them believing nothing depended on it. **A caller survey that ends
+//! at the repository boundary is not a caller survey.**
+//!
+//! What the old banner got right, and what remains true: on today's transport
+//! [`MAX_SERVICE_INPUT_BYTES`] (4 MiB) can never be the binding limit — see the note on that
+//! constant. It is a backstop, not the operative bound, and the comment there now says so
+//! instead of leaving a reader to assume a 4 MiB input is a case that occurs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -451,6 +459,21 @@ pub fn service_slug(service: &crate::channel::ServiceType) -> std::borrow::Cow<'
 /// costed prompt. Capping at the dispatch boundary rejects it with a clean JSON-RPC error before any
 /// subprocess is spawned. 4 MiB comfortably fits a resized cookbook ingredient photo (the client caps
 /// it at 1024px JPEG → a few hundred KB of base64) while bounding abuse.
+///
+/// **This is a backstop, not the operative limit (#476).** On the transport this dispatcher
+/// actually runs over, a request is length-prefixed with a `u16`, so
+/// [`crate::a2a::MAX_MESSAGE_BYTES`] (65535) rejects an oversized `input` roughly 64× earlier —
+/// and it is that rejection, not this one, that a caller meets in practice. `ct-agent`'s own
+/// error path names it: "an oversized `input` is correctly rejected by `write_message`
+/// (MAX_MESSAGE_BYTES, u16 wire ceiling)".
+///
+/// So the "arbitrarily large `input`" the paragraph above describes cannot reach this check on
+/// today's wire. Keeping the constant is still right — a second bound costs nothing and a future
+/// transport with a wider frame would make it operative — but reading it as the thing that
+/// currently stops the attack would credit the wrong control, and leave the real one
+/// (`MAX_MESSAGE_BYTES`) looking optional. `service_input_cap_is_a_backstop_not_the_live_bound`
+/// pins which of the two binds first, so the day that inverts is a test failure and not a
+/// surprise.
 pub const MAX_SERVICE_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn register_service_tools(
@@ -659,6 +682,35 @@ pub fn registry_with_card(card_json: Value) -> ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which of the two size limits actually stops an oversized `service/<slug>` input (#476).
+    ///
+    /// [`MAX_SERVICE_INPUT_BYTES`] reads like the control that bounds this attack — its doc
+    /// paragraph describes the abuse in full. It cannot: every request crosses a `u16`
+    /// length-prefixed frame first, so [`crate::a2a::MAX_MESSAGE_BYTES`] rejects the same
+    /// input roughly 64× earlier. Crediting the wrong control is how the right one ends up
+    /// looking optional, so the ordering is pinned here rather than left to a reader.
+    ///
+    /// If a future transport widens the frame past 4 MiB this test fails, which is the point:
+    /// the day the backstop becomes the live bound should be a red test, not a discovery.
+    #[test]
+    fn service_input_cap_is_a_backstop_not_the_live_bound() {
+        assert!(
+            crate::a2a::MAX_MESSAGE_BYTES < MAX_SERVICE_INPUT_BYTES,
+            "the frame ceiling ({}) must bind before the dispatcher cap ({MAX_SERVICE_INPUT_BYTES}); \
+             if that has inverted, MAX_SERVICE_INPUT_BYTES is now the operative limit and its \
+             doc comment (and this test) must say so",
+            crate::a2a::MAX_MESSAGE_BYTES
+        );
+        // Concretely: an input sized for the dispatcher's cap cannot even be framed. This is
+        // the reachability claim, not just an ordering of two numbers.
+        let at_dispatcher_cap = MAX_SERVICE_INPUT_BYTES - 1;
+        assert!(
+            at_dispatcher_cap > crate::a2a::MAX_MESSAGE_BYTES,
+            "an input just under the dispatcher cap is unrepresentable on this wire, so the \
+             dispatcher's own check never sees it"
+        );
+    }
 
     fn registry() -> ToolRegistry {
         let mut r = ToolRegistry::new();
