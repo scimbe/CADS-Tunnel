@@ -748,7 +748,10 @@ async fn payment_webhook(
     state
         .verifier
         .verify(timestamp, &body, signature, now)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+        .map_err(|e| {
+            note_payment_webhook_rejected(&e.to_string()); // #561
+            (StatusCode::UNAUTHORIZED, e.to_string())
+        })?;
 
     let event: WebhookEvent = serde_json::from_slice(&body)
         .map_err(|_| (StatusCode::BAD_REQUEST, "malformed event body".to_string()))?;
@@ -3687,6 +3690,7 @@ async fn me_issue(
             .map(|d| d.as_secs() / ISSUE_WINDOW_SECS)
             .unwrap_or(0);
         if !state.issue_limiter.lock_safe().allow(&sub, window) {
+            note_issue_rate_limited(); // #561
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 "issue rate limit exceeded".to_string(),
@@ -3831,6 +3835,49 @@ pub struct StatusState {
 /// instead of one per request.
 const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// #561: refusals that the runbook asks an operator to alert on, but which left no
+/// trace anywhere — the rejection went to the caller and vanished. Process-wide, in
+/// the same shape as the edge's own refusal counters.
+///
+/// Counted, never logged per occurrence: a rate limiter exists precisely for floods,
+/// so a line per refusal would reproduce the flood in the log. The webhook rejection
+/// is the exception below — it is rare by nature and one of its two causes is an
+/// attacker.
+static ISSUE_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNAUTH_WRITE_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAYMENT_WEBHOOK_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_issue_rate_limited() -> u64 {
+    ISSUE_RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+fn note_unauth_write_rate_limited() -> u64 {
+    UNAUTH_WRITE_RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+/// #561: count a webhook whose signature did not verify, and say so in the log.
+///
+/// Logged on EVERY occurrence, unlike the rate-limit counters: this path is not a
+/// flood surface (a provider sends few webhooks), and one of its two causes is a
+/// forgery attempt. The reason string comes from the verifier and names the failure
+/// mode (stale timestamp, bad signature) — never the body or the signature itself.
+fn note_payment_webhook_rejected(why: &str) -> u64 {
+    let n = PAYMENT_WEBHOOK_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!(
+        "ct-control-plane: payment webhook REFUSED ({why}) -- {n} so far. Either \
+         CT_PAYMENT_WEBHOOK_SECRET does not match the provider's, or someone is forging \
+         webhooks (#561)."
+    );
+    n
+}
+
+/// #561: the three counters above, for `/status`.
+fn refusal_counters() -> (u64, u64, u64) {
+    (
+        ISSUE_RATE_LIMITED.load(std::sync::atomic::Ordering::Relaxed),
+        UNAUTH_WRITE_RATE_LIMITED.load(std::sync::atomic::Ordering::Relaxed),
+        PAYMENT_WEBHOOK_REJECTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Aggregated operator status — health plus metadata counts the operator
 /// legitimately sees (never payload; consistent with ADR-0016 / the threat model).
 #[derive(Serialize, Deserialize, Clone)]
@@ -3853,6 +3900,19 @@ pub struct StatusResp {
     pub agents_directory: i64,
     /// Seconds since the control plane started.
     pub uptime_seconds: u64,
+    /// #561: `POST /me/issue` requests refused by the per-subject rate limit since
+    /// start. The runbook says to alert on sustained 429s here; until now the
+    /// refusal was returned to the caller and left no trace at all, so that
+    /// instruction had nothing to watch.
+    pub issue_rate_limited: u64,
+    /// #561: unauthenticated writes refused by the per-IP limiter (#87) since start.
+    pub unauth_write_rate_limited: u64,
+    /// #561: payment webhooks refused because their signature did not verify.
+    ///
+    /// The runbook calls this "a misconfigured `CT_PAYMENT_WEBHOOK_SECRET` **or a
+    /// forgery attempt**" — and a forgery attempt used to leave no record whatsoever.
+    /// A refusal is the system working; a refusal nobody can see is not.
+    pub payment_webhook_rejected: u64,
     /// #328: whether `/me/*` is actually mounted and serving right now -- `false`
     /// covers both "CT_OIDC_ISSUER unset" and "set but the boot-time JWKS fetch
     /// never got a usable key", since both mean the same thing from here: nothing
@@ -3928,6 +3988,12 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         payments_confirmed,
         uptime_seconds: s.started.elapsed().as_secs(),
         oidc_enabled: s.oidc.is_ready(),
+        // #561: process-wide, so they are NOT part of the cached store aggregation
+        // above -- read at render time, which is what makes a rising value visible
+        // between two scrapes rather than smoothed by the cache TTL.
+        issue_rate_limited: refusal_counters().0,
+        unauth_write_rate_limited: refusal_counters().1,
+        payment_webhook_rejected: refusal_counters().2,
     }
 }
 
@@ -5168,6 +5234,7 @@ async fn limit_unauth_writes(
             .map(|d| d.as_secs() / UNAUTH_WRITE_WINDOW_SECS)
             .unwrap_or(0);
         if !state.limiter.lock_safe().allow(&addr.ip(), window) {
+            note_unauth_write_rate_limited(); // #561
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate limit: too many unauthenticated requests from your address\n",
@@ -5845,6 +5912,32 @@ pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
 mod tests {
     use super::*;
     use crate::client::ControlPlaneClient;
+
+    /// #561: the three refusal counters must actually MOVE when a refusal happens.
+    ///
+    /// The runbook asks an operator to alert on sustained 429s and on webhook 401s.
+    /// Before this, each of those refusals was returned to the caller and left no
+    /// trace whatsoever — the instruction had nothing to watch, which is worse than
+    /// no instruction, because it reads as covered.
+    ///
+    /// Asserted as deltas, not absolutes: the counters are process-wide and other
+    /// tests in this binary share them.
+    #[test]
+    fn refusal_counters_move_and_the_webhook_one_is_the_loud_kind_561() {
+        let (i0, u0, w0) = refusal_counters();
+
+        assert_eq!(note_issue_rate_limited(), i0 + 1, "a throttled /me/issue is counted");
+        assert_eq!(note_unauth_write_rate_limited(), u0 + 1, "a throttled unauth write is counted");
+        assert_eq!(
+            note_payment_webhook_rejected("signature mismatch"),
+            w0 + 1,
+            "a webhook whose signature did not verify is counted -- one of its two causes \
+             is a forgery attempt, and that used to leave no record at all"
+        );
+
+        let (i1, u1, w1) = refusal_counters();
+        assert_eq!((i1, u1, w1), (i0 + 1, u0 + 1, w0 + 1), "and the readers see the same values");
+    }
 
     #[test]
     fn hex_decoders_reject_non_ascii_input_instead_of_panicking_401() {

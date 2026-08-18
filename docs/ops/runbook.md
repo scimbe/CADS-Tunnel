@@ -204,9 +204,29 @@ plane's restart counter, because the CP's own container healthcheck probes
 `/readyz` too — so a **rising** restart count is the flapping signal that a
 momentary 200 hides. The edge's listeners are covered by `/healthz` (#553).
 
-The remaining two (`429` bursts on `/me/issue`, webhook `401`s) are **not**
-enforced anywhere yet; they are prose. Say so rather than assume the list is
-covered.
+The remaining two are now **observable** (#561), which they were not: both
+refusals used to be returned to the caller and leave no trace at all, so the
+instruction to alert on them had nothing to watch. `GET /status` carries:
+
+| field | meaning |
+|---|---|
+| `issue_rate_limited` | `POST /me/issue` refused by the per-subject limiter |
+| `unauth_write_rate_limited` | unauthenticated writes refused by the per-IP limiter (#87) |
+| `payment_webhook_rejected` | webhook whose signature did not verify |
+
+The first two are counted only — a rate limiter exists for floods, so a log line
+per refusal would reproduce the flood in the log. The **webhook** one also logs
+every occurrence (`payment webhook REFUSED (<reason>)`), because that path is not
+a flood surface and one of its two causes is someone forging webhooks. A refusal
+is the system working; a refusal nobody can see is not.
+
+`edge-watch.sh` section 0b consumes all three: it alarms on the **increase since
+the last run**, never the absolute (they are process-wide sums since start, and a
+control-plane restart resets them). Thresholds: 20 per 10-minute window for the
+two rate limiters — that is the "sustained" the rule asks for, a single refusal is
+a hectic client — and **1** for the webhook, which has no benign explanation in
+steady state. If the running control plane predates #561 and the fields are absent,
+the watcher says the check *could not run* rather than staying silent.
 
 ## Routine procedures
 

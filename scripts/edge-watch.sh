@@ -79,6 +79,72 @@ else
   ALARMS+=("Die Control-Plane '$CP_CONTAINER' existiert nicht -- /readyz konnte NICHT geprueft werden. Kein Freispruch, sondern eine fehlende Pruefung (Name via CT_WATCH_CP_CONTAINER anpassbar).")
 fi
 
+# --- 0b. Abgewiesene Anfragen an der Control-Plane (#561) -------------------
+# Das Runbook verlangt Alarme bei anhaltenden 429ern auf `/me/issue` und bei
+# Webhook-401ern. Beides war bis #561 UNMOEGLICH: alle drei Abweisungswege gaben
+# ihren Fehler an den Aufrufer zurueck und hinterliessen sonst nichts -- kein
+# Log, kein Zaehler. Die Vorschrift hatte also nichts zu beobachten, was sich
+# von "es passiert nichts" nicht unterscheiden liess.
+#
+# Die beiden Ratenbegrenzer werden nur GEZAEHLT (eine Zeile je Abweisung wuerde
+# die Flut, gegen die sie existieren, im Log wiederholen), der Webhook zusaetzlich
+# geloggt -- er ist keine Flutflaeche, und eine seiner beiden Ursachen ist ein
+# Faelschungsversuch.
+CP_STATUS_URL="${CT_WATCH_CP_STATUS:-http://127.0.0.1:8090/status}"
+CP_STATUS_JSON=$(curl -s --max-time 10 "$CP_STATUS_URL" 2>/dev/null || true)
+CP_REFUSALS=$(printf '%s' "$CP_STATUS_JSON" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+k=("issue_rate_limited","unauth_write_rate_limited","payment_webhook_rejected")
+if not all(x in d for x in k): sys.exit(2)
+print(" ".join(str(int(d[x])) for x in k))
+' 2>/dev/null) && CP_REFUSALS_OK=1 || CP_REFUSALS_OK=0
+
+if [ "$CP_REFUSALS_OK" = "1" ]; then
+  # Bewusst kein `set --`: die Positionsparameter des Skripts bleiben unberuehrt.
+  ISSUE_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f1)
+  UNAUTH_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f2)
+  HOOK_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f3)
+  REF_FILE="$STATE_DIR/cp-refusals"
+  # Erster Lauf: den Stand merken und NICHT alarmieren -- die Zaehler sind
+  # prozessweite Summen seit Prozessstart, ihr Absolutwert sagt nichts ueber
+  # jetzt. Alarmiert wird auf den Zuwachs seit dem letzten Lauf.
+  ISSUE_PREV=$ISSUE_NOW; UNAUTH_PREV=$UNAUTH_NOW; HOOK_PREV=$HOOK_NOW
+  # `read` meldet bei einer Datei OHNE abschliessendes Zeilenende einen
+  # Fehlschlag, obwohl es die Variablen korrekt gesetzt hat. Ein `|| default`
+  # daran haette die gelesenen Werte wieder verworfen -- jeder Zuwachs waere
+  # dann dauerhaft null gewesen und dieser Waechter haette NIE ausgeloest.
+  # Deshalb wird die Datei unten MIT Zeilenende geschrieben und hier nur
+  # gelesen, wenn sie existiert.
+  if [ -s "$REF_FILE" ]; then
+    read -r ISSUE_PREV UNAUTH_PREV HOOK_PREV < "$REF_FILE" || true
+  fi
+  # Ein Neustart der CP setzt die Zaehler zurueck; ein negativer Zuwachs ist
+  # also kein Fehler, sondern genau das -- dann wird nur neu verankert.
+  D_ISSUE=$(( ISSUE_NOW - ISSUE_PREV )); [ "$D_ISSUE" -lt 0 ] && D_ISSUE=0
+  D_UNAUTH=$(( UNAUTH_NOW - UNAUTH_PREV )); [ "$D_UNAUTH" -lt 0 ] && D_UNAUTH=0
+  D_HOOK=$(( HOOK_NOW - HOOK_PREV )); [ "$D_HOOK" -lt 0 ] && D_HOOK=0
+
+  # Schwellen: die Ratenbegrenzer duerfen vereinzelt greifen (ein hektischer
+  # Client, ein Doppelklick) -- erst eine Haeufung im 10-Minuten-Fenster ist das
+  # "sustained" aus dem Runbook. Der Webhook dagegen hat KEINE gutartige
+  # Erklaerung im laufenden Betrieb: entweder ist das Geheimnis falsch
+  # konfiguriert oder jemand faelscht. Deshalb Schwelle 1.
+  [ "$D_ISSUE" -ge 20 ] && \
+    ALARMS+=("$D_ISSUE abgewiesene /me/issue-Anfragen seit dem letzten Lauf (429) -- entweder laeuft ein Client Amok oder jemand probiert die Issue-Schnittstelle durch (#561).")
+  [ "$D_UNAUTH" -ge 20 ] && \
+    ALARMS+=("$D_UNAUTH abgewiesene unauthentisierte Schreibzugriffe seit dem letzten Lauf (429, #87) -- der Pro-IP-Begrenzer haelt gerade etwas zurueck.")
+  [ "$D_HOOK" -ge 1 ] && \
+    ALARMS+=("$D_HOOK Zahlungs-Webhook(s) mit ungueltiger Signatur abgewiesen (401) -- entweder ist das Webhook-Geheimnis falsch konfiguriert ODER jemand faelscht Webhooks. Beide Faelle brauchen eine Antwort; im Log der Control-Plane steht der Grund je Vorfall (#561).")
+  printf '%s %s %s\n' "$ISSUE_NOW" "$UNAUTH_NOW" "$HOOK_NOW" > "$REF_FILE"
+elif [ -n "$CP_STATUS_JSON" ]; then
+  # Gleiches Muster wie bei den Edge-Kennzahlen: eine Pruefung, die mangels
+  # Feld nicht laufen kann, wird GESAGT. Sonst liest sich ihr Schweigen wie
+  # "keine Abweisungen" -- und genau das war der Zustand vor #561.
+  ALARMS+=("Die laufende Control-Plane liefert die Abweisungs-Zaehler auf /status nicht (Stand vor #561). 429-Haeufungen und Webhook-401er koennen deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Control-Plane neu ausrollen.")
+fi
+
 # --- 1. Läuft der Container überhaupt? -------------------------------------
 if ! RUNNING=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null); then
   ALARMS+=("Der Edge-Container '$CONTAINER' existiert nicht mehr.")

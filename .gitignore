@@ -49,3 +49,6 @@ examples/flappy-demo/crew.json
 # docker/Dockerfile's wasm-builder stage, embedded via crates/control-plane/build.rs) --
 # a build artifact, not source, same as target/.
 crates/control-plane/wasm-pkg/
+
+# Temporaere Worktrees isolierter Agenten -- nie Teil des Repos.
+.claude/worktrees/
