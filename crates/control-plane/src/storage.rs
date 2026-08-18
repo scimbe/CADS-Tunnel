@@ -2749,13 +2749,7 @@ impl SqliteTunnelStore {
         if owner == subject {
             return Ok(Some(token));
         }
-        let granted: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
-                params![tunnel_id, subject],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let granted = Self::has_grant(&conn, tunnel_id, subject)?.then_some(1i64);
         Ok(granted.map(|_| token))
     }
 
@@ -2784,13 +2778,7 @@ impl SqliteTunnelStore {
         if owner == subject {
             return Ok(hostname);
         }
-        let granted: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
-                params![tunnel_id, subject],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let granted = Self::has_grant(&conn, tunnel_id, subject)?.then_some(1i64);
         Ok(granted.and(hostname))
     }
 
@@ -3244,21 +3232,47 @@ impl SqliteTunnelStore {
         rows.collect::<rusqlite::Result<Vec<String>>>().map_err(GrantError::Db)
     }
 
-    /// Whether `subject` may use `tunnel_id`: `true` if it is the owner or holds
-    /// a grant (#29). This is the authorization gate for capability access to a
-    /// shared tunnel — `false` for an unknown tunnel.
-    pub fn is_authorized(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
-        let conn = self.read();
-        if Self::owner_of(&conn, tunnel_id)?.as_deref() == Some(subject) {
-            return Ok(true);
-        }
-        let granted: Option<i64> = conn
+    /// Does `subject` hold a grant on `tunnel_id` (#578)?
+    ///
+    /// The owner-or-grantee rule existed as three byte-identical `SELECT 1 FROM
+    /// tunnel_grants` copies plus a fourth, set-shaped one in
+    /// [`Self::list_authorized_for_subject`]. Three of them are now this helper. The
+    /// fourth cannot be (it filters a list rather than answering about one subject), so
+    /// `every_tunnel_authorization_path_agrees_578` pins all four against each other --
+    /// a rule spread across copies diverges silently, and the copy that reads like the
+    /// canonical one ([`Self::is_authorized`]) is the one no production path calls.
+    fn has_grant(
+        conn: &rusqlite::Connection,
+        tunnel_id: &str,
+        subject: &str,
+    ) -> rusqlite::Result<bool> {
+        let row: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM tunnel_grants WHERE tunnel_id = ?1 AND grantee = ?2",
                 params![tunnel_id, subject],
                 |r| r.get(0),
             )
             .optional()?;
+        Ok(row.is_some())
+    }
+
+    /// Whether `subject` may use `tunnel_id`: `true` if it is the owner or holds
+    /// a grant (#29) — `false` for an unknown tunnel.
+    ///
+    /// **Not the live gate, despite reading like it (#578).** This said "the authorization
+    /// gate for capability access to a shared tunnel" while having no production caller
+    /// anywhere in the workspace; the paths that actually gate access are
+    /// [`Self::routing_token_if_authorized`] and [`Self::hostname_if_authorized`], and
+    /// [`Self::list_authorized_for_subject`] expresses the same rule set-shaped. Tightening
+    /// the rule here alone would change nothing in production, which is exactly the mistake
+    /// the old wording invited. `every_tunnel_authorization_path_agrees_578` holds all four
+    /// to the same answer.
+    pub fn is_authorized(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<bool> {
+        let conn = self.read();
+        if Self::owner_of(&conn, tunnel_id)?.as_deref() == Some(subject) {
+            return Ok(true);
+        }
+        let granted = Self::has_grant(&conn, tunnel_id, subject)?.then_some(1i64);
         Ok(granted.is_some())
     }
 }
@@ -6788,6 +6802,69 @@ mod tests {
         // A non-grantee: neither authorized nor able to see it.
         assert_eq!(store.routing_token_if_authorized("carol", &t.id).unwrap(), None);
         assert!(store.list_authorized_for_subject("carol").unwrap().is_empty());
+    }
+
+    /// #578: all four expressions of "owner or grantee" answer the same question.
+    ///
+    /// The rule lived as three byte-identical `SELECT 1 FROM tunnel_grants` copies plus a
+    /// set-shaped fourth in `list_authorized_for_subject`. Three are now one helper; the
+    /// fourth cannot be, because it filters a list. That leaves a real divergence risk, and
+    /// it points the wrong way: `is_authorized` carries the doc comment calling it *the*
+    /// authorization gate and has **no production caller at all** — the live gates are
+    /// `routing_token_if_authorized` and `hostname_if_authorized`. Someone tightening the
+    /// rule would naturally edit the canonical-looking one and change nothing.
+    ///
+    /// So the matrix is asserted across all four at once, including after a revoke.
+    #[test]
+    fn every_tunnel_authorization_path_agrees_578() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store
+            // A hostname is REQUIRED for this fixture: `hostname_if_authorized` returns
+            // `None` both for "not authorized" and for "authorized but no hostname
+            // assigned". Without one, that path would report `false` for the owner too and
+            // the matrix would compare two different questions.
+            .create("alice", "web", Some("share-578.example.org"))
+            .unwrap()
+            .created()
+            .expect("hostname is free in this test");
+        store.grant("alice", &t.id, "bob").unwrap();
+
+        // (subject, expected) — carol never appears in any grant.
+        let check = |store: &SqliteTunnelStore, subject: &str, expected: bool| {
+            assert_eq!(
+                store.is_authorized(subject, &t.id).unwrap(),
+                expected,
+                "is_authorized({subject})"
+            );
+            assert_eq!(
+                store.routing_token_if_authorized(subject, &t.id).unwrap().is_some(),
+                expected,
+                "routing_token_if_authorized({subject}) -- a LIVE gate"
+            );
+            assert_eq!(
+                store.hostname_if_authorized(subject, &t.id).unwrap().is_some(),
+                expected,
+                "hostname_if_authorized({subject}) -- the other LIVE gate; this tunnel has a \
+                 hostname, so `None` here can only mean 'not authorized'"
+            );
+            assert_eq!(
+                store
+                    .list_authorized_for_subject(subject)
+                    .unwrap()
+                    .iter()
+                    .any(|(st, _)| st.id == t.id),
+                expected,
+                "list_authorized_for_subject({subject}) -- the set-shaped fourth copy"
+            );
+        };
+
+        check(&store, "alice", true); // owner
+        check(&store, "bob", true); // grantee
+        check(&store, "carol", false); // stranger
+
+        store.revoke_grant("alice", &t.id, "bob").unwrap();
+        check(&store, "bob", false); // revoked -- every path must forget together
+        check(&store, "alice", true); // and the owner is untouched by a revoke
     }
 
     #[test]
