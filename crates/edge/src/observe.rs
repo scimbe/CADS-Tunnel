@@ -420,7 +420,23 @@ async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<Co
     ];
     loops.extend(listeners.iter().map(|(label, hb)| BrokerLoopStatus::of(label, hb)));
     match broker_loops_health(&loops, now, BROKER_HEALTH_MAX_AGE_SECS) {
-        Ok(()) => (axum::http::StatusCode::OK, "ok\n".to_string()),
+        // #573: the 200 names what it checked. The two brokers above are hardcoded, so this
+        // endpoint can never pass on an empty set -- but the LISTENERS are whatever registered
+        // itself, and a bare "ok" reported two green brokers exactly like five green loops.
+        // Dropping an `expect_listener` call in a refactor would shrink health gating silently:
+        // the listener would still serve, so nothing would look wrong, and its later death
+        // would no longer restart the container. Naming the scope makes the shrink visible
+        // from outside -- to an operator, and to `edge-watch.sh`, which alarms when this set
+        // gets smaller than it was on the previous run. Same reasoning the /metrics rows were
+        // given (see the HELP text above); it was never applied to /healthz's own answer.
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            format!(
+                "ok -- {} loops checked: {}\n",
+                loops.len(),
+                loops.iter().map(|l| l.name).collect::<Vec<_>>().join(", ")
+            ),
+        ),
         Err(why) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
     }
 }
@@ -629,6 +645,61 @@ mod tests {
     /// Both halves are asserted against a listener that is EXPECTED AND NEVER BEAT, i.e.
     /// exactly a failed bind, and a gating listener is put beside it in the same state to
     /// show the two are treated differently rather than the check being asleep.
+    /// #573: a passing `/healthz` states which loops it passed on.
+    ///
+    /// The two brokers are hardcoded into the check, so it can never pass on an empty set --
+    /// but the listeners are whatever registered itself, and a bare `ok` read the same for two
+    /// green brokers as for five green loops. A refactor that dropped an `expect_listener`
+    /// call would shrink health gating without changing anything an operator can see: the
+    /// listener keeps serving, so nothing looks wrong, and only its LATER death would go
+    /// unnoticed -- no 503, no container restart.
+    ///
+    /// Asserted through the router, not against the formatter, so the scope really travels to
+    /// a caller. `edge-watch.sh` consumes exactly this line.
+    #[tokio::test]
+    async fn a_passing_healthz_names_the_loops_it_checked_573() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.relay_broker_heartbeat().beat(now);
+        state.rendezvous_broker_heartbeat().beat(now);
+        let fd = state.expect_listener(":443 front door", now);
+        fd.beat(now);
+        // Advisory listeners are not part of the gated set and must not be counted here --
+        // reporting one as "checked" would overstate what the 200 actually covers.
+        state.expect_listener_advisory(":80 redirect", now - BROKER_HEALTH_MAX_AGE_SECS - 120);
+
+        let resp = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "everything gating is fresh");
+        let body = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+        )
+        .unwrap();
+
+        for expected in ["relay", "rendezvous", ":443 front door"] {
+            assert!(
+                body.contains(expected),
+                "a passing /healthz must name {expected} among the loops it checked, \
+                 otherwise a shrinking gated set is invisible from outside: {body:?}"
+            );
+        }
+        assert!(
+            body.contains("3 loops"),
+            "the count must be stated too -- names alone still let a reader assume \
+             completeness they cannot verify: {body:?}"
+        );
+        assert!(
+            !body.contains(":80 redirect"),
+            "an advisory listener never gates /healthz and must not be reported as \
+             checked: {body:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_advisory_listener_is_reported_but_never_fails_healthz() {
         let now = std::time::SystemTime::now()

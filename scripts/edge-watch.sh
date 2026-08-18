@@ -210,6 +210,44 @@ else
     ALARMS+=("Der Container laeuft, aber /healthz antwortet nicht -- der Prozess haengt vermutlich.")
   elif ! printf '%s' "$HEALTH" | grep -q "^ok"; then
     ALARMS+=("/healthz meldet einen Fehler: $(printf '%s' "$HEALTH" | head -c 300)")
+  else
+    # #573: Ein gruenes /healthz sagt jetzt, WORUEBER es gruen ist. Genau das wird
+    # hier gebraucht: die beiden Broker sind fest verdrahtet, die Lauscher aber
+    # melden sich selbst an. Faellt eine `expect_listener`-Zeile bei einem Umbau
+    # weg, schrumpft die Gesundheitspruefung still -- der Lauscher bedient weiter,
+    # nichts sieht falsch aus, und erst sein SPAETERER Tod loest dann keinen
+    # Neustart mehr aus.
+    #
+    # Verglichen wird gegen den letzten Lauf, NICHT gegen eine hier gepflegte
+    # Liste: eine solche Liste waere selbst die naechste Aufzaehlung, die altert.
+    # Alarm nur beim SCHRUMPFEN -- Wachstum ist der Normalfall (ein Betreiber
+    # schaltet CT_EDGE_BROWSER_LISTEN zu) und darf nicht stoeren.
+    # `|| true` ist hier NICHT kosmetisch: unter `set -euo pipefail` liefert
+    # `grep -v` bei leerer Eingabe Exit 1, die Zuweisung scheitert und das
+    # GESAMTE Skript bricht ab -- ausgerechnet im interessanten Fall (ein Edge,
+    # der die Schleifen nicht nennt). Alle nachfolgenden Pruefungen waeren dann
+    # stillschweigend ausgefallen. Beim Trockenlauf aufgefallen, nicht im Kopf.
+    LOOPS_NOW=$(printf '%s' "$HEALTH" | sed -n 's/.*checked: //p' | tr ',' '\n' \
+                | sed 's/^ *//; s/ *$//' | grep -v '^$' | sort | tr '\n' '|' || true)
+    LOOP_FILE="$STATE_DIR/healthz-loops"
+    if [ -z "$LOOPS_NOW" ]; then
+      # Kein "checked:"-Teil: entweder ein Edge vor #573 oder das Format hat sich
+      # geaendert. Beides muss gesagt werden -- sonst liest sich das Fehlen der
+      # Pruefung wie ihr Bestehen, und die Schrumpf-Erkennung waere ab sofort tot.
+      if [ "$(cat "$LOOP_FILE" 2>/dev/null)" != "__KEINE__" ]; then
+        ALARMS+=("/healthz nennt die geprueften Schleifen nicht (Edge vor #573 oder Format geaendert). Die Schrumpf-Erkennung des bewachten Satzes ist damit ausser Betrieb.")
+        printf '__KEINE__\n' > "$LOOP_FILE"
+      fi
+    else
+      LOOPS_PREV=$(cat "$LOOP_FILE" 2>/dev/null || echo "")
+      if [ -n "$LOOPS_PREV" ] && [ "$LOOPS_PREV" != "__KEINE__" ] && [ "$LOOPS_PREV" != "$LOOPS_NOW" ]; then
+        VERLOREN=$(comm -23 <(printf '%s' "$LOOPS_PREV" | tr '|' '\n' | grep -v '^$') \
+                            <(printf '%s' "$LOOPS_NOW"  | tr '|' '\n' | grep -v '^$') | tr '\n' ' ')
+        [ -n "${VERLOREN// /}" ] && \
+          ALARMS+=("Der von /healthz bewachte Satz ist geschrumpft -- nicht mehr dabei: ${VERLOREN}. Diese Schleife(n) koennen den Container jetzt nicht mehr neu starten, wenn sie sterben (#573). Entweder wurde eine expect_listener-Registrierung entfernt oder ein Lauscher wurde auf 'advisory' herabgestuft.")
+      fi
+      printf '%s\n' "$LOOPS_NOW" > "$LOOP_FILE"
+    fi
   fi
 
   MET=$(docker exec "$CONTAINER" curl -fsS --max-time 5 "$METRICS/metrics" 2>/dev/null || true)
