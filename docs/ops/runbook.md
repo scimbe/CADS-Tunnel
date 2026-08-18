@@ -244,7 +244,17 @@ instruction to alert on them had nothing to watch. `GET /status` carries:
 |---|---|
 | `issue_rate_limited` | `POST /me/issue` refused by the per-subject limiter |
 | `unauth_write_rate_limited` | unauthenticated writes refused by the per-IP limiter (#87) |
+| `unauth_write_limit_per_min` | what that limiter is armed at; **`0` = not running** (#572) |
 | `payment_webhook_rejected` | webhook whose signature did not verify |
+
+Read the second and third rows together. The per-IP limiter is opt-in
+(`CT_CP_UNAUTH_WRITE_PER_MIN`, **off by default and unset in this deployment**), so
+its refusal count sits at `0` by construction whenever it is not armed — which is
+indistinguishable from calm unless you also read `unauth_write_limit_per_min`.
+`edge-watch.sh` reports every change of that value, in both directions, once per
+change rather than once per run: leaving the limiter off is a legitimate operator
+decision, but it must never be a silent one. Arming it also needs the variable
+forwarded in the compose file, where it is not listed today.
 
 The first two are counted only — a rate limiter exists for floods, so a log line
 per refusal would reproduce the flood in the log. The **webhook** one also logs

@@ -100,7 +100,12 @@ k=("issue_rate_limited","unauth_write_rate_limited","payment_webhook_rejected")
 if not all(x in d for x in k): sys.exit(2)
 # uptime_seconds kommt mit: ohne sie liesse sich ein Neustart der CP nicht von
 # "keine neuen Abweisungen" unterscheiden.
-print(" ".join(str(int(d[x])) for x in k), int(d.get("uptime_seconds", 0)))
+# #572: ob der unauth-Begrenzer ueberhaupt scharf ist. Ohne diesen Wert ist
+# unauth_write_rate_limited=0 nicht von "keine Fluten" zu unterscheiden -- der
+# Zaehler ist auf 0 festgenagelt, solange CT_CP_UNAUTH_WRITE_PER_MIN fehlt.
+# -1 heisst: die laufende CP kennt das Feld nicht (Stand vor #572).
+print(" ".join(str(int(d[x])) for x in k), int(d.get("uptime_seconds", 0)),
+      int(d.get("unauth_write_limit_per_min", -1)))
 ' 2>/dev/null) && CP_REFUSALS_OK=1 || CP_REFUSALS_OK=0
 
 if [ "$CP_REFUSALS_OK" = "1" ]; then
@@ -109,6 +114,7 @@ if [ "$CP_REFUSALS_OK" = "1" ]; then
   UNAUTH_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f2)
   HOOK_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f3)
   UP_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f4)
+  ARMED_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f5)
   REF_FILE="$STATE_DIR/cp-refusals"
   # Erster Lauf: den Stand merken und NICHT alarmieren -- die Zaehler sind
   # prozessweite Summen seit Prozessstart, ihr Absolutwert sagt nichts ueber
@@ -141,6 +147,25 @@ if [ "$CP_REFUSALS_OK" = "1" ]; then
   D_ISSUE=$(( ISSUE_NOW - ISSUE_PREV )); [ "$D_ISSUE" -lt 0 ] && D_ISSUE=0
   D_UNAUTH=$(( UNAUTH_NOW - UNAUTH_PREV )); [ "$D_UNAUTH" -lt 0 ] && D_UNAUTH=0
   D_HOOK=$(( HOOK_NOW - HOOK_PREV )); [ "$D_HOOK" -lt 0 ] && D_HOOK=0
+
+  # #572: Der Zuwachs-Alarm auf D_UNAUTH kann NIE ausloesen, solange der
+  # Begrenzer nicht scharf ist -- CT_CP_UNAUTH_WRITE_PER_MIN ist ab Werk leer.
+  # Eine Regel, die nicht feuern kann, liest sich wie eine, die nichts findet.
+  # Gemeldet wird deshalb der WECHSEL, nicht der Zustand: sonst kaeme die
+  # gleiche Zeile alle zehn Minuten, obwohl das Ausschalten eine bewusste
+  # Betreiberentscheidung sein darf. Bewusst eine eigene Datei -- die vier
+  # Felder in $REF_FILE werden mit genau vier Variablen gelesen, ein fuenftes
+  # landete stillschweigend in UP_PREV.
+  ARM_FILE="$STATE_DIR/cp-unauth-armed"
+  ARMED_PREV=$(cat "$ARM_FILE" 2>/dev/null || echo "unbekannt")
+  if [ "$ARMED_NOW" != "$ARMED_PREV" ]; then
+    case "$ARMED_NOW" in
+      -1) ALARMS+=("Die laufende Control-Plane meldet nicht, ob der Flutschutz fuer unauthentisierte Schreibrouten scharf ist (Feld unauth_write_limit_per_min fehlt, Stand vor #572). Der Zaehler daneben ist damit nicht deutbar.") ;;
+       0) ALARMS+=("Der Flutschutz fuer unauthentisierte Schreibrouten ist NICHT scharf (CT_CP_UNAUTH_WRITE_PER_MIN ungesetzt, #87/#572). Die 0 bei unauth_write_rate_limited bedeutet deshalb 'keine Kontrolle', nicht 'keine Fluten', und die Zuwachs-Regel unten kann nicht ausloesen. Das ist die Werkseinstellung und eine offene Betreiberentscheidung -- diese Meldung kommt einmal je Wechsel, nicht je Lauf.") ;;
+       *) ALARMS+=("Der Flutschutz fuer unauthentisierte Schreibrouten ist jetzt scharf bei $ARMED_NOW Anfragen/IP/Minute (#87/#572). Ab jetzt ist der Zuwachs unten eine echte Aussage.") ;;
+    esac
+    printf '%s\n' "$ARMED_NOW" > "$ARM_FILE"
+  fi
 
   # Schwellen: die Ratenbegrenzer duerfen vereinzelt greifen (ein hektischer
   # Client, ein Doppelklick) -- erst eine Haeufung im 10-Minuten-Fenster ist das
