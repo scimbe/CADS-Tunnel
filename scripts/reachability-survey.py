@@ -22,6 +22,33 @@ otherwise reports exactly what a survey that found nothing reports.
 """
 import os, re, sys
 
+def test_only_files(roots):
+    """Files that are ENTIRELY test code although nothing inside them says so.
+
+    `#[cfg(test)] mod tests;` puts the attribute in the PARENT file; `tests.rs` itself carries
+    no marker, so a span scan of it finds nothing and reads it as production. ct-agent's
+    `channel_run/tests.rs` is 2000+ lines that way, and its test functions turned up as
+    "production callers" of the very functions being surveyed.
+    """
+    decl = re.compile(r'#\[cfg\(test\)\]\s*(pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;')
+    out = set()
+    for root in roots:
+        for dp, _, fs in os.walk(root):
+            if '/target/' in dp:
+                continue
+            for f in fs:
+                if not f.endswith('.rs'):
+                    continue
+                p = os.path.join(dp, f)
+                txt = open(p, encoding='utf8', errors='replace').read()
+                for m in decl.finditer(txt.replace('\n', ' ')):
+                    name = m.group(2)
+                    for cand in (os.path.join(dp, name + '.rs'), os.path.join(dp, name, 'mod.rs')):
+                        if os.path.exists(cand):
+                            out.add(os.path.abspath(cand))
+    return out
+
+
 def test_spans(path):
     lines = open(path, encoding='utf8', errors='replace').read().split('\n')
     spans, i = [], 0
@@ -114,8 +141,14 @@ def main():
 
     # (symbol, calling file, calling function) for every non-test call site.
     own_names = set(own)
+    whole_file_tests = test_only_files(consumers + [crate_src])
+    if whole_file_tests:
+        print(f"[test-only files] {len(whole_file_tests)} (declared `#[cfg(test)] mod X;` "
+              f"in a parent, no marker inside)", file=sys.stderr)
     cache = {}
     for p in files:
+        if os.path.abspath(p) in whole_file_tests:
+            continue
         lines = open(p, encoding='utf8', errors='replace').read().split('\n')
         spans = test_spans(p)
         inside_crate = os.path.abspath(p).startswith(os.path.abspath(crate_src))
@@ -135,7 +168,11 @@ def main():
                     (inside_crate, enclosing_fn(lines, n), f"{os.path.relpath(p)}:{n}"))
 
     # Fixpoint: a symbol is live if called from outside the crate, or from a live symbol.
+    # A binary's root is its own `main`, not an outside caller. Without this, everything a
+    # binary does looks unreachable: ct-agent's `run_agent`, `run_channel_command` and
+    # `rotate_origin_key` were all reported dead, each "only from main".
     live = {s for s, hits in cache.items() if any(not inside for inside, _, _ in hits)}
+    live |= {'main'} & set(own)
     changed = True
     while changed:
         changed = False
