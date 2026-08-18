@@ -249,6 +249,32 @@ pub async fn a2a_recv<R: AsyncRead + Unpin>(
 /// itself: a focused, frozen proof that a byte-exact seam works, useful to read when changing
 /// the live one. It is **not** a second wire format in service, and a future cutover change
 /// belongs in the multiplexed pump, not here.
+// ---------------------------------------------------------------------------
+// The tagged-frame cutover below is NOT the cutover this system runs (#476).
+//
+// It is an earlier design of the same idea. The live relay→direct handoff is
+// [`crate::upgrade`]'s: its own `TAG_OFFER`/`TAG_READY`/`TAG_ABORT` protocol, finishing with
+// `noise::PumpControl::Cutover`, driven from ct-agent (`p2p.rs`, `channel_run/mod.rs`) through
+// `upgrade::run_upgradable_session`. Nothing reaches the helpers below.
+//
+// Established by walking callers across every consumer of this crate — both repositories plus
+// every workspace member — and classifying each hit against the file's real `#[cfg(test)]`
+// spans rather than its filename. Four items form one unreachable cluster:
+// `a2a_send_framed` → `a2a_send`, and `a2a_drain_relay_until_cutover` → `a2a_recv_framed` →
+// `a2a_recv`. Their only non-test callers are each other. Everything else in this module has a
+// real production root (`a2a_initiate`, `a2a_respond`, `a2a_respond_verified`,
+// `establish_direct_session`, `establish_direct_over_duplex`, `serve_request_loop`,
+// `write_message`, `read_message`).
+//
+// Left in place deliberately: this is public API of a crate other repositories depend on by
+// tag, so removing it is a breaking change and a decision for the operator, not a tidy-up.
+// What is fixed here is the reading: the doc comments below described a live seam, and the
+// #477 hardening on it reads as protection of a path in service. Neither was true, and that
+// direction of error is the dangerous one — it invites reasoning about a mechanism that never
+// runs, and it makes the mechanism that DOES run ([`crate::upgrade`]) look like one option
+// among two.
+// ---------------------------------------------------------------------------
+
 pub const A2A_TAG_DATA: u8 = 0;
 pub const A2A_TAG_CUTOVER: u8 = 1;
 
@@ -294,7 +320,12 @@ pub async fn a2a_recv_framed<R: AsyncRead + Unpin>(
 pub const DRAIN_UNTIL_CUTOVER_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DRAIN_UNTIL_CUTOVER_DEADLINE: Duration = Duration::from_secs(30);
 
-/// **Receiver side of the #104 cutover (H2).** Drain application DATA messages from the RELAY
+/// **Receiver side of the #104 cutover (H2) — as designed, not as deployed (#476).** The
+/// handoff that actually runs is [`crate::upgrade`]'s; see the block comment above
+/// [`A2A_TAG_DATA`]. Read the paragraphs below as a specification of this seam, not as a
+/// description of what protects a live session.
+///
+/// Drain application DATA messages from the RELAY
 /// session **in order** until the [`A2A_TAG_CUTOVER`] marker arrives, returning them; after this
 /// the caller switches to reading the DIRECT session (`a2a_recv_framed`). Because the marker is
 /// in-order on the same reliable framed session, no application bytes are lost or duplicated at
