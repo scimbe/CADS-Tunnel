@@ -328,7 +328,16 @@ where
                     return Ok(());
                 }
             }
-            Err(e)
+            // Name the HOST, not only the token. `open_agent_stream` is a generic routing
+            // helper and legitimately knows nothing but the token; this call site does know
+            // the hostname, and it is the only place that can join the two.
+            //
+            // The line it enriches already carries a token because the 2026-08-16 llm
+            // incident could not tell two same-day bursts apart. That fixed one level and
+            // left the next: on 2026-08-18 a burst of `no agent tunnel for token 9a1aee0b`
+            // could not be attributed to a site at all -- nothing in the logs maps a token
+            // to a hostname, so "which site is down?" was unanswerable from the record.
+            Err(format!("{e} — host {sni}").into())
         }
     }
 }
@@ -402,7 +411,8 @@ where
                     return Ok(());
                 }
             }
-            Err(e)
+            // Same reason as the SNI leg above: this is the level that knows the host.
+            Err(format!("{e} — host {host}").into())
         }
     }
 }
