@@ -223,6 +223,48 @@ impl ParkPhase {
 /// stray 0xFF falls into the existing len-oob refusal, not into phase parsing.
 pub(crate) const PHASE_PREAMBLE_MAGIC: u8 = 0xFF;
 
+/// #495 U2 (b'): read the OPTIONAL phase preamble off a join stream, whatever transport it
+/// arrived on, and hand back a stream that reads identically either way.
+///
+/// Both branches return the same type: on a marker, `pos = 2` (nothing to replay); with no
+/// marker, `pos = 0` (both bytes replay as the length prefix they were). That is what makes
+/// this usable where the caller cannot branch on a type -- notably the QUIC admission path,
+/// which has no preamble handling at all today.
+///
+/// **The safety argument here is NOT the one the `:443` peek relies on.** That one is gated
+/// on a #500 keepalive ALPN, so an old client's bytes are never even inspected. QUIC
+/// negotiates no ALPN at all (measured: `pki.rs`'s `quic_channel_endpoint_and_an_alpn_...`),
+/// so on that path every client's first two bytes pass through here. What carries the
+/// safety instead is the length bound alone: a legitimate join is under 1024 bytes, so its
+/// length's high byte is never 0xFF, and a stray 0xFF still lands in the existing len-oob
+/// refusal rather than in phase parsing. Stated explicitly because a reader who assumes the
+/// KA gate protects this path too would draw a stronger conclusion than the code supports.
+async fn peek_optional_phase_marker<R: AsyncRead + Unpin>(
+    mut recv: R,
+) -> Result<(PrependBytes<R>, ParkPhase), BoxError> {
+    let mut first = [0u8; 2];
+    recv.read_exact(&mut first)
+        .await
+        .map_err(|e| -> BoxError { format!("channel join: preamble/length read failed: {e}").into() })?;
+    if first[0] != PHASE_PREAMBLE_MAGIC {
+        return Ok((PrependBytes { pre: first, pos: 0, inner: recv }, ParkPhase::Unmarked));
+    }
+    let phase = match first[1] {
+        0x01 => ParkPhase::Rendezvous,
+        0x02 => ParkPhase::Relay,
+        // Same reasoning as the `:443` peek: a wrong byte AFTER the magic is a defect in the
+        // client's marker writer, never transient, so the per-IP penalty must see it as
+        // definitive (#509).
+        other => {
+            return Err(DefinitiveJoinRefusal::boxed(
+                format!("channel join: unknown phase marker 0x{other:02x} after the preamble magic")
+                    .into(),
+            ))
+        }
+    };
+    Ok((PrependBytes { pre: first, pos: 2, inner: recv }, phase))
+}
+
 /// Put two already-read bytes back in front of a stream -- the no-preamble path of the
 /// phase peek (the two bytes were the join's length prefix after all). Write half passes
 /// through untouched.
@@ -648,6 +690,13 @@ where
     };
     // The quinn broker pairs over the `quinn::Connection` (rendezvous endpoint swap /
     // relay bi-stream), not over this join stream, so the returned read half is dropped.
+    // #495 U2 (b'): TOLERATE an optional phase preamble here. Purely additive -- the value
+    // is read and discarded, so every current client (none of which sends one) behaves
+    // exactly as before, and a future marker-sending client is no longer refused before it
+    // can be understood. Landing the toleration FIRST is not a preference: the measurements
+    // in #495 show the QUIC join has no forward-compatibility slack at all, so a client that
+    // ships before this would have every join rejected.
+    let (recv, _phase) = peek_optional_phase_marker(recv).await?;
     let (send, _recv, req, operator, member_noise, member_attest, observed) =
         read_channel_join_on_stream(send, recv, observed, now, join_timeout, authorize).await?;
     Ok((send, req, operator, member_noise, member_attest, observed))
@@ -3402,6 +3451,49 @@ mod tests {
     ///
     /// Gemessen statt geschlossen: `safe_endpoint` parst die GANZE Zeichenkette strikt,
     /// und das relay-only-Sentinel wird exakt verglichen. Damit ist auch dieser Weg zu.
+    /// #495 U2 (b'): der QUIC-Pfad TOLERIERT jetzt eine optionale Phasen-Praeambel.
+    ///
+    /// Drei Faelle, und der erste ist der wichtigste: **ein Bestandsclient**, der gar keine
+    /// Praeambel sendet, muss byte-genau wie zuvor gelesen werden. Genau das leistet der
+    /// Peek, indem er die beiden Bytes zurueckstellt -- ohne diese Zusage waere die
+    /// Toleranz-Scheibe ein Ausfall aller heutigen QUIC-Joins statt einer Vorbereitung.
+    #[tokio::test]
+    async fn the_quic_join_tolerates_an_optional_phase_preamble_495_u2() {
+        use tokio::io::AsyncWriteExt;
+
+        // 1. Bestandsclient: keine Praeambel. Die zwei Bytes sind die Laenge und muessen
+        //    unveraendert wieder herauskommen.
+        let (mut c, srv) = tokio::io::duplex(64);
+        tokio::spawn(async move { c.write_all(&[0x00, 0x05, b'h', b'e', b'l', b'l', b'o']).await.unwrap(); });
+        let Ok((mut recv, phase)) = peek_optional_phase_marker(srv).await else { panic!("kein Marker ist zulaessig") };
+        assert_eq!(phase, ParkPhase::Unmarked);
+        let mut got = [0u8; 7];
+        recv.read_exact(&mut got).await.expect("Bytes zurueckgestellt");
+        assert_eq!(&got, &[0x00, 0x05, b'h', b'e', b'l', b'l', b'o'], "byte-genau wie ohne Peek");
+
+        // 2. Markierter Client: der Marker wird verbraucht, der Rest bleibt unberuehrt.
+        let (mut c2, srv2) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            c2.write_all(&[PHASE_PREAMBLE_MAGIC, 0x02, 0x00, 0x02, b'h', b'i']).await.unwrap();
+        });
+        let Ok((mut recv2, phase2)) = peek_optional_phase_marker(srv2).await else { panic!("Marker zulaessig") };
+        assert_eq!(phase2, ParkPhase::Relay);
+        let mut got2 = [0u8; 4];
+        recv2.read_exact(&mut got2).await.expect("Rest unberuehrt");
+        assert_eq!(&got2, &[0x00, 0x02, b'h', b'i'], "der Marker ist verbraucht, sonst nichts");
+
+        // 3. Unbekanntes Byte nach der Magie: bleibt DEFINITIV abgewiesen -- die Toleranz
+        //    ist eng, nicht generell. Ein Client-Fehler darf weiterhin nicht als transient
+        //    durchgehen (#509).
+        let (mut c3, srv3) = tokio::io::duplex(64);
+        tokio::spawn(async move { let _ = c3.write_all(&[PHASE_PREAMBLE_MAGIC, 0x7F]).await; });
+        let Err(e) = peek_optional_phase_marker(srv3).await else { panic!("unbekannter Marker muss abgewiesen werden") };
+        assert!(
+            e.downcast_ref::<DefinitiveJoinRefusal>().is_some(),
+            "und zwar DEFINITIV, damit die Pro-IP-Strafe greift: {e}"
+        );
+    }
+
     #[test]
     fn an_endpoint_with_an_appended_capability_marker_is_refused_495_u2() {
         use ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY;
