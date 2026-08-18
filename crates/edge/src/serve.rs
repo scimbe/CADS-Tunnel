@@ -2274,9 +2274,17 @@ enum ParkAndPingError {
     AgentDead { client: crate::state::BoxedStream, source: BoxError },
 }
 
-/// Hand-written (the rescued `client` stream is not `Debug`/`Display`; only the
-/// underlying cause is shown, verbatim, so existing diagnostics that match on the
-/// inner message -- e.g. "superseded" -- keep working).
+/// Hand-written because the rescued `client` stream is not `Debug`/`Display`; only
+/// the underlying cause is shown, verbatim.
+///
+/// #584: an earlier version of this comment claimed the verbatim wording (e.g.
+/// "superseded") was needed to keep "existing diagnostics" matching on it --
+/// checked, not true. No production code matches on that text; every real
+/// `park_and_ping` caller ('K'/'F'/'L') already treats `NoClient` uniformly
+/// (log and shut down). The two tests that do match on "superseded"
+/// (`park_and_ping_...`) are a wording canary, same idea as #550 -- they
+/// confirm this variant stays distinguishable from a generic ping failure in
+/// its message, not a real diagnostic dependency.
 impl std::fmt::Display for ParkAndPingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
