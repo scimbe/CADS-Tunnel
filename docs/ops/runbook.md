@@ -902,9 +902,22 @@ itself. For a permanent conflict it produces a visible restart loop instead of a
 runs, answers 200, and serves nothing. That is deliberate: before it, a failed `:443` bind
 reached only a single stderr line while every tunnel was dead.
 
-Covered: `CT_FRONT_DOOR`, `CT_EDGE_BROWSER_LISTEN`, `CT_EDGE_CHANNEL_LISTEN`, the channel
-relay, `ws-channel`. **Not** covered: `CT_EDGE_HTTP_REDIRECT` — it registers no heartbeat even
-when it works, so its silence still cannot be distinguished from health (#563).
+Health-gating (a failed bind restarts the container): `CT_FRONT_DOOR`,
+`CT_EDGE_BROWSER_LISTEN`, `CT_EDGE_CHANNEL_LISTEN`, the channel relay, `ws-channel`.
+
+`CT_EDGE_HTTP_REDIRECT` is **advisory**: watched and reported, never fatal. Restarting every
+live tunnel to recover a plain-http redirect would do more damage than the fault, so its
+death must not fail `/healthz` — but it must not be invisible either, which is what it was
+while "fatal" and "unregistered" were the only two options. Read which is which:
+
+```
+ct_edge_listener_loop_health_gating{listener=":443 front door"} 1   <- its death restarts the edge
+ct_edge_listener_loop_health_gating{listener=":80 redirect"}    0   <- reported only
+```
+
+Because nothing restarts on an advisory failure, **nothing heals it either**: the
+`edge-watch.sh` mail is the only notice a dead `:80` redirect ever produces. It fires on
+"expected but never seen", which is precisely a failed bind.
 
 ### The control plane's two background loops
 

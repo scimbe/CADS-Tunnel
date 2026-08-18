@@ -462,6 +462,19 @@ pub struct EdgeState<H> {
     /// class on the listener with the widest blast radius. Keyed by the loop's own label
     /// so `/healthz` can name which one is gone.
     listener_heartbeats: RwLock<HashMap<&'static str, std::sync::Arc<BrokerHeartbeat>>>,
+    /// Listeners that are watched but must NOT decide `/healthz`.
+    ///
+    /// Registering a listener used to mean two things at once: it becomes visible in
+    /// `/metrics`, and its death turns `/healthz` into a 503 — which restarts the container.
+    /// For a loop that carries the data plane that is right. For the `:80` redirect it is
+    /// not: losing it costs a convenience redirect, and tearing down every live tunnel to
+    /// recover it does far more damage than the fault (#553 argued exactly this).
+    ///
+    /// With only those two settings available, #553 had to pick "invisible", and the
+    /// consequence was the failure mode this whole family of checks exists against: a dead
+    /// `:80` listener and a healthy one produce the same output — nothing. This set is the
+    /// missing third setting: watched, reported, never fatal.
+    advisory_listeners: RwLock<std::collections::HashSet<&'static str>>,
     /// #554: bumped by [`Self::revoke_token`] to wake live relays.
     ///
     /// Deliberately ONE global counter rather than a per-token registry of cancel handles.
@@ -576,6 +589,7 @@ impl<H: Clone> EdgeState<H> {
             relay_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             rendezvous_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             listener_heartbeats: RwLock::new(HashMap::new()),
+            advisory_listeners: RwLock::new(std::collections::HashSet::new()),
             revocation_tick: tokio::sync::watch::channel(0).0,
             registrations: Counter::default(),
             relays: Counter::default(),
@@ -820,11 +834,44 @@ impl<H: Clone> EdgeState<H> {
         hb
     }
 
-    /// #553: every registered accept loop, for `/healthz` and `/metrics`.
+    /// Register a listener that is reported but never fails `/healthz`.
+    ///
+    /// Same bookkeeping as [`Self::expect_listener`] — call it before the bind, so a
+    /// listener that never starts is distinguishable from one that was never wanted — but
+    /// excluded from the health verdict. See [`Self::advisory_listeners`].
+    pub fn expect_listener_advisory(
+        &self,
+        label: &'static str,
+        now: u64,
+    ) -> std::sync::Arc<BrokerHeartbeat> {
+        self.advisory_listeners.write_safe().insert(label);
+        self.expect_listener(label, now)
+    }
+
+    /// #553: every registered accept loop, for `/metrics`. Includes the advisory ones —
+    /// being reported is the whole point of them.
     pub fn listener_heartbeats(&self) -> Vec<(&'static str, std::sync::Arc<BrokerHeartbeat>)> {
         self.listener_heartbeats
             .read_safe()
             .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Is this listener allowed to turn `/healthz` into a 503?
+    pub fn listener_is_health_gating(&self, label: &str) -> bool {
+        !self.advisory_listeners.read_safe().contains(label)
+    }
+
+    /// The subset of [`Self::listener_heartbeats`] that decides `/healthz`.
+    pub fn gating_listener_heartbeats(
+        &self,
+    ) -> Vec<(&'static str, std::sync::Arc<BrokerHeartbeat>)> {
+        let advisory = self.advisory_listeners.read_safe();
+        self.listener_heartbeats
+            .read_safe()
+            .iter()
+            .filter(|(k, _)| !advisory.contains(*k))
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     }

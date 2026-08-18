@@ -232,6 +232,25 @@ its own. `cross_family` is ordinary dual-stack.\n\
             hb.expected_since()
         ));
     }
+    // Which of those rows can actually fail /healthz. Without it, the two rows above are
+    // ambiguous in the direction that matters: an operator seeing "expected but never seen"
+    // cannot tell whether the container is about to restart itself or whether nothing at all
+    // will happen. Those call for different responses, and the difference is invisible in
+    // the data. A separate series rather than a label on the existing ones -- adding a label
+    // to a series that is already being graphed would break the graph.
+    out.push_str(
+        "# HELP ct_edge_listener_loop_health_gating 1 if this listener's death turns /healthz \
+         into a 503 (and therefore restarts the container), 0 if it is watched but never \
+         fatal -- the :80 redirect only serves a convenience redirect, so losing it must not \
+         tear down every live tunnel.\n\
+         # TYPE ct_edge_listener_loop_health_gating gauge\n",
+    );
+    for (label, _) in &listeners {
+        out.push_str(&format!(
+            "ct_edge_listener_loop_health_gating{{listener=\"{label}\"}} {}\n",
+            u8::from(state.listener_is_health_gating(label))
+        ));
+    }
     // #551: the per-IP join-refusal penalty (#414/#542/#547) had no surface at all. Both
     // numbers are needed and they answer different questions: `sheds_total` says whether
     // the penalty has ever done anything, `tracked_ips` says whether it still CAN.
@@ -373,7 +392,9 @@ async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<Co
     // #553: the TCP accept loops are checked by the SAME classifier as the QUIC brokers.
     // Kept as one list on purpose -- two parallel health paths drift, and the listener that
     // carries every public hostname is precisely the one that must not be the exception.
-    let listeners = state.listener_heartbeats();
+    // Advisory listeners are deliberately absent here: they are reported in /metrics but
+    // must never restart the container (see `EdgeState::advisory_listeners`).
+    let listeners = state.gating_listener_heartbeats();
     let mut loops = vec![
         BrokerLoopStatus::of("relay", &state.relay_broker_heartbeat()),
         BrokerLoopStatus::of("rendezvous", &state.rendezvous_broker_heartbeat()),
@@ -575,6 +596,72 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("relay") && text.contains("#498"), "names the wedged loop: {text}");
+    }
+
+    /// An advisory listener must be BOTH: reported in `/metrics`, and unable to fail
+    /// `/healthz`. Either half alone is the wrong answer.
+    ///
+    /// The `:80` redirect was left unregistered by #553 for a good reason — restarting every
+    /// live tunnel over a lost convenience redirect is worse than the fault — but with only
+    /// "fatal" and "invisible" on offer, that reason forced the failure mode this whole
+    /// family of checks exists against: a dead listener and a healthy one produced the same
+    /// output, namely nothing.
+    ///
+    /// Both halves are asserted against a listener that is EXPECTED AND NEVER BEAT, i.e.
+    /// exactly a failed bind, and a gating listener is put beside it in the same state to
+    /// show the two are treated differently rather than the check being asleep.
+    #[tokio::test]
+    async fn an_advisory_listener_is_reported_but_never_fails_healthz() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.relay_broker_heartbeat().beat(now);
+        state.rendezvous_broker_heartbeat().beat(now);
+        // Long past the grace window, so "never started" is already decided.
+        let dead_long_ago = now - BROKER_HEALTH_MAX_AGE_SECS - 120;
+        state.expect_listener_advisory(":80 redirect", dead_long_ago);
+
+        let resp = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a dead advisory listener must not restart the container"
+        );
+
+        let body = metrics_router(state.clone(), None)
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("ct_edge_listener_loop_expected_since_seconds{listener=\":80 redirect\"}"),
+            "not fatal must not mean not reported: {text}"
+        );
+        assert!(
+            text.contains("ct_edge_listener_loop_health_gating{listener=\":80 redirect\"} 0"),
+            "the row must say it cannot fail the check, or a reader cannot tell an imminent \
+             restart from nothing happening: {text}"
+        );
+
+        // The control: the SAME state, the SAME "expected, never beat" condition, on a
+        // gating listener -- 503. Without this the test above would also pass if the whole
+        // never-started check had stopped working.
+        state.expect_listener(":443 front door", dead_long_ago);
+        let resp = metrics_router(state, None)
+            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a gating listener still fails");
     }
 
     #[tokio::test]

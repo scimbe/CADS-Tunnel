@@ -3732,6 +3732,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // to https on the unified gateway. Off unless CT_EDGE_HTTP_REDIRECT is set
     // (e.g. 0.0.0.0:80). Pairs with the front door / FD4-a Portal termination.
     if let Ok(addr) = std::env::var("CT_EDGE_HTTP_REDIRECT") {
+        // Advisory, not gating: recorded before the bind like every other listener, so a
+        // failed `:80` bind is visible in `/metrics` instead of leaving no trace at all --
+        // but excluded from the `/healthz` verdict, because #553's reasoning below still
+        // holds and restarting every live tunnel over a lost convenience redirect would be
+        // worse than the fault. Until this existed the only two options were "fatal" and
+        // "invisible", and #553 had to choose invisible.
+        let redirect_health = state.expect_listener_advisory(":80 redirect", unix_now());
         match addr.parse::<SocketAddr>() {
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
                 Ok(rl) => {
@@ -3758,9 +3765,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         // carry the data plane, so their death is an outage worth restarting
                         // the edge for. This one only 308s plain http:// to https://; losing
                         // it costs a convenience redirect, and tearing down every live tunnel
-                        // to recover it would do far more damage than the fault. Omitted on
-                        // purpose, not by oversight.
-                        None,
+                        // to recover it would do far more damage than the fault. That
+                        // reasoning is unchanged -- what changed is that "not fatal" no
+                        // longer has to mean "not reported": the heartbeat below is advisory,
+                        // so this loop shows up in /metrics and stays out of /healthz.
+                        Some(redirect_health),
                         move |tcp, _addr, permit| async move {
                             let _permit = permit; // held for the connection's lifetime
                             let _ = serve_http_redirect(tcp).await;
