@@ -516,6 +516,11 @@ is in progress and the defence is degraded. Alert on
 `ct_edge_channel_join_penalty_tracked_ips / ct_edge_channel_join_penalty_tracked_ips_max > 0.9`
 rather than on the shed counter, which stays at zero in exactly that scenario.
 
+`scripts/edge-watch.sh` does that check every 10 minutes and mails on it — the instruction
+above used to be prose only, which is a rule nobody enforces. It also alarms when the metric
+is ABSENT (an edge older than #551): a check that cannot run is reported as such, never left
+to read as a pass.
+
 Reading the two together: `sheds_total > 0` with a low `tracked_ips` is the penalty working
 as designed (a few noisy sources, absorbed). `sheds_total == 0` with `tracked_ips` at the
 bound is the failure mode above — many sources, none individually over budget, nothing shed.

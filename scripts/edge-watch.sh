@@ -108,6 +108,27 @@ else
   REFUSED=$(docker logs --since 15m "$CONTAINER" 2>&1 | grep -ciE "os error 111|connection refused|no live park" || true)
   [ "${REFUSED:-0}" -gt 0 ] && \
     ALARMS+=("$REFUSED Zeile(n) mit der refused-111-Signatur in den letzten 15 Minuten (Basiswert 0) -- Browser-Auslieferung an einen toten Park (#522).")
+
+  # 5. Saettigung der Join-Straftabelle (#551). Das Runbook schreibt vor, auf das
+  #    VERHAELTNIS zu alarmieren und nicht auf den Shed-Zaehler -- der bleibt in
+  #    genau dem Fall bei null, den man fangen will: Verteilt sich ein Sturm auf
+  #    mehr Quellen als die Tabelle fasst, verdraengt sie aelteste zuerst, keine
+  #    IP erreicht je ihr Budget, und die Abwehr greift nie. Bis hierher stand
+  #    diese Vorschrift nur in der Doku; sie hatte keinen Durchsetzer.
+  TRACKED=$(printf '%s' "$MET" | awk '/^ct_edge_channel_join_penalty_tracked_ips / {print $2}' | head -1)
+  TRACKED_MAX=$(printf '%s' "$MET" | awk '/^ct_edge_channel_join_penalty_tracked_ips_max / {print $2}' | head -1)
+  TRACKED=${TRACKED%.*}; TRACKED_MAX=${TRACKED_MAX%.*}
+  if [ -n "${TRACKED:-}" ] && [ "${TRACKED_MAX:-0}" -gt 0 ]; then
+    # Ganzzahlig gerechnet (kein bc auf diesem Host): 10*belegt >= 9*Kapazitaet.
+    if [ $(( TRACKED * 10 )) -ge $(( TRACKED_MAX * 9 )) ]; then
+      ALARMS+=("Join-Straftabelle zu $(( TRACKED * 100 / TRACKED_MAX ))% belegt ($TRACKED/$TRACKED_MAX) -- an der Obergrenze verdraengt sie aelteste Eintraege, keine Quell-IP erreicht mehr ihr Budget, und die Pro-IP-Strafe greift dann gar nicht. Ein hoher Wert ist hier eine Warnung, keine Beruhigung (#551).")
+    fi
+  else
+    # Gleiches Muster wie beim #539-Gauge oben: eine Pruefung, die mangels
+    # Kennzahl nicht laufen kann, wird GESAGT und nicht verschwiegen -- sonst
+    # liest sich ihr Schweigen wie ein Bestehen.
+    ALARMS+=("Der laufende Edge kennt 'ct_edge_channel_join_penalty_tracked_ips' nicht (Stand vor #551). Die Saettigung der Join-Straftabelle kann deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
+  fi
 fi
 
 # --- 6. Die Dienste selbst -------------------------------------------------
