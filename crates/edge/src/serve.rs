@@ -3,7 +3,9 @@
 //! The Agent-registration path: an Agent opens a control stream and registers
 //! the Routing Token it serves; the Edge stores the connection in [`EdgeState`]
 //! so a later Client rendezvous for that token can be routed to it. The Client
-//! route→relay path is exercised end to end in the M5.6 testbed smoke.
+//! route→relay path is exercised end to end in the M5.6 testbed smoke. The
+//! live path is [`serve_connection`]'s `'A'` role branch, not [`register_agent`]
+//! (#583 -- see that function's own doc comment).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +28,15 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Handle one Agent registration on `conn`: read `role='A'(1) | token(32)` on a
 /// fresh bi-stream, register the connection in `state`, ack `OK`, and return the
 /// registered token.
+///
+/// #583: despite the confident doc comment above, this is **not** the live
+/// registration path -- the daemon's real accept loop (`run_edge` ->
+/// `serve_agent_connection` -> `serve_connection`) registers via
+/// `state.register_with_candidate_unless_revoked` directly in
+/// `serve_connection`'s `'A'` branch, which also enforces the revocation
+/// check this function skips. Every caller of `register_agent` today is a
+/// test helper (`mod tests` below); kept as a test convenience, not because
+/// production reaches it.
 pub async fn register_agent(
     conn: &Connection,
     state: &EdgeState<Connection>,
@@ -1727,6 +1738,17 @@ pub async fn serve_connection(
             };
             send.write_all(b"OK").await?;
             send.finish()?;
+            // #583: this event was previously silent -- diagnosing whether an
+            // outage was a real deregistration or just a dead-but-not-yet-evicted
+            // connection required inference from unrelated log lines.
+            {
+                let mut th_buf = [0u8; 8];
+                let th = token_hex(&token, &mut th_buf);
+                eprintln!(
+                    "ct-edge: agent registered token={th} reg={reg} remote={:?} (#583)",
+                    conn.remote_address()
+                );
+            }
             // Return the (token, registration id) so the caller can evict exactly
             // THIS agent when its connection drops — issue #2 (mode a): a dropped
             // agent's registration was never removed, so a later Client `route()`
@@ -4259,6 +4281,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 // the same token keep the tunnel up.
                 if let Ok(Some((token, reg))) = registered {
                     state.remove_registration(&token, reg);
+                    // #583: previously silent; see the matching registration
+                    // log line in `serve_connection`'s `'A'` branch.
+                    let mut th_buf = [0u8; 8];
+                    let th = token_hex(&token, &mut th_buf);
+                    eprintln!("ct-edge: agent deregistered token={th} reg={reg} (#583)");
                 }
             }
         });
