@@ -192,11 +192,38 @@ else
     [ "$HEALTH" != "__UNREACHABLE__" ] && \
       ALARMS+=("/metrics liefert nichts, obwohl /healthz antwortet -- die Messwerte fehlen, also ist ab hier nichts geprueft.")
   else
-    # 3. Park-Gauge (#522)
+    # 3. Park-Gauge (#522) -- und zwar als Aussage ueber LEICHEN, nicht ueber eine Anzahl.
+    #
+    # Der Zaehler allein kann "viele gesunde Parks" nicht von "der Reaper ist tot"
+    # unterscheiden. Am 18.08. hat er deshalb falsch gemeldet: nach vier Deploys kurz
+    # hintereinander parken alle Agenten gleichzeitig neu, der Zaehler stand bei 85 -- und
+    # fiel in der Minute darauf auf 31, bei fliessenden Reaps. Die Meldung behauptete dabei
+    # woertlich, der Reaper arbeite "vermutlich nicht mehr", waehrend er sichtbar raeumte.
+    #
+    # Was Leichen ausmacht, ist nicht die Hoehe, sondern der STILLSTAND: viele Parks UND
+    # keine Reaps seit dem letzten Lauf. Genau das wird jetzt geprueft. Ein grosser Bestand
+    # bei laufendem Reaper ist eine grosse Flotte, kein Fehler -- und umgekehrt faellt ein
+    # Reaper-Ausfall auch dann auf, wenn er sich unter einem gewachsenen Bestand versteckt.
+    #
+    # Dazu dasselbe Anlauffenster wie bei den Diensten weiter unten: unmittelbar nach einem
+    # Edge-Neustart ist ein Stau normal, und eine Messung darin sagt nichts.
     PARK=$(printf '%s' "$MET" | awk '/^ct_edge_tcp_fallback_parked /{print $2}' | head -1)
+    REAPED=$(printf '%s' "$MET" | awk '/^ct_edge_tcp_fallback_reaped_total /{print $2}' | head -1)
+    PARK_AGE=$(( $(date +%s) - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null)" +%s 2>/dev/null || date +%s) ))
+    REAP_FILE="$STATE_DIR/tcp-reaped"
+    REAP_PREV=$(cat "$REAP_FILE" 2>/dev/null || echo "")
     if [ -n "${PARK:-}" ] && [ "${PARK%.*}" -gt "$PARK_MAX" ]; then
-      ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) -- Leichen sammeln sich an, der TCP-Park-Reaper arbeitet vermutlich nicht mehr (#522).")
+      if [ "$PARK_AGE" -lt "$SETTLE" ]; then
+        log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), aber der Edge lief erst ${PARK_AGE}s -- nach einem Neustart parken alle Agenten gleichzeitig neu. NICHT bewertet, kein Freispruch."
+      elif [ -n "$REAP_PREV" ] && [ "${REAPED%.*}" -le "$REAP_PREV" ]; then
+        ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) -- das ist die Leichen-Signatur: der TCP-Park-Reaper raeumt nicht mehr (#522).")
+      elif [ -z "$REAP_PREV" ]; then
+        log "Park-Gauge bei $PARK (Schwelle $PARK_MAX); ob Reaps fliessen, ist erst ab dem naechsten Lauf entscheidbar (kein Vorwert)."
+      else
+        log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), aber die Reaps fliessen ($REAP_PREV -> ${REAPED%.*}) -- grosse Flotte, keine Leichen."
+      fi
     fi
+    [ -n "${REAPED:-}" ] && printf '%s\n' "${REAPED%.*}" > "$REAP_FILE"
 
     # 5. Broker-Loop-Stillstand; #539 unterscheidet dabei "nie vorgesehen" von
     #    "vorgesehen, aber nie angelaufen" -- beides steht in den Gauges.
