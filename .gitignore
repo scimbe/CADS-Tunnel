@@ -52,3 +52,7 @@ crates/control-plane/wasm-pkg/
 
 # Temporaere Worktrees isolierter Agenten -- nie Teil des Repos.
 .claude/worktrees/
+
+# Nebenprodukt des Skript-Imports in scripts/ (policy-predicate-guard.py laedt
+# reachability-survey.py als Modul)
+__pycache__/

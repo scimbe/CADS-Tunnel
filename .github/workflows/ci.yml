@@ -34,6 +34,17 @@ jobs:
       - name: Committed-secret guard
         run: bash scripts/check-no-secrets.sh
 
+      - name: No new rule without an enforcer
+        # #579: four times on 2026-08-18 the same shape turned up -- something built,
+        # tested and documented that nothing live calls (#576 the policy consulted in the
+        # wrong branch, #578 the authorization gate with no caller, #560 three channel
+        # mechanisms never exercised, #225 the auction policy). #248 recorded it in July
+        # already. Every one of them was found by hand; this makes the next one fail here
+        # instead. Fails only when the set GROWS against scripts/policy-predicates.baseline
+        # -- and exits 2 if its own detector stops matching, because an empty result would
+        # otherwise read exactly like a clean one.
+        run: python3 scripts/policy-predicate-guard.py
+
       - name: hello-world-pipeline.zip matches its source files
         # The zip is include_bytes!'d into the served /downloads/hello-world-pipeline.zip
         # (crates/control-plane/src/service.rs) but built by hand from README.md/

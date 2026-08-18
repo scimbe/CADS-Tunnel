@@ -1,0 +1,20 @@
+# Politik-Praedikate ohne Produktionsaufrufer -- der geduldete Bestand (#579).
+#
+# Ein Eintrag heisst: "diese Regel ruft heute niemand, und das ist geprueft und
+# begruendet". Er heisst NICHT "das ist in Ordnung" -- er heisst "das ist bekannt".
+#
+# scripts/policy-predicate-guard.py scheitert, sobald ein Praedikat DAZUKOMMT, das
+# hier nicht steht. Verschwindet eines, meldet es das nur; dann diese Zeile streichen.
+#
+# Format:  name  # Begruendung
+#
+# Ein Test, der die Regel belegt, ist KEINE Begruendung. Genau das war der Fehler in
+# #576: `host_auth_required` hatte einen gruenen Test und wurde trotzdem nicht
+# angewandt. Die Begruendung muss sagen, WER die Regel stattdessen durchsetzt -- oder
+# warum sie niemand durchsetzen muss.
+
+is_authorized                   # #578: die drei LEBENDEN Tore sind routing_token_if_authorized, hostname_if_authorized und list_authorized_for_subject; every_tunnel_authorization_path_agrees_578 haelt alle vier auf dieselbe Antwort. Diese Fassung bleibt als lesbare Formulierung der Regel stehen, ihr Doc-Kommentar sagt inzwischen, dass sie nicht das Tor ist.
+is_benign_client_abort          # Die Klassifizierung ist live, aber ueber classify_io_client_abort (#533); dies ist ein zweiter Zugang zu derselben Entscheidung. Wirkung waere Log-Rauschen, nicht Autorisierung.
+temporary_password_is_enforced  # #536: durchgesetzt wird serverseitig von Keycloak (registrierte UPDATE_PASSWORD-Aktion), nicht von diesem Code. Aus diesem Repo heraus nicht entscheidbar -- die Pruefung dazu gehoert an den Realm-Import.
+is_assigned                     # Hilfspraedikat der Topologie-Ansicht ohne Sicherheitsbezug; die Zuweisung selbst wird an der Quelle gefuehrt.
+is_direct                       # Hilfspraedikat auf dem Upgrade-Pfad ohne Sicherheitsbezug; die Entscheidung faellt an der Zustandsmaschine, nicht hier.
