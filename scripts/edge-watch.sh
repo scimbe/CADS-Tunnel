@@ -98,7 +98,9 @@ try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
 k=("issue_rate_limited","unauth_write_rate_limited","payment_webhook_rejected")
 if not all(x in d for x in k): sys.exit(2)
-print(" ".join(str(int(d[x])) for x in k))
+# uptime_seconds kommt mit: ohne sie liesse sich ein Neustart der CP nicht von
+# "keine neuen Abweisungen" unterscheiden.
+print(" ".join(str(int(d[x])) for x in k), int(d.get("uptime_seconds", 0)))
 ' 2>/dev/null) && CP_REFUSALS_OK=1 || CP_REFUSALS_OK=0
 
 if [ "$CP_REFUSALS_OK" = "1" ]; then
@@ -106,11 +108,12 @@ if [ "$CP_REFUSALS_OK" = "1" ]; then
   ISSUE_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f1)
   UNAUTH_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f2)
   HOOK_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f3)
+  UP_NOW=$(printf '%s' "$CP_REFUSALS" | cut -d' ' -f4)
   REF_FILE="$STATE_DIR/cp-refusals"
   # Erster Lauf: den Stand merken und NICHT alarmieren -- die Zaehler sind
   # prozessweite Summen seit Prozessstart, ihr Absolutwert sagt nichts ueber
   # jetzt. Alarmiert wird auf den Zuwachs seit dem letzten Lauf.
-  ISSUE_PREV=$ISSUE_NOW; UNAUTH_PREV=$UNAUTH_NOW; HOOK_PREV=$HOOK_NOW
+  ISSUE_PREV=$ISSUE_NOW; UNAUTH_PREV=$UNAUTH_NOW; HOOK_PREV=$HOOK_NOW; UP_PREV=$UP_NOW
   # `read` meldet bei einer Datei OHNE abschliessendes Zeilenende einen
   # Fehlschlag, obwohl es die Variablen korrekt gesetzt hat. Ein `|| default`
   # daran haette die gelesenen Werte wieder verworfen -- jeder Zuwachs waere
@@ -118,10 +121,23 @@ if [ "$CP_REFUSALS_OK" = "1" ]; then
   # Deshalb wird die Datei unten MIT Zeilenende geschrieben und hier nur
   # gelesen, wenn sie existiert.
   if [ -s "$REF_FILE" ]; then
-    read -r ISSUE_PREV UNAUTH_PREV HOOK_PREV < "$REF_FILE" || true
+    read -r ISSUE_PREV UNAUTH_PREV HOOK_PREV UP_PREV < "$REF_FILE" || true
+    UP_PREV=${UP_PREV:-0}
+  fi
+  # Ein Neustart der Control-Plane setzt die Zaehler auf null zurueck. Ohne
+  # diese Erkennung verschwindet der Zuwachs genau dann, wenn der neue Stand
+  # zufaellig wieder den alten erreicht -- am 18.08. real passiert: der Waechter
+  # blieb bei zwei abgewiesenen Webhooks still, weil vor dem Rollout ebenfalls
+  # zwei gezaehlt worden waren. Eine gefallene Laufzeit ist der eindeutige
+  # Beleg; danach zaehlt der volle aktuelle Stand als Zuwachs.
+  if [ "${UP_NOW:-0}" -lt "${UP_PREV:-0}" ]; then
+    ISSUE_PREV=0; UNAUTH_PREV=0; HOOK_PREV=0
   fi
   # Ein Neustart der CP setzt die Zaehler zurueck; ein negativer Zuwachs ist
   # also kein Fehler, sondern genau das -- dann wird nur neu verankert.
+  # Ein negativer Zuwachs bleibt zusaetzlich abgefangen: faellt die Laufzeit
+  # einmal nicht (Uhrenspruenge, fehlendes Feld), ist ein gesunkener Zaehler
+  # trotzdem nur als Ruecksetzung erklaerbar und nie als Alarm.
   D_ISSUE=$(( ISSUE_NOW - ISSUE_PREV )); [ "$D_ISSUE" -lt 0 ] && D_ISSUE=0
   D_UNAUTH=$(( UNAUTH_NOW - UNAUTH_PREV )); [ "$D_UNAUTH" -lt 0 ] && D_UNAUTH=0
   D_HOOK=$(( HOOK_NOW - HOOK_PREV )); [ "$D_HOOK" -lt 0 ] && D_HOOK=0
@@ -137,7 +153,7 @@ if [ "$CP_REFUSALS_OK" = "1" ]; then
     ALARMS+=("$D_UNAUTH abgewiesene unauthentisierte Schreibzugriffe seit dem letzten Lauf (429, #87) -- der Pro-IP-Begrenzer haelt gerade etwas zurueck.")
   [ "$D_HOOK" -ge 1 ] && \
     ALARMS+=("$D_HOOK Zahlungs-Webhook(s) mit ungueltiger Signatur abgewiesen (401) -- entweder ist das Webhook-Geheimnis falsch konfiguriert ODER jemand faelscht Webhooks. Beide Faelle brauchen eine Antwort; im Log der Control-Plane steht der Grund je Vorfall (#561).")
-  printf '%s %s %s\n' "$ISSUE_NOW" "$UNAUTH_NOW" "$HOOK_NOW" > "$REF_FILE"
+  printf '%s %s %s %s\n' "$ISSUE_NOW" "$UNAUTH_NOW" "$HOOK_NOW" "$UP_NOW" > "$REF_FILE"
 elif [ -n "$CP_STATUS_JSON" ]; then
   # Gleiches Muster wie bei den Edge-Kennzahlen: eine Pruefung, die mangels
   # Feld nicht laufen kann, wird GESAGT. Sonst liest sich ihr Schweigen wie

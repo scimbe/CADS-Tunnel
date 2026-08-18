@@ -221,8 +221,11 @@ a flood surface and one of its two causes is someone forging webhooks. A refusal
 is the system working; a refusal nobody can see is not.
 
 `edge-watch.sh` section 0b consumes all three: it alarms on the **increase since
-the last run**, never the absolute (they are process-wide sums since start, and a
-control-plane restart resets them). Thresholds: 20 per 10-minute window for the
+the last run**, never the absolute (they are process-wide sums since start). A
+control-plane restart resets them, which the watcher detects via `uptime_seconds`
+on the same response — without that, refusals vanish exactly when the post-restart
+count happens to reach the pre-restart one, which is not hypothetical: it swallowed
+two rejected webhooks on 2026-08-18. Thresholds: 20 per 10-minute window for the
 two rate limiters — that is the "sustained" the rule asks for, a single refusal is
 a hectic client — and **1** for the webhook, which has no benign explanation in
 steady state. If the running control plane predates #561 and the fields are absent,
