@@ -2939,6 +2939,36 @@ fn rendezvous_window() -> u64 {
     unix_now() / WINDOW_SECS
 }
 
+/// What startup should DO about hostname-ownership authorization (#576).
+///
+/// [`host_auth_required`] below has always answered the policy question correctly, and a test
+/// has always proved it. That test kept passing while the answer was never acted on: the call
+/// sat inside the `CT_EDGE_ADMIN_TOKEN` block, so a front door configured without that token
+/// left `host_auth` at `None` — and `host_bind_allowed` says `true` for every token then.
+/// Proving a rule and applying it are different claims; this type exists so the second one can
+/// be tested too, instead of living only inside a listener-spawning startup path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostAuthDecision {
+    /// Enforce ownership. `orphaned` = required but no admin token exists, so nothing can ever
+    /// authorize a host and every bind will be refused — correct, and worth saying out loud.
+    Required { orphaned: bool },
+    /// Do not enforce. `warn` = a public front door is exposed anyway, which is the open door
+    /// the operator should hear about.
+    Open { warn: bool },
+}
+
+fn host_auth_startup_decision(
+    require_env: Option<&str>,
+    front_door_set: bool,
+    admin_token_present: bool,
+) -> HostAuthDecision {
+    if host_auth_required(require_env, front_door_set) {
+        HostAuthDecision::Required { orphaned: !admin_token_present }
+    } else {
+        HostAuthDecision::Open { warn: front_door_set }
+    }
+}
+
 fn host_auth_required(require_env: Option<&str>, front_door_set: bool) -> bool {
     match require_env {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.trim().is_empty() => false,
@@ -3227,34 +3257,56 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // That is the whole failure mode worth guarding here: an operator arms it in `.env`,
     // a later redeploy loses the line, and nothing in the log says the door reopened.
     eprintln!("{}", crate::channel_broker::attested_endpoint_startup_line());
+    // #23 BP4b / #84: require hostname-ownership authorization for 'H'/'B' binds —
+    // fail-closed by default when a public front door is exposed (CT_FRONT_DOOR), so an
+    // anonymous bind can't squat an unbound name on :443.
+    //
+    // #576: this whole decision used to sit INSIDE the `CT_EDGE_ADMIN_TOKEN` block below.
+    // The policy was computed correctly (`host_auth_required(None, front_door)` is `true`)
+    // but never consulted without that token, so a front door configured without it left
+    // `host_auth` at `None` — and `EdgeState::host_bind_allowed` answers `true` for EVERY
+    // token in that state. Any proof-of-work token holder could bind any unbound hostname,
+    // and no line said so: the `CT_EDGE_REQUIRE_HOST_AUTH=0` opt-out is warned about, this
+    // path was not. Exactly the failure mode the `attested_endpoint_startup_line()` above
+    // exists to prevent, ten lines further down the same function.
+    let front_door_set = std::env::var_os("CT_FRONT_DOOR").is_some();
+    let admin_token = std::env::var("CT_EDGE_ADMIN_TOKEN")
+        .ok()
+        .and_then(|s| parse_admin_token_hex(&s));
+    let decision = host_auth_startup_decision(
+        std::env::var("CT_EDGE_REQUIRE_HOST_AUTH").ok().as_deref(),
+        front_door_set,
+        admin_token.is_some(),
+    );
+    if let HostAuthDecision::Required { orphaned } = decision {
+        state.require_host_auth();
+        eprintln!(
+            "ct-edge: hostname-ownership authorization required (#84 — fail-closed default under \
+             CT_FRONT_DOOR; set CT_EDGE_REQUIRE_HOST_AUTH=0 to disable)"
+        );
+        if orphaned {
+            // Fail-closed is now real without the token, which also means NOTHING can
+            // authorize a host: the CP reaches this edge over the admin API, and that needs
+            // the shared secret. Said plainly so the resulting refusals read as a
+            // configuration gap rather than an unexplained outage.
+            eprintln!(
+                "ct-edge: WARNING — host-auth is required but CT_EDGE_ADMIN_TOKEN is unset, so no \
+                 hostname can ever be authorized and every 'H'/'B' bind will be refused. Set \
+                 CT_EDGE_ADMIN_TOKEN (matching the control plane's CT_CP_EDGE_ADMIN_TOKEN) (#576)."
+            );
+        }
+    } else if decision == (HostAuthDecision::Open { warn: true }) {
+        eprintln!(
+            "ct-edge: WARNING — CT_FRONT_DOOR is exposed with host-auth DISABLED; any routing-token \
+             holder can squat an unbound hostname (#84)"
+        );
+    }
     // #27 RB3: enable the authenticated revoke op only when the shared admin
     // secret is configured (64-hex CT_EDGE_ADMIN_TOKEN, matching the control
     // plane's CT_CP_EDGE_ADMIN_TOKEN). Absent -> revocation stays disabled.
-    if let Some(tok) = std::env::var("CT_EDGE_ADMIN_TOKEN")
-        .ok()
-        .and_then(|s| parse_admin_token_hex(&s))
-    {
+    if let Some(tok) = admin_token {
         state.set_admin_token(tok);
         eprintln!("ct-edge: tunnel revocation enabled (CT_EDGE_ADMIN_TOKEN set)");
-        // #23 BP4b / #84: require hostname-ownership authorization for 'H'/'B' binds —
-        // fail-closed by default when a public front door is exposed (CT_FRONT_DOOR),
-        // so an anonymous bind can't squat an unbound name on :443.
-        let front_door_set = std::env::var_os("CT_FRONT_DOOR").is_some();
-        if host_auth_required(
-            std::env::var("CT_EDGE_REQUIRE_HOST_AUTH").ok().as_deref(),
-            front_door_set,
-        ) {
-            state.require_host_auth();
-            eprintln!(
-                "ct-edge: hostname-ownership authorization required (#84 — fail-closed default under \
-                 CT_FRONT_DOOR; set CT_EDGE_REQUIRE_HOST_AUTH=0 to disable)"
-            );
-        } else if front_door_set {
-            eprintln!(
-                "ct-edge: WARNING — CT_FRONT_DOOR is exposed with host-auth DISABLED; any routing-token \
-                 holder can squat an unbound hostname (#84)"
-            );
-        }
         // #27 RB4: serve the authenticated admin API (POST /admin/revoke/:token)
         // the control plane calls on a customer revoke — only when an admin
         // listener is configured, and bind it to a private interface in prod.
@@ -4903,6 +4955,39 @@ mod tests {
         assert!(
             crate::channel_broker::channel_park_reaped_total() >= reaped_before + 1,
             "#530: the reap must raise ct_edge_channel_park_reaped_total"
+        );
+    }
+
+    /// #576: the fail-closed policy is APPLIED, not merely computed.
+    ///
+    /// Its sibling below has always proved `host_auth_required` answers correctly, and it kept
+    /// passing while the answer was unreachable: startup only consulted it inside the
+    /// `CT_EDGE_ADMIN_TOKEN` block, so a front door without that token left `host_auth` at
+    /// `None` — the state in which `EdgeState::host_bind_allowed` returns `true` for every
+    /// token. The cell that used to be wrong is the third one, and it is the whole point.
+    #[test]
+    fn the_fail_closed_host_auth_default_does_not_depend_on_the_admin_token_576() {
+        assert_eq!(
+            host_auth_startup_decision(None, true, true),
+            HostAuthDecision::Required { orphaned: false },
+            "front door + admin token: enforce, nothing unusual to report"
+        );
+        assert_eq!(
+            host_auth_startup_decision(None, false, true),
+            HostAuthDecision::Open { warn: false },
+            "no front door: no enforcement and nothing to warn about"
+        );
+        assert_eq!(
+            host_auth_startup_decision(None, true, false),
+            HostAuthDecision::Required { orphaned: true },
+            "front door WITHOUT the admin token: still enforce -- this is the cell that used \
+             to fall through to a silently open door -- and say that nothing can authorize a \
+             host, so the refusals that follow read as configuration, not as an outage"
+        );
+        assert_eq!(
+            host_auth_startup_decision(Some("0"), true, false),
+            HostAuthDecision::Open { warn: true },
+            "an explicit opt-out stays possible, and stays loud"
         );
     }
 
