@@ -2401,10 +2401,20 @@ async fn do_claim(st: &ClaimState, headers: &HeaderMap, channel_hex: &str, req: 
         .channels
         .claim_via_allowlist(&ct_common::channel::ChannelId(channel), &email, &holder, &noise_pubkey, &noise_attestation, now, Some(&claims.subject))
         .map_err(|e| internal_error("do_claim/claim_via_allowlist", e))?;
-    if claimed {
-        Ok(())
-    } else {
-        Err((StatusCode::FORBIDDEN, "this email is not allow-listed for this channel".to_string()))
+    // #577: two refusals, two answers. Reporting the second one as "not allow-listed" would
+    // send a member who IS allow-listed off to ask for an invitation they already have.
+    match claimed {
+        crate::storage::ClaimOutcome::Claimed => Ok(()),
+        crate::storage::ClaimOutcome::NotAllowlisted => Err((
+            StatusCode::FORBIDDEN,
+            "this email is not allow-listed for this channel".to_string(),
+        )),
+        crate::storage::ClaimOutcome::HolderClaimedByAnother => Err((
+            StatusCode::CONFLICT,
+            "this holder identity was already claimed by a different account — claim your \
+             own holder key, or ask the channel owner to remove the stale membership"
+                .to_string(),
+        )),
     }
 }
 
@@ -5484,7 +5494,7 @@ mod tests {
         assert!(channels.allowlist_add(&ch_other_user, "owner", "someone-else@example.com", 1_200).unwrap());
         assert!(channels
             .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000, None)
-            .unwrap());
+            .unwrap().claimed());
 
         let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();

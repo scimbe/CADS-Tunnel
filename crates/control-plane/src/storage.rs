@@ -3301,6 +3301,30 @@ pub enum GrantDepositOutcome {
     NotAMember,
 }
 
+/// Why a self-service claim did or did not land (#577).
+///
+/// Was a bare `bool` whose `false` the route reported as "this email is not allow-listed".
+/// Once a second, unrelated refusal existed, that single word would have named the wrong
+/// cause for it -- the caller would be told to ask for an invitation when the real answer is
+/// that the holder belongs to someone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// Membership written (first claim, or the same subject rotating its own key).
+    Claimed,
+    /// This email is not on the channel's allow-list (covers an unknown channel).
+    NotAllowlisted,
+    /// This `(channel, holder)` was already claimed by a DIFFERENT portal subject.
+    HolderClaimedByAnother,
+}
+
+impl ClaimOutcome {
+    /// True only for [`ClaimOutcome::Claimed`] -- for call sites that genuinely need the
+    /// yes/no and have nothing to say about the reason.
+    pub fn claimed(self) -> bool {
+        matches!(self, ClaimOutcome::Claimed)
+    }
+}
+
 impl SqliteChannelStore {
     /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
     /// connections (#398; see the struct doc).
@@ -3902,7 +3926,7 @@ impl SqliteChannelStore {
         noise_attestation: &[u8; 64],
         now: u64,
         subject: Option<&str>,
-    ) -> rusqlite::Result<bool> {
+    ) -> rusqlite::Result<ClaimOutcome> {
         let conn = self.writer.lock_safe();
         let allowed: bool = conn
             .query_row(
@@ -3913,7 +3937,36 @@ impl SqliteChannelStore {
             .optional()?
             .is_some();
         if !allowed {
-            return Ok(false);
+            return Ok(ClaimOutcome::NotAllowlisted);
+        }
+        // #577: the allow-list authorizes an EMAIL; the row this writes is keyed on
+        // `(channel, holder)`, and `holder` comes from the caller with nothing binding the
+        // two. The attestation check upstream stops a FORGED key, not a REPLAYED one: every
+        // member legitimately receives the other members' `(noise_pubkey, attestation)` from
+        // the edge's authorize response, so one allow-listed member could re-submit another
+        // member's older attested key and, through `INSERT OR REPLACE`, roll that member's
+        // pinned key back to a value it had rotated away from. The same call also replaced
+        // the `channel_member_subjects` row below, redirecting the victim's deposited-grant
+        // pickup (`holders_for_subject`, subject-scoped) to the caller.
+        //
+        // So: a holder already claimed by a portal subject may only be re-claimed by THAT
+        // subject. Rotation by the rightful member keeps working; taking over someone else's
+        // holder does not. Deliberately narrow -- it refuses only when the store can name a
+        // different owner, never on a first claim, so it cannot lock out a legitimate member
+        // whose holder nobody has claimed.
+        if let Some(subject) = subject {
+            let owned_by_other: bool = conn
+                .query_row(
+                    "SELECT 1 FROM channel_member_subjects \
+                     WHERE channel = ?1 AND holder = ?2 AND subject <> ?3",
+                    params![&channel.0[..], &holder[..], subject],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if owned_by_other {
+                return Ok(ClaimOutcome::HolderClaimedByAnother);
+            }
         }
         conn.execute(
             "INSERT OR REPLACE INTO channel_members (channel, holder, noise_pubkey, noise_attestation) \
@@ -3935,7 +3988,7 @@ impl SqliteChannelStore {
                 params![&channel.0[..], &holder[..], subject, now as i64],
             )?;
         }
-        Ok(true)
+        Ok(ClaimOutcome::Claimed)
     }
 
     /// Self-service discoverability (2026-08-01): every channel `email`
@@ -7405,7 +7458,7 @@ mod tests {
         );
         assert!(s
             .claim_via_allowlist(&ch, "nat@example.com", &holder, &[0xcdu8; 32], &[0u8; 64], 2_000, Some("subj-nat"))
-            .unwrap());
+            .unwrap().claimed());
         assert_eq!(
             s.deposit_grant(&ch, "mallory", &holder, "aa", 2_100).unwrap(),
             GrantDepositOutcome::NotOwner
@@ -7441,6 +7494,63 @@ mod tests {
     /// can no longer re-fetch its grant. A sibling holder the SAME subject claimed on the
     /// SAME channel (the real two-identity case: an account that re-claimed with a fresh
     /// persistent browser identity) must survive untouched.
+    /// #577: an allow-listed member cannot take over ANOTHER member's holder.
+    ///
+    /// The attack this refuses, reproduced end to end below: the allow-list authorizes an
+    /// *email*, but the row written is keyed on `(channel, holder)` and `holder` arrives from
+    /// the caller. The upstream attestation check stops a forged key, not a replayed one --
+    /// and every member legitimately receives the other members' `(noise_pubkey,
+    /// attestation)` from the edge's authorize response. So Mallory, who is on the same
+    /// allow-list, could re-submit Alice's earlier attested key and `INSERT OR REPLACE`
+    /// Alice's pinned key back to a value Alice had rotated away from; the same write also
+    /// replaced the subject link, redirecting Alice's deposited grant to Mallory.
+    ///
+    /// Both halves are asserted, because closing only the key half would leave the grant
+    /// redirect standing and the test would still look green.
+    #[test]
+    fn an_allow_listed_member_cannot_take_over_another_members_holder_577() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0xa7u8; 32]);
+        let alice = [0x01u8; 32];
+        let old_key = [0xc0u8; 32]; // what Alice rotated away from -- assume it leaked
+        let new_key = [0xc9u8; 32]; // Alice's current key
+        assert!(s.register_channel(&ch, &[0x11u8; 32], "owner").unwrap());
+        assert!(s.allowlist_add(&ch, "owner", "alice@example.com", 1_000).unwrap());
+        assert!(s.allowlist_add(&ch, "owner", "mallory@example.com", 1_000).unwrap());
+
+        assert!(s
+            .claim_via_allowlist(&ch, "alice@example.com", &alice, &old_key, &[0u8; 64], 2_000, Some("subj-alice"))
+            .unwrap()
+            .claimed());
+        assert!(
+            s.claim_via_allowlist(&ch, "alice@example.com", &alice, &new_key, &[0u8; 64], 2_100, Some("subj-alice"))
+                .unwrap()
+                .claimed(),
+            "Alice rotating her own key must keep working -- the guard binds the holder to a \
+             subject, it does not freeze the key"
+        );
+
+        // Mallory is genuinely allow-listed, so this is NOT a membership refusal.
+        assert_eq!(
+            s.claim_via_allowlist(&ch, "mallory@example.com", &alice, &old_key, &[0u8; 64], 2_200, Some("subj-mallory"))
+                .unwrap(),
+            ClaimOutcome::HolderClaimedByAnother,
+            "an allow-listed stranger must not be able to re-pin another member's key"
+        );
+
+        assert_eq!(
+            s.member_noise_key(&ch, &alice).unwrap(),
+            Some(new_key),
+            "Alice's pinned key must still be the one she rotated TO -- a successful rollback \
+             here is what would let a leaked static key complete handshakes as Alice"
+        );
+        assert!(
+            s.deposited_grants_for_subject(&ch, "subj-mallory").unwrap().is_empty(),
+            "and the subject link must not have moved: it is what scopes deposited-grant \
+             pickup, so taking it over redirects the victim's own grant"
+        );
+    }
+
     #[test]
     fn remove_member_is_a_complete_revocation_and_spares_siblings() {
         let s = SqliteChannelStore::open_in_memory().unwrap();
@@ -7452,10 +7562,10 @@ mod tests {
         // One subject claims BOTH holders on this channel.
         assert!(s
             .claim_via_allowlist(&ch, "tester@example.com", &stale, &[0xc1u8; 32], &[0u8; 64], 2_000, Some("subj-t"))
-            .unwrap());
+            .unwrap().claimed());
         assert!(s
             .claim_via_allowlist(&ch, "tester@example.com", &good, &[0xc2u8; 32], &[0u8; 64], 2_100, Some("subj-t"))
-            .unwrap());
+            .unwrap().claimed());
         assert_eq!(s.deposit_grant(&ch, "owner", &stale, "aaaa", 2_200).unwrap(), GrantDepositOutcome::Deposited);
         assert_eq!(s.deposit_grant(&ch, "owner", &good, "bbbb", 2_300).unwrap(), GrantDepositOutcome::Deposited);
         // Both fetchable before revocation.
@@ -7502,11 +7612,11 @@ mod tests {
         assert!(!s.allowlist_contains(&ch, "someone-else@example.com").unwrap());
 
         // An email NOT on the allow-list can't claim.
-        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest, 3_000, None).unwrap());
+        assert!(!s.claim_via_allowlist(&ch, "stranger@example.com", &holder, &noise, &attest, 3_000, None).unwrap().claimed());
         assert!(!s.is_member(&ch, &holder).unwrap());
 
         // The allow-listed email claims successfully (owner never involved in this call).
-        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest, 3_000, None).unwrap());
+        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &holder, &noise, &attest, 3_000, None).unwrap().claimed());
         assert!(s.is_member(&ch, &holder).unwrap());
 
         // Owner removes the email; a FUTURE claim by a new holder is refused, but the
@@ -7517,11 +7627,11 @@ mod tests {
         assert_eq!(s.allowlist_list(&ch, "alice").unwrap(), Some(vec![]));
         assert!(s.is_member(&ch, &holder).unwrap(), "de-listing doesn't revoke an existing member");
         let another_holder = [0x99u8; 32];
-        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest, 4_000, None).unwrap());
+        assert!(!s.claim_via_allowlist(&ch, "nat@example.com", &another_holder, &noise, &attest, 4_000, None).unwrap().claimed());
 
         // An unknown channel's allow-list is always empty -> claim always false.
         let unknown = ChannelId([0xAB; 32]);
-        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest, 4_000, None).unwrap());
+        assert!(!s.claim_via_allowlist(&unknown, "nat@example.com", &holder, &noise, &attest, 4_000, None).unwrap().claimed());
     }
 
     #[test]
@@ -7551,7 +7661,7 @@ mod tests {
         assert!(listed.iter().all(|(_, claimed_at)| claimed_at.is_none()));
 
         // Claim on ch_a only -> that one shows claimed_at, ch_b still pending.
-        assert!(s.claim_via_allowlist(&ch_a, "nat@example.com", &holder, &noise, &attest, 5_000, None).unwrap());
+        assert!(s.claim_via_allowlist(&ch_a, "nat@example.com", &holder, &noise, &attest, 5_000, None).unwrap().claimed());
         let listed = s.channels_for_email("nat@example.com").unwrap();
         let a_status = listed.iter().find(|(c, _)| *c == ch_a).unwrap().1;
         let b_status = listed.iter().find(|(c, _)| *c == ch_b).unwrap().1;
