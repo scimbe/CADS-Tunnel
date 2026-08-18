@@ -76,6 +76,16 @@ completely, while both at 0 means nothing was measured, not that offload succeed
          # regression signal.\n\
          # TYPE ct_edge_channel_park_reaped_total counter\n\
          ct_edge_channel_park_reaped_total {channel_park_reaped}\n\
+         # HELP ct_edge_channel_park_superseded_total Parks torn down because the SAME holder\n\
+         # re-joined past the per-member park-queue cap. Split out from the reap counter\n\
+         # because the two are identical on the wire BY DESIGN (both send the park-expiry\n\
+         # signal so a live client re-parks instead of reading a refusal) and mean opposite\n\
+         # things: a rising reap rate means nobody is coming, a rising supersede rate means\n\
+         # one holder keeps re-joining before its partner arrives -- a client retry storm.\n\
+         # Before this existed a supersede incremented nothing, so parks-minus-reaps drifted\n\
+         # upward and read as healthy live parks.\n\
+         # TYPE ct_edge_channel_park_superseded_total counter\n\
+         ct_edge_channel_park_superseded_total {channel_park_superseded}\n\
          # HELP ct_edge_front_door_client_aborts_total :443 front-door connections that ended\n\
          # in a BENIGN client abort (ECONNRESET, EPIPE, or a peer that dropped the connection\n\
          # without sending TLS close_notify) since start (#533) -- normal client behavior, not\n\
@@ -117,6 +127,7 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         channel_splices = crate::channel_broker::channel_relay_totals().1,
         channel_pairs = crate::channel_broker::channel_rendezvous_pairs_total(),
         channel_park_reaped = crate::channel_broker::channel_park_reaped_total(),
+        channel_park_superseded = crate::channel_broker::channel_park_superseded_total(),
         front_door_client_aborts = crate::serve::front_door_client_aborts_total(),
         failovers = state.failovers_total(),
         tcp_parked = state.tcp_parked(),
@@ -437,6 +448,10 @@ mod tests {
         // #530: the channel-pairer reap counter renders (value is a process-wide
         // static shared with other tests, so assert presence, not a number).
         assert!(body.contains("ct_edge_channel_park_reaped_total"), "{body}");
+        // ...and beside it the supersede counter, which is the whole point of the split:
+        // if only one of the two renders, an operator reading /metrics cannot tell a
+        // "nobody is coming" churn from a same-holder retry storm.
+        assert!(body.contains("ct_edge_channel_park_superseded_total"), "{body}");
         // #533: same for the front-door benign client-abort counter.
         assert!(body.contains("ct_edge_front_door_client_aborts_total"), "{body}");
     }

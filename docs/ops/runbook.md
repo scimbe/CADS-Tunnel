@@ -857,6 +857,27 @@ absence of any effect would otherwise be indistinguishable from the setting not 
 up — opposite problems with opposite fixes. `no` is not a fault: a browser member on `:4437`
 cannot choose an ALPN at all.
 
+**Park churn has two causes, and they need opposite responses.** A parked leg disappears
+either because its TTL ran out with no partner, or because the *same holder* re-joined past
+the per-member park-queue cap and superseded its own oldest park. On the wire the two are
+deliberately identical — both send the park-expiry signal so a live client re-parks instead
+of misreading the close as a refusal — so only the counters tell them apart:
+
+```
+ct_edge_channel_park_reaped_total      …   <- nobody is coming: idle parks aging out
+ct_edge_channel_park_superseded_total  …   <- one holder keeps re-joining: a retry storm
+```
+
+A rising *reap* rate points at the TTL (see `CT_EDGE_KA_PARK_TTL_SECS` below). A rising
+*supersede* rate points at a client, and is the failure the join backoff (#231/#250) exists
+for — chasing it with a longer TTL makes it worse, not better. Before the supersede counter
+existed this second case incremented nothing at all: legs vanished, the reap counter stayed
+flat, and parks-minus-reaps drifted upward looking like healthy live parks.
+
+No alert threshold is stated here on purpose. A supersede has never been observed in this
+deployment, so any number written down now would be invented rather than measured; the
+counter comes first, the rule after a baseline exists.
+
 **`CT_EDGE_KA_PARK_TTL_SECS` has a rollout order, not just a value.** A KA-negotiated park is
 observed (10 s NUL ticks, corpse detection ≤10 s), so a longer TTL is no resource risk and
 ends the idle re-park cycle. But raising it before the deployed agents carry the tick-based

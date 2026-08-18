@@ -1462,6 +1462,40 @@ pub(crate) fn note_channel_park_reaped() {
     CHANNEL_PARK_REAPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Parks torn down because the SAME holder re-joined past the [`PARKS_PER_MEMBER`] queue
+/// cap — [`PairOutcome::Superseded`].
+///
+/// Deliberately separate from [`CHANNEL_PARK_REAPED`], because the two are indistinguishable
+/// everywhere else and mean opposite things. On the wire they are identical **by design**:
+/// a superseded leg gets the same `EX` token / `park-expired:` close reason a TTL reap
+/// sends, so a live client re-parks on the same rung instead of misreading the close as a
+/// refusal. Toward the operator that sameness was **not** a decision, it was an omission —
+/// a supersede incremented nothing and logged nothing at all, while a TTL reap has a
+/// counter, a throttled per-member line and a window summary.
+///
+/// The two questions they answer are different:
+///
+/// * a rising reap rate means *nobody is coming* — idle parks aging out (tune the TTL, #506);
+/// * a rising supersede rate means *the same holder keeps re-joining* before its partner
+///   arrives, i.e. a client retry storm — the failure #231/#250 exist for.
+///
+/// Without this split both look like park churn, and the second one looked like nothing:
+/// legs vanished without incrementing the reap counter, so parks-minus-reaps drifted upward
+/// and read as "lots of healthy live parks".
+static CHANNEL_PARK_SUPERSEDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `ct_edge_channel_park_superseded_total` for `/metrics`.
+pub fn channel_park_superseded_total() -> u64 {
+    CHANNEL_PARK_SUPERSEDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count one park torn down by a same-holder re-join. Counted, not logged per occurrence:
+/// a supersede storm is by definition a flood, and one line each would reproduce the flood
+/// in the log — the same argument the reap line's throttle already makes.
+fn note_channel_park_superseded() {
+    CHANNEL_PARK_SUPERSEDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// #530: how long one reap-log summary window lasts. Within a window, each
 /// (channel,holder) pair gets ONE full per-member log line (its first reap); further
 /// reaps of the same pair only feed the window's aggregate, spoken as a single
@@ -2430,6 +2464,7 @@ where
             // and the write vanishes harmlessly, like the reaper's. Spawned (#511): the
             // notify's graceful close drains up to 2s, and this is the NEW member's
             // admission path — the fresh park must not wait out the stale leg's teardown.
+            note_channel_park_superseded();
             tokio::spawn(stale.payload.notify_park_expired());
             Ok(None)
         }
@@ -2918,6 +2953,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                 // through no fault of its grant, exactly like a TTL reap. The suffix stays
                 // honest about WHY.
                 PairOutcome::Superseded(stale) => {
+                    note_channel_park_superseded();
                     stale.payload.conn.close(
                         0u32.into(),
                         quic_park_expired_reason("superseded by a newer join from the same holder").as_bytes(),
@@ -4918,6 +4954,74 @@ mod tests {
         );
         for c in clients {
             c.abort(); // still parked -- nothing to read; the test only asserts the superseded one
+        }
+    }
+
+    /// A supersede must be countable, and countable as ITSELF -- not as a reap.
+    ///
+    /// The two are identical on the wire on purpose (the test above pins that: a superseded
+    /// leg gets the same `EX` a TTL reap sends, so a live client re-parks instead of reading
+    /// a refusal). Toward the operator that sameness was an omission: a supersede
+    /// incremented nothing, so a holder retry storm -- the failure #231/#250 exist for --
+    /// left the reap counter flat and the park counter climbing, which reads as healthy
+    /// live parks.
+    ///
+    /// Driven through the REAL `admit_and_pair_on_stream` path, not by calling the counter:
+    /// a test that calls `note_channel_park_superseded` directly would pass even if no
+    /// production site ever did.
+    #[tokio::test]
+    async fn a_supersede_is_counted_as_a_supersede_and_not_as_a_reap() {
+        use std::sync::Mutex;
+        let pk = operator_pubkey();
+        let channel = [0x9Au8; 32];
+        let holder = holder_sk(0xc4);
+        let pairer: Mutex<ChannelPairer<AdmittedStreamMember<tokio::io::DuplexStream>>> =
+            Mutex::new(ChannelPairer::new());
+        let authorize =
+            move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+        let obs: std::net::SocketAddr = "203.0.113.10:9010".parse().unwrap();
+
+        let before = channel_park_superseded_total();
+        let mut clients = Vec::new();
+        for i in 0..=PARKS_PER_MEMBER {
+            let req = ChannelJoinRequest {
+                grant: grant_h(channel, &holder, Direction::Accept, 1_000),
+                endpoint: format!("203.0.113.10:9{i:03}"),
+            };
+            let sk = holder_sk(0xc4);
+            let (c, s) = tokio::io::duplex(4096);
+            clients.push(tokio::spawn(async move {
+                let mut c = c;
+                let rb = req.encode();
+                c.write_all(&(rb.len() as u16).to_be_bytes()).await.expect("len");
+                c.write_all(&rb).await.expect("req");
+                let mut ch = [0u8; 32];
+                c.read_exact(&mut ch).await.expect("challenge");
+                c.write_all(&sk.sign(&ch).to_bytes()).await.expect("sig");
+                let mut buf = Vec::new();
+                let _ = c.read_to_end(&mut buf).await;
+            }));
+            admit_and_pair_on_stream(s, obs, 500, std::time::Duration::from_secs(5), &authorize, 10_000, &pairer, None)
+                .await
+                .expect("admit");
+        }
+
+        // `>=`, not `==`: this counter is process-wide and the #499 test above drives the
+        // same path concurrently. The claim that matters is that the path increments it AT
+        // ALL, which it did not before.
+        assert!(
+            channel_park_superseded_total() >= before + 1,
+            "the (cap+1)th same-holder offer must be counted as a supersede: {} did not exceed {before}",
+            channel_park_superseded_total()
+        );
+        // Deliberately NOT asserted: that the reap counter stayed put. It is process-wide
+        // too, so "did not move" is a statement about every other test running right now,
+        // not about this code path -- it would be a flake, not a check. What actually
+        // separates the two here is that the `Superseded` arm calls only the supersede
+        // counter; the reap counter is incremented solely by the TTL drain loops in
+        // `serve.rs` and `ws_channel.rs`, which this test never runs.
+        for c in clients {
+            c.abort();
         }
     }
 
