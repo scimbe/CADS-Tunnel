@@ -725,21 +725,34 @@ async fn payment_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // #561: these two header checks refuse the request just as the signature
+    // check does, so they are counted the same way. Found by actually poking the
+    // deployed endpoint: a probe that does not send our headers at all -- which
+    // is exactly what an attacker scanning `/payment/webhook` sends -- never
+    // reached the verifier below, so it left no trace whatsoever. Instrumenting
+    // only the cryptographic check would have watched the one path a forger is
+    // least likely to take.
     let timestamp = headers
         .get("x-ct-webhook-timestamp")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "missing or invalid X-CT-Webhook-Timestamp".to_string(),
-        ))?;
+        .ok_or_else(|| {
+            note_payment_webhook_rejected("missing or invalid X-CT-Webhook-Timestamp");
+            (
+                StatusCode::BAD_REQUEST,
+                "missing or invalid X-CT-Webhook-Timestamp".to_string(),
+            )
+        })?;
     let signature = headers
         .get("x-ct-webhook-signature")
         .and_then(|v| v.to_str().ok())
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "missing X-CT-Webhook-Signature".to_string(),
-        ))?;
+        .ok_or_else(|| {
+            note_payment_webhook_rejected("missing X-CT-Webhook-Signature");
+            (
+                StatusCode::BAD_REQUEST,
+                "missing X-CT-Webhook-Signature".to_string(),
+            )
+        })?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -9951,6 +9964,80 @@ mod tests {
             7,
             "idempotent: no double credit"
         );
+    }
+
+    /// #561: EVERY way the webhook endpoint refuses a request has to be
+    /// countable, not just the cryptographic one.
+    ///
+    /// This test exists because the first version of #561 instrumented only the
+    /// signature verifier, and a probe against the deployed endpoint then moved
+    /// no counter at all: a request without our headers is refused earlier, with
+    /// a 400. That is precisely the shape of a scan — someone poking
+    /// `/payment/webhook` does not guess two custom header names first — so the
+    /// one path an attacker actually takes was the one path left unwatched.
+    #[tokio::test]
+    async fn every_webhook_refusal_is_counted_not_just_the_signature_one_561() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(WebhookVerifier::new(b"whsec_test".to_vec(), 300));
+        let app = payment_webhook_router(ledger, verifier);
+
+        // Deltas, and `>=` rather than `==`: the counter is process-wide and the
+        // sibling webhook test above runs concurrently in this same binary and
+        // increments it too. Exact equality here would be a flake, not a check.
+        let before = refusal_counters().2;
+        let at_least = |n: u64, what: &str| {
+            let now = refusal_counters().2;
+            assert!(now >= before + n, "{what}: {now} < {} (+{n})", before + n);
+        };
+
+        // 1. No headers at all -- the scan shape.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/payment/webhook")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"type":"probe"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        at_least(1, "a header-less probe is counted");
+
+        // 2. Timestamp present, signature header missing.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/payment/webhook")
+                    .header("x-ct-webhook-timestamp", "1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"type":"probe"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        at_least(2, "a half-formed probe is counted");
+
+        // 3. Both headers present but the signature does not verify -- the path
+        //    that was already covered, asserted here so the three stay together.
+        let resp = app
+            .oneshot(
+                Request::post("/payment/webhook")
+                    .header("x-ct-webhook-timestamp", "1")
+                    .header("x-ct-webhook-signature", "deadbeef")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"type":"probe"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        at_least(3, "a forged signature is counted");
     }
 
     #[tokio::test]
