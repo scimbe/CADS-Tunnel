@@ -121,11 +121,19 @@ pub fn authorized_channels(
 }
 
 /// Whether an operator's declared overlay authorizes `channel` — true iff some declared link
-/// `(a, b)` derives exactly it (#107-enforce / #102-broker-enforce). The predicate the
-/// broker-enforce admission gate calls so a member is admissible to a channel only when the
-/// declared topology actually contains the link that names it; an edge removed from the overlay
-/// stops authorizing its channel with no per-channel bookkeeping. Canonical order-independent, so
-/// `(a, b)` and `(b, a)` authorize the same channel.
+/// `(a, b)` derives exactly it (#107-enforce / #102-broker-enforce). Canonical
+/// order-independent, so `(a, b)` and `(b, a)` authorize the same channel.
+///
+/// #582: **not currently consulted by any live admission gate** — checked, not assumed
+/// (`crates/edge/src/channel_broker.rs` calls neither this nor [`channel_id_for_link`]
+/// anywhere). The live gate, [`crate::channel::verify_stateless`]-based
+/// `authorize_channel_pair` in that file, admits a channel purely on two matching, valid
+/// grants for it; it has no concept of a declared network topology at all. This function
+/// is part of an overlay-declaration feature (with [`elect_superpeers`] here and
+/// `plan_network_overlay`/`link_cost_from_probes` in `crate::overlay`) that is fully
+/// built and tested but not wired into live channel admission anywhere in either
+/// workspace. If that wiring ever happens, this is the predicate to call — until then, a
+/// removed overlay link does NOT actually revoke the channels it used to authorize.
 pub fn overlay_authorizes_channel(
     operator_pubkey: &[u8; 32],
     links: &[([u8; 32], [u8; 32])],
