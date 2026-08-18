@@ -3341,6 +3341,14 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // the Edge stays payload-blind. Off by default; set
     // CT_EDGE_BROWSER_LISTEN=0.0.0.0:443. Hostnames are bound by agents via 'H'.
     if let Ok(addr) = std::env::var("CT_EDGE_BROWSER_LISTEN") {
+        // The intent is recorded HERE -- the operator set the variable, so this listener is
+        // expected -- and NOT further down as an argument to `serve_listener`, which is only
+        // reached once the bind has already succeeded. Same placement, and the same reason,
+        // as the relay/rendezvous loops below (#539): a failed bind must read as "expected
+        // but absent", not as "never wanted". Before the variable is even parsed, so a
+        // malformed address counts too: that is also a listener the operator asked for and
+        // did not get.
+        let browser_health = state.expect_listener("Browser-Plane SNI listener", unix_now());
         match addr.parse::<SocketAddr>() {
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
                 Ok(bl) => {
@@ -3364,7 +3372,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         "Browser-Plane SNI listener",
                         None,
                         shutdown.clone(),
-                        Some(state.expect_listener("Browser-Plane SNI listener", unix_now())),
+                        Some(browser_health),
                         move |tcp, _addr, permit| {
                             let state = bstate.clone();
                             let browser_tunnel_cap = browser_tunnel_cap_bl.clone();
@@ -3414,6 +3422,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     let mut _relay_pairer_keepalive: Option<crate::channel_broker::SharedQuicChannelPairer> = None;
     let mut _rendezvous_pairer_keepalive: Option<crate::channel_broker::SharedQuicChannelPairer> = None;
     if let Ok(addr) = std::env::var("CT_FRONT_DOOR") {
+        // The severe one. `:443` is the entire public surface of this edge: if this bind
+        // fails, every tunnel is dead. Until this line the failure reached only the
+        // `eprintln!` in the Err arm below -- `/healthz` kept answering 200 (the listener
+        // that never started also never registered, and an absent row cannot fail a check),
+        // the container healthcheck stayed green, and nothing restarted. Recorded before the
+        // parse for the same reason as the Browser-Plane listener above.
+        let front_door_health = state.expect_listener(":443 front door", unix_now());
         match addr.parse::<SocketAddr>() {
             Ok(listen) => match tokio::net::TcpListener::bind(listen).await {
                 Ok(fl) => {
@@ -3658,7 +3673,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         ":443 front door",
                         None,
                         shutdown.clone(),
-                        Some(state.expect_listener(":443 front door", unix_now())),
+                        Some(front_door_health),
                         move |tcp, _addr, permit| {
                             let state = fstate.clone();
                             let acceptor = facceptor.clone();
