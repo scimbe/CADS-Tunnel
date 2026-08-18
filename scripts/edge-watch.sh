@@ -326,6 +326,18 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
       TARGETS="$TARGETS https://${ENTRY%%=*}.$ZONE/=${ENTRY##*=}"
     done
     TARGETS="$TARGETS $URLS"
+    # Wieviele Adressen SOLLTEN geprueft werden. Unten wird mitgezaehlt, wieviele
+    # es tatsaechlich wurden, und beides muss uebereinstimmen.
+    #
+    # Anlass: dieser Waechter meldete "Edge in Ordnung (Dienste geprueft: 0)" mit
+    # Exit 0, wenn die Liste zu nichts ausgewertet wurde -- ein Lauf, der NICHTS
+    # geprueft hat, las sich exakt wie ein sauberer. Fuer das Deploy-Fenster wird
+    # genau dieser Fall weiter oben schon ausdruecklich gesagt ("kein Freispruch");
+    # ausserhalb davon fehlte er. Ein leerer Vorgabewert ist durch `:-` abgedeckt,
+    # eine Liste aus Leerraum nicht -- und ebensowenig ein kuenftiger Tippfehler in
+    # der Zerlegung, der still Eintraege verschluckt.
+    TARGETS_EXPECTED=0
+    for _E in $TARGETS; do TARGETS_EXPECTED=$((TARGETS_EXPECTED + 1)); done
 
     DOWN=""
     for ENTRY in $TARGETS; do
@@ -387,6 +399,14 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
       else
         log "voruebergehender Aussetzer, beim zweiten Durchgang wieder erreichbar:$DOWN"
       fi
+    fi
+    # Die Deckungspruefung: hat der Durchlauf ueberhaupt das geprueft, was er
+    # pruefen sollte? Das Ergebnis "alles in Ordnung" ist nur so viel wert wie die
+    # Zahl der Adressen dahinter.
+    if [ "$SITES_CHECKED" -ne "$TARGETS_EXPECTED" ]; then
+      ALARMS+=("Die Dienstpruefung hat $SITES_CHECKED von $TARGETS_EXPECTED Adressen geprueft. Eine Abweichung heisst, dass die Liste nicht zu dem ausgewertet wurde, was sie soll -- das Ergebnis dieses Laufs traegt nicht. Listen: CT_WATCH_SITES / CT_WATCH_URLS.")
+    elif [ "$TARGETS_EXPECTED" -eq 0 ]; then
+      ALARMS+=("Die Dienstpruefung hatte NICHTS zu pruefen (leere Liste). Kein Freispruch, sondern eine ausgefallene Pruefung -- CT_WATCH_SITES/CT_WATCH_URLS pruefen.")
     fi
   fi
 fi
