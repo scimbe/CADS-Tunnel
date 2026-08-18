@@ -1741,8 +1741,19 @@ pub async fn serve_connection(
             match open_agent_stream(state, &token).await {
                 Ok((agent_send, agent_recv)) => {
                     let mut th_buf = [0u8; 8];
-                    let (a, b) =
-                        relay_quic(send, recv, agent_send, agent_recv, token_hex(&token, &mut th_buf)).await?;
+                    // #554: this is the QUIC data plane -- a ct-client talking to its agent --
+                    // and it was the ONE token-carrying relay the guard never covered. The
+                    // structural test enumerated `relay(&mut` / `framed_relay(&mut` and this
+                    // call is neither: a different relay function, and split over two lines so
+                    // no line-shaped pattern could have matched it either. Revoking a tunnel's
+                    // token therefore did not cut an already-flowing client session here, while
+                    // it did on every other transport.
+                    let (a, b) = until_revoked(
+                        state,
+                        &token,
+                        relay_quic(send, recv, agent_send, agent_recv, token_hex(&token, &mut th_buf)),
+                    )
+                    .await?;
                     state.note_relay(&token, a, b, crate::state::RelayKind::DataPlane); // #10 O2
                     Ok(None)
                 }
@@ -2833,7 +2844,17 @@ where
         return Err(format!("peer edge refused mesh-relay for '{host}'").into());
     }
 
-    relay(&mut inbound, &mut peer).await?;
+    // This leg carries no routing token of OURS. We are the middle hop, and the peer edge
+    // owns the tunnel and applies its own revocation to the session it terminates. Cutting
+    // here on a local revocation would tear down traffic we do not own.
+    //
+    // Stated at the call site rather than left to the pattern: the previous version of the
+    // guard happened not to match this line, which is indistinguishable from an exemption
+    // nobody ever decided. The marker sits INSIDE the call expression: the guard reads
+    // statements, so a marker in the prose above can be split off by any punctuation (a
+    // semicolon in a sentence did exactly that), and one after the `;` already belongs to
+    // the next statement. Inside the parentheses it cannot be separated from what it exempts.
+    relay(&mut inbound, /* #554-exempt: peer edge owns this tunnel */ &mut peer).await?;
     Ok(())
 }
 
@@ -5482,10 +5503,25 @@ mod tests {
         // in for an agent or origin.
         let prod = src.split("\n#[cfg(test)]\n").next().unwrap();
 
-        let unguarded: Vec<&str> = prod
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with("let (") && (l.contains("= relay(&mut") || l.contains("= framed_relay(&mut")))
+        // Statement-shaped, not line-shaped, and by relay FUNCTION rather than by call form.
+        // The first version enumerated `let (… = relay(&mut` / `= framed_relay(&mut`, and
+        // missed the QUIC data plane twice over: `relay_quic` was not in the list, and its
+        // call is split across two lines so no line-shaped pattern could match it. That is
+        // the one relay a ct-client's own traffic takes, and it went unguarded while this
+        // test read as "every token-carrying relay is covered".
+        //
+        // Now: join continuations, split on `;`, and require the guard in the same statement
+        // as any relay-family call. A new relay function is caught by being a call at all.
+        let flat = prod.replace('\n', " ");
+        let unguarded: Vec<String> = flat
+            .split(';')
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|s| {
+                ["relay(", "framed_relay(", "relay_quic("]
+                    .iter()
+                    .any(|f| s.contains(&format!(" {f}")) || s.contains(&format!("={f}")) || s.contains(&format!("= {f}")))
+            })
+            .filter(|s| !s.contains("until_revoked") && !s.contains("#554-exempt"))
             .collect();
 
         assert!(
