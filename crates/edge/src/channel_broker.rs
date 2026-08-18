@@ -3393,6 +3393,30 @@ mod tests {
         assert!(admissible_endpoint(&mk("203.0.113.10:7001")), "a public address is still admitted");
     }
 
+    /// Wire-Probe (#495 U2): traegt das `endpoint`-Feld einen Faehigkeits-Marker?
+    ///
+    /// Der letzte verbliebene Kandidat, nachdem das Praeambel-Byte (definitive Abweisung
+    /// samt #509-Strafe) und ALPN (Stichtag, gemessen in `pki.rs`) ausgeschieden sind. Der
+    /// Rumpf der Anfrage ist `grant(fest) | endpoint(Rest)` und hat keine Feldstruktur --
+    /// ein Marker koennte nur an die Endpunkt-Zeichenkette angehaengt werden.
+    ///
+    /// Gemessen statt geschlossen: `safe_endpoint` parst die GANZE Zeichenkette strikt,
+    /// und das relay-only-Sentinel wird exakt verglichen. Damit ist auch dieser Weg zu.
+    #[test]
+    fn an_endpoint_with_an_appended_capability_marker_is_refused_495_u2() {
+        use ct_common::channel::CHANNEL_ENDPOINT_RELAY_ONLY;
+        assert!(safe_endpoint("203.0.113.9:9001").is_some(), "die nackte Adresse ist zulaessig");
+        assert!(
+            safe_endpoint("203.0.113.9:9001;ss").is_none(),
+            "ein angehaengter Marker macht die Adresse unparsbar -- der Bestands-Edge weist ab"
+        );
+        let relay_only_with_marker = format!("{CHANNEL_ENDPOINT_RELAY_ONLY};ss");
+        assert_ne!(
+            relay_only_with_marker, CHANNEL_ENDPOINT_RELAY_ONLY,
+            "und am relay-only-Sentinel ebenso: es wird exakt verglichen"
+        );
+    }
+
     #[test]
     fn safe_endpoint_rejects_private_and_internal_ranges() {
         // #94: a peer dials the advertised endpoint, so only publicly-routable
