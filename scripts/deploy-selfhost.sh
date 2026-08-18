@@ -282,15 +282,49 @@ running_setting() {     # what the container that is up right now actually has
     | sed -n "s/^${2}=//p" | tail -1
 }
 check_no_silent_security_downgrade() {
-  # service | variable | how "armed" is spelled | what is lost
+  # WHICH variables are watched is derived, not listed.
+  #
+  # The first version carried a table of two. That table was a snapshot: the compose files
+  # define five switches that can silently vanish (`"${VAR:-}"` -- unset in the environment
+  # and the container comes up without them), and the two it named were the two I happened to
+  # be thinking about. One of the three it missed is `CT_EDGE_ADMIN_TOKEN`, whose absence
+  # disables tunnel revocation outright -- the very capability #554/#566 spent this night
+  # making reliable, switched off by a deploy nobody would question.
+  #
+  # So: read the switches out of the compose files this deploy actually uses. A switch added
+  # to a compose file is watched the day it is added, without anyone remembering this script.
+  local composes=("$COMPOSE_BASE")
+  [ "$FRONTDOOR" = "1" ] && composes+=("$COMPOSE_FRONTDOOR")
+  [ "$SSO" = "1" ] && composes+=("$COMPOSE_SSO")
+  grep -q '^CT_RELAY_NODE_PEER=..*' "$ENV_FILE" 2>/dev/null && composes+=("$COMPOSE_RELAY")
+  local watched
+  watched=$(grep -hoE '^[[:space:]]+CT_[A-Z_]+: "\$\{CT_[A-Z_]+:-\}"' "${composes[@]}" 2>/dev/null \
+            | grep -oE 'CT_[A-Z_]+' | sort -u)
+
+  # Annotations only -- never the scope. An unannotated switch is still watched; it just gets
+  # a generic sentence instead of a specific one. That is the whole point: a switch nobody
+  # annotated must not thereby become invisible.
   local rows=(
-    "edge|CT_EDGE_REQUIRE_ATTESTED_ENDPOINT|exactly-1|endpoint attestation (#546): a channel join from an address that contradicts the advertised one is refused"
-    "control-plane|CT_CP_EDGE_ADMIN_TOKEN|non-empty|the control plane's admin gate (#543): without a token it does not fail -- it is simply absent"
+    "CT_EDGE_REQUIRE_ATTESTED_ENDPOINT|exactly-1|endpoint attestation (#546): a channel join from an address that contradicts the advertised one is refused"
+    "CT_CP_EDGE_ADMIN_TOKEN|non-empty|the control plane's admin gate (#543): without a token it does not fail -- it is simply absent"
+    "CT_EDGE_ADMIN_TOKEN|non-empty|tunnel revocation on the edge (#27 RB3): absent, the edge cannot cut a revoked tunnel at all"
+    "CT_PORTAL_SESSION_KEY|non-empty|a stable portal session key: absent, every restart signs sessions with a fresh random key and logs everyone out"
+    "CT_OIDC_ISSUER|non-empty|OIDC/SSO on the portal: absent, /me/* stays disabled"
   )
-  local downgrades=() row svc var how what now next armed_now armed_next
-  for row in "${rows[@]}"; do
-    IFS='|' read -r svc var how what <<<"$row"
-    now=$(running_setting "$svc" "$var") || continue   # nothing running -> nothing to lose
+  local downgrades=() row var how what now next armed_now armed_next svc
+  for var in $watched; do
+    how=non-empty
+    what="the switch $var (no annotation in this script -- watched anyway)"
+    for row in "${rows[@]}"; do
+      case "$row" in "$var|"*) IFS='|' read -r _ how what <<<"$row" ;; esac
+    done
+    # Which service carries it is derived too: ask both, take the one that has it. A
+    # hand-kept service column would be a second snapshot next to the first.
+    now=""
+    for svc in edge control-plane; do
+      now=$(running_setting "$svc" "$var") && [ -n "$now" ] && break
+    done
+    [ -n "${now:-}" ] || continue                      # not set anywhere now -> nothing to lose
     next=$(effective_setting "$var")
     case "$how" in
       exactly-1) [ "$now" = "1" ] && armed_now=1 || armed_now=0
@@ -301,7 +335,7 @@ check_no_silent_security_downgrade() {
     # Only the arming direction matters. Values are never printed: one of these
     # is a secret, and the answer the operator needs is on/off, not its content.
     if [ "$armed_now" = "1" ] && [ "$armed_next" != "1" ]; then
-      downgrades+=("$var is armed on the running $svc, and this deploy would leave it unset -- losing $what")
+      downgrades+=("$var is armed on the running stack, and this deploy would leave it unset -- losing $what")
     fi
   done
   [ ${#downgrades[@]} -eq 0 ] && return 0
