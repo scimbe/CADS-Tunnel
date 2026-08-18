@@ -927,13 +927,35 @@ const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// reaper [`ChannelFrontDoor::new`] spawns (#256) — this constant alone only marks eligibility.
 const CHANNEL_PARK_TTL_SECS: u64 = 30;
 
+/// #575: the first ct-agent release whose KA legs actually survive a long park.
+///
+/// This number is the whole safety argument for raising `CT_EDGE_KA_PARK_TTL_SECS`, and it
+/// used to be prose repeated in three places, all three naming a release that was
+/// **v0.4.19 — never cut** (the v0.4 line ends at v0.4.18). An operator checking their fleet
+/// against it got an unanswerable question.
+///
+/// The real dates, from the ct-agent history:
+///
+/// | what | release |
+/// |---|---|
+/// | client OFFERS the KA ALPNs — which is what makes this edge grant the long TTL | v0.4.13 |
+/// | client CARRIES the tick-based wait contract — which is what makes the long TTL safe | v0.5.0 |
+///
+/// Those are six releases apart, so `v0.4.13`…`v0.4.18` claim the capability without
+/// implementing it: the edge grants them a long park and their unchanged 45 s admission
+/// bound abandons it. The ALPN handshake is therefore NOT proof of the wait contract, and
+/// this edge cannot tell the two generations apart — see #575 for the structural fix
+/// (a distinct ALPN id for the tick generation, which needs a client release first).
+/// Until then the floor is an operator obligation, not something the edge can verify.
+pub(crate) const KA_TICK_CONTRACT_MIN_AGENT: &str = "v0.5.0";
+
 /// #506: park TTL for a **KA-negotiated** `:443` leg, from `CT_EDGE_KA_PARK_TTL_SECS`.
 /// The 30 s default TTL predates the KA contract — it was the only bound when parks
 /// were blind; since #499b/#500 a KA park is OBSERVED (10 s NUL ticks, corpse
 /// detection ≤10 s), so a long TTL is no resource risk and ends the idle EX/re-park
 /// cycle. Defaults to [`CHANNEL_PARK_TTL_SECS`] (i.e. **unchanged**) because the
 /// deployed client fleet must first carry the tick-based wait contract (ct-agent
-/// v0.4.19): an older client's 45 s admission-exchange bound fires before a long
+/// [`KA_TICK_CONTRACT_MIN_AGENT`]): an older client's 45 s admission-exchange bound fires before a long
 /// park's EX, cycling at 45 s with stale parks holding permits — flip the env only
 /// once the fleet is ready (rollout order documented in #506). Non-KA legs always
 /// keep the short TTL: without ticks, the short bound IS their corpse control.
@@ -944,7 +966,26 @@ fn ka_park_ttl_secs_from(v: Option<&str>) -> u64 {
 }
 
 fn ka_park_ttl_secs() -> u64 {
-    ka_park_ttl_secs_from(std::env::var("CT_EDGE_KA_PARK_TTL_SECS").ok().as_deref())
+    let ttl = ka_park_ttl_secs_from(std::env::var("CT_EDGE_KA_PARK_TTL_SECS").ok().as_deref());
+    // #575: this edge CANNOT verify the precondition it depends on -- it never sees a client
+    // version, and the ALPN handshake that grants the long TTL was shipped six releases
+    // before the wait contract that makes it safe (see `KA_TICK_CONTRACT_MIN_AGENT`). So the
+    // one thing it can do is state the obligation, once, at the moment the switch starts
+    // mattering. Silence here was the whole problem: the flip left no trace naming what it
+    // assumed about the fleet, and the number it was assumed against did not exist.
+    if ttl != CHANNEL_PARK_TTL_SECS {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!(
+                "ct-edge: KA park TTL raised to {ttl}s (default {CHANNEL_PARK_TTL_SECS}s) -- \
+                 this is SAFE ONLY IF every ct-agent reaching this edge is \
+                 {KA_TICK_CONTRACT_MIN_AGENT} or newer; older KA clients (v0.4.13+) negotiate \
+                 the same ALPN but abandon a long park at their 45s admission bound. This edge \
+                 cannot check that (#575)."
+            );
+        });
+    }
+    ttl
 }
 
 /// Bound how long a public `:443` client may take to deliver its complete TLS ClientHello
@@ -4499,8 +4540,98 @@ mod tests {
 
     /// #506: the KA park TTL is env-driven and DEFAULTS to the unchanged 30 s — the
     /// long-park flip must be an explicit operator decision gated on the client
-    /// fleet carrying the v0.4.19 tick-based wait contract (an older client's 45 s
+    /// fleet carrying the [`KA_TICK_CONTRACT_MIN_AGENT`] tick-based wait contract (an older client's 45 s
     /// exchange bound would fire before a long park's EX). Garbage/zero stays safe.
+    /// #575: the operator-facing floor and the code's floor are the same number.
+    ///
+    /// The floor lived as a hand-copied version in three places and all three named
+    /// **v0.4.19, a release that was never cut** — so an operator checking their fleet
+    /// against the runbook got an unanswerable question, and the safety argument for
+    /// raising `CT_EDGE_KA_PARK_TTL_SECS` rested on nothing.
+    ///
+    /// Two assertions, both about things that actually drift: the runbook is where the
+    /// operator reads the floor, so it must state the constant; and the dead version must
+    /// be gone from the repo entirely, since a stale copy elsewhere is what produced this.
+    #[test]
+    fn the_runbook_states_the_same_ka_fleet_floor_as_the_code_575() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/edge -> repo root");
+        let runbook = std::fs::read_to_string(root.join("docs/ops/runbook.md"))
+            .expect("the runbook is the operator-facing half of this contract");
+        let claims: Vec<&str> = runbook
+            .lines()
+            .filter(|l| l.contains("ct-agent \u{2265} v"))
+            .collect();
+        assert!(
+            !claims.is_empty(),
+            "the runbook states no ct-agent version floor at all -- either the wording \
+             changed or the guidance was lost; both leave the operator without the number"
+        );
+        for line in &claims {
+            assert!(
+                line.contains(KA_TICK_CONTRACT_MIN_AGENT),
+                "the runbook states a ct-agent floor that is not {KA_TICK_CONTRACT_MIN_AGENT}: \
+                 {line}"
+            );
+        }
+
+        // Assembled, never spelled out: a test that searches for a literal cannot carry
+        // that literal in its own source, or it reports itself on every run.
+        const DEAD: &str = concat!("v0.4.", "19");
+        // The specific defect: a floor pointing at a release that does not exist. Searched
+        // across the whole repo because it was copied, and a copy left behind is the exact
+        // mechanism that made three sites agree on a wrong number.
+        let mut walk = vec![root.to_path_buf()];
+        let mut scanned = 0usize;
+        while let Some(dir) = walk.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if p.is_dir() {
+                    // `.git` carries every OLD revision of these files; failing on history
+                    // nobody can edit would make this test impossible to satisfy. `.claude`
+                    // holds agent worktrees -- scratch checkouts of arbitrary older commits,
+                    // found carrying exactly this stale copy on the first run of this test.
+                    if !matches!(name, "target" | ".git" | ".claude" | "node_modules") {
+                        walk.push(p);
+                    }
+                    continue;
+                }
+                if !matches!(
+                    p.extension().and_then(|s| s.to_str()),
+                    Some("rs") | Some("md") | Some("sh") | Some("yml")
+                ) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&p) else { continue };
+                scanned += 1;
+                for (i, line) in text.lines().enumerate() {
+                    // The one line that documents the dead version ON PURPOSE, as the
+                    // finding itself, says so on the same line -- deliberately, so this
+                    // exemption cannot silently widen to cover a genuine stale copy.
+                    if line.contains("never cut") {
+                        continue;
+                    }
+                    assert!(
+                        !line.contains(DEAD),
+                        "{}:{} still names {DEAD}, a ct-agent release that was never cut: \
+                         {line}",
+                        p.display(),
+                        i + 1
+                    );
+                }
+            }
+        }
+        assert!(
+            scanned >= 50,
+            "only {scanned} files scanned -- the walk broke, so finding no stale copy \
+             proves nothing"
+        );
+    }
+
     #[test]
     fn ka_park_ttl_defaults_to_the_short_ttl_and_parses_the_env_506() {
         assert_eq!(ka_park_ttl_secs_from(None), CHANNEL_PARK_TTL_SECS, "unset: unchanged");

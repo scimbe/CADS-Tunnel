@@ -930,7 +930,7 @@ counter comes first, the rule after a baseline exists.
 **`CT_EDGE_KA_PARK_TTL_SECS` has a rollout order, not just a value.** A KA-negotiated park is
 observed (10 s NUL ticks, corpse detection ≤10 s), so a longer TTL is no resource risk and
 ends the idle re-park cycle. But raising it before the deployed agents carry the tick-based
-wait contract (**ct-agent ≥ v0.4.19**) makes an older client's 45 s admission bound fire
+wait contract (**ct-agent ≥ v0.5.0**) makes an older client's 45 s admission bound fire
 first: the pair then cycles at 45 s with stale parks holding cap permits. Roll the fleet
 first, then raise this — the reverse order buys the cycling it was meant to end.
 
