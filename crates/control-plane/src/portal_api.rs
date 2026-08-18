@@ -4579,6 +4579,9 @@ mod tests {
             include_str!("../../../examples/help-site/compose.help-site.yml").contains(&format!("CT_AGENT_REF:-{tag}")),
             "help-site compose fallback must match CT_AGENT_RELEASE ({tag})"
         );
+        // The two assertions above name two files. `every_ct_agent_pin_matches_the_release`
+        // below covers the rest -- they are kept because they also pin the exact SHAPE of
+        // each line, which the repo-wide scan deliberately does not.
         assert!(
             !html.contains("clone https://github.com/scimbe/CADS-Tunnel.git"),
             "must not build the workspace's stale git-pinned agent dependency"
@@ -4660,6 +4663,109 @@ mod tests {
         // The .env block itself is OS-agnostic and must appear exactly once,
         // not duplicated in a PowerShell-specific rendering.
         assert_eq!(html.matches("CT_AGENT_JOIN_TOKEN=").count(), 1, ".env content is not duplicated for PowerShell");
+    }
+
+    /// #512 was written to stop the ct-agent pin from scattering again — "seven pins with
+    /// four different values caused the #502 class". It checked three of them.
+    ///
+    /// The portal HTML, `examples/help-site/Agent.Dockerfile` and that example's compose
+    /// file were named explicitly; `docker/Dockerfile`, `scripts/build-ct-agent-wasm.sh`,
+    /// `scripts/e2e-video-call/run.sh` and the two `Cargo.toml` git pins were not. They agree
+    /// today only because someone bumped them by hand. The next bump that touches the three
+    /// covered surfaces would pass this crate's tests with three pins left behind — which is
+    /// exactly the failure #512 exists to prevent, reproduced by the guard's own scope.
+    ///
+    /// So the file set is derived: walk the repository and check every pin-shaped occurrence.
+    /// A pin added in a file nobody thought of is covered on the day it is written.
+    #[test]
+    fn every_ct_agent_pin_matches_the_release() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/<name> sits two levels below the repo root")
+            .to_path_buf();
+        let tag = std::fs::read_to_string(root.join("CT_AGENT_RELEASE"))
+            .expect("CT_AGENT_RELEASE is readable")
+            .trim()
+            .to_string();
+
+        // Only pin-SHAPED occurrences. A bare `vX.Y.Z` anywhere would drag in prose like
+        // ct-client's "#507: was a v0.3.0-era rev", which is history, not a pin.
+        let pin_forms = |line: &str| -> Vec<String> {
+            let mut found = Vec::new();
+            for (needle, skip) in [("CT_AGENT_REF=", 13), ("CT_AGENT_REF:-", 14)] {
+                let mut rest = line;
+                while let Some(i) = rest.find(needle) {
+                    let v: String = rest[i + skip..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == 'v')
+                        .collect();
+                    if v.starts_with('v') && v.contains('.') {
+                        found.push(v);
+                    }
+                    rest = &rest[i + skip..];
+                }
+            }
+            if line.contains("ct-agent") {
+                if let Some(i) = line.find("tag = \"") {
+                    let v: String = line[i + 7..].chars().take_while(|c| *c != '"').collect();
+                    if v.starts_with('v') {
+                        found.push(v);
+                    }
+                }
+            }
+            found
+        };
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let skip = ["target", ".git", ".claude", "node_modules"];
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if !skip.contains(&name.as_str()) {
+                        walk(&p, out);
+                    }
+                } else if matches!(
+                    p.extension().and_then(|x| x.to_str()),
+                    Some("toml") | Some("yml") | Some("yaml") | Some("sh")
+                ) || name.starts_with("Dockerfile")
+                    || name.ends_with(".Dockerfile")
+                {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+
+        let mut checked = 0usize;
+        let mut wrong: Vec<String> = Vec::new();
+        for f in &files {
+            let Ok(src) = std::fs::read_to_string(f) else { continue };
+            for (n, line) in src.lines().enumerate() {
+                for v in pin_forms(line) {
+                    checked += 1;
+                    if v != tag {
+                        wrong.push(format!("{}:{} pins {v}", f.strip_prefix(&root).unwrap_or(f).display(), n + 1));
+                    }
+                }
+            }
+        }
+        // A walk that found nothing passes exactly like a walk that found everything in
+        // order. The count is the difference between "checked and clean" and "never ran".
+        assert!(
+            checked >= 5,
+            "expected at least the five known pin sites, found {checked} -- the scan is not \
+             reaching the repository (root: {})",
+            root.display()
+        );
+        assert!(
+            wrong.is_empty(),
+            "these ct-agent pins disagree with CT_AGENT_RELEASE ({tag}) -- bump them together \
+             or the fleet runs mixed versions (#502/#512): {wrong:#?}"
+        );
     }
 
     #[tokio::test]
