@@ -3829,19 +3829,48 @@ mod tests {
     fn no_channel_plane_refusal_site_writes_a_bare_no_literal() {
         // #524 regression guard: every channel-plane refusal must go through
         // `ct_common::channel::encode_channel_refusal` (sentinel + framed category), so a
-        // future checkpoint can't quietly reintroduce the diagnosis-free bare `NO`. Source
-        // scan of the two channel-plane files; the pattern is assembled at runtime so this
-        // test doesn't match itself.
-        let broker = include_str!("channel_broker.rs");
-        let relay_gate = include_str!("relay_gate.rs");
+        // future checkpoint can't quietly reintroduce the diagnosis-free bare `NO`. The
+        // pattern is assembled at runtime so this test doesn't match itself.
+        //
+        // The file set is DERIVED, not listed. It used to be two `include_str!`s naming
+        // channel_broker.rs and relay_gate.rs — correct on the day it was written, and a
+        // snapshot ever after: `ws_channel.rs` already admits channel joins, and the day a
+        // refusal is written there (or in any new channel-plane file) the guard would have
+        // kept passing without ever looking. That is the #566 shape — a guard whose coverage
+        // is a hand-kept list rather than a consequence of what it protects.
+        //
+        // A file belongs to the channel plane iff it uses the channel-refusal machinery.
+        // Bare `NO` writes elsewhere in this crate are correct: the rendezvous, credential
+        // and agent-registration planes have their own wire contracts and are not #524's
+        // subject. Reading the directory at test time is what makes "every channel-plane
+        // file" true rather than "the two we thought of".
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let bare_write = format!("write_all(b\"{}\")", "NO");
-        for (file, src) in [("channel_broker.rs", broker), ("relay_gate.rs", relay_gate)] {
+        let mut scanned = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("edge src dir is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("source file is readable");
+            let in_channel_plane =
+                src.contains("encode_channel_refusal") || src.contains("CHANNEL_REFUSAL_SENTINEL");
+            if !in_channel_plane {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            scanned.push(name.clone());
             assert_eq!(
                 src.matches(&bare_write).count(),
                 0,
-                "{file} writes a bare NO literal — route it through encode_channel_refusal (#524)",
+                "{name} writes a bare NO literal — route it through encode_channel_refusal (#524)",
             );
         }
+        // A scan that silently covered nothing would pass exactly like a clean one.
+        assert!(
+            scanned.len() >= 2,
+            "expected to find at least the two known channel-plane files, scanned: {scanned:?}"
+        );
     }
 
     #[tokio::test]
