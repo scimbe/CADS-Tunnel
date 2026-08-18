@@ -195,7 +195,11 @@ its own. `cross_family` is ordinary dual-stack.\n\
          error -- a browser member on :4437 cannot choose an ALPN at all -- it is the answer to \
          \"who does the long park TTL apply to\". Read this BEFORE raising \
          CT_EDGE_KA_PARK_TTL_SECS: with `keepalive=\"yes\"` at 0 the value changes nothing, \
-         however high it is set.\n\
+         however high it is set. AFTER raising it, do NOT read the ratio as adoption: these \
+         count ADMISSIONS, not members, and a longer TTL makes each keepalive leg re-park \
+         far less often while plain legs keep their 30s cycle -- so the yes-share falls by \
+         construction. Measured here 2026-08-18: 82% before the raise, 60% after, with no \
+         client change whatsoever.\n\
          # TYPE ct_edge_channel_park_legs_total counter\n\
          ct_edge_channel_park_legs_total{{keepalive=\"yes\"}} {ka_legs}\n\
          ct_edge_channel_park_legs_total{{keepalive=\"no\"}} {plain_legs}\n",

@@ -857,6 +857,13 @@ absence of any effect would otherwise be indistinguishable from the setting not 
 up — opposite problems with opposite fixes. `no` is not a fault: a browser member on `:4437`
 cannot choose an ALPN at all.
 
+**After you raise it, stop reading the ratio as adoption.** These are ADMISSIONS, not members.
+A longer TTL makes each keepalive leg re-park far less often while plain legs keep their 30 s
+cycle, so the `yes` share falls by construction. Measured on 2026-08-18: 82 % before the raise,
+60 % after, with no client change at all. Use it to answer "does the setting apply to anyone"
+before the change; afterwards the number that shows the effect is the reap rate
+(`ct_edge_channel_park_reaped_total`, 11.1/min → 2.3/min in the same experiment).
+
 **Park churn has two causes, and they need opposite responses.** A parked leg disappears
 either because its TTL ran out with no partner, or because the *same holder* re-joined past
 the per-member park-queue cap and superseded its own oldest park. On the wire the two are
