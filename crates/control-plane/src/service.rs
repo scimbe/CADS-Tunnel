@@ -3859,6 +3859,18 @@ const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 static ISSUE_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNAUTH_WRITE_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PAYMENT_WEBHOOK_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Requests per IP per minute the unauthenticated-write limiter is armed at, or `0`
+/// when it is not armed at all (#572).
+///
+/// [`UNAUTH_WRITE_RATE_LIMITED`] above is a refusal counter, and #561 made it visible
+/// so the runbook would have something to watch. But the limiter it counts is opt-in
+/// (`CT_CP_UNAUTH_WRITE_PER_MIN`, off by default) and is **not** set in this
+/// deployment — so that counter is pinned to `0` by construction, and a reader cannot
+/// tell "no floods" from "no limiter". Publishing the armed value alongside the count
+/// is what makes the `0` readable: it is a floor, exactly like the coverage assertions
+/// the watcher scripts carry.
+static UNAUTH_WRITE_LIMIT_PER_MIN: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 fn note_issue_rate_limited() -> u64 {
     ISSUE_RATE_LIMITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
@@ -3891,9 +3903,14 @@ fn refusal_counters() -> (u64, u64, u64) {
     )
 }
 
+/// Requests/IP/minute the unauthenticated-write limiter runs at; `0` = not armed (#572).
+fn unauth_write_limit_per_min() -> u32 {
+    UNAUTH_WRITE_LIMIT_PER_MIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Aggregated operator status — health plus metadata counts the operator
 /// legitimately sees (never payload; consistent with ADR-0016 / the threat model).
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct StatusResp {
     /// Database reachable (same signal as `/readyz`).
     pub ready: bool,
@@ -3920,6 +3937,13 @@ pub struct StatusResp {
     pub issue_rate_limited: u64,
     /// #561: unauthenticated writes refused by the per-IP limiter (#87) since start.
     pub unauth_write_rate_limited: u64,
+    /// #572: requests/IP/minute the limiter above is armed at — `0` means it is not
+    /// running, so the count beside it is `0` by construction rather than by calm.
+    ///
+    /// Without this field the two states are indistinguishable in a scrape, and the
+    /// quieter one is the dangerous one: #561 gave the runbook a counter to watch and
+    /// the switch it depends on (`CT_CP_UNAUTH_WRITE_PER_MIN`) is off by default.
+    pub unauth_write_limit_per_min: u32,
     /// #561: payment webhooks refused because their signature did not verify.
     ///
     /// The runbook calls this "a misconfigured `CT_PAYMENT_WEBHOOK_SECRET` **or a
@@ -4009,6 +4033,7 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         issue_rate_limited: refusal_counters().0,
         unauth_write_rate_limited: refusal_counters().1,
         payment_webhook_rejected: refusal_counters().2,
+        unauth_write_limit_per_min: unauth_write_limit_per_min(),
     }
 }
 
@@ -4021,6 +4046,9 @@ fn refresh_refusal_counters(resp: &mut StatusResp) {
     resp.issue_rate_limited = issue;
     resp.unauth_write_rate_limited = unauth;
     resp.payment_webhook_rejected = webhook;
+    // #572: armed-or-not travels with the count on every cache-serving path too, so a
+    // cached response can never pair a live count with a stale reading of the switch.
+    resp.unauth_write_limit_per_min = unauth_write_limit_per_min();
 }
 
 async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
@@ -5233,6 +5261,12 @@ const UNAUTH_WRITE_PATHS: &[&str] = &[
     // only after a valid invitation verifies), so an idle deployment's SQLite file grows
     // without bound under a bare flood of this endpoint.
     "/channel/invite/challenge",
+    // #572: the bulk form of `/enroll/issue`, on the same router, capped internally at
+    // MAX_BATCH_TOKENS=100 rows per call and missing here since it was added. Capping
+    // the single-issue route while its own batch sibling ran uncapped did not bound
+    // token issuance at all — one call did the work of a hundred. The test below
+    // derives this pairing from the route table instead of trusting the list.
+    "/enroll/issue-batch",
 ];
 
 /// Per-client-IP fixed-window limiter state for the unauthenticated DB-writers.
@@ -5252,6 +5286,10 @@ pub(crate) fn with_unauth_write_limit(app: Router, per_window: u32) -> Router {
     let state = UnauthWriteLimit {
         limiter: Arc::new(Mutex::new(KeyedRateLimiter::new(per_window))),
     };
+    // #572: record that the limiter is armed, and at what, so `/status` can say so.
+    // This is the ONLY place the layer is installed, so the published value cannot
+    // drift away from whether the layer actually runs.
+    UNAUTH_WRITE_LIMIT_PER_MIN.store(per_window, std::sync::atomic::Ordering::Relaxed);
     app.layer(from_fn_with_state(state, limit_unauth_writes))
 }
 
@@ -5955,6 +5993,88 @@ mod tests {
     /// trace whatsoever — the instruction had nothing to watch, which is worse than
     /// no instruction, because it reads as covered.
     ///
+    /// #572: a bulk sibling of a flood-capped path must be capped too.
+    ///
+    /// Derived from the route table, not from a second hand-kept list: every `POST`
+    /// route in this file is collected, and for each capped path P, a `P-batch` route
+    /// that exists must appear in [`UNAUTH_WRITE_PATHS`] as well. `/enroll/issue` was
+    /// capped while `/enroll/issue-batch` — same router, up to `MAX_BATCH_TOKENS`
+    /// rows per call — was not, so the cap bounded nothing.
+    ///
+    /// The floor matters as much as the check: with no pairing found, this test would
+    /// pass while asserting nothing, which is the failure mode it exists to prevent.
+    #[test]
+    fn a_bulk_sibling_of_a_flood_capped_path_is_capped_too_572() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/service.rs"))
+            .expect("own source readable");
+        let post_routes: Vec<String> = src
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix(".route(\"")?;
+                let (path, tail) = rest.split_once('"')?;
+                tail.trim_start()
+                    .strip_prefix(", post(")
+                    .map(|_| path.to_string())
+            })
+            .collect();
+        assert!(
+            post_routes.len() >= 20,
+            "route scan found only {} POST routes -- the parser stopped matching the \
+             source, so any pairing it fails to find proves nothing",
+            post_routes.len()
+        );
+
+        let mut pairs = 0usize;
+        for capped in UNAUTH_WRITE_PATHS {
+            let bulk = format!("{capped}-batch");
+            if !post_routes.iter().any(|r| r == &bulk) {
+                continue;
+            }
+            pairs += 1;
+            assert!(
+                UNAUTH_WRITE_PATHS.contains(&bulk.as_str()),
+                "{bulk} is the bulk form of the flood-capped {capped} and is itself \
+                 uncapped -- one call does the work of many, so the cap on {capped} \
+                 does not bound the write volume it exists to bound"
+            );
+        }
+        assert!(
+            pairs >= 1,
+            "no capped path has a -batch sibling in the route table; either the \
+             naming convention changed or the scan broke -- either way this test is \
+             no longer guarding anything"
+        );
+    }
+
+    /// #572: `/status` distinguishes "no floods" from "no limiter".
+    ///
+    /// The refusal counter #561 added is pinned to `0` whenever
+    /// `CT_CP_UNAUTH_WRITE_PER_MIN` is unset — which is the default, and the state of
+    /// the live deployment. A watcher reading only the count cannot tell the calm case
+    /// from the disabled one, and the disabled one is the one worth knowing about.
+    #[test]
+    fn the_unauth_write_counter_says_whether_its_limiter_is_even_armed_572() {
+        UNAUTH_WRITE_LIMIT_PER_MIN.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut resp = StatusResp {
+            unauth_write_limit_per_min: 4242, // a stale value the refresh must overwrite
+            ..StatusResp::default()
+        };
+        refresh_refusal_counters(&mut resp);
+        assert_eq!(
+            resp.unauth_write_limit_per_min, 0,
+            "an unarmed limiter must report 0, not a leftover reading of the switch"
+        );
+
+        let _armed = with_unauth_write_limit(Router::new(), 30);
+        refresh_refusal_counters(&mut resp);
+        assert_eq!(
+            resp.unauth_write_limit_per_min, 30,
+            "arming the limiter must be visible in /status -- otherwise the operator \
+             cannot confirm the switch they set actually took effect"
+        );
+        UNAUTH_WRITE_LIMIT_PER_MIN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Asserted as deltas, not absolutes: the counters are process-wide and other
     /// tests in this binary share them.
     #[test]
