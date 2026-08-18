@@ -111,6 +111,42 @@ const LISTENER_HEARTBEAT_TICK: std::time::Duration = std::time::Duration::from_s
 /// as before); bounding how long already-admitted connections are given to finish is
 /// `run_edge`'s job ([`crate::shutdown::wait_for_drain`]), not this loop's.
 ///
+/// Connections shed by a listener's cap, per listener label.
+///
+/// #335 is the reason this exists. A shed connection is dropped BEFORE the TLS handshake,
+/// so the client sees a TCP connect that completes and then a close with zero bytes
+/// exchanged — reported there as `tls handshake eof`, and indistinguishable from a hostile
+/// middlebox or a broken cert. The number that would have settled it in one query lived only
+/// inside the `ConnectionCap`, and the only way out was a log line printed at powers of two:
+/// a steady trickle of five sheds an hour goes completely silent after the fourth.
+///
+/// Per-label rather than one total, because the caps are shared between listeners and "which
+/// listener is shedding" is the first question an operator asks. A process-wide static for
+/// the same reason as the reaper counters: this loop deliberately has no `EdgeState` handle,
+/// and threading one through every call site is where a path gets missed.
+static LISTENER_SHEDS: std::sync::Mutex<Option<std::collections::HashMap<&'static str, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn note_listener_shed(label: &'static str) {
+    if let Ok(mut g) = LISTENER_SHEDS.lock() {
+        *g.get_or_insert_with(std::collections::HashMap::new).entry(label).or_insert(0) += 1;
+    }
+}
+
+/// `ct_edge_listener_conn_cap_sheds_total` for `/metrics`: `(label, count)`, sorted so the
+/// rendering is stable between scrapes.
+pub fn listener_shed_totals() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = LISTENER_SHEDS
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    v.sort_unstable_by_key(|(l, _)| *l);
+    v
+}
+
 /// Otherwise never returns (mirrors every accept loop it replaces): a per-connection
 /// `accept()` error is transient and logged, not fatal to the listener.
 pub(crate) async fn serve_listener<F, Fut>(
@@ -208,6 +244,7 @@ async fn serve_listener_with_tick<F, Fut>(
                     // 1000) so a sustained shed streak is visible without spamming
                     // stdout under a real flood.
                     let total = cap.note_shed();
+                    note_listener_shed(label);
                     if total.is_power_of_two() || total % 1000 == 0 {
                         eprintln!(
                             "ct-edge: {label} shedding — connection cap full, {total} connection(s) shed since start"
@@ -600,6 +637,15 @@ mod tests {
         assert!(matches!(read, Ok(0) | Err(_)), "shed connection closes without any handler bytes: {read:?}");
         assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1, "the shed connection never reached the handler");
         assert_eq!(cap.shed_total(), 1, "the shed was recorded");
+        // #335: and recorded UNDER THIS LISTENER'S LABEL, which is the half an operator can
+        // reach. `shed_total()` lives inside the cap; the label-keyed tally is what /metrics
+        // renders, and without it a shed is visible only as a log line printed at powers of
+        // two -- a steady trickle goes silent after the fourth.
+        assert!(
+            listener_shed_totals().iter().any(|(l, n)| *l == "test-listener" && *n >= 1),
+            "the shed is attributed to its listener: {:?}",
+            listener_shed_totals()
+        );
 
         // Free the slot: a third connection is admitted again.
         drop(first);

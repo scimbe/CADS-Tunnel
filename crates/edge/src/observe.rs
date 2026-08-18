@@ -232,6 +232,21 @@ its own. `cross_family` is ordinary dual-stack.\n\
             hb.expected_since()
         ));
     }
+    // #335: connections a listener's cap shed before the TLS handshake. The client sees a
+    // completed TCP connect and then a close with zero bytes -- "tls handshake eof", which
+    // looks exactly like a broken cert or a hostile middlebox. This row is what separates
+    // "the edge is refusing load" from "something is mangling TLS"; a row missing entirely
+    // means that listener has never shed, which is not the same as it not being capped.
+    out.push_str(
+        "# HELP ct_edge_listener_conn_cap_sheds_total Connections dropped before the TLS \
+         handshake because the listener's connection cap was full, by listener.\n\
+         # TYPE ct_edge_listener_conn_cap_sheds_total counter\n",
+    );
+    for (label, n) in crate::transport::listener_shed_totals() {
+        out.push_str(&format!(
+            "ct_edge_listener_conn_cap_sheds_total{{listener=\"{label}\"}} {n}\n"
+        ));
+    }
     // Which of those rows can actually fail /healthz. Without it, the two rows above are
     // ambiguous in the direction that matters: an operator seeing "expected but never seen"
     // cannot tell whether the container is about to restart itself or whether nothing at all
