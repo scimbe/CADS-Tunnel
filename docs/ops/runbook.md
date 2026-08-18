@@ -885,6 +885,27 @@ wait contract (**ct-agent ≥ v0.4.19**) makes an older client's 45 s admission 
 first: the pair then cycles at 45 s with stale parks holding cap permits. Roll the fleet
 first, then raise this — the reverse order buys the cycling it was meant to end.
 
+### A listener that was configured but never bound
+
+`/healthz` fails 60 s after the edge decides to run a listener that then does not start.
+This covers a bind that fails outright (port taken, address not assignable, no permission)
+and an address the operator mistyped — both are listeners that were asked for and not
+delivered. The body names the one that is missing:
+
+```
+channel broker loop(s) not serving: :443 front door (never started, expected 72s ago)
+```
+
+**This restarts the container**, because the container healthcheck probes `/healthz`. For the
+common real case — the previous container has not released the port yet — that heals by
+itself. For a permanent conflict it produces a visible restart loop instead of an edge that
+runs, answers 200, and serves nothing. That is deliberate: before it, a failed `:443` bind
+reached only a single stderr line while every tunnel was dead.
+
+Covered: `CT_FRONT_DOOR`, `CT_EDGE_BROWSER_LISTEN`, `CT_EDGE_CHANNEL_LISTEN`, the channel
+relay, `ws-channel`. **Not** covered: `CT_EDGE_HTTP_REDIRECT` — it registers no heartbeat even
+when it works, so its silence still cannot be distinguished from health (#563).
+
 ### The control plane's two background loops
 
 Both are **off unless switched on**, and both are switched on by the literal `1`:
