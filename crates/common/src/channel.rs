@@ -772,21 +772,6 @@ pub fn verify_stateless(
     Ok(())
 }
 
-/// #415: pre-rename compatibility alias for [`verify_stateless`], kept only because
-/// an external crate ([`ct-agent`](https://github.com/scimbe/ct-agent), pinned by tag
-/// in this workspace's own dependents) still calls this by its old name. No code in
-/// *this* workspace calls it anymore — every in-tree caller was updated to
-/// `verify_stateless` directly. Do not add new callers; use [`verify_stateless`] (or,
-/// better, [`verify_fresh`] if you're wiring up a new admission path).
-#[deprecated(note = "renamed to verify_stateless to make its lack of replay protection explicit (#415); this alias exists only for external/pre-rename callers")]
-pub fn verify(
-    operator_pubkey: &[u8; 32],
-    signed: &SignedChannelGrant,
-    now: UnixSeconds,
-) -> Result<(), GrantError> {
-    verify_stateless(operator_pubkey, signed, now)
-}
-
 /// Like [`verify_stateless`], but additionally rejects a **replay** (#88 SEC88b). A
 /// captured grant is otherwise valid until `expires_at` *any number of times*;
 /// `cache` records the grant's 64-byte signature (unique per grant — a replay
@@ -797,6 +782,15 @@ pub fn verify(
 /// bounded. Signature/expiry are checked first, so an invalid or expired grant never
 /// populates the cache. This is orthogonal to holder-possession (#81) and
 /// membership/revocation — all three gate admission together.
+///
+/// #581: currently unused, deliberately — not an oversight, checked before assuming
+/// otherwise. Every LIVE call site of `verify_stateless` (`channel_broker.rs`,
+/// `relay_gate.rs`) already follows it with a fresh, single-use possession challenge,
+/// which is strictly stronger than this seen-signature cache: a replayed grant still
+/// can't answer a challenge it was never issued. The one call site without that
+/// follow-up (`edge/src/auth.rs`) is itself dead code (#415, zero callers). If a new
+/// admission path is ever added WITHOUT a possession challenge of its own, call this
+/// instead of `verify_stateless` there.
 pub fn verify_fresh(
     operator_pubkey: &[u8; 32],
     signed: &SignedChannelGrant,
@@ -3383,15 +3377,6 @@ mod tests {
         let (_pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
         let other = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
         assert_eq!(verify_stateless(&other, &signed, 500), Err(GrantError::BadSignature));
-    }
-
-    /// #415: the pre-rename `verify` alias still exists (external/back-compat callers)
-    /// and must keep behaving identically to `verify_stateless`.
-    #[test]
-    #[allow(deprecated)]
-    fn deprecated_verify_alias_still_works() {
-        let (pk, signed) = signed_grant(Direction::Both, Rights::ReadWrite, true, 1_000);
-        assert_eq!(verify(&pk, &signed, 999), Ok(()));
     }
 
     #[test]

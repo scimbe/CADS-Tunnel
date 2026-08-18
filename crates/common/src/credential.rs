@@ -165,6 +165,14 @@ pub fn verify_stateless(
 /// point that owns `cache`; the cache evicts on expiry so it stays bounded.
 /// Signature/expiry are checked first, so an invalid or expired credential never
 /// populates the cache.
+///
+/// #581: currently unused, deliberately — checked, not assumed. `SignedCredential` is
+/// minted (`control-plane`'s `credential.rs`/`issuance.rs`) but not currently
+/// *presented and verified* anywhere in either workspace; only the more specific
+/// `SignedChannelGrant` (`crate::channel`) is live, and its own `verify_fresh`
+/// sibling carries the equivalent reasoning for why it too is unused without being
+/// forgotten. If a live consumer of `SignedCredential` is ever wired up, call this
+/// instead of `verify_stateless` there.
 pub fn verify_fresh(
     issuer_pubkey: &[u8; 32],
     signed: &SignedCredential,
