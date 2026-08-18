@@ -197,6 +197,17 @@ Alert on: `/readyz` flapping (DB reachability), edge TCP-listener down,
 sustained `429`s on `/me/issue` (a client hitting the rate limit), and webhook
 `401`s (misconfigured `CT_PAYMENT_WEBHOOK_SECRET` or a forgery attempt).
 
+`scripts/edge-watch.sh` covers the first two every 10 minutes: it probes
+`/readyz` directly (not `/healthz` — since #541 only `/readyz` reads from a real
+table, so only it says anything about the DATABASE) and watches the control
+plane's restart counter, because the CP's own container healthcheck probes
+`/readyz` too — so a **rising** restart count is the flapping signal that a
+momentary 200 hides. The edge's listeners are covered by `/healthz` (#553).
+
+The remaining two (`429` bursts on `/me/issue`, webhook `401`s) are **not**
+enforced anywhere yet; they are prose. Say so rather than assume the list is
+covered.
+
 ## Routine procedures
 
 ### Authorize a new pipeline hostname (headless agents, #214)

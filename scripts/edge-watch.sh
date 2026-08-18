@@ -41,6 +41,44 @@ ALARMS=()
 
 command -v docker >/dev/null || { log "FEHLER: docker fehlt -- der Waechter kann nichts pruefen"; exit 1; }
 
+# --- 0. Die Control-Plane ---------------------------------------------------
+# Das Runbook schreibt "Alert on: /readyz flapping (DB reachability)" -- bis
+# hierher stand das nur da. Der Waechter kannte die CP ueberhaupt nicht, obwohl
+# sie unter dem Edge liegt: Ist ihre Datenbank nicht erreichbar, scheitern die
+# Kanal-Autorisierung, die Rehydrierung nach einem Neustart (#548) und jede
+# dynamische Portalseite -- waehrend `/healthz` und die statische Startseite
+# weiter 200 liefern und dieser Waechter still bliebe.
+#
+# `/readyz` ist bewusst die gepruefte Adresse und nicht `/healthz`: seit #541
+# liest sie aus einer echten Tabelle, ist also ein Aussage ueber die DATENBANK
+# und nicht nur darueber, dass der Prozess Sockets annimmt.
+CP_CONTAINER="${CT_WATCH_CP_CONTAINER:-ct-selfhost-control-plane-1}"
+CP_READYZ="${CT_WATCH_CP_READYZ:-http://127.0.0.1:8090/readyz}"
+if CP_RUNNING=$(docker inspect -f '{{.State.Running}}' "$CP_CONTAINER" 2>/dev/null); then
+  if [ "$CP_RUNNING" != "true" ]; then
+    ALARMS+=("Die Control-Plane '$CP_CONTAINER' laeuft nicht (State.Running=$CP_RUNNING) -- Kanal-Autorisierung und Rehydrierung haengen daran.")
+  else
+    CP_RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$CP_CONTAINER" 2>/dev/null || echo 0)
+    CP_PREV_FILE="$STATE_DIR/cp-restarts"
+    CP_PREV=$(cat "$CP_PREV_FILE" 2>/dev/null || echo "$CP_RESTARTS")
+    if [ "$CP_RESTARTS" -gt "$CP_PREV" ]; then
+      # Der Container-Healthcheck der CP probt selbst /readyz, ein anhaltend
+      # unbereiter Prozess wird also von Docker neu gestartet. Genau deshalb ist
+      # ein STEIGENDER Zaehler das Flapping-Signal aus dem Runbook -- ein
+      # Momentan-200 verdeckt es.
+      ALARMS+=("Die Control-Plane wurde neu gestartet ($CP_PREV -> $CP_RESTARTS) -- ihr Healthcheck probt /readyz, ein Anstieg ist also das Flapping-Signal fuer die DB-Erreichbarkeit.")
+    fi
+    printf '%s' "$CP_RESTARTS" > "$CP_PREV_FILE"
+    CP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$CP_READYZ" 2>/dev/null || true)
+    [ -n "$CP_CODE" ] || CP_CODE=000
+    [ "$CP_CODE" = "200" ] || \
+      ALARMS+=("Control-Plane /readyz antwortet $CP_CODE (erwartet 200) -- die Datenbank ist nicht erreichbar; /healthz und die statische Startseite koennen dabei weiter 200 liefern.")
+  fi
+else
+  # Wie ueberall hier: eine Pruefung, die nicht laufen kann, wird gesagt.
+  ALARMS+=("Die Control-Plane '$CP_CONTAINER' existiert nicht -- /readyz konnte NICHT geprueft werden. Kein Freispruch, sondern eine fehlende Pruefung (Name via CT_WATCH_CP_CONTAINER anpassbar).")
+fi
+
 # --- 1. Läuft der Container überhaupt? -------------------------------------
 if ! RUNNING=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null); then
   ALARMS+=("Der Edge-Container '$CONTAINER' existiert nicht mehr.")
