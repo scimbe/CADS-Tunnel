@@ -3,7 +3,10 @@
 //! Maps a Routing Token to the Agent tunnel handle that serves it, so the Edge
 //! can route a resolved Client rendezvous to the right Agent connection. Generic
 //! over the handle type (`quinn::Connection` in the daemon) to stay
-//! unit-testable. `is_known` plugs straight into `resolve_rendezvous_gated`.
+//! unit-testable. `is_known` feeds [`Self::is_resolvable`], which gates the
+//! rate limiter ahead of the inline PoW-gated `'C'` admission in `serve.rs`
+//! (the original `resolve_rendezvous_gated` this fed had zero production
+//! callers and was removed as dead code, #580).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;

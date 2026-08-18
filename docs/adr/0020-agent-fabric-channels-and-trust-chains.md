@@ -25,12 +25,28 @@ What exists today does **not** cover this:
   (`routing_token_if_authorized`). That is a redundancy/HA primitive ("another
   agent can serve this one tunnel"), not "two different tunnels can talk". There is
   no role/scope separation — whoever holds the token has full access to both ends.
-- **Direct-path infra is client↔one-agent only.** `CT_AGENT_DIRECT_ADVERTISE`
-  (`crates/agent/src/config.rs`, `direct_advertise_ip`) + edge rendezvous
-  (`crates/edge/src/rendezvous.rs`: `resolve_rendezvous[_gated]`) + the client's
-  direct-then-relay dial (`crates/client/src/transport.rs`) let a **client** learn
-  one agent's advertised endpoint, connect directly, and fall back to edge relay.
-  There is no agent↔agent route anywhere in `crates/` (verified).
+- **Direct-path infra is client↔one-agent only** (true when this ADR was written;
+  the specific mechanism named below has since been removed — see the note after
+  this bullet). `CT_AGENT_DIRECT_ADVERTISE` (`crates/agent/src/config.rs`,
+  `direct_advertise_ip`) + edge rendezvous (`crates/edge/src/rendezvous.rs`:
+  `resolve_rendezvous[_gated]`) + the client's direct-then-relay dial
+  (`crates/client/src/transport.rs`) let a **client** learn one agent's advertised
+  endpoint, connect directly, and fall back to edge relay. There was no
+  agent↔agent route anywhere in `crates/` at the time (verified then).
+
+  **2026-08-18 note:** `crates/edge/src/rendezvous.rs` and
+  `crates/client/src/rendezvous.rs` were removed as structurally unreachable dead
+  code (#580) — superseded pre-dating this ADR by the inline PoW-gated dial in
+  `serve.rs`'s `'C'` role handling / `client_tunnel_noise[_tcp]`, which this
+  bullet's own `crates/client/src/transport.rs` citation already pointed at.
+  `crates/agent` no longer exists in this workspace either: ct-agent was
+  extracted to its own repository, and the direct-path capability this bullet
+  describes now lives there, in a materially more capable form (DCUtR + reflexive
+  address discovery, `ct-agent/native/src/channel_run/connectivity.rs`) than the
+  static `CT_AGENT_DIRECT_ADVERTISE` this bullet names. The Agent Fabric this ADR
+  proposed was built; its channel-plane rendezvous (`channel_broker.rs`,
+  `relay_gate.rs`) is an independent implementation, not a caller of the removed
+  functions.
 - **The token/identity model is flat.** `RoutingToken` and `Capability`
   (`crates/common/src/lib.rs`) are flat bearer values: possession = full access,
   no direction, no rights, no expiry, no notion of "which agent may address which".

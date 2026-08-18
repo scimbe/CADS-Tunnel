@@ -8,7 +8,6 @@ pub mod bench;
 pub mod config;
 pub mod ladder;
 pub mod noise;
-pub mod rendezvous;
 pub mod transport;
 
 /// Stable crate identifier.
