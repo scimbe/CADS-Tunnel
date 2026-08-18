@@ -186,6 +186,8 @@ where
             return Err(refuse(&mut stream, "grant-verify", &ctx, format!("grant rejected: {e}").into()).await);
         }
 
+        // ct-agent#36: sibling of channel_broker.rs's QUIC-path challenge -- same
+        // fresh-and-unpredictable requirement, see the comment there for why.
         let mut challenge = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
         stream

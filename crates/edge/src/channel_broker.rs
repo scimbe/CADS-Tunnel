@@ -864,6 +864,13 @@ where
     // presenter must return an ed25519 signature over it under `holder`. A stolen
     // grant (exfiltrated wire bytes) cannot answer, and a captured old signature
     // can't be replayed against a new challenge.
+    // ct-agent#36: this challenge is the holder key's entire signing contract with an
+    // edge it does not otherwise trust -- `holder.sign(&challenge)` on the client side
+    // signs it with NO domain-separation prefix. Safe only because every generator of
+    // this challenge (this one, and `relay_gate.rs`'s TLS-`:443` sibling) draws it fresh
+    // from the OS CSPRNG on every call, never a value the caller can steer or replay.
+    // Weakening either property (predictable bytes, reuse across calls) at ANY generator
+    // would turn the holder key into a raw signing oracle for that path.
     let mut challenge = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut challenge);
     send.write_all(&challenge)
