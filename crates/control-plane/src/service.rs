@@ -4001,13 +4001,26 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         payments_confirmed,
         uptime_seconds: s.started.elapsed().as_secs(),
         oidc_enabled: s.oidc.is_ready(),
-        // #561: process-wide, so they are NOT part of the cached store aggregation
-        // above -- read at render time, which is what makes a rising value visible
-        // between two scrapes rather than smoothed by the cache TTL.
+        // #561: process-wide atomics, not part of the store aggregation above.
+        // `status_handler` overwrites these on every cache-serving path (see
+        // `refresh_refusal_counters`), so the value a scrape sees is always the
+        // live one -- a cached "0" would mean "no refusals" during exactly the
+        // window in which refusals are happening.
         issue_rate_limited: refusal_counters().0,
         unauth_write_rate_limited: refusal_counters().1,
         payment_webhook_rejected: refusal_counters().2,
     }
+}
+
+/// Overwrite the three #561 refusal counters with their live values (#561).
+///
+/// Called on every cache-serving path, never on the fresh path, where
+/// `aggregate_status` has just read them itself.
+fn refresh_refusal_counters(resp: &mut StatusResp) {
+    let (issue, unauth, webhook) = refusal_counters();
+    resp.issue_rate_limited = issue;
+    resp.unauth_write_rate_limited = unauth;
+    resp.payment_webhook_rejected = webhook;
 }
 
 async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
@@ -4022,11 +4035,19 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
     // restart and no tolerance for a multi-second cache delay. Caching
     // everything else while keeping this one field always-live preserves both
     // guarantees at once instead of trading one off against the other.
+    //
+    // #561's three refusal counters ride the same exception, for the same
+    // reason: they are three relaxed atomic loads -- cheaper than the OIDC
+    // handle check -- and a stale one reports "no refusals" during a window in
+    // which refusals are in fact happening. That is the exact failure mode
+    // those counters exist to end, so serving them from the cache would
+    // reintroduce it at a five-second granularity.
     let cached = s.status_cache.read().await.clone();
     match cached {
         Some((cached_at, resp)) if cached_at.elapsed() < STATUS_CACHE_TTL => {
             let mut resp = resp;
             resp.oidc_enabled = s.oidc.is_ready();
+            refresh_refusal_counters(&mut resp); // #561
             Json(resp)
         }
         Some((_, stale)) => {
@@ -4041,6 +4062,7 @@ async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
             maybe_spawn_status_refresh(s.clone());
             let mut resp = stale;
             resp.oidc_enabled = s.oidc.is_ready();
+            refresh_refusal_counters(&mut resp); // #561
             Json(resp)
         }
         None => {
@@ -10685,6 +10707,72 @@ mod tests {
             1,
             "a request within STATUS_CACHE_TTL must still serve the cached count, not re-aggregate -- \
              proves the cache actually short-circuited the store call"
+        );
+    }
+
+    /// #561: the refusal counters must NOT be served from the status cache.
+    ///
+    /// Found in the field, not in review: after the first deploy, two refusals
+    /// were visible in the control-plane log while `/status` still reported
+    /// zero. Harmless-looking -- the cache is five seconds -- but the counters
+    /// exist so that "no refusals reported" means "no refusals", and a cached
+    /// zero says exactly the wrong thing during the window that matters.
+    ///
+    /// The `agents` assertion at the end is the control: without it this test
+    /// would also pass if the cache had simply expired, which would prove
+    /// nothing about the cache-serving path.
+    #[tokio::test]
+    async fn the_refusal_counters_are_never_served_from_the_status_cache_561() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let registry = Arc::new(SqliteRegistry::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let agent_directory = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
+
+        let tenant = TenantId("t".into());
+        let jt1 = enrollment.issue_join_token(&tenant).unwrap();
+        enrollment.redeem(&jt1, &AgentId("a1".into()), [1u8; 32]).unwrap();
+
+        let app = status_router(
+            enrollment.clone(),
+            registry,
+            ledger,
+            agent_directory,
+            pipeline_registry,
+            None,
+            OidcVerifierHandle::empty(),
+        );
+        let get = |app: Router| async {
+            let resp = app.oneshot(Request::get("/status").body(Body::empty()).unwrap()).await.unwrap();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<StatusResp>(&body).unwrap()
+        };
+
+        // First request populates the cache.
+        let first = get(app.clone()).await;
+
+        // A refusal happens, and a second agent enrolls, both between the two
+        // requests and both within STATUS_CACHE_TTL.
+        note_payment_webhook_rejected("test");
+        let jt2 = enrollment.issue_join_token(&tenant).unwrap();
+        enrollment.redeem(&jt2, &AgentId("a2".into()), [2u8; 32]).unwrap();
+
+        let second = get(app).await;
+        assert!(
+            second.payment_webhook_rejected > first.payment_webhook_rejected,
+            "the refusal must be visible immediately: {} did not exceed {}",
+            second.payment_webhook_rejected,
+            first.payment_webhook_rejected
+        );
+        assert_eq!(
+            second.agents, 1,
+            "control: this second request WAS served from the cache (a re-aggregation \
+             would report 2 agents), so the counter above came from the live read, \
+             not from an expired cache"
         );
     }
 
