@@ -29,6 +29,38 @@ section too, all in one idempotent, re-runnable command. `--help` for every
 flag. The manual steps below are what it automates; read them for the *why*,
 run the script for the *how*.
 
+**The script can refuse to run, on purpose.** Some safeguards live only in the environment of
+the deploy *call*, not in `.env`, so re-running without them recreates the container without
+the safeguard — the deployment looks identical, comes up healthy, and is quietly less
+protected. That happened three times in one night before the check existed. Now the script
+compares the running stack against what this call would set and stops if a safeguard would be
+lost:
+
+```
+! CT_EDGE_ADMIN_TOKEN is armed on the running stack, and this deploy would leave it unset
+error: refusing to disarm a safeguard that is currently armed. Re-run with the variable(s)
+       set, e.g.  CT_EDGE_REQUIRE_ATTESTED_ENDPOINT=1 ./scripts/deploy-selfhost.sh …
+       or, if turning it off is really intended, pass --allow-security-downgrade.
+```
+
+The watched set is **derived from the compose files this call uses**, not a list in the
+script — a switch added to a compose file is watched the day it is added. Only the
+*disarming* direction stops the deploy; arming something never does, and a stack that was
+already unarmed stays that way without complaint. Values are never printed: one of them is a
+secret, and the answer an operator needs is on/off.
+
+Two things it deliberately does **not** cover, both because there is nothing running to
+compare against: the **first** deploy on a fresh host, and `--fresh`. Put the switches you
+want permanently into `docker/deploy/.env` — that is what survives both.
+
+**Overlays are chosen for you, and one is keyed off `.env`.** `--frontdoor`, `--sso` and
+`--help-site` add their compose files; `compose.relay.yml` is included automatically whenever
+`CT_RELAY_NODE_PEER` is set in `.env`. That auto-include exists because the relay-gate overlay
+used to be applied by hand, so every scripted redeploy silently dropped it and the gate then
+answered every NAT'd channel member with "relay gate not configured" while the rest of the
+edge looked perfectly healthy (live incident 2026-08-13). **A new overlay belongs in the
+script the same way — never applied by hand.**
+
 **Optional `:443` front door** (`compose.frontdoor.yml`, #60) — publishes one
 `:443` that serves the **Portal landing page**, **Browser-Plane subdomains**
 (`help.<zone>`), the tunnel data-plane relay, and the **Agent-Fabric channel
