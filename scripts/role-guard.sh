@@ -49,6 +49,17 @@ if [ "${1:-}" = "--selftest" ]; then
   check agent     '{"tool_name":"Bash","tool_input":{"command":"rm crates/x.rs"}}'  2
   check agent     '{"tool_name":"Bash","tool_input":{"command":"ls; rm f"}}'        2
   check agent     '{"tool_name":"Bash","tool_input":{"command":"docker run --rm rust:1-slim bash -c cargo"}}' 0
+  # #585: find -delete / git clean / bun|deno eval are common, non-adversarial ways to delete or
+  # write files that missed every earlier pattern -- confirmed against the unfixed script first
+  # (all four returned 0/allowed there).
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"find . -name \"*.rs\" -delete"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"git clean -fdx"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"bun -e \"require('\''fs'\'').writeFileSync('\''f'\'',x)\""}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"deno eval \"Deno.writeTextFileSync('\''f'\'',x)\""}}' 2
+  # #585 false-positive guards: reads that merely use find/git/deno without deleting/writing stay allowed.
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"find . -name \"*.rs\""}}' 0
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"git status && git log -1"}}' 0
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"deno --version"}}' 0
   check agent     '{"tool_name":"Read","tool_input":{}}'                        0
   check developer '{"tool_name":"Edit","tool_input":{}}'                        0
   check developer '{"tool_name":"Bash","tool_input":{"command":"echo x > f"}}'  0
@@ -95,8 +106,10 @@ if tool == "Bash":
     # another route — the trust boundary is ultimately social); it closes the easy/accidental holes.
     if re.search(
         r">>?(?![>&])|\btee\b|\bsed\b[^|]*-i|\bdd\b|\btruncate\b|\bcp\b|\bmv\b|(?<!-)\brm\b"
-        r"|git\s+(add|commit|apply|checkout|restore|reset|push|rm|mv)"
-        r"|\b(python3?|perl|ruby|node|nodejs|php)\b[^|]*\s-{1,2}(c|e|E|r|eval)\b"
+        r"|git\s+(add|commit|apply|checkout|restore|reset|push|rm|mv|clean)"
+        r"|\bfind\b[^|]*-delete\b"
+        r"|\b(python3?|perl|ruby|node|nodejs|php|bun)\b[^|]*\s-{1,2}(c|e|E|r|eval)\b"
+        r"|\bdeno\b[^|]*\beval\b"
         r"|\bcurl\b[^|]*\s-{1,2}(o|O|output|remote-name)\b"
         r"|(^|[;&|(]\s*)(wget|patch|rsync)\b",
         cmd,
