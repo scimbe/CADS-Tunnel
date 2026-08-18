@@ -17,11 +17,17 @@ WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked \
-    && cp target/release/ct-agent /tmp/ct-agent
+    && cp target/release/ct-agent /tmp/ct-agent \
+    && cp target/release/ct-agent-supervisor /tmp/ct-agent-supervisor
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /tmp/ct-agent /usr/local/bin/ct-agent
+# `cargo build` already produced this beside ct-agent; until now it was compiled on every
+# image build and discarded (#331). Shipping it makes "run the agent under a supervisor that
+# reports WHY it exited" a one-word change to the command below, instead of a rebuild.
+# The default stays the bare agent: this adds a capability, it does not switch one on.
+COPY --from=builder /tmp/ct-agent-supervisor /usr/local/bin/ct-agent-supervisor
 CMD ["ct-agent"]
