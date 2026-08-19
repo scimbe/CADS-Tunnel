@@ -531,10 +531,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "ct-agent"
+version = "0.5.5"
+source = "git+https://github.com/scimbe/ct-agent?tag=v0.5.5#4d6f7815b36a3e8e8142c48f40318dcda1ca3d8c"
+dependencies = [
+ "axum",
+ "base64",
+ "ct-common",
+ "ct-control-plane",
+ "ct-dns",
+ "ed25519-dalek",
+ "hickory-resolver 0.26.1",
+ "libc",
+ "libp2p",
+ "libp2p-stream",
+ "quinn",
+ "rand 0.8.7",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ct-agent-tools"
 version = "0.0.0"
 dependencies = [
- "ct-agent",
+ "ct-agent 0.5.4",
  "ct-common",
  "tokio",
 ]
@@ -544,7 +576,7 @@ name = "ct-client"
 version = "0.0.0"
 dependencies = [
  "axum",
- "ct-agent",
+ "ct-agent 0.5.5",
  "ct-common",
  "ct-control-plane",
  "ct-edge",

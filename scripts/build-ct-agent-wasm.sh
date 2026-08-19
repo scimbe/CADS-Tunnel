@@ -24,7 +24,7 @@ OUT_DIR="$REPO_ROOT/crates/control-plane/wasm-pkg"
 # Pin by commit SHA, not a branch -- bump deliberately. scimbe/ct-agent's actual HEAD as of
 # this feature's build (2026-08-12), the commit that tightened the TCP-fallback keepalive
 # (ct-agent#15) -- includes the wasm/ crate at v0.4.2, unchanged by that commit.
-CT_AGENT_REF="${CT_AGENT_REF:-v0.5.4}"
+CT_AGENT_REF="${CT_AGENT_REF:-v0.5.5}"
 
 mkdir -p "$OUT_DIR"
 
