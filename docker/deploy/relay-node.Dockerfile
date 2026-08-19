@@ -37,7 +37,14 @@ RUN apt-get update \
 # Using the tag (not another bare commit) from here on: it's a real, CI-gated,
 # version-checked release (ct-agent#29's guard) with published binaries, not just a
 # convenient main-branch snapshot.
-ARG CT_AGENT_REF=v0.5.5
+#
+# 2026-08-19: bumped to v0.5.6 -- ct-agent#35 Path B (an external security review):
+# Accept-side channel sessions now enforce Noise-key attestation instead of
+# authenticating nothing at the Noise layer on two of three code paths. This
+# relay-node's own DCUtR path is a documented, still-open THIRD path (#41,
+# "Path A") the fix does not cover -- see that issue before assuming this pin
+# closes the finding for relay-node specifically.
+ARG CT_AGENT_REF=v0.5.6
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
