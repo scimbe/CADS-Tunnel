@@ -50,7 +50,7 @@ use ct_common::sync::MutexExt;
 /// already does -- Noise messages are self-delimiting via `noise::frame`/`take_frame`'s
 /// own length prefix), the two framings never need to line up.
 /// How often an idle (no application bytes flowing) channel connection gets a
-/// server-sent WebSocket Ping (#XXX): once two members are paired and their Noise/
+/// server-sent WebSocket Ping (#586): once two members are paired and their Noise/
 /// signaling session is established, real call traffic is sparse (occasional SDP/
 /// ICE messages, not a steady stream) -- exactly the shape of connection an
 /// idle-timeout reverse proxy or load balancer in front of this listener is most
@@ -217,7 +217,7 @@ pub type WsChannelStream = WsByteStream;
 pub struct WsChannelState {
     pairer: crate::channel_broker::SharedChannelPairer,
     resolver: Arc<dyn ChannelMemberResolver>,
-    /// Concurrency cap (#XXX), matching every other public listener's `ConnectionCap`
+    /// Concurrency cap (#451), matching every other public listener's `ConnectionCap`
     /// (QUIC, TCP-fallback, the `:443` front door, BrowserTunnel) -- `None` means
     /// unbounded (the default for [`Self::standalone`]/tests; production always sets
     /// one, see `serve.rs`'s `CT_EDGE_MAX_WS_CHANNEL_CONNECTIONS`).
@@ -992,7 +992,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_idle_ws_byte_stream_sends_periodic_keepalive_pings() {
-        // #XXX: once paired, a real call's signaling traffic is sparse -- a
+        // #586: once paired, a real call's signaling traffic is sparse -- a
         // WsByteStream sitting idle (no application bytes to relay) must still keep
         // sending WS Pings so an idle-timeout reverse proxy/load balancer in front of
         // this listener doesn't drop the connection mid-call. Proves the mechanism
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_full_connection_cap_sheds_the_ws_upgrade_before_admission() {
-        // #XXX: every OTHER public listener sheds cheaply under a ConnectionCap once
+        // #451: every OTHER public listener sheds cheaply under a ConnectionCap once
         // full; this listener had none at all until now. Proves the mechanism
         // directly: a cap of 1, a first real WebSocket connection that holds its slot
         // (never closes), and a second real connection that must be REJECTED AT THE
