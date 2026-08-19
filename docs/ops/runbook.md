@@ -565,6 +565,13 @@ TCP-fallback arms. A test asserts at build time that no relay call site bypasses
 next one added cannot silently miss it. The mesh leg to a peer edge is deliberately exempt:
 that tunnel belongs to the peer, which applies its own revocation.
 
+**Scope limit: this does NOT cover `ct-agent`'s direct-connect path (ct-agent#45,
+threat-model.md residual risk #8).** `serve_direct` bypasses the Edge entirely and is
+authenticated purely by Noise_IK against the Agent's Origin key — a token revoke here has
+zero effect on it. If an incident might involve a client with direct-connect access
+(`direct_advertise_ip`), revoking the token is not enough: rotate the Origin key too
+(ct-agent#12) so the old Capability stops working on both paths.
+
 **What `/healthz` actually covers (#498/#539/#553).** The endpoint the container healthcheck
 consumes reports 503 when any accept loop the edge *meant* to run has stopped iterating. Since
 #553 that is six loops, not two: the QUIC `relay` and `rendezvous` brokers plus the four TCP

@@ -161,3 +161,46 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    there as a slice rather than as a second parallel mechanism. **Open, pending an operator
    decision (#540)** — documented here rather than left as a gap the model silently implies
    is covered.
+
+8. **Token revocation does not reach ct-agent's direct-connect path (ct-agent#45)** — the
+   runbook's #554 fix (below, "Revoking a tunnel now cuts live sessions too") is scoped to
+   the Edge: every token-carrying relay in `crates/edge/src/serve.rs` re-checks the token and
+   cuts on revocation. `ct-agent`'s **direct-connect** listener (`serve_direct`,
+   `native/src/serve.rs`) never touches the Edge at all — it accepts a QUIC connection with
+   `with_no_client_auth()` and terminates the session purely on `origin_handshake_any`
+   matching one of the Agent's own `origin_keys`. Noise_IK only proves the *responder's*
+   (Origin's) identity to the initiator by default; nothing here checks the initiator's
+   static key, so **any party that has ever learned the Origin Identity** — exactly what
+   every Capability distributes out of band (`ct-agent/native/src/origin.rs`) — retains
+   direct access indefinitely, independent of the Routing Token's revocation state.
+
+   **This is not a code bug in isolation — it is a genuine second, separate revocation
+   mechanism** that already exists and works: `ct-agent`'s Origin-key rotation (#12) mints a
+   fresh `OriginIdentity` and re-issues the Capability with the *same* token, so once the
+   rotation window closes and the old key is dropped from `origin_keys`, direct access
+   (and relayed access) both stop working for holders of the old Capability. The gap is
+   **operational, not architectural**: an incident responder who reaches for the fast,
+   well-tested, Edge-side action (`POST /admin/revoke/:token`) reasonably believes — per the
+   runbook's own, now over-broad "cuts live sessions too" claim — that access is fully cut.
+   For any client that also has (or could reach) the Agent's direct listener, it is not:
+   only an Origin-key rotation actually revokes it, and nothing surfaces that distinction
+   at the moment of the decision.
+
+   **Bounded**: confidentiality is unaffected the same way #540's is — Noise_IK still
+   requires the Origin's real private key to terminate a session, so a party without a valid
+   Capability learns nothing. What's exposed is continued *access* for a party whose
+   Capability was meant to be revoked. The direct-connect feature is opt-in
+   (`direct_advertise_ip`) and its own client-side documentation already states plainly that
+   it trades the Edge's token/PoW gate for the Noise handshake alone
+   (`crates/client/src/transport.rs`) — so the trust model itself is a deliberate, documented
+   choice; what was missing was the runbook cross-reference making the scope of #554's
+   guarantee honest.
+
+   **The real fix, if pursued, is agent-side**: have the direct-connect handshake also carry
+   the Routing Token (e.g. in the Noise payload) and let the Agent check it against a
+   periodically-refreshed local copy of the token's live/revoked state — closing the loop
+   without requiring every direct-connect byte to round-trip the Edge, which would defeat the
+   feature's own purpose. Not a quick fix: it changes the direct-connect wire contract and
+   needs a rollout story for already-deployed agents, so it's an operator decision, not
+   something to implement speculatively. **Open, pending an operator decision (ct-agent#45)**
+   — the runbook's #554 section now cross-references this scope limit directly.
