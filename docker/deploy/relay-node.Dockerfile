@@ -51,7 +51,14 @@ RUN apt-get update \
 # path runs) now verify the relayed peer's Noise-key attestation instead of
 # pinning it unconditionally. With this pin, #35's finding is fully closed for
 # this container, not just referenced.
-ARG CT_AGENT_REF=v0.5.7
+#
+# 2026-08-19: bumped to v0.5.8 -- CADS-Tunnel#495 U2 (a'): join_via_relay_dcutr/
+# join_via_relay_gate_dcutr (this container's own DCUtR path) now send the
+# QUIC phase-preamble marker (PHASE_MARKER_RELAY). Deliberately a no-op here
+# today -- the edge only TOLERATES the marker so far (#495 U2 (b'), already
+# live); nothing consumes it until U2 Slice 2 (CT_EDGE_UNIFIED_PAIRER) lands.
+# Bumping now avoids a second coordinated release once Slice 2 ships.
+ARG CT_AGENT_REF=v0.5.8
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

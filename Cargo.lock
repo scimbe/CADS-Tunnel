@@ -532,8 +532,8 @@ dependencies = [
 
 [[package]]
 name = "ct-agent"
-version = "0.5.7"
-source = "git+https://github.com/scimbe/ct-agent?tag=v0.5.7#f37a3804990701cf3af04f223d78f42a535bc2a6"
+version = "0.5.8"
+source = "git+https://github.com/scimbe/ct-agent?tag=v0.5.8#018a0868d0e6c9ab2b9f58dad15c4da4d46026d9"
 dependencies = [
  "axum",
  "base64",
@@ -576,7 +576,7 @@ name = "ct-client"
 version = "0.0.0"
 dependencies = [
  "axum",
- "ct-agent 0.5.7",
+ "ct-agent 0.5.8",
  "ct-common",
  "ct-control-plane",
  "ct-edge",
