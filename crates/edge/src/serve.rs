@@ -70,7 +70,20 @@ const RELAY_OPEN_BI_TIMEOUT: Duration = Duration::from_secs(5);
 /// Short enough to stay well under the Client's own tunnel timeout (8s, see
 /// [`RELAY_OPEN_BI_TIMEOUT`]'s doc comment) even when combined with the
 /// `open_agent_stream` attempt that precedes it.
-const TCP_FALLBACK_DELIVER_WAIT: Duration = Duration::from_millis(1500);
+///
+/// #589: raised 1500ms -> 3000ms (live-caught on sort.bunsenbrenner.org, a
+/// TCP-fallback-only tunnel with zero QUIC registrations ever -- for that
+/// case `open_agent_stream`'s own attempt costs ~0ms, since `agents.is_empty()`
+/// returns immediately rather than spending any of `RELAY_OPEN_BI_TIMEOUT`, so
+/// this constant alone was the entire client-visible budget). The failure
+/// this widens for is a single re-park round-trip (agent notices its one-shot
+/// TCP-fallback slot was consumed, dials out again, completes TCP+TLS,
+/// re-registers) racing a burst of parallel client connections against a
+/// pool that only ever holds one spare slot per outstanding dial -- 1.5s left
+/// too little margin for jitter on a real network. Doubling still leaves
+/// comfortable headroom under the 8s ceiling even stacked on top of a
+/// worst-case multi-agent `open_agent_stream` timeout elsewhere in this file.
+const TCP_FALLBACK_DELIVER_WAIT: Duration = Duration::from_millis(3000);
 
 /// First 8 hex chars of a token, for correlating an Edge trace line with a
 /// field-supplied token during cross-host diagnosis.
@@ -348,7 +361,13 @@ where
             // left the next: on 2026-08-18 a burst of `no agent tunnel for token 9a1aee0b`
             // could not be attributed to a site at all -- nothing in the logs maps a token
             // to a hostname, so "which site is down?" was unanswerable from the record.
-            Err(format!("{e} — host {sni}").into())
+            //
+            // #589: name the TCP-fallback pool depth too, at the moment this call gives up
+            // (after the wait above already found it empty). Distinguishes "pool was
+            // genuinely empty" (0) from "pool had a slot but 1.5s wasn't enough to claim
+            // it" (>0) -- two different failure shapes that read identically without this.
+            let pool = state.tcp_parked_for(&token);
+            Err(format!("{e} — host {sni} — tcp_fallback_pool={pool}").into())
         }
     }
 }
@@ -423,7 +442,9 @@ where
                 }
             }
             // Same reason as the SNI leg above: this is the level that knows the host.
-            Err(format!("{e} — host {host}").into())
+            // #589: pool depth at give-up time, same reasoning as the SNI leg's twin.
+            let pool = state.tcp_parked_for(&token);
+            Err(format!("{e} — host {host} — tcp_fallback_pool={pool}").into())
         }
     }
 }
@@ -1841,7 +1862,9 @@ pub async fn serve_connection(
                     {
                         return Ok(None);
                     }
-                    Err(e)
+                    // #589: pool depth at give-up time, same reasoning as the SNI/Gelb legs.
+                    let pool = state.tcp_parked_for(&token);
+                    Err(format!("{e} — tcp_fallback_pool={pool}").into())
                 }
             }
         }
@@ -2720,7 +2743,9 @@ where
                         {
                             return Ok(());
                         }
-                        Err(e)
+                        // #589: pool depth at give-up time, same reasoning as the SNI/Gelb legs.
+                        let pool = state.tcp_parked_for(&token);
+                        Err(format!("{e} — tcp_fallback_pool={pool}").into())
                     }
                 },
             }
@@ -2791,7 +2816,9 @@ where
                         {
                             return Ok(());
                         }
-                        Err(e)
+                        // #589: pool depth at give-up time, same reasoning as the SNI/Gelb legs.
+                        let pool = state.tcp_parked_for(&token);
+                        Err(format!("{e} — tcp_fallback_pool={pool}").into())
                     }
                 },
             }

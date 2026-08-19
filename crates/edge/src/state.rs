@@ -2178,6 +2178,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_parked_for_is_per_token_and_never_leaks_across_tokens_589() {
+        // #589: `tcp_parked_for` (#544) had zero test coverage before CADS-Tunnel#589
+        // started leaning on it in the "no agent tunnel" error enrichment -- the
+        // operator-visible pool-depth number at give-up time now depends on this
+        // being right per-token, not just in aggregate.
+        let state: EdgeState<u32> = EdgeState::new();
+        assert_eq!(state.tcp_parked_for(&token(40)), 0, "an unknown token has no parked slots");
+
+        let _rx_a1 = state.park_tcp_agent(token(40));
+        assert_eq!(state.tcp_parked_for(&token(40)), 1);
+        assert_eq!(state.tcp_parked_for(&token(41)), 0, "a different token is unaffected");
+
+        let _rx_a2 = state.park_tcp_agent(token(40));
+        assert_eq!(state.tcp_parked_for(&token(40)), 2, "additive -- both parks count (#229)");
+
+        let _rx_b1 = state.park_tcp_agent(token(41));
+        assert_eq!(state.tcp_parked_for(&token(40)), 2, "still unaffected by the other token");
+        assert_eq!(state.tcp_parked_for(&token(41)), 1);
+
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        assert!(state.deliver_to_tcp_agent(&token(40), client).is_ok());
+        assert_eq!(state.tcp_parked_for(&token(40)), 1, "one slot consumed, one remains");
+    }
+
+    #[tokio::test]
     async fn a_parked_slot_whose_agent_vanished_still_leaves_the_gauge_consistent() {
         // The receiver being dropped (agent gone) must not leak the gauge: the slot
         // is consumed either way, otherwise tcp_parked drifts upward forever and
