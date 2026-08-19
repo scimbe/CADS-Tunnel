@@ -18,6 +18,18 @@ use rustls::pki_types::CertificateDer;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Cap on an echoed bulk read so a misbehaving Agent/Origin (this bench dials whatever
+/// `client_tunnel_stream`'s Capability points at, which for #322-style pipeline onboarding
+/// or an operator benchmarking a third party is not always something the operator fully
+/// controls) can't make the client allocate unbounded memory or hang forever draining a
+/// peer that never closes. `tokio::io::AsyncReadExt::read_to_end` has no built-in bound
+/// (unlike quinn's `RecvStream::read_to_end(max_size)`, used by the sibling
+/// `direct_bench.rs`'s QUIC path) -- `.take(MAX_BULK_BYTES)` supplies one here. 256 MiB,
+/// matching `direct_bench.rs`'s own constant: well above any smoke payload, and a read
+/// that hits this cap fails the existing length/content check below rather than silently
+/// succeeding on truncated data.
+const MAX_BULK_BYTES: u64 = 256 * 1024 * 1024;
+
 /// CSV header for a sweep result file. The M16 statistical columns
 /// (`stddev_ms`, `ci95_ms`, `p99_ms`) are appended after the original M6 columns
 /// so existing readers that index the first nine columns keep working. The
@@ -168,11 +180,11 @@ async fn run_once_stream(
 
     // Drive the local app end: send the payload, half-close so the pump sees
     // EOF, then read the echoed bytes back.
-    let (mut r, mut w) = tokio::io::split(app_remote);
+    let (r, mut w) = tokio::io::split(app_remote);
     w.write_all(payload).await?;
     w.shutdown().await?;
     let mut got = Vec::new();
-    r.read_to_end(&mut got).await?;
+    r.take(MAX_BULK_BYTES).read_to_end(&mut got).await?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let _ = tunnel.await;
@@ -289,7 +301,7 @@ async fn run_once_throughput(
             },
         );
 
-    let (mut r, mut w) = tokio::io::split(app_remote);
+    let (r, mut w) = tokio::io::split(app_remote);
     let payload_owned = payload.to_vec();
     let writer = tokio::spawn(async move {
         w.write_all(&payload_owned).await?;
@@ -298,7 +310,7 @@ async fn run_once_throughput(
     });
 
     let mut got = Vec::with_capacity(payload.len());
-    r.read_to_end(&mut got).await?;
+    r.take(MAX_BULK_BYTES).read_to_end(&mut got).await?;
     let elapsed = start.elapsed().as_secs_f64();
 
     writer.await??;
@@ -890,5 +902,41 @@ mod tests {
         agent_task.abort();
         edge.abort();
         origin.abort();
+    }
+
+    #[tokio::test]
+    async fn bounded_read_stops_a_runaway_peer_instead_of_hanging_forever_593() {
+        // #593: proves the exact mechanism run_once_stream/run_once_throughput now rely
+        // on (`.take(cap).read_to_end()`), isolated from the real edge/Noise harness. A
+        // peer that keeps writing and never closes -- the "old code" failure mode -- must
+        // not hang or grow the read buffer without bound: a bare `read_to_end(&mut got)`
+        // against this same writer would never return (it only completes on EOF, which
+        // this writer deliberately never sends), so this test would time out under the
+        // pre-#593 code instead of completing.
+        let (local, mut remote) = tokio::io::duplex(4096);
+        let (r, _w) = tokio::io::split(local);
+        const SMALL_CAP: u64 = 1024;
+        let writer = tokio::spawn(async move {
+            // Write well past the cap, then keep the connection open (no shutdown) --
+            // exactly the "runaway/never-closes" peer shape the cap defends against.
+            let chunk = vec![0xABu8; 256];
+            for _ in 0..(SMALL_CAP as usize / chunk.len() + 4) {
+                if remote.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            // Deliberately never shutdown -- a bare read_to_end would block forever here.
+            std::future::pending::<()>().await;
+        });
+
+        let mut got = Vec::new();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), r.take(SMALL_CAP).read_to_end(&mut got))
+                .await;
+
+        writer.abort();
+        assert!(result.is_ok(), "a capped read must return once the cap is hit, not hang");
+        assert!(result.unwrap().is_ok(), "reaching the cap is Ok, not an error");
+        assert_eq!(got.len(), SMALL_CAP as usize, "growth stops exactly at the cap");
     }
 }

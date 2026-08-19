@@ -50,7 +50,7 @@ const MAX_BULK_BYTES: usize = 256 * 1024 * 1024;
 async fn tcp_throughput_once(target: SocketAddr, payload: &[u8]) -> Result<f64, BoxError> {
     let start = Instant::now();
     let stream = TcpStream::connect(target).await?;
-    let (mut r, mut w) = stream.into_split();
+    let (r, mut w) = stream.into_split();
     let payload_owned = payload.to_vec();
     let writer = tokio::spawn(async move {
         w.write_all(&payload_owned).await?;
@@ -58,7 +58,12 @@ async fn tcp_throughput_once(target: SocketAddr, payload: &[u8]) -> Result<f64, 
         Ok::<(), std::io::Error>(())
     });
     let mut got = Vec::with_capacity(payload.len());
-    r.read_to_end(&mut got).await?;
+    // #593: this TCP path used the unbounded `AsyncReadExt::read_to_end` -- unlike the
+    // QUIC path just below, which already bounds via quinn's own `RecvStream::read_to_end
+    // (MAX_BULK_BYTES)`. tokio's generic `AsyncReadExt::read_to_end` has no built-in cap
+    // parameter, so `.take(MAX_BULK_BYTES)` supplies the equivalent bound here; a read
+    // that hits it fails the length check below instead of allocating without limit.
+    r.take(MAX_BULK_BYTES as u64).read_to_end(&mut got).await?;
     let elapsed = start.elapsed().as_secs_f64();
     writer.await??;
     if got.len() == payload.len() {
