@@ -49,10 +49,27 @@ pub async fn serve_api(
 fn authorized(st: &ApiState, headers: &HeaderMap) -> bool {
     match &st.token {
         None => true,
-        Some(t) => {
-            headers.get("x-ct-dns-token").and_then(|v| v.to_str().ok()) == Some(t.as_ref())
-        }
+        Some(t) => headers
+            .get("x-ct-dns-token")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|presented| token_eq(presented, t)),
     }
+}
+
+/// Constant-time token comparison (avoid leaking `CT_DNS_API_TOKEN` via response-timing
+/// differences on a byte-by-byte `==` short-circuit) -- the same defence-in-depth
+/// discipline the control plane's own admin-token check already applies
+/// (`ct_token_eq`, `crates/control-plane/src/service.rs`), generalized here from a
+/// fixed 32-byte array to this API's variable-length string token. The length check
+/// itself is allowed to short-circuit (the token's LENGTH isn't the secret, only its
+/// content is -- `ct_token_eq`'s own fixed-size signature makes the same assumption
+/// implicitly).
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// #299: a real ACME DNS-01 key authorization digest (base64url SHA-256) is exactly
