@@ -11,7 +11,7 @@ RUN apt-get update \
 # Which ct-agent tag/branch/commit to build -- bump deliberately. The default MUST
 # match the repo-root `CT_AGENT_RELEASE` file (#512, the one pin source; a portal
 # test asserts this file agrees with it), so a release bump updates both together.
-ARG CT_AGENT_REF=v0.5.6
+ARG CT_AGENT_REF=v0.5.7
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
