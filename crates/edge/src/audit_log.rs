@@ -141,8 +141,34 @@ fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     let _mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    // #608: the module doc's "Access is host-only (`sqlite3` directly on the box) by
+    // design" claim is only true if the FILE actually enforces that -- `Connection::
+    // open` creates it with the process's default umask (typically 0644, world-
+    // readable), which any other local account on the host could then read directly,
+    // bypassing every access control this module otherwise relies on. Restricted
+    // AFTER entering WAL mode (not before): SQLite creates the `-wal`/`-shm` sidecar
+    // files as part of the PRAGMA above, so by this point all three exist to restrict.
+    // Best-effort: a failure here doesn't fail `open` -- it only tightens a file that
+    // is otherwise already fully functional, never blocks startup on it.
+    restrict_db_file_permissions(path);
     Ok(conn)
 }
+
+/// See [`open_tuned`]'s call site for why. `path`'s `-wal`/`-shm` sidecar files (WAL
+/// mode) can hold the same data as the main file (recent, not-yet-checkpointed rows),
+/// so all three need the same restriction, not just the main path.
+#[cfg(unix)]
+fn restrict_db_file_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    for candidate in [path.to_string(), format!("{path}-wal"), format!("{path}-shm")] {
+        if std::path::Path::new(&candidate).exists() {
+            let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_file_permissions(_path: &str) {}
 
 /// #603: periodic retention sweep, deleting `conn_audit` rows older than
 /// `window_secs`. No scheduled prune/retention job exists anywhere else in this
@@ -189,6 +215,16 @@ mod tests {
         SqliteAuditLog::open_in_memory().unwrap()
     }
 
+    /// A unique temp DB path (no wall-clock / process helpers needed) -- mirrors
+    /// `crates/control-plane/src/storage.rs`'s own `temp_db_path` test helper.
+    fn temp_db_path() -> String {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        std::env::temp_dir().join(format!("ct_audit_log_{name}.db")).to_string_lossy().into_owned()
+    }
+
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
@@ -229,6 +265,31 @@ mod tests {
 
         // A second prune with the same cutoff finds nothing new to remove.
         assert_eq!(s.prune_older_than(1_000).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_restricts_the_file_and_its_wal_shm_sidecars_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_db_path();
+        let s = SqliteAuditLog::open(&path).unwrap();
+        // Force a write so the row actually lands (and, on some SQLite builds, so the
+        // -wal file is guaranteed to exist, not just the -shm memory-mapped index).
+        s.record(ConnTransport::FrontDoorTls, ip(203, 0, 113, 1), 1, None, None, None).unwrap();
+
+        let mode = |p: &str| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "main db file must be owner-only, not the umask default");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = format!("{path}{suffix}");
+            if std::path::Path::new(&sidecar).exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{sidecar} must be owner-only too -- it can hold the same data");
+            }
+        }
+
+        drop(s);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
     #[tokio::test]

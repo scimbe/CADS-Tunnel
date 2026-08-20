@@ -81,8 +81,36 @@ pub(crate) fn ensure_column(conn: &Connection, table: &str, column: &str, decl: 
 pub(crate) fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     tune_connection(&conn)?;
+    // #608: `Connection::open` creates the file with the process's default umask
+    // (typically 0644, world/group-readable) -- this file holds ledger balances,
+    // payment/issuance records, and service-account data, none of which should be
+    // readable by another local account on the host. Restricted AFTER
+    // `tune_connection` engages WAL mode (not before): SQLite creates the
+    // `-wal`/`-shm` sidecar files as part of that PRAGMA, so by this point all
+    // three exist to restrict. Best-effort: a failure here doesn't fail `open` --
+    // it only tightens a file that is otherwise already fully functional, never
+    // blocks startup on it. Same gap+fix as `crates/edge/src/audit_log.rs`'s
+    // `open_tuned` (this crate's own doc above notes the WAL tuning is duplicated
+    // rather than shared between the two, same reasoning applies here).
+    restrict_db_file_permissions(path);
     Ok(conn)
 }
+
+/// See [`open_tuned`]'s call site for why. `path`'s `-wal`/`-shm` sidecar files (WAL
+/// mode) can hold the same data as the main file (recent, not-yet-checkpointed rows),
+/// so all three need the same restriction, not just the main path.
+#[cfg(unix)]
+fn restrict_db_file_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    for candidate in [path.to_string(), format!("{path}-wal"), format!("{path}-shm")] {
+        if std::path::Path::new(&candidate).exists() {
+            let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_file_permissions(_path: &str) {}
 
 /// The WAL + busy_timeout tuning itself (#344), factored out of [`open_tuned`]
 /// so [`SqliteTunnelStore::open`]'s pooled reader connections (via
@@ -6068,6 +6096,35 @@ mod tests {
         drop(store);
 
         // Clean up the DB plus the WAL/SHM sidecars WAL mode creates.
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_restricts_the_file_and_its_wal_shm_sidecars_to_owner_only() {
+        // This DB file holds ledger balances, payment/issuance records, and
+        // service-account data -- `Connection::open`'s default umask-based mode
+        // (typically 0644) would let any other local account on the host read it
+        // directly, bypassing the control plane entirely.
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_db_path();
+        let store = SqliteBootstrap::open(&path).expect("open a file-backed store");
+        // Force a write so a real transaction has actually touched the WAL, not
+        // just the initial schema-creation one from `open`/`from_connection`.
+        let _ = store.mint("perm-test-secret", 3600u64, 1u64).unwrap();
+
+        let mode = |p: &str| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "main db file must be owner-only, not the umask default");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = format!("{path}{suffix}");
+            if std::path::Path::new(&sidecar).exists() {
+                assert_eq!(mode(&sidecar), 0o600, "{sidecar} must be owner-only too -- it can hold the same data");
+            }
+        }
+
+        drop(store);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
