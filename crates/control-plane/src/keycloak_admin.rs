@@ -752,11 +752,13 @@ async fn fetch_realm_enforcement(
     Ok(classify_realm_enforcement(&realm, &actions, &idps))
 }
 
-/// Bounded client for the startup check: a Keycloak that accepts the connection
-/// but never answers must not keep this task alive forever (#295 saw exactly that
-/// shape block `main()` on the JWKS fetch). Same bounds as `main.rs`'s
-/// `jwks_fetch_client`.
-fn startup_check_http_client() -> reqwest::Client {
+/// Bounded client for any admin-API call against Keycloak: a Keycloak that
+/// accepts the connection but never answers must not keep the caller alive
+/// forever (#295 saw exactly that shape block `main()` on the JWKS fetch;
+/// #610 found the same gap on the live service-account create/rotate/delete
+/// request handlers, which each built their own unbounded `Client::new()`
+/// instead of reusing this). Same bounds as `main.rs`'s `jwks_fetch_client`.
+pub(crate) fn bounded_admin_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -812,7 +814,7 @@ pub fn spawn_startup_keycloak_enforcement_check() {
         user_provisioning: true,
     };
     tokio::spawn(async move {
-        let client = startup_check_http_client();
+        let client = bounded_admin_http_client();
         let check = check_realm_enforcement(&client, &cfg).await;
         for line in check.report_lines(&cfg.realm, scope) {
             eprintln!("{line}");
@@ -845,6 +847,37 @@ mod tests {
     fn config_from_lookup_is_none_when_any_required_var_is_missing() {
         assert!(KeycloakAdminConfig::from_lookup(|_| None).is_none());
         assert!(KeycloakAdminConfig::from_lookup(|k| (k == "KEYCLOAK_PUBLIC_URL").then(|| "x".to_string())).is_none());
+    }
+
+    /// `bounded_admin_http_client` is now the shared client for every live
+    /// admin-API call site (the startup enforcement check, plus the
+    /// service-account create/rotate/delete request handlers in
+    /// `service.rs`, which each previously built their own unbounded
+    /// `Client::new()`). Prove directly that it does not hang forever on a
+    /// Keycloak that accepts the connection and never answers -- a stall,
+    /// not a refusal (a refused connection already errors immediately and
+    /// proves nothing about the timeout).
+    #[tokio::test]
+    async fn bounded_admin_http_client_does_not_hang_on_a_stalled_connection_forever() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    std::mem::forget(socket);
+                }
+            }
+        });
+
+        let client = bounded_admin_http_client();
+        // A generous outer bound, completely independent of the client's own
+        // (much shorter) configured timeout: proves the request returns at
+        // all, rather than hanging past its own budget.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), client.get(format!("http://{addr}/")).send()).await;
+        let err = outcome
+            .expect("the request must return within a bounded time, not hang on a stalled connection forever")
+            .expect_err("a connection that never answers must surface as a request error");
+        assert!(err.is_timeout(), "expected a client-side timeout, got: {err}");
     }
 
     #[tokio::test]

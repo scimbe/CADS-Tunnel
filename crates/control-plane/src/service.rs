@@ -1165,7 +1165,7 @@ async fn service_account_create(
     // sa-<16 hex bytes>: server-generated, never user-supplied -- a real
     // Keycloak clientId with no injection/collision surface to worry about.
     let client_id = format!("sa-{}", gen_hex_id());
-    let http = reqwest::Client::new();
+    let http = crate::keycloak_admin::bounded_admin_http_client();
     let created = crate::keycloak_admin::create_service_account_client(&http, kc, &client_id, name)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
@@ -1214,7 +1214,7 @@ async fn service_account_rotate(
         .internal_id_for(&subject, &client_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "unknown service account or not owned by you".to_string()))?;
-    let http = reqwest::Client::new();
+    let http = crate::keycloak_admin::bounded_admin_http_client();
     let secret = crate::keycloak_admin::rotate_client_secret(&http, kc, &internal_id)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
@@ -1235,7 +1235,7 @@ async fn service_account_delete(
         .internal_id_for(&subject, &client_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "unknown service account or not owned by you".to_string()))?;
-    let http = reqwest::Client::new();
+    let http = crate::keycloak_admin::bounded_admin_http_client();
     crate::keycloak_admin::delete_client(&http, kc, &internal_id).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
     // Real Keycloak delete already succeeded -- drop the ownership row too. A
     // failure here leaves a harmless dangling row (the client_id no longer
