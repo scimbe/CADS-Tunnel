@@ -4122,6 +4122,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         relay_pairer,
                                         relay_penalty,
                                         relay_heartbeat,
+                                        None, // #601: step 6 wires the real store
                                     )
                                     .await;
                                 });
@@ -4185,6 +4186,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 rendezvous_pairer,
                                 rendezvous_penalty,
                                 rendezvous_heartbeat,
+                                None, // #601: step 6 wires the real store
                             )
                             .await;
                         });
