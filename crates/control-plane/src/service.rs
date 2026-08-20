@@ -653,6 +653,11 @@ async fn buy_token(
                         LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => {
                             StatusCode::CONFLICT
                         }
+                        // #604: only `credit()` can produce this -- unreachable via a
+                        // debit-only path, kept for match exhaustiveness.
+                        LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
                         LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     (code, e.to_string())
@@ -669,6 +674,10 @@ async fn buy_token(
                     // #440: only debit_and_record_issuance's insert can produce this --
                     // unreachable via the plain debit() this arm covers.
                     LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                    // #604: only `credit()` can produce this -- unreachable via debit().
+                    LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => {
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
                     LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -3744,6 +3753,9 @@ async fn me_issue(
             LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => StatusCode::PAYMENT_REQUIRED,
             LedgerOpError::Ledger(LedgerError::UnknownAccount) => StatusCode::NOT_FOUND,
             LedgerOpError::Ledger(LedgerError::IdempotencyKeyReused) => StatusCode::CONFLICT,
+            // #604: only `credit()` can produce this -- unreachable via the debit calls
+            // this closure covers, kept for match exhaustiveness.
+            LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => StatusCode::INTERNAL_SERVER_ERROR,
             LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match &idempotency_key {

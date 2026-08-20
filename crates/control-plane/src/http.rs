@@ -258,6 +258,10 @@ async fn buy_token(
                 // Not enough credit to pay for the token.
                 LedgerError::InsufficientCredit { .. } => StatusCode::PAYMENT_REQUIRED,
                 LedgerError::IdempotencyKeyReused => StatusCode::CONFLICT,
+                // #604: this in-memory Ledger's own `credit()` can't actually produce
+                // this (it has no i64-cast to guard against), but the variant is shared
+                // with SqliteLedger's, so the match must stay exhaustive.
+                LedgerError::CreditAmountTooLarge { .. } => StatusCode::BAD_REQUEST,
             };
             (code, e.to_string())
         })?;

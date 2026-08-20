@@ -1428,6 +1428,12 @@ impl SqliteLedger {
     /// The app-level `Mutex<Connection>` already excludes that within one
     /// process; this closes the same gap across processes.
     pub fn credit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
+        // #604: same guard as `create_intent`'s own #83 check, mirrored here so this
+        // function is self-defending regardless of caller -- see `LedgerError::
+        // CreditAmountTooLarge`'s doc for why `amount as i64` below is unsafe unguarded.
+        if amount > i64::MAX as u64 {
+            return Err(LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { amount }));
+        }
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
         let bal = Self::balance_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
@@ -7371,6 +7377,33 @@ mod tests {
             "the maximum valid top-up credits the exact amount"
         );
         assert_eq!(ledger.balance(&acct).unwrap(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn credit_rejects_amount_above_i64_max_604() {
+        // #604: `credit()` had no guard of its own -- only `create_intent` (the one
+        // production entry point) had the #83 check. A direct `credit()` call with an
+        // over-i64::MAX amount used to wrap NEGATIVE and silently DECREASE the balance
+        // instead of erroring.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 100).unwrap();
+
+        assert!(
+            matches!(
+                ledger.credit(&acct, u64::MAX),
+                Err(LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { amount: u64::MAX }))
+            ),
+            "an over-i64::MAX credit is rejected with the typed error, not silently wrapped"
+        );
+        assert_eq!(ledger.balance(&acct).unwrap(), 100, "the balance must be untouched, not decreased");
+
+        assert!(ledger.credit(&acct, (i64::MAX as u64) + 1).is_err(), "just above i64::MAX is rejected");
+        assert_eq!(ledger.balance(&acct).unwrap(), 100);
+
+        // The boundary value i64::MAX is still accepted (matches create_intent's own
+        // boundary, and doesn't overflow the saturating_add against a small existing balance).
+        assert_eq!(ledger.credit(&acct, i64::MAX as u64).unwrap(), i64::MAX as u64);
     }
 
     /// Production requirement: billing state survives a restart. Open + credit +

@@ -34,6 +34,11 @@ pub enum LedgerError {
     /// point means a genuine cross-account key collision, a real conflict to surface,
     /// not a raw DB error).
     IdempotencyKeyReused,
+    /// #604: `amount` would wrap NEGATIVE through SQLite's INTEGER (i64) storage
+    /// (`amount as i64`) — the same failure mode `create_intent`'s own `#83` guard
+    /// already rejects, mirrored here so `SqliteLedger::credit` is self-defending
+    /// regardless of caller, not just the one call site #83 happened to fix first.
+    CreditAmountTooLarge { amount: u64 },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -45,6 +50,9 @@ impl std::fmt::Display for LedgerError {
             }
             LedgerError::IdempotencyKeyReused => {
                 write!(f, "idempotency key already used by a different account")
+            }
+            LedgerError::CreditAmountTooLarge { amount } => {
+                write!(f, "credit amount {amount} exceeds the maximum {}", i64::MAX)
             }
         }
     }
