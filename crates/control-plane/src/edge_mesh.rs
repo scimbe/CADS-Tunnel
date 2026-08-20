@@ -74,7 +74,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
+    // #596: byte-length guard alone isn't a char-boundary guard -- a multi-byte UTF-8
+    // char can pass the length check and still land mid-char at a `s[i..j]` slice,
+    // panicking instead of returning `None` as this function's own contract promises.
+    // Same fix already applied once in this crate as service.rs::hex_decode_32 (#401).
+    if s.len() != 64 || !s.is_ascii() {
         return None;
     }
     let mut out = [0u8; 32];
@@ -85,7 +89,8 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
 }
 
 fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
-    if s.len() != 128 {
+    // #596: same char-boundary hazard as hex_decode_32.
+    if s.len() != 128 || !s.is_ascii() {
         return None;
     }
     let mut out = [0u8; 64];
@@ -625,6 +630,25 @@ mod tests {
 
     fn store() -> Arc<SqliteEdgeMesh> {
         Arc::new(SqliteEdgeMesh::open_in_memory().unwrap())
+    }
+
+    #[test]
+    fn hex_decoders_reject_non_ascii_input_instead_of_panicking_596() {
+        // #596: same char-boundary hazard as service.rs::hex_decode_32/64 (#401) -- a
+        // multi-byte UTF-8 char can pass the byte-length guard and still land mid-char at
+        // a later `s[i..j]` slice, which panics rather than returning `None` as each
+        // function's own `Option` contract promises.
+        let euro_64 = format!("{}{}", '€', "a".repeat(61));
+        assert_eq!(euro_64.len(), 64);
+        assert_eq!(hex_decode_32(&euro_64), None, "must reject, not panic");
+
+        let euro_128 = format!("{}{}", '€', "a".repeat(125));
+        assert_eq!(euro_128.len(), 128);
+        assert_eq!(hex_decode_64(&euro_128), None, "must reject, not panic");
+
+        // Real valid hex still round-trips correctly (the fix must not reject legitimate input).
+        let real = "ab".repeat(32);
+        assert!(hex_decode_32(&real).is_some());
     }
 
     #[test]
