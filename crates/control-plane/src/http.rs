@@ -25,6 +25,18 @@ use ct_common::sync::MutexExt;
 pub type SharedEnrollment = Arc<Mutex<Enrollment>>;
 
 /// Build the enrollment HTTP router: `POST /enroll/issue`, `POST /enroll/redeem`.
+///
+/// **#605: test-only scaffolding, not a production path** — same status as the
+/// [`Enrollment`] state it wraps (see that struct's own `#447` doc comment).
+/// `redeem` below calls [`Enrollment::redeem`] directly, which never checks
+/// proof-of-possession (`#88 SEC88c`) — unlike the REAL production enrollment
+/// router, [`crate::service::persistent_control_plane_router`] (wired in
+/// `main.rs`), which uses [`crate::storage::SqliteEnrollment::redeem_with_proof`]
+/// and does verify it. Confirmed via `grep`: this router's only caller outside
+/// this file's own tests is `client.rs`'s `#[cfg(test)] mod tests`. If this
+/// router is ever wired into a real binary instead of `service.rs`'s, it
+/// reopens the #88 SEC88c identity-binding bypass this crate already fixed
+/// once elsewhere.
 pub fn enrollment_router(state: SharedEnrollment) -> Router {
     Router::new()
         .route("/enroll/issue", post(issue))
@@ -59,6 +71,7 @@ struct RedeemResp {
     tenant: String,
 }
 
+/// **#605: no proof-of-possession check** — see [`enrollment_router`]'s doc.
 async fn redeem(
     State(enr): State<SharedEnrollment>,
     Json(req): Json<RedeemReq>,
@@ -77,6 +90,11 @@ async fn redeem(
 /// Build the full control-plane router: enrollment + registry/rendezvous +
 /// billing (accounts/payment/gated issuance, M15.4b) on one app, each with its
 /// own shared state.
+///
+/// **#605: test-only, NOT the real production router** — despite the name.
+/// The real one is [`crate::service::persistent_control_plane_router`] (wired
+/// in `main.rs`). See [`enrollment_router`]'s doc for exactly why this one
+/// must not be wired into a real binary.
 pub fn control_plane_router(
     enrollment: SharedEnrollment,
     registry: SharedRegistry,
