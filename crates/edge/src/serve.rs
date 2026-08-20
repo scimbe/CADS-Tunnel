@@ -1424,7 +1424,7 @@ pub async fn serve_front_door(
             let tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, acceptor.accept(joined))
                 .await
                 .map_err(|_| -> BoxError { "front door: TLS handshake not completed within the timeout (#422)".into() })??;
-            serve_tcp_connection(tls, state, challenge, tcp_agent_cap).await
+            serve_tcp_connection(tls, state, challenge, tcp_agent_cap, observed.ip()).await
         }
         crate::sni::FrontDoorRoute::Proxy(host) => {
             let (addr, tls) = proxies
@@ -2393,6 +2393,24 @@ fn note_parked_fallback_relay(
     state.note_relay(token, client_to_agent, agent_to_client, crate::state::RelayKind::TcpFallback);
 }
 
+/// #603: durable record of one TCP-fallback registration/rendezvous's source IP.
+/// Shared by every `serve_tcp_connection` role arm ('A'/'K'/'F'/'B'/'L' register,
+/// 'C' rendezvous) instead of duplicating the `state.audit_log()` call five times.
+fn audit_log_tcp_fallback(state: &EdgeState<Connection>, peer_ip: std::net::IpAddr, token: &RoutingToken) {
+    if let Some(log) = state.audit_log() {
+        if let Err(e) = log.record(
+            crate::audit_log::ConnTransport::TcpFallback,
+            peer_ip,
+            unix_now() as i64,
+            Some(&hex_of_bytes(&token.0)),
+            None,
+            None,
+        ) {
+            eprintln!("ct-edge: audit-log record failed: {e} (#603)");
+        }
+    }
+}
+
 /// Serve one connection over the **TCP fallback** (M12.2b, issue #3 / P1.2c-3b)
 /// by dispatching on the first byte's role:
 ///
@@ -2438,6 +2456,13 @@ pub async fn serve_tcp_connection<S>(
     state: &EdgeState<Connection>,
     challenge: &Challenge,
     tcp_agent_cap: Option<&ConnectionCap>,
+    // #603: the connecting socket's source IP, for the durable audit-log record
+    // on a successful 'A'/'K'/'F'/'B'/'L' registration or 'C' rendezvous below.
+    // TCP has no `Connection::remote_address()` the way QUIC does, so unlike
+    // `serve_connection` this has to come in as a parameter -- both callers
+    // already capture it (the front-door arm's `observed`, the dedicated
+    // `:4433` listener's own accept-time `addr`).
+    peer_ip: std::net::IpAddr,
 ) -> Result<(), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2477,6 +2502,7 @@ where
                 let _ = stream.shutdown().await;
                 return Ok(());
             };
+            audit_log_tcp_fallback(state, peer_ip, &token);
             // Await the parked Client, then relay this agent stream to it.
             match parked.await {
                 Ok(mut client) => {
@@ -2516,6 +2542,7 @@ where
                 let _ = stream.shutdown().await;
                 return Ok(());
             };
+            audit_log_tcp_fallback(state, peer_ip, &token);
             match park_and_ping(&mut stream, parked).await {
                 Ok(mut client) => {
                     // Clean, unambiguous hand-off boundary (see TCP_PING_STOP's
@@ -2587,6 +2614,7 @@ where
             else {
                 return Ok(());
             };
+            audit_log_tcp_fallback(state, peer_ip, &token);
             match park_and_ping(&mut stream, parked).await {
                 Ok(mut client) => {
                     // Same clean park->relay boundary as 'K': the STOP sentinel
@@ -2636,6 +2664,7 @@ where
             else {
                 return Ok(());
             };
+            audit_log_tcp_fallback(state, peer_ip, &token);
             match parked.await {
                 Ok(mut client) => {
                     // #534, as in the 'A' arm above.
@@ -2678,6 +2707,7 @@ where
             else {
                 return Ok(());
             };
+            audit_log_tcp_fallback(state, peer_ip, &token);
             match park_and_ping(&mut stream, parked).await {
                 Ok(mut client) => {
                     // Clean, unambiguous hand-off boundary, same as 'K': announce the
@@ -2737,6 +2767,7 @@ where
             })
             .await
             .map_err(|_| "tcp-fallback: role 'C' admission timed out")??;
+            audit_log_tcp_fallback(state, peer_ip, &token);
 
             // Prefer a parked TCP-fallback agent; else relay to a QUIC agent.
             match state.deliver_to_tcp_agent_draining(&token, Box::new(stream)) {
@@ -4021,7 +4052,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
         None,
         shutdown.clone(),
         Some(state.expect_listener("TCP fallback", unix_now())),
-        move |tcp, _addr, permit| {
+        move |tcp, addr, permit| {
             let acceptor = acceptor.clone();
             let state = state_tcp.clone();
             let tcp_agent_cap = tcp_agent_cap_loop.clone();
@@ -4043,7 +4074,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 // fails for any reason, including a NAT/firewall silently dropping an
                 // idle TCP-fallback connection mid-session, previously left zero log
                 // output explaining why.
-                if let Err(e) = serve_tcp_connection(tls, &state, &challenge, tcp_agent_cap.as_ref()).await {
+                if let Err(e) = serve_tcp_connection(tls, &state, &challenge, tcp_agent_cap.as_ref(), addr.ip()).await {
                     // #533-follow: same classifier and throttle as the `:443` arm. A client
                     // that closes without close_notify is ordinary, not a fault -- logging
                     // it flat produced 44 error-shaped lines in three hours, in exactly the
@@ -4404,6 +4435,12 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    /// #603: a fixed TEST-NET-3 (RFC 5737) address for `serve_tcp_connection`'s
+    /// `peer_ip` parameter in tests that don't otherwise care what it is.
+    fn test_peer_ip() -> std::net::IpAddr {
+        std::net::Ipv4Addr::new(203, 0, 113, 42).into()
+    }
 
     /// #533: build the front-door abort throttle a test drives by hand.
     fn front_door_abort_log(
@@ -5295,7 +5332,7 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let start = tokio::time::Instant::now();
-            let res = serve_tcp_connection(edge_side, &state, &challenge, None).await;
+            let res = serve_tcp_connection(edge_side, &state, &challenge, None, test_peer_ip()).await;
             (res, start.elapsed())
         });
 
@@ -5326,7 +5363,7 @@ mod tests {
         let state_srv = state.clone();
         tokio::spawn(async move {
             let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-            let _ = serve_tcp_connection(edge_side, &state_srv, &challenge, None).await;
+            let _ = serve_tcp_connection(edge_side, &state_srv, &challenge, None, test_peer_ip()).await;
         });
 
         let host = "help.bunsenbrenner.org";
@@ -5381,7 +5418,7 @@ mod tests {
                 tokio::spawn(async move {
                     if let Ok(tls) = acceptor.accept(tcp).await {
                         let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-                        let _ = serve_tcp_connection(tls, &state, &challenge, None).await;
+                        let _ = serve_tcp_connection(tls, &state, &challenge, None, test_peer_ip()).await;
                     }
                 });
             }
@@ -5459,7 +5496,7 @@ mod tests {
             let (tcp, _) = listener_b.accept().await.unwrap();
             if let Ok(tls) = acceptor_b.accept(tcp).await {
                 let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
-                let _ = serve_tcp_connection(tls, &state_b, &challenge, None).await;
+                let _ = serve_tcp_connection(tls, &state_b, &challenge, None, test_peer_ip()).await;
             }
         });
 
@@ -5912,7 +5949,7 @@ mod tests {
         tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None, test_peer_ip()).await;
         });
 
         let mut client = tcp_tls_connect(taddr, tcert).await.expect("tcp connect");
@@ -6000,7 +6037,7 @@ mod tests {
         let tcp_edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None, test_peer_ip()).await;
         });
 
         // Client over TLS-TCP: 'C' rendezvous + 15 bytes, read the 15-byte echo.
@@ -6281,7 +6318,7 @@ mod tests {
         let tcp_edge = tokio::spawn(async move {
             let (tcp, _) = tcp_listener.accept().await.unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
-            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None).await;
+            let _ = serve_tcp_connection(tls, &state_t, &chal_t, None, test_peer_ip()).await;
         });
 
         // Agent over TLS-TCP: register 'A', then echo the relayed client bytes.
@@ -6402,7 +6439,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(1024);
         let state_a = state.clone();
         let chal_a = challenge.clone();
-        let edge = tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_a, &chal_a, None).await });
+        let edge = tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_a, &chal_a, None, test_peer_ip()).await });
 
         // Agent peer: register 'A' | token, read OK, then echo (origin-relay sim).
         let mut hdr = vec![b'A'];
@@ -6456,7 +6493,7 @@ mod tests {
 
         let (mut attacker, edge_side) = tokio::io::duplex(64);
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(edge_side, &state, &challenge, Some(&cap)).await
+            serve_tcp_connection(edge_side, &state, &challenge, Some(&cap), test_peer_ip()).await
         });
 
         let mut hdr = vec![b'A'];
@@ -6492,7 +6529,7 @@ mod tests {
         let state_a = state.clone();
         let cap_a = cap.clone();
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(agent_edge, &state_a, &challenge, Some(&cap_a)).await
+            serve_tcp_connection(agent_edge, &state_a, &challenge, Some(&cap_a), test_peer_ip()).await
         });
 
         let mut hdr = vec![b'A'];
@@ -6565,7 +6602,7 @@ mod tests {
             let permit = conn_cap.try_admit().expect("conn_cap has room for every one of these");
             let task = tokio::spawn(async move {
                 let _permit = permit;
-                let _ = serve_tcp_connection(edge_side, &state_i, &chal_i, Some(&tcp_agent_cap_i)).await;
+                let _ = serve_tcp_connection(edge_side, &state_i, &chal_i, Some(&tcp_agent_cap_i), test_peer_ip()).await;
             });
             tasks.push(task);
             attacker_streams.push((i, attacker_side));
@@ -7086,7 +7123,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
         let state_k = state.clone();
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(agent_edge, &state_k, &challenge, None).await
+            serve_tcp_connection(agent_edge, &state_k, &challenge, None, test_peer_ip()).await
         });
         let mut hdr = vec![b'K'];
         hdr.extend_from_slice(&token.0);
@@ -7155,7 +7192,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
         let state_f = state.clone();
         let edge =
-            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None).await });
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None, test_peer_ip()).await });
 
         // Admission: identical wire to 'B'/'L' -- role, token, then the
         // length-prefixed hostname, OK out, hostname routable.
@@ -7312,7 +7349,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
         let state_f = state.clone();
         let edge =
-            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None).await });
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_f, &challenge, None, test_peer_ip()).await });
 
         let host = "kinds-framed.bunsenbrenner.org";
         let mut hdr = vec![b'F'];
@@ -7402,7 +7439,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
         let state_l = state.clone();
         let edge =
-            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_l, &challenge, None).await });
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_l, &challenge, None, test_peer_ip()).await });
 
         let host = "kinds-raw.bunsenbrenner.org";
         let mut hdr = vec![b'L'];
@@ -7472,7 +7509,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(1 << 16);
         let state_k = state.clone();
         let edge =
-            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_k, &challenge, None).await });
+            tokio::spawn(async move { serve_tcp_connection(agent_edge, &state_k, &challenge, None, test_peer_ip()).await });
 
         let mut hdr = vec![b'K'];
         hdr.extend_from_slice(&token.0);
@@ -7544,7 +7581,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
         let state_k = state.clone();
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(agent_edge, &state_k, &challenge, None).await
+            serve_tcp_connection(agent_edge, &state_k, &challenge, None, test_peer_ip()).await
         });
 
         let mut hdr = vec![b'K'];
@@ -7662,7 +7699,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
         let state_k = state.clone();
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(agent_edge, &state_k, &challenge, None).await
+            serve_tcp_connection(agent_edge, &state_k, &challenge, None, test_peer_ip()).await
         });
 
         let mut hdr = vec![b'K'];
@@ -7749,7 +7786,7 @@ mod tests {
 
         let (mut attacker, edge_side) = tokio::io::duplex(64);
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(edge_side, &state, &challenge, Some(&cap)).await
+            serve_tcp_connection(edge_side, &state, &challenge, Some(&cap), test_peer_ip()).await
         });
 
         let mut hdr = vec![b'K'];
@@ -7789,7 +7826,7 @@ mod tests {
         let state_k = state.clone();
         let cap_k = cap.clone();
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(agent_edge, &state_k, &challenge, Some(&cap_k)).await
+            serve_tcp_connection(agent_edge, &state_k, &challenge, Some(&cap_k), test_peer_ip()).await
         });
 
         let mut hdr = vec![b'K'];
@@ -7857,7 +7894,7 @@ mod tests {
         let (mut agent_peer, agent_edge) = tokio::io::duplex(4096);
         let state_a = state.clone();
         let edge = tokio::spawn(async move {
-            serve_tcp_connection(agent_edge, &state_a, &challenge, None).await
+            serve_tcp_connection(agent_edge, &state_a, &challenge, None, test_peer_ip()).await
         });
 
         let mut hdr = vec![b'A'];
