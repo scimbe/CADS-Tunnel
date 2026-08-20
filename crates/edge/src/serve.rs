@@ -1826,6 +1826,22 @@ pub async fn serve_connection(
                 return Err("rendezvous rate limit exceeded".into());
             }
 
+            // #603: durable record of this rendezvous client's source IP -- PoW
+            // solved, token resolvable, rate limit clear, i.e. a real client about
+            // to be routed to its tunnel (not yet whether TCP-fallback or QUIC).
+            if let Some(log) = state.audit_log() {
+                if let Err(e) = log.record(
+                    crate::audit_log::ConnTransport::QuicRelayClient,
+                    conn.remote_address().ip(),
+                    unix_now() as i64,
+                    Some(&hex_of_bytes(&token.0)),
+                    None,
+                    None,
+                ) {
+                    eprintln!("ct-edge: audit-log record failed: {e} (#603)");
+                }
+            }
+
             // A QUIC client must also reach a TCP-fallback agent (#13): the TCP
             // path prefers a parked TCP agent, and the QUIC path must mirror it or
             // a QUIC-client → TCP-agent tunnel is invisible and dies with
