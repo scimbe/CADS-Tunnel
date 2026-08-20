@@ -20,6 +20,14 @@
 #   backup-selfhost.sh --no-push  # snapshot only, leave it in $WORK
 set -euo pipefail
 
+# #598: everything staged below (pg_dump, deploy.env, control-plane.db, cert
+# material) is cleartext until the gpg step near the end of this script. Without
+# this, mkdir/redirect inherit the host's ambient umask -- on this host that's
+# 0002, which yields a world-readable stage directory (775/664) for the whole
+# multi-step run. backup-verify.sh already gets this right for its own (mktemp-based)
+# work dir; this makes the fixed-path $STAGE match it.
+umask 077
+
 REPO_SSH="${CADS_BACKUP_REPO:-https://github.com/scimbe/CADS-Tunnel-backups.git}"
 PASSFILE="${CADS_BACKUP_PASSFILE:-/home/becke/.config/cads-backup/passphrase}"
 SRC="${CADS_TUNNEL_SRC:-/home/becke/workspace/CADS-Tunnel}"
@@ -37,7 +45,7 @@ command -v gpg >/dev/null || die "gpg fehlt"
 
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 STAGE="$WORK/stage-$STAMP"
-rm -rf "$STAGE"; mkdir -p "$STAGE/volumes"
+rm -rf "$STAGE"; mkdir -p "$STAGE/volumes"; chmod 700 "$STAGE"
 
 # --- Keycloak: logical dump, not a file copy. Copying a live Postgres data
 # directory yields a torn image; pg_dump is consistent by construction.

@@ -12,6 +12,12 @@
 #   restore-selfhost.sh --dry-run       # decrypt + verify, change nothing
 set -euo pipefail
 
+# #598: the decrypted snapshot (Keycloak DB, control-plane grants, deploy.env,
+# CA/cert material) lands in $WORK in the clear -- without this, mkdir inherits the
+# host's ambient umask (0002 here), leaving it world-readable for the whole restore,
+# longer still under --dry-run. Mirrors the backup-side fix.
+umask 077
+
 BACKUP_REPO="${CADS_BACKUP_REPO:-https://github.com/scimbe/CADS-Tunnel-backups.git}"
 SRC_REPO="${CADS_SRC_REPO:-https://github.com/scimbe/CADS-Tunnel.git}"
 PASSFILE="${CADS_BACKUP_PASSFILE:-/home/becke/.config/cads-backup/passphrase}"
@@ -33,7 +39,7 @@ esac
 [ -r "$PASSFILE" ] || die "keine Passphrase unter $PASSFILE — ohne sie ist der Snapshot unbrauchbar"
 command -v docker >/dev/null || die "docker fehlt"
 
-rm -rf "$WORK"; mkdir -p "$WORK"
+rm -rf "$WORK"; mkdir -p "$WORK"; chmod 700 "$WORK"
 log "Sicherungen holen"
 git clone -q --depth 1 "$BACKUP_REPO" "$WORK/backups" || die "clone des Backup-Repos fehlgeschlagen"
 
