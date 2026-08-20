@@ -31,6 +31,14 @@ services:
     # #36: keep the origin up across host reboots / #15 stack redeploys, so the
     # "route intact but Caddy origin stuck/down" failure mode recovers on its own.
     restart: unless-stopped
+    # #600: same #312 rationale as the core plane services (compose.selfhost.yml) --
+    # this runs on the same swap-less shared host as production edge/control-plane
+    # (see `networks` below), so an unbounded container here is one bad spike away
+    # from starving them too. Sized generously above a static Caddy origin's real
+    # footprint (~5-10MB idle).
+    mem_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
 
   help-agent:
     # ct-agent, in Browser-Plane mode -- built from the standalone scimbe/ct-agent
@@ -79,6 +87,11 @@ services:
     # edge forever (it won't exit on edge downtime), so this won't crash-loop
     # redeeming an already-spent join token.
     restart: unless-stopped
+    # #600: same #312 rationale as help-origin above -- sized generously above a
+    # single ct-agent browser-mode process's real footprint.
+    mem_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
     # #141: durable state for restart-safe onboarding (see CT_AGENT_STATE_DIR above).
     volumes:
       - help_agent_state:/var/lib/ct-agent
