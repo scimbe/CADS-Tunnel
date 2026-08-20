@@ -209,14 +209,25 @@ async fn tunnel_status(
 }
 
 /// Parse a 64-hex string into 32 bytes.
+///
+/// Chunks the raw BYTES rather than string-slicing (`&s[i*2..i*2+2]`): `s.len()` is a
+/// byte length and says nothing about where UTF-8 char boundaries fall, so a 64-byte
+/// string containing a multi-byte char (e.g. one `U+FFFD`, 3 bytes, plus 61 ASCII bytes)
+/// passes the length guard and then panics on the first out-of-boundary slice (#595).
+/// Reachable via the `:token`/`:host` axum `Path` extractors, which percent-decode into
+/// a plain `String` with no ASCII restriction — confirmed NOT reachable via the
+/// `x-ct-admin-token` *header* path (`admin_authed`), since `HeaderValue::to_str()`
+/// rejects any non-ASCII byte before `parse_token_hex` ever sees it, so this needs a
+/// caller that already passes the shared-secret check, not an anonymous one. Same shape
+/// already fixed once in this codebase family — ct-agent#36's `decode_hex_32`.
 fn parse_token_hex(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     if s.len() != 64 {
         return None;
     }
     let mut t = [0u8; 32];
-    for (i, b) in t.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        t[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(t)
 }
@@ -451,5 +462,42 @@ mod tests {
             get(Some(secret_hex), "/admin/tunnel-status/not-hex".to_string()).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// Same bug class as ct-agent#36: a 64-BYTE string containing a multi-byte UTF-8
+    /// char (`U+FFFD` is 3 bytes) passes the `s.len() != 64` guard, then the old
+    /// `&s[i*2..i*2+2]` string-slicing panicked the moment an `i*2` offset fell inside
+    /// that char instead of on a boundary. `\u{FFFD}` (3 bytes) + 61 ASCII hex digits =
+    /// 64 bytes / 62 chars -- reproduces the exact construction from the fixed function's
+    /// doc comment.
+    #[test]
+    fn parse_token_hex_rejects_rather_than_panics_on_a_multi_byte_char_at_a_bad_offset() {
+        let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
+        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(parse_token_hex(&s), None);
+    }
+
+    #[tokio::test]
+    async fn revoke_rejects_rather_than_panics_on_a_malformed_multi_byte_token_path_segment() {
+        // The `x-ct-admin-token` HEADER path is NOT vulnerable to this: HeaderValue::to_str()
+        // rejects any non-ASCII byte before parse_token_hex ever runs, confirmed separately
+        // (an earlier draft of this test wrongly assumed the opposite). The real trigger is
+        // the `:token` URL segment, which axum's `Path<String>` percent-decodes into a plain
+        // String with no such restriction -- and is reachable only by a caller who already
+        // passes the admin-secret check (this test authenticates first).
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x22u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        // Percent-encoded U+FFFD (3 bytes: %EF%BF%BD) + 61 ASCII 'a's decodes to a 64-byte,
+        // 62-char token -- passes `s.len() != 64`, then panics the old string-slicing code.
+        let bad_token = format!("%EF%BF%BD{}", "a".repeat(61));
+
+        let app = admin_router(state);
+        let req = Request::post(format!("/admin/revoke/{bad_token}"))
+            .header("x-ct-admin-token", secret_hex)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 }
