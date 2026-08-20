@@ -866,6 +866,8 @@ Two things worth knowing before touching them:
 | `CT_EDGE_MESH_RELAY_ENABLED` | **off** | ADR-0021 Part 1: on a hostname this edge has no local route for, ask the registry which edge owns it and relay the raw bytes there. Off by default and a no-op until a **second** edge actually exists. See the failure modes below before turning it on |
 | `CT_DNS_STORE_PATH` | — | zone store for the standalone `ct-dns` service (not deployed here; `ct-dns` runs no container in this stack) |
 | `CT_AGENT_SETUP_URL` / `CT_AGENT_SETUP_PS1_URL` | upstream raw URL | where `/install` redirects for the shell and PowerShell setup scripts. Exists so a self-hosting operator can point at their own mirror instead of a single chokepoint on `raw.githubusercontent.com` — the product's own audience should not need to patch the crate for that (#448) |
+| `CT_EDGE_AUDIT_LOG_PATH` | — (off) | #603: enables the durable, host-only connection-source audit log (`crates/edge/src/audit_log.rs`) at the given SQLite file path — e.g. `/shared/conn-audit.sqlite3`, inside the already-persisted `shared` volume. Purely evidentiary (timestamp, source IP, transport, routing token/channel — see privacy policy §9), not a network-reachable interface. Unset (the shipped default) leaves every accept path's audit-log call a true no-op |
+| `CT_EDGE_AUDIT_LOG_RETENTION_SECS` | `604800` (7 days) | how long `CT_EDGE_AUDIT_LOG_PATH` rows are kept before the hourly retention sweep deletes them. Only meaningful when the path above is set |
 
 **Reading a mesh-relay failure (#549).** Once `CT_EDGE_MESH_RELAY_ENABLED` is on, a browser
 request for a peer-owned hostname can fail in two ways that look identical from the browser

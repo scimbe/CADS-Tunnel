@@ -188,6 +188,14 @@ services:
       # silently. Found by reading the value back out of the running container instead of
       # trusting the deploy (`docker exec ... echo $CT_EDGE_KA_PARK_TTL_SECS` came back empty).
       CT_EDGE_KA_PARK_TTL_SECS: "${CT_EDGE_KA_PARK_TTL_SECS:-}"
+      # #603: durable, host-only record of accepted connections' source IPs, for the
+      # operator's own evidentiary defense (see audit_log.rs's module doc). Off by
+      # default -- unset here means every accept path's audit-log call stays a no-op.
+      # Set CT_EDGE_AUDIT_LOG_PATH=/shared/conn-audit.sqlite3 in .env to opt in (the
+      # `shared` volume below already persists across container recreates). Retention
+      # defaults to 7 days if CT_EDGE_AUDIT_LOG_RETENTION_SECS is also left unset.
+      CT_EDGE_AUDIT_LOG_PATH: "${CT_EDGE_AUDIT_LOG_PATH:-}"
+      CT_EDGE_AUDIT_LOG_RETENTION_SECS: "${CT_EDGE_AUDIT_LOG_RETENTION_SECS:-}"
     volumes:
       - shared:/shared
     ports:

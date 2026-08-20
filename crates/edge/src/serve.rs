@@ -959,6 +959,11 @@ const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// reaper [`ChannelFrontDoor::new`] spawns (#256) — this constant alone only marks eligibility.
 const CHANNEL_PARK_TTL_SECS: u64 = 30;
 
+/// #603: default `conn_audit` retention window when `CT_EDGE_AUDIT_LOG_PATH` is
+/// set but `CT_EDGE_AUDIT_LOG_RETENTION_SECS` isn't -- 7 days, matching the
+/// figure named in `docs/legal/privacy-policy.html` §9's evidentiary-record text.
+const AUDIT_LOG_DEFAULT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// #575: the first ct-agent release whose KA legs actually survive a long park.
 ///
 /// This number is the whole safety argument for raising `CT_EDGE_KA_PARK_TTL_SECS`, and it
@@ -995,6 +1000,26 @@ fn ka_park_ttl_secs_from(v: Option<&str>) -> u64 {
     v.and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
         .unwrap_or(CHANNEL_PARK_TTL_SECS)
+}
+
+/// #603: `CT_EDGE_AUDIT_LOG_PATH` -> `Some(path)` only for a genuinely non-empty,
+/// trimmed value. Compose's `"${CT_EDGE_AUDIT_LOG_PATH:-}"` convention means an
+/// unset variable arrives here as `Some("")`, not `None` -- and `SqliteAuditLog::
+/// open("")` would NOT fail (SQLite treats an empty path as a private, throwaway
+/// on-disk database), so a naive `Option::is_some()` check would silently enable
+/// a pointless, non-durable audit log on every default deployment that never
+/// opted in.
+fn audit_log_path_from(v: Option<&str>) -> Option<String> {
+    v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// #603: `CT_EDGE_AUDIT_LOG_RETENTION_SECS`, defaulting to
+/// [`AUDIT_LOG_DEFAULT_RETENTION_SECS`] for unset/empty/non-positive input --
+/// same shape as [`ka_park_ttl_secs_from`].
+fn audit_log_retention_secs_from(v: Option<&str>) -> i64 {
+    v.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(AUDIT_LOG_DEFAULT_RETENTION_SECS)
 }
 
 fn ka_park_ttl_secs() -> u64 {
@@ -3375,6 +3400,34 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // That is the whole failure mode worth guarding here: an operator arms it in `.env`,
     // a later redeploy loses the line, and nothing in the log says the door reopened.
     eprintln!("{}", crate::channel_broker::attested_endpoint_startup_line());
+    // #603: durable connection-source audit log, off by default (no host-only evidentiary
+    // record unless the operator opts in). `CT_EDGE_AUDIT_LOG_PATH` unset -> every wired
+    // accept path's `state.audit_log()` stays `None`, a pure no-op, exactly like every
+    // other still-`None` call site before this step. A path that fails to open is a
+    // configuration error, not a reason to refuse tunnel service -- logged and left
+    // disabled, matching this function's admin-token/host-auth advisory-disable posture.
+    let audit_log_path = audit_log_path_from(std::env::var("CT_EDGE_AUDIT_LOG_PATH").ok().as_deref());
+    if let Some(path) = audit_log_path {
+        match crate::audit_log::SqliteAuditLog::open(&path) {
+            Ok(log) => {
+                let log = std::sync::Arc::new(log);
+                state.set_audit_log(log.clone());
+                let retention_secs =
+                    audit_log_retention_secs_from(std::env::var("CT_EDGE_AUDIT_LOG_RETENTION_SECS").ok().as_deref());
+                eprintln!(
+                    "ct-edge: connection-source audit log enabled at {path} (retention {retention_secs}s, #603)"
+                );
+                let audit_shutdown = shutdown.clone();
+                tokio::spawn(crate::audit_log::run_audit_retention_loop(log, retention_secs, audit_shutdown));
+            }
+            Err(e) => {
+                eprintln!(
+                    "ct-edge: WARNING — CT_EDGE_AUDIT_LOG_PATH={path} failed to open ({e}); \
+                     connection-source audit logging stays disabled (#603)"
+                );
+            }
+        }
+    }
     // #23 BP4b / #84: require hostname-ownership authorization for 'H'/'B' binds —
     // fail-closed by default when a public front door is exposed (CT_FRONT_DOOR), so an
     // anonymous bind can't squat an unbound name on :443.
@@ -4143,6 +4196,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 // channel-join transports (2026-08-13 storm).
                                 let relay_penalty = state.join_refusal_penalty();
                                 let relay_heartbeat = state.relay_broker_heartbeat();
+                                let relay_audit_log = state.audit_log(); // #603
                                 // #400: constructed here (not inside `run_channel_broker_loop`) so
                                 // `run_edge` can keep its own clone alive independently of the
                                 // loop's lifetime -- see `_relay_pairer_keepalive`'s own comment above.
@@ -4183,7 +4237,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         relay_pairer,
                                         relay_penalty,
                                         relay_heartbeat,
-                                        None, // #603: step 6 wires the real store
+                                        relay_audit_log,
                                     )
                                     .await;
                                 });
@@ -4202,6 +4256,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         // across every channel-join transport).
                         let rendezvous_penalty = state.join_refusal_penalty();
                         let rendezvous_heartbeat = state.rendezvous_broker_heartbeat();
+                        let rendezvous_audit_log = state.audit_log(); // #603
                         // #539: same as the relay above. The rendezvous loop has no
                         // "deliberately off" case today, which is exactly why its silence
                         // would be pure failure -- and just as invisible without this.
@@ -4247,7 +4302,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 rendezvous_pairer,
                                 rendezvous_penalty,
                                 rendezvous_heartbeat,
-                                None, // #603: step 6 wires the real store
+                                rendezvous_audit_log,
                             )
                             .await;
                         });
@@ -9479,4 +9534,29 @@ mod tests {
         );
     }
 
+    /// #603: the exact bug an `Option::is_some()` check would have shipped -- compose's
+    /// `"${CT_EDGE_AUDIT_LOG_PATH:-}"` convention hands an unset var to the process as
+    /// `Some("")`, not `None`. This must resolve to `None` (audit logging OFF), not
+    /// `Some("")` (which `SqliteAuditLog::open` would NOT reject -- an empty path is a
+    /// valid, if useless, private on-disk SQLite database).
+    #[test]
+    fn audit_log_path_from_treats_unset_and_empty_the_same_as_absent_603() {
+        assert_eq!(audit_log_path_from(None), None);
+        assert_eq!(audit_log_path_from(Some("")), None);
+        assert_eq!(audit_log_path_from(Some("   ")), None);
+        assert_eq!(
+            audit_log_path_from(Some("  /shared/conn-audit.sqlite3  ")),
+            Some("/shared/conn-audit.sqlite3".to_string())
+        );
+    }
+
+    #[test]
+    fn audit_log_retention_secs_from_defaults_on_unset_empty_or_nonpositive_603() {
+        assert_eq!(audit_log_retention_secs_from(None), AUDIT_LOG_DEFAULT_RETENTION_SECS);
+        assert_eq!(audit_log_retention_secs_from(Some("")), AUDIT_LOG_DEFAULT_RETENTION_SECS);
+        assert_eq!(audit_log_retention_secs_from(Some("0")), AUDIT_LOG_DEFAULT_RETENTION_SECS);
+        assert_eq!(audit_log_retention_secs_from(Some("-5")), AUDIT_LOG_DEFAULT_RETENTION_SECS);
+        assert_eq!(audit_log_retention_secs_from(Some("not a number")), AUDIT_LOG_DEFAULT_RETENTION_SECS);
+        assert_eq!(audit_log_retention_secs_from(Some("86400")), 86_400);
+    }
 }

@@ -78,6 +78,16 @@ pursuit of legal claims.
 Account and operational metadata is retained for as long as an account exists, or as long as a statutory
 retention obligation applies; server log files are deleted after a reasonable period.
 </p>
+<p>
+Where the operator has enabled it, the tunnel edge additionally keeps a minimal, host-local record of
+accepted connections — timestamp, source IP address, transport, and the routing token or channel
+identifier already used for authorization elsewhere — for the operator's own evidentiary purposes (for
+example, demonstrating to a competent authority that a given relayed session originated from a real
+client, rather than from the edge's own address). No request content, headers, or user-agent data is
+included. This record is not exposed through any network-reachable interface; it is accessible only by
+direct, host-local access to the operator's server. Entries are automatically deleted after 7 days by
+default, unless the operator has configured a different retention period.
+</p>
 
 <h2>10. Your rights</h2>
 <p>
