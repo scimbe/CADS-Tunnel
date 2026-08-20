@@ -102,9 +102,18 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// #606: `s.len() % 2 == 0` is a BYTE-length check, not a char-boundary guard -- a
+/// string with a multi-byte UTF-8 char can still have even byte length while a
+/// `s[i*2..i*2+2]` slice lands mid-character and panics (e.g. `"a\u{e9}a"` is 4
+/// bytes/even but the 'é' straddles the first slice boundary). Guarding on
+/// `is_ascii()` too closes it -- same fix already applied to this exact
+/// same-shaped function, `service::hex_decode` (#401). `signature_hex` here comes
+/// from the `x-ct-webhook-signature` header; not reachable today (`HeaderValue::
+/// to_str()` already rejects non-ASCII before this runs, same as #595/#606's other
+/// header-sourced sites), fixed anyway for consistency and defense-in-depth.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if s.len() % 2 != 0 || !s.is_ascii() {
         return None;
     }
     (0..s.len() / 2)
@@ -118,6 +127,15 @@ mod tests {
 
     const SECRET: &[u8] = b"whsec_test_secret";
     const BODY: &[u8] = br#"{"intent":"pi_123","status":"succeeded","credits":10}"#;
+
+    #[test]
+    fn hex_decode_rejects_rather_than_panics_on_a_multi_byte_char_606() {
+        // U+FFFD (3 bytes) + 1 ASCII byte = 4 bytes total (even -- passes the
+        // `len() % 2` guard alone), but the char straddles the first 2-byte slice.
+        let s = "\u{FFFD}a";
+        assert_eq!(s.len() % 2, 0, "even-byte-length guard alone would let this through");
+        assert_eq!(hex_decode(s), None);
+    }
 
     #[test]
     fn valid_signature_within_tolerance_is_accepted() {
