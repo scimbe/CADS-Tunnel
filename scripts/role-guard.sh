@@ -60,6 +60,14 @@ if [ "${1:-}" = "--selftest" ]; then
   check agent     '{"tool_name":"Bash","tool_input":{"command":"find . -name \"*.rs\""}}' 0
   check agent     '{"tool_name":"Bash","tool_input":{"command":"git status && git log -1"}}' 0
   check agent     '{"tool_name":"Bash","tool_input":{"command":"deno --version"}}' 0
+  # #602: the eval-flag gate missed the equally standard "read the program from stdin" form --
+  # confirmed against the unfixed script first (all three returned 0/allowed there).
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"python3 <<PY\nopen(\"f\",\"w\")\nPY"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"node - < script.js"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"echo x | python3"}}' 2
+  # #602 false-positive guard: a read that merely mentions an interpreter name after a pipe
+  # (not running it) stays allowed.
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"echo done | grep python3"}}' 0
   check agent     '{"tool_name":"Read","tool_input":{}}'                        0
   check developer '{"tool_name":"Edit","tool_input":{}}'                        0
   check developer '{"tool_name":"Bash","tool_input":{"command":"echo x > f"}}'  0
@@ -99,6 +107,12 @@ if tool == "Bash":
     #   - python/perl/ruby/node/php with an eval flag (-c/-e/-E/-r/--eval) run ARBITRARY code, so they
     #     can write any file with no shell `>` — the most concerning bypass (general-purpose). Gated on
     #     the eval flag so `python3 script.py`, `node --version`, etc. stay allowed.
+    #   - #602: the eval-flag gate above missed the equally standard "read the program from stdin"
+    #     form — a heredoc (`python3 <<'PY' ... PY`), a redirected file (`python3 - < script.py`), or
+    #     a pipe (`echo code | python3`) — every one of which runs arbitrary code with NO eval flag
+    #     ever appearing on the command line. Live-reproduced against the unfixed script: all three
+    #     forms returned 0 (allowed). Blocked generically on "interpreter followed by `<`" and
+    #     "piped directly into an interpreter", regardless of flags.
     #   - curl writing to a file (-o/-O/--output/--remote-name); plain curl-to-stdout stays allowed.
     #   - wget / patch / rsync in COMMAND position (start, or after ; & | ( ) — so `grep "patch" f`
     #     and other read commands that merely mention the word are not falsely blocked.
@@ -109,6 +123,8 @@ if tool == "Bash":
         r"|git\s+(add|commit|apply|checkout|restore|reset|push|rm|mv|clean)"
         r"|\bfind\b[^|]*-delete\b"
         r"|\b(python3?|perl|ruby|node|nodejs|php|bun)\b[^|]*\s-{1,2}(c|e|E|r|eval)\b"
+        r"|\b(python3?|perl|ruby|node|nodejs|php|bun)\b[^|]*<"
+        r"|\|\s*(python3?|perl|ruby|node|nodejs|php|bun)\b"
         r"|\bdeno\b[^|]*\beval\b"
         r"|\bcurl\b[^|]*\s-{1,2}(o|O|output|remote-name)\b"
         r"|(^|[;&|(]\s*)(wget|patch|rsync)\b",
