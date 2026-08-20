@@ -29,6 +29,12 @@ CONTAINER="${CT_EDGE_CONTAINER:-ct-selfhost-edge-1}"
 METRICS="${CT_EDGE_METRICS_URL:-http://localhost:9600}"
 PARK_MAX="${CT_EDGE_PARK_MAX:-80}"
 BEAT_MAX_AGE="${CT_EDGE_BEAT_MAX_AGE:-60}"
+# #599: used at the Park-Gauge check (below, in the same section as PARK_MAX) --
+# was previously only assigned much later (section 6), so any run that crossed
+# PARK_MAX before SETTLE's original assignment aborted with "SETTLE: unbound
+# variable" under `set -u`, silently skipping the rest of that cycle's checks.
+# Confirmed live in /var/tmp/cads-edge-watch/cron.log (2026-08-19 ~01:00Z run).
+SETTLE="${CT_WATCH_SETTLE_SECS:-90}"
 STATE_DIR="${CT_EDGE_WATCH_STATE:-/var/tmp/cads-edge-watch}"
 RENOTIFY_H="${CT_EDGE_RENOTIFY_H:-6}"     # gleiche Meldung höchstens alle N Stunden
 SRC="${CADS_TUNNEL_SRC:-/home/becke/workspace/CADS-Tunnel}"
@@ -385,7 +391,8 @@ fi
 # Prozess kennt, prueft nicht das, wofuer es die Anlage gibt.
 SITES="${CT_WATCH_SITES:-sort=200 help=200 llm-34a13a96=200 game2048=200 a2a-demo=200 auction-demo=200 cookbook=200 flappy-demo=200 devsystem-demo=302}"
 ZONE="${CT_WATCH_ZONE:-bunsenbrenner.org}"
-SETTLE="${CT_WATCH_SETTLE_SECS:-90}"
+# SETTLE moved to the top config block (#599) -- was here, now defined before its
+# earlier use in the Park-Gauge check.
 # Vollstaendige URLs, die keine Demo-Subdomain sind -- und die beiden wichtigsten
 # Adressen ueberhaupt: das Portal (das Produkt selbst) und die Realm-Auskunft von
 # Keycloak. Letztere ist mit Bedacht die Realm-URL und nicht die Startseite: am
