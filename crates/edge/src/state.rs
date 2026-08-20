@@ -407,6 +407,10 @@ pub struct EdgeState<H> {
     /// Shared admin secret authenticating the control plane's `'R'` revoke op
     /// (#27 RB3). `None` = revocation disabled (no `CT_EDGE_ADMIN_TOKEN`).
     admin_token: Mutex<Option<[u8; 32]>>,
+    /// #601: durable connection-source audit log. `None` = disabled (no
+    /// `CT_EDGE_AUDIT_LOG_PATH`), the default until step 6 wires the compose/env
+    /// plumbing -- see `audit_log.rs`'s module doc for scope/rationale.
+    audit_log: Mutex<Option<std::sync::Arc<crate::audit_log::SqliteAuditLog>>>,
     /// Hostname-ownership authorization (#23 BP4b). `None` = not required (legacy
     /// binds allowed, subject to BP4a takeover-safety). `Some(map)` = required:
     /// a hostname may only be bound by the token the control plane authorized for
@@ -585,6 +589,7 @@ impl<H: Clone> EdgeState<H> {
             hosts_by_token: Mutex::new(HashMap::new()),
             revoked: RwLock::new(HashSet::new()),
             admin_token: Mutex::new(None),
+            audit_log: Mutex::new(None),
             host_auth: RwLock::new(None),
             gelb_hosts: RwLock::new(HashSet::new()),
             rendezvous_limiter: Mutex::new(None),
@@ -1415,6 +1420,18 @@ impl<H: Clone> EdgeState<H> {
     /// (#27 RB3). Set from `CT_EDGE_ADMIN_TOKEN` at startup.
     pub fn set_admin_token(&self, token: [u8; 32]) {
         *self.admin_token.lock_safe() = Some(token);
+    }
+
+    /// Configure the durable connection-source audit log (#601). `None` (the
+    /// default) leaves every accept path's audit-log call a no-op -- set from
+    /// `CT_EDGE_AUDIT_LOG_PATH` at startup once step 6 wires it.
+    pub fn set_audit_log(&self, log: std::sync::Arc<crate::audit_log::SqliteAuditLog>) {
+        *self.audit_log.lock_safe() = Some(log);
+    }
+
+    /// The configured audit log, if any (#601).
+    pub fn audit_log(&self) -> Option<std::sync::Arc<crate::audit_log::SqliteAuditLog>> {
+        self.audit_log.lock_safe().clone()
     }
 
     /// Constant-time check that `auth` matches the configured admin secret.

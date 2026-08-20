@@ -1770,6 +1770,20 @@ pub async fn serve_connection(
                     conn.remote_address()
                 );
             }
+            // #601: durable record of this registration's source IP -- a real
+            // Agent (holder of the routing token), not a rendezvous client.
+            if let Some(log) = state.audit_log() {
+                if let Err(e) = log.record(
+                    crate::audit_log::ConnTransport::QuicRelayAgent,
+                    conn.remote_address().ip(),
+                    unix_now() as i64,
+                    Some(&hex_of_bytes(&token.0)),
+                    None,
+                    None,
+                ) {
+                    eprintln!("ct-edge: audit-log record failed: {e} (#601)");
+                }
+            }
             // Return the (token, registration id) so the caller can evict exactly
             // THIS agent when its connection drops — issue #2 (mode a): a dropped
             // agent's registration was never removed, so a later Client `route()`
