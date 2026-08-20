@@ -90,13 +90,16 @@ impl PipelineSpec {
     }
 }
 
+/// #606: `s.len()` is BYTE length -- a multi-byte UTF-8 char in `s` can pass this guard
+/// while a raw `&s[i*2..i*2+2]` slice would land mid-character and panic. Chunk the bytes
+/// instead of slicing the `str`.
 fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(out)
 }
@@ -580,6 +583,13 @@ mod tests {
     use super::*;
     use crate::channel::{CapacityKind, ServiceType::*};
     use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn decode_hex_32_rejects_rather_than_panics_on_a_multi_byte_char_606() {
+        let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
+        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(decode_hex_32(&s), None);
+    }
 
     // #473: counts calls to `PipelineSpec::valid_offers` — the single choke point where offer
     // signatures are verified — so tests can prove a whole `auction_view`/`convene_*` call

@@ -199,12 +199,17 @@ fn admin_authed(headers: &HeaderMap, admin_token: Option<[u8; 32]>) -> Result<()
         .get("x-ct-admin-token")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| {
+            // #606: chunk bytes rather than slicing `s` by index -- `HeaderValue::to_str()`
+            // above already rejects any non-ASCII byte, so this specific site can never
+            // actually receive a multi-byte char (confirmed, same header-vs-path-segment
+            // distinction as #595's admin.rs), but the pattern is fixed here too for
+            // consistency with every other hex-decode in this codebase.
             if s.len() != 64 {
                 return None;
             }
             let mut out = [0u8; 32];
-            for (i, b) in out.iter_mut().enumerate() {
-                *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+            for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+                out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
             }
             Some(out)
         })

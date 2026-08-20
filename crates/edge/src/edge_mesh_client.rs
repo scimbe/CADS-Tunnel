@@ -80,13 +80,17 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// #606: `s.len()` is BYTE length -- a multi-byte UTF-8 char in `s` can pass this guard
+/// while a raw `&s[2*i..2*i+2]` slice would land mid-character and panic. Chunk the bytes
+/// instead of slicing the `str` -- `s` here comes from a peer edge's JSON response body
+/// (ADR-0021 mesh), a genuinely peer-controlled trust boundary.
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
     let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(out)
 }
@@ -235,6 +239,13 @@ mod tests {
     use super::*;
     use axum::extract::{Json as AxJson, Path as AxPath};
     use axum::http::{HeaderMap, StatusCode};
+
+    #[test]
+    fn hex_decode_32_rejects_rather_than_panics_on_a_multi_byte_char_606() {
+        let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
+        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(hex_decode_32(&s), None);
+    }
     use axum::routing::{get, post};
     use axum::Router;
     use serde_json::Value;

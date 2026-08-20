@@ -104,14 +104,19 @@ fn token_hex<'a>(token: &RoutingToken, buf: &'a mut [u8; 8]) -> &'a str {
 }
 
 /// Parse a 64-hex admin token (`CT_EDGE_ADMIN_TOKEN`) into 32 bytes, if valid (#27 RB3).
+///
+/// #606: `s.len()` is BYTE length -- a multi-byte UTF-8 char in a malformed
+/// `CT_EDGE_ADMIN_TOKEN` (operator-set, but not necessarily hand-typed -- automated
+/// tooling/deploy scripts set it too) can pass this guard while a raw
+/// `&s[i*2..i*2+2]` slice would land mid-character and panic at startup.
 fn parse_admin_token_hex(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     if s.len() != 64 {
         return None;
     }
     let mut t = [0u8; 32];
-    for (i, b) in t.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        t[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(t)
 }
@@ -4490,6 +4495,13 @@ mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
     use std::sync::Arc;
+
+    #[test]
+    fn parse_admin_token_hex_rejects_rather_than_panics_on_a_multi_byte_char_606() {
+        let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
+        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(parse_admin_token_hex(&s), None);
+    }
 
     /// #603: a fixed TEST-NET-3 (RFC 5737) address for `serve_tcp_connection`'s
     /// `peer_ip` parameter in tests that don't otherwise care what it is.
