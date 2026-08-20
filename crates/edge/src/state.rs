@@ -553,11 +553,19 @@ pub struct EdgeState<H> {
     /// the pre-existing fleet-wide-only counter #10 O2 added) since a
     /// tunnel's own owner needs their own number, not the fleet aggregate --
     /// still ADR-0016-bounded: liveness/volume only, never payload content.
-    /// Grows only by one entry per distinct token ever seen (bounded the
-    /// same way `agents`/`hosts` are; a token is never removed from this map
-    /// even after revoke, matching `relay_bytes`'s own cumulative-forever
-    /// semantics -- restarting the Edge is the only reset, same as every
-    /// other in-memory counter here).
+    /// Grows by one entry per distinct token ever seen and, deliberately
+    /// UNLIKE `agents`/`hosts` (which genuinely shrink back to zero on
+    /// deregistration/revoke), a token's entry here is never removed even
+    /// after revoke -- this is meant as a cumulative-forever tunnel-owner
+    /// total, the same intent as `relay_bytes`'s own fleet-wide aggregate
+    /// (a structurally different `Counter`, not a per-token map, but the
+    /// same "never reset except by restart" semantics). A revoked/deleted
+    /// tunnel's historical byte total stays visible rather than vanishing.
+    /// Restarting the Edge is the only reset, same as every other
+    /// in-memory counter here. Bounded in practice by how many distinct
+    /// routing tokens the operator ever provisions, not by attacker input
+    /// (an entry is only created by `note_relay`, reachable only after a
+    /// real relay actually happened on an already-registered token).
     tunnel_bytes: Mutex<HashMap<RoutingToken, (u64, u64)>>,
     /// #282 follow-up: `agents`/`candidates`/`direct`/`hosts` are four
     /// independent mutexes with no shared critical section of their own, which
