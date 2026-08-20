@@ -658,6 +658,7 @@ dependencies = [
  "rand 0.8.7",
  "rcgen",
  "reqwest",
+ "rusqlite",
  "rustls",
  "rustls-pki-types",
  "serde",
