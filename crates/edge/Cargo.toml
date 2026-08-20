@@ -44,7 +44,7 @@ hyper-util = { version = "0.1", features = ["http1", "server", "tokio", "service
 # #81 SEC81c-c c-ii: the edge queries the control plane's channel-authorize endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-# #601: the connection-source audit log (audit_log.rs) -- crates/edge's first disk
+# #603: the connection-source audit log (audit_log.rs) -- crates/edge's first disk
 # persistence. Same version/features as control-plane's own rusqlite pin
 # (crates/control-plane/Cargo.toml) for consistency, even though the two crates share
 # no DB file (separate processes, each opens its own).

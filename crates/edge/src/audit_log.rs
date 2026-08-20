@@ -1,4 +1,4 @@
-//! Durable, minimal audit log of accepted connections' source IP addresses (#601),
+//! Durable, minimal audit log of accepted connections' source IP addresses (#603),
 //! for the operator's own evidentiary defense -- proving to law enforcement/abuse
 //! investigators that a real client, not the relay's own IP, originated a given
 //! relayed session. This is NOT `X-Forwarded-For` to origin servers: most hostnames
@@ -144,7 +144,7 @@ fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// #601: periodic retention sweep, deleting `conn_audit` rows older than
+/// #603: periodic retention sweep, deleting `conn_audit` rows older than
 /// `window_secs`. No scheduled prune/retention job exists anywhere else in this
 /// codebase's production code today (the one prune function that does,
 /// `SqliteEdgeMesh::prune_stale_edges`, is dead code, called only from its own
@@ -164,9 +164,9 @@ pub async fn run_audit_retention_loop(
             _ = tick.tick() => {
                 let cutoff = now_secs().saturating_sub(window_secs);
                 match log.prune_older_than(cutoff) {
-                    Ok(n) if n > 0 => eprintln!("ct-edge: audit-log retention pruned {n} row(s) older than {window_secs}s (#601)"),
+                    Ok(n) if n > 0 => eprintln!("ct-edge: audit-log retention pruned {n} row(s) older than {window_secs}s (#603)"),
                     Ok(_) => {}
-                    Err(e) => eprintln!("ct-edge: audit-log retention sweep failed: {e} (#601)"),
+                    Err(e) => eprintln!("ct-edge: audit-log retention sweep failed: {e} (#603)"),
                 }
             }
         }

@@ -1770,7 +1770,7 @@ pub async fn serve_connection(
                     conn.remote_address()
                 );
             }
-            // #601: durable record of this registration's source IP -- a real
+            // #603: durable record of this registration's source IP -- a real
             // Agent (holder of the routing token), not a rendezvous client.
             if let Some(log) = state.audit_log() {
                 if let Err(e) = log.record(
@@ -1781,7 +1781,7 @@ pub async fn serve_connection(
                     None,
                     None,
                 ) {
-                    eprintln!("ct-edge: audit-log record failed: {e} (#601)");
+                    eprintln!("ct-edge: audit-log record failed: {e} (#603)");
                 }
             }
             // Return the (token, registration id) so the caller can evict exactly
@@ -4136,7 +4136,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                         relay_pairer,
                                         relay_penalty,
                                         relay_heartbeat,
-                                        None, // #601: step 6 wires the real store
+                                        None, // #603: step 6 wires the real store
                                     )
                                     .await;
                                 });
@@ -4200,7 +4200,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 rendezvous_pairer,
                                 rendezvous_penalty,
                                 rendezvous_heartbeat,
-                                None, // #601: step 6 wires the real store
+                                None, // #603: step 6 wires the real store
                             )
                             .await;
                         });

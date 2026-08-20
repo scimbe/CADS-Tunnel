@@ -2836,7 +2836,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
     pairer: SharedQuicChannelPairer,
     penalty: std::sync::Arc<crate::state::JoinRefusalPenalty>,
     heartbeat: std::sync::Arc<crate::state::BrokerHeartbeat>,
-    // #601 step 2: `None` from every call site until step 6 wires the real store +
+    // #603 step 2: `None` from every call site until step 6 wires the real store +
     // compose/env plumbing -- see `audit_log.rs`'s module doc. Optional so a broker
     // that never gets a store (tests, and every caller until step 6) pays nothing.
     audit_log: Option<std::sync::Arc<crate::audit_log::SqliteAuditLog>>,
@@ -2983,7 +2983,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
             let channel = member.req.grant.grant.channel;
             let holder = member.req.grant.grant.holder;
 
-            // #601: durable evidentiary record of this admitted member's source IP,
+            // #603: durable evidentiary record of this admitted member's source IP,
             // independent of whether it ends up Parked or Paired below -- admission
             // (grant + possession-proof verified) is the meaningful "a real client
             // reached this channel" event, not the later pairing outcome.
@@ -2997,7 +2997,7 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
                     Some(&crate::serve::hex_of_bytes(&channel.0)),
                     Some(&crate::serve::hex_of_bytes(&holder)),
                 ) {
-                    eprintln!("ct-edge: audit-log record failed: {e} (#601)");
+                    eprintln!("ct-edge: audit-log record failed: {e} (#603)");
                 }
             }
 
@@ -4181,7 +4181,7 @@ mod tests {
                 pairer_loop,
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 hb_loop,
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -6390,7 +6390,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -6515,7 +6515,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -6604,7 +6604,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -6676,7 +6676,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -7280,7 +7280,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -7384,7 +7384,7 @@ mod tests {
                 pairer_loop,
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
@@ -7442,7 +7442,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(ChannelPairer::new())),
                 std::sync::Arc::new(crate::state::JoinRefusalPenalty::new()),
                 std::sync::Arc::new(crate::state::BrokerHeartbeat::new()),
-                None, // #601: step 6 wires the real store
+                None, // #603: step 6 wires the real store
             )
             .await;
         });
