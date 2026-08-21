@@ -78,6 +78,17 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
         // #414: only a genuinely NEW key can trigger eviction — reusing an already-tracked key
         // must never evict anything (including itself), or a legitimate repeat caller could be
         // starved by its own traffic.
+        //
+        // `insertion_order` is pushed to ONLY inside the `max_tracked_keys` branch (matching its
+        // own doc comment: "maintained only when max_tracked_keys is set"). Previously this push
+        // ran unconditionally for every new key, including with no cap configured at all -- and
+        // the window sweep above evicts a key from `counters` on every window it doesn't renew
+        // its attempt in, so a single well-behaved key used every window re-enters this "new key"
+        // branch every window, forever. With no cap, that pushed one entry per (key, window)
+        // pair onto `insertion_order` with nothing ever popping it back off -- unbounded growth
+        // over the process's uptime from ordinary, non-adversarial traffic, not just attacker
+        // key-churn. `counters` itself was never affected (the window sweep bounds it correctly
+        // regardless of `max_tracked_keys`); only this side structure leaked.
         if !self.counters.contains_key(key) {
             if let Some(cap) = self.max_tracked_keys {
                 if self.counters.len() >= cap {
@@ -88,8 +99,8 @@ impl<K: Eq + Hash + Clone> KeyedRateLimiter<K> {
                         // Already gone (e.g. pruned by the window sweep above) — keep popping.
                     }
                 }
+                self.insertion_order.push_back(key.clone());
             }
-            self.insertion_order.push_back(key.clone());
         }
         let entry = self.counters.entry(key.clone()).or_insert((window, 0));
         if entry.0 != window {
@@ -132,6 +143,15 @@ pub type RateLimiter = KeyedRateLimiter<RoutingToken>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl<K> KeyedRateLimiter<K> {
+        /// Test-only: the size of the eviction-order side structure, which must stay empty
+        /// (never grow) when `max_tracked_keys` is `None` -- it exists solely to support the
+        /// FIFO eviction bound, so with no bound configured it has no reason to hold anything.
+        fn insertion_order_len(&self) -> usize {
+            self.insertion_order.len()
+        }
+    }
 
     fn token(b: u8) -> RoutingToken {
         RoutingToken([b; 32])
@@ -257,6 +277,30 @@ mod tests {
         // sweeps or resets it — the stale count is dead by definition.
         assert!(!rl.over_limit(&1, 1), "a new window clears the penalty on read");
         assert!(rl.allow(&1, 1), "and the budget is genuinely fresh");
+    }
+
+    /// A single well-behaved key, used every window forever, must not leak memory. The window
+    /// sweep evicts the key from `counters` on every transition it doesn't renew fast enough to
+    /// straddle (by design — a strictly-past-window entry is dead), so the "is this a new key"
+    /// check in `allow` sees it as new again on its very next use. Without the fix, that
+    /// re-entered `insertion_order.push_back` every single window even though nothing was ever
+    /// configured to cap or evict from it -- pure, unbounded, non-adversarial growth over the
+    /// process's uptime. Only `insertion_order` leaked; `counters` was always correctly bounded
+    /// by the window sweep regardless.
+    #[test]
+    fn default_uncapped_limiter_never_grows_insertion_order_across_many_windows() {
+        let mut rl: RateLimiter = RateLimiter::new(5);
+        let t = token(1);
+        for window in 0..1000u64 {
+            rl.allow(&t, window);
+        }
+        assert_eq!(
+            rl.insertion_order_len(),
+            0,
+            "insertion_order must stay empty with no max_tracked_keys configured, not grow \
+             one entry per window for a single well-behaved key"
+        );
+        assert_eq!(rl.tracked_keys(), 1, "counters itself was always correctly bounded");
     }
 
     #[test]
