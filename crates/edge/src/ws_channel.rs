@@ -229,12 +229,18 @@ pub struct WsChannelState {
     penalty: Option<Arc<crate::state::JoinRefusalPenalty>>,
 }
 
-/// How long a browser member's join stays parked waiting for its channel partner
-/// before the periodic reaper drops it -- same value the front door uses
-/// (`CHANNEL_PARK_TTL_SECS`, kept in sync manually since it's a `const` in `serve.rs`,
-/// not exported; both exist to bound the same "a lone parked member's stream/task
-/// held forever" leak class).
-const WS_CHANNEL_PARK_TTL_SECS: u64 = 120;
+/// #617: how long a browser member's join stays parked waiting for its channel
+/// partner before the periodic reaper drops it -- literally
+/// [`crate::serve::CHANNEL_PARK_TTL_SECS`], the SAME constant the `:443` front door
+/// uses, not a second copy of the value. Both listeners share one
+/// `SharedChannelPairer` in production (cross-transport pairing, see this module's
+/// own doc comment), so a mismatched TTL here would let one transport's member
+/// outlive the other's — reaped out from under an arriving cross-transport partner
+/// well before this listener's own, longer window said it should be. A duplicated
+/// `const` claiming "kept in sync manually" had silently drifted to 120 against
+/// `serve.rs`'s 30 since this file's very first commit; referencing the constant
+/// directly makes that drift impossible instead of merely documented.
+const WS_CHANNEL_PARK_TTL_SECS: u64 = crate::serve::CHANNEL_PARK_TTL_SECS;
 const WS_CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl WsChannelState {

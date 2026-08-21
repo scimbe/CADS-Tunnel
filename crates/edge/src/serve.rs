@@ -962,7 +962,15 @@ const CHANNEL_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// [`crate::channel_broker::ChannelPairer::drain_expired`] (#109 #3). Generous, since the
 /// two holders of a channel may reach `:443` seconds apart. Actually evicted by the periodic
 /// reaper [`ChannelFrontDoor::new`] spawns (#256) — this constant alone only marks eligibility.
-const CHANNEL_PARK_TTL_SECS: u64 = 30;
+///
+/// #617: `pub(crate)` so `ws_channel.rs`'s browser listener uses this SAME constant rather
+/// than a second copy of the literal — the two transports share one `SharedChannelPairer`
+/// in production (cross-transport pairing is the whole point, see `ws_channel`'s module
+/// doc), so a member on one transport that outlives the other's TTL would reap out from
+/// under an arriving partner. A duplicated `const` claiming to be "kept in sync manually"
+/// had silently drifted (120 vs. this 30) since `ws_channel.rs`'s very first commit —
+/// referencing this one directly makes that drift impossible instead of merely documented.
+pub(crate) const CHANNEL_PARK_TTL_SECS: u64 = 30;
 
 /// #603: default `conn_audit` retention window when `CT_EDGE_AUDIT_LOG_PATH` is
 /// set but `CT_EDGE_AUDIT_LOG_RETENTION_SECS` isn't -- 7 days, matching the
