@@ -61,6 +61,18 @@ const TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// on the relay-node indefinitely.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// #616: bound on connecting to the internal relay-node upstream, after admission
+/// succeeds. Everything else on this path is already bounded — [`TLS_ACCEPT_TIMEOUT`]
+/// (#422), [`RELAY_GATE_TIMEOUT`], [`RELAY_IDLE_TIMEOUT`] (#427) — but this connect was
+/// not: a requester that already passed full grant+possession authentication holds the
+/// front door's `ConnectionCap` permit for as long as `TcpStream::connect` runs, and a
+/// plain "port closed" refusal is fast while a network-level partition/drop to the
+/// (internal-only, never publicly reachable) relay-node is not, subject to the OS's own
+/// default TCP connect timeout. Same value as `TLS_ACCEPT_TIMEOUT`: generous for a
+/// same-host/same-network connect, short enough that a relay-node outage can't exhaust
+/// the front door's connection cap the way #422 already showed an unbounded step can.
+const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Splice `a`↔`b` like [`tokio::io::copy_bidirectional`], but close the connection if
 /// NEITHER side produces a byte within [`RELAY_IDLE_TIMEOUT`] (#427) — `copy_bidirectional`
 /// itself has no such hook, so this drives two manual read/write loops via `select!`,
@@ -151,7 +163,7 @@ async fn refuse<W: AsyncWrite + Unpin>(send: &mut W, tag: &str, context: &str, r
 /// [`SignedChannelGrant`] — no framing needed, the grant is fixed-length), verify it is
 /// an authentic, unexpired grant for a channel `resolver` confirms is currently live,
 /// challenge the presenter to prove it holds the grant's `holder` private key, and on
-/// success write `OK<u16-LE len><relay_node_peer utf8>` and hand back the still-open
+/// success write `OK<u16-BE len><relay_node_peer utf8>` and hand back the still-open
 /// `stream` for the caller to splice to the internal relay-node. The peer id is included
 /// so the requester — which never reaches the relay-node directly — can address its
 /// Circuit-Relay v2 reservation/dial. Every failure path writes `NO` and returns the
@@ -238,7 +250,18 @@ where
         })?
         .map_err(|e| { eprintln!("ct-edge: relay-gate NO [tls-accept]: {e}"); e })?;
     let mut admitted = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
-    let mut upstream = tokio::net::TcpStream::connect(ctx.relay_upstream).await?;
+    let mut upstream = tokio::time::timeout(
+        RELAY_UPSTREAM_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(ctx.relay_upstream),
+    )
+    .await
+    .map_err(|_| -> BoxError {
+        eprintln!(
+            "ct-edge: relay-gate NO [upstream-connect-timeout]: relay-node not reachable within {RELAY_UPSTREAM_CONNECT_TIMEOUT:?}"
+        );
+        "relay-gate: relay-node connect not completed within the timeout (#616)".into()
+    })?
+    .map_err(|e| { eprintln!("ct-edge: relay-gate NO [upstream-connect]: {e}"); e })?;
     copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream).await?;
     Ok(())
 }
@@ -492,6 +515,133 @@ mod tests {
         assert!(
             start.elapsed() >= TLS_ACCEPT_TIMEOUT && start.elapsed() < RELAY_GATE_TIMEOUT + TLS_ACCEPT_TIMEOUT,
             "must fail at the TLS-accept bound, not fall through to a much longer timeout"
+        );
+    }
+
+    /// A `ServerCertVerifier` that accepts anything — this test only needs a real TLS
+    /// handshake to actually complete against a self-signed cert, not certificate trust.
+    #[derive(Debug)]
+    struct NoVerify;
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// #616: the happy path this fix must not break — a requester that completes TLS,
+    /// passes grant+possession admission, and reaches a relay-node upstream that is
+    /// actually listening must still connect and relay bytes normally, well within
+    /// [`RELAY_UPSTREAM_CONNECT_TIMEOUT`]. A genuine "connect hangs forever" scenario
+    /// (the failure mode #616 itself fixes) needs a real network-level partition to a
+    /// silently-dropping address, which cannot be constructed deterministically in a
+    /// unit test the way the in-memory-duplex TLS-accept-timeout test above can — this
+    /// test instead protects against the fix regressing the far more common case: a
+    /// timeout wired in wrong (too short, or around the wrong operation) that breaks
+    /// every real relay-gate connection.
+    #[tokio::test]
+    async fn serve_relay_gate_connects_to_a_live_upstream_and_relays_within_the_timeout_616() {
+        crate::transport::install_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["relay-gate.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            certified.key_pair.serialize_der(),
+        ));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+        let op = SigningKey::from_bytes(&[21u8; 32]);
+        let holder_key = SigningKey::from_bytes(&[22u8; 32]);
+        let holder = holder_key.verifying_key().to_bytes();
+        let channel = ChannelId([2u8; 32]);
+        let grant = grant_for(&op, channel, holder, 10_000);
+        let resolver: RelayGateResolver =
+            std::sync::Arc::new(MockResolver { operator: op.verifying_key().to_bytes(), channel, holder });
+
+        // A real, listening local "relay-node" upstream.
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_upstream = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream_listener.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello");
+            sock.write_all(b"world").await.unwrap();
+        });
+
+        let ctx = RelayGateContext::new(resolver, acceptor, relay_upstream, "relay-peer-616".to_string());
+
+        let front_door_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_door_addr = front_door_listener.local_addr().unwrap();
+        let start = tokio::time::Instant::now();
+        let server_task = tokio::spawn(async move {
+            let (server_side, _) = front_door_listener.accept().await.unwrap();
+            serve_relay_gate(server_side, &ctx, 1_000).await
+        });
+        let client_side = tokio::net::TcpStream::connect(front_door_addr).await.unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        let _ = roots.add(cert);
+        let ccfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let server_name = rustls::pki_types::ServerName::try_from("relay-gate.test").unwrap();
+        let mut client_tls = connector.connect(server_name, client_side).await.unwrap();
+
+        client_tls.write_all(&grant.encode()).await.unwrap();
+        let mut challenge = [0u8; 32];
+        client_tls.read_exact(&mut challenge).await.unwrap();
+        let sig = holder_key.sign(&challenge).to_bytes();
+        client_tls.write_all(&sig).await.unwrap();
+        let mut ack = [0u8; 4]; // "OK" + u16-LE peer-id length
+        client_tls.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack[..2], b"OK");
+        let peer_len = u16::from_be_bytes([ack[2], ack[3]]) as usize;
+        let mut peer_id = vec![0u8; peer_len];
+        client_tls.read_exact(&mut peer_id).await.unwrap();
+        assert_eq!(peer_id, b"relay-peer-616");
+
+        client_tls.write_all(b"hello").await.unwrap();
+        let mut resp = [0u8; 5];
+        client_tls.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"world");
+
+        drop(client_tls);
+        upstream_task.await.unwrap();
+        let _ = server_task.await.unwrap();
+        assert!(
+            start.elapsed() < RELAY_UPSTREAM_CONNECT_TIMEOUT,
+            "a live, listening upstream must connect and relay well within the timeout, not near it"
         );
     }
 }
