@@ -1204,6 +1204,14 @@ pub enum ClientAbortClass {
     /// dropped the TCP connection instead of shutting the TLS session down cleanly.
     /// Ubiquitous among real HTTP clients.
     TlsCloseNotifyMissing,
+    /// `ETIMEDOUT` from a genuine OS-level socket read/write — an idle-but-alive
+    /// connection whose keepalive probes a middlebox silently swallowed (see
+    /// `transport::apply_tcp_keepalive`'s 2026-08-12/13 doc comment for the full
+    /// story). Narrowed to `raw_os_error().is_some()` so `relay.rs`'s own
+    /// synthetic `TimedOut` errors (relay/upstream-connect setup failures, which
+    /// are real, operator-visible edge-side problems, not client aborts) never
+    /// match here — #618.
+    IdleTimeout,
 }
 
 impl ClientAbortClass {
@@ -1214,6 +1222,7 @@ impl ClientAbortClass {
             Self::ConnectionReset => "connection-reset",
             Self::BrokenPipe => "broken-pipe",
             Self::TlsCloseNotifyMissing => "tls-close-notify-missing",
+            Self::IdleTimeout => "idle-timeout",
         }
     }
 }
@@ -1256,6 +1265,14 @@ fn classify_io_client_abort(e: &std::io::Error) -> Option<ClientAbortClass> {
         std::io::ErrorKind::BrokenPipe => Some(ClientAbortClass::BrokenPipe),
         std::io::ErrorKind::UnexpectedEof if e.to_string().contains(RUSTLS_MISSING_CLOSE_NOTIFY) => {
             Some(ClientAbortClass::TlsCloseNotifyMissing)
+        }
+        // #618: `TimedOut` alone is NOT enough -- `relay.rs` raises its own synthetic
+        // `TimedOut` for real relay/upstream-connect failures, and those must stay
+        // loud. `raw_os_error().is_some()` narrows this to errors the OS itself
+        // produced (a real socket syscall failure), which a hand-built
+        // `Error::new(TimedOut, "...")` can never satisfy.
+        std::io::ErrorKind::TimedOut if e.raw_os_error().is_some() => {
+            Some(ClientAbortClass::IdleTimeout)
         }
         _ => None,
     }
@@ -1303,7 +1320,7 @@ pub fn front_door_client_aborts_total() -> u64 {
 pub(crate) const FRONT_DOOR_ABORT_LOG_WINDOW_SECS: u64 = 600;
 
 /// #533: cap on the abort classes tracked per window. The key space is a closed enum
-/// today (3 variants), so the cap can never bite in production — it exists because the
+/// today (4 variants), so the cap can never bite in production — it exists because the
 /// shared throttle's memory bound is a property of the core, not of the caller, and it
 /// keeps the invariant true if the classifier ever gains a data-derived key.
 pub(crate) const FRONT_DOOR_ABORT_LOG_MAX_TRACKED_CLASSES: usize = 8;
@@ -4551,6 +4568,50 @@ mod tests {
             "EPIPE is classified by KIND, regardless of message"
         );
         assert!(is_benign_client_abort(&reset) && is_benign_client_abort(&pipe));
+    }
+
+    /// #618: a genuine OS-level `ETIMEDOUT` (a real socket read/write that the kernel
+    /// gave up on — the middlebox-swallowed-keepalive case `transport::apply_tcp_keepalive`
+    /// documents) is the same "client/network died quietly" class as `ConnectionReset`,
+    /// so it must classify as benign.
+    #[test]
+    fn client_abort_classifier_recognizes_a_genuine_os_level_idle_timeout_618() {
+        let timeout: BoxError = Box::new(std::io::Error::from_raw_os_error(110)); // ETIMEDOUT
+        assert!(
+            timeout.to_string().contains("timed out"),
+            "the exact line seen in production logs: {timeout}"
+        );
+        assert_eq!(
+            classify_client_abort(&timeout),
+            Some(ClientAbortClass::IdleTimeout),
+            "a real OS ETIMEDOUT is the same benign class as a middlebox-dropped connection"
+        );
+        assert!(is_benign_client_abort(&timeout));
+    }
+
+    /// #618: the regression guard. `relay.rs` raises its OWN `TimedOut` for a real
+    /// relay/upstream-connect setup failure — a genuine, operator-actionable edge-side
+    /// problem, not a client hanging up. It must NEVER be swallowed as a benign abort
+    /// just because it shares `ErrorKind::TimedOut` with the OS case above.
+    #[test]
+    fn client_abort_classifier_does_not_swallow_relays_own_synthetic_timeout_618() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "edge relay upstream connect: relay setup timed out",
+        );
+        assert_eq!(
+            io_err.raw_os_error(),
+            None,
+            "a hand-built Error::new must never carry a raw OS errno — that is the exact \
+             property the classifier narrows on"
+        );
+        let relay_timeout: BoxError = Box::new(io_err);
+        assert_eq!(
+            classify_client_abort(&relay_timeout),
+            None,
+            "a real relay/upstream failure must stay loud, never be filed as a benign client abort"
+        );
+        assert!(!is_benign_client_abort(&relay_timeout));
     }
 
     /// #533: the rustls "no close_notify" class. rustls surfaces it as a plain
