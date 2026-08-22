@@ -102,12 +102,23 @@ async fn quic_throughput_once(
 
 /// One fresh-connection TCP round-trip: connect → write → half-close → read echo.
 async fn tcp_once(target: SocketAddr, payload: &[u8]) -> Result<f64, BoxError> {
+    tcp_once_capped(target, payload, MAX_BULK_BYTES as u64).await
+}
+
+/// [`tcp_once`]'s real body, with the read cap as a parameter so a test can pin a
+/// small cap instead of paying for `MAX_BULK_BYTES` (#619).
+async fn tcp_once_capped(target: SocketAddr, payload: &[u8], cap: u64) -> Result<f64, BoxError> {
     let start = Instant::now();
     let mut stream = TcpStream::connect(target).await?;
     stream.write_all(payload).await?;
     stream.shutdown().await?; // signal EOF so the echo (socat /bin/cat) replies + closes
     let mut got = Vec::new();
-    stream.read_to_end(&mut got).await?;
+    // #619: this was the one unbounded `read_to_end` left in this file after #593
+    // capped every other read here (`tcp_throughput_once`/`quic_throughput_once`/
+    // `quic_once`) -- CT_DIRECT_TARGET is "not always something the operator fully
+    // controls" (#593's own reasoning), so a misbehaving/malicious echo peer that
+    // never closes could otherwise make this allocate without bound.
+    stream.take(cap).read_to_end(&mut got).await?;
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     if got == payload {
         Ok(elapsed)
@@ -234,4 +245,54 @@ async fn main() -> Result<(), BoxError> {
         proto, summary.n, iterations, summary.mean_ms, summary.p95_ms
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// #619: a peer that keeps sending past the cap and never closes must not make
+    /// `tcp_once` read without bound -- the `.take(cap)` read hits the cap, `got`
+    /// stops growing there, and the existing length-mismatch check (not a hang, not
+    /// an unbounded allocation) is what ends the call. A small cap here (not the
+    /// real 256 MiB `MAX_BULK_BYTES`) keeps this test fast while still proving the
+    /// bound is real.
+    #[tokio::test]
+    async fn tcp_once_stops_at_the_cap_instead_of_reading_a_peer_that_never_closes() {
+        const CAP: u64 = 4096;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain whatever the client sends, then stream well past CAP without
+            // ever closing -- the exact "misbehaving/malicious echo peer" shape
+            // #619 is about.
+            let mut discard = [0u8; 64];
+            let _ = sock.read(&mut discard).await;
+            let chunk = vec![0u8; 1024];
+            for _ in 0..(CAP as usize / chunk.len() + 4) {
+                if sock.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            // Deliberately never shuts down / drops late: the client's `.take(CAP)`
+            // must be what ends the read, not the peer closing.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tcp_once_capped(addr, b"probe", CAP),
+        )
+        .await
+        .expect("bounded by the cap, not by a hang waiting for the peer to close");
+
+        // The peer never echoes the exact payload back (it streams zeros), so this
+        // is always the length/content-mismatch error -- the point is it returns
+        // promptly at all, proving the read didn't grow past the cap.
+        assert!(result.is_err(), "a non-echoing peer fails the content check, as expected");
+
+        server.abort();
+    }
 }
