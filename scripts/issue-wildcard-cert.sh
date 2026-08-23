@@ -46,7 +46,13 @@ ok()   { printf "\033[32m  ✓\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m  !\033[0m %s\n" "$*" >&2; }
 die()  { printf "\033[31merror:\033[0m %s\n" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# Derived, not a hardcoded line range -- same class as #626/#627: this one
+# silently dropped lines 25-33 (the WILDCARD_CERT_DIR/Phase-F-redeploy note
+# and the reload-command TODO for whoever revisits this after Phase F lands).
+usage() {
+  awk 'NR>=2 && (/^#/||/^$/){sub(/^# ?/,""); print; next} NR>=2{exit}' "${BASH_SOURCE[0]}"
+  exit "${1:-0}"
+}
 case "${1:-}" in -h|--help) usage 0 ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in

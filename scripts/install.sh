@@ -46,8 +46,12 @@ ok()   { printf "${C_G}  ✓${C_0} %s\n" "$*"; }
 warn() { printf "${C_Y}  !${C_0} %s\n" "$*" >&2; }
 die()  { printf "${C_R}error:${C_0} %s\n" "$*" >&2; exit 1; }
 
+# Derived, not a hardcoded line range -- same class as #626/#627: this one
+# went stale in the OTHER direction (the range outlived the header and started
+# swallowing real code), so --help was leaking `set -euo pipefail` and the
+# ROOT-resolution comment into user-facing output instead of stopping cleanly.
 usage() {
-  sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk 'NR>=2 && (/^#/||/^$/){sub(/^# ?/,""); print; next} NR>=2{exit}' "${BASH_SOURCE[0]}"
   exit "${1:-0}"
 }
 
