@@ -81,9 +81,21 @@ for v in ct-selfhost_shared ct-selfhost_keycloak_data \
   fi
 done
 
-# --- Secrets and certificates that live on the host filesystem.
-[ -f "$SRC/docker/deploy/.env" ] && cp "$SRC/docker/deploy/.env" "$STAGE/deploy.env"
-[ -d "$CERT_DIRS" ] && tar czf "$STAGE/certs.tar.gz" -C "$(dirname "$CERT_DIRS")" "$(basename "$CERT_DIRS")"
+# --- Secrets and certificates that live on the host filesystem. Both are core,
+# always-present artifacts of a running deployment (the stack cannot be up
+# without a readable .env; a BYO-cert container cannot be up without
+# $CERT_DIRS) -- unlike the enumerated OPTIONAL volumes loop above (whose
+# absence is legitimately possible and is logged, not fatal), a missing one
+# here means something is actually wrong on this host. A bare
+# `[ -f X ] && cp ...` does NOT trip `set -e` when the guard itself is false
+# (verified: `bash -c 'set -e; [ -f /nonexistent ] && echo x; echo reached'`
+# prints "reached") -- so this used to silently ship (and, within $KEEP
+# nights, force-push over the last known-good copy of) a snapshot missing
+# the one thing a restore actually needs. Guard failures are now fatal.
+[ -f "$SRC/docker/deploy/.env" ] || die ".env fehlt unter $SRC/docker/deploy/.env -- Snapshot ohne Deploy-Secrets waere nutzlos"
+cp "$SRC/docker/deploy/.env" "$STAGE/deploy.env"
+[ -d "$CERT_DIRS" ] || die "Zertifikatsverzeichnis $CERT_DIRS fehlt -- Snapshot ohne BYO-Zertifikate waere unvollstaendig"
+tar czf "$STAGE/certs.tar.gz" -C "$(dirname "$CERT_DIRS")" "$(basename "$CERT_DIRS")"
 
 # --- Manifest: what a restore needs to reproduce THIS deployment, including the
 # source commits. Restoring state onto a different code revision is the failure
