@@ -49,25 +49,54 @@ struct EnrollState {
 }
 
 /// Build the persistent enrollment router: `POST /enroll/issue`,
-/// `POST /enroll/redeem`, backed by a durable [`SqliteEnrollment`]. `/enroll/issue`
-/// is unauthenticated (dev/back-compat); use [`enrollment_router_sqlite_with_admin`]
-/// to require the admin token on issuance.
+/// `POST /enroll/redeem`, backed by a durable [`SqliteEnrollment`]. With no admin
+/// token configured, `/enroll/issue[-batch]` is **absent** (#543 fail-closed, see
+/// [`enrollment_router_sqlite_with_admin`]); use that function directly to configure one.
 pub fn enrollment_router_sqlite(store: Arc<SqliteEnrollment>) -> Router {
     enrollment_router_sqlite_with_admin(store, None)
 }
 
-/// Like [`enrollment_router_sqlite`] but gates `POST /enroll/issue` behind the shared
-/// admin token (#87 SEC87b-auth): a caller must present `x-ct-admin-token`. `/enroll/redeem`
-/// stays open — an agent redeems with its single-use join token + proof-of-possession,
-/// which is its own auth. Only the *issuance* of join tokens is restricted here.
+/// Like [`enrollment_router_sqlite`] but gates `POST /enroll/issue[-batch]` behind the
+/// shared admin token (#87 SEC87b-auth): a caller must present `x-ct-admin-token`.
+///
+/// #543 fail-closed (mirrors #194's billing writers): `/enroll/issue` and
+/// `/enroll/issue-batch` mint an onboarding credential with no possession proof, so
+/// mounting them OPEN when `issue_admin_token` is unset would mean a deploy that forgot
+/// `CT_CP_EDGE_ADMIN_TOKEN` silently exposes unauthenticated join-token minting. When
+/// unset they are simply **absent** (404), not open — same treatment as
+/// `billing_writers_gated`. `/enroll/redeem` is unaffected either way: an agent redeems
+/// with its single-use join token + proof-of-possession, which is its own auth and stays
+/// mounted unconditionally.
 pub fn enrollment_router_sqlite_with_admin(
+    store: Arc<SqliteEnrollment>,
+    issue_admin_token: Option<[u8; 32]>,
+) -> Router {
+    let redeem_router = Router::new()
+        .route("/enroll/redeem", post(redeem))
+        .with_state(EnrollState { store: store.clone(), issue_admin_token: None });
+    // #543 fail-closed (mirrors #194's billing writers, done here rather than inside
+    // enroll_issue_writers_gated so that helper stays a plain, always-mounted, inline-gated
+    // router builder -- the SAME shape billing_writers_gated has -- and the "mount at all"
+    // decision lives at exactly one call site, same as the production router's own choice.
+    match issue_admin_token {
+        Some(_) => redeem_router.merge(enroll_issue_writers_gated(store, issue_admin_token)),
+        None => redeem_router,
+    }
+}
+
+/// The `/enroll/issue` + `/enroll/issue-batch` writer router, always mounted, gated inline
+/// by [`require_issue_admin`] (open when `issue_admin_token` is `None`) -- the same shape as
+/// [`billing_writers_gated`]. Exposed separately from [`enrollment_router_sqlite_with_admin`]
+/// (which additionally fail-closes to ABSENT when unconfigured, #543) so a test setup that
+/// legitimately needs issuance open against an otherwise-production router (mirroring #194's
+/// `spawn_unified`) can merge it explicitly instead of weakening the production default.
+pub fn enroll_issue_writers_gated(
     store: Arc<SqliteEnrollment>,
     issue_admin_token: Option<[u8; 32]>,
 ) -> Router {
     Router::new()
         .route("/enroll/issue", post(issue))
         .route("/enroll/issue-batch", post(issue_batch))
-        .route("/enroll/redeem", post(redeem))
         .with_state(EnrollState { store, issue_admin_token })
 }
 
@@ -129,11 +158,13 @@ pub(crate) fn admin_gate_startup_line(configured: bool) -> String {
             .to_string()
     } else {
         "ct-cp: #543: WARNUNG -- CT_CP_EDGE_ADMIN_TOKEN ist nicht gesetzt. Die \
-         Abrechnungs-Schreibrouten sind deshalb GAR NICHT eingehaengt (#194), aber diese \
-         Faehigkeiten stehen OHNE Nachweis offen: Join-Token ausstellen (/enroll/issue), \
-         Routing-Registry schreiben (/registry/register), Bootstrap-Token praegen \
-         (/bootstrap/mint), Agentenverzeichnis schreiben, Pipelines veroeffentlichen, \
-         edge-mesh. Fuer einen oeffentlich erreichbaren Betrieb ist das falsch."
+         Abrechnungs-Schreibrouten, Join-Token-Ausstellung (/enroll/issue, /enroll/issue-batch) \
+         und Bootstrap-Token-Praegung (/bootstrap/mint) sind deshalb GAR NICHT eingehaengt \
+         (#194, seit diesem Fix auch #543 -- beide praegen ein Zugangsmittel ohne \
+         Besitznachweis), aber diese Faehigkeiten stehen OHNE Nachweis offen: \
+         Routing-Registry schreiben (/registry/register), Agentenverzeichnis schreiben, \
+         Pipelines veroeffentlichen, edge-mesh. Fuer einen oeffentlich erreichbaren Betrieb ist \
+         das falsch."
             .to_string()
     }
 }
@@ -324,6 +355,10 @@ struct BootstrapState {
 /// * `POST /bootstrap/mint` `{secret, ttl_secs?}` → `{token}` — **admin-gated** (minting
 ///   hands off control of a secret bundle; same `CT_CP_EDGE_ADMIN_TOKEN` as the other
 ///   operator writers). The operator/portal mints when generating an install one-liner.
+///   #543 fail-closed (mirrors #194's billing writers): with no admin token configured
+///   this route is simply **absent** (404), not open — minting hands off a secret bundle
+///   with no possession proof, so leaving it open on an unconfigured deploy would be a
+///   silent unauthenticated secret-mint surface.
 /// * `POST /bootstrap/redeem` `{token}` → `{secret}` — **public**: possession of the
 ///   short-lived single-use token is the authorization, and it is handed off over TLS
 ///   in the response body (never on the command line). `404` unknown, `409` already
@@ -332,10 +367,16 @@ pub fn bootstrap_router(store: Arc<SqliteBootstrap>, admin_token: Option<[u8; 32
     let redeem = Router::new()
         .route("/bootstrap/redeem", post(bootstrap_redeem))
         .with_state(BootstrapState { store: store.clone() });
-    let mint = Router::new()
-        .route("/bootstrap/mint", post(bootstrap_mint))
-        .with_state(BootstrapState { store });
-    redeem.merge(admin_gated(mint, admin_token))
+    let mint = match admin_token {
+        Some(_) => admin_gated(
+            Router::new()
+                .route("/bootstrap/mint", post(bootstrap_mint))
+                .with_state(BootstrapState { store }),
+            admin_token,
+        ),
+        None => Router::new(),
+    };
+    redeem.merge(mint)
 }
 
 /// Seconds since the Unix epoch (wall clock), for the bootstrap-token TTL.
@@ -6176,9 +6217,9 @@ mod tests {
     #[tokio::test]
     async fn enroll_issue_requires_the_admin_token_when_configured() {
         // #87 SEC87b-auth: with an admin token configured, POST /enroll/issue requires
-        // x-ct-admin-token (401 without / wrong, 200 with). With none configured it's
-        // open (dev/back-compat). /enroll/redeem is unaffected (agent-authed by its
-        // single-use token + proof).
+        // x-ct-admin-token (401 without / wrong, 200 with). #543 fail-closed: with none
+        // configured, the route is ABSENT (404), not open. /enroll/redeem is unaffected
+        // either way (agent-authed by its single-use token + proof).
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -6205,9 +6246,11 @@ mod tests {
             "correct admin token issues a join token"
         );
 
-        // No admin token configured -> issuance is open (dev/back-compat).
-        let open = enrollment_router_sqlite_with_admin(Arc::new(SqliteEnrollment::open_in_memory().unwrap()), None);
-        let r = open
+        // #543: no admin token configured -> /enroll/issue is ABSENT (404), not open --
+        // mirrors #194's billing writers. /enroll/redeem stays mounted regardless.
+        let closed = enrollment_router_sqlite_with_admin(Arc::new(SqliteEnrollment::open_in_memory().unwrap()), None);
+        let r = closed
+            .clone()
             .oneshot(
                 Request::post("/enroll/issue")
                     .header("content-type", "application/json")
@@ -6216,7 +6259,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::OK, "issuance open when no admin token is configured");
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "issuance absent when no admin token is configured (#543)");
+        let r2 = closed
+            .oneshot(
+                Request::post("/enroll/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"00","agent":"a","pubkey":"00","proof":"00"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(r2.status(), StatusCode::NOT_FOUND, "redeem stays mounted with no admin token");
     }
 
     #[tokio::test]
@@ -6494,9 +6547,11 @@ mod tests {
             "unknown token -> 404"
         );
 
-        // With no admin token configured, mint is open (dev/back-compat).
-        let open = bootstrap_router(Arc::new(SqliteBootstrap::open_in_memory().unwrap()), None);
-        let r = open
+        // #543 fail-closed: with no admin token configured, mint is ABSENT (404), not open --
+        // mirrors #194's billing writers. /bootstrap/redeem stays mounted regardless.
+        let closed = bootstrap_router(Arc::new(SqliteBootstrap::open_in_memory().unwrap()), None);
+        let r = closed
+            .clone()
             .oneshot(
                 Request::post("/bootstrap/mint")
                     .header("content-type", "application/json")
@@ -6505,7 +6560,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::OK, "mint open when no admin token is configured");
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "mint absent when no admin token is configured (#543)");
+        let r2 = closed
+            .oneshot(
+                Request::post("/bootstrap/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"00"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(r2.status(), StatusCode::NOT_FOUND, "redeem stays mounted with no admin token");
     }
 
     #[tokio::test]
@@ -7094,11 +7159,16 @@ mod tests {
             .into_owned()
     }
 
+    /// Fixed test-only admin token for [`spawn`] -- #543 fail-closes `/enroll/issue` when
+    /// unconfigured, so this restart test (which legitimately drives issuance) needs the
+    /// route mounted, same as `spawn_unified`'s billing-writer test setup does for #194.
+    const TEST_ENROLL_ADMIN: [u8; 32] = [0x11u8; 32];
+
     /// Serve the persistent enrollment router (on `db_path`) on an ephemeral
     /// port; returns the base URL. Simulates one process instance.
     async fn spawn(db_path: &str) -> String {
         let store = Arc::new(SqliteEnrollment::open(db_path).unwrap());
-        let app = enrollment_router_sqlite(store);
+        let app = enrollment_router_sqlite_with_admin(store, Some(TEST_ENROLL_ADMIN));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -7118,7 +7188,7 @@ mod tests {
         let token;
         let proof;
         {
-            let cp = ControlPlaneClient::new(spawn(&db).await);
+            let cp = ControlPlaneClient::new(spawn(&db).await).with_admin_token(hex_encode(&TEST_ENROLL_ADMIN));
             token = cp
                 .issue_join_token(&TenantId("tenant-x".to_string()))
                 .await
@@ -7129,7 +7199,7 @@ mod tests {
         }
 
         // Fresh service instance on the same database (a restart).
-        let cp2 = ControlPlaneClient::new(spawn(&db).await);
+        let cp2 = ControlPlaneClient::new(spawn(&db).await).with_admin_token(hex_encode(&TEST_ENROLL_ADMIN));
         let replay = cp2.redeem(&token, &agent, &pubkey, &proof).await;
         assert!(
             matches!(replay, Err(crate::client::CpError::Status(_))),
@@ -7245,14 +7315,16 @@ mod tests {
     const TEST_WEBHOOK_SECRET: &[u8] = b"whsec_unified_test";
 
     async fn spawn_unified(db_path: &str) -> String {
-        // #194: the production router fail-closes the client-supplied-account billing writers
-        // (/accounts/open, /payment/intent, /billing/issue) when no admin token is configured. This
-        // E2E restart test legitimately drives them (open_account / buy_token) to prove billing
-        // persists across a restart, so mount the OPEN (ungated) writers here against the SAME db —
-        // test-only, and no route conflict since the production router mounts none without a token.
+        // #194/#543: the production router fail-closes the client-supplied-account billing
+        // writers (/accounts/open, /payment/intent, /billing/issue) AND /enroll/issue[-batch]
+        // when no admin token is configured. This E2E restart test legitimately drives both
+        // (open_account/buy_token, issue_join_token) to prove they persist across a restart,
+        // so mount the OPEN (ungated) writers here against the SAME db — test-only, and no
+        // route conflict since the production router mounts neither without a token.
         let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", OidcVerifierHandle::empty())
             .unwrap()
-            .merge(billing_writers_gated(std::sync::Arc::new(SqliteLedger::open(db_path).unwrap()), None));
+            .merge(billing_writers_gated(std::sync::Arc::new(SqliteLedger::open(db_path).unwrap()), None))
+            .merge(enroll_issue_writers_gated(std::sync::Arc::new(SqliteEnrollment::open(db_path).unwrap()), None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
