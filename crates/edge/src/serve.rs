@@ -1212,6 +1212,13 @@ pub enum ClientAbortClass {
     /// are real, operator-visible edge-side problems, not client aborts) never
     /// match here — #618.
     IdleTimeout,
+    /// `ENOTCONN` — a socket operation landed on a connection the peer had already
+    /// torn down (the OS answers with "Transport endpoint is not connected" instead
+    /// of the more common `ECONNRESET`/`EPIPE`, depending on exactly which syscall
+    /// raced the teardown). Same "client/network went away" family as those two; no
+    /// synthetic error in this codebase raises `NotConnected` for a real edge-side
+    /// fault, so unlike `IdleTimeout` this needs no `raw_os_error()` narrowing — #631.
+    NotConnected,
 }
 
 impl ClientAbortClass {
@@ -1222,7 +1229,8 @@ impl ClientAbortClass {
             Self::ConnectionReset => "connection-reset",
             Self::BrokenPipe => "broken-pipe",
             Self::TlsCloseNotifyMissing => "tls-close-notify-missing",
-            Self::IdleTimeout => "idle-timeout",
+                Self::IdleTimeout => "idle-timeout",
+            Self::NotConnected => "not-connected",
         }
     }
 }
@@ -1274,6 +1282,9 @@ fn classify_io_client_abort(e: &std::io::Error) -> Option<ClientAbortClass> {
         std::io::ErrorKind::TimedOut if e.raw_os_error().is_some() => {
             Some(ClientAbortClass::IdleTimeout)
         }
+        // #631: ENOTCONN — no synthetic error in this codebase raises `NotConnected`,
+        // so (unlike `TimedOut` above) this needs no `raw_os_error()` narrowing.
+        std::io::ErrorKind::NotConnected => Some(ClientAbortClass::NotConnected),
         _ => None,
     }
 }
@@ -4612,6 +4623,27 @@ mod tests {
             "a real relay/upstream failure must stay loud, never be filed as a benign client abort"
         );
         assert!(!is_benign_client_abort(&relay_timeout));
+    }
+
+    /// #631: a genuine OS-level `ENOTCONN` ("Transport endpoint is not connected") —
+    /// observed live on the `:443` front door as a single, unclassified line right
+    /// after a redeploy (`ct-edge: :443 front-door connection error: Transport
+    /// endpoint is not connected (os error 107)`) — is the same "client/network went
+    /// away mid-operation" family as `ECONNRESET`/`EPIPE`, so it must classify as
+    /// benign rather than stay loud.
+    #[test]
+    fn client_abort_classifier_recognizes_enotconn_631() {
+        let notconn: BoxError = Box::new(std::io::Error::from_raw_os_error(107)); // ENOTCONN
+        assert!(
+            notconn.to_string().contains("Transport endpoint is not connected"),
+            "the exact line measured in production: {notconn}"
+        );
+        assert_eq!(
+            classify_client_abort(&notconn),
+            Some(ClientAbortClass::NotConnected),
+            "ENOTCONN is the same benign client-abort family as ECONNRESET/EPIPE"
+        );
+        assert!(is_benign_client_abort(&notconn));
     }
 
     /// #533: the rustls "no close_notify" class. rustls surfaces it as a plain
