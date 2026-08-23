@@ -81,7 +81,29 @@ for entry in $ROLES; do
       # for anything (a build, an editor, an unrelated service). Verify the
       # cmdline still names serve-role.sh before signaling it, so a PID-reuse
       # race can never kill an unrelated process on the operator host.
-      if tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -q 'serve-role\.sh'; then
+      #
+      # #(this finding): the ORIGINAL #321 check above matched 'serve-role\.sh'
+      # literally — but serve-role.sh's own last line is `exec env ... $CT_AGENT
+      # channel`, and `exec` replaces the process image IN PLACE (same PID, new
+      # argv) rather than forking. The instant that line runs — which is nearly
+      # this process's entire lifetime, not a brief window — /proc/<pid>/cmdline
+      # no longer contains "serve-role.sh" at all; it's `env`'s own argv
+      # mid-chain, or (steady state, the case this check actually hits every
+      # real time) plain `<CT_AGENT> channel`. Verified empirically: a stand-in
+      # for this exact nohup-env-serve-role.sh-exec-env-ct_agent chain shows
+      # cmdline `<ct-agent path> channel`, zero occurrences of "serve-role.sh".
+      # So the ORIGINAL check matched NOTHING for any genuinely healthy,
+      # long-running process this script itself started — every real restart
+      # attempt fell into the "PID reuse" branch below and skipped killing the
+      # actually-hung process, silently defeating this watchdog's entire
+      # purpose (it would still spawn a NEW process alongside the never-killed
+      # hung one). Match on what's actually still there post-exec instead: the
+      # literal "channel" subcommand token serve-role.sh's exec line always
+      # passes as ct-agent's last argv — present for the process's whole life,
+      # whether mid-exec-chain or steady state — OR the original serve-role.sh
+      # string, kept as a belt-and-suspenders match for the brief pre-exec
+      # window (the shell still literally running serve-role.sh's own body).
+      if tr '\0' ' ' < "/proc/$oldpid/cmdline" 2>/dev/null | grep -qE 'serve-role\.sh|(^| )channel( |$)'; then
         log "role=$role stopping stale serve pid=$oldpid"
         kill "$oldpid" 2>/dev/null || true
         sleep 1
