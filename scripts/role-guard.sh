@@ -68,6 +68,12 @@ if [ "${1:-}" = "--selftest" ]; then
   # #602 false-positive guard: a read that merely mentions an interpreter name after a pipe
   # (not running it) stays allowed.
   check agent     '{"tool_name":"Bash","tool_input":{"command":"echo done | grep python3"}}' 0
+  # (#629): perl -i / ruby -i are the same native in-place-edit flag as sed -i, on two
+  # interpreters the eval-flag/stdin checks above don't cover for this route -- confirmed against
+  # the unfixed script first (both returned 0/allowed there).
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"perl -i -pe \"s/a/b/\" crates/x.rs"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"ruby -i -pe \"gsub(/a/,%q(b))\" crates/x.rs"}}' 2
+  check agent     '{"tool_name":"Bash","tool_input":{"command":"perl -i.bak -pe \"s/a/b/\" crates/x.rs"}}' 2
   check agent     '{"tool_name":"Read","tool_input":{}}'                        0
   check developer '{"tool_name":"Edit","tool_input":{}}'                        0
   check developer '{"tool_name":"Bash","tool_input":{"command":"echo x > f"}}'  0
@@ -116,10 +122,16 @@ if tool == "Bash":
     #   - curl writing to a file (-o/-O/--output/--remote-name); plain curl-to-stdout stays allowed.
     #   - wget / patch / rsync in COMMAND position (start, or after ; & | ( ) — so `grep "patch" f`
     #     and other read commands that merely mention the word are not falsely blocked.
+    #   - (#629) the in-place-edit check only ever named `sed -i` — but `perl -i` and `ruby -i`
+    #     are the SAME native in-place-file-edit flag on two other interpreters already covered by the
+    #     eval-flag/stdin checks above for their OTHER write routes, so a classic
+    #     `perl -i -pe 's/a/b/' crates/x.rs` slipped through untouched. Live-reproduced against the
+    #     unfixed script: both `perl -i` and `ruby -i` returned 0 (allowed). Extended the same `-i`
+    #     substring check (already permissive of `-i.bak`-style suffixes) to all three interpreters.
     # This is defence-in-depth, not airtight (an adversary with shell metaprogramming can always find
     # another route — the trust boundary is ultimately social); it closes the easy/accidental holes.
     if re.search(
-        r">>?(?![>&])|\btee\b|\bsed\b[^|]*-i|\bdd\b|\btruncate\b|\bcp\b|\bmv\b|(?<!-)\brm\b"
+        r">>?(?![>&])|\btee\b|\b(sed|perl|ruby)\b[^|]*-i|\bdd\b|\btruncate\b|\bcp\b|\bmv\b|(?<!-)\brm\b"
         r"|git\s+(add|commit|apply|checkout|restore|reset|push|rm|mv|clean)"
         r"|\bfind\b[^|]*-delete\b"
         r"|\b(python3?|perl|ruby|node|nodejs|php|bun)\b[^|]*\s-{1,2}(c|e|E|r|eval)\b"
