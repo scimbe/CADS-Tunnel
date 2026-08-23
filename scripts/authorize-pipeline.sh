@@ -58,7 +58,15 @@ print(json.dumps({"tenant": os.environ["CT_TENANT"]}))
 '
 }
 
-usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# Derived, not a hardcoded line range -- see the matching fix (#626) in
+# deploy-selfhost.sh's usage(). Here a stale range is worse than cosmetic: it
+# silently dropped the "relay OUT OF BAND, never GitHub" warning below (lines
+# 32-34), the exact reminder an operator running --help would want before
+# handing off CT_AGENT_TOKEN/the join token/cert files.
+usage() {
+  awk 'NR>=2 && (/^#/||/^$/){sub(/^# ?/,""); print; next} NR>=2{exit}' "${BASH_SOURCE[0]}"
+  exit "${1:-0}"
+}
 [ $# -ge 1 ] || usage 1
 case "$1" in -h|--help) usage 0 ;; esac
 
