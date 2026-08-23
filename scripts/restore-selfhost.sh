@@ -85,8 +85,20 @@ docker compose -f "$SRC/docker/deploy/compose.selfhost.yml" \
   --env-file "$SRC/docker/deploy/.env" down 2>/dev/null || true
 
 log "Secrets und Zertifikate zurückspielen"
-[ -f "$WORK/state/deploy.env" ] && install -m 600 "$WORK/state/deploy.env" "$SRC/docker/deploy/.env"
-[ -f "$WORK/state/certs.tar.gz" ] && tar xzf "$WORK/state/certs.tar.gz" -C "$CERT_PARENT"
+# Same silent-gap shape as #624 (backup-selfhost.sh), mirrored here: a bare
+# `[ -f X ] && action` does not trip `set -e` when the guard itself is false,
+# so a snapshot missing deploy.env or certs.tar.gz used to let this continue
+# silently -- and here the consequence is worse than on the backup side: the
+# restore would go on to call deploy-selfhost.sh below with NO deploy.env in
+# place, which can auto-generate a FRESH one with brand-new secrets. The
+# restore would then report success (readyz 200) while actually being a
+# differently-keyed deployment than the one being restored -- indistinguishable
+# from a real restore until something downstream (an OIDC client secret, a
+# pinned cert) mismatches. Guard failures are now fatal, matching #624.
+[ -f "$WORK/state/deploy.env" ] || die "deploy.env fehlt im Snapshot ($WORK/state/deploy.env) -- Wiederherstellung wuerde ohne die Original-Secrets weiterlaufen"
+install -m 600 "$WORK/state/deploy.env" "$SRC/docker/deploy/.env"
+[ -f "$WORK/state/certs.tar.gz" ] || die "certs.tar.gz fehlt im Snapshot ($WORK/state/certs.tar.gz) -- Wiederherstellung waere ohne die BYO-Zertifikate unvollstaendig"
+tar xzf "$WORK/state/certs.tar.gz" -C "$CERT_PARENT"
 
 log "Volumes zurückspielen"
 for f in "$WORK/state/volumes"/*.tar.gz; do
