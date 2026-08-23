@@ -118,6 +118,20 @@ override or fallback. To test against staging, point the control plane's own
 `ct-agent`-facing test fixtures at
 `https://acme-staging-v02.api.letsencrypt.org/directory` instead.
 
+The DNS-01 propagation race that motivated ADR-0003 (`ct-agent`'s
+`src/dns01_propagation.rs`/`src/acme_orchestrate.rs`) has a few advanced,
+optional tuning vars — sane defaults for every one, no reason to touch them
+unless you're diagnosing a specific propagation failure:
+
+| variable | default | meaning |
+|---|---|---|
+| `CT_ACME_ACCOUNT_KEY_PATH` | `<CT_ACME_CERT_OUT_DIR>/acme-account-key.der` | where the agent's own ACME account key lives |
+| `CT_ACME_DNS01_RESOLVER_URLS` | two independent public DoH resolvers | comma-separated DoH resolver URLs used to poll for the TXT record's propagation before telling the CA to validate |
+| `CT_ACME_DNS01_PROPAGATION_TIMEOUT_SECS` | `180` | how long to poll before giving up on this attempt |
+| `CT_ACME_DNS01_ATTEMPTS` | `3` | whole-order retries on a lost propagation race; every attempt is a real order against the CA's failed-validation rate limit, so keep this low |
+| `CT_ACME_DNS01_INITIAL_DELAY_SECS` | `75` | delay before the first propagation poll; lowering it risks re-poisoning a resolver's negative-answer cache |
+| `CT_ACME_DNS01_AUTHORITATIVE` | on (any value other than `0`/`false`/`no`) | additionally poll the zone's own authoritative nameservers, not just the DoH resolvers above |
+
 ## 5. Verify
 After a cert run publishes a challenge, from anywhere:
 ```bash

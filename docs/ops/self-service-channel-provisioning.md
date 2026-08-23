@@ -125,7 +125,10 @@ than hardcoding, since an operator can override the defaults via
 `CT_CP_CHANNEL_BROKER_PORT`/`CT_CP_CHANNEL_RELAY_PORT`). **Not** `4433` — that's the
 Mesh-Plane tunnel rendezvous port (`mesh_edge_port`), a different listener/protocol
 entirely; pointing at it fails every join immediately and consistently, not with an
-auth/membership refusal.
+auth/membership refusal. `/network-info`'s fourth port, `channel_relay_gate_port`
+(default `443`, override via `CT_CP_CHANNEL_RELAY_GATE_PORT`), is the #330 Circuit-Relay
+gate's shared front door — a member still needs QUIC admission first; see `docs/channel.md`
+in the `ct-agent` repo (`CT_CHANNEL_RELAY_GATE`/`_CERT`) for the client side.
 
 Runs relay-only (`CT_CHANNEL_RELAY_ONLY=1` — no dialable address needed, #173),
 re-admitting successive peers automatically (#179/#200 — up to 8 concurrent

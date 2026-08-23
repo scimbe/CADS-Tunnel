@@ -154,6 +154,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL; **alone** enables OIDC — the realm JWKS is fetched at startup to mount `/me/*` (#42) |
 | `CT_OIDC_PUBKEY_PATH` | control plane | PEM of the realm's RSA public key; an **offline override** of the JWKS fetch (takes precedence when set) |
 | `CT_OIDC_ACCESS_AUD` | control plane | **opt-in** access-token `aud` enforcement for `/me/*` (#82); set to your realm's field-checked access-token audience so a token whose `aud` omits it is rejected. Unset ⇒ audience not checked |
+| `CT_OIDC_AUTHORIZE_URL` / `CT_OIDC_TOKEN_URL` | control plane | Portal OIDC endpoints (`PortalOidc`); both **derived from `CT_OIDC_ISSUER`** (`<issuer>/protocol/openid-connect/{auth,token}`, the Keycloak layout) when unset, so a Keycloak deployment never needs either. Set explicitly only against an IdP with a non-Keycloak endpoint layout |
 | `CT_PAYMENT_WEBHOOK_SECRET` | control plane | provider webhook signing secret (unset ⇒ payment disabled) |
 | `CT_CP_UNAUTH_WRITE_PER_MIN` | control plane | **opt-in** per-IP rate cap on the unauthenticated DB-writer endpoints, bounding disk-DoS from a single address (#87); positive integer ⇒ on, unset ⇒ off |
 | `CT_CP_EDGE_ADMIN_TOKEN` | control plane | **opt-in** 64-hex shared admin token gating the machine/operator writer endpoints (`/enroll/issue`, `/registry/register`, `POST /registry/agents`, `/accounts/open`, `/payment/intent`, `/billing/issue`, `/bootstrap/mint`) (#87/#90/#161); unset ⇒ those routes stay open (dev/back-compat). Reads, customer `/me/*`, and the portal are unaffected. The front-door overlay sets it from `CT_EDGE_ADMIN_TOKEN`, so the edge and control plane share one value |
@@ -173,6 +174,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_EDGE_AUTH_HOST` | edge | a second front-door terminate host (e.g. `auth.<zone>`) — routes that SNI to the IdP (Keycloak) behind the same `:443`, no separate published port (#48) |
 | `CT_EDGE_AUTH_ADDR` | edge | upstream the Auth host reverse-proxies to (e.g. `keycloak:8080`); a hostname or `IP:port` |
 | `CT_EDGE_AUTH_CERT` / `CT_EDGE_AUTH_KEY` | edge | PEM cert+key for `CT_EDGE_AUTH_HOST` so the front door terminates its TLS (same BYO-cert story as the Portal) |
+| `CT_EDGE_WS_CHANNEL_CERT` / `CT_EDGE_WS_CHANNEL_KEY` | edge | **optional** PEM cert+key so the browser WS-channel listener terminates TLS natively (`wss://`). Absent is a normal config, not a misconfiguration — plain `ws://` behind a reverse proxy that already terminates TLS (e.g. the deployed CADS-webconference-demo's Caddy front) or local dev with no TLS at all. Only a *partially* set pair (one var present, the other absent/unusable) warns loudly |
 | `CT_EDGE_HTTP_REDIRECT` | edge | optional `:80` listener (e.g. `0.0.0.0:80`) that 308-redirects to `:443` (unset ⇒ off) |
 | `CT_CP_EDGE_CERT_PATH` | control plane | path it reads the edge CA root from to publish at `/pki/ca` (default `/shared/edge-cert.der`, issue #11) |
 | `CT_AGENT_EDGE_CERT_URL` | agent | fetch the edge CA root from this control-plane URL instead of a local file (issue #11) |
@@ -182,6 +184,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS` | agent | throttle the "waiting for edge cert" log line (default 5s, #73) — cosmetic; does not affect the wait |
 | `CT_CLIENT_EDGE_CERT_WAIT_SECS` | client | bound the edge-cert wait (default 30s, #73); the client is a bench/test tool, so it fails fast rather than hanging |
 | `CT_CLIENT_CAPABILITY_WAIT_SECS` | client | bound the capability wait (default 60s, #73); fail-fast with a precise error instead of an indefinite poll |
+| `CT_CLIENT_TUNNEL_TIMEOUT_SECS` | client | overall deadline (default 10s, issue #2) for the tunnel operation once the edge connection is up, so the client never hangs when the edge accepts the connection but cannot relay (e.g. no agent registered for the token) |
 
 Secrets come from `.env` (self-host, gitignored) or Kubernetes Secrets (hosted) —
 never commit them. Verify with `./scripts/check-no-secrets.sh`.
@@ -846,6 +849,7 @@ entry rather than inferred from their names:
 | `CT_GATE_COOKIE_DOMAIN` | unset | the gate's session-cookie domain, set to the zone so **one** login covers every `*.<zone>` subdomain. **Until it is set, every gate handler answers `503`** — the gate is opt-in-until-configured, not silently open |
 | `CT_GATE_REDIRECT_URI` | derived | the gate's OIDC redirect target. Unset, it is the portal's `redirect_uri` with `/portal/callback` swapped for `/gate/callback` — correct whenever both live on the same host, so it usually needs no value at all |
 | `CT_PORTAL_SOCIAL_PROVIDERS` | unset ⇒ **none shown** | comma-separated allowlist (`google`, `github`) of social-login buttons on the logged-out portal |
+| `CT_PORTAL_REQUIRE_VERIFIED_EMAIL` | off | **a distinct variable from `CT_GATE_REQUIRE_VERIFIED_EMAIL`** (see the [threat model](../security/threat-model.md)). Truthy ⇒ the *Portal's* channel-allowlist self-service claim flow additionally requires an `email_verified` id_token claim before an email can claim an allowlist slot. Off by default until a real email-confirmation mechanism exists |
 
 Two things worth knowing before touching them:
 
@@ -987,6 +991,19 @@ Both are **off unless switched on**, and both are switched on by the literal `1`
 | `CT_CP_ACME_BROKER_TICK_SECS` | `60` | how often that broker runs |
 | `CT_CP_DIRECT_PROBE` | off | the direct-serving reachability probe (#517 V3, slice 3). It **only probes and records** the hysteresis state — no DNS is touched, so enabling it changes no live routing; it makes the probe decisions observable before a later slice wires them to records |
 | `CT_CP_DIRECT_PROBE_TICK_SECS` | `30` | how often that probe runs |
+
+### Per-CA ACME EAB credentials
+
+The broker's `pick_ca` step attaches External Account Binding credentials to any assigned CA
+that requires them — one fixed `(kid, hmac)` pair per CA, same trust tier as a `directory_url`
+itself. Unset for a given CA ⇒ that CA is simply never assigned (no EAB, no issuance). Let's
+Encrypt needs none of these.
+
+| variable | CA |
+|---|---|
+| `CT_CP_ACME_EAB_ZEROSSL_KID` / `CT_CP_ACME_EAB_ZEROSSL_HMAC` | ZeroSSL |
+| `CT_CP_ACME_EAB_GTS_KID` / `CT_CP_ACME_EAB_GTS_HMAC` | Google Trust Services |
+| `CT_CP_ACME_EAB_SSLCOM_KID` / `CT_CP_ACME_EAB_SSLCOM_HMAC` | SSL.com |
 
 **Only the exact string `1` counts.** `true`, `yes` and `on` leave the loop off, silently — the
 vocabulary differs from the flood-control limits, which do accept `off`/`false`/`none` as an
