@@ -75,12 +75,21 @@ if [ "$MODE" = "--test-mail" ]; then
 fi
 
 # --- Collect what a restore genuinely needs. Nothing here is optional-nice: each
-# item is something a rebuilt host cannot derive on its own.
+# item is something a rebuilt host cannot derive on its own -- so a failure to
+# collect any one of them must abort the whole run, not silently ship a bundle
+# missing a piece a real restore would need. (Found live: with `set -e` active,
+# neither `[ -r "$PASSFILE" ] && cp ...` nor a `| grep ... || true` pipeline
+# actually trips -e on failure -- the script would otherwise report success and
+# mail out a "complete" bundle with an empty or missing item, discoverable only
+# during an actual disaster-recovery attempt.)
 mkdir -p "$WORK/bundle"
-[ -r "$PASSFILE" ] && cp "$PASSFILE" "$WORK/bundle/backup-passphrase.txt"
+[ -r "$PASSFILE" ] && cp "$PASSFILE" "$WORK/bundle/backup-passphrase.txt" \
+  || die "kann die Backup-Passphrase nicht aus $PASSFILE lesen -- ohne sie sind die naechtlichen Sicherungen aus diesem Paket nicht entschluesselbar; breche ab statt ein unvollstaendiges Paket zu verschicken"
 cp "$ENVFILE" "$WORK/bundle/deploy.env"
 docker inspect ct-selfhost-keycloak-1 --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
   | grep -E '^KEYCLOAK_ADMIN' > "$WORK/bundle/keycloak-admin.txt" || true
+[ -s "$WORK/bundle/keycloak-admin.txt" ] \
+  || die "konnte KEYCLOAK_ADMIN* nicht aus ct-selfhost-keycloak-1 lesen (Container nicht erreichbar oder Variablen fehlen) -- breche ab statt ein unvollstaendiges Paket zu verschicken"
 cat > "$WORK/bundle/WIEDERHERSTELLUNG.md" <<EOF
 # Wiederherstellung in Kürze
 
