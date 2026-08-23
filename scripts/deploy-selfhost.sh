@@ -74,7 +74,18 @@ ok()   { printf "${C_G}  ✓${C_0} %s\n" "$*"; }
 warn() { printf "${C_Y}  !${C_0} %s\n" "$*" >&2; }
 die()  { printf "${C_R}error:${C_0} %s\n" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# Derived, not a hardcoded line range: the header comment block above has grown
+# past its original bounds at least once already (a prior `sed -n '2,27p'` cut
+# the "Required env"/"Optional env" paragraphs -- lines 28-38 -- silently out of
+# `--help`'s output, and would keep doing so on the next header edit too). Print
+# every line from line 2 through the end of the leading `#`/blank-line block,
+# stopping at the first real code line (`set -euo pipefail`) -- self-updating,
+# same "derive it, don't list it" reasoning check_no_silent_security_downgrade
+# already uses for its own watched-variable list below.
+usage() {
+  awk 'NR>=2 && (/^#/||/^$/){sub(/^# ?/,""); print; next} NR>=2{exit}' "${BASH_SOURCE[0]}"
+  exit "${1:-0}"
+}
 
 # Kept verbatim so an error message can hand the operator the exact command to
 # re-run. Inside a function `$*` would be that function's arguments, not these.
