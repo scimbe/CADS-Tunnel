@@ -58,7 +58,9 @@ RUN apt-get update \
 # today -- the edge only TOLERATES the marker so far (#495 U2 (b'), already
 # live); nothing consumes it until U2 Slice 2 (CT_EDGE_UNIFIED_PAIRER) lands.
 # Bumping now avoids a second coordinated release once Slice 2 ships.
-ARG CT_AGENT_REF=v0.5.8
+# 2026-08-24: bumped to v0.6.9 -- fleet-wide ct-agent pin bump (7 fixes since
+# v0.5.8, see CT_AGENT_RELEASE), same reasoning as every other pin in this repo.
+ARG CT_AGENT_REF=v0.6.9
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
