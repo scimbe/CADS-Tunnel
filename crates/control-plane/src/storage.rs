@@ -656,6 +656,28 @@ mod service_account_store_tests {
     }
 
     #[test]
+    fn record_if_under_limit_closes_the_toctou_race_the_handler_used_to_have() {
+        // Real gap found live 2026-08-24: service_account_create used to check
+        // existing_count via a separate, earlier list_for_subject().len() call,
+        // then insert unconditionally after a real Keycloak network round-trip
+        // in between -- two concurrent callers could both pass the check before
+        // either inserted. This test proves the atomic replacement actually
+        // enforces the cap: fill up to the limit, then confirm the next
+        // attempt is rejected and performs NO insert (not just returns an
+        // error after inserting anyway).
+        let store = SqliteServiceAccountStore::open_in_memory().unwrap();
+        assert!(store.record_if_under_limit("alice", "sa-1", "kc-1", "one", 100, 2).unwrap());
+        assert!(store.record_if_under_limit("alice", "sa-2", "kc-2", "two", 200, 2).unwrap());
+        assert!(
+            !store.record_if_under_limit("alice", "sa-3", "kc-3", "three", 300, 2).unwrap(),
+            "a third record at the cap of 2 must be rejected"
+        );
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 2, "the rejected attempt must not have inserted a row");
+        // A different subject has their own independent limit.
+        assert!(store.record_if_under_limit("bob", "sa-4", "kc-4", "bob's", 400, 2).unwrap());
+    }
+
+    #[test]
     fn remove_is_owner_scoped_and_reports_whether_anything_was_actually_removed() {
         let store = SqliteServiceAccountStore::open_in_memory().unwrap();
         store.record("alice", "sa-1", "kc-internal-1", "CI bot", 100).unwrap();
