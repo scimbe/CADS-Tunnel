@@ -32,10 +32,10 @@
  .steps li::before{content:counter(step);position:absolute;left:0;top:.05rem;width:1.9rem;height:1.9rem;border-radius:50%;background:var(--accent);color:#0e1116;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:.95rem}
  .steps strong{display:block;margin-bottom:.15rem}
  .oswrap{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.8rem}
- .ostab{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:.4rem .9rem;font-size:.9rem;cursor:pointer;color:var(--muted);user-select:none}
- .ostab.active{color:var(--fg);border-color:var(--accent);background:#111a24}
- .ospane{display:none}
- .ospane.active{display:block}
+ .ostab,.ostab-sb{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:.4rem .9rem;font-size:.9rem;cursor:pointer;color:var(--muted);user-select:none}
+ .ostab.active,.ostab-sb.active{color:var(--fg);border-color:var(--accent);background:#111a24}
+ .ospane,.ospane-sb{display:none}
+ .ospane.active,.ospane-sb.active{display:block}
  .grid{display:grid;gap:.6rem}
  footer{color:var(--muted);font-size:.82rem;text-align:center;margin-top:2rem;border-top:1px solid var(--line);padding-top:1.2rem}
  .pill{display:inline-block;background:#0d1117;border:1px solid var(--line);border-radius:999px;padding:.2rem .7rem;font-size:.8rem;color:var(--muted);margin:.15rem}
@@ -149,6 +149,75 @@
   </div>
 
   <div class="card">
+    <h2>🧪 Lieber auf Nummer sicher? (Sandbox-Variante)</h2>
+    <p>
+      <code>ct-agent</code> ist ein Programm, das aktiv mit dem Internet redet —
+      genau wie jedes andere Netzwerk-Programm auch. Wer seinen eigenen Rechner
+      dabei lieber nicht direkt exponieren will, lässt den Agenten stattdessen
+      in einer leichtgewichtigen, isolierten Sandbox (einem Docker-Container)
+      laufen: selbst im unwahrscheinlichen Fall eines Bugs oder eines
+      kompromittierten Agenten bleiben deine eigenen Dateien, Programme und
+      Daten außerhalb des Containers unberührt. Das ist auch der Weg, den das
+      eigene Setup-Skript selbst als „empfohlene Isolation" bezeichnet.
+    </p>
+    <p class="muted">
+      Einzige Voraussetzung: Docker ist installiert (Docker Desktop unter
+      macOS/Windows, Docker Engine unter Linux —
+      <a href="https://docs.docker.com/get-docker/">docs.docker.com/get-docker</a>).
+      Ersetze <code>&lt;dein-token&gt;</code> und <code>&lt;deine-hostname&gt;</code>
+      wie oben durch die Werte von deiner Tunnel-Seite im Portal, und
+      <code>&lt;dein-lokaler-port&gt;</code> durch den Port, auf dem dein Kram
+      lokal läuft (z. B. <code>8080</code>).
+    </p>
+
+    <div class="oswrap">
+      <span class="ostab-sb active" data-os-sb="linux">🐧 Linux</span>
+      <span class="ostab-sb" data-os-sb="mac">🍎 macOS</span>
+      <span class="ostab-sb" data-os-sb="win">🪟 Windows</span>
+    </div>
+
+    <div class="ospane-sb active" data-os-sb="linux">
+      <pre><code>mkdir ct-tunnel-sandbox &amp;&amp; cd ct-tunnel-sandbox
+curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | \
+  CT_BOOTSTRAP=&lt;dein-token&gt; \
+  CT_AGENT_CP_URL=https://bunsenbrenner.org \
+  CT_AGENT_HOSTNAME=&lt;deine-hostname&gt; \
+  CT_AGENT_ORIGIN=127.0.0.1:&lt;dein-lokaler-port&gt; \
+  bash -s -- --docker</code></pre>
+    </div>
+
+    <div class="ospane-sb" data-os-sb="mac">
+      <p class="muted">Derselbe Befehl wie unter Linux:</p>
+      <pre><code>mkdir ct-tunnel-sandbox &amp;&amp; cd ct-tunnel-sandbox
+curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | \
+  CT_BOOTSTRAP=&lt;dein-token&gt; \
+  CT_AGENT_CP_URL=https://bunsenbrenner.org \
+  CT_AGENT_HOSTNAME=&lt;deine-hostname&gt; \
+  CT_AGENT_ORIGIN=127.0.0.1:&lt;dein-lokaler-port&gt; \
+  bash -s -- --docker</code></pre>
+    </div>
+
+    <div class="ospane-sb" data-os-sb="win">
+      <pre><code>$env:CT_BOOTSTRAP='&lt;dein-token&gt;'
+$env:CT_AGENT_CP_URL='https://bunsenbrenner.org'
+$env:CT_AGENT_HOSTNAME='&lt;deine-hostname&gt;'
+$env:CT_AGENT_ORIGIN='127.0.0.1:&lt;dein-lokaler-port&gt;'
+&amp;([scriptblock]::Create((irm https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1))) -Docker</code></pre>
+      <p class="muted">Voraussetzung: Docker Desktop läuft bereits.</p>
+    </div>
+
+    <p class="muted" style="margin-top:1rem">
+      Baut ein schlankes Image, startet den Agenten als Container namens
+      <code>ct-agent</code> und meldet ihn genauso an wie die direkte
+      Installation oben — nur eben eingesperrt. Logs ansehen:
+      <code>docker logs -f ct-agent</code>. Stoppen: <code>docker stop ct-agent</code>.
+      Alles zurücksetzen: <code>docker rm -f ct-agent</code> (und bei Bedarf den
+      lokalen <code>.ct-agent-state</code>-Ordner löschen), dann den Befehl
+      erneut ausführen.
+    </p>
+  </div>
+
+  <div class="card">
     <h2>📶 Und danach?</h2>
     <p>Dein Tunnel läuft erstmal mit einem geteilten Zertifikat — das reicht für
       den Start völlig aus und funktioniert in jedem Browser ohne Warnung.
@@ -209,6 +278,13 @@ document.querySelectorAll('.ostab').forEach(function(tab){
     var os = tab.getAttribute('data-os');
     document.querySelectorAll('.ostab').forEach(function(t){ t.classList.toggle('active', t === tab); });
     document.querySelectorAll('.ospane').forEach(function(p){ p.classList.toggle('active', p.getAttribute('data-os') === os); });
+  });
+});
+document.querySelectorAll('.ostab-sb').forEach(function(tab){
+  tab.addEventListener('click', function(){
+    var os = tab.getAttribute('data-os-sb');
+    document.querySelectorAll('.ostab-sb').forEach(function(t){ t.classList.toggle('active', t === tab); });
+    document.querySelectorAll('.ospane-sb').forEach(function(p){ p.classList.toggle('active', p.getAttribute('data-os-sb') === os); });
   });
 });
 </script>
