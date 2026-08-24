@@ -83,7 +83,26 @@ const RELAY_OPEN_BI_TIMEOUT: Duration = Duration::from_secs(5);
 /// too little margin for jitter on a real network. Doubling still leaves
 /// comfortable headroom under the 8s ceiling even stacked on top of a
 /// worst-case multi-agent `open_agent_stream` timeout elsewhere in this file.
-const TCP_FALLBACK_DELIVER_WAIT: Duration = Duration::from_millis(3000);
+const TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS: u64 = 3000;
+
+/// #589 follow-up: `CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS` lets an operator raise
+/// (or lower) [`TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS`] without a rebuild, the same
+/// escape hatch [`ka_park_ttl_secs_from`] already gives `CT_EDGE_KA_PARK_TTL_SECS`
+/// for the same reason: the right number is a real tradeoff (client-visible
+/// latency vs. surviving a re-park burst under load) this binary can't know in
+/// advance for every deployment. Unset/zero/garbage all fall back to the
+/// hardcoded default -- this must never silently disable the wait.
+fn tcp_fallback_deliver_wait_ms_from(v: Option<&str>) -> u64 {
+    v.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS)
+}
+
+fn tcp_fallback_deliver_wait() -> Duration {
+    Duration::from_millis(tcp_fallback_deliver_wait_ms_from(
+        std::env::var("CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS").ok().as_deref(),
+    ))
+}
 
 /// First 8 hex chars of a token, for correlating an Edge trace line with a
 /// field-supplied token during cross-host diagnosis.
@@ -352,7 +371,7 @@ where
             // open several at once). Give it a brief window to free a slot
             // rather than failing this request outright. Draining too (#510):
             // the freed slot may sit behind stale dead ones.
-            if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
+            if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await {
                 if state.deliver_to_tcp_agent_draining(&token, stream).is_ok() {
                     return Ok(());
                 }
@@ -441,7 +460,7 @@ where
         Err(e) => {
             // Same momentarily-exhausted-pool recovery as serve_sni_passthrough
             // (#229 follow-up), draining too (#510).
-            if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await {
+            if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await {
                 if state.deliver_to_tcp_agent_draining(&token, stream).is_ok() {
                     return Ok(());
                 }
@@ -1951,7 +1970,7 @@ pub async fn serve_connection(
                     // Same momentarily-exhausted-pool recovery as
                     // serve_sni_passthrough (#229 follow-up): this QUIC client
                     // may be reaching an agent that is TCP-fallback-only.
-                    if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
+                    if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await
                         && state
                             .deliver_to_tcp_agent_draining(&token, Box::new(join(recv, send)))
                             .is_ok()
@@ -2865,7 +2884,7 @@ where
                         // Momentarily-exhausted pool recovery (#229 follow-up):
                         // give a burst of parallel browser connections a brief
                         // window to find a freed-up TCP-fallback slot.
-                        if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
+                        if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await
                             && state.deliver_to_tcp_agent_draining(&token, stream).is_ok()
                         {
                             return Ok(());
@@ -2938,7 +2957,7 @@ where
                     Err(e) => {
                         // Momentarily-exhausted pool recovery (#229 follow-up),
                         // same as the 'C' arm above.
-                        if state.wait_for_tcp_agent(&token, TCP_FALLBACK_DELIVER_WAIT).await
+                        if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await
                             && state.deliver_to_tcp_agent_draining(&token, stream).is_ok()
                         {
                             return Ok(());
@@ -4990,6 +5009,50 @@ mod tests {
         assert_eq!(ka_park_ttl_secs_from(Some(" 60 ")), 60, "trimmed");
         assert_eq!(ka_park_ttl_secs_from(Some("0")), CHANNEL_PARK_TTL_SECS, "zero is not a TTL");
         assert_eq!(ka_park_ttl_secs_from(Some("abc")), CHANNEL_PARK_TTL_SECS, "garbage falls back");
+    }
+
+    #[test]
+    fn tcp_fallback_deliver_wait_defaults_and_parses_the_env_589() {
+        assert_eq!(
+            tcp_fallback_deliver_wait_ms_from(None),
+            TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS,
+            "unset: unchanged default"
+        );
+        assert_eq!(tcp_fallback_deliver_wait_ms_from(Some("5000")), 5000, "explicit override");
+        assert_eq!(tcp_fallback_deliver_wait_ms_from(Some(" 750 ")), 750, "trimmed");
+        assert_eq!(
+            tcp_fallback_deliver_wait_ms_from(Some("0")),
+            TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS,
+            "zero is not a wait -- falls back rather than disabling the wait entirely"
+        );
+        assert_eq!(
+            tcp_fallback_deliver_wait_ms_from(Some("abc")),
+            TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS,
+            "garbage falls back"
+        );
+    }
+
+    #[test]
+    fn tcp_fallback_deliver_wait_reads_the_real_env_var_589() {
+        // Proves the wrapper actually wires CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS through to
+        // wait_for_tcp_agent's argument, not just that the pure parser above works in isolation.
+        // #[serial]-free: std::env::set_var/remove_var on a process-global var is a real data
+        // race against any other test reading it concurrently, so this saves/restores around a
+        // single-threaded critical section using the same std::env::var name no other test in
+        // this file touches.
+        let key = "CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS";
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, "6000");
+        assert_eq!(tcp_fallback_deliver_wait(), Duration::from_millis(6000));
+        std::env::remove_var(key);
+        assert_eq!(
+            tcp_fallback_deliver_wait(),
+            Duration::from_millis(TCP_FALLBACK_DELIVER_WAIT_DEFAULT_MS)
+        );
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     /// #505: stale DEAD TCP-fallback parks (an edge-flap leftover: agents fall back,
