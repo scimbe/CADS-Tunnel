@@ -1,18 +1,17 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CADS-Tunnel — dein Rechner, öffentlich erreichbar, ohne dass wir mitlesen</title>
+<title>CADS-Tunnel — your computer, publicly reachable, without us reading along</title>
 <style>
  :root{--bg:#0e1116;--card:#161b22;--line:#30363d;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#238636;--yellow:#e3b341;--red:#f85149}
  *{box-sizing:border-box}
  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:var(--bg);color:var(--fg);line-height:1.6}
- .wrap{max-width:820px;margin:0 auto;padding:2.5rem 1.25rem 4rem}
+ .wrap{max-width:820px;margin:0 auto;padding:1.2rem 1.25rem 4rem}
  header{text-align:center;margin-bottom:1.6rem}
  h1{font-size:2.1rem;margin:.2rem 0}
  .tag{color:var(--muted);font-size:1.1rem;max-width:560px;margin:.6rem auto 0}
- .disc{background:#341a00;border:1px solid #7d4e00;color:#f0c674;border-radius:10px;padding:.7rem 1rem;margin:1.4rem 0;font-size:.85rem}
  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1.5rem 1.6rem;margin:1.1rem 0}
  h2{font-size:1.2rem;margin:.1rem 0 .7rem;display:flex;align-items:center;gap:.5rem}
  h3{font-size:1rem;margin:1.1rem 0 .4rem;color:var(--fg)}
@@ -26,10 +25,13 @@
  code{background:#0d1117;border:1px solid var(--line);border-radius:6px;padding:.1rem .4rem;font-size:.9em;word-break:break-all}
  pre{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:.9rem 1rem;overflow-x:auto;margin:.6rem 0}
  pre code{background:none;border:none;padding:0;white-space:pre;word-break:normal}
+ pre,code{direction:ltr;text-align:left}
  .steps{counter-reset:step;list-style:none;margin:0;padding:0}
  .steps li{counter-increment:step;position:relative;padding:0 0 1.1rem 2.6rem;margin:0}
  .steps li:last-child{padding-bottom:0}
  .steps li::before{content:counter(step);position:absolute;left:0;top:.05rem;width:1.9rem;height:1.9rem;border-radius:50%;background:var(--accent);color:#0e1116;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:.95rem}
+ html[dir="rtl"] .steps li{padding:0 2.6rem 1.1rem 0}
+ html[dir="rtl"] .steps li::before{left:auto;right:0}
  .steps strong{display:block;margin-bottom:.15rem}
  .oswrap{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.8rem}
  .ostab,.ostab-sb{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:.4rem .9rem;font-size:.9rem;cursor:pointer;color:var(--muted);user-select:none}
@@ -40,78 +42,94 @@
  footer{color:var(--muted);font-size:.82rem;text-align:center;margin-top:2rem;border-top:1px solid var(--line);padding-top:1.2rem}
  .pill{display:inline-block;background:#0d1117;border:1px solid var(--line);border-radius:999px;padding:.2rem .7rem;font-size:.8rem;color:var(--muted);margin:.15rem}
  .tier{display:inline-flex;align-items:center;gap:.35rem;font-size:.88rem;margin:.25rem .6rem .25rem 0}
- .dot{width:.6rem;height:.6rem;border-radius:50%;display:inline-block}
+ .dot{width:.6rem;height:.6rem;border-radius:50%;display:inline-block;flex-shrink:0}
  .dot.rot{background:var(--red)} .dot.gelb{background:var(--yellow)} .dot.gruen{background:var(--green)}
  .cta-row{display:flex;gap:.7rem;flex-wrap:wrap;margin-top:.7rem}
+ .langbar{display:flex;justify-content:flex-end;margin-bottom:1rem}
+ .langbar select{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:.4rem .7rem;font-size:.85rem;cursor:pointer}
 </style>
 </head>
 <body>
 <div class="wrap">
+  <div class="langbar">
+    <select id="langSelect" aria-label="Language">
+      <option value="en">🇬🇧 English</option>
+      <option value="de">🇩🇪 Deutsch</option>
+      <option value="fr">🇫🇷 Français</option>
+      <option value="es">🇪🇸 Español</option>
+      <option value="zh">🇨🇳 中文</option>
+      <option value="hi">🇮🇳 हिन्दी</option>
+      <option value="ar">🇸🇦 العربية</option>
+      <option value="pt">🇵🇹 Português</option>
+      <option value="ru">🇷🇺 Русский</option>
+      <option value="ja">🇯🇵 日本語</option>
+    </select>
+  </div>
+
   <header>
     <h1>CADS-Tunnel</h1>
-    <div class="tag">Dein Rechner bekommt eine echte, öffentliche Internetadresse —
-      auch hinter NAT, Firewall oder im heimischen WLAN. Die Daten, die durchlaufen,
-      kann nicht einmal der Betreiber dieses Tunnels lesen.</div>
+    <div class="tag" data-i18n="tag">Your computer gets a real, public internet address — even behind NAT, a firewall, or home Wi-Fi. Not even the operator of this tunnel can read the data that passes through.</div>
     <div class="cta-row" style="justify-content:center">
-      <a class="btn" href="https://bunsenbrenner.org/portal">Kostenlos anmelden &amp; loslegen &rarr;</a>
+      <a class="btn" href="https://bunsenbrenner.org/portal" data-i18n="cta_signup">Sign up free &amp; get started &rarr;</a>
     </div>
   </header>
 
   <div class="card">
-    <h2>🔥 Was macht das eigentlich?</h2>
-    <p>
-      Du hast irgendwas auf deinem Rechner laufen — eine Web-App, einen Chat-Bot,
-      einen kleinen Server, ein Spiel, egal — und willst, dass <em>jemand anderes</em>
-      es im Browser aufrufen kann, ohne dass du einen eigenen Server mieten,
-      Port-Forwarding im Router einrichten oder dich mit Zertifikaten rumschlagen musst.
+    <h2 data-i18n="c1_h2">🔥 So what does this actually do?</h2>
+    <p data-i18n="c1_p1">
+      You've got something running on your computer — a web app, a chatbot,
+      a small server, a game, whatever — and you want <em>someone else</em>
+      to be able to open it in a browser, without renting your own server,
+      setting up port forwarding on your router, or wrestling with certificates.
     </p>
-    <p>
-      Genau dafür ist der Tunnel da: ein kleines Programm (<code>ct-agent</code>)
-      läuft auf deinem Rechner, baut eine Verbindung nach draußen auf und meldet
-      „hol dir das, was hier lokal läuft, unter dieser Adresse ab". Die Nutzdaten
-      sind dabei durchgehend verschlüsselt (Ende-zu-Ende, nicht nur bis zu uns) —
-      wir als Betreiber der Vermittlungsinfrastruktur sehen nur, <em>dass</em>
-      Daten fließen, nicht <em>was</em> drinsteht.
+    <p data-i18n="c1_p2">
+      That's exactly what the tunnel is for: a small program (<code>ct-agent</code>)
+      runs on your computer, opens a connection outward, and says "fetch
+      whatever's running locally here, at this address." The payload stays
+      encrypted the whole way (end-to-end, not just to us) — as the operator
+      of the relay infrastructure, we only see <em>that</em> data is flowing,
+      never <em>what's</em> in it.
     </p>
-    <p class="muted">Kurz: dein Laptop wird für ein paar Minuten zu einem echten,
-      im Internet erreichbaren Server — ohne dass du einer fremden Firma deine
-      Daten unverschlüsselt anvertraust.</p>
+    <p class="muted" data-i18n="c1_muted">In short: for a few minutes, your laptop becomes a real,
+      internet-reachable server — without handing an unencrypted copy of your
+      data to some other company.</p>
   </div>
 
   <div class="card">
-    <h2>🚀 So geht's — in 3 Schritten</h2>
+    <h2 data-i18n="c2_h2">🚀 How it works — 3 steps</h2>
     <ol class="steps">
       <li>
-        <strong>Konto anlegen</strong>
-        Im <a href="https://bunsenbrenner.org/portal">Portal</a> mit deinem
-        Google- oder GitHub-Konto anmelden. Kein Formular, kein Passwort,
-        keine Kreditkarte — ein Klick, fertig.
+        <strong data-i18n="step1_title">Create an account</strong>
+        <span data-i18n="step1_body">Sign in to the <a href="https://bunsenbrenner.org/portal">portal</a>
+        with your Google or GitHub account — no account yet? Signing up works
+        exactly the same way, it's created automatically on your first login.
+        No form, no password, no credit card — one click and you're done.</span>
       </li>
       <li>
-        <strong>Tunnel erstellen</strong>
-        Im Portal auf „Neuer Tunnel" klicken, einen Namen und den lokalen
-        Port angeben, den du freigeben willst (z. B. <code>8080</code>, falls
-        dein Kram auf <code>localhost:8080</code> läuft).
+        <strong data-i18n="step2_title">Create a tunnel</strong>
+        <span data-i18n="step2_body">Click "New tunnel" in the portal, give it a name and the local
+        port you want to expose (e.g. <code>8080</code>, if your thing runs on
+        <code>localhost:8080</code>).</span>
       </li>
       <li>
-        <strong>Einen Befehl einfügen</strong>
-        Das Portal zeigt dir danach einen fertigen Befehl für <em>dein</em>
-        Betriebssystem (unten). Einfach ins Terminal / PowerShell einfügen,
-        Enter drücken — der Befehl lädt den Agenten, meldet ihn bei uns an
-        und startet den Tunnel. Kein manuelles Installieren, kein Neustart nötig.
+        <strong data-i18n="step3_title">Paste one command</strong>
+        <span data-i18n="step3_body">The portal then shows you a ready-made command for <em>your</em>
+        operating system (below). Paste it into your terminal / PowerShell,
+        hit Enter — the command downloads the agent, registers it with us,
+        and starts the tunnel. No manual install, no reboot needed.</span>
       </li>
     </ol>
-    <p class="muted">Das war's. Sobald der Befehl durchgelaufen ist, ist deine
-      Adresse live erreichbar — die URL steht direkt danach in deinem Terminal
-      und in deinem Portal.</p>
+    <p class="muted" data-i18n="c2_muted">That's it. As soon as the command finishes, your address
+      is live — the URL shows up right there in your terminal and in your
+      portal.</p>
   </div>
 
   <div class="card">
-    <h2>💻 Der Ein-Zeiler, nach System sortiert</h2>
-    <p class="muted">Die folgenden Befehle bekommst du <strong>personalisiert</strong>
-      im Portal nach Schritt 2 angezeigt (mit einem für dich einmalig gültigen,
-      zeitlich begrenzten Token statt <code>&lt;dein-token&gt;</code>) — hier siehst
-      du nur, wie sie aussehen und was sie tun.</p>
+    <h2 data-i18n="c3_h2">💻 The one-liner, by operating system</h2>
+    <p class="muted" data-i18n="c3_intro">You'll get these commands <strong>personalized</strong>
+      in the portal after step 2 (with a token that's valid once, for a
+      limited time, in place of <code>&lt;your-token&gt;</code>) — here you're
+      just seeing what they look like and what they do.</p>
 
     <div class="oswrap">
       <span class="ostab active" data-os="linux">🐧 Linux</span>
@@ -120,54 +138,53 @@
     </div>
 
     <div class="ospane active" data-os="linux">
-      <p>Terminal öffnen, einfügen, Enter:</p>
-      <pre><code>curl -fsSL https://bunsenbrenner.org/install.sh | CT_BOOTSTRAP=&lt;dein-token&gt; sh</code></pre>
-      <p class="muted">Funktioniert auf jeder halbwegs aktuellen Distro (Ubuntu, Debian,
-        Fedora, Arch, …) — <code>curl</code> reicht, sonst nichts.</p>
+      <p data-i18n="os_linux_intro">Open a terminal, paste, hit Enter:</p>
+      <pre><code>curl -fsSL https://bunsenbrenner.org/install.sh | CT_BOOTSTRAP=&lt;your-token&gt; sh</code></pre>
+      <p class="muted" data-i18n="os_linux_note">Works on pretty much any current distro (Ubuntu, Debian,
+        Fedora, Arch, …) — <code>curl</code> is all you need.</p>
     </div>
 
     <div class="ospane" data-os="mac">
-      <p>Terminal öffnen (⌘+Leertaste → „Terminal"), einfügen, Enter:</p>
-      <pre><code>curl -fsSL https://bunsenbrenner.org/install.sh | CT_BOOTSTRAP=&lt;dein-token&gt; sh</code></pre>
-      <p class="muted">Derselbe Befehl wie unter Linux — macOS bringt <code>curl</code>
-        von Haus aus mit.</p>
+      <p data-i18n="os_mac_intro">Open a terminal (⌘+space → "Terminal"), paste, hit Enter:</p>
+      <pre><code>curl -fsSL https://bunsenbrenner.org/install.sh | CT_BOOTSTRAP=&lt;your-token&gt; sh</code></pre>
+      <p class="muted" data-i18n="os_mac_note">Same command as Linux — macOS ships with <code>curl</code>
+        already.</p>
     </div>
 
     <div class="ospane" data-os="win">
-      <p>PowerShell öffnen (Rechtsklick auf Start → „Windows PowerShell"), einfügen, Enter:</p>
-      <pre><code>$env:CT_BOOTSTRAP='&lt;dein-token&gt;'; irm https://bunsenbrenner.org/install.ps1 | iex</code></pre>
-      <p class="muted">Kein Admin-Rechte nötig, kein Installer-Fenster, keine Neustarts.</p>
+      <p data-i18n="os_win_intro">Open PowerShell (right-click Start → "Windows PowerShell"), paste, hit Enter:</p>
+      <pre><code>$env:CT_BOOTSTRAP='&lt;your-token&gt;'; irm https://bunsenbrenner.org/install.ps1 | iex</code></pre>
+      <p class="muted" data-i18n="os_win_note">No admin rights needed, no installer window, no reboots.</p>
     </div>
 
-    <p class="muted" style="margin-top:1rem">
-      Sicherheits-Detail für alle, die's interessiert: das Token im Befehl ist
-      <em>nicht</em> dein eigentliches Zugangs-Geheimnis — es ist selbst nur
-      einmalig gültig und wird server-seitig gegen die echten Schlüssel
-      eingetauscht. Selbst wenn dieser Befehl irgendwo in deiner Shell-History
-      hängen bleibt, bringt er niemandem etwas, sobald er einmal benutzt wurde.
+    <p class="muted" style="margin-top:1rem" data-i18n="c3_security">
+      Security detail, for anyone curious: the token in that command is
+      <em>not</em> your actual credential — it's itself only valid once, and
+      gets exchanged server-side for the real keys. Even if this command ends
+      up sitting in your shell history somewhere, it's useless to anyone the
+      moment it's been used.
     </p>
   </div>
 
   <div class="card">
-    <h2>🧪 Lieber auf Nummer sicher? (Sandbox-Variante)</h2>
-    <p>
-      <code>ct-agent</code> ist ein Programm, das aktiv mit dem Internet redet —
-      genau wie jedes andere Netzwerk-Programm auch. Wer seinen eigenen Rechner
-      dabei lieber nicht direkt exponieren will, lässt den Agenten stattdessen
-      in einer leichtgewichtigen, isolierten Sandbox (einem Docker-Container)
-      laufen: selbst im unwahrscheinlichen Fall eines Bugs oder eines
-      kompromittierten Agenten bleiben deine eigenen Dateien, Programme und
-      Daten außerhalb des Containers unberührt. Das ist auch der Weg, den das
-      eigene Setup-Skript selbst als „empfohlene Isolation" bezeichnet.
+    <h2 data-i18n="c4_h2">🧪 Prefer to play it safe? (Sandbox option)</h2>
+    <p data-i18n="c4_p1">
+      <code>ct-agent</code> is a program that actively talks to the internet —
+      just like any other network program. If you'd rather not expose your
+      own machine directly, you can run the agent inside a lightweight,
+      isolated sandbox (a Docker container) instead: even in the unlikely
+      case of a bug or a compromised agent, your own files, programs, and
+      data outside the container stay untouched. This is also the path the
+      setup script itself calls "recommended isolation."
     </p>
-    <p class="muted">
-      Einzige Voraussetzung: Docker ist installiert (Docker Desktop unter
-      macOS/Windows, Docker Engine unter Linux —
+    <p class="muted" data-i18n="c4_prereq">
+      Only prerequisite: Docker is installed (Docker Desktop on
+      macOS/Windows, Docker Engine on Linux —
       <a href="https://docs.docker.com/get-docker/">docs.docker.com/get-docker</a>).
-      Ersetze <code>&lt;dein-token&gt;</code> und <code>&lt;deine-hostname&gt;</code>
-      wie oben durch die Werte von deiner Tunnel-Seite im Portal, und
-      <code>&lt;dein-lokaler-port&gt;</code> durch den Port, auf dem dein Kram
-      lokal läuft (z. B. <code>8080</code>).
+      Replace <code>&lt;your-token&gt;</code> and <code>&lt;your-hostname&gt;</code>
+      as above with the values from your tunnel's page in the portal, and
+      <code>&lt;your-local-port&gt;</code> with the port your thing runs on
+      locally (e.g. <code>8080</code>).
     </p>
 
     <div class="oswrap">
@@ -179,97 +196,88 @@
     <div class="ospane-sb active" data-os-sb="linux">
       <pre><code>mkdir ct-tunnel-sandbox &amp;&amp; cd ct-tunnel-sandbox
 curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | \
-  CT_BOOTSTRAP=&lt;dein-token&gt; \
+  CT_BOOTSTRAP=&lt;your-token&gt; \
   CT_AGENT_CP_URL=https://bunsenbrenner.org \
-  CT_AGENT_HOSTNAME=&lt;deine-hostname&gt; \
-  CT_AGENT_ORIGIN=127.0.0.1:&lt;dein-lokaler-port&gt; \
+  CT_AGENT_HOSTNAME=&lt;your-hostname&gt; \
+  CT_AGENT_ORIGIN=127.0.0.1:&lt;your-local-port&gt; \
   bash -s -- --docker</code></pre>
     </div>
 
     <div class="ospane-sb" data-os-sb="mac">
-      <p class="muted">Derselbe Befehl wie unter Linux:</p>
+      <p class="muted" data-i18n="c4_mac_note">Same command as Linux:</p>
       <pre><code>mkdir ct-tunnel-sandbox &amp;&amp; cd ct-tunnel-sandbox
 curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | \
-  CT_BOOTSTRAP=&lt;dein-token&gt; \
+  CT_BOOTSTRAP=&lt;your-token&gt; \
   CT_AGENT_CP_URL=https://bunsenbrenner.org \
-  CT_AGENT_HOSTNAME=&lt;deine-hostname&gt; \
-  CT_AGENT_ORIGIN=127.0.0.1:&lt;dein-lokaler-port&gt; \
+  CT_AGENT_HOSTNAME=&lt;your-hostname&gt; \
+  CT_AGENT_ORIGIN=127.0.0.1:&lt;your-local-port&gt; \
   bash -s -- --docker</code></pre>
     </div>
 
     <div class="ospane-sb" data-os-sb="win">
-      <pre><code>$env:CT_BOOTSTRAP='&lt;dein-token&gt;'
+      <pre><code>$env:CT_BOOTSTRAP='&lt;your-token&gt;'
 $env:CT_AGENT_CP_URL='https://bunsenbrenner.org'
-$env:CT_AGENT_HOSTNAME='&lt;deine-hostname&gt;'
-$env:CT_AGENT_ORIGIN='127.0.0.1:&lt;dein-lokaler-port&gt;'
+$env:CT_AGENT_HOSTNAME='&lt;your-hostname&gt;'
+$env:CT_AGENT_ORIGIN='127.0.0.1:&lt;your-local-port&gt;'
 &amp;([scriptblock]::Create((irm https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.ps1))) -Docker</code></pre>
-      <p class="muted">Voraussetzung: Docker Desktop läuft bereits.</p>
+      <p class="muted" data-i18n="c4_win_note">Prerequisite: Docker Desktop is already running.</p>
     </div>
 
-    <p class="muted" style="margin-top:1rem">
-      Baut ein schlankes Image, startet den Agenten als Container namens
-      <code>ct-agent</code> und meldet ihn genauso an wie die direkte
-      Installation oben — nur eben eingesperrt. Logs ansehen:
-      <code>docker logs -f ct-agent</code>. Stoppen: <code>docker stop ct-agent</code>.
-      Alles zurücksetzen: <code>docker rm -f ct-agent</code> (und bei Bedarf den
-      lokalen <code>.ct-agent-state</code>-Ordner löschen), dann den Befehl
-      erneut ausführen.
+    <p class="muted" style="margin-top:1rem" data-i18n="c4_closing">
+      Builds a slim image, starts the agent as a container named
+      <code>ct-agent</code>, and registers it exactly like the direct
+      install above — just locked in a box. View logs:
+      <code>docker logs -f ct-agent</code>. Stop it:
+      <code>docker stop ct-agent</code>. Reset everything:
+      <code>docker rm -f ct-agent</code> (and delete the local
+      <code>.ct-agent-state</code> folder if needed), then run the command
+      again.
     </p>
   </div>
 
   <div class="card">
-    <h2>📶 Und danach?</h2>
-    <p>Dein Tunnel läuft erstmal mit einem geteilten Zertifikat — das reicht für
-      den Start völlig aus und funktioniert in jedem Browser ohne Warnung.
-      Willst du später ein eigenes, auf deinen Namen ausgestelltes Zertifikat,
-      steigst du im Portal mit einem Klick um:</p>
+    <h2 data-i18n="c5_h2">📶 And after that?</h2>
+    <p data-i18n="c5_p">Your tunnel starts out on a shared certificate — that's plenty for
+      getting started, and works in every browser with no warnings. Want your
+      own certificate later, issued in your own name? Switch over in the
+      portal with one click:</p>
     <p>
-      <span class="tier"><span class="dot rot"></span> Rot — noch nicht verifiziert</span>
-      <span class="tier"><span class="dot gelb"></span> Gelb — läuft, geteiltes Zertifikat</span>
-      <span class="tier"><span class="dot gruen"></span> Grün — eigenes Zertifikat, eigene Domain</span>
+      <span class="tier"><span class="dot rot"></span> <span data-i18n="tier_rot">Rot (red) — not yet verified</span></span>
+      <span class="tier"><span class="dot gelb"></span> <span data-i18n="tier_gelb">Gelb (yellow) — live, shared certificate</span></span>
+      <span class="tier"><span class="dot gruen"></span> <span data-i18n="tier_gruen">Grün (green) — your own certificate, your own domain</span></span>
     </p>
-    <p class="muted">Für die allermeisten reicht Gelb dauerhaft aus.</p>
+    <p class="muted" data-i18n="c5_muted">For almost everyone, Gelb is perfectly fine to stay on permanently.</p>
   </div>
 
   <div class="card">
-    <h2>🛠️ Für die Technik-Nerds unter euch</h2>
+    <h2 data-i18n="c6_h2">🛠️ For the tech nerds among you</h2>
     <div>
       <span class="pill">Rust</span><span class="pill">Noise_IK_25519_ChaChaPoly_BLAKE2s (E2E)</span>
       <span class="pill">QUIC + TLS-TCP-Fallback</span><span class="pill">SNI-Routing</span>
       <span class="pill">Let's Encrypt / ACME</span><span class="pill">provider-blind</span>
       <span class="pill">Open Source</span>
     </div>
-    <p class="muted" style="margin-top:.7rem">
-      Quellcode, Architektur-Entscheidungen (ADRs), Bedrohungsmodell und Whitepaper:
+    <p class="muted" style="margin-top:.7rem" data-i18n="c6_muted">
+      Source code, architecture decisions (ADRs), threat model, and whitepaper:
       <a href="https://github.com/scimbe/CADS-Tunnel">github.com/scimbe/CADS-Tunnel</a>.
-      Der Agent (<code>ct-agent</code>), den du eben installiert hast, hat sein
-      eigenes Repo: <a href="https://github.com/scimbe/ct-agent">github.com/scimbe/ct-agent</a> —
-      Quellcode einsehen, Binary selbst bauen, alles offen.
+      The agent (<code>ct-agent</code>) you just installed has its own repo:
+      <a href="https://github.com/scimbe/ct-agent">github.com/scimbe/ct-agent</a> —
+      read the source, build the binary yourself, everything's open.
     </p>
   </div>
 
-  <div class="disc">
-    <strong>Ehrlich gesagt:</strong> Große Teile dieses Projekts — Code, Docs und auch
-    diese Seite — sind mit Unterstützung eines LLM entstanden. Das Sicherheits-Design
-    (Ende-zu-Ende-Verschlüsselung, provider-blinde Vermittlung) ist echt und im
-    <a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/security/whitepaper.md">Whitepaper</a>
-    nachlesbar — Zahlen und Formulierungen drumherum bitte trotzdem kritisch prüfen.
-    Und: das schützt die <em>Vertraulichkeit</em> deiner Daten, nicht deine Anonymität —
-    Details im <a href="https://github.com/scimbe/CADS-Tunnel/blob/main/docs/security/threat-model.md">Bedrohungsmodell</a>.
-  </div>
-
   <div class="card" style="text-align:center">
-    <h2 style="justify-content:center">Bereit?</h2>
-    <p class="muted">Ein Klick, ein Befehl, live in unter einer Minute.</p>
+    <h2 style="justify-content:center" data-i18n="final_h2">Ready?</h2>
+    <p class="muted" data-i18n="final_muted">One click, one command, live in under a minute.</p>
     <div class="cta-row" style="justify-content:center">
-      <a class="btn" href="https://bunsenbrenner.org/portal">Zum Portal &rarr;</a>
-      <a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel">Code ansehen</a>
+      <a class="btn" href="https://bunsenbrenner.org/portal" data-i18n="final_btn_portal">Go to the portal &rarr;</a>
+      <a class="btn secondary" href="https://github.com/scimbe/CADS-Tunnel" data-i18n="final_btn_code">View the code</a>
     </div>
   </div>
 
-  <footer>
-    Diese Seite selbst läuft über einen Tunnel (Browser Plane von CADS-Tunnel) ·
-    Nutzlast Ende-zu-Ende verschlüsselt · LLM-unterstützt erstellt
+  <footer data-i18n="footer">
+    This page itself runs over a tunnel (CADS-Tunnel's Browser Plane) ·
+    payload end-to-end encrypted · LLM-assisted build
   </footer>
 </div>
 <script>
@@ -288,5 +296,6 @@ document.querySelectorAll('.ostab-sb').forEach(function(tab){
   });
 });
 </script>
+<script src="i18n.js"></script>
 </body>
 </html>
