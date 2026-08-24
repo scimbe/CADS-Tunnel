@@ -188,6 +188,12 @@ services:
       # silently. Found by reading the value back out of the running container instead of
       # trusting the deploy (`docker exec ... echo $CT_EDGE_KA_PARK_TTL_SECS` came back empty).
       CT_EDGE_KA_PARK_TTL_SECS: "${CT_EDGE_KA_PARK_TTL_SECS:-}"
+      # #589 follow-up (PR#637): wait window for a TCP-fallback agent to redeliver before
+      # the front door gives up. Same silent-no-op trap as CT_EDGE_KA_PARK_TTL_SECS above --
+      # the knob was added to the edge binary and documented, but this compose file never
+      # forwarded it, so setting it in the deploy environment did nothing (found the same
+      # way: read it back out of the running container after a deploy, came back empty).
+      CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS: "${CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS:-}"
       # #603: durable, host-only record of accepted connections' source IPs, for the
       # operator's own evidentiary defense (see audit_log.rs's module doc). Off by
       # default -- unset here means every accept path's audit-log call stays a no-op.
