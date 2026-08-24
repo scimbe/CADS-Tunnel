@@ -1212,16 +1212,35 @@ async fn service_account_create(
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("keycloak: {e}")))?;
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
-    if let Err(e) = state.store.record(&subject, &client_id, &created.internal_id, name, now) {
-        // The Keycloak client is real and live at this point but we failed to
-        // record ownership -- best-effort cleanup so it isn't silently
-        // orphaned (unreachable by this subject, invisible to list/rotate/
-        // delete, but still live and spendable). Logged, not surfaced as a
-        // second error -- the operator already gets the real DB error below.
-        if let Err(cleanup_err) = crate::keycloak_admin::delete_client(&http, kc, &created.internal_id).await {
-            eprintln!("ct-cp: service_account_create: ownership record failed AND cleanup delete failed for {client_id}: {cleanup_err}");
+    // Real gap found live 2026-08-24 (TOCTOU sweep): the `existing_count` check
+    // above is only a fast-path optimization (avoids the Keycloak round-trip
+    // above when obviously already at the cap) -- it is NOT the authoritative
+    // check, since a concurrent request from the same subject could insert
+    // between it and here. record_if_under_limit re-checks the count and
+    // inserts under one lock acquisition, closing that window for real.
+    match state.store.record_if_under_limit(&subject, &client_id, &created.internal_id, name, now, MAX_SERVICE_ACCOUNTS_PER_SUBJECT) {
+        Ok(true) => {}
+        Ok(false) => {
+            // Lost the race: another concurrent request filled the last slot
+            // between the fast-path check above and this atomic re-check. The
+            // Keycloak client is real and live but must not be recorded --
+            // same best-effort cleanup as the DB-error path below.
+            if let Err(cleanup_err) = crate::keycloak_admin::delete_client(&http, kc, &created.internal_id).await {
+                eprintln!("ct-cp: service_account_create: over-limit race lost AND cleanup delete failed for {client_id}: {cleanup_err}");
+            }
+            return Err((StatusCode::BAD_REQUEST, format!("at most {MAX_SERVICE_ACCOUNTS_PER_SUBJECT} service accounts per subject")));
         }
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        Err(e) => {
+            // The Keycloak client is real and live at this point but we failed
+            // to record ownership -- best-effort cleanup so it isn't silently
+            // orphaned (unreachable by this subject, invisible to list/rotate/
+            // delete, but still live and spendable). Logged, not surfaced as a
+            // second error -- the operator already gets the real DB error below.
+            if let Err(cleanup_err) = crate::keycloak_admin::delete_client(&http, kc, &created.internal_id).await {
+                eprintln!("ct-cp: service_account_create: ownership record failed AND cleanup delete failed for {client_id}: {cleanup_err}");
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
     }
 
     Ok(Json(CreateServiceAccountResp { client_id, secret: created.secret }))

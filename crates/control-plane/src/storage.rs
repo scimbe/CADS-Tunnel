@@ -552,6 +552,37 @@ impl SqliteServiceAccountStore {
         Ok(())
     }
 
+    /// Like [`Self::record`], but the owned-count check and the insert run
+    /// under the SAME `conn` lock acquisition as one atomic unit -- same
+    /// check-then-act race class `create_if_under_owned_limit` already closed
+    /// for tunnels (#432). Found live during the TOCTOU consolidation sweep
+    /// (2026-08-24): `service_account_create`'s handler used to read
+    /// `existing_count` via a separate, earlier call to [`Self::list_for_subject`]
+    /// -- with a real Keycloak admin-API round-trip in between the check and
+    /// this insert, two concurrent requests from the same subject could both
+    /// observe `existing_count < max` before either one's insert committed,
+    /// exceeding `max`. Returns `Ok(false)` (no row inserted) when `subject`
+    /// already owns `max` or more clients at the moment of the same lock
+    /// acquisition that would perform the insert -- the caller is responsible
+    /// for cleaning up the already-created (now unrecorded) Keycloak client in
+    /// that case.
+    pub fn record_if_under_limit(&self, subject: &str, client_id: &str, internal_id: &str, name: &str, created_at: i64, max: usize) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let owned_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM service_account_clients WHERE subject = ?1",
+            params![subject],
+            |r| r.get(0),
+        )?;
+        if owned_count as usize >= max {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO service_account_clients (client_id, subject, internal_id, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![client_id, subject, internal_id, name, created_at],
+        )?;
+        Ok(true)
+    }
+
     /// Every service-account client `subject` has self-issued, oldest first.
     /// Never carries a secret -- see the type's own doc comment.
     pub fn list_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<ServiceAccountClient>> {
