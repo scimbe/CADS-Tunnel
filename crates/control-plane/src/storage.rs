@@ -552,6 +552,37 @@ impl SqliteServiceAccountStore {
         Ok(())
     }
 
+    /// Like [`Self::record`], but the owned-count check and the insert run
+    /// under the SAME `conn` lock acquisition as one atomic unit -- same
+    /// check-then-act race class `create_if_under_owned_limit` already closed
+    /// for tunnels (#432). Found live during the TOCTOU consolidation sweep
+    /// (2026-08-24): `service_account_create`'s handler used to read
+    /// `existing_count` via a separate, earlier call to [`Self::list_for_subject`]
+    /// -- with a real Keycloak admin-API round-trip in between the check and
+    /// this insert, two concurrent requests from the same subject could both
+    /// observe `existing_count < max` before either one's insert committed,
+    /// exceeding `max`. Returns `Ok(false)` (no row inserted) when `subject`
+    /// already owns `max` or more clients at the moment of the same lock
+    /// acquisition that would perform the insert -- the caller is responsible
+    /// for cleaning up the already-created (now unrecorded) Keycloak client in
+    /// that case.
+    pub fn record_if_under_limit(&self, subject: &str, client_id: &str, internal_id: &str, name: &str, created_at: i64, max: usize) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock_safe();
+        let owned_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM service_account_clients WHERE subject = ?1",
+            params![subject],
+            |r| r.get(0),
+        )?;
+        if owned_count as usize >= max {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO service_account_clients (client_id, subject, internal_id, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![client_id, subject, internal_id, name, created_at],
+        )?;
+        Ok(true)
+    }
+
     /// Every service-account client `subject` has self-issued, oldest first.
     /// Never carries a secret -- see the type's own doc comment.
     pub fn list_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<ServiceAccountClient>> {
@@ -622,6 +653,28 @@ mod service_account_store_tests {
         assert_eq!(store.internal_id_for("alice", "sa-1").unwrap(), Some("kc-internal-1".to_string()));
         assert_eq!(store.internal_id_for("mallory", "sa-1").unwrap(), None, "a non-owner must never resolve another subject's client");
         assert_eq!(store.internal_id_for("alice", "sa-does-not-exist").unwrap(), None);
+    }
+
+    #[test]
+    fn record_if_under_limit_closes_the_toctou_race_the_handler_used_to_have() {
+        // Real gap found live 2026-08-24: service_account_create used to check
+        // existing_count via a separate, earlier list_for_subject().len() call,
+        // then insert unconditionally after a real Keycloak network round-trip
+        // in between -- two concurrent callers could both pass the check before
+        // either inserted. This test proves the atomic replacement actually
+        // enforces the cap: fill up to the limit, then confirm the next
+        // attempt is rejected and performs NO insert (not just returns an
+        // error after inserting anyway).
+        let store = SqliteServiceAccountStore::open_in_memory().unwrap();
+        assert!(store.record_if_under_limit("alice", "sa-1", "kc-1", "one", 100, 2).unwrap());
+        assert!(store.record_if_under_limit("alice", "sa-2", "kc-2", "two", 200, 2).unwrap());
+        assert!(
+            !store.record_if_under_limit("alice", "sa-3", "kc-3", "three", 300, 2).unwrap(),
+            "a third record at the cap of 2 must be rejected"
+        );
+        assert_eq!(store.list_for_subject("alice").unwrap().len(), 2, "the rejected attempt must not have inserted a row");
+        // A different subject has their own independent limit.
+        assert!(store.record_if_under_limit("bob", "sa-4", "kc-4", "bob's", 400, 2).unwrap());
     }
 
     #[test]
