@@ -449,37 +449,65 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
         .unwrap_or_default()
         .as_secs();
 
+    // Real gap found live 2026-08-24: every step below discarded its Result
+    // with a bare `let _ =` and no log line, unlike this same file's own
+    // established `eprintln!("ct-cp: {context}: {e}")` convention used for
+    // every comparable best-effort operation elsewhere (auto-provision,
+    // edge authorize-host, DNS record create/delete, Keycloak provisioning).
+    // A failed step here (SQLite busy/locked, disk error) silently left the
+    // resource live -- for the allowlist/share-list removal below,
+    // specifically, that means the deleted account's e-mail can remain on
+    // OTHER accounts' channel/topology share lists, a real privacy residue
+    // -- while the response unconditionally told the caller everything was
+    // gone, with nothing anywhere to show an operator otherwise. Logging
+    // each failure (not turning it into an HTTP error -- this cascade is
+    // deliberately best-effort across independent resource kinds, one
+    // failure must not abort the rest) makes it at least diagnosable.
     if let Ok(owned) = st.tunnels.list_for_subject(subject) {
         for t in owned {
-            let _ = st.tunnels.revoke(subject, &t.id, now);
+            if let Err(e) = st.tunnels.revoke(subject, &t.id, now) {
+                eprintln!("ct-cp: account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            }
         }
     }
 
     if let Ok(owned) = st.channels.channels_owned_by(subject) {
         for c in owned {
-            let _ = st.channels.delete_channel(subject, &c);
+            if let Err(e) = st.channels.delete_channel(subject, &c) {
+                eprintln!("ct-cp: account deletion for {subject}: deleting channel {} failed: {e}", hex(&c.0));
+            }
         }
     }
 
-    let _ = st.topologies.delete_all_owned_by(subject);
+    if let Err(e) = st.topologies.delete_all_owned_by(subject) {
+        eprintln!("ct-cp: account deletion for {subject}: deleting owned topologies failed: {e}");
+    }
 
     if let Ok(owned) = st.networks.list(subject) {
         for id in owned {
-            let _ = st.networks.delete(subject, &id);
+            if let Err(e) = st.networks.delete(subject, &id) {
+                eprintln!("ct-cp: account deletion for {subject}: deleting network {id} failed: {e}");
+            }
         }
     }
 
     if let Ok(all) = st.pipelines.list() {
         for (id, owner) in all {
             if owner == subject {
-                let _ = st.pipelines.unpublish(subject, &id);
+                if let Err(e) = st.pipelines.unpublish(subject, &id) {
+                    eprintln!("ct-cp: account deletion for {subject}: unpublishing pipeline {id} failed: {e}");
+                }
             }
         }
     }
 
     if let Some(email) = claims.email.as_deref() {
-        let _ = st.channels.remove_allowlist_entries_for_email(email);
-        let _ = st.topologies.remove_shares_by_email(email);
+        if let Err(e) = st.channels.remove_allowlist_entries_for_email(email) {
+            eprintln!("ct-cp: account deletion for {subject}: removing channel allowlist entries for {email} failed: {e}");
+        }
+        if let Err(e) = st.topologies.remove_shares_by_email(email) {
+            eprintln!("ct-cp: account deletion for {subject}: removing topology shares for {email} failed: {e}");
+        }
     }
 
     let body = r#"<h1 class="deleted-check">Your account data has been deleted</h1>
