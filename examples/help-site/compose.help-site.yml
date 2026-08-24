@@ -17,6 +17,7 @@ services:
       dockerfile: Caddy.Dockerfile
     volumes:
       - ./index.html:/srv/index.html:ro
+      - ./i18n.js:/srv/i18n.js:ro
       # #226: this agent's own signed AgentCard, so it can be a real (not fabricated)
       # entry in /registry/agents — proof the auto-discoverability path works end to
       # end, using core's own infrastructure/keys, not anyone else's.
