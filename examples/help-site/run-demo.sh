@@ -38,7 +38,7 @@ AGENT_EDGE="${AGENT_EDGE:-edge:4433}"
 # control-plane base URL, not .../pki/ca — ct-agent's ControlPlaneClient::
 # fetch_edge_cert() (crates/control-plane/src/client.rs) appends /pki/ca itself,
 # so appending it here too produced a double .../pki/ca/pki/ca path (404 loop).
-COMPOSE="docker compose -f compose.help-site.yml"
+COMPOSE="docker compose -p help-site -f compose.help-site.yml"
 # Edge admin endpoint for hostname-ownership authorization (#23 BP4b). Reuses the
 # same URL+secret the control plane uses for the revoke/authorize push. When set,
 # the demo authorizes `help.` and pins the agent's routing token so it works with
