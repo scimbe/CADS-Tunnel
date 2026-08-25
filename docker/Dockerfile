@@ -78,7 +78,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/ct-edge target/release/ct-client \
           target/release/ct-control-plane target/release/cp_selftest \
           target/release/metrics_probe target/release/udp_echo \
-          target/release/quic_echo target/release/direct_bench /build/bin/
+          target/release/quic_echo target/release/direct_bench \
+          target/release/masque-proxy /build/bin/
 
 # Shared non-root setup both runtime stages below apply identically -- kept as one
 # place so the uid/gid convention (#305) can never drift between them.
@@ -92,6 +93,7 @@ COPY --from=builder /build/bin/metrics_probe /usr/local/bin/metrics_probe
 COPY --from=builder /build/bin/udp_echo /usr/local/bin/udp_echo
 COPY --from=builder /build/bin/quic_echo /usr/local/bin/quic_echo
 COPY --from=builder /build/bin/direct_bench /usr/local/bin/direct_bench
+COPY --from=builder /build/bin/masque-proxy /usr/local/bin/masque-proxy
 
 # #315: the real production/self-host image -- ca-certificates + curl only, no
 # iproute2/iptables. Not the default target (see `runtime` below, which stays the

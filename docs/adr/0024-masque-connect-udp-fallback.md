@@ -164,11 +164,37 @@ rather than left implicit in "use RFC 9298."
   kept in sync by the operator at deploy time -- nothing in code enforces the two
   configs agree, since they're two separate processes/binaries with no shared
   config source today.
-- **M3 — ct-agent client side.** New `EdgeRung::Masque` in `ladder.rs`; QUIC-over-
-  MASQUE-tunnel dial reusing the existing `quinn` stack against the tunneled UDP path;
-  wired into the existing ladder-walk/registration-role logic between `Quic` and
-  `TlsTcp`; opt-in env knob; unit tests mirroring the existing ladder test style.
-- **M4 — Field trial + docs.** Opt-in deploy against kali.bunsenbrenner.org
-  specifically (the motivating live case), real-world A/B against the current
-  TLS-TCP-only fallback, observability parity, docs update (mirrors this session's
-  Task #9 docs-overhaul pattern), then a deliberate decision on wider rollout.
+
+  **Addendum, found during M4 (2026-08-25): target-restriction alone was not
+  sufficient.** Hard-restricting *where* a tunnel can go says nothing about *who*
+  may open one -- and this proxy's single target is the edge's own INTERNAL QUIC
+  listener, reachable from the whole internet through nothing more than a bare
+  TLS+h2 handshake to the public front door (no ct-agent credential, no tunnel
+  registration). An anonymous caller could open tunnels purely to consume
+  proxy/edge resources, and every such tunnel's traffic reaches the edge's QUIC
+  listener from `masque-proxy`'s own loopback source address -- hiding the real
+  caller's IP from whatever per-source rate-limiting the edge's `:4433` listener
+  would otherwise apply. Fixed by requiring a shared secret (`CT_MASQUE_PROXY_
+  TOKEN`, 64-hex, fail-closed -- `main.rs` refuses to start without one) that
+  every caller must present via `x-ct-masque-token`, checked in constant time
+  (mirrors the edge's own `x-ct-admin-token`/`admin_authed` pattern exactly) and
+  folded into the SAME refusal path as a wrong-target request, so there is no
+  oracle distinguishing "wrong token" from "wrong target". A dedicated test
+  (`a_request_with_no_or_wrong_token_gets_refused_even_for_the_correct_target`)
+  proves a caller with the right target and no/wrong token still gets refused.
+- **M3 — ct-agent client side — DONE (ct-agent#83/PR#84, #85/PR#86, merged,
+  released v0.7.2).** `dial_quic_via_masque` bridges a real `quinn::Endpoint` over
+  the tunnel via a `quinn::AsyncUdpSocket` impl (`MasqueUdpSocket`); wired into
+  `run_agent`'s reconnect loop between a failed direct QUIC dial and the existing
+  TLS-TCP fallback. Opt-in via `CT_AGENT_MASQUE_PROXY`/`CT_AGENT_MASQUE_SNI_HOST`/
+  `CT_AGENT_MASQUE_TARGET`/`CT_AGENT_MASQUE_TOKEN` (all four read together,
+  all-or-nothing -- partial configuration is a hard error). The client also sends
+  `x-ct-masque-token` on its CONNECT-UDP request, matching the M2 addendum above.
+- **M4 — Field trial + docs — IN PROGRESS.** `masque-proxy` shipped in the
+  self-host image + opt-in `compose.masque.yml` overlay (#655/PR#656);
+  `masque.bunsenbrenner.org` DNS + LE cert issued live. Next: point the
+  kali.bunsenbrenner.org-side ct-agent (v0.7.2) at it and observe whether the
+  20:14-20:20-class drop episode stops recurring; then docs update and a
+  deliberate decision on wider rollout (standing operator directive: a
+  successful kali trial triggers migrating all connected agents/services, not
+  just kali).

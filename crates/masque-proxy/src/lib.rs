@@ -11,6 +11,23 @@
 //! else, which is a much stronger guarantee than an allowlist check would be (#559:
 //! "the user must not be compromisable through any of our services" -- an accidental
 //! open UDP relay would be exactly that).
+//!
+//! **Also requires a shared secret.** Target-restriction alone answers "where can a
+//! caller send traffic" (only this proxy's one configured target), not "who may call
+//! at all" -- and this proxy's one target is the edge's own INTERNAL QUIC listener,
+//! not a public destination. Without a second check, anyone who can reach the public
+//! `masque.<zone>:443` front door with a bare TLS+h2 handshake -- no ct-agent
+//! credential, no tunnel registration, nothing -- could open a CONNECT-UDP tunnel and
+//! consume proxy/edge resources, or have their real source IP hidden from the edge's
+//! QUIC-level view behind this proxy's loopback source address (losing whatever
+//! per-IP rate-limiting the edge's own `:4433` listener would otherwise see). Every
+//! request must therefore also carry the `x-ct-masque-token` header matching this
+//! proxy's `CT_MASQUE_PROXY_TOKEN` (64-hex, required -- `main.rs` refuses to start
+//! without one, the same fail-closed posture as `CT_EDGE_ADMIN_TOKEN`), checked in
+//! constant time exactly like the edge's own admin API (`crates/edge/src/admin.rs`).
+//! A missing/wrong token is refused through the SAME `RST_STREAM` path as a
+//! wrong-target request -- one undifferentiated failure mode, not an oracle a caller
+//! could use to tell "wrong token" apart from "wrong target".
 
 pub mod capsule;
 pub mod varint;
@@ -53,6 +70,41 @@ fn expected_connect_udp_path(target: SocketAddr) -> String {
     format!("{CONNECT_UDP_PATH_PREFIX}/{}/{}/", encode_target_host(&target), target.port())
 }
 
+/// Parse a 64-hex shared token (`CT_MASQUE_PROXY_TOKEN` / a caller's `x-ct-masque-
+/// token` header) into 32 bytes, if valid. Mirrors `crates/edge/src/serve.rs`'s
+/// `parse_admin_token_hex` exactly, including its #606 fix: `s.len()` is BYTE
+/// length -- a multi-byte UTF-8 char in a malformed header can pass this guard
+/// while a raw `&s[i*2..i*2+2]` slice would land mid-character and panic.
+pub fn parse_token_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut t = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        t[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(t)
+}
+
+/// Constant-time 32-byte token comparison (avoid leaking the shared token via
+/// timing) -- same construction as `crates/control-plane/src/service.rs`'s
+/// `ct_token_eq`.
+fn ct_token_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Constant-time check of the `x-ct-masque-token` header against the configured
+/// shared token -- same header-then-hex-then-compare shape as the edge admin
+/// API's `admin_authed` (`crates/edge/src/admin.rs`).
+fn masque_authed(headers: &http::HeaderMap, expected_token: &[u8; 32]) -> bool {
+    headers
+        .get("x-ct-masque-token")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_token_hex)
+        .is_some_and(|got| ct_token_eq(&got, expected_token))
+}
+
 /// Runtime configuration. Constructed by `main.rs` from `CT_MASQUE_PROXY_*` env vars
 /// (kept out of this module so the framing/proxy logic here stays testable without
 /// touching process environment).
@@ -76,6 +128,11 @@ pub struct Config {
     /// codebase (CADS-Tunnel#54 family): an agent that vanished mid-session must not
     /// pin a UDP socket + h2 stream open forever.
     pub idle_timeout: Duration,
+    /// The shared secret every caller must present (`x-ct-masque-token`) -- see the
+    /// crate doc for why target-restriction alone isn't enough. `main.rs` requires
+    /// `CT_MASQUE_PROXY_TOKEN` to be set (fail-closed, no default); this `Default`
+    /// impl exists only for tests, which use a fixed, obviously-non-production value.
+    pub shared_token: [u8; 32],
 }
 
 impl Default for Config {
@@ -85,6 +142,7 @@ impl Default for Config {
             target: "127.0.0.1:4433".parse().unwrap(),
             max_concurrent_tunnels: 256,
             idle_timeout: Duration::from_secs(120),
+            shared_token: [0u8; 32],
         }
     }
 }
@@ -98,6 +156,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
     let admission = Arc::new(Semaphore::new(config.max_concurrent_tunnels));
     let target = config.target;
     let idle_timeout = config.idle_timeout;
+    let shared_token = config.shared_token;
 
     loop {
         let (io, _peer) = listener.accept().await?;
@@ -110,7 +169,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
             let Ok(_permit) = admission.try_acquire_owned() else {
                 return;
             };
-            if let Err(e) = serve_connection(io, target, &expected_path, idle_timeout).await {
+            if let Err(e) = serve_connection(io, target, &expected_path, idle_timeout, &shared_token).await {
                 eprintln!("masque-proxy: connection ended with error: {e}");
             }
         });
@@ -122,6 +181,7 @@ async fn serve_connection(
     target: SocketAddr,
     expected_path: &str,
     idle_timeout: Duration,
+    shared_token: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = h2::server::Builder::new()
         .enable_connect_protocol()
@@ -135,7 +195,7 @@ async fn serve_connection(
     // return after the first request.
     while let Some(result) = conn.accept().await {
         let (req, respond) = result?;
-        if let Err(e) = handle_request(req, respond, target, expected_path, idle_timeout).await {
+        if let Err(e) = handle_request(req, respond, target, expected_path, idle_timeout, shared_token).await {
             eprintln!("masque-proxy: request handling ended with error: {e}");
         }
     }
@@ -148,6 +208,7 @@ async fn handle_request(
     target: SocketAddr,
     expected_path: &str,
     idle_timeout: Duration,
+    shared_token: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_connect_udp = req.method() == Method::CONNECT
         && req.extensions().get::<Protocol>() == Some(&Protocol::from_static("connect-udp"));
@@ -157,7 +218,11 @@ async fn handle_request(
     // template, an attempt to probe for other targets -- fails this same equality
     // check and is refused identically, with no separate "is this destination
     // allowed" logic to get wrong.
-    if !is_connect_udp || req.uri().path() != expected_path {
+    //
+    // The shared-token check is folded into this SAME condition (not a separate
+    // early-return) so a caller sees one undifferentiated refusal whether they got
+    // the target wrong, the token wrong, or both -- no oracle for probing which.
+    if !is_connect_udp || req.uri().path() != expected_path || !masque_authed(req.headers(), shared_token) {
         respond.send_reset(h2::Reason::REFUSED_STREAM);
         return Ok(());
     }
