@@ -129,6 +129,33 @@ second source of truth for tunnels/accounts/ledger — the admin console
 reads and writes through the same storage the rest of control-plane already
 uses.
 
+**Addendum, found during the admin-identity foundation's implementation
+(2026-08-25):** `admin_identity::admin_session_from_headers` resolves the
+current request's verified email via `portal::session_claims_for`, i.e. the
+existing `ct_portal_session` cookie. That cookie is deliberately host-only —
+`portal.rs`'s `session_cookie()` sets no `Domain=` attribute at all — so it is
+only ever sent back to the exact host that set it. Decision 5 puts the admin
+console on its *own* new hostname (`CT_EDGE_ADMIN_UI_HOST`), distinct from
+Portal's own front door (`CT_EDGE_PORTAL_HOST`); per RFC 6265, a browser never
+attaches a host-only cookie minted on one host to a request against a
+different host. As specified today, an admin who is genuinely logged into
+Portal would still get `401` visiting `admin.<zone>` — the session simply
+never arrives. This does not block the identity/authorization logic itself
+(its tests exercise `admin_session_from_headers` directly against a
+hand-signed cookie, which is a valid unit-level proof of the check), but
+whichever later phase wires up the real `/admin-ui/*` login flow must resolve
+it before the extractor works end-to-end. Two options, not decided here:
+(a) widen `ct_portal_session` to a `Domain=`-scoped cookie shared across the
+whole zone (mirroring `CT_GATE_COOKIE_DOMAIN`/`ct_gate_session` in `gate.rs`),
+reusing Portal's existing login as-is; or (b) give the admin console its own
+dedicated OIDC login and its own `Domain=`-scoped session cookie, fully
+mirroring `gate.rs`'s shape rather than reusing Portal's. (a) is less new
+code but widens the blast radius of Portal's session cookie to every current
+and future `*.<zone>` subdomain — a real tradeoff the next phase should weigh
+explicitly rather than pick by default. `admin_session_from_headers` itself
+needs no change either way; only which cookie/domain-scoping mints the
+session it reads is still open.
+
 ### Decision 6 — Additional admin capabilities beyond what was explicitly asked
 
 Per the operator's own request to add capabilities "important for
