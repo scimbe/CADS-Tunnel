@@ -2212,6 +2212,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "masque-proxy"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "h2",
+ "http",
+ "tokio",
+]
+
+[[package]]
 name = "match-lookup"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

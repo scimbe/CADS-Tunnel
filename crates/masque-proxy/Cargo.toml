@@ -1,0 +1,27 @@
+[package]
+name = "masque-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+description = """
+ADR-0024 M2: a standalone RFC 9298 (CONNECT-UDP) proxy over HTTP/2 Extended
+CONNECT (RFC 9220), fronted by the edge's existing TLS-terminate-and-forward
+`FrontDoorRoute::Proxy` arm (same shape Portal/Auth IdP already use -- see
+docs/adr/0024). Deliberately NOT a general-purpose relay: hard-restricted to
+one configured target address (this edge's own CT_EDGE_LISTEN QUIC port),
+by construction rather than by allowlist logic (#559 security baseline).
+"""
+
+[[bin]]
+name = "masque-proxy"
+path = "src/main.rs"
+
+[dependencies]
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
