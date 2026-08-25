@@ -183,6 +183,77 @@ async fn a_request_for_any_target_other_than_the_configured_one_gets_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_response_arrives_even_when_the_client_sends_no_data_first() {
+    // ADR-0024 M4 regression test for the real bug found live against the deployed
+    // proxy: `serve_connection` used to await `handle_request` INLINE instead of
+    // spawning it, so nothing kept driving the h2 Connection's I/O while
+    // `handle_request` was off doing its own thing -- the 200 response `handle_
+    // request` had already queued via `send_response` sat buffered and unflushed
+    // until the whole tunnel ended (see lib.rs's own doc comment on this fix for
+    // the full mechanism). The OTHER round-trip test above never caught this: it
+    // sends a DATA frame immediately after the request, and servicing that
+    // incoming frame incidentally drove the connection enough to flush the
+    // response too. A real ct-agent client (ADR-0024 M3's own dial sequence)
+    // waits for the response BEFORE sending anything -- this test does the same.
+    let target = spawn_udp_echo_target().await;
+    let token = [0x55u8; 32];
+    let config = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        target,
+        max_concurrent_tunnels: 4,
+        idle_timeout: Duration::from_secs(5),
+        shared_token: token,
+    };
+    let listen_probe = std::net::TcpListener::bind(config.listen).unwrap();
+    let proxy_addr = listen_probe.local_addr().unwrap();
+    drop(listen_probe);
+
+    let mut config = config;
+    config.listen = proxy_addr;
+    tokio::spawn(masque_proxy::run(config));
+
+    let client_io = 'connect: {
+        for _ in 0..50 {
+            if let Ok(io) = tokio::net::TcpStream::connect(proxy_addr).await {
+                break 'connect io;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("masque-proxy never started accepting on {proxy_addr}");
+    };
+
+    let (send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+    tokio::spawn(connection);
+
+    let mut send_request = send_request.ready().await.unwrap();
+    for _ in 0..50 {
+        if send_request.is_extended_connect_protocol_enabled() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(send_request.is_extended_connect_protocol_enabled());
+
+    let path = format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port());
+    let mut request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("https://{proxy_addr}{path}"))
+        .header("x-ct-masque-token", hex_token(&token))
+        .body(())
+        .unwrap();
+    request.extensions_mut().insert(Protocol::from_static("connect-udp"));
+
+    // No client_send.send_data(...) here -- the whole point of this test.
+    let (response_fut, _client_send) = send_request.send_request(request, false).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(3), response_fut)
+        .await
+        .expect("the response must arrive well within 3s -- it must not depend on the client sending data first")
+        .unwrap();
+    assert_eq!(response.status(), 200, "the proxy accepted the CONNECT-UDP request for its configured target");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_request_with_no_or_wrong_token_gets_refused_even_for_the_correct_target() {
     // The complementary security property to the target-restriction test above: an
     // anonymous caller with no ct-agent credential at all -- just a bare TLS+h2
