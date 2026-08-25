@@ -48,11 +48,24 @@ an implementation detail, and must be spiked before the rest of this plan is tru
    HTTP/3. The proxy endpoint is reachable exactly where the existing TLS-TCP fallback
    already is (same port, same TLS posture) — MASQUE adds a *third* rung, it does not
    replace the existing TCP/443 reachability story.
-2. **Proxy component: extend the edge, not a new service.** The edge already owns
-   `:443` as an SNI-multiplexed gateway (ADR-0019) with live TLS/ACME infra; adding a
-   CONNECT-UDP handler there avoids a new deploy unit, a new cert story, and a new
-   discovery mechanism — a MASQUE-capable agent dials the *same* edge host it already
-   knows, just requesting Extended CONNECT instead of (or after) a raw QUIC/TCP dial.
+2. **Proxy component: a new local backend the edge fronts, same shape as Portal —
+   not new edge-binary code, and not a new public deploy unit.** (Revised 2026-08-25,
+   during M2 groundwork: reading `crates/edge/src/serve.rs`'s existing
+   `FrontDoorRoute::Proxy(host)` arm showed it's *already* exactly "TLS-terminate,
+   then `copy_bidirectional` raw bytes to a plaintext upstream" — the identical
+   pattern the Portal (`CT_EDGE_PORTAL_HOST`/`CT_CP_PROXY_ADDR`) and Auth IdP
+   (`CT_EDGE_AUTH_HOST`/`CT_EDGE_AUTH_ADDR`) already use. Portal itself is not part
+   of the edge binary; it's the control-plane process, fronted by the edge's
+   existing terminate-and-forward logic.) The CONNECT-UDP handler is a **new local
+   process** (own crate, own binary) that speaks h2 + the Capsule Protocol on a
+   plain TCP port, registered into the SAME `proxies` map via a third
+   `CT_EDGE_MASQUE_HOST`/`CT_EDGE_MASQUE_ADDR` pair, mirroring the Portal/Auth-IdP
+   registration block in `serve.rs` verbatim. This needed **zero changes** to the
+   front-door SNI/ALPN classification hot path (`sni.rs::classify_front_door`) or
+   the dispatch match in `serve.rs` — MASQUE traffic is indistinguishable, at the
+   TLS-termination layer, from Portal traffic; the two are told apart only by which
+   hostname/cert the agent's ClientHello names, exactly like Portal vs. Auth IdP are
+   today.
 3. **Client side (ct-agent): a new `EdgeRung::Masque(SocketAddr)` ladder variant**,
    tried between `Quic` and `TlsTcp` — attempt real QUIC first (fastest, works whenever
    UDP isn't blocked), then MASQUE-tunneled QUIC (recovers QUIC's properties over an
@@ -87,10 +100,12 @@ rather than left implicit in "use RFC 9298."
 - Real feasibility risk at the crate-ecosystem level (HTTP/2 Extended CONNECT support
   in Rust), which is why the decomposition below puts a spike first, before any
   production-facing code.
-- The edge's `:443` gateway (ADR-0019) gains a third classification branch (portal /
-  tunnel-passthrough / **now MASQUE CONNECT-UDP**) — must stay strictly fenced, same
-  ordering-guard principle ADR-0019 already established (refuse anything not
-  explicitly authorized).
+- The edge's `:443` gateway (ADR-0019) needs **no new classification branch at all**
+  (revised, see Decision 2) — MASQUE registers as a third `proxies` entry
+  (`CT_EDGE_MASQUE_HOST`/`CT_EDGE_MASQUE_ADDR`) through the *existing*
+  `FrontDoorRoute::Proxy(host)` arm, the same one Portal and Auth IdP already use.
+  The ordering-guard principle ADR-0019 established (refuse anything not explicitly
+  configured) is inherited for free, not re-implemented.
 - Observability: the #533 benign-abort log family and the per-hostname breakdown gap
   noted during tonight's kali incident should be extended to cover the new rung too,
   not left as a blind spot from day one.
@@ -127,9 +142,18 @@ rather than left implicit in "use RFC 9298."
 
   If this had failed, Decision 1 would need revisiting before M2+; it didn't, so M2 is
   unblocked.
-- **M2 — Edge-side CONNECT-UDP handler.** New branch in the edge's `:443` SNI/protocol
-  demux (alongside ADR-0019's portal/tunnel branches); datagram encapsulation/
-  decapsulation; bounded per #559/#54 conventions; unit + integration tests.
+- **M2 — CONNECT-UDP proxy backend + edge registration.** (Revised shape, see Decision
+  2.) A new local process (own crate/binary, `crates/masque-proxy` or similar) that
+  speaks h2 + Capsule Protocol on a plain TCP port and, on a valid CONNECT-UDP
+  request, pumps datagrams bidirectionally to/from a real UDP socket -- **hard-
+  restricted to this edge's own QUIC listener as the only legitimate target**
+  (validate `target_host`/`target_port` against one configured address; reject
+  everything else) rather than a general-purpose relay, which sidesteps the #559
+  open-UDP-relay risk by construction instead of by allowlist logic. Registered into
+  `serve.rs`'s existing `proxies` map via a new `CT_EDGE_MASQUE_HOST`/
+  `CT_EDGE_MASQUE_ADDR` pair, mirroring the Portal/Auth-IdP registration block
+  verbatim -- no changes to `sni.rs` or the front-door dispatch `match`. Bounded per
+  #559/#54 conventions (timeouts, rate limits); unit + integration tests.
 - **M3 — ct-agent client side.** New `EdgeRung::Masque` in `ladder.rs`; QUIC-over-
   MASQUE-tunnel dial reusing the existing `quinn` stack against the tunneled UDP path;
   wired into the existing ladder-walk/registration-role logic between `Quic` and
