@@ -3813,6 +3813,21 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         let tls = build_front_door_cert("Auth IdP", "CT_EDGE_AUTH_CERT", "CT_EDGE_AUTH_KEY");
                         proxies.insert(host.to_ascii_lowercase(), (addr, tls));
                     }
+                    // ADR-0024 M2: the MASQUE/CONNECT-UDP proxy (crates/masque-proxy),
+                    // fronted exactly like Portal/Auth IdP above -- same TLS-terminate-
+                    // and-forward arm, no dispatch changes needed. `addr` here is the
+                    // proxy's own plaintext listen address (CT_MASQUE_PROXY_LISTEN on
+                    // that binary), never exposed publicly by itself; the proxy in turn
+                    // hard-restricts every CONNECT-UDP request to its own configured
+                    // target (this edge's CT_EDGE_LISTEN), so keeping the two in sync at
+                    // deploy time is the operator's responsibility, not enforced here.
+                    if let (Some(host), Some(addr)) = (
+                        std::env::var("CT_EDGE_MASQUE_HOST").ok().filter(|s| !s.is_empty()),
+                        resolve_proxy_addr(std::env::var("CT_EDGE_MASQUE_ADDR").ok()),
+                    ) {
+                        let tls = build_front_door_cert("MASQUE", "CT_EDGE_MASQUE_CERT", "CT_EDGE_MASQUE_KEY");
+                        proxies.insert(host.to_ascii_lowercase(), (addr, tls));
+                    }
                     // #233: the shared front-door wildcard cert backing the Gelb
                     // tier — same env-var/loading convention as Portal/Auth IdP
                     // above. `None` (unset, or unusable per #142) means every
