@@ -1,10 +1,12 @@
 # ADR-0024 — MASQUE/CONNECT-UDP (RFC 9298) as a third transport rung for UDP-blocked networks
 
 ## Status
-Proposed. Builds on ADR-0004 (QUIC data-plane transport with TCP fallback), ADR-0010
-(Mesh-Plane-first / Browser-Plane SNI), ADR-0019 (unified :443 gateway). Tracked by
-ct-agent#81 (design-tracking issue, recon already done there) and this ADR's own
-decomposition below. Operator green-lit real design + implementation work 2026-08-25.
+Proposed; **M1 (feasibility spike) complete and PASSED**, 2026-08-25 — see its own
+section below. Builds on ADR-0004 (QUIC data-plane transport with TCP fallback),
+ADR-0010 (Mesh-Plane-first / Browser-Plane SNI), ADR-0019 (unified :443 gateway).
+Tracked by ct-agent#81 (design-tracking issue, recon already done there) and this
+ADR's own decomposition below. Operator green-lit real design + implementation work
+2026-08-25.
 
 ## Context
 ADR-0004 already anticipates UDP-blocked networks and falls back to a TCP-framed
@@ -94,12 +96,37 @@ rather than left implicit in "use RFC 9298."
   not left as a blind spot from day one.
 
 ## Decomposition (phased, mirrors ADR-0019's GW1-GW4 slicing)
-- **M1 — Feasibility spike (do this first, before committing further).** Prove, with
-  a minimal standalone Rust program (not integrated into either production crate yet),
-  that an HTTP/2 Extended CONNECT (RFC 9220) request can be made and a CONNECT-UDP
-  (RFC 9298) Capsule-Protocol UDP datagram tunnel established end-to-end using
-  available crates (`h2` + hand-rolled capsule framing if no higher-level crate exists).
-  If this is not cleanly buildable, this ADR's Decision 1 needs revisiting before M2+.
+- **M1 — Feasibility spike — DONE, PASSED (2026-08-25, `ct-agent` `spike-masque-h2/`,
+  branch `fix/81-m1-masque-h2-spike`).** Real, standalone workspace-member crate (not
+  wired into `native`): `varint.rs`/`capsule.rs` hand-implement RFC 9297's Capsule
+  Protocol (Type/Length/Value framing) and RFC 9298's UDP Proxying HTTP Datagram
+  payload (Context ID + raw UDP bytes) over the `h2` crate's existing `:protocol`
+  pseudo-header support (`h2::ext::Protocol`, confirms RFC 9220 Extended CONNECT is
+  supported out of the box). `tests/roundtrip.rs` drives a real client+server exchange
+  over an actual loopback TCP socket: Extended CONNECT with `:protocol=connect-udp`,
+  a 200 response, one capsule-framed UDP datagram sent, echoed back, decoded, and
+  byte-compared -- **passes**. No off-the-shelf Rust crate implements RFC 9298 over
+  HTTP/2 specifically (the one Rust MASQUE implementation found, `jromwu/masquerade`,
+  is HTTP/3-only via `quiche`) -- this had to be hand-rolled, confirming the ADR's
+  own risk callout was real, not hypothetical.
+
+  Two real findings surfaced by getting a working implementation, both relevant to M2/M3:
+  1. **SETTINGS race**: a client's `SendRequest::ready()` resolving does *not*
+     guarantee the server's `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` frame has already been
+     processed -- `is_extended_connect_protocol_enabled()` must be polled with a bounded
+     wait before attempting Extended CONNECT, not checked once.
+  2. **Flush requires continued driving**: `send_data(..., end_of_stream: true)` only
+     *buffers* the final frame -- `h2::server::Connection` must keep being polled (its
+     own accept loop, same handle used to receive the original request) to actually
+     flush buffered writes to the socket. Returning/dropping the connection immediately
+     after the last `send_data` call closed the TCP socket out from under a still-
+     buffered response in early iterations of this spike (client saw a broken-pipe
+     reset instead of its data) -- a real proxy (M2) naturally avoids this by virtue of
+     running a persistent accept loop, but it is a sharp edge worth remembering
+     explicitly rather than rediscovering it in M2.
+
+  If this had failed, Decision 1 would need revisiting before M2+; it didn't, so M2 is
+  unblocked.
 - **M2 — Edge-side CONNECT-UDP handler.** New branch in the edge's `:443` SNI/protocol
   demux (alongside ADR-0019's portal/tunnel branches); datagram encapsulation/
   decapsulation; bounded per #559/#54 conventions; unit + integration tests.
