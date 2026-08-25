@@ -48,6 +48,15 @@ issue_cert() {
     --reloadcmd "$reload_cmd" \
     || warn "acme.sh install-cert reload step failed (fine on first issuance — verifying cert files below)"
   [ -f "$full" ] && [ -f "$key" ] || die "cert files missing after acme.sh install-cert"
-  chmod 600 "$key"
+  # 644, not 600: whatever serves this cert (edge, control-plane) reads it via a
+  # host bind mount as its own non-root container uid (65532), not as the host
+  # user issuing it -- 600 is unreadable to anyone but the issuing host user and
+  # silently breaks TLS termination on the very next container recreate (found
+  # live, 2026-08-25, ADR-0024 M4: the masque cert this same function issued came
+  # up with the edge logging "MASQUE TLS cert configured but UNUSABLE (Permission
+  # denied)" and falling back to unterminated/plaintext proxying -- #142). The
+  # private key itself is still only host-readable by anyone with access to this
+  # machine at all, same as every other secret in docker/deploy/.env.
+  chmod 644 "$key"
   ok "cert installed at $dir ($([ "${STAGING:-0}" = "1" ] && echo staging || echo production))"
 }
