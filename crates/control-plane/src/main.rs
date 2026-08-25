@@ -273,7 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let app = persistent_control_plane_router(&db, &webhook_secret, &session_key, oidc_handle)?;
+    let app = persistent_control_plane_router(&db, &webhook_secret, &session_key, oidc_handle, admin_identity)?;
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("ct-control-plane: listening on {listen}, db={db}");

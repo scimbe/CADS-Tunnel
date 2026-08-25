@@ -1348,6 +1348,12 @@ impl SqliteLedger {
         // for every one. DEFAULT 1 keeps every existing account's behavior
         // unchanged on a pre-existing DB.
         ensure_column(&conn, "accounts", "max_tunnels", "INTEGER NOT NULL DEFAULT 1")?;
+        // ADR-0025 (admin console): an admin-blocked account is refused at every
+        // credit-gated admission point (`debit`/`debit_and_record_issuance`) and at
+        // the self-service tunnel-creation gate (`portal_api::create_tunnel`) --
+        // see [`Self::is_blocked`]'s doc for the "a flag nobody checks is worthless"
+        // reasoning. DEFAULT 0 keeps every existing account unblocked on upgrade.
+        ensure_column(&conn, "accounts", "blocked", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1387,6 +1393,74 @@ impl SqliteLedger {
             |r| r.get(0),
         )
         .optional()
+    }
+
+    /// `(balance, blocked)` in one row read -- used by [`Self::debit`] and
+    /// [`Self::debit_and_record_issuance`] so the blocked check and the balance
+    /// read are the same snapshot inside their transaction, not two separate
+    /// queries that could observe an admin's concurrent block/unblock between them.
+    fn balance_and_blocked_of(conn: &Connection, id: &AccountId) -> rusqlite::Result<Option<(i64, bool)>> {
+        conn.query_row(
+            "SELECT balance, blocked FROM accounts WHERE account = ?1",
+            params![&id.0[..]],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+    }
+
+    /// Whether `account` is admin-blocked (ADR-0025 Decision 6 / the admin
+    /// console's block action). Checked by [`Self::debit`]/
+    /// [`Self::debit_and_record_issuance`] (the credit-gated token-issuance
+    /// admission path) and by `portal_api::create_tunnel` (the self-service
+    /// tunnel-creation admission path) -- this codebase has an explicit standing
+    /// lesson that a block flag nobody checks is worthless, so both real
+    /// admission points enforce it, not just this accessor existing.
+    pub fn is_blocked(&self, account: &AccountId) -> rusqlite::Result<bool> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT blocked FROM accounts WHERE account = ?1",
+                params![&account.0[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0) != 0)
+    }
+
+    /// Set (or clear) `account`'s blocked flag -- the admin console's block/
+    /// unblock action. No-op (not an error) if `account` doesn't exist yet,
+    /// matching [`Self::set_max_tunnels`]'s own convention.
+    pub fn set_blocked(&self, account: &AccountId, blocked: bool) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "UPDATE accounts SET blocked = ?1 WHERE account = ?2",
+            params![blocked as i64, &account.0[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Remove `subject`'s account row and its `account_subjects` mapping entirely
+    /// -- the ledger half of an admin-triggered account deletion
+    /// (`portal_api::admin_ui_delete_account`). Self-service account deletion
+    /// deliberately does NOT do this (Keycloak still owns that caller's identity
+    /// and a returning login would just re-create the account row); an admin
+    /// deleting someone else's account has no such expectation, so this actually
+    /// removes the row. No-op if `subject` has no account yet.
+    pub fn delete_account_for_subject(&self, subject: &str) -> rusqlite::Result<()> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let account: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT account FROM account_subjects WHERE subject = ?1",
+                params![subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = account {
+            tx.execute("DELETE FROM accounts WHERE account = ?1", params![&bytes[..]])?;
+            tx.execute("DELETE FROM account_subjects WHERE subject = ?1", params![subject])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Open a fresh account with a zero balance; returns its id.
@@ -1530,7 +1604,15 @@ impl SqliteLedger {
     pub fn debit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
-        let bal = Self::balance_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let (bal, blocked) =
+            Self::balance_and_blocked_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        // ADR-0025: an admin-blocked account is refused here regardless of
+        // balance -- checked before the balance comparison so a blocked-but-funded
+        // account gets the same refusal as a blocked-and-broke one, not a
+        // misleading InsufficientCredit.
+        if blocked {
+            return Err(LedgerOpError::Ledger(LedgerError::AccountBlocked));
+        }
         let bal_u = bal as u64;
         if bal_u < amount {
             return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
@@ -1596,12 +1678,12 @@ impl SqliteLedger {
     ) -> Result<u64, LedgerOpError> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
-        let bal = tx
-            .query_row("SELECT balance FROM accounts WHERE account = ?1", params![&id.0[..]], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?
-            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let (bal, blocked) =
+            Self::balance_and_blocked_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        // ADR-0025: same "blocked wins over InsufficientCredit" ordering as `debit`.
+        if blocked {
+            return Err(LedgerOpError::Ledger(LedgerError::AccountBlocked));
+        }
         let bal_u = bal as u64;
         if bal_u < amount {
             return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
@@ -7434,6 +7516,80 @@ mod tests {
             Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: 10, requested: 25 }))
         ));
         assert_eq!(ledger.balance(&acct).unwrap(), 10, "balance intact");
+    }
+
+    /// ADR-0025 (admin console): fail-first proof that `debit` — the credit-gated
+    /// token-issuance admission path (`billing.rs`'s own doc: "the economic gate on
+    /// tunnel creation") — actually refuses a blocked account, and does so BEFORE
+    /// the balance check (a funded-but-blocked account gets `AccountBlocked`, not a
+    /// misleading `InsufficientCredit`), with no mutation on refusal.
+    #[test]
+    fn debit_refuses_a_blocked_account_regardless_of_balance() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 100).unwrap();
+        ledger.set_blocked(&acct, true).unwrap();
+        assert!(
+            matches!(ledger.debit(&acct, 1), Err(LedgerOpError::Ledger(LedgerError::AccountBlocked))),
+            "a blocked account's debit must be refused even though it can afford it"
+        );
+        assert_eq!(ledger.balance(&acct).unwrap(), 100, "the refused debit left the balance intact");
+    }
+
+    /// Same admission gate, the idempotency-key-carrying sibling call site
+    /// (`debit_and_record_issuance`, used by every issuance call that supplies a
+    /// retry key).
+    #[test]
+    fn debit_and_record_issuance_refuses_a_blocked_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 100).unwrap();
+        ledger.set_blocked(&acct, true).unwrap();
+        let err = ledger.debit_and_record_issuance(&acct, 1, &[0x22u8; 32], &[0x33u8; 32], 1_000);
+        assert!(matches!(err, Err(LedgerOpError::Ledger(LedgerError::AccountBlocked))));
+        assert_eq!(ledger.issuance_for_key(&acct, &[0x22u8; 32]).unwrap(), None, "no issuance was recorded");
+    }
+
+    #[test]
+    fn unblocking_an_account_restores_its_debit_capability() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 10).unwrap();
+        ledger.set_blocked(&acct, true).unwrap();
+        assert!(ledger.debit(&acct, 1).is_err(), "blocked: refused");
+        ledger.set_blocked(&acct, false).unwrap();
+        assert_eq!(ledger.debit(&acct, 1).unwrap(), 9, "unblocked: same ledger, now succeeds");
+    }
+
+    #[test]
+    fn is_blocked_defaults_false_for_a_never_blocked_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        assert!(!ledger.is_blocked(&acct).unwrap());
+    }
+
+    /// The ledger half of an admin-triggered account deletion
+    /// (`portal_api::admin_ui_delete_account`): the account row and its subject
+    /// mapping are both actually gone, not merely zeroed -- proven by
+    /// `account_for_subject` minting a FRESH (different) account id afterward,
+    /// which only happens when no `account_subjects` row remains.
+    #[test]
+    fn delete_account_for_subject_removes_the_row_so_a_later_login_gets_a_fresh_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let original = ledger.account_for_subject("kc-gone").unwrap();
+        ledger.credit(&original, 42).unwrap();
+
+        ledger.delete_account_for_subject("kc-gone").unwrap();
+
+        let recreated = ledger.account_for_subject("kc-gone").unwrap();
+        assert_ne!(recreated.0, original.0, "a fresh account id was minted -- the old row is really gone");
+        assert_eq!(ledger.balance(&recreated).unwrap(), 0, "the fresh account starts at zero, not the old balance");
+    }
+
+    #[test]
+    fn delete_account_for_subject_is_a_no_op_for_a_subject_with_no_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(ledger.delete_account_for_subject("kc-never-logged-in").is_ok());
     }
 
     #[test]

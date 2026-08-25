@@ -280,6 +280,10 @@ async fn buy_token(
                 // this (it has no i64-cast to guard against), but the variant is shared
                 // with SqliteLedger's, so the match must stay exhaustive.
                 LedgerError::CreditAmountTooLarge { .. } => StatusCode::BAD_REQUEST,
+                // ADR-0025: this in-memory Ledger's own `debit()` has no blocked
+                // concept and can never produce this -- kept for match exhaustiveness
+                // (the variant is shared with SqliteLedger's real, blocked-aware debit).
+                LedgerError::AccountBlocked => StatusCode::FORBIDDEN,
             };
             (code, e.to_string())
         })?;

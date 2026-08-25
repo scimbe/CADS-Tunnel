@@ -699,6 +699,8 @@ async fn buy_token(
                         LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => {
                             StatusCode::INTERNAL_SERVER_ERROR
                         }
+                        // ADR-0025: the account is admin-blocked.
+                        LedgerOpError::Ledger(LedgerError::AccountBlocked) => StatusCode::FORBIDDEN,
                         LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     (code, e.to_string())
@@ -721,6 +723,8 @@ async fn buy_token(
                     LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => {
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
+                    // ADR-0025: the account is admin-blocked.
+                    LedgerOpError::Ledger(LedgerError::AccountBlocked) => StatusCode::FORBIDDEN,
                     LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (code, e.to_string())
@@ -3816,6 +3820,8 @@ async fn me_issue(
             // #604: only `credit()` can produce this -- unreachable via the debit calls
             // this closure covers, kept for match exhaustiveness.
             LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => StatusCode::INTERNAL_SERVER_ERROR,
+            // ADR-0025: the account is admin-blocked.
+            LedgerOpError::Ledger(LedgerError::AccountBlocked) => StatusCode::FORBIDDEN,
             LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match &idempotency_key {
@@ -5403,6 +5409,13 @@ pub fn persistent_control_plane_router(
     webhook_secret: &[u8],
     session_key: &[u8],
     oidc: OidcVerifierHandle,
+    // ADR-0025: the admin console's identity layer, already constructed (and its
+    // required `CT_ADMIN_SUPER_EMAIL` fail-closed-checked, `admin_identity::
+    // super_admin_email_from_env`) by `main.rs` before this is called -- passed in
+    // rather than rebuilt here because that fail-closed check needs to abort `main()`
+    // itself, not this `rusqlite::Result`-returning function whose error type can't
+    // carry `admin_identity::super_admin_email_from_env`'s `String` error cleanly.
+    admin: Arc<crate::admin_identity::AdminIdentity>,
 ) -> rusqlite::Result<Router> {
     // #328: `/me/*` used to be conditionally *mounted* based on whether `oidc` was
     // `Some` at this exact call -- a boot-time-only decision. It's now always a
@@ -5418,6 +5431,11 @@ pub fn persistent_control_plane_router(
     // #107: the Topology Editor store — its public live-status page is always mounted;
     // the authed `/me/topologies*` editor mounts only with an OIDC verifier (below).
     let topologies = Arc::new(SqliteTopologyStore::open(db_path)?);
+    // ADR-0025 Decision 6: the admin action audit log, opened the same way every
+    // other store above is (from `db_path`, inside this function) -- unlike `admin`
+    // itself, this has no fail-closed startup requirement of its own, so it doesn't
+    // need to be threaded in from `main.rs` the way `admin` does.
+    let admin_audit = Arc::new(crate::audit_log::SqliteAuditLog::open(db_path)?);
     let verifier = Arc::new(WebhookVerifier::new(
         webhook_secret.to_vec(),
         WEBHOOK_TOLERANCE_SECS,
@@ -5795,6 +5813,19 @@ pub fn persistent_control_plane_router(
                 networks.clone(),
                 pipeline_registry.clone(),
             ))
+            // ADR-0025: the admin console's account/user operations, gated on a
+            // verified admin session rather than the shared `x-ct-admin-token`.
+            .merge(crate::portal_api::admin_ui_router(
+                session_key,
+                admin.clone(),
+                admin_audit.clone(),
+                ledger.clone(),
+                tunnels.clone(),
+                channels.clone(),
+                topologies.clone(),
+                networks.clone(),
+                pipeline_registry.clone(),
+            ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
             // Real self-service M2M credentials -- an account owner's own
@@ -6057,6 +6088,15 @@ pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
 mod tests {
     use super::*;
     use crate::client::ControlPlaneClient;
+
+    /// A fresh, in-memory `AdminIdentity` for the router-construction tests below
+    /// -- none of them exercise admin-console behavior itself (that's
+    /// `admin_identity`'s own test module's job), they just need SOME identity to
+    /// satisfy `persistent_control_plane_router`'s required `admin` parameter.
+    fn test_admin_identity() -> Arc<crate::admin_identity::AdminIdentity> {
+        let store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        Arc::new(crate::admin_identity::AdminIdentity::new(store, "test-admin@example.com"))
+    }
 
     /// #561: the three refusal counters must actually MOVE when a refusal happens.
     ///
@@ -7340,7 +7380,7 @@ mod tests {
         // (open_account/buy_token, issue_join_token) to prove they persist across a restart,
         // so mount the OPEN (ungated) writers here against the SAME db — test-only, and no
         // route conflict since the production router mounts neither without a token.
-        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", OidcVerifierHandle::empty())
+        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity())
             .unwrap()
             .merge(billing_writers_gated(std::sync::Arc::new(SqliteLedger::open(db_path).unwrap()), None))
             .merge(enroll_issue_writers_gated(std::sync::Arc::new(SqliteEnrollment::open(db_path).unwrap()), None));
@@ -7390,7 +7430,7 @@ mod tests {
         let db = temp_db_path();
         let oidc = Some(Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct")));
         let app =
-            persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::from(oidc)).unwrap();
+            persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::from(oidc), test_admin_identity()).unwrap();
         let resp = app
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
@@ -7401,7 +7441,7 @@ mod tests {
 
         // Without an OIDC verifier the public search is STILL mounted (#161): it is a public,
         // machine-facing surface, not part of the authed `/me/*` set that OIDC gates.
-        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let still = no_oidc
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
@@ -10338,7 +10378,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let app =
-            persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc))).unwrap();
+            persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity()).unwrap();
 
         // Without a bearer token the mounted endpoint rejects with 401 (not 404).
         let resp = app
@@ -10385,7 +10425,7 @@ mod tests {
         let secret = b"realm-secret";
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc))).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity()).unwrap();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10431,7 +10471,7 @@ mod tests {
         use tower::ServiceExt;
 
         let handle = OidcVerifierHandle::empty();
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", handle.clone()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", handle.clone(), test_admin_identity()).unwrap();
         let resp = app
             .clone()
             .oneshot(Request::get("/me/account").body(Body::empty()).unwrap())
@@ -10467,7 +10507,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"the-webhook-secret", b"the-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"the-webhook-secret", b"the-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
 
         // A cookie forged with the webhook secret (what an attacker who only
         // learned THAT secret could produce) is rejected -> bounced to /portal.
@@ -10507,7 +10547,7 @@ mod tests {
         // The unified production router must not expose the M18 stub endpoint —
         // credits come only from the signed webhook (proven crediting-side by
         // unified_control_plane_survives_restart).
-        let app = persistent_control_plane_router(":memory:", b"whsec_prod", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_prod", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp = app
             .oneshot(
                 Request::post("/payment/confirm")
@@ -10531,7 +10571,7 @@ mod tests {
         use tower::ServiceExt;
 
         // The full production router serves the landing page at `/`.
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp = app
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
@@ -10577,7 +10617,7 @@ mod tests {
         // #194: fail closed — with no CT_CP_EDGE_ADMIN_TOKEN set (unset in the test env → admin_token
         // = None), the unauthenticated client-supplied-account billing writer must NOT be served;
         // /billing/issue is absent (404), not an open account-debit endpoint.
-        let app_b = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app_b = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp_b = app_b
             .oneshot(
                 Request::post("/billing/issue")
@@ -10617,7 +10657,7 @@ mod tests {
             "links to the project's Buy Me a Coffee page"
         );
         // /publish still redirects (old links / bookmarks keep working) to the merged section.
-        let app_pub = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app_pub = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp_pub = app_pub.oneshot(Request::get("/publish").body(Body::empty()).unwrap()).await.unwrap();
         assert!(resp_pub.status().is_redirection(), "/publish redirects, got {}", resp_pub.status());
         assert_eq!(
@@ -10626,7 +10666,7 @@ mod tests {
             "/publish redirects into the merged landing-page section"
         );
         // The starter template is a real, downloadable zip (not a 404, not HTML).
-        let app_zip = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app_zip = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp_zip = app_zip
             .oneshot(Request::get("/downloads/hello-world-pipeline.zip").body(Body::empty()).unwrap())
             .await
@@ -10648,7 +10688,7 @@ mod tests {
         let zip_bytes = to_bytes(resp_zip.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&zip_bytes[..2], b"PK", "serves a real zip archive (PK magic bytes)");
         // The read-it-yourself template guide actually serves (not a dead link).
-        let app_guide = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app_guide = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp_guide = app_guide
             .oneshot(Request::get("/template-guide").body(Body::empty()).unwrap())
             .await
@@ -10660,7 +10700,7 @@ mod tests {
             guide_html.contains("pipeline-spec.json") && guide_html.contains(".env"),
             "the template guide explains the file structure and the .env identity file"
         );
-        let app2 = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app2 = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
         let ct2 = resp2.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -10720,7 +10760,7 @@ mod tests {
                 ],
             ),
         ] {
-            let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+            let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
             let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{path} should serve");
             let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -11183,7 +11223,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"whsec_health", b"test-session-key", OidcVerifierHandle::empty()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_health", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
 
         let health = app
             .clone()

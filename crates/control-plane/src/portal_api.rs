@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -523,6 +523,344 @@ page (while still signed in elsewhere) if you also want to remove your Keycloak 
     resp
 }
 
+// ===== ADR-0025: `/admin-ui/*` -- admin-identity-gated account/user operations =====
+//
+// Every route below requires a verified admin session (`admin_ui_authed`, wrapping
+// `admin_identity::admin_session_from_headers`), NOT the shared `x-ct-admin-token`
+// the pre-existing `/admin/*` routes above use -- that token stays for edge-to-edge
+// internal calls (ADR-0025 task framing), this surface is what a real admin-console
+// UI session drives. Every successful mutation is recorded via `audit`
+// (`crate::audit_log::SqliteAuditLog`) -- ADR-0025 Decision 6's "operator must be
+// able to see everything" convention applied to the admin surface itself.
+
+/// Shared state for the `/admin-ui/*` routes. Kept as its own router/state
+/// (mirrors [`AccountDeleteState`]'s own reasoning) rather than widening `ApiState`:
+/// `ApiState` is built once in `portal_api_router` and exercised by many pre-existing
+/// tests that construct it directly with a fixed field set, and the admin-identity/
+/// audit-log values this needs don't exist at that call site's callers before
+/// ADR-0025.
+#[derive(Clone)]
+struct AdminUiState {
+    session_key: Arc<[u8]>,
+    admin: Arc<crate::admin_identity::AdminIdentity>,
+    audit: Arc<crate::audit_log::SqliteAuditLog>,
+    ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+    networks: Arc<crate::storage::SqliteNetworkStore>,
+    pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+}
+
+/// Resolve + require an admin session for an `/admin-ui/*` handler — the one gate
+/// every route below calls first (mirrors `admin_authed`'s role for the legacy
+/// `/admin/*` shared-token routes, and `account_for_session`'s role for the
+/// self-service `/portal/*` routes). `401`/`403` per `admin_session_from_headers`'s
+/// own contract (no session / not verified vs. verified-but-not-an-admin).
+fn admin_ui_authed(
+    st: &AdminUiState,
+    headers: &HeaderMap,
+) -> Result<crate::admin_identity::AdminSession, Response> {
+    crate::admin_identity::admin_session_from_headers(&st.session_key, &st.admin, headers)
+}
+
+/// Build the `/admin-ui/*` router (ADR-0025): account credit/block/unblock/delete,
+/// an admin-identity-gated mirror of the legacy max-tunnels unlock, and
+/// admin-management (list/add/remove).
+pub fn admin_ui_router(
+    session_key: &[u8],
+    admin: Arc<crate::admin_identity::AdminIdentity>,
+    audit: Arc<crate::audit_log::SqliteAuditLog>,
+    ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+    networks: Arc<crate::storage::SqliteNetworkStore>,
+    pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+) -> Router {
+    Router::new()
+        .route("/admin-ui/accounts/:subject/credit", post(admin_ui_credit_account))
+        .route("/admin-ui/accounts/:subject/block", post(admin_ui_block_account))
+        .route("/admin-ui/accounts/:subject/unblock", post(admin_ui_unblock_account))
+        .route("/admin-ui/accounts/:subject/delete", post(admin_ui_delete_account))
+        .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
+        .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
+        .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
+        .with_state(AdminUiState {
+            session_key: Arc::from(session_key.to_vec()),
+            admin,
+            audit,
+            ledger,
+            tunnels,
+            channels,
+            topologies,
+            networks,
+            pipelines,
+        })
+}
+
+#[derive(Deserialize)]
+struct CreditReq {
+    amount: u64,
+}
+
+#[derive(Serialize)]
+struct CreditResp {
+    balance: u64,
+}
+
+/// `POST /admin-ui/accounts/:subject/credit {amount}` (admin-identity-gated):
+/// grant `amount` credits to `subject`'s account. Wraps `SqliteLedger::credit`
+/// directly -- the same durable ledger the payment webhook credits -- no
+/// payment-intent step; this IS the admin top-up.
+async fn admin_ui_credit_account(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<CreditReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_credit_account/account_for_subject", e).into_response(),
+    };
+    let balance = match st.ledger.credit(&account, req.amount) {
+        Ok(b) => b,
+        Err(e) => return internal_error("admin_ui_credit_account/credit", e).into_response(),
+    };
+    let _ = st.audit.record(
+        &session.email,
+        "credit_grant",
+        Some(&subject),
+        Some(&format!("+{} credits (new balance {balance})", req.amount)),
+    );
+    Json(CreditResp { balance }).into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/block` (admin-identity-gated): the admin
+/// console's block action. `SqliteLedger::debit`/`debit_and_record_issuance` (the
+/// credit-gated token-issuance admission path) and `create_tunnel` above (the
+/// self-service tunnel-creation admission path) both check this flag -- see
+/// their doc comments; a block flag nobody checks is worthless.
+async fn admin_ui_block_account(State(st): State<AdminUiState>, headers: HeaderMap, Path(subject): Path<String>) -> Response {
+    admin_ui_set_blocked(st, headers, subject, true, "account_block").await
+}
+
+/// `POST /admin-ui/accounts/:subject/unblock` (admin-identity-gated): the inverse
+/// of [`admin_ui_block_account`].
+async fn admin_ui_unblock_account(State(st): State<AdminUiState>, headers: HeaderMap, Path(subject): Path<String>) -> Response {
+    admin_ui_set_blocked(st, headers, subject, false, "account_unblock").await
+}
+
+async fn admin_ui_set_blocked(
+    st: AdminUiState,
+    headers: HeaderMap,
+    subject: String,
+    blocked: bool,
+    action: &str,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_blocked/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_blocked(&account, blocked) {
+        return internal_error("admin_ui_set_blocked/set_blocked", e).into_response();
+    }
+    let _ = st.audit.record(&session.email, action, Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/delete` (admin-identity-gated): the
+/// admin-target-any-account variant of [`delete_account`] -- same resource
+/// cascade (owned tunnels revoked; channels/topologies/networks/pipelines
+/// deleted), PLUS the ledger account row itself removed
+/// (`SqliteLedger::delete_account_for_subject`). Self-service `delete_account`
+/// deliberately leaves that row (Keycloak still owns the caller's own identity,
+/// and a returning login would just re-create it); an admin deleting someone
+/// else's account has no such expectation, so this actually removes it.
+///
+/// Does **not** strip `subject`'s e-mail from other accounts' channel/topology
+/// share lists the way [`delete_account`] strips the CALLER's own verified
+/// e-mail — unlike that self-service path, an admin acting on a bare `subject`
+/// string has no verified e-mail for that account in hand here (accounts are
+/// pseudonymous by design, ADR-0012); scrubbing a specific e-mail from other
+/// accounts' share lists once it's known is still available via the existing
+/// self-service primitives (`remove_allowlist_entries_for_email`/
+/// `remove_shares_by_email`).
+async fn admin_ui_delete_account(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Same best-effort, independently-logged cascade shape as `delete_account`
+    // (2026-08-24 gap fix: log every step's failure, never `let _ =` it away).
+    if let Ok(owned) = st.tunnels.list_for_subject(&subject) {
+        for t in owned {
+            if let Err(e) = st.tunnels.revoke(&subject, &t.id, now) {
+                eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            }
+        }
+    }
+    if let Ok(owned) = st.channels.channels_owned_by(&subject) {
+        for c in owned {
+            if let Err(e) = st.channels.delete_channel(&subject, &c) {
+                eprintln!("ct-cp: admin account deletion for {subject}: deleting channel {} failed: {e}", hex(&c.0));
+            }
+        }
+    }
+    if let Err(e) = st.topologies.delete_all_owned_by(&subject) {
+        eprintln!("ct-cp: admin account deletion for {subject}: deleting owned topologies failed: {e}");
+    }
+    if let Ok(owned) = st.networks.list(&subject) {
+        for id in owned {
+            if let Err(e) = st.networks.delete(&subject, &id) {
+                eprintln!("ct-cp: admin account deletion for {subject}: deleting network {id} failed: {e}");
+            }
+        }
+    }
+    if let Ok(all) = st.pipelines.list() {
+        for (id, owner) in all {
+            if owner == subject {
+                if let Err(e) = st.pipelines.unpublish(&subject, &id) {
+                    eprintln!("ct-cp: admin account deletion for {subject}: unpublishing pipeline {id} failed: {e}");
+                }
+            }
+        }
+    }
+    if let Err(e) = st.ledger.delete_account_for_subject(&subject) {
+        eprintln!("ct-cp: admin account deletion for {subject}: removing ledger row failed: {e}");
+    }
+
+    let _ = st.audit.record(&session.email, "account_delete", Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/max-tunnels {max}` (admin-identity-gated):
+/// the admin-identity-gated mirror of [`admin_set_max_tunnels`] -- same effect
+/// (raises/lowers `subject`'s tunnel-count limit), reachable by a verified admin
+/// session instead of the shared `x-ct-admin-token`. The legacy
+/// `/admin/accounts/:subject/max-tunnels` route stays mounted unchanged for
+/// edge-to-edge/internal callers that only hold the shared token -- ADR-0025's
+/// task framing keeps that mechanism for those callers rather than replacing it.
+async fn admin_ui_set_max_tunnels(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetMaxTunnelsReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_max_tunnels/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_max_tunnels(&account, req.max) {
+        return internal_error("admin_ui_set_max_tunnels/set", e).into_response();
+    }
+    let _ = st
+        .audit
+        .record(&session.email, "max_tunnels_set", Some(&subject), Some(&format!("max={}", req.max)));
+    StatusCode::OK.into_response()
+}
+
+#[derive(Serialize)]
+struct AdminRowResp {
+    email: String,
+    added_by: Option<String>,
+    added_at: i64,
+}
+
+/// `GET /admin-ui/admins` (admin-identity-gated): list current admins for the
+/// admin-console UI to render. Any verified admin may view this (not
+/// super-admin-only) -- knowing who else has admin access is not itself a
+/// privileged mutation.
+async fn admin_ui_list_admins(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    match st.admin.list_admins() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| AdminRowResp { email: r.email, added_by: r.added_by, added_at: r.added_at })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error("admin_ui_list_admins", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddAdminReq {
+    email: String,
+}
+
+/// `POST /admin-ui/admins {email}` (admin-identity-gated, super-admin-only):
+/// add a new admin. Requires the CALLER be the super-admin -- checked here (an
+/// honest `403` before even calling `AdminIdentity::add_admin`, so a
+/// non-super-admin gets a clear reason rather than a generic failure) AND again
+/// inside `add_admin` itself (defense in depth, ADR-0025 Decision 2).
+async fn admin_ui_add_admin(State(st): State<AdminUiState>, headers: HeaderMap, Json(req): Json<AddAdminReq>) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if !session.is_super_admin {
+        return (StatusCode::FORBIDDEN, "only the super-admin may add admins").into_response();
+    }
+    let email = req.email.trim();
+    if email.is_empty() {
+        return (StatusCode::BAD_REQUEST, "email is required").into_response();
+    }
+    match st.admin.add_admin(&session.email, email) {
+        Ok(()) => {
+            let _ = st.audit.record(&session.email, "admin_add", Some(email), None);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    }
+}
+
+/// `DELETE /admin-ui/admins/:email` (admin-identity-gated, super-admin-only):
+/// remove an admin. Same super-admin gate as [`admin_ui_add_admin`];
+/// `AdminIdentity::remove_admin` additionally refuses the super-admin's own row
+/// unconditionally, regardless of who is asking (ADR-0025 Decision 2).
+async fn admin_ui_remove_admin(State(st): State<AdminUiState>, headers: HeaderMap, Path(email): Path<String>) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if !session.is_super_admin {
+        return (StatusCode::FORBIDDEN, "only the super-admin may remove admins").into_response();
+    }
+    match st.admin.remove_admin(&session.email, &email) {
+        Ok(()) => {
+            let _ = st.audit.record(&session.email, "admin_remove", Some(&email), None);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    }
+}
+
+// ===== end ADR-0025 `/admin-ui/*` =====
+
 /// A new tunnel from the create form. #439 follow-up: linked from the UI
 /// (`tunnels_html`'s create-another-tunnel form) whenever the caller's owned
 /// tunnel count is under their account's real `max_tunnels` — see
@@ -798,18 +1136,34 @@ async fn create_tunnel(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
     }
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
+    };
+    // ADR-0025: the tunnel-creation admission gate for an admin-blocked account --
+    // checked before the max-tunnels gate below so a blocked account gets an
+    // honest "you are blocked" rather than being told it's merely over its quota.
+    // This is the OTHER real admission point the admin console's block action
+    // relies on, alongside `SqliteLedger::debit`/`debit_and_record_issuance` --
+    // portal-created tunnels never call those (they're free within the account's
+    // `max_tunnels`), so without this check here specifically, a blocked account
+    // could still self-serve new tunnels.
+    match st.ledger.is_blocked(&account) {
+        Ok(true) => {
+            return (StatusCode::FORBIDDEN, "this account is blocked from creating tunnels").into_response()
+        }
+        Ok(false) => {}
+        Err(e) => return internal_error("create_tunnel/is_blocked", e).into_response(),
+    }
     // #214: the Standard tier's default is 1 tunnel per account, but an
     // operator can raise this for a SPECIFIC account (SqliteLedger::
     // set_max_tunnels, via POST /admin/accounts/:subject/max-tunnels) to
     // unlock self-service creation of additional subdomains -- so the gate
     // compares against that account's own limit, not a hardcoded "ever own
     // one at all".
-    let max = match st.ledger.account_for_subject(&subject) {
-        Ok(account) => match st.ledger.max_tunnels(&account) {
-            Ok(m) => m,
-            Err(e) => return internal_error("create_tunnel/max_tunnels", e).into_response(),
-        },
-        Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
+    let max = match st.ledger.max_tunnels(&account) {
+        Ok(m) => m,
+        Err(e) => return internal_error("create_tunnel/max_tunnels", e).into_response(),
     };
     let hostname = st
         .dns
@@ -4371,6 +4725,235 @@ mod tests {
 
         assert_eq!(tunnels.list_for_subject(remote).unwrap().len(), 3, "remote really owns 3 real tunnel rows, not just 3 successful responses");
     }
+
+    // ===== ADR-0025 `/admin-ui/*` tests =====
+
+    const SUPER_ADMIN: &str = "super@example.com";
+
+    /// One app merging BOTH the self-service portal API and the `/admin-ui/*`
+    /// router over the SAME `ledger`/`tunnels` `Arc`s -- exactly how
+    /// `service.rs`'s `persistent_control_plane_router` wires them together in
+    /// production, which matters for the blocked-account test below (the block
+    /// action and the tunnel-creation attempt must observe the same storage).
+    fn test_admin_ui_app() -> (
+        Router,
+        Arc<SqliteLedger>,
+        Arc<SqliteTunnelStore>,
+        Arc<crate::admin_identity::AdminIdentity>,
+    ) {
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
+        let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
+        let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+
+        let portal_app = portal_api_router(
+            KEY,
+            ledger.clone(),
+            tunnels.clone(),
+            enrollment,
+            bootstrap,
+            "https://portal.example",
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            None,
+        );
+        let admin_app = admin_ui_router(
+            KEY,
+            admin.clone(),
+            audit,
+            ledger.clone(),
+            tunnels.clone(),
+            channels,
+            topologies,
+            networks,
+            pipelines,
+        );
+        (portal_app.merge(admin_app), ledger, tunnels, admin)
+    }
+
+    async fn admin_ui_req(app: &Router, method: &str, path: &str, cookie: &str, json_body: Option<&str>) -> StatusCode {
+        let mut b = Request::builder().method(method).uri(path).header("cookie", cookie);
+        let body = match json_body {
+            Some(j) => {
+                b = b.header("content-type", "application/json");
+                Body::from(j.to_string())
+            }
+            None => Body::empty(),
+        };
+        app.clone().oneshot(b.body(body).unwrap()).await.unwrap().status()
+    }
+
+    /// Every `/admin-ui/*` route must refuse a session that is verified (a real
+    /// `email_verified` IdP assertion, per `admin_session_from_headers`) but not
+    /// in the `admins` table -- `403`, not merely "not 200".
+    #[tokio::test]
+    async fn every_admin_ui_route_refuses_a_verified_but_non_admin_session_403() {
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        ledger.account_for_subject("kc-target").unwrap();
+        let non_admin = session_header_with_email("kc-someone", "not-an-admin@example.com");
+
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("POST", "/admin-ui/accounts/kc-target/credit", Some(r#"{"amount":10}"#)),
+            ("POST", "/admin-ui/accounts/kc-target/block", None),
+            ("POST", "/admin-ui/accounts/kc-target/unblock", None),
+            ("POST", "/admin-ui/accounts/kc-target/delete", None),
+            ("POST", "/admin-ui/accounts/kc-target/max-tunnels", Some(r#"{"max":3}"#)),
+            ("GET", "/admin-ui/admins", None),
+            ("POST", "/admin-ui/admins", Some(r#"{"email":"new@example.com"}"#)),
+            ("DELETE", "/admin-ui/admins/someone@example.com", None),
+        ];
+        for (method, path, body) in cases {
+            let status = admin_ui_req(&app, method, path, &non_admin, *body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} must 403 a verified non-admin session");
+        }
+    }
+
+    /// No session at all -> `401` (distinct from the 403-for-verified-non-admin
+    /// case above), on a representative route -- `admin_session_from_headers`'s
+    /// own `401`-vs-`403` contract is exhaustively unit-tested in
+    /// `admin_identity.rs`; this just proves the ROUTING actually reaches that
+    /// same check rather than, say, redirecting like the self-service `/portal/*`
+    /// routes do.
+    #[tokio::test]
+    async fn admin_ui_route_with_no_session_at_all_is_401_not_a_redirect() {
+        let (app, ..) = test_admin_ui_app();
+        let resp = app
+            .oneshot(Request::post("/admin-ui/accounts/kc-target/block").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `admin_ui_add_admin`/`admin_ui_remove_admin` require the SUPER-admin
+    /// specifically -- a regular (non-super) admin is an admin (passes
+    /// `admin_ui_authed`) but must still be refused here, with the target admin
+    /// row provably untouched.
+    #[tokio::test]
+    async fn admin_management_routes_refuse_a_regular_non_super_admin() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        admin.add_admin(SUPER_ADMIN, "regular-admin@example.com").unwrap();
+        let regular = session_header_with_email("kc-regular", "regular-admin@example.com");
+
+        let status = admin_ui_req(&app, "POST", "/admin-ui/admins", &regular, Some(r#"{"email":"third@example.com"}"#)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!admin.is_admin("third@example.com"), "the refused add must not have happened");
+
+        let status = admin_ui_req(&app, "DELETE", "/admin-ui/admins/regular-admin@example.com", &regular, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(admin.is_admin("regular-admin@example.com"), "the refused remove must not have happened");
+    }
+
+    #[tokio::test]
+    async fn super_admin_can_add_list_and_remove_a_regular_admin() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let status = admin_ui_req(&app, "POST", "/admin-ui/admins", &super_session, Some(r#"{"email":"second@example.com"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(admin.is_admin("second@example.com"));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/admin-ui/admins")
+                    .header("cookie", &super_session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.as_array().unwrap().iter().any(|r| r["email"] == "second@example.com"),
+            "listing includes the newly added admin: {json}"
+        );
+
+        let status = admin_ui_req(&app, "DELETE", "/admin-ui/admins/second@example.com", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!admin.is_admin("second@example.com"));
+    }
+
+    #[tokio::test]
+    async fn admin_ui_credit_route_credits_the_target_accounts_real_ledger_balance() {
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        let account = ledger.account_for_subject("kc-target").unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 0);
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/credit", &super_session, Some(r#"{"amount":500}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ledger.balance(&account).unwrap(), 500, "the real durable ledger balance actually moved");
+    }
+
+    /// Fail-first proof (ADR-0025): before `create_tunnel`'s `is_blocked` check
+    /// existed, this exact sequence (admin blocks the account, then that
+    /// account's own session tries `/portal/tunnels`) returned `303 See Other`
+    /// (self-service creation succeeded) instead of `403` -- the block flag was
+    /// set in storage but nothing on the tunnel-creation path ever read it. This
+    /// proves the check is real: the admin-console block action, the self-service
+    /// tunnel-creation admission path, and the SAME underlying account row.
+    #[tokio::test]
+    async fn a_blocked_account_is_refused_when_it_tries_to_create_a_tunnel() {
+        let (app, ledger, tunnels, _admin) = test_admin_ui_app();
+        let account = ledger.account_for_subject("kc-blocked").unwrap();
+        // Raise the limit so a refusal can only be the blocked check, never the
+        // (also-real, separately tested) max-tunnels quota.
+        ledger.set_max_tunnels(&account, 5).unwrap();
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-blocked/block", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ledger.is_blocked(&account).unwrap());
+
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "kc-blocked", "name=my-tunnel").await,
+            StatusCode::FORBIDDEN,
+            "a blocked account must be refused tunnel creation, not merely quota-limited"
+        );
+        assert!(tunnels.list_for_subject("kc-blocked").unwrap().is_empty(), "no tunnel was actually created");
+
+        // Unblock: the same account can now create normally -- proves the check
+        // is a live gate, not an accidental permanent lockout once blocked.
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-blocked/unblock", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(post_form(&app, "/portal/tunnels", "kc-blocked", "name=my-tunnel").await, StatusCode::SEE_OTHER);
+        assert_eq!(tunnels.list_for_subject("kc-blocked").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_ui_delete_account_cascades_and_removes_the_ledger_row_for_any_subject() {
+        let (app, ledger, tunnels, _admin) = test_admin_ui_app();
+        tunnels.create("kc-target", "t1", None).unwrap();
+        let account = ledger.account_for_subject("kc-target").unwrap();
+        ledger.credit(&account, 42).unwrap();
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/delete", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(tunnels.list_for_subject("kc-target").unwrap().is_empty(), "owned tunnels revoked");
+        // account_for_subject idempotently RE-CREATES a fresh (zero-balance)
+        // account for an unseen subject -- so a freshly-minted, different id with
+        // a zero balance proves the OLD funded row is really gone, not merely
+        // left alone.
+        let recreated = ledger.account_for_subject("kc-target").unwrap();
+        assert_ne!(recreated.0, account.0, "a fresh account id was minted -- the old row is gone");
+        assert_eq!(ledger.balance(&recreated).unwrap(), 0);
+    }
+
+    // ===== end ADR-0025 `/admin-ui/*` tests =====
 
     #[tokio::test]
     async fn install_page_carries_the_tunnels_own_assigned_hostname_not_a_bare_mesh_tunnel() {
