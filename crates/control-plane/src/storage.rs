@@ -1833,6 +1833,15 @@ pub struct SubjectTunnel {
     pub routing_token: String,
 }
 
+/// One row of `disabled_hostnames` (ADR-0025) -- the admin console's own
+/// listing of what it has blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisabledHostnameRow {
+    pub hostname: String,
+    pub disabled_by: String,
+    pub disabled_at: i64,
+}
+
 /// Rot/Gelb/Grün certificate-tier state for one hostname (#233 admission
 /// queue broker). See [`SqliteTunnelStore::cert_admission_for_hostname`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2129,6 +2138,16 @@ impl SqliteTunnelStore {
                  note         TEXT NOT NULL DEFAULT '',
                  requested_at INTEGER NOT NULL,
                  PRIMARY KEY (hostname, email)
+             );
+             -- ADR-0025 (admin console): a hostname an admin has explicitly disabled.
+             -- The enforcer lives in `portal_api::authorize_hostname` -- see
+             -- `is_hostname_disabled`'s own doc for why the check belongs there rather
+             -- than anywhere else (every path that would (re-)authorize a hostname at
+             -- the edge funnels through that one function).
+             CREATE TABLE IF NOT EXISTS disabled_hostnames (
+                 hostname     TEXT PRIMARY KEY,
+                 disabled_by  TEXT NOT NULL,
+                 disabled_at  INTEGER NOT NULL
              );",
         )?;
         // #406: nothing previously enforced one-tunnel-per-hostname -- `idx_subject_tunnels_
@@ -2475,6 +2494,72 @@ impl SqliteTunnelStore {
             .optional()?
             .map(|n| n != 0)
             .unwrap_or(false))
+    }
+
+    /// ADR-0025 (admin console): mark `hostname` disabled -- the enforcer,
+    /// [`Self::is_hostname_disabled`], is consulted by `portal_api::
+    /// authorize_hostname` (every path that would (re-)authorize a hostname at
+    /// the edge funnels through that one function), so once this returns, no
+    /// future authorize-host push for `hostname` succeeds until
+    /// [`Self::enable_hostname`] reverses it. Idempotent: disabling an
+    /// already-disabled hostname just refreshes who/when.
+    pub fn disable_hostname(&self, hostname: &str, disabled_by: &str, at: i64) -> rusqlite::Result<()> {
+        self.writer.lock_safe().execute(
+            "INSERT INTO disabled_hostnames (hostname, disabled_by, disabled_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(hostname) DO UPDATE SET disabled_by = excluded.disabled_by, disabled_at = excluded.disabled_at",
+            params![hostname, disabled_by, at],
+        )?;
+        Ok(())
+    }
+
+    /// Reverse [`Self::disable_hostname`]. Returns whether a row was actually
+    /// removed (`false` if `hostname` wasn't disabled). Deliberately does NOT
+    /// re-push the edge authorize-host call itself -- disabling one revoked the
+    /// tunnel's live routing-token registration (see the `/admin-ui/hostnames/
+    /// :host/disable` handler), so simply lifting the block here only permits
+    /// the NEXT ordinary authorize_hostname call (e.g. the owner recreating the
+    /// tunnel) to succeed again.
+    pub fn enable_hostname(&self, hostname: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .writer
+            .lock_safe()
+            .execute("DELETE FROM disabled_hostnames WHERE hostname = ?1", params![hostname])?;
+        Ok(n > 0)
+    }
+
+    /// Whether `hostname` is currently admin-disabled -- the one check
+    /// [`crate::portal_api::authorize_hostname`] makes before ever pushing an
+    /// authorize-host call to the edge (ADR-0025's "flag needs an enforcer"
+    /// discipline, same shape as [`crate::accounts::AccountId`]'s block flag).
+    pub fn is_hostname_disabled(&self, hostname: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT 1 FROM disabled_hostnames WHERE hostname = ?1",
+                params![hostname],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every disabled hostname, most-recently-disabled first -- the admin
+    /// console's own visibility into what it has blocked.
+    pub fn list_disabled_hostnames(&self) -> rusqlite::Result<Vec<DisabledHostnameRow>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT hostname, disabled_by, disabled_at FROM disabled_hostnames ORDER BY disabled_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DisabledHostnameRow {
+                    hostname: r.get(0)?,
+                    disabled_by: r.get(1)?,
+                    disabled_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// #501: enable/disable the "any authenticated account may enter" mode for a
@@ -5376,6 +5461,156 @@ pub struct AdminRow {
     pub email: String,
     pub added_by: Option<String>,
     pub added_at: i64,
+}
+
+/// Bare CRUD on `managed_domains` + `managed_domain_hostnames` (ADR-0025
+/// Decision 4: multi-domain onboarding). No policy here (mirrors
+/// [`SqliteAdminStore`]'s own split) -- `domain_admin`'s handlers own the real
+/// DNS/cert side effects and decide what `status` means; this store just
+/// persists whatever they decide.
+///
+/// `managed_domains` is the onboarded-zone registry (`POST /admin-ui/domains`);
+/// `managed_domain_hostnames` records every subdomain cert issued under one of
+/// those zones (`POST /admin-ui/domains/:zone/hostnames`) so the cert-expiry
+/// dashboard (`GET /admin-ui/certs`) knows which per-domain cert files exist
+/// without scanning the filesystem.
+pub struct SqliteManagedDomains {
+    conn: Mutex<Connection>,
+}
+
+sqlite_store_ctors!(SqliteManagedDomains);
+
+impl SqliteManagedDomains {
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS managed_domains (
+                 zone     TEXT PRIMARY KEY,
+                 added_by TEXT,
+                 added_at INTEGER NOT NULL,
+                 status   TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS managed_domain_hostnames (
+                 hostname  TEXT PRIMARY KEY,
+                 zone      TEXT NOT NULL,
+                 cert_dir  TEXT NOT NULL,
+                 issued_by TEXT,
+                 issued_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_managed_domain_hostnames_zone
+                 ON managed_domain_hostnames (zone);",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Register `zone` as managed. Returns `false` (no-op) if `zone` is already
+    /// present -- the caller (`domain_admin::register_domain`) treats that as
+    /// "already onboarded", not an error, since the real work (DNS records) is
+    /// idempotent too.
+    pub fn add_zone(&self, zone: &str, added_by: &str, added_at: i64, status: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "INSERT OR IGNORE INTO managed_domains (zone, added_by, added_at, status) VALUES (?1, ?2, ?3, ?4)",
+            params![zone, added_by, added_at, status],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn zone(&self, zone: &str) -> rusqlite::Result<Option<ManagedDomainRow>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT zone, added_by, added_at, status FROM managed_domains WHERE zone = ?1",
+                params![zone],
+                |r| {
+                    Ok(ManagedDomainRow {
+                        zone: r.get(0)?,
+                        added_by: r.get(1)?,
+                        added_at: r.get(2)?,
+                        status: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Every managed domain, most-recently-added first.
+    pub fn list_zones(&self) -> rusqlite::Result<Vec<ManagedDomainRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT zone, added_by, added_at, status FROM managed_domains ORDER BY added_at DESC")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ManagedDomainRow {
+                    zone: r.get(0)?,
+                    added_by: r.get(1)?,
+                    added_at: r.get(2)?,
+                    status: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record a subdomain cert issued under a managed zone (idempotent upsert --
+    /// a re-issued cert just refreshes `issued_at`/`issued_by`/`cert_dir`).
+    pub fn record_hostname_cert(
+        &self,
+        hostname: &str,
+        zone: &str,
+        cert_dir: &str,
+        issued_by: &str,
+        issued_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "INSERT INTO managed_domain_hostnames (hostname, zone, cert_dir, issued_by, issued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(hostname) DO UPDATE SET
+                 cert_dir = excluded.cert_dir, issued_by = excluded.issued_by, issued_at = excluded.issued_at",
+            params![hostname, zone, cert_dir, issued_by, issued_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every subdomain cert issued under any managed zone -- the cert-expiry
+    /// dashboard's source of which per-domain cert files to check.
+    pub fn list_hostname_certs(&self) -> rusqlite::Result<Vec<ManagedDomainHostnameRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT hostname, zone, cert_dir, issued_by, issued_at FROM managed_domain_hostnames ORDER BY hostname",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ManagedDomainHostnameRow {
+                    hostname: r.get(0)?,
+                    zone: r.get(1)?,
+                    cert_dir: r.get(2)?,
+                    issued_by: r.get(3)?,
+                    issued_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// One row of `managed_domains` (ADR-0025 Decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDomainRow {
+    pub zone: String,
+    pub added_by: Option<String>,
+    pub added_at: i64,
+    pub status: String,
+}
+
+/// One row of `managed_domain_hostnames` (ADR-0025 Decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDomainHostnameRow {
+    pub hostname: String,
+    pub zone: String,
+    pub cert_dir: String,
+    pub issued_by: Option<String>,
+    pub issued_at: i64,
 }
 
 #[cfg(test)]
@@ -8596,5 +8831,106 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    // ===== ADR-0025: disabled_hostnames (SqliteTunnelStore) =====
+
+    /// Fail-first proof: an ordinary hostname must NOT read as disabled --
+    /// otherwise every other assertion in this group would pass vacuously.
+    #[test]
+    fn a_hostname_nobody_ever_disabled_is_not_disabled() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        assert!(!store.is_hostname_disabled("never-touched.example").unwrap());
+    }
+
+    #[test]
+    fn disable_hostname_is_visible_via_is_hostname_disabled_and_reversible_via_enable() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.disable_hostname("evil.example", "admin@example.com", 1000).unwrap();
+        assert!(store.is_hostname_disabled("evil.example").unwrap());
+
+        let removed = store.enable_hostname("evil.example").unwrap();
+        assert!(removed, "enable_hostname must report the row it just removed");
+        assert!(!store.is_hostname_disabled("evil.example").unwrap());
+    }
+
+    #[test]
+    fn enable_hostname_on_a_never_disabled_host_is_a_harmless_no_op() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        assert!(!store.enable_hostname("never-disabled.example").unwrap());
+    }
+
+    #[test]
+    fn disable_hostname_is_idempotent_and_refreshes_who_and_when() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.disable_hostname("host.example", "first-admin@example.com", 100).unwrap();
+        store.disable_hostname("host.example", "second-admin@example.com", 200).unwrap();
+        let rows = store.list_disabled_hostnames().unwrap();
+        assert_eq!(rows.len(), 1, "re-disabling must not duplicate the row");
+        assert_eq!(rows[0].disabled_by, "second-admin@example.com");
+        assert_eq!(rows[0].disabled_at, 200);
+    }
+
+    #[test]
+    fn list_disabled_hostnames_is_newest_first() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.disable_hostname("a.example", "admin@example.com", 100).unwrap();
+        store.disable_hostname("b.example", "admin@example.com", 200).unwrap();
+        let rows = store.list_disabled_hostnames().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].hostname, "b.example", "newest first");
+        assert_eq!(rows[1].hostname, "a.example");
+    }
+
+    // ===== ADR-0025: SqliteManagedDomains =====
+
+    #[test]
+    fn add_zone_then_zone_round_trips_and_a_second_add_is_a_no_op() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        assert!(store.add_zone("example.org", "admin@example.com", 1000, "active").unwrap());
+        // Re-adding the same zone must not error or overwrite -- "already onboarded".
+        assert!(!store.add_zone("example.org", "someone-else@example.com", 2000, "active").unwrap());
+
+        let row = store.zone("example.org").unwrap().expect("zone exists");
+        assert_eq!(row.added_by.as_deref(), Some("admin@example.com"), "the FIRST add wins");
+        assert_eq!(row.added_at, 1000);
+        assert_eq!(row.status, "active");
+    }
+
+    #[test]
+    fn zone_is_none_for_a_never_registered_domain() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        assert_eq!(store.zone("never-onboarded.example").unwrap(), None);
+    }
+
+    #[test]
+    fn list_zones_is_newest_first() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        store.add_zone("a.example", "admin@example.com", 100, "active").unwrap();
+        store.add_zone("b.example", "admin@example.com", 200, "active").unwrap();
+        let rows = store.list_zones().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].zone, "b.example");
+        assert_eq!(rows[1].zone, "a.example");
+    }
+
+    #[test]
+    fn record_hostname_cert_round_trips_and_upserts_on_reissue() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        store
+            .record_hostname_cert("app.example.org", "example.org", "/certs/managed/app.example.org", "admin@example.com", 1000)
+            .unwrap();
+        let rows = store.list_hostname_certs().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].zone, "example.org");
+        assert_eq!(rows[0].cert_dir, "/certs/managed/app.example.org");
+
+        // Re-issuance (e.g. renewal) upserts, not duplicates.
+        store
+            .record_hostname_cert("app.example.org", "example.org", "/certs/managed/app.example.org", "admin@example.com", 2000)
+            .unwrap();
+        let rows = store.list_hostname_certs().unwrap();
+        assert_eq!(rows.len(), 1, "re-issuing the same hostname's cert must not duplicate the row");
+        assert_eq!(rows[0].issued_at, 2000);
     }
 }
