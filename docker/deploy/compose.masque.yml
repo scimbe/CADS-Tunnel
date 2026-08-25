@@ -1,0 +1,78 @@
+# Optional MASQUE (RFC 9298 CONNECT-UDP) fallback overlay (ADR-0024 M4). Lets an
+# ct-agent whose network blocks raw outbound UDP outright still reach this edge's
+# real QUIC endpoint -- tunneled over HTTP/2 Extended CONNECT (RFC 9220) on the
+# SAME published :443 front door everything else already uses, so on the wire it
+# looks like ordinary HTTPS. See docs/adr/0024-masque-connect-udp-fallback.md.
+#
+# OFF BY DEFAULT: opt in by naming it explicitly, same convention as every other
+# overlay here. Prereq: the edge's :443 front door must already be enabled
+# (compose.frontdoor.yml) -- this overlay only adds the MASQUE proxy backend + its
+# front-door route on top:
+#
+#   docker compose \
+#     -f docker/deploy/compose.selfhost.yml \
+#     -f docker/deploy/compose.frontdoor.yml \
+#     [-f docker/deploy/compose.sso.yml] \
+#     -f docker/deploy/compose.masque.yml \
+#     --env-file docker/deploy/.env up --build -d
+#
+# .env keys this overlay reads:
+#   MASQUE_PUBLIC_HOST   the hostname routed to the MASQUE proxy backend (e.g.
+#                        masque.<zone>), its DNS pointed at this edge like every
+#                        other front-door hostname. Served + terminated at :443.
+#   MASQUE_CERT_DIR      host dir with the BYO cert for MASQUE_PUBLIC_HOST --
+#                        fullchain.pem + privkey.pem (LE via deSEC DNS-01, same
+#                        mechanism as the Portal/Auth certs -- scripts/lib-acme.sh).
+#                        Never committed.
+#
+# masque-proxy runs in the edge container's OWN network namespace
+# (`network_mode: service:edge`), not its own -- ADR-0024 M2's by-construction
+# target restriction compares the CONNECT-UDP request path byte-for-byte against
+# `CT_MASQUE_PROXY_TARGET_ADDR` as resolved; sharing the edge's netns lets that
+# target be the trivially stable literal `127.0.0.1:4433` (the edge's own
+# CT_EDGE_LISTEN, reached over loopback) instead of a Docker-internal IP that can
+# change across a network recreate. A ct-agent's own CT_AGENT_MASQUE_TARGET must
+# be set to this SAME literal `127.0.0.1:4433` -- it is only ever a label the two
+# sides compare, never an address the agent itself dials.
+
+name: ct-selfhost
+
+services:
+  masque-proxy:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: production
+    image: ct-testbed
+    command: ["masque-proxy"]
+    # Shares the edge container's network namespace -- see the header comment for
+    # why. No `ports:`/`expose:` here: under a shared network_mode those are
+    # ignored, and there is nothing to publish anyway (only the edge process
+    # itself, over loopback, ever talks to this).
+    network_mode: "service:edge"
+    depends_on:
+      edge:
+        condition: service_started
+    # #312-style bound (matches every other service on this shared, no-swap host,
+    # see compose.selfhost.yml's control-plane/edge limits) -- sized above this
+    # thin proxy's real footprint, not tightly.
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.5
+    user: "65532:65532"
+    environment:
+      CT_MASQUE_PROXY_LISTEN: "127.0.0.1:4434"
+      CT_MASQUE_PROXY_TARGET_ADDR: "127.0.0.1:4433"
+    restart: unless-stopped
+
+  edge:
+    environment:
+      CT_EDGE_MASQUE_HOST: "${MASQUE_PUBLIC_HOST:?set MASQUE_PUBLIC_HOST=masque.<zone>}"
+      CT_EDGE_MASQUE_ADDR: "127.0.0.1:4434"
+      CT_EDGE_MASQUE_CERT: "/certs/masque/fullchain.pem"
+      CT_EDGE_MASQUE_KEY: "/certs/masque/privkey.pem"
+    volumes:
+      # BYO cert for MASQUE_PUBLIC_HOST (fullchain.pem + privkey.pem), obtained
+      # like the Portal's/Auth's via deSEC DNS-01. Never committed -- supplied
+      # from the host.
+      - "${MASQUE_CERT_DIR:?set MASQUE_CERT_DIR=<host dir with masque fullchain.pem+privkey.pem>}:/certs/masque:ro"
