@@ -1,12 +1,12 @@
 # ADR-0024 — MASQUE/CONNECT-UDP (RFC 9298) as a third transport rung for UDP-blocked networks
 
 ## Status
-Proposed; **M1 (feasibility spike) complete and PASSED**, 2026-08-25 — see its own
-section below. Builds on ADR-0004 (QUIC data-plane transport with TCP fallback),
-ADR-0010 (Mesh-Plane-first / Browser-Plane SNI), ADR-0019 (unified :443 gateway).
-Tracked by ct-agent#81 (design-tracking issue, recon already done there) and this
-ADR's own decomposition below. Operator green-lit real design + implementation work
-2026-08-25.
+Proposed; **M1 (feasibility spike) and M2 (proxy backend + edge registration)
+complete**, 2026-08-25 — see their own sections below. Builds on ADR-0004 (QUIC
+data-plane transport with TCP fallback), ADR-0010 (Mesh-Plane-first / Browser-Plane
+SNI), ADR-0019 (unified :443 gateway). Tracked by ct-agent#81 (design-tracking
+issue, recon already done there) and this ADR's own decomposition below. Operator
+green-lit real design + implementation work 2026-08-25.
 
 ## Context
 ADR-0004 already anticipates UDP-blocked networks and falls back to a TCP-framed
@@ -142,18 +142,28 @@ rather than left implicit in "use RFC 9298."
 
   If this had failed, Decision 1 would need revisiting before M2+; it didn't, so M2 is
   unblocked.
-- **M2 — CONNECT-UDP proxy backend + edge registration.** (Revised shape, see Decision
-  2.) A new local process (own crate/binary, `crates/masque-proxy` or similar) that
-  speaks h2 + Capsule Protocol on a plain TCP port and, on a valid CONNECT-UDP
-  request, pumps datagrams bidirectionally to/from a real UDP socket -- **hard-
-  restricted to this edge's own QUIC listener as the only legitimate target**
-  (validate `target_host`/`target_port` against one configured address; reject
-  everything else) rather than a general-purpose relay, which sidesteps the #559
-  open-UDP-relay risk by construction instead of by allowlist logic. Registered into
-  `serve.rs`'s existing `proxies` map via a new `CT_EDGE_MASQUE_HOST`/
-  `CT_EDGE_MASQUE_ADDR` pair, mirroring the Portal/Auth-IdP registration block
-  verbatim -- no changes to `sni.rs` or the front-door dispatch `match`. Bounded per
-  #559/#54 conventions (timeouts, rate limits); unit + integration tests.
+- **M2 — CONNECT-UDP proxy backend + edge registration — DONE (2026-08-25,
+  `crates/masque-proxy`, #651/PR#652 + PR#653).** Built exactly as revised in
+  Decision 2: a new local process (`crates/masque-proxy`) speaking h2 + Capsule
+  Protocol on a plain TCP port, pumping datagrams bidirectionally to/from a real
+  UDP socket. **Hard-restricted by construction, not allowlist**: every CONNECT-UDP
+  request's path is compared byte-for-byte against one path precomputed from the
+  single configured target (this edge's own `CT_EDGE_LISTEN`) -- there is no code
+  path that can proxy anywhere else. Registered into `serve.rs`'s `proxies` map via
+  `CT_EDGE_MASQUE_HOST`/`CT_EDGE_MASQUE_ADDR`, mirroring Portal/Auth-IdP verbatim
+  (PR#653) -- zero changes to `sni.rs` or the dispatch `match`, confirmed. Bounded
+  per #559/#54 (concurrent-tunnel semaphore, idle timeout, declared-capsule-length
+  cap against a peer claiming an absurd size). Two real end-to-end tests: a
+  datagram round-tripping through a live `masque_proxy::run` instance to a real UDP
+  target, and a dedicated rejection test for the security-critical property (any
+  other target gets `RST_STREAM`, never proxied). Opt-in -- both env vars unset by
+  default, no existing deployment affected.
+
+  One process/deploy hygiene note for whoever picks up M4: `CT_MASQUE_PROXY_TARGET_ADDR`
+  (on the `masque-proxy` binary) and `CT_EDGE_LISTEN` (on the edge binary) must be
+  kept in sync by the operator at deploy time -- nothing in code enforces the two
+  configs agree, since they're two separate processes/binaries with no shared
+  config source today.
 - **M3 — ct-agent client side.** New `EdgeRung::Masque` in `ladder.rs`; QUIC-over-
   MASQUE-tunnel dial reusing the existing `quinn` stack against the tunneled UDP path;
   wired into the existing ladder-walk/registration-role logic between `Quic` and
