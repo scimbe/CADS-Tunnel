@@ -550,6 +550,64 @@ struct AdminUiState {
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    /// ADR-0025 Decision 4: the onboarded-zone registry.
+    managed_domains: Arc<crate::storage::SqliteManagedDomains>,
+    /// ADR-0025 Decision 4/6: everything else the domain/hostname routes need.
+    domain_admin: DomainAdminConfig,
+}
+
+/// ADR-0025 Decision 4/6: config for the domain/hostname admin routes, bundled
+/// into one struct (rather than five more positional params on
+/// [`admin_ui_router`]) so a future field addition doesn't ripple through
+/// every call site's positional argument list.
+#[derive(Clone, Default)]
+pub struct DomainAdminConfig {
+    /// Edge admin API base + shared token (`CT_CP_EDGE_ADMIN_URL`/`_TOKEN`) --
+    /// same config [`portal_api_router`]'s own `edge_admin` param takes,
+    /// reused here for the hostname-disable route's revoke call.
+    pub edge_admin: Option<(String, String)>,
+    /// The public IP a newly onboarded zone's A records should point at
+    /// (`CT_CP_DNS_EDGE_IP`) -- same value `portal_api_router`'s own DNS
+    /// autopilot uses for auto-assigned Standard-tier hostnames.
+    pub dns_edge_ip: Option<String>,
+    /// The deSEC API token (`DESEC_TOKEN`). Kept as a raw value here (not a
+    /// pre-built `DesecClient`) because [`DesecClient`] is bound to exactly
+    /// ONE zone at construction (`DESEC_DOMAIN`) -- onboarding a NEW zone
+    /// needs a fresh, differently-zoned client per call
+    /// ([`desec_client_for_zone`]), built from this token.
+    pub desec_token: Option<String>,
+    /// `DESEC_API_BASE`, if the operator overrode the default.
+    pub desec_api_base: Option<String>,
+    /// Subdomain cert issuance config (`POST /admin-ui/domains/:zone/hostnames`)
+    /// -- `None` when `CT_CP_LIB_ACME_PATH` isn't configured, in which case
+    /// that route `503`s with a clear reason instead of trying and failing
+    /// opaquely partway through a subprocess call.
+    pub managed_cert: Option<ManagedCertConfig>,
+    /// Front-door cert file paths for the expiry dashboard (`GET
+    /// /admin-ui/certs`) -- each `None` renders as `NotConfigured`, never
+    /// silently omitted from the response.
+    pub front_door_certs: FrontDoorCertPaths,
+}
+
+/// Where + how to issue a subdomain cert under a managed zone
+/// ([`crate::cert_issuer::issue_cert`]'s config, plus the base directory
+/// individual hostnames' cert dirs nest under).
+#[derive(Clone)]
+pub struct ManagedCertConfig {
+    pub acme: crate::cert_issuer::AcmeConfig,
+    pub cert_base_dir: String,
+}
+
+/// Configured front-door cert file paths this control-plane process can read
+/// directly off its own filesystem (mirrors `CT_CP_EDGE_CERT_PATH`'s existing
+/// shared-volume-with-the-edge convention, `service.rs`) -- `GET
+/// /admin-ui/certs`'s fixed four slots, before any per-managed-domain certs.
+#[derive(Clone, Default)]
+pub struct FrontDoorCertPaths {
+    pub portal: Option<String>,
+    pub auth: Option<String>,
+    pub masque: Option<String>,
+    pub admin_ui: Option<String>,
 }
 
 /// Resolve + require an admin session for an `/admin-ui/*` handler — the one gate
@@ -577,6 +635,8 @@ pub fn admin_ui_router(
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    managed_domains: Arc<crate::storage::SqliteManagedDomains>,
+    domain_admin: DomainAdminConfig,
 ) -> Router {
     Router::new()
         .route("/admin-ui/accounts/:subject/credit", post(admin_ui_credit_account))
@@ -586,6 +646,14 @@ pub fn admin_ui_router(
         .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
         .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
         .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
+        // ADR-0025 Decision 4/6: hostname disable/enable + multi-domain onboarding
+        // + cert-expiry dashboard. See each handler's own doc for its exact contract.
+        .route("/admin-ui/hostnames/:host/disable", post(admin_ui_disable_hostname))
+        .route("/admin-ui/hostnames/:host/enable", post(admin_ui_enable_hostname))
+        .route("/admin-ui/hostnames/disabled", get(admin_ui_list_disabled_hostnames))
+        .route("/admin-ui/domains", get(admin_ui_list_domains).post(admin_ui_register_domain))
+        .route("/admin-ui/domains/:zone/hostnames", post(admin_ui_add_domain_hostname))
+        .route("/admin-ui/certs", get(admin_ui_certs))
         .with_state(AdminUiState {
             session_key: Arc::from(session_key.to_vec()),
             admin,
@@ -596,6 +664,8 @@ pub fn admin_ui_router(
             topologies,
             networks,
             pipelines,
+            managed_domains,
+            domain_admin,
         })
 }
 
@@ -859,6 +929,388 @@ async fn admin_ui_remove_admin(State(st): State<AdminUiState>, headers: HeaderMa
     }
 }
 
+fn admin_ui_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `POST /admin-ui/hostnames/:host/disable` (admin-identity-gated): revoke
+/// authorization for `host` AND prevent it being re-authorized until an
+/// explicit [`admin_ui_enable_hostname`] reverses it.
+///
+/// Two independent effects, matching the task's own split:
+/// 1. **Prevent future re-authorization** -- [`crate::storage::SqliteTunnelStore::
+///    disable_hostname`] marks the row; the enforcer is `authorize_hostname`'s
+///    own `is_hostname_disabled` check (the ADR's "flag needs an enforcer"
+///    discipline, same shape as the blocked-account check).
+/// 2. **Revoke the currently-live authorization**, if any -- reuses the exact
+///    same edge machinery [`delete_tunnel`] already uses (`POST
+///    /admin/revoke/:token` via [`edge_admin_http_client`]), looking the
+///    routing token up via [`crate::storage::SqliteTunnelStore::
+///    routing_token_for_hostname`]. Best-effort and logged like every other
+///    edge-admin call in this file: a hostname with no live tunnel on it right
+///    now still gets step 1 (there's simply nothing to revoke).
+async fn admin_ui_disable_hostname(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(host): Path<String>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(host) = ct_common::normalize_hostname(&host) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    if let Err(e) = st.tunnels.disable_hostname(&host, &session.email, admin_ui_now_secs()) {
+        return internal_error("admin_ui_disable_hostname/disable_hostname", e).into_response();
+    }
+
+    let mut detail = "no live tunnel on this hostname to revoke".to_string();
+    if let Some((edge_url, edge_token)) = &st.domain_admin.edge_admin {
+        match st.tunnels.routing_token_for_hostname(&host) {
+            Ok(Some(token)) => {
+                let endpoint = format!("{}/admin/revoke/{}", edge_url.trim_end_matches('/'), token);
+                match edge_admin_http_client()
+                    .post(&endpoint)
+                    .header("x-ct-admin-token", edge_token.as_str())
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => detail = "revoked the live tunnel on this hostname".to_string(),
+                    Ok(r) => {
+                        detail = format!("edge revoke returned {}", r.status());
+                        eprintln!("ct-cp: admin_ui_disable_hostname: edge revoke for {host} returned {}", r.status());
+                    }
+                    Err(e) => {
+                        let redacted = redact_routing_tokens(&e.to_string());
+                        detail = format!("edge revoke failed: {redacted}");
+                        eprintln!("ct-cp: admin_ui_disable_hostname: edge revoke for {host} failed: {redacted}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("ct-cp: admin_ui_disable_hostname: routing_token_for_hostname for {host} failed: {e}"),
+        }
+    }
+    let _ = st.audit.record(&session.email, "hostname_disable", Some(&host), Some(&detail));
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/hostnames/:host/enable` (admin-identity-gated): reverse
+/// [`admin_ui_disable_hostname`]'s block. Deliberately does NOT re-push an
+/// edge authorize-host call itself -- disabling revoked any live tunnel's
+/// registration, so this only permits the NEXT ordinary authorize_hostname
+/// call (the owner recreating the tunnel, or the admin re-provisioning it) to
+/// succeed again.
+async fn admin_ui_enable_hostname(State(st): State<AdminUiState>, headers: HeaderMap, Path(host): Path<String>) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(host) = ct_common::normalize_hostname(&host) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    match st.tunnels.enable_hostname(&host) {
+        Ok(was_disabled) => {
+            let _ = st.audit.record(
+                &session.email,
+                "hostname_enable",
+                Some(&host),
+                Some(if was_disabled { "was disabled" } else { "was not disabled (no-op)" }),
+            );
+            StatusCode::OK.into_response()
+        }
+        Err(e) => internal_error("admin_ui_enable_hostname/enable_hostname", e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct DisabledHostnameResp {
+    hostname: String,
+    disabled_by: String,
+    disabled_at: i64,
+}
+
+/// `GET /admin-ui/hostnames/disabled` (admin-identity-gated): every currently
+/// admin-disabled hostname -- the console's own visibility into what it has
+/// blocked, mirroring [`admin_ui_list_admins`]'s "any verified admin may view"
+/// posture (viewing isn't itself a privileged mutation).
+async fn admin_ui_list_disabled_hostnames(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    match st.tunnels.list_disabled_hostnames() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| DisabledHostnameResp { hostname: r.hostname, disabled_by: r.disabled_by, disabled_at: r.disabled_at })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error("admin_ui_list_disabled_hostnames", e).into_response(),
+    }
+}
+
+/// Build a [`DesecClient`] scoped to `zone` from a raw token (ADR-0025 Decision
+/// 4): [`DesecClient::from_env`]/the module-wide client `portal_api_router`
+/// already builds are bound to exactly ONE zone (`DESEC_DOMAIN`) at
+/// construction and refuse (`guard_under_zone`) any host outside it -- onboarding
+/// a genuinely NEW zone needs a differently-zoned client, built here via
+/// [`DesecClient::from_lookup`] rather than `from_env` reading the process
+/// environment (which still only ever names the ORIGINAL zone).
+fn desec_client_for_zone(zone: &str, token: &str, api_base: Option<&str>) -> Option<DesecClient> {
+    let token = token.to_string();
+    let zone = zone.to_string();
+    let api_base = api_base.map(str::to_string);
+    DesecClient::from_lookup(move |k| match k {
+        "DESEC_TOKEN" => Some(token.clone()),
+        "DESEC_DOMAIN" => Some(zone.clone()),
+        "DESEC_API_BASE" => api_base.clone(),
+        _ => None,
+    })
+}
+
+#[derive(Deserialize)]
+struct RegisterDomainReq {
+    zone: String,
+}
+
+#[derive(Serialize)]
+struct ManagedDomainResp {
+    zone: String,
+    added_by: Option<String>,
+    added_at: i64,
+    status: String,
+}
+
+/// `POST /admin-ui/domains {zone}` (admin-identity-gated, ADR-0025 Decision 4):
+/// register a new zone as managed. Does **not** attempt DNS delegation --
+/// per the ADR, that's the documented one-time human step at the registrar,
+/// assumed already done by the time this is called. Issues the apex + wildcard
+/// A records via [`DesecClient::set_a`], pointed at [`DomainAdminConfig::
+/// dns_edge_ip`], and only inserts the `managed_domains` row once BOTH
+/// succeed -- a `DesecClient` call failing (e.g. the zone isn't actually under
+/// deSEC's management yet) reports a clear, actionable error and leaves NO
+/// half-registered row behind, rather than a zone that looks managed but has
+/// no real DNS.
+async fn admin_ui_register_domain(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterDomainReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(zone) = ct_common::normalize_hostname(req.zone.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid zone").into_response();
+    };
+    match st.managed_domains.zone(&zone) {
+        Ok(Some(_)) => return (StatusCode::CONFLICT, format!("{zone} is already managed")).into_response(),
+        Ok(None) => {}
+        Err(e) => return internal_error("admin_ui_register_domain/zone", e).into_response(),
+    }
+    let Some(token) = st.domain_admin.desec_token.as_deref().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DESEC_TOKEN is not configured on this deployment -- cannot manage DNS for a new zone",
+        )
+            .into_response();
+    };
+    let Some(edge_ip) = st.domain_admin.dns_edge_ip.as_deref().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CT_CP_DNS_EDGE_IP is not configured -- cannot point the new zone's A records anywhere",
+        )
+            .into_response();
+    };
+    let Some(client) = desec_client_for_zone(&zone, token, st.domain_admin.desec_api_base.as_deref()) else {
+        return internal_error("admin_ui_register_domain/desec_client_for_zone", "failed to build a deSEC client").into_response();
+    };
+    if let Err(e) = client.set_a(&zone, edge_ip).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("apex A record for {zone} failed -- is the zone actually delegated to deSEC yet? ({e})"),
+        )
+            .into_response();
+    }
+    let wildcard = format!("*.{zone}");
+    if let Err(e) = client.set_a(&wildcard, edge_ip).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "the apex A record for {zone} WAS created, but the wildcard record for {wildcard} failed: {e} \
+                 -- retrying this call is safe (both records are idempotent upserts)"
+            ),
+        )
+            .into_response();
+    }
+    let now = admin_ui_now_secs();
+    match st.managed_domains.add_zone(&zone, &session.email, now, "active") {
+        Ok(_) => {
+            let _ = st.audit.record(&session.email, "domain_register", Some(&zone), Some("apex+wildcard A records issued"));
+            Json(ManagedDomainResp { zone, added_by: Some(session.email), added_at: now, status: "active".to_string() }).into_response()
+        }
+        Err(e) => internal_error("admin_ui_register_domain/add_zone", e).into_response(),
+    }
+}
+
+/// `GET /admin-ui/domains` (admin-identity-gated): every managed domain +
+/// status, newest first.
+async fn admin_ui_list_domains(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    match st.managed_domains.list_zones() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| ManagedDomainResp { zone: r.zone, added_by: r.added_by, added_at: r.added_at, status: r.status })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error("admin_ui_list_domains", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddDomainHostnameReq {
+    subdomain: String,
+}
+
+#[derive(Serialize)]
+struct AddDomainHostnameResp {
+    hostname: String,
+    cert_dir: String,
+}
+
+/// `POST /admin-ui/domains/:zone/hostnames {subdomain}` (admin-identity-gated,
+/// ADR-0025 Decision 4): given an already-managed zone, issue a cert for
+/// `subdomain.zone` via [`crate::cert_issuer::issue_cert`] (`lib-acme.sh`'s
+/// `issue_cert`, shelled out to -- see that module's doc for why). Runs the
+/// blocking subprocess call on `spawn_blocking` so it doesn't stall this
+/// handler's async worker for the (potentially tens-of-seconds) duration of a
+/// real ACME issuance.
+async fn admin_ui_add_domain_hostname(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(zone): Path<String>,
+    Json(req): Json<AddDomainHostnameReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(zone) = ct_common::normalize_hostname(&zone) else {
+        return (StatusCode::BAD_REQUEST, "invalid zone").into_response();
+    };
+    match st.managed_domains.zone(&zone) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("{zone} is not a managed domain -- register it first via POST /admin-ui/domains"),
+            )
+                .into_response()
+        }
+        Err(e) => return internal_error("admin_ui_add_domain_hostname/zone", e).into_response(),
+    }
+    let subdomain = req.subdomain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if subdomain.is_empty() || subdomain.contains('.') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "subdomain must be a single label (e.g. \"app\"), not a full hostname",
+        )
+            .into_response();
+    }
+    let Some(hostname) = ct_common::normalize_hostname(&format!("{subdomain}.{zone}")) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    let Some(cert_cfg) = st.domain_admin.managed_cert.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cert issuance is not configured on this deployment (CT_CP_LIB_ACME_PATH unset)",
+        )
+            .into_response();
+    };
+    let cert_dir = std::path::PathBuf::from(&cert_cfg.cert_base_dir).join(&hostname);
+    let issue_result = {
+        let hostname = hostname.clone();
+        let cert_dir = cert_dir.clone();
+        tokio::task::spawn_blocking(move || crate::cert_issuer::issue_cert(&cert_cfg.acme, &hostname, &cert_dir)).await
+    };
+    match issue_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, format!("cert issuance for {hostname} failed: {e}")).into_response(),
+        Err(e) => return internal_error("admin_ui_add_domain_hostname/spawn_blocking", e).into_response(),
+    }
+    let cert_dir_str = cert_dir.to_string_lossy().into_owned();
+    if let Err(e) =
+        st.managed_domains
+            .record_hostname_cert(&hostname, &zone, &cert_dir_str, &session.email, admin_ui_now_secs())
+    {
+        return internal_error("admin_ui_add_domain_hostname/record_hostname_cert", e).into_response();
+    }
+    let _ = st.audit.record(&session.email, "domain_hostname_cert_issue", Some(&hostname), Some(&format!("zone={zone}")));
+    Json(AddDomainHostnameResp { hostname, cert_dir: cert_dir_str }).into_response()
+}
+
+#[derive(Serialize)]
+struct CertStatusResp {
+    label: String,
+    state: &'static str,
+    days_remaining: Option<i64>,
+    not_after_unix: Option<i64>,
+    reason: Option<String>,
+}
+
+impl From<crate::cert_status::CertStatus> for CertStatusResp {
+    fn from(s: crate::cert_status::CertStatus) -> Self {
+        match s.state {
+            crate::cert_status::CertState::Ok { days_remaining, not_after_unix } => {
+                CertStatusResp { label: s.label, state: "ok", days_remaining: Some(days_remaining), not_after_unix: Some(not_after_unix), reason: None }
+            }
+            crate::cert_status::CertState::NotConfigured => {
+                CertStatusResp { label: s.label, state: "not_configured", days_remaining: None, not_after_unix: None, reason: None }
+            }
+            crate::cert_status::CertState::Unreadable { reason } => {
+                CertStatusResp { label: s.label, state: "unreadable", days_remaining: None, not_after_unix: None, reason: Some(reason) }
+            }
+        }
+    }
+}
+
+/// `GET /admin-ui/certs` (admin-identity-gated, ADR-0025 Decision 6): for
+/// every currently-configured front-door cert (Portal/Auth/MASQUE/Admin, per
+/// [`DomainAdminConfig::front_door_certs`]) plus every per-managed-domain cert
+/// ([`crate::storage::SqliteManagedDomains::list_hostname_certs`]), report
+/// days-until-expiry. A missing/unreadable/unconfigured cert is reported as
+/// its own explicit state (see [`crate::cert_status::CertState`]) rather than
+/// omitted -- an admin needs to see gaps, not just healthy entries.
+async fn admin_ui_certs(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let paths = &st.domain_admin.front_door_certs;
+    let mut out = vec![
+        crate::cert_status::check("portal", paths.portal.as_deref().map(std::path::Path::new)),
+        crate::cert_status::check("auth", paths.auth.as_deref().map(std::path::Path::new)),
+        crate::cert_status::check("masque", paths.masque.as_deref().map(std::path::Path::new)),
+        crate::cert_status::check("admin-ui", paths.admin_ui.as_deref().map(std::path::Path::new)),
+    ];
+    match st.managed_domains.list_hostname_certs() {
+        Ok(rows) => {
+            for r in rows {
+                let path = std::path::PathBuf::from(&r.cert_dir).join("fullchain.pem");
+                out.push(crate::cert_status::check(r.hostname, Some(path.as_path())));
+            }
+        }
+        Err(e) => eprintln!("ct-cp: admin_ui_certs: list_hostname_certs failed: {e} -- per-domain certs omitted from this response"),
+    }
+    Json(out.into_iter().map(CertStatusResp::from).collect::<Vec<_>>()).into_response()
+}
+
 // ===== end ADR-0025 `/admin-ui/*` =====
 
 /// A new tunnel from the create form. #439 follow-up: linked from the UI
@@ -1061,6 +1513,30 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
     let Some(host) = tunnel.hostname.as_deref() else {
         return;
     };
+    // ADR-0025: the enforcer for `POST /admin-ui/hostnames/:host/disable` -- this
+    // is the ONE function every path that would (re-)authorize a hostname at the
+    // edge already funnels through (auto-provision, admin_provision_tunnel,
+    // create_tunnel), so it is the one place the check needs to live. Fails
+    // CLOSED on a storage error (skips authorization) rather than open: the whole
+    // point of this check is a security control an admin explicitly asked for,
+    // and a transient DB hiccup letting a disabled hostname back onto the edge
+    // would defeat it silently -- a spurious skip on a healthy, non-disabled
+    // hostname self-heals on the next call, which a live block being bypassed
+    // does not.
+    match st.tunnels.is_hostname_disabled(host) {
+        Ok(true) => {
+            eprintln!(
+                "ct-cp: edge authorize-host SKIPPED for {host} -- hostname is admin-disabled \
+                 (ADR-0025); re-enable it via /admin-ui/hostnames/{host}/enable first"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("ct-cp: is_hostname_disabled check for {host} failed: {e} -- authorize SKIPPED (fail-closed)");
+            return;
+        }
+    }
     // #23 BP4b-c: authorize the hostname at the edge (host -> routing token)
     // so the agent's 'H' bind is accepted under CT_EDGE_REQUIRE_HOST_AUTH.
     if let Some(edge) = &st.edge_admin {
@@ -4657,6 +5133,77 @@ mod tests {
         assert_eq!(created.routing_token, routing_token);
     }
 
+    /// ADR-0025 "flag needs an enforcer" fail-first proof: a hostname an admin
+    /// has disabled must never reach the edge's authorize-host call, even via
+    /// the operator-only `admin_provision_tunnel` escape hatch -- the row
+    /// still gets CREATED (disabling a hostname doesn't retroactively forbid
+    /// naming it), but `authorize_hostname`'s edge push must be skipped.
+    /// Without the `is_hostname_disabled` check in `authorize_hostname`, this
+    /// test fails: the mock endpoint receives the call.
+    #[tokio::test]
+    async fn admin_provision_tunnel_never_authorizes_a_disabled_hostname_at_the_edge() {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x77u8; 32];
+        let host = "blocked.bunsenbrenner.org";
+
+        let received = Arc::new(std::sync::Mutex::new(0u32));
+        let mock = Router::new()
+            .route(
+                "/admin/authorize-host/:token/:host",
+                post({
+                    let received = received.clone();
+                    move || {
+                        let received = received.clone();
+                        async move {
+                            *received.lock().unwrap() += 1;
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        tunnels.disable_hostname(host, "admin@example.com", 1000).unwrap();
+
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels.clone(),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+            None,
+            None,
+            EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
+            Some(secret),
+        );
+
+        let body = format!(r#"{{"subject":"someone","name":"blocked","hostname":"{host}"}}"#);
+        let req = Request::post("/admin/provision-tunnel")
+            .header("content-type", "application/json")
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the tunnel ROW is still created");
+
+        assert_eq!(
+            tunnels.list_for_subject("someone").unwrap()[0].hostname.as_deref(),
+            Some(host),
+            "disabling a hostname doesn't forbid naming a new tunnel with it"
+        );
+        assert_eq!(
+            *received.lock().unwrap(),
+            0,
+            "authorize-host must NEVER be called at the edge for a disabled hostname"
+        );
+    }
+
     #[tokio::test]
     async fn admin_set_max_tunnels_unlocks_self_service_creation_for_one_specific_account() {
         // #214: remote asked to self-service-create MORE than the Standard
@@ -4777,6 +5324,8 @@ mod tests {
             topologies,
             networks,
             pipelines,
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
         );
         (portal_app.merge(admin_app), ledger, tunnels, admin)
     }
@@ -4811,6 +5360,14 @@ mod tests {
             ("GET", "/admin-ui/admins", None),
             ("POST", "/admin-ui/admins", Some(r#"{"email":"new@example.com"}"#)),
             ("DELETE", "/admin-ui/admins/someone@example.com", None),
+            // ADR-0025 Decision 4/6: hostname disable/enable + domain onboarding + certs.
+            ("POST", "/admin-ui/hostnames/blocked.example/disable", None),
+            ("POST", "/admin-ui/hostnames/blocked.example/enable", None),
+            ("GET", "/admin-ui/hostnames/disabled", None),
+            ("GET", "/admin-ui/domains", None),
+            ("POST", "/admin-ui/domains", Some(r#"{"zone":"example.org"}"#)),
+            ("POST", "/admin-ui/domains/example.org/hostnames", Some(r#"{"subdomain":"app"}"#)),
+            ("GET", "/admin-ui/certs", None),
         ];
         for (method, path, body) in cases {
             let status = admin_ui_req(&app, method, path, &non_admin, *body).await;
@@ -4951,6 +5508,317 @@ mod tests {
         let recreated = ledger.account_for_subject("kc-target").unwrap();
         assert_ne!(recreated.0, account.0, "a fresh account id was minted -- the old row is gone");
         assert_eq!(ledger.balance(&recreated).unwrap(), 0);
+    }
+
+    // ===== ADR-0025 Decision 4/6: hostname disable/enable + domains + certs =====
+
+    /// Builds a standalone `/admin-ui/*` app (not via [`test_admin_ui_app`], which
+    /// always uses an empty [`DomainAdminConfig`]) so each test below can inject
+    /// its own edge-admin/deSEC mock + `managed_domains` store.
+    fn domain_admin_ui_app(tunnels: Arc<SqliteTunnelStore>, managed_domains: Arc<crate::storage::SqliteManagedDomains>, domain_admin: DomainAdminConfig) -> Router {
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        admin_ui_router(
+            KEY,
+            admin,
+            audit,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels,
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            managed_domains,
+            domain_admin,
+        )
+    }
+
+    /// Fail-first proof of both halves of ADR-0025's hostname-disable contract:
+    /// the CURRENTLY-live tunnel on that hostname gets revoked at the edge (the
+    /// same `POST /admin/revoke/:token` primitive `delete_tunnel` uses), AND the
+    /// hostname is marked disabled so a FUTURE `authorize_hostname` call would be
+    /// refused (proven directly against `is_hostname_disabled`, since the
+    /// enforcement itself is proven end-to-end by
+    /// `admin_provision_tunnel_never_authorizes_a_disabled_hostname_at_the_edge`
+    /// above). `enable` then reverses only the future-block half.
+    #[tokio::test]
+    async fn admin_ui_disable_hostname_revokes_the_live_tunnel_and_blocks_future_reauthorization() {
+        use axum::extract::Path as AxPath;
+        let host = "blocked.example.org";
+        let received: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = Router::new().route(
+            "/admin/revoke/:token",
+            post({
+                let received = received.clone();
+                move |AxPath(token): AxPath<String>| {
+                    let received = received.clone();
+                    async move {
+                        received.lock().unwrap().push(token);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let created = match tunnels.create("alice", "site", Some(host)).unwrap() {
+            crate::storage::CreateTunnelOutcome::Created(t) => t,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let app = domain_admin_ui_app(
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { edge_admin: Some((format!("http://{addr}"), "edge-secret".to_string())), ..Default::default() },
+        );
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", &format!("/admin-ui/hostnames/{host}/disable"), &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[created.routing_token.clone()],
+            "the tunnel currently on this hostname was revoked at the edge"
+        );
+        assert!(tunnels.is_hostname_disabled(host).unwrap());
+
+        // enable reverses the future-block half.
+        let status = admin_ui_req(&app, "POST", &format!("/admin-ui/hostnames/{host}/enable"), &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!tunnels.is_hostname_disabled(host).unwrap());
+    }
+
+    /// A hostname with no live tunnel still gets disabled (nothing to revoke,
+    /// but the future-block half must still apply) -- and the response is still
+    /// `200`, not an error, since "nothing to revoke" isn't a failure.
+    #[tokio::test]
+    async fn admin_ui_disable_hostname_with_no_live_tunnel_still_blocks_future_reauthorization() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(), // no edge_admin configured at all
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/hostnames/never-existed.example/disable", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tunnels.is_hostname_disabled("never-existed.example").unwrap());
+    }
+
+    #[tokio::test]
+    async fn admin_ui_register_domain_issues_apex_and_wildcard_a_records_then_persists_the_zone() {
+        let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = Router::new().route(
+            "/domains/:domain/rrsets/",
+            axum::routing::patch({
+                let captured = captured.clone();
+                move |body: String| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig {
+                desec_token: Some("t".to_string()),
+                desec_api_base: Some(format!("http://{addr}")),
+                dns_edge_ip: Some("9.9.9.9".to_string()),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let bodies = captured.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "apex + wildcard A records, both pushed: {bodies:?}");
+        assert!(bodies.iter().any(|b| b.contains("\"subname\":\"\"") && b.contains("9.9.9.9")), "apex record present: {bodies:?}");
+        assert!(bodies.iter().any(|b| b.contains("\"subname\":\"*\"") && b.contains("9.9.9.9")), "wildcard record present: {bodies:?}");
+
+        let zone = managed_domains.zone("example.org").unwrap().expect("zone persisted");
+        assert_eq!(zone.status, "active");
+        assert_eq!(zone.added_by.as_deref(), Some(SUPER_ADMIN));
+
+        // Re-registering an already-managed zone is a conflict, not a second DNS push.
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(captured.lock().unwrap().len(), 2, "no new DNS calls for an already-managed zone");
+
+        let listed = admin_ui_req(&app, "GET", "/admin-ui/domains", &super_session, None).await;
+        assert_eq!(listed, StatusCode::OK);
+    }
+
+    /// Fail-first proof of "do not half-register a broken zone": when the apex
+    /// A-record push fails (e.g. the zone isn't actually delegated to deSEC
+    /// yet), the handler must report a clear error AND leave no `managed_domains`
+    /// row behind -- a zone that "looks managed" with no real DNS is worse than
+    /// having to retry.
+    #[tokio::test]
+    async fn admin_ui_register_domain_leaves_no_row_behind_when_the_apex_record_push_fails() {
+        let mock = Router::new().route("/domains/:domain/rrsets/", axum::routing::patch(|| async { StatusCode::BAD_REQUEST }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig {
+                desec_token: Some("t".to_string()),
+                desec_api_base: Some(format!("http://{addr}")),
+                dns_edge_ip: Some("9.9.9.9".to_string()),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"never-delegated.example"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            managed_domains.zone("never-delegated.example").unwrap().is_none(),
+            "a failed apex DNS push must not leave a managed_domains row behind"
+        );
+    }
+
+    /// `POST /admin-ui/domains` without `DESEC_TOKEN`/`CT_CP_DNS_EDGE_IP`
+    /// configured reports a clear `503`, not a confusing failure deep inside a
+    /// DNS client construction -- and, same as the failure-path test above,
+    /// leaves no row behind.
+    #[tokio::test]
+    async fn admin_ui_register_domain_503s_clearly_when_desec_is_not_configured() {
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig::default(),
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(managed_domains.zone("example.org").unwrap().is_none());
+    }
+
+    /// `POST /admin-ui/domains/:zone/hostnames` against a zone that was never
+    /// registered via `POST /admin-ui/domains` must `404`, not silently try to
+    /// issue a cert for it anyway.
+    #[tokio::test]
+    async fn admin_ui_add_domain_hostname_404s_for_an_unmanaged_zone() {
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains/never-registered.example/hostnames", &super_session, Some(r#"{"subdomain":"app"}"#)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Proves the full cert-issuance plumbing against a FAKE `issue_cert` (never
+    /// touches real acme.sh/deSEC), and that a successful issuance is recorded in
+    /// `managed_domains` so `GET /admin-ui/certs` can find it afterward.
+    #[tokio::test]
+    async fn admin_ui_add_domain_hostname_issues_a_cert_and_records_it_for_the_certs_dashboard() {
+        let dir = std::env::temp_dir().join(format!("ct-cp-domainhostname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("lib-acme.sh");
+        std::fs::write(
+            &script,
+            r#"issue_cert() {
+  local host="$1" dir="$2"
+  mkdir -p "$dir"
+  echo "cert" > "$dir/fullchain.pem"
+  echo "key" > "$dir/privkey.pem"
+}
+"#,
+        )
+        .unwrap();
+
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        managed_domains.add_zone("example.org", SUPER_ADMIN, 1000, "active").unwrap();
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig {
+                managed_cert: Some(ManagedCertConfig {
+                    acme: crate::cert_issuer::AcmeConfig {
+                        lib_acme_path: script.to_string_lossy().into_owned(),
+                        acme_home: dir.join("acme-home").to_string_lossy().into_owned(),
+                        acme_email: "acme-test@example.com".to_string(),
+                        desec_token: Some("t".to_string()),
+                    },
+                    cert_base_dir: dir.join("certs").to_string_lossy().into_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains/example.org/hostnames", &super_session, Some(r#"{"subdomain":"app"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rows = managed_domains.list_hostname_certs().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hostname, "app.example.org");
+        assert_eq!(rows[0].zone, "example.org");
+        assert!(std::path::Path::new(&rows[0].cert_dir).join("fullchain.pem").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /admin-ui/certs`: a front-door slot with no path configured reports
+    /// `not_configured`; one pointed at a missing file reports `unreadable`
+    /// (never silently omitted from the response, per ADR-0025's own
+    /// requirement) -- proven together so the two states are visibly distinct.
+    #[tokio::test]
+    async fn admin_ui_certs_reports_not_configured_and_unreadable_as_distinct_explicit_states() {
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig {
+                front_door_certs: FrontDoorCertPaths {
+                    portal: None,
+                    auth: Some("/does/not/exist/fullchain.pem".to_string()),
+                    masque: None,
+                    admin_ui: None,
+                },
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let req = Request::get("/admin-ui/certs")
+            .header("cookie", &super_session)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 4, "all four fixed front-door slots always appear: {entries:?}");
+
+        let portal = entries.iter().find(|e| e["label"] == "portal").unwrap();
+        assert_eq!(portal["state"], "not_configured");
+
+        let auth = entries.iter().find(|e| e["label"] == "auth").unwrap();
+        assert_eq!(auth["state"], "unreadable");
+        assert!(auth["reason"].as_str().unwrap().contains("read failed"));
     }
 
     // ===== end ADR-0025 `/admin-ui/*` tests =====

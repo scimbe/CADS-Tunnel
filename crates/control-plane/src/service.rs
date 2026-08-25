@@ -5436,6 +5436,9 @@ pub fn persistent_control_plane_router(
     // itself, this has no fail-closed startup requirement of its own, so it doesn't
     // need to be threaded in from `main.rs` the way `admin` does.
     let admin_audit = Arc::new(crate::audit_log::SqliteAuditLog::open(db_path)?);
+    // ADR-0025 Decision 4: the onboarded-zone registry, opened the same way
+    // every other store in this function is (from `db_path`).
+    let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open(db_path)?);
     let verifier = Arc::new(WebhookVerifier::new(
         webhook_secret.to_vec(),
         WEBHOOK_TOLERANCE_SECS,
@@ -5539,6 +5542,48 @@ pub fn persistent_control_plane_router(
     ) {
         (Some(url), Some(token)) => Some((url, token)),
         _ => None,
+    };
+    // ADR-0025 Decision 4/6: domain/hostname admin-route config, built entirely
+    // from environment -- every field degrades to an explicit "not configured"
+    // response in its own route rather than a panic or a silent wrong answer.
+    // `edge_admin_config`/`CT_CP_DNS_EDGE_IP` are the SAME values already used
+    // above/below for the edge-authorize proxy and the portal's DNS autopilot --
+    // reused here, not re-derived, so the surfaces can never drift apart.
+    let domain_admin_config = crate::portal_api::DomainAdminConfig {
+        edge_admin: edge_admin_config.clone(),
+        dns_edge_ip: std::env::var("CT_CP_DNS_EDGE_IP").ok().filter(|s| !s.is_empty()),
+        desec_token: std::env::var("DESEC_TOKEN").ok().filter(|s| !s.is_empty()),
+        desec_api_base: std::env::var("DESEC_API_BASE").ok().filter(|s| !s.is_empty()),
+        // Always Some, not gated on an env var being set at all: the `production`
+        // Docker image now ships `scripts/lib-acme.sh` at this exact default path
+        // (`docker/Dockerfile`'s `production` target), so a deployment using that
+        // image needs no extra config beyond `DESEC_TOKEN` for this to actually
+        // work -- `CT_CP_LIB_ACME_PATH` stays available to override for a non-
+        // container / different-layout run. Missing script / missing token still
+        // surface as their own clear, typed errors from `cert_issuer::issue_cert`
+        // at call time (`LibAcmeScriptMissing`/`MissingDesecToken`) rather than
+        // this ever silently doing nothing.
+        managed_cert: Some(crate::portal_api::ManagedCertConfig {
+            acme: crate::cert_issuer::AcmeConfig {
+                lib_acme_path: std::env::var("CT_CP_LIB_ACME_PATH")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "/app/scripts/lib-acme.sh".to_string()),
+                acme_home: std::env::var("CT_CP_ACME_HOME").unwrap_or_else(|_| "/data/acme".to_string()),
+                acme_email: std::env::var("CT_CP_ACME_EMAIL").unwrap_or_else(|_| "scimbe@gmail.com".to_string()),
+                desec_token: std::env::var("DESEC_TOKEN").ok().filter(|s| !s.is_empty()),
+            },
+            cert_base_dir: std::env::var("CT_CP_MANAGED_CERT_BASE_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "/certs/managed".to_string()),
+        }),
+        front_door_certs: crate::portal_api::FrontDoorCertPaths {
+            portal: std::env::var("CT_CP_CERT_PORTAL_PATH").ok().filter(|s| !s.is_empty()),
+            auth: std::env::var("CT_CP_CERT_AUTH_PATH").ok().filter(|s| !s.is_empty()),
+            masque: std::env::var("CT_CP_CERT_MASQUE_PATH").ok().filter(|s| !s.is_empty()),
+            admin_ui: std::env::var("CT_CP_CERT_ADMIN_UI_PATH").ok().filter(|s| !s.is_empty()),
+        },
     };
     // #233: the Rot/Gelb/Grün admission-queue sweep. Opt-in and off by
     // default (matches this crate's "absent unless configured" convention
@@ -5825,6 +5870,8 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                managed_domains.clone(),
+                domain_admin_config.clone(),
             ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
