@@ -111,7 +111,7 @@ async fn a_udp_datagram_round_trips_through_the_real_proxy_to_the_configured_tar
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_request_for_any_target_other_than_the_configured_one_is_refused() {
+async fn a_request_for_any_target_other_than_the_configured_one_gets_refused() {
     // The security-critical property (#559, ADR-0024 Decision 5): this proxy is not
     // a general relay. A request naming a DIFFERENT host/port than the one configured
     // target must be refused, not silently proxied somewhere else.
