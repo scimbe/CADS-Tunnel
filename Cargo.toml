@@ -7,6 +7,7 @@ members = [
     "crates/control-plane",
     "crates/client",
     "crates/dns",
+    "crates/masque-proxy",
 ]
 
 [workspace.package]
