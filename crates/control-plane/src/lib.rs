@@ -12,6 +12,8 @@ pub mod acme_broker;
 pub mod admin_identity;
 pub mod audit_log;
 pub mod billing;
+pub mod cert_issuer;
+pub mod cert_status;
 pub mod client;
 pub mod credential;
 pub mod dns01_challenge;

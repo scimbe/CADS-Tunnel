@@ -33,6 +33,12 @@ r2d2_sqlite = "0.24"
 jsonwebtoken = "9"
 hmac = "0.12"
 sha2 = "0.10"
+# ADR-0025 (admin console, cert-expiry dashboard, `cert_status.rs`): real PEM/
+# X.509 parsing of the front-door cert files' notAfter. Already resolved in
+# this workspace's Cargo.lock via ct-edge's own dev-dependency (`pki.rs`'s
+# not_after verification) -- pinned to the identical 0.17 rather than adding a
+# second cert-parsing dependency.
+x509-parser = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "signal"] }
 # #437: join_all for tunnels_page's concurrent edge_tunnel_status calls (was N
 # sequential awaited round trips, one per tunnel row).
