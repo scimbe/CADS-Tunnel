@@ -24,6 +24,17 @@
 #                        fullchain.pem + privkey.pem (LE via deSEC DNS-01, same
 #                        mechanism as the Portal/Auth certs -- scripts/lib-acme.sh).
 #                        Never committed.
+#   CT_MASQUE_PROXY_TOKEN  64-hex shared secret every CONNECT-UDP caller must
+#                        present (`x-ct-masque-token`), checked in constant time.
+#                        Target-restriction alone (M2) answers WHERE traffic can
+#                        go, not WHO may open a tunnel at all -- and this proxy's
+#                        one target is the edge's own INTERNAL QUIC listener, so
+#                        an anonymous caller with no ct-agent credential must not
+#                        be able to reach it merely by getting the target right.
+#                        Required -- masque-proxy refuses to start without it
+#                        (fail-closed, same posture as CT_EDGE_ADMIN_TOKEN). Every
+#                        ct-agent using this fallback needs the SAME value in its
+#                        own CT_AGENT_MASQUE_TOKEN.
 #
 # masque-proxy runs in the edge container's OWN network namespace
 # (`network_mode: service:edge`), not its own -- ADR-0024 M2's by-construction
@@ -63,6 +74,7 @@ services:
     environment:
       CT_MASQUE_PROXY_LISTEN: "127.0.0.1:4434"
       CT_MASQUE_PROXY_TARGET_ADDR: "127.0.0.1:4433"
+      CT_MASQUE_PROXY_TOKEN: "${CT_MASQUE_PROXY_TOKEN:?set CT_MASQUE_PROXY_TOKEN=<64-hex, same value every legitimate ct-agent's CT_AGENT_MASQUE_TOKEN uses>}"
     restart: unless-stopped
 
   edge:

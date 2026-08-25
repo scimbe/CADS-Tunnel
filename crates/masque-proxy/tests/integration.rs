@@ -12,6 +12,10 @@ use masque_proxy::{capsule, Config};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
+fn hex_token(t: &[u8; 32]) -> String {
+    t.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Binds a UDP socket that echoes every datagram it receives back to its sender --
 /// stands in for "the edge's QUIC listener" (this proxy's single hard-restricted
 /// target) without needing a real QUIC endpoint in this test.
@@ -31,11 +35,13 @@ async fn spawn_udp_echo_target() -> std::net::SocketAddr {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_udp_datagram_round_trips_through_the_real_proxy_to_the_configured_target() {
     let target = spawn_udp_echo_target().await;
+    let token = [0x42u8; 32];
     let config = Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         target,
         max_concurrent_tunnels: 4,
         idle_timeout: Duration::from_secs(5),
+        shared_token: token,
     };
     // `run()` binds its own listener; grab the real (OS-assigned) address by binding
     // ourselves first and handing it the same address run() will then re-bind to
@@ -78,6 +84,7 @@ async fn a_udp_datagram_round_trips_through_the_real_proxy_to_the_configured_tar
     let mut request = Request::builder()
         .method(Method::CONNECT)
         .uri(format!("https://{proxy_addr}{path}"))
+        .header("x-ct-masque-token", hex_token(&token))
         .body(())
         .unwrap();
     request.extensions_mut().insert(Protocol::from_static("connect-udp"));
@@ -122,11 +129,13 @@ async fn a_request_for_any_target_other_than_the_configured_one_gets_refused() {
     let proxy_addr = listen_probe.local_addr().unwrap();
     drop(listen_probe);
 
+    let token = [0x77u8; 32];
     let config = Config {
         listen: proxy_addr,
         target,
         max_concurrent_tunnels: 4,
         idle_timeout: Duration::from_secs(5),
+        shared_token: token,
     };
     tokio::spawn(masque_proxy::run(config));
 
@@ -155,6 +164,7 @@ async fn a_request_for_any_target_other_than_the_configured_one_gets_refused() {
     let mut request = Request::builder()
         .method(Method::CONNECT)
         .uri(format!("https://{proxy_addr}{path}"))
+        .header("x-ct-masque-token", hex_token(&token))
         .body(())
         .unwrap();
     request.extensions_mut().insert(Protocol::from_static("connect-udp"));
@@ -169,5 +179,72 @@ async fn a_request_for_any_target_other_than_the_configured_one_gets_refused() {
             response.status()
         ),
         Err(_) => {} // expected: the stream was reset
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_with_no_or_wrong_token_gets_refused_even_for_the_correct_target() {
+    // The complementary security property to the target-restriction test above: an
+    // anonymous caller with no ct-agent credential at all -- just a bare TLS+h2
+    // handshake to the public front door -- must not be able to open a tunnel merely
+    // by getting the target right. See lib.rs's crate doc for why target-restriction
+    // alone isn't enough here (the target is the edge's own internal QUIC listener).
+    let target = spawn_udp_echo_target().await;
+    let real_token = [0x11u8; 32];
+    let wrong_token = [0x22u8; 32];
+
+    let listen_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = listen_probe.local_addr().unwrap();
+    drop(listen_probe);
+
+    let config = Config {
+        listen: proxy_addr,
+        target,
+        max_concurrent_tunnels: 4,
+        idle_timeout: Duration::from_secs(5),
+        shared_token: real_token,
+    };
+    tokio::spawn(masque_proxy::run(config));
+
+    let path = format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port());
+
+    // Try three ways to get in without the real token: wrong token, no header at
+    // all, and a header that isn't valid hex -- all three must be refused
+    // identically to a wrong-target request (RST_STREAM, never a 200).
+    for header in [Some(hex_token(&wrong_token)), None, Some("not-hex".to_string())] {
+        let client_io = 'connect: {
+            for _ in 0..50 {
+                if let Ok(io) = tokio::net::TcpStream::connect(proxy_addr).await {
+                    break 'connect io;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("masque-proxy never started accepting on {proxy_addr}");
+        };
+        let (send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(connection);
+        let mut send_request = send_request.ready().await.unwrap();
+        for _ in 0..50 {
+            if send_request.is_extended_connect_protocol_enabled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut builder = Request::builder().method(Method::CONNECT).uri(format!("https://{proxy_addr}{path}"));
+        if let Some(h) = &header {
+            builder = builder.header("x-ct-masque-token", h);
+        }
+        let mut request = builder.body(()).unwrap();
+        request.extensions_mut().insert(Protocol::from_static("connect-udp"));
+
+        let (response_fut, _client_send) = send_request.send_request(request, true).unwrap();
+        match response_fut.await {
+            Ok(response) => panic!(
+                "a request with header {header:?} must never succeed -- got status {} instead of a refusal",
+                response.status()
+            ),
+            Err(_) => {} // expected: the stream was reset
+        }
     }
 }
