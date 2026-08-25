@@ -14,7 +14,11 @@
 //! unset, a random key is used, so sessions just don't survive a restart until
 //! it's set), and `CT_OIDC_ISSUER` + `CT_OIDC_PUBKEY_PATH` (the Keycloak realm
 //! issuer and a PEM file with the realm's RSA public key; when both are set the
-//! authenticated `/me/*` endpoints are mounted, otherwise they are absent).
+//! authenticated `/me/*` endpoints are mounted, otherwise they are absent), and
+//! `CT_ADMIN_SUPER_EMAIL` (ADR-0025 — the one Google account allowed to reach
+//! the admin console and manage other admins; **required**, no default: this
+//! process refuses to start without it, same fail-closed posture as
+//! `CT_EDGE_ADMIN_TOKEN`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,6 +70,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "0.0.0.0:8090".to_string())
         .parse()?;
     let db = std::env::var("CT_CONTROL_PLANE_DB").unwrap_or_else(|_| "control-plane.db".to_string());
+
+    // ADR-0025 Decision 2: the admin console's super-admin is a startup-configured
+    // invariant, not just "whoever happens to be first in the `admins` table" --
+    // fail-closed, same posture as `CT_EDGE_ADMIN_TOKEN` (crates/edge/src/serve.rs):
+    // this process refuses to come up at all rather than silently booting an admin
+    // surface with no super-admin asserted (or, worse, one no session could ever
+    // satisfy). Every other admin-identity check in later phases traces back to
+    // this one value.
+    let super_admin_email = ct_control_plane::admin_identity::super_admin_email_from_env()?;
+    let admin_store = Arc::new(ct_control_plane::storage::SqliteAdminStore::open(&db)?);
+    let admin_identity = Arc::new(ct_control_plane::admin_identity::AdminIdentity::new(
+        admin_store,
+        super_admin_email.clone(),
+    ));
+    // Idempotent (INSERT OR IGNORE under the hood) -- safe, and necessary, on
+    // every boot: a fresh DB has no `admins` row at all yet, and a pre-existing
+    // one must not gain a duplicate or a refreshed `added_at` just from
+    // restarting. Best-effort like every other DB-backed startup self-heal in
+    // this file (e.g. the edge_mesh backfill in `persistent_control_plane_router`)
+    // -- a transient DB hiccup here logs loudly and retries next boot rather than
+    // aborting a process whose *configuration* (the env var above) was valid.
+    if let Err(e) = admin_identity.ensure_super_admin_seeded() {
+        eprintln!(
+            "ct-control-plane: WARNING -- failed to seed super-admin row for {super_admin_email}: {e} \
+             (will retry next boot)"
+        );
+    }
+    eprintln!("ct-control-plane: admin console identity enabled (super-admin={super_admin_email})");
 
     // The webhook signing secret must match the payment provider's. If it is
     // unconfigured, fall back to an unguessable random secret so no attacker can

@@ -5204,6 +5204,98 @@ impl SqliteTopologyStore {
     }
 }
 
+/// Bare CRUD on the `admins` table (ADR-0025 Decision 1/2): who may reach the
+/// admin console at all, kept entirely separate from the pseudonymous
+/// `AccountId`/ledger schema above -- a real Google email, not an opaque
+/// account. This store has NO policy (who may add/remove whom, the
+/// super-admin's un-removability) -- that lives in `admin_identity::AdminIdentity`,
+/// which wraps this store. `email` is stored lowercased, matching every other
+/// email column in this file (e.g. `tunnel_login_allowlist`).
+pub struct SqliteAdminStore {
+    conn: Mutex<Connection>,
+}
+
+sqlite_store_ctors!(SqliteAdminStore);
+
+impl SqliteAdminStore {
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS admins (
+                 email    TEXT PRIMARY KEY,
+                 added_by TEXT,
+                 added_at INTEGER NOT NULL
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Whether `email` (any casing) has a row in `admins`.
+    pub fn is_admin(&self, email: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM admins WHERE email = ?1",
+                params![email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Insert `email` as an admin if not already present (idempotent). `added_by`
+    /// is the acting admin's email -- `None` only for the startup seed of the
+    /// super-admin itself, which has no human actor.
+    pub fn add_admin_row(&self, email: &str, added_by: Option<&str>, added_at: i64) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "INSERT OR IGNORE INTO admins (email, added_by, added_at) VALUES (?1, ?2, ?3)",
+            params![
+                email.to_ascii_lowercase(),
+                added_by.map(|s| s.to_ascii_lowercase()),
+                added_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove `email`'s admin row, if present. Returns whether a row was actually
+    /// removed. No policy enforced here -- see the struct doc.
+    pub fn remove_admin_row(&self, email: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "DELETE FROM admins WHERE email = ?1",
+            params![email.to_ascii_lowercase()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every admin row, most-recently-added first -- for the admin-management UI
+    /// (later phase).
+    pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare("SELECT email, added_by, added_at FROM admins ORDER BY added_at DESC")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AdminRow {
+                    email: r.get(0)?,
+                    added_by: r.get(1)?,
+                    added_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// One row of the `admins` table (ADR-0025) -- for the admin-management UI's listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminRow {
+    pub email: String,
+    pub added_by: Option<String>,
+    pub added_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
