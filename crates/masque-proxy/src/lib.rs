@@ -169,7 +169,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
             let Ok(_permit) = admission.try_acquire_owned() else {
                 return;
             };
-            if let Err(e) = serve_connection(io, target, &expected_path, idle_timeout, &shared_token).await {
+            if let Err(e) = serve_connection(io, target, expected_path, idle_timeout, shared_token).await {
                 eprintln!("masque-proxy: connection ended with error: {e}");
             }
         });
@@ -179,25 +179,41 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
 async fn serve_connection(
     io: TcpStream,
     target: SocketAddr,
-    expected_path: &str,
+    expected_path: Arc<String>,
     idle_timeout: Duration,
-    shared_token: &[u8; 32],
+    shared_token: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut conn = h2::server::Builder::new()
         .enable_connect_protocol()
         .handshake::<_, Bytes>(io)
         .await?;
 
-    // One CONNECT-UDP tunnel per TCP connection is all this proxy needs to support
-    // (ct-agent, M3, opens one connection per MASQUE dial attempt) -- but the accept
-    // loop still keeps `conn` driven for its whole lifetime (ADR-0024 M1 finding:
-    // dropping it early strands buffered-but-unflushed frames), so this doesn't
-    // return after the first request.
+    // ADR-0024 M4: found live, causing every real CONNECT-UDP request to hang
+    // until the client gave up -- `handle_request` was previously awaited INLINE
+    // here rather than spawned onto its own task. This loop calling `conn.accept()`
+    // is what actually drives the h2 Connection's I/O; while `handle_request` is
+    // off doing its own thing (binding a UDP socket, pumping datagrams for up to
+    // `idle_timeout`), nothing was polling `conn` at all, so the response headers
+    // `handle_request` had already queued via `send_response` sat buffered and
+    // unflushed for the tunnel's ENTIRE lifetime -- the exact "flush requires
+    // continued driving" trap ADR-0024 M1 already documented, reapplied here to a
+    // different call site than the one M1 originally caught. (The passing
+    // integration test below happened to avoid tripping this: it sends a DATA
+    // frame immediately after the request, and servicing that incoming frame
+    // incidentally drove the connection enough to flush the response too -- a real
+    // ct-agent client that waits for the response before sending anything, per
+    // ADR-0024 M3's own dial sequence, hits the hang every time.) Spawning each
+    // request handler onto its own task lets this loop return to `conn.accept()`
+    // immediately, keeping the connection driven continuously for the whole
+    // tunnel's lifetime, independent of whatever `handle_request` itself is doing.
     while let Some(result) = conn.accept().await {
         let (req, respond) = result?;
-        if let Err(e) = handle_request(req, respond, target, expected_path, idle_timeout, shared_token).await {
-            eprintln!("masque-proxy: request handling ended with error: {e}");
-        }
+        let expected_path = expected_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_request(req, respond, target, &expected_path, idle_timeout, &shared_token).await {
+                eprintln!("masque-proxy: request handling ended with error: {e}");
+            }
+        });
     }
     Ok(())
 }
