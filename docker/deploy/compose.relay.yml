@@ -34,6 +34,12 @@ services:
       context: .
       dockerfile: relay-node.Dockerfile
     image: ct-relay-node
+    # #667: run as non-root (matches the image's own USER 65532:65532 default,
+    # relay-node.Dockerfile) -- explicit here too so a future base-image change
+    # can't silently widen this back to root, same reasoning as #305's control-
+    # plane/edge `user:` lines below in compose.selfhost.yml. No volumes/data
+    # dir to worry about ownership for -- this process persists nothing to disk.
+    user: "65532:65532"
     # #312: bounded like every other service on this shared, no-swap host (see
     # compose.selfhost.yml's control-plane/edge limits for the full rationale).
     mem_limit: 256m

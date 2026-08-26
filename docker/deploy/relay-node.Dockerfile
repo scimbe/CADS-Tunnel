@@ -73,4 +73,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /tmp/ct-agent /usr/local/bin/ct-agent
+# #667: was the sole deviation from #305's non-root baseline (docker/Dockerfile) --
+# ran as root with a writable rootfs despite terminating protocol bytes from
+# semi-trusted relayed peers (this process's own protocol-level acceptance is
+# deliberately unguarded, see the top-of-file comment). uid/gid 65532 is the
+# same "nobody"-style convention #305 already established; nothing here does
+# username lookups, so no /etc/passwd entry is needed. Binds only unprivileged
+# tcp/4437 and needs no elevated capabilities.
+USER 65532:65532
 CMD ["ct-agent", "relay-node"]
