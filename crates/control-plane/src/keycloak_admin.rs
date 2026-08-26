@@ -344,6 +344,47 @@ pub async fn create_service_account_client(
     Ok(CreatedClient { internal_id, secret })
 }
 
+/// The one field of Keycloak's `UserRepresentation` this needs.
+#[derive(Deserialize)]
+struct UserRepresentationEmail {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Look up `user_id`'s (a Keycloak internal user id -- the same value that
+/// lands in a verified ID token's `sub` claim, see `portal.rs`'s claims
+/// parsing) email address. `Ok(None)` for a user id that no longer exists in
+/// this realm (an account deleted after the ledger row it's still attached to
+/// was created) -- an admin console should be able to show "no such Keycloak
+/// account anymore" as a normal state, not an error.
+pub async fn get_user_email(client: &reqwest::Client, cfg: &KeycloakAdminConfig, user_id: &str) -> Result<Option<String>, KcError> {
+    let mut token = cached_admin_token(client, cfg, false).await?;
+    let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
+    let mut resp = client
+        .get(format!("{realm_url}/users/{user_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| KcError::Http(e.to_string()))?;
+    // #434: single retry with a force-refreshed token, same reasoning as ensure_user.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        resp = client
+            .get(format!("{realm_url}/users/{user_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(KcError::Http(format!("GET user returned {}", resp.status())));
+    }
+    resp.json::<UserRepresentationEmail>().await.map(|u| u.email).map_err(|e| KcError::Http(e.to_string()))
+}
+
 /// Regenerate `internal_id`'s client secret and return the new value -- the
 /// old secret stops working immediately (Keycloak's own regenerate semantics).
 /// Ownership must already be verified by the caller (`SqliteServiceAccountStore
@@ -1583,5 +1624,68 @@ mod tests {
             "an unreachable Keycloak must never produce the confirmation line: {}",
             lines[0]
         );
+    }
+
+    /// Admin console Accounts page (2026-08-26): a subject with a real,
+    /// still-existing Keycloak account resolves to its real email.
+    #[tokio::test]
+    async fn get_user_email_returns_the_email_for_an_existing_user() {
+        use axum::extract::Path;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user(Path(id): Path<String>) -> Json<serde_json::Value> {
+            Json(json!({ "id": id, "email": "alice@example.com", "username": "alice@example.com" }))
+        }
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", get(user));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let email = get_user_email(&reqwest::Client::new(), &cfg, "user-abc-123").await.unwrap();
+        assert_eq!(email.as_deref(), Some("alice@example.com"));
+    }
+
+    /// A ledger row can outlive the Keycloak account it was created for (the
+    /// account gets deleted out-of-band, the ledger row doesn't). The Accounts
+    /// page must be able to render that as "no such account anymore", not fail
+    /// the whole page render.
+    #[tokio::test]
+    async fn get_user_email_returns_none_for_a_deleted_user() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user_gone() -> axum::http::StatusCode {
+            axum::http::StatusCode::NOT_FOUND
+        }
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", axum::routing::get(user_gone));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let email = get_user_email(&reqwest::Client::new(), &cfg, "long-gone").await.unwrap();
+        assert_eq!(email, None);
     }
 }
