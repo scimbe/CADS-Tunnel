@@ -753,25 +753,26 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CADS-Tunnel Admin — {title}</title>
 <style>
- :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#9aa4b0;
        --accent:#d98a4f;--accent-hover:#e39a63;--accent-ink:#20130a;
        --accent2:#5fb8ab;--accent2-hover:#7cc9bd;
        --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      font-size:16px;line-height:1.55;
       display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:2.5rem 1rem}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:1000px;width:100%;
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:1100px;width:100%;
       animation:cardIn .32s ease-out}}
  @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
  @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
  h1,h2{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
- h1{{font-size:1.55rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.05rem;color:var(--muted);margin:1.5rem 0 .6rem}}
+ h1{{font-size:1.6rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.1rem;color:var(--muted);margin:1.5rem 0 .6rem}}
  nav{{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem;margin-bottom:1.2rem;border-bottom:1px solid var(--border);padding-bottom:.9rem}}
- nav a{{color:var(--accent2);text-decoration:none;font-size:.88rem;font-weight:600;transition:color .15s ease}}
+ nav a{{color:var(--accent2);text-decoration:none;font-size:.92rem;font-weight:600;transition:color .15s ease}}
  nav a:hover{{color:var(--accent2-hover)}}
  nav .spacer{{flex:1 1 auto}}
- nav .signed-in-as{{color:var(--muted);font-size:.84rem}}
+ nav .signed-in-as{{color:var(--muted);font-size:.88rem}}
  nav .signed-in-as strong{{color:var(--text);font-weight:600}}
- .badge{{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.68rem;font-weight:700;vertical-align:middle}}
+ .badge{{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.72rem;font-weight:700;vertical-align:middle}}
  .badge.super{{background:#2d1a00;color:#f0c674;border:1px solid #7d4e00}}
  .badge.blocked{{background:#3d1418;color:#ff9a9a;border:1px solid #6e2530}}
  .badge.ok{{background:#0d2818;color:#3fb950;border:1px solid #1f5c33}}
@@ -785,11 +786,16 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
  a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
  a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
  button:disabled{{opacity:.4;cursor:not-allowed}}
- table.data{{width:100%;border-collapse:collapse;margin:.4rem 0 1rem;font-size:.86rem}}
- table.data th,table.data td{{padding:.5rem .6rem;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}}
- table.data th{{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.04em}}
+ table.data{{width:100%;border-collapse:collapse;margin:.4rem 0 1rem;font-size:.92rem}}
+ table.data th,table.data td{{padding:.55rem .6rem;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}}
+ table.data th{{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}}
  table.data tr:hover td{{background:#1c222b}}
- table.data code{{font-size:.82rem}}
+ table.data code{{font-size:.86rem}}
+ table.data th.sortable{{cursor:pointer;user-select:none;white-space:nowrap}}
+ table.data th.sortable:hover{{color:var(--text)}}
+ table.data th.sortable .sort-arrow{{display:inline-block;width:.9em;opacity:.55}}
+ table.data th.sort-asc .sort-arrow::after{{content:"\25b2"}}
+ table.data th.sort-desc .sort-arrow::after{{content:"\25bc"}}
  .status-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:.4rem;vertical-align:middle}}
  .status-dot.live{{background:var(--accent2);animation:pulse 1.6s ease-in-out infinite}}
  .status-dot.off{{background:var(--muted)}}
@@ -798,15 +804,15 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
  input:focus,select:focus{{outline:none;border-color:var(--accent2)}}
  code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.15rem .4rem}}
  form.inline{{display:inline;margin:0}}
- label{{display:block;margin:.7rem 0;font-size:.88rem}}
- .help{{color:var(--muted);font-size:.82rem}}
+ label{{display:block;margin:.7rem 0;font-size:.92rem}}
+ .help{{color:var(--muted);font-size:.86rem;line-height:1.5}}
  p.help{{margin:.2rem 0 1rem}}
- .msg{{font-size:.84rem;margin:.3rem 0;min-height:1.2em}}
+ .msg{{font-size:.88rem;margin:.3rem 0;min-height:1.2em}}
  .msg.err{{color:#ff9a9a}} .msg.ok{{color:#3fb950}}
  .section{{margin-bottom:2rem}}
  .kv{{display:flex;flex-wrap:wrap;gap:1.5rem;margin:.6rem 0 1rem}}
  .kv .stat{{min-width:120px}} .kv .stat .n{{font-family:var(--serif);font-size:1.5rem;display:block}}
- .kv .stat .l{{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}}
+ .kv .stat .l{{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.03em}}
  @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
 </style></head><body>
 <div class="card">
@@ -848,6 +854,55 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
    if(!window.confirm(msg)){{ ev.preventDefault(); }}
   }}
  }});
+ // Click-to-sort for every table.data on the page (and any table a page's own
+ // script builds later via innerHTML, e.g. traffic.html's two fetch()-populated
+ // tables -- those call window.ctSortableInit(el) themselves right after setting
+ // innerHTML). A column is skipped when its header has no text, or when any of
+ // its body cells hold an interactive control (button/form/input) rather than
+ // plain data -- sorting an "Actions" column by button label isn't useful and
+ // risks confusing a click-to-sort with a click-to-act.
+ function ctSortableInit(root){{
+  var tables = root
+   ? (root.matches && root.matches('table.data') ? [root] : Array.prototype.slice.call(root.querySelectorAll('table.data')))
+   : Array.prototype.slice.call(document.querySelectorAll('table.data'));
+  tables.forEach(function(table){{
+   if(table.getAttribute('data-sortable-init')) return;
+   table.setAttribute('data-sortable-init', '1');
+   var headRow = table.tHead && table.tHead.rows[0];
+   var tbody = table.tBodies[0];
+   if(!headRow || !tbody) return;
+   var bodyRows = Array.prototype.slice.call(tbody.rows);
+   if(bodyRows.length < 2) return; // nothing meaningful to sort (0 or 1 rows, incl. a "none yet" placeholder)
+   Array.prototype.forEach.call(headRow.cells, function(th, colIndex){{
+    var text = (th.textContent || '').trim();
+    var hasControl = bodyRows.some(function(r){{ var c = r.cells[colIndex]; return c && c.querySelector('button,form,input,a.btn'); }});
+    if(!text || hasControl) return;
+    th.classList.add('sortable');
+    th.innerHTML = th.innerHTML + ' <span class="sort-arrow"></span>';
+    th.addEventListener('click', function(){{ ctSortTable(table, colIndex, th, headRow); }});
+   }});
+  }});
+ }}
+ function ctSortTable(table, colIndex, th, headRow){{
+  var tbody = table.tBodies[0];
+  if(!tbody) return;
+  var asc = !th.classList.contains('sort-asc');
+  Array.prototype.forEach.call(headRow.cells, function(c){{ c.classList.remove('sort-asc', 'sort-desc'); }});
+  th.classList.add(asc ? 'sort-asc' : 'sort-desc');
+  var rows = Array.prototype.slice.call(tbody.rows);
+  rows.sort(function(a, b){{
+   var ca = a.cells[colIndex], cb = b.cells[colIndex];
+   var av = ((ca && (ca.getAttribute('data-sort') || ca.textContent)) || '').trim();
+   var bv = ((cb && (cb.getAttribute('data-sort') || cb.textContent)) || '').trim();
+   var an = parseFloat(av.replace(/[,\s]/g, '')), bn = parseFloat(bv.replace(/[,\s]/g, ''));
+   var bothNumeric = /^-?[\d.,]+$/.test(av) && /^-?[\d.,]+$/.test(bv) && !isNaN(an) && !isNaN(bn);
+   var cmp = bothNumeric ? (an - bn) : av.toLowerCase().localeCompare(bv.toLowerCase());
+   return asc ? cmp : -cmp;
+  }});
+  rows.forEach(function(r){{ tbody.appendChild(r); }});
+ }}
+ window.ctSortableInit = ctSortableInit;
+ ctSortableInit();
 </script>
 </body></html>"#,
         title = escape(title),
@@ -2126,6 +2181,7 @@ connection has been up.</p>
    });
    html += '</tbody></table>';
    document.getElementById('trafficTable').innerHTML = html;
+   window.ctSortableInit(document.getElementById('trafficTable'));
   })
   .catch(function(s){ document.getElementById('msg').textContent = 'could not load traffic (' + s + ')'; });
  fetch('/admin-ui/tunnels').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
@@ -2137,10 +2193,11 @@ connection has been up.</p>
     var uptime = t.uptime_seconds != null ? Math.round(t.uptime_seconds/60) + ' min' : '-';
     var lastSeen = t.last_seen_unix ? new Date(t.last_seen_unix*1000).toLocaleString() : 'never';
     html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td><td>' + esc(t.edge_id || '-') + '</td>'
-      + '<td>' + transportBadge(t.transport) + '</td><td>' + uptime + '</td><td>' + esc(lastSeen) + '</td></tr>';
+      + '<td>' + transportBadge(t.transport) + '</td><td data-sort="' + (t.uptime_seconds || 0) + '">' + uptime + '</td><td data-sort="' + (t.last_seen_unix || 0) + '">' + esc(lastSeen) + '</td></tr>';
    });
    html += '</tbody></table>';
    document.getElementById('tunnelsTable').innerHTML = html;
+   window.ctSortableInit(document.getElementById('tunnelsTable'));
   })
   .catch(function(s){ document.getElementById('msg').textContent = 'could not load tunnel overview (' + s + ')'; });
 })();
@@ -7326,6 +7383,38 @@ mod tests {
             let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let html = String::from_utf8(body.to_vec()).unwrap();
             assert!(html.contains("<html"), "{path} must render a real page: {html}");
+        }
+    }
+
+    /// Operator feedback (2026-08-26): every `/admin-ui/*` data table should be
+    /// sortable by clicking a column header. The click-to-sort behavior itself
+    /// lives in browser JS and isn't exercisable from a Rust test, but the hook
+    /// every page's table relies on (`window.ctSortableInit`, wired from
+    /// `admin_page`'s shared chrome) must ship on every page -- this is the
+    /// regression guard that a future edit to the shared chrome doesn't silently
+    /// drop it from one page while leaving it on the others.
+    #[tokio::test]
+    async fn every_admin_ui_page_ships_the_sortable_table_hook() {
+        let (app, ledger, _tunnels, admin) = test_admin_ui_app();
+        ledger.account_for_subject("kc-someone").unwrap();
+        admin.add_admin(SUPER_ADMIN, "second@example.com").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        for path in [
+            "/admin-ui/",
+            "/admin-ui/traffic",
+            "/admin-ui/accounts",
+            "/admin-ui/domains",
+            "/admin-ui/admins",
+            "/admin-ui/certs",
+            "/admin-ui/audit",
+        ] {
+            let resp = admin_ui_html_get(&app, path, Some(&super_session)).await;
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                html.contains("function ctSortableInit") && html.contains("window.ctSortableInit = ctSortableInit"),
+                "{path} must ship the sortable-table hook: {html}"
+            );
         }
     }
 
