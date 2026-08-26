@@ -5593,6 +5593,11 @@ pub fn persistent_control_plane_router(
             masque: std::env::var("CT_CP_CERT_MASQUE_PATH").ok().filter(|s| !s.is_empty()),
             admin_ui: std::env::var("CT_CP_CERT_ADMIN_UI_PATH").ok().filter(|s| !s.is_empty()),
         },
+        // Operator feedback (2026-08-26): "why don't I see bunsenbrenner.org in
+        // Domains?" -- see DomainAdminConfig::platform_zone's own doc. Opt-in,
+        // absent by default (matches this whole config block's "absent unless
+        // configured" convention).
+        platform_zone: std::env::var("CT_CP_PLATFORM_ZONE").ok().filter(|s| !s.is_empty()),
     };
     // #233: the Rot/Gelb/Grün admission-queue sweep. Opt-in and off by
     // default (matches this crate's "absent unless configured" convention
