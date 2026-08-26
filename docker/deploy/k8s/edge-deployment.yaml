@@ -11,8 +11,13 @@
 #   same reason the control plane uses it -- an RWO PVC can't be bound by two
 #   pods at once, so the old pod must fully terminate before a replacement
 #   binds the claim.
-# - No control-plane HTTP surface, so liveness/readiness use a TCP-socket probe
-#   on 4433 (the TLS-TCP fallback listener) as the "edge is accepting" signal.
+# - #590: probes target /healthz on the metrics port (edge-config.yaml's
+#   CT_EDGE_METRICS_LISTEN), same as control-plane-deployment.yaml's own
+#   pattern -- the older "no control-plane HTTP surface" reasoning this
+#   comment used to give was stale since #377ff. added the edge's own
+#   healthz/metrics server (broker_loops_health() catches a hung/crashed
+#   relay-loop task a bare TCP-connect on 4433 cannot: the listener stays
+#   accepting even if that task is dead).
 # - Hardened: non-root, read-only rootfs, all caps dropped. It needs no
 #   NET_ADMIN — that was only for netem in the testbed image.
 #
@@ -111,6 +116,11 @@ spec:
             - name: admin
               containerPort: 9601
               protocol: TCP
+            # #590: healthz/metrics HTTP server (#377ff.) -- see edge-config.yaml's
+            # CT_EDGE_METRICS_LISTEN.
+            - name: metrics
+              containerPort: 9600
+              protocol: TCP
           # #375: livenessProbe/readinessProbe alone gave a slow first start (each
           # edge mints its own internal CA and runs PoW setup *before* binding the
           # tls-tcp listener) only ~35-50s before liveness's own failureThreshold
@@ -122,21 +132,24 @@ spec:
           # already-running liveness bound below. ~150s window
           # (5s * 30 == 150s), generous for a one-time cold start.
           startupProbe:
-            tcpSocket:
-              port: tls-tcp
+            httpGet:
+              path: /healthz
+              port: metrics
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 30
           livenessProbe:
-            tcpSocket:
-              port: tls-tcp
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 5
             periodSeconds: 15
             timeoutSeconds: 3
             failureThreshold: 3
           readinessProbe:
-            tcpSocket:
-              port: tls-tcp
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 3
             periodSeconds: 10
             timeoutSeconds: 3
