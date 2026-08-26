@@ -1345,8 +1345,21 @@ impl<H: Clone> EdgeState<H> {
         drop(agents);
         self.candidates.write_safe().remove(token);
         self.direct.write_safe().remove(token);
-        // The tunnel is gone — drop its hostname routes too (#23 BP4a).
-        self.clear_hosts_for(token);
+        // The QUIC side is gone — drop its hostname routes too (#23 BP4a), UNLESS
+        // a live TCP-fallback registration for this same token still exists (#661,
+        // found live via a real field trial: a token's hostname binding can be
+        // served by either transport, and this function only ever looks at the
+        // QUIC 'agents' map going empty. Clearing routes unconditionally here
+        // wiped a perfectly healthy TCP-fallback-only tunnel's real, working
+        // routing the moment an UNRELATED QUIC registration for the same token
+        // (e.g. a stale reprobe connection finally detected as dead) reached
+        // zero -- with nothing to automatically re-populate it until some other
+        // event happened to trigger a fresh register_host call, stranding real
+        // traffic for anywhere from tens of seconds to minutes with no error
+        // logged that pointed at the actual cause.
+        if !self.has_tcp_agent(token) {
+            self.clear_hosts_for(token);
+        }
     }
 
     /// Remove **all** Agent tunnels (and candidate + direct + tcp) for `token` —
@@ -2107,6 +2120,47 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn remove_registration_leaves_hostname_routing_intact_when_a_tcp_fallback_agent_is_still_live_661() {
+        // #661: found live via a real field trial -- a token's hostname binding
+        // can be served by EITHER transport (QUIC 'agents' or the TCP-fallback
+        // pool), but remove_registration used to decide whether to wipe the
+        // hostname route by looking ONLY at whether the QUIC 'agents' map for
+        // this token had gone empty. A perfectly healthy, still-parked
+        // TCP-fallback registration for the SAME token got its real, working
+        // hostname routing wiped the moment an unrelated QUIC registration
+        // (e.g. a stale reprobe connection finally detected as dead) reached
+        // zero -- stranding real traffic with nothing to automatically
+        // re-populate the route.
+        let state = EdgeState::<u32>::new();
+        let t = token(61);
+        let cand: std::net::SocketAddr = "203.0.113.9:4433".parse().unwrap();
+
+        // A live TCP-fallback registration for this token -- keep the receiver
+        // alive so `has_tcp_agent` sees it as live, same as a real parked pool
+        // worker awaiting a Client.
+        let _parked = state.park_tcp_agent(t.clone());
+        assert!(state.has_tcp_agent(&t), "the park above must register as live");
+
+        // The token's ONLY hostname binding was actually established via the
+        // TCP-fallback ('B'/'L') path in the real bug -- register_host is the
+        // same call either transport uses.
+        state.register_host("kali.test", t.clone()).expect("hostname binds cleanly");
+        assert_eq!(state.route_host("kali.test"), Some(t.clone()), "sanity: routed before teardown");
+
+        // A SEPARATE, unrelated QUIC registration for the same token (e.g. a
+        // stale reprobe) now gets torn down.
+        let id = state.register_with_candidate(t.clone(), 1u32, cand);
+        state.remove_registration(&t, id);
+
+        assert_eq!(
+            state.route_host("kali.test"),
+            Some(t.clone()),
+            "a live TCP-fallback registration must keep the hostname routed even after \
+             an unrelated QUIC registration for the same token is torn down (#661 regression)"
+        );
     }
 
     #[test]
