@@ -82,6 +82,12 @@ data:
   # edge-networkpolicy.yaml scopes its ingress to the control-plane pod only
   # -- the k8s-native equivalent of compose's loopback-only publish.
   CT_EDGE_ADMIN_LISTEN: "0.0.0.0:9601"
+  # --- Healthz/metrics HTTP server (#377ff.) -------------------------------
+  # #590: unset here meant this whole surface was OFF in the k8s path (default
+  # off, crates/edge/src/serve.rs) even though the base compose stack has
+  # always published it -- edge-deployment.yaml's three probes below now
+  # target this port instead of a bare TCP-connect on the tls-tcp port.
+  CT_EDGE_METRICS_LISTEN: "0.0.0.0:9600"
   # --- Left out of scope by #309 (see kustomization.yaml's header) --------
   # CT_EDGE_AUTH_HOST/_ADDR/_CERT/_KEY (Keycloak Auth route, #48) and
   # CT_EDGE_WILDCARD_CERT/_KEY (Gelb-tier tunnel wildcard, #233) are NOT wired
