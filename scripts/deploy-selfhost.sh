@@ -48,6 +48,7 @@ COMPOSE_FRONTDOOR="$DEPLOY_DIR/compose.frontdoor.yml"
 COMPOSE_SSO="$DEPLOY_DIR/compose.sso.yml"
 COMPOSE_RELAY="$DEPLOY_DIR/compose.relay.yml"
 COMPOSE_MASQUE="$DEPLOY_DIR/compose.masque.yml"
+COMPOSE_ADMIN="$DEPLOY_DIR/compose.admin.yml"
 
 FRESH=0
 FRONTDOOR=0
@@ -147,6 +148,13 @@ compose_() {
   # deployments that never opted into MASQUE byte-identical to before.
   if grep -q '^CT_MASQUE_PROXY_TOKEN=..*' "$ENV_FILE" 2>/dev/null; then
     files+=(-f "$COMPOSE_MASQUE")
+  fi
+  # Admin console overlay (ADR-0025): same auto-include convention as MASQUE/relay
+  # above -- ADMIN_UI_PUBLIC_HOST is the overlay's own opt-in signal (compose.admin.yml's
+  # header comment), keyed the same way so a deployment that hasn't configured the
+  # admin console stays byte-identical to before.
+  if grep -q '^ADMIN_UI_PUBLIC_HOST=..*' "$ENV_FILE" 2>/dev/null; then
+    files+=(-f "$COMPOSE_ADMIN")
   fi
   docker_ compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
@@ -321,6 +329,7 @@ check_no_silent_security_downgrade() {
   [ "$SSO" = "1" ] && composes+=("$COMPOSE_SSO")
   grep -q '^CT_RELAY_NODE_PEER=..*' "$ENV_FILE" 2>/dev/null && composes+=("$COMPOSE_RELAY")
   grep -q '^CT_MASQUE_PROXY_TOKEN=..*' "$ENV_FILE" 2>/dev/null && composes+=("$COMPOSE_MASQUE")
+  grep -q '^ADMIN_UI_PUBLIC_HOST=..*' "$ENV_FILE" 2>/dev/null && composes+=("$COMPOSE_ADMIN")
   local watched
   watched=$(grep -hoE '^[[:space:]]+CT_[A-Z_]+: "\$\{CT_[A-Z_]+:-\}"' "${composes[@]}" 2>/dev/null \
             | grep -oE 'CT_[A-Z_]+' | sort -u)
