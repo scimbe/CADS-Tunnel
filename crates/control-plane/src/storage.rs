@@ -235,6 +235,15 @@ pub struct SqliteEnrollment {
 
 sqlite_store_ctors!(SqliteEnrollment);
 
+/// #663: a join token's default lifetime from mint to redemption -- long enough
+/// that an operator can generate an install link/QR and hand it to a new
+/// device/person without a tight deadline, short enough that a token leaked
+/// from a partial/failed install, a backup, or a log line stops being
+/// exploitable for tenant-scoped rogue-agent enrollment after a bounded
+/// window instead of forever. 7 days, matching common industry practice for
+/// enrollment/invite links.
+const JOIN_TOKEN_TTL_SECS: u64 = 7 * 24 * 3600;
+
 impl SqliteEnrollment {
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(
@@ -260,18 +269,31 @@ impl SqliteEnrollment {
         // don't know their true age), so they don't vanish in one surprise sweep
         // right after an upgrade; only rows minted from here on age out normally.
         ensure_column(&conn, "batch_issuance", "created_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // #663: same additive-migration shape, same grandfather semantics --
+        // `expires_at = 0` on an already-deployed row means "minted before this
+        // fix existed", and is treated as never-expiring (`redeem`'s own check
+        // skips 0 explicitly). This does NOT reopen the vulnerability for new
+        // tokens: every `INSERT` from here on (issue_join_token[s][_idempotent])
+        // always writes a real, positive `expires_at`. It only avoids silently
+        // invalidating tokens an operator already handed out under the old
+        // no-expiry contract, which would be a surprise breakage this migration
+        // has no business causing.
+        ensure_column(&conn, "join_tokens", "expires_at", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Issue a fresh single-use join token for `tenant`, persisting it.
-    pub fn issue_join_token(&self, tenant: &TenantId) -> rusqlite::Result<JoinToken> {
+    /// Issue a fresh single-use join token for `tenant`, persisting it. Expires
+    /// [`JOIN_TOKEN_TTL_SECS`] after `now` (#663) -- an unredeemed token past
+    /// that point is refused (and consumed) by [`Self::redeem`].
+    pub fn issue_join_token(&self, tenant: &TenantId, now: u64) -> rusqlite::Result<JoinToken> {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let expires_at = now.saturating_add(JOIN_TOKEN_TTL_SECS);
         self.conn.lock_safe().execute(
-            "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
-            params![&bytes[..], tenant.0],
+            "INSERT INTO join_tokens (token, tenant, redeemed, expires_at) VALUES (?1, ?2, 0, ?3)",
+            params![&bytes[..], tenant.0, expires_at as i64],
         )?;
         Ok(JoinToken(bytes))
     }
@@ -293,7 +315,9 @@ impl SqliteEnrollment {
         &self,
         tenant: &TenantId,
         count: usize,
+        now: u64,
     ) -> rusqlite::Result<Vec<JoinToken>> {
+        let expires_at = now.saturating_add(JOIN_TOKEN_TTL_SECS) as i64;
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
         let mut tokens = Vec::with_capacity(count);
@@ -301,8 +325,8 @@ impl SqliteEnrollment {
             let mut bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut bytes);
             tx.execute(
-                "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
-                params![&bytes[..], tenant.0],
+                "INSERT INTO join_tokens (token, tenant, redeemed, expires_at) VALUES (?1, ?2, 0, ?3)",
+                params![&bytes[..], tenant.0, expires_at],
             )?;
             tokens.push(JoinToken(bytes));
         }
@@ -358,14 +382,17 @@ impl SqliteEnrollment {
                 .collect());
         }
         // First time: mint `count` tokens, persisting each join token + the idempotency record.
+        // #663: same `now` this call already threads through for `batch_issuance.created_at`,
+        // reused for `expires_at` too -- no new parameter needed.
+        let expires_at = now.saturating_add(JOIN_TOKEN_TTL_SECS) as i64;
         let mut tokens = Vec::with_capacity(count);
         let mut blob = Vec::with_capacity(count * 32);
         for _ in 0..count {
             let mut bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut bytes);
             tx.execute(
-                "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
-                params![&bytes[..], tenant.0],
+                "INSERT INTO join_tokens (token, tenant, redeemed, expires_at) VALUES (?1, ?2, 0, ?3)",
+                params![&bytes[..], tenant.0, expires_at],
             )?;
             blob.extend_from_slice(&bytes);
             tokens.push(JoinToken(bytes));
@@ -380,7 +407,12 @@ impl SqliteEnrollment {
 
     /// Redeem a join token, binding `agent`'s public key to the token's tenant.
     /// Single-use: a second redemption of the same token is rejected, and the
-    /// consumption is persisted so it survives a restart.
+    /// consumption is persisted so it survives a restart. #663: also refused
+    /// (as [`EnrollError::Expired`]) once `now` is past the token's `expires_at`
+    /// -- an `expires_at` of exactly 0 is a pre-migration legacy row (see
+    /// [`Self::from_connection`]'s `ensure_column` call) and is never expired.
+    /// An expired token is still consumed (mirrors [`SqliteBootstrap::redeem`]),
+    /// so it can't be retried indefinitely either.
     ///
     /// #288: the consume (`UPDATE redeemed`) and the bind (`INSERT
     /// agent_bindings`) run in one transaction -- previously two separate
@@ -394,17 +426,18 @@ impl SqliteEnrollment {
         token: &JoinToken,
         agent: &AgentId,
         pubkey: AgentPublicKey,
+        now: u64,
     ) -> Result<TenantId, RedeemError> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
-        let row: Option<(String, i64)> = tx
+        let row: Option<(String, i64, i64)> = tx
             .query_row(
-                "SELECT tenant, redeemed FROM join_tokens WHERE token = ?1",
+                "SELECT tenant, redeemed, expires_at FROM join_tokens WHERE token = ?1",
                 params![&token.0[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (tenant, redeemed) = row.ok_or(RedeemError::Enroll(EnrollError::UnknownToken))?;
+        let (tenant, redeemed, expires_at) = row.ok_or(RedeemError::Enroll(EnrollError::UnknownToken))?;
         if redeemed != 0 {
             return Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed));
         }
@@ -412,6 +445,10 @@ impl SqliteEnrollment {
             "UPDATE join_tokens SET redeemed = 1 WHERE token = ?1",
             params![&token.0[..]],
         )?;
+        if expires_at != 0 && (now as i64) > expires_at {
+            tx.commit()?;
+            return Err(RedeemError::Enroll(EnrollError::Expired));
+        }
         tx.execute(
             "INSERT OR REPLACE INTO agent_bindings (agent, tenant, pubkey) VALUES (?1, ?2, ?3)",
             params![agent.0, tenant, &pubkey[..]],
@@ -433,11 +470,12 @@ impl SqliteEnrollment {
         agent: &AgentId,
         pubkey: AgentPublicKey,
         proof: &[u8; 64],
+        now: u64,
     ) -> Result<TenantId, RedeemError> {
         if !crate::enrollment::verify_join_proof(token, &pubkey, proof) {
             return Err(RedeemError::Enroll(EnrollError::BadProof));
         }
-        self.redeem(token, agent, pubkey)
+        self.redeem(token, agent, pubkey, now)
     }
 
     /// The binding recorded for `agent`, if enrolled.
@@ -479,13 +517,20 @@ impl SqliteEnrollment {
             .query_row("SELECT COUNT(*) FROM agent_bindings", [], |r| r.get(0))
     }
 
-    /// Delete already-redeemed join-token rows (#292 housekeeping); returns the
-    /// count removed. Unlike [`SqliteBootstrap::prune`] this needs no age check at
-    /// all — `redeem` already enforces single-use via the `redeemed` flag, so a
-    /// redeemed row can never be validly reused regardless of how old it is. Safe
-    /// to call periodically; live, unredeemed tokens are never touched.
-    pub fn prune_redeemed_join_tokens(&self) -> rusqlite::Result<usize> {
-        self.conn.lock_safe().execute("DELETE FROM join_tokens WHERE redeemed != 0", [])
+    /// Delete already-redeemed join-token rows (#292 housekeeping) AND
+    /// unredeemed rows past their `expires_at` (#663 -- an expired-but-never-
+    /// redeemed token is exactly the "leaked, unbounded lifetime" case this
+    /// column exists to close; there's no reason to keep it around once
+    /// [`Self::redeem`] would refuse it anyway). `expires_at = 0` (a pre-
+    /// migration legacy row) is never matched by the age check, same
+    /// grandfather semantics as everywhere else this column is read. Returns
+    /// the count removed. Safe to call periodically; live, unexpired,
+    /// unredeemed tokens are never touched.
+    pub fn prune_redeemed_join_tokens(&self, now: u64) -> rusqlite::Result<usize> {
+        self.conn.lock_safe().execute(
+            "DELETE FROM join_tokens WHERE redeemed != 0 OR (expires_at != 0 AND expires_at < ?1)",
+            params![now as i64],
+        )
     }
 
     /// Delete `batch_issuance` idempotency records older than `now - max_age_secs`
@@ -7490,11 +7535,11 @@ mod tests {
     #[test]
     fn issue_then_redeem_binds_public_key() {
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let token = store.issue_join_token(&tenant()).unwrap();
+        let token = store.issue_join_token(&tenant(), 1_000).unwrap();
         let agent = AgentId("agent-1".into());
         let pubkey = [7u8; 32];
 
-        let bound = store.redeem(&token, &agent, pubkey).unwrap();
+        let bound = store.redeem(&token, &agent, pubkey, 1_000).unwrap();
         assert_eq!(bound, tenant());
         assert_eq!(store.binding(&agent).unwrap(), Some((tenant(), pubkey)));
     }
@@ -7502,12 +7547,123 @@ mod tests {
     #[test]
     fn join_token_is_single_use() {
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let token = store.issue_join_token(&tenant()).unwrap();
-        store.redeem(&token, &AgentId("a1".into()), [1u8; 32]).unwrap();
-        let second = store.redeem(&token, &AgentId("a2".into()), [2u8; 32]);
+        let token = store.issue_join_token(&tenant(), 1_000).unwrap();
+        store.redeem(&token, &AgentId("a1".into()), [1u8; 32], 1_000).unwrap();
+        let second = store.redeem(&token, &AgentId("a2".into()), [2u8; 32], 1_000);
         assert!(
             matches!(second, Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))),
             "second redemption rejected"
+        );
+    }
+
+    /// #663: a leaked-but-unredeemed join token must stop being exploitable
+    /// once it's past its TTL, not stay valid forever. Minted at `now = 1_000`
+    /// with the default `JOIN_TOKEN_TTL_SECS` (7 days) means `expires_at =
+    /// 1_000 + 604_800`; redeeming one second past that must be refused.
+    #[test]
+    fn redeem_refuses_a_join_token_past_its_expiry() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let token = store.issue_join_token(&tenant(), 1_000).unwrap();
+        let past_expiry = 1_000 + JOIN_TOKEN_TTL_SECS + 1;
+        let result = store.redeem(&token, &AgentId("a".into()), [1u8; 32], past_expiry);
+        assert!(
+            matches!(result, Err(RedeemError::Enroll(EnrollError::Expired))),
+            "an expired join token must be refused: {result:?}"
+        );
+        assert!(
+            store.binding(&AgentId("a".into())).unwrap().is_none(),
+            "an expired redemption must not bind the agent"
+        );
+    }
+
+    /// The flip side of the expiry check: still comfortably inside the TTL
+    /// window, redemption proceeds exactly as before this fix.
+    #[test]
+    fn redeem_succeeds_for_a_join_token_still_within_its_ttl() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let token = store.issue_join_token(&tenant(), 1_000).unwrap();
+        let still_valid = 1_000 + JOIN_TOKEN_TTL_SECS - 1;
+        let bound = store.redeem(&token, &AgentId("a".into()), [1u8; 32], still_valid).unwrap();
+        assert_eq!(bound, tenant());
+    }
+
+    /// #663: an expired token is CONSUMED, not left redeemable on retry --
+    /// mirrors `SqliteBootstrap::redeem`'s "consume regardless of freshness"
+    /// behavior. Without this, an attacker holding an expired-but-unconsumed
+    /// token could keep retrying until an operator's clock/TTL assumption
+    /// somehow worked in their favor; with it, one redemption attempt (expired
+    /// or not) permanently burns the token.
+    #[test]
+    fn an_expired_join_token_is_consumed_not_left_retryable() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let token = store.issue_join_token(&tenant(), 1_000).unwrap();
+        let past_expiry = 1_000 + JOIN_TOKEN_TTL_SECS + 1;
+        assert!(matches!(
+            store.redeem(&token, &AgentId("a".into()), [1u8; 32], past_expiry),
+            Err(RedeemError::Enroll(EnrollError::Expired))
+        ));
+        // A second attempt, even well within what would have been the TTL from
+        // this exact `now`, sees the token already consumed -- not "expired"
+        // again, "already used".
+        assert!(matches!(
+            store.redeem(&token, &AgentId("b".into()), [2u8; 32], past_expiry),
+            Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))
+        ));
+    }
+
+    /// #663: a pre-migration row (`expires_at = 0`, the `ensure_column`
+    /// default) must be grandfathered -- never treated as expired, regardless
+    /// of how far `now` has moved on. Simulated directly via the raw table
+    /// (an `INSERT` with no `expires_at` column, hitting the schema default)
+    /// since every real `issue_join_token*` call always writes a real,
+    /// positive value from here on.
+    #[test]
+    fn a_pre_migration_join_token_with_no_expiry_never_expires() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        {
+            let conn = store.conn.lock_safe();
+            conn.execute(
+                "INSERT INTO join_tokens (token, tenant, redeemed) VALUES (?1, ?2, 0)",
+                params![&[9u8; 32][..], tenant().0],
+            )
+            .unwrap();
+        }
+        let far_future = 1_000 + JOIN_TOKEN_TTL_SECS * 100;
+        let bound = store
+            .redeem(&JoinToken([9u8; 32]), &AgentId("legacy".into()), [1u8; 32], far_future)
+            .unwrap();
+        assert_eq!(bound, tenant(), "a legacy expires_at=0 row is never expired");
+    }
+
+    /// #663: `prune_redeemed_join_tokens` now also removes unredeemed rows
+    /// past their expiry, not just already-redeemed ones (#292's original
+    /// scope) -- an expired-but-never-redeemed token is exactly the "leaked,
+    /// unbounded lifetime" case this whole column exists to close, so
+    /// housekeeping should be able to clear it out too.
+    #[test]
+    fn prune_redeemed_join_tokens_also_removes_unredeemed_expired_rows_663() {
+        let store = SqliteEnrollment::open_in_memory().unwrap();
+        let expired = store.issue_join_token(&tenant(), 1_000).unwrap();
+        // Minted much later, so its own `expires_at` lands well after the
+        // `past_expiry` moment used below to prune -- the two tokens must
+        // land on opposite sides of that line, not share the same expiry.
+        let live = store.issue_join_token(&tenant(), 600_000).unwrap();
+        let past_expiry = 1_000 + JOIN_TOKEN_TTL_SECS + 1;
+        assert_eq!(
+            store.prune_redeemed_join_tokens(past_expiry).unwrap(),
+            1,
+            "exactly the expired, still-unredeemed row is pruned"
+        );
+        assert!(
+            matches!(
+                store.redeem(&expired, &AgentId("a".into()), [1u8; 32], past_expiry),
+                Err(RedeemError::Enroll(EnrollError::UnknownToken))
+            ),
+            "the pruned row is gone entirely, not just marked expired"
+        );
+        assert!(
+            store.redeem(&live, &AgentId("b".into()), [2u8; 32], 1_000).is_ok(),
+            "an unexpired token survives the same prune call"
         );
     }
 
@@ -7516,7 +7672,7 @@ mod tests {
         // #145 bulk provisioning (frozen): a batch mint yields N DISTINCT tokens, each redeemable
         // exactly once and independent of the others — "provision N agents" in one call.
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let tokens = store.issue_join_tokens(&tenant(), 5).unwrap();
+        let tokens = store.issue_join_tokens(&tenant(), 5, 1_000).unwrap();
         assert_eq!(tokens.len(), 5, "five tokens minted");
 
         // All distinct.
@@ -7526,21 +7682,21 @@ mod tests {
         }
 
         // Each is a real, independently single-use token: redeem #0, its replay fails, #1 still works.
-        assert!(store.redeem(&tokens[0], &AgentId("a0".into()), [10u8; 32]).is_ok(), "first token redeems");
+        assert!(store.redeem(&tokens[0], &AgentId("a0".into()), [10u8; 32], 1_000).is_ok(), "first token redeems");
         assert!(
             matches!(
-                store.redeem(&tokens[0], &AgentId("a0b".into()), [11u8; 32]),
+                store.redeem(&tokens[0], &AgentId("a0b".into()), [11u8; 32], 1_000),
                 Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))
             ),
             "a batch token is single-use like any other"
         );
         assert!(
-            store.redeem(&tokens[1], &AgentId("a1".into()), [12u8; 32]).is_ok(),
+            store.redeem(&tokens[1], &AgentId("a1".into()), [12u8; 32], 1_000).is_ok(),
             "a different batch token is unaffected — independent tokens"
         );
 
         // count = 0 yields no tokens (caller/REST layer decides whether that's an error).
-        assert!(store.issue_join_tokens(&tenant(), 0).unwrap().is_empty(), "zero count mints nothing");
+        assert!(store.issue_join_tokens(&tenant(), 0, 1_000).unwrap().is_empty(), "zero count mints nothing");
     }
 
     #[test]
@@ -7561,7 +7717,7 @@ mod tests {
         assert!(other.iter().all(|t| !first.contains(t)), "a different key mints distinct tokens");
 
         // The idempotently-minted tokens are real, single-use join tokens.
-        assert!(store.redeem(&first[0], &AgentId("a".into()), [1u8; 32]).is_ok(), "an idempotent token redeems");
+        assert!(store.redeem(&first[0], &AgentId("a".into()), [1u8; 32], 1_000).is_ok(), "an idempotent token redeems");
         // Replaying the key again AFTER one was redeemed still returns the same set (idempotency is
         // about issuance, not redemption state).
         let replay2 = store.issue_join_tokens_idempotent(&tenant(), 3, "req-abc", 1_000).unwrap();
@@ -7600,15 +7756,15 @@ mod tests {
     #[test]
     fn prune_redeemed_join_tokens_removes_only_redeemed_rows_292() {
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let live = store.issue_join_token(&tenant()).unwrap();
-        let redeemed = store.issue_join_token(&tenant()).unwrap();
-        store.redeem(&redeemed, &AgentId("a".into()), [1u8; 32]).unwrap();
+        let live = store.issue_join_token(&tenant(), 1_000).unwrap();
+        let redeemed = store.issue_join_token(&tenant(), 1_000).unwrap();
+        store.redeem(&redeemed, &AgentId("a".into()), [1u8; 32], 1_000).unwrap();
 
-        assert_eq!(store.prune_redeemed_join_tokens().unwrap(), 1, "exactly the redeemed row is pruned");
+        assert_eq!(store.prune_redeemed_join_tokens(1_000).unwrap(), 1, "exactly the redeemed row is pruned");
         // A second prune immediately after finds nothing new to remove.
-        assert_eq!(store.prune_redeemed_join_tokens().unwrap(), 0);
+        assert_eq!(store.prune_redeemed_join_tokens(1_000).unwrap(), 0);
         // Pruning the redeemed row never touched the live, unredeemed one.
-        assert!(store.redeem(&live, &AgentId("b".into()), [2u8; 32]).is_ok(), "the live token still redeems");
+        assert!(store.redeem(&live, &AgentId("b".into()), [2u8; 32], 1_000).is_ok(), "the live token still redeems");
     }
 
     #[test]
@@ -7641,7 +7797,7 @@ mod tests {
     #[test]
     fn unknown_token_is_rejected() {
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let result = store.redeem(&JoinToken([0u8; 32]), &AgentId("a1".into()), [3u8; 32]);
+        let result = store.redeem(&JoinToken([0u8; 32]), &AgentId("a1".into()), [3u8; 32], 1_000);
         assert!(matches!(
             result,
             Err(RedeemError::Enroll(EnrollError::UnknownToken))
@@ -7657,7 +7813,7 @@ mod tests {
         use ed25519_dalek::{Signer, SigningKey};
 
         let store = SqliteEnrollment::open_in_memory().unwrap();
-        let token = store.issue_join_token(&tenant()).unwrap();
+        let token = store.issue_join_token(&tenant(), 1_000).unwrap();
         let agent = AgentId("agent-1".into());
 
         let sk = SigningKey::from_bytes(&[42u8; 32]);
@@ -7668,7 +7824,7 @@ mod tests {
         let forged = wrong.sign(&token.0).to_bytes();
         assert!(
             matches!(
-                store.redeem_with_proof(&token, &agent, pubkey, &forged),
+                store.redeem_with_proof(&token, &agent, pubkey, &forged, 1_000),
                 Err(RedeemError::Enroll(EnrollError::BadProof))
             ),
             "a proof that doesn't match the bound key is rejected"
@@ -7677,11 +7833,11 @@ mod tests {
 
         // Genuine proof by the bound key -> binds, and the token is now single-use.
         let proof = sk.sign(&token.0).to_bytes();
-        assert_eq!(store.redeem_with_proof(&token, &agent, pubkey, &proof).unwrap(), tenant());
+        assert_eq!(store.redeem_with_proof(&token, &agent, pubkey, &proof, 1_000).unwrap(), tenant());
         assert_eq!(store.binding(&agent).unwrap(), Some((tenant(), pubkey)));
         assert!(
             matches!(
-                store.redeem_with_proof(&token, &agent, pubkey, &proof),
+                store.redeem_with_proof(&token, &agent, pubkey, &proof, 1_000),
                 Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))
             ),
             "the token is consumed after a successful proven redemption"
@@ -7698,8 +7854,8 @@ mod tests {
         let token;
         {
             let store = SqliteEnrollment::open(&path).unwrap();
-            token = store.issue_join_token(&tenant()).unwrap();
-            store.redeem(&token, &agent, [9u8; 32]).unwrap();
+            token = store.issue_join_token(&tenant(), 1_000).unwrap();
+            store.redeem(&token, &agent, [9u8; 32], 1_000).unwrap();
         } // store dropped -> connection closed
 
         let reopened = SqliteEnrollment::open(&path).unwrap();
@@ -7708,7 +7864,7 @@ mod tests {
             Some((tenant(), [9u8; 32])),
             "binding persisted across reopen"
         );
-        let replay = reopened.redeem(&token, &AgentId("other".into()), [1u8; 32]);
+        let replay = reopened.redeem(&token, &AgentId("other".into()), [1u8; 32], 1_000);
         assert!(
             matches!(replay, Err(RedeemError::Enroll(EnrollError::TokenAlreadyUsed))),
             "token stays consumed across reopen"

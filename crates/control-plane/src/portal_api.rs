@@ -3323,7 +3323,11 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     // actual tokens above.
     let hostname = st.tunnels.hostname_if_authorized(&subject, &id).ok().flatten();
     // Mint a fresh single-use join token bound to the customer (subject as tenant).
-    let token = match st.enrollment.issue_join_token(&TenantId(subject.clone())) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let token = match st.enrollment.issue_join_token(&TenantId(subject.clone()), now) {
         Ok(t) => hex(&t.0),
         Err(e) => return internal_error("install_page/issue_join_token", e).into_response(),
     };

@@ -196,7 +196,7 @@ async fn issue(
     require_issue_admin(&headers, &st.issue_admin_token)?;
     let token = st
         .store
-        .issue_join_token(&TenantId(req.tenant))
+        .issue_join_token(&TenantId(req.tenant), now_secs())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(IssueResp {
         token: hex_encode(&token.0),
@@ -243,12 +243,7 @@ async fn issue_batch(
     let tokens = match req.idempotency_key.as_deref() {
         Some(key) => st
             .store
-            .issue_join_tokens_idempotent(
-                &tenant,
-                req.count,
-                key,
-                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-            )
+            .issue_join_tokens_idempotent(&tenant, req.count, key, now_secs())
             .map_err(|e| {
                 let code = match e {
                     IssueBatchError::Conflict => StatusCode::CONFLICT,
@@ -258,7 +253,7 @@ async fn issue_batch(
             })?,
         None => st
             .store
-            .issue_join_tokens(&tenant, req.count)
+            .issue_join_tokens(&tenant, req.count, now_secs())
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
     Ok(Json(IssueBatchResp {
@@ -291,12 +286,13 @@ async fn redeem(
         .ok_or((StatusCode::BAD_REQUEST, "malformed proof".to_string()))?;
     let tenant = st
         .store
-        .redeem_with_proof(&JoinToken(token), &AgentId(req.agent), pubkey, &proof)
+        .redeem_with_proof(&JoinToken(token), &AgentId(req.agent), pubkey, &proof, now_secs())
         .map_err(|e| {
             let code = match &e {
                 RedeemError::Enroll(EnrollError::TokenAlreadyUsed) => StatusCode::CONFLICT,
                 RedeemError::Enroll(EnrollError::UnknownToken) => StatusCode::NOT_FOUND,
                 RedeemError::Enroll(EnrollError::BadProof) => StatusCode::FORBIDDEN,
+                RedeemError::Enroll(EnrollError::Expired) => StatusCode::GONE,
                 RedeemError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (code, e.to_string())
@@ -6411,6 +6407,46 @@ mod tests {
         assert_ne!(r2.status(), StatusCode::NOT_FOUND, "redeem stays mounted with no admin token");
     }
 
+    /// #663 end to end over the real HTTP route: a join token minted with an
+    /// `expires_at` far in the past (well before this test's real wall-clock
+    /// `now`, which `/enroll/redeem` reads via `now_secs()`) must be refused
+    /// with 410 Gone, matching `bootstrap_redeem`'s existing Expired -> GONE
+    /// convention -- not silently accepted, not a generic error.
+    #[tokio::test]
+    async fn enroll_redeem_refuses_an_expired_join_token_with_410() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let store = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        // Minted "at" unix time 1 -- expires ~7 days later, i.e. still in 1970,
+        // hopelessly in the past relative to the real `now_secs()` the route
+        // itself will check against.
+        let token = store.issue_join_token(&TenantId("t1".to_string()), 1).unwrap();
+        let sk = SigningKey::from_bytes(&[77u8; 32]);
+        let pubkey = sk.verifying_key().to_bytes();
+        let proof = sk.sign(&token.0).to_bytes();
+
+        let app = enrollment_router_sqlite(store);
+        let body = format!(
+            r#"{{"token":"{}","agent":"agent-1","pubkey":"{}","proof":"{}"}}"#,
+            hex_encode(&token.0),
+            hex_encode(&pubkey),
+            hex_encode(&proof),
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/enroll/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE, "an expired join token must be refused with 410, not silently accepted");
+    }
+
     #[tokio::test]
     async fn enroll_issue_batch_is_admin_gated_caps_count_and_mints_n_tokens() {
         // #145 bulk provisioning (frozen): POST /enroll/issue-batch mints N tokens in one admin call,
@@ -10946,9 +10982,9 @@ mod tests {
 
         // Seed one of each metadata kind.
         let tenant = TenantId("t".into());
-        let jt = enrollment.issue_join_token(&tenant).unwrap();
+        let jt = enrollment.issue_join_token(&tenant, 1_000).unwrap();
         enrollment
-            .redeem(&jt, &AgentId("a".into()), [1u8; 32])
+            .redeem(&jt, &AgentId("a".into()), [1u8; 32], 1_000)
             .unwrap();
         registry
             .register(
@@ -11020,8 +11056,8 @@ mod tests {
         let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
 
         let tenant = TenantId("t".into());
-        let jt1 = enrollment.issue_join_token(&tenant).unwrap();
-        enrollment.redeem(&jt1, &AgentId("a1".into()), [1u8; 32]).unwrap();
+        let jt1 = enrollment.issue_join_token(&tenant, 1_000).unwrap();
+        enrollment.redeem(&jt1, &AgentId("a1".into()), [1u8; 32], 1_000).unwrap();
 
         let app = status_router(
             enrollment.clone(),
@@ -11042,8 +11078,8 @@ mod tests {
         assert_eq!(get_agents(app.clone()).await, 1, "first request reports the real, freshly-aggregated count");
 
         // A second agent enrolls -- a real re-aggregation would now see 2.
-        let jt2 = enrollment.issue_join_token(&tenant).unwrap();
-        enrollment.redeem(&jt2, &AgentId("a2".into()), [2u8; 32]).unwrap();
+        let jt2 = enrollment.issue_join_token(&tenant, 1_000).unwrap();
+        enrollment.redeem(&jt2, &AgentId("a2".into()), [2u8; 32], 1_000).unwrap();
 
         assert_eq!(
             get_agents(app).await,
@@ -11077,8 +11113,8 @@ mod tests {
         let pipeline_registry = Arc::new(SqlitePipelineRegistry::open_in_memory().unwrap());
 
         let tenant = TenantId("t".into());
-        let jt1 = enrollment.issue_join_token(&tenant).unwrap();
-        enrollment.redeem(&jt1, &AgentId("a1".into()), [1u8; 32]).unwrap();
+        let jt1 = enrollment.issue_join_token(&tenant, 1_000).unwrap();
+        enrollment.redeem(&jt1, &AgentId("a1".into()), [1u8; 32], 1_000).unwrap();
 
         let app = status_router(
             enrollment.clone(),
@@ -11101,8 +11137,8 @@ mod tests {
         // A refusal happens, and a second agent enrolls, both between the two
         // requests and both within STATUS_CACHE_TTL.
         note_payment_webhook_rejected("test");
-        let jt2 = enrollment.issue_join_token(&tenant).unwrap();
-        enrollment.redeem(&jt2, &AgentId("a2".into()), [2u8; 32]).unwrap();
+        let jt2 = enrollment.issue_join_token(&tenant, 1_000).unwrap();
+        enrollment.redeem(&jt2, &AgentId("a2".into()), [2u8; 32], 1_000).unwrap();
 
         let second = get(app).await;
         assert!(
