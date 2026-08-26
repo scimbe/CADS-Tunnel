@@ -501,18 +501,22 @@ pub(crate) fn identity_from_verified_id_token(
 /// email" hits `/portal/login`, which reports [`sso_unconfigured`] the same way),
 /// whereas redirecting straight into a login flow that doesn't exist would leave
 /// the site's own landing page showing nothing at all.
-async fn portal_home(State(st): State<PortalState>, Query(q): Query<LoginQuery>) -> Response {
+async fn portal_home(State(st): State<PortalState>, Query(q): Query<LoginQuery>, headers: HeaderMap) -> Response {
     match st.oidc {
         Some(cfg) => {
             // Same CSRF-state-cookie dance portal_login already does -- this and
             // portal_login now reach an identical result; /portal/login stays as
             // its own route for any existing bookmarked/linked-to URLs.
+            let next = sanitized_next(q.next.as_deref());
+            if let Some(redirect) = redirect_to_canonical_login_host(&headers, &cfg.redirect_uri, next.as_deref()) {
+                return redirect;
+            }
             let state = random_state();
             let mut resp = Redirect::to(&cfg.authorize_redirect(&state, None, None, false)).into_response();
             set_cookie(&mut resp, &state_cookie(&state));
             // #521: an unauthenticated deep link (e.g. a claim page) redirects here
             // with ?next=<portal path>; carry it across the OIDC round-trip.
-            if let Some(next) = sanitized_next(q.next.as_deref()) {
+            if let Some(next) = next {
                 set_cookie(&mut resp, &next_cookie(&next));
             }
             resp
@@ -595,9 +599,13 @@ fn known_idp_hint(hint: Option<&str>) -> Option<&str> {
     hint.filter(|h| matches!(*h, "google" | "github" | "gitlab"))
 }
 
-async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>) -> Response {
+async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>, headers: HeaderMap) -> Response {
     match st.oidc {
         Some(cfg) => {
+            let next = sanitized_next(q.next.as_deref());
+            if let Some(redirect) = redirect_to_canonical_login_host(&headers, &cfg.redirect_uri, next.as_deref()) {
+                return redirect;
+            }
             // Mint the CSRF `state`, carry it BOTH in the authorize redirect and
             // in a single-use HttpOnly cookie so the callback can prove the
             // response came back to the same browser we sent out.
@@ -611,7 +619,7 @@ async fn portal_login(State(st): State<PortalState>, Query(q): Query<LoginQuery>
             ))
             .into_response();
             set_cookie(&mut resp, &state_cookie(&state));
-            if let Some(next) = sanitized_next(q.next.as_deref()) {
+            if let Some(next) = next {
                 set_cookie(&mut resp, &next_cookie(&next));
             }
             resp
@@ -1037,6 +1045,19 @@ fn set_cookie(resp: &mut Response, cookie: &str) {
 /// The single-use CSRF state cookie: HttpOnly (no JS access), Secure (HTTPS
 /// only), SameSite=Lax (sent on the top-level IdP redirect back), scoped to
 /// `/portal`, expiring in 10 minutes.
+///
+/// **Cannot be `Domain=`-widened, ever**: `STATE_COOKIE` carries the `__Host-`
+/// prefix specifically so ONLY this exact host can set/overwrite it (see its own
+/// doc comment) -- the `__Host-` prefix's browser-enforced contract explicitly
+/// FORBIDS a `Domain=` attribute; a `Set-Cookie` combining both is silently
+/// dropped by the browser, not degraded. That means a login initiated on a
+/// non-canonical host (e.g. `admin.<zone>`) can never have its state cookie
+/// survive the trip to the OIDC callback (fixed to `redirect_uri`'s host) --
+/// this is real, live-reproduced ("invalid or missing CSRF state" the first
+/// time the admin console's login was exercised). The actual fix lives one
+/// layer up: [`redirect_to_canonical_login_host`] sends a non-canonical-host
+/// login attempt to the canonical host FIRST, so this cookie is always minted
+/// and read on the exact same host it already assumes -- no change needed here.
 fn state_cookie(state: &str) -> String {
     format!("{STATE_COOKIE}={state}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax")
 }
@@ -1051,6 +1072,12 @@ fn cleared_state_cookie() -> String {
 /// it, an unauthenticated deep link -- the claim page is the field case -- landed
 /// on the portal home after sign-in and the participant had to find their way
 /// back (measured as real first-contact friction by the docs tester).
+///
+/// Not `__Host-`-prefixed, so `Domain=`-widening would be *possible* here, but
+/// deliberately not done: [`redirect_to_canonical_login_host`] means this cookie
+/// is now always minted and read on the canonical host too (same fix as the
+/// state cookie above), so there is nothing left for widening to solve --
+/// keeping it host-only is simply the smaller, more restrictive cookie.
 const NEXT_COOKIE: &str = "ct_portal_next";
 
 fn next_cookie(next: &str) -> String {
@@ -1059,6 +1086,37 @@ fn next_cookie(next: &str) -> String {
 
 fn cleared_next_cookie() -> String {
     format!("{NEXT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+}
+
+/// ADR-0025 Decision 5 addendum: the actual fix for "login started on a
+/// non-canonical host never completes" (the class the __Host- state cookie
+/// makes structurally impossible to solve by widening a cookie's `Domain=`).
+/// If the request didn't arrive on `redirect_uri`'s own host (read via
+/// `x-forwarded-host`, the same header `gate.rs`'s own host-aware routes
+/// already trust), bounce it to that canonical host's `/portal/login` BEFORE
+/// any state/next cookie is minted -- carrying the intended post-login target
+/// as a plain query param (not yet a cookie, so no cookie-domain problem to
+/// solve at this hop either). The entire OIDC round trip then always happens
+/// on exactly one host, satisfying `__Host-`'s contract by construction; only
+/// the FINAL session cookie (already `Domain=`-scoped via
+/// [`configured_cookie_domain`], and NOT `__Host-`-prefixed) needs to cross
+/// back to the originating host, which it already does correctly.
+///
+/// Returns `None` (proceed normally) when already on the canonical host, when
+/// `x-forwarded-host` is absent (a direct/dev request with no fronting proxy --
+/// nothing to bounce from), or when `redirect_uri` is unparseable.
+fn redirect_to_canonical_login_host(headers: &HeaderMap, redirect_uri: &str, next: Option<&str>) -> Option<Response> {
+    let (scheme, rest) = redirect_uri.split_once("://")?;
+    let canonical_host = rest.split('/').next()?;
+    let request_host = headers.get("x-forwarded-host").and_then(|v| v.to_str().ok())?;
+    if request_host.eq_ignore_ascii_case(canonical_host) {
+        return None;
+    }
+    let mut url = format!("{scheme}://{canonical_host}/portal/login");
+    if let Some(n) = next {
+        url = format!("{url}?next={}", urlencode(n));
+    }
+    Some(Redirect::to(&url).into_response())
 }
 
 /// #521: accept only portal-internal paths as post-login targets -- anything else
@@ -1772,6 +1830,73 @@ mod tests {
         assert!(loc.contains("redirect_uri=https%3A%2F%2Fportal.example%2Fportal%2Fcallback"));
         assert!(loc.contains("scope=openid"));
         assert!(loc.contains("state="), "carries a CSRF state");
+    }
+
+    /// ADR-0025 Decision 5 addendum: the actual fix for "invalid or missing CSRF
+    /// state" when login is reached via a non-canonical host (e.g. `admin.<zone>`
+    /// fronting the same control-plane) -- `STATE_COOKIE`'s `__Host-` prefix makes
+    /// widening its `Domain=` impossible (browsers silently drop such a
+    /// `Set-Cookie` outright), so the fix bounces to the canonical
+    /// (`redirect_uri`) host's OWN `/portal/login` BEFORE any state cookie is
+    /// minted, instead of setting one that could never survive the round trip.
+    /// Fail-first: before `redirect_to_canonical_login_host` existed, this request
+    /// went straight to Keycloak with a state cookie scoped to `admin.example` --
+    /// exactly the cookie the callback (landing on `portal.example`) could never
+    /// read back.
+    #[tokio::test]
+    async fn login_from_a_non_canonical_host_bounces_to_the_canonical_host_first_0025() {
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login?next=/portal/topologies")
+                    .header("x-forwarded-host", "admin.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "a redirect, not straight to Keycloak");
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            loc, "https://portal.example/portal/login?next=%2Fportal%2Ftopologies",
+            "bounces to the canonical host's own /portal/login, carrying next as a plain query param: {loc}"
+        );
+        assert!(
+            resp.headers().get("set-cookie").is_none(),
+            "no state/next cookie minted on the bounce -- it would be scoped to the wrong host: {:?}",
+            resp.headers().get("set-cookie")
+        );
+    }
+
+    /// The bounce must not fire when already on the canonical host -- otherwise
+    /// every real login would loop or add a pointless extra hop.
+    #[tokio::test]
+    async fn login_on_the_canonical_host_proceeds_straight_to_keycloak_0025() {
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login")
+                    .header("x-forwarded-host", "portal.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert!(loc.starts_with("https://kc.example/"), "already canonical -- straight to Keycloak, no bounce: {loc}");
+        assert!(resp.headers().get("set-cookie").is_some(), "state cookie IS minted on the canonical host");
     }
 
     #[tokio::test]
