@@ -4602,17 +4602,22 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    script, which checks the environment and installs + onboards for me:
    `curl -fsSL https://raw.githubusercontent.com/scimbe/ct-agent/main/scripts/setup.sh | bash`.
    No Docker, no Rust toolchain, no repo clone required for this.
-4. Help me turn hello-handler.sh into a handler for my idea: &lt;describe what you
-   want your service to do here&gt;. It's currently running on: &lt;your PC /
-   Raspberry Pi / container / agent&gt;.
-5. Mint my channel identity with `ct-agent channel init`, append it to `.env`,
-   and reload it (`set -a; source .env; set +a`). This identity is meant to be
-   long-lived -- running channel init again later would create a second,
-   unrelated identity rather than restoring this one; that's just how it works,
-   not something to worry about.
-6. Walk me through running the handler as a live role, then publishing my
-   pipeline at POST /me/pipelines with my portal login's OIDC bearer token
-   (not an admin token -- I was never given one, and don't need one).</code></template>
+4. First get the UNMODIFIED template running end to end by following its
+   README.md steps 1-7 in order -- they are a verified transcript against this
+   deployment, ending with a real self-test call to your own service over the
+   live relay (step 6), so we both KNOW the loop works before changing anything.
+   Two contract details the README explains that are worth respecting when we
+   customize later: handlers read stdin with `$(cat)` (input arrives without a
+   trailing newline) and must be executable.
+5. The identities the README has you mint (`channel init`, `operator-init`) are
+   meant to be long-lived -- keep them in the `.env`/`operator.env` files and
+   reload with `set -a; source .env; set +a` when resuming. Running init again
+   later would create a second, unrelated identity rather than restoring this
+   one; that's just how it works, not something to worry about.
+6. Once the hello-world loop works, help me turn hello-handler.sh into a handler
+   for my idea: &lt;describe what you want your service to do here&gt;. It's currently
+   running on: &lt;your PC / Raspberry Pi / container / agent&gt;. Re-run the README's
+   step-6 self-test call against the new handler before we call it done.</code></template>
   </div>
   <p class="alt-link">
    Prefer to read the code yourself? <a href="/downloads/hello-world-pipeline.zip" download>Download hello-world-pipeline.zip</a>
