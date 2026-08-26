@@ -631,6 +631,18 @@ pub struct ObservabilityConfig {
     /// derives the co-located `/healthz` URL from it (both live on the edge's
     /// `metrics_router`, `crates/edge/src/observe.rs`, on the same listener).
     pub edge_metrics_url: Option<String>,
+    /// Operator feedback (2026-08-26): the Accounts page should show each
+    /// account's email and be searchable by it, not just by the opaque
+    /// Keycloak subject id. The ledger's own `account_subjects` table has no
+    /// email column (it's keyed purely on the OIDC `sub` claim -- see
+    /// `service.rs`'s `subject_of`), so this is resolved live per page render
+    /// via Keycloak's own Admin API instead of a schema change. `None` when
+    /// `KeycloakAdminConfig::from_env()` didn't find a full config (the exact
+    /// same config `authed_service_account_router`'s provisioning already
+    /// needs, so on a deployment where THAT already works this needs no new
+    /// env var) -- the Accounts page then falls back to subject-only search,
+    /// same as before this field existed.
+    pub keycloak_admin: Option<crate::keycloak_admin::KeycloakAdminConfig>,
 }
 
 /// Resolve + require an admin session for an `/admin-ui/*` handler — the one gate
@@ -2410,31 +2422,66 @@ async fn admin_ui_accounts_page(State(st): State<AdminUiState>, headers: HeaderM
         Ok(v) => v,
         Err(e) => return internal_error("admin_ui_accounts_page/list_accounts", e).into_response(),
     };
+    // Resolve every row's email live via Keycloak (see ObservabilityConfig::
+    // keycloak_admin's doc for why this isn't a ledger column). Concurrent,
+    // not sequential -- same join_all shape edge_tunnel_status_bulk already
+    // uses for its own N-calls-per-page-render scrape. A failed/missing
+    // lookup for one subject just leaves it out of `emails` (rendered as "-",
+    // never blocks the rest of the page).
+    let emails: std::collections::HashMap<String, String> = match &st.observability.keycloak_admin {
+        Some(cfg) => {
+            let client = keycloak_admin_http_client();
+            futures::future::join_all(rows.iter().map(|r| {
+                let subject = r.subject.clone();
+                let client = client.clone();
+                async move {
+                    let email = crate::keycloak_admin::get_user_email(&client, cfg, &subject).await.ok().flatten();
+                    (subject, email)
+                }
+            }))
+            .await
+            .into_iter()
+            .filter_map(|(s, e)| e.map(|e| (s, e)))
+            .collect()
+        }
+        None => std::collections::HashMap::new(),
+    };
     let query = q.q.unwrap_or_default();
     let filter = query.trim().to_ascii_lowercase();
     let filtered: Vec<_> = if filter.is_empty() {
         rows
     } else {
         rows.into_iter()
-            .filter(|r| r.subject.to_ascii_lowercase().contains(&filter) || r.account_hex.contains(&filter))
+            .filter(|r| {
+                r.subject.to_ascii_lowercase().contains(&filter)
+                    || r.account_hex.contains(&filter)
+                    || emails.get(&r.subject).map(|e| e.to_ascii_lowercase().contains(&filter)).unwrap_or(false)
+            })
             .collect()
     };
-    Html(admin_accounts_page_html(&session, &filtered, query.trim())).into_response()
+    Html(admin_accounts_page_html(&session, &filtered, query.trim(), &emails)).into_response()
 }
 
-fn admin_accounts_page_html(session: &crate::admin_identity::AdminSession, rows: &[crate::storage::AccountSummaryRow], query: &str) -> String {
+fn admin_accounts_page_html(
+    session: &crate::admin_identity::AdminSession,
+    rows: &[crate::storage::AccountSummaryRow],
+    query: &str,
+    emails: &std::collections::HashMap<String, String>,
+) -> String {
     let mut table = String::from(
-        r#"<table class="data"><thead><tr><th>Subject</th><th>Account id</th><th>Balance</th><th>State</th><th>Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
+        r#"<table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th>Balance</th><th>State</th><th>Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
-        table.push_str(r#"<tr><td colspan="6" class="help">No accounts match.</td></tr>"#);
+        table.push_str(r#"<tr><td colspan="7" class="help">No accounts match.</td></tr>"#);
     }
     for r in rows {
         let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
         let block_label = if r.blocked { "Unblock" } else { "Block" };
+        let email = emails.get(&r.subject).map(|e| escape(e)).unwrap_or_else(|| r#"<span class="help">-</span>"#.to_string());
         table.push_str(&format!(
             r#"<tr>
 <td>{subject}</td>
+<td>{email}</td>
 <td><code style="word-break:break-all">{account}</code></td>
 <td>{balance}</td>
 <td>{state_badge}</td>
@@ -2453,6 +2500,7 @@ fn admin_accounts_page_html(session: &crate::admin_identity::AdminSession, rows:
 </div></td>
 </tr>"#,
             subject = escape(&r.subject),
+            email = email,
             account = escape(&r.account_hex),
             balance = r.balance,
             state_badge = state_badge,
@@ -2467,9 +2515,12 @@ fn admin_accounts_page_html(session: &crate::admin_identity::AdminSession, rows:
         r#"<h1>Accounts</h1>
 <p class="help">Every subject with an account, its credit balance, block state, and
 tunnel-creation quota. Credit grants call the same durable ledger a payment webhook
-credits -- this IS the admin top-up, not a separate mechanism.</p>
+credits -- this IS the admin top-up, not a separate mechanism. Email is resolved live
+from Keycloak (not stored in the ledger itself) -- shows "-" for a subject whose
+Keycloak account no longer exists, or if this deployment has no Keycloak admin API
+configured at all.</p>
 <form method="get" action="/admin-ui/accounts" class="search-form">
- <label>Search by subject or account id <input type="text" name="q" value="{query}" placeholder="kc-alice"></label>
+ <label>Search by subject, email, or account id <input type="text" name="q" value="{query}" placeholder="alice@example.com"></label>
  <button type="submit" class="sec">Search</button>
 </form>
 {table}
@@ -6894,6 +6945,78 @@ mod tests {
         let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/credit", &super_session, Some(r#"{"amount":500}"#)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ledger.balance(&account).unwrap(), 500, "the real durable ledger balance actually moved");
+    }
+
+    /// Operator feedback (2026-08-26): the Accounts page should show each
+    /// subject's email (resolved live from Keycloak, see
+    /// `ObservabilityConfig::keycloak_admin`'s doc) and be searchable by it.
+    #[tokio::test]
+    async fn admin_ui_accounts_page_shows_and_searches_by_email_when_keycloak_admin_is_configured() {
+        use axum::extract::Path as AxPath;
+        use axum::routing::{get, post};
+        use axum::Json;
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "access_token": "test-admin-token" }))
+        }
+        async fn user(AxPath(id): AxPath<String>) -> axum::response::Response {
+            let email = match id.as_str() {
+                "kc-alice" => Some("alice@example.com"),
+                "kc-bob" => Some("bob@example.com"),
+                _ => None,
+            };
+            match email {
+                Some(e) => Json(serde_json::json!({ "id": id, "email": e })).into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+        let kc_app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/users/:id", get(user));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kc_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, kc_app).await.unwrap() });
+
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        ledger.account_for_subject("kc-alice").unwrap();
+        ledger.account_for_subject("kc-bob").unwrap();
+        let app = admin_ui_router(
+            KEY,
+            admin,
+            audit,
+            ledger,
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+            ObservabilityConfig {
+                keycloak_admin: Some(crate::keycloak_admin::KeycloakAdminConfig {
+                    base_url: format!("http://{kc_addr}"),
+                    realm: "ct-demo".to_string(),
+                    admin_user: "admin".to_string(),
+                    admin_password: "pw".to_string(),
+                }),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let resp = admin_ui_html_get(&app, "/admin-ui/accounts", Some(&super_session)).await;
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("alice@example.com"), "resolved email must render: {html}");
+        assert!(html.contains("bob@example.com"), "resolved email must render: {html}");
+
+        let resp = admin_ui_html_get(&app, "/admin-ui/accounts?q=alice%40example.com", Some(&super_session)).await;
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("kc-alice"), "searching by email must find the matching subject: {html}");
+        assert!(!html.contains("kc-bob"), "searching by email must exclude a non-matching subject: {html}");
     }
 
     /// Fail-first proof (ADR-0025): before `create_tunnel`'s `is_blocked` check
