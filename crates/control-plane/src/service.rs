@@ -5894,6 +5894,11 @@ pub fn persistent_control_plane_router(
                 crate::portal_api::ObservabilityConfig {
                     edge_mesh: Some(edge_mesh.clone()),
                     edge_metrics_url: std::env::var("CT_CP_EDGE_METRICS_URL").ok().filter(|u| !u.is_empty()),
+                    // Operator feedback (2026-08-26): Accounts page email column +
+                    // search. Same config authed_service_account_router already
+                    // needs for its own provisioning below -- reused, not a new
+                    // required env var on a deployment where that already works.
+                    keycloak_admin: crate::keycloak_admin::KeycloakAdminConfig::from_env(),
                 },
             ))
             .merge(authed_network_router(networks, oidc.clone()))
