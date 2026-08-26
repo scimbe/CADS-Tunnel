@@ -47,6 +47,7 @@ COMPOSE_BASE="$DEPLOY_DIR/compose.selfhost.yml"
 COMPOSE_FRONTDOOR="$DEPLOY_DIR/compose.frontdoor.yml"
 COMPOSE_SSO="$DEPLOY_DIR/compose.sso.yml"
 COMPOSE_RELAY="$DEPLOY_DIR/compose.relay.yml"
+COMPOSE_MASQUE="$DEPLOY_DIR/compose.masque.yml"
 
 FRESH=0
 FRONTDOOR=0
@@ -135,6 +136,17 @@ compose_() {
   # gate-less deployments byte-identical to before.
   if grep -q '^CT_RELAY_NODE_PEER=..*' "$ENV_FILE" 2>/dev/null; then
     files+=(-f "$COMPOSE_RELAY")
+  fi
+  # MASQUE overlay (ADR-0024 M4): same auto-include convention as the relay-gate
+  # overlay above, for the same reason -- masque-proxy runs `network_mode:
+  # service:edge` (compose.masque.yml), so leaving this overlay out of a redeploy
+  # doesn't just fail to update it, it ORPHANS the existing masque-proxy container
+  # against the now-dead network namespace of the edge container that redeploy
+  # just recreated (found live, 2026-08-26: a redeploy without --masque left
+  # masque-proxy "Up" but netns-dead). Keying on CT_MASQUE_PROXY_TOKEN keeps
+  # deployments that never opted into MASQUE byte-identical to before.
+  if grep -q '^CT_MASQUE_PROXY_TOKEN=..*' "$ENV_FILE" 2>/dev/null; then
+    files+=(-f "$COMPOSE_MASQUE")
   fi
   docker_ compose "${files[@]}" --env-file "$ENV_FILE" "$@"
 }
@@ -308,6 +320,7 @@ check_no_silent_security_downgrade() {
   [ "$FRONTDOOR" = "1" ] && composes+=("$COMPOSE_FRONTDOOR")
   [ "$SSO" = "1" ] && composes+=("$COMPOSE_SSO")
   grep -q '^CT_RELAY_NODE_PEER=..*' "$ENV_FILE" 2>/dev/null && composes+=("$COMPOSE_RELAY")
+  grep -q '^CT_MASQUE_PROXY_TOKEN=..*' "$ENV_FILE" 2>/dev/null && composes+=("$COMPOSE_MASQUE")
   local watched
   watched=$(grep -hoE '^[[:space:]]+CT_[A-Z_]+: "\$\{CT_[A-Z_]+:-\}"' "${composes[@]}" 2>/dev/null \
             | grep -oE 'CT_[A-Z_]+' | sort -u)
