@@ -1311,6 +1311,16 @@ pub struct SqliteLedger {
     conn: Mutex<Connection>,
 }
 
+/// One row of [`SqliteLedger::list_accounts`] (ADR-0025 admin console).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummaryRow {
+    pub subject: String,
+    pub account_hex: String,
+    pub balance: u64,
+    pub blocked: bool,
+    pub max_tunnels: u32,
+}
+
 sqlite_store_ctors!(SqliteLedger);
 
 impl SqliteLedger {
@@ -1461,6 +1471,35 @@ impl SqliteLedger {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Every known subject's account state (ADR-0025 admin console, `GET
+    /// /admin-ui/accounts`) -- subject, account id (hex), balance, blocked, and
+    /// max_tunnels, one row per `account_subjects` entry. ADR-0012 deliberately
+    /// keeps ordinary self-service code from ever enumerating other subjects'
+    /// accounts; this is the narrow admin-only exception (mirrors admin_identity's
+    /// own "narrow, explicit carve-out" framing), reachable only via the
+    /// admin-session-gated `/admin-ui/*` surface, never a self-service route.
+    pub fn list_accounts(&self) -> rusqlite::Result<Vec<AccountSummaryRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels
+             FROM account_subjects s JOIN accounts a ON a.account = s.account
+             ORDER BY s.subject",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let account: Vec<u8> = r.get(1)?;
+                Ok(AccountSummaryRow {
+                    subject: r.get(0)?,
+                    account_hex: account.iter().map(|b| format!("{b:02x}")).collect(),
+                    balance: r.get::<_, i64>(2)?.max(0) as u64,
+                    blocked: r.get::<_, i64>(3)? != 0,
+                    max_tunnels: r.get::<_, i64>(4)?.max(0) as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Open a fresh account with a zero balance; returns its id.
@@ -7801,6 +7840,41 @@ mod tests {
         let ledger = SqliteLedger::open_in_memory().unwrap();
         let acct = ledger.open_account().unwrap();
         assert!(!ledger.is_blocked(&acct).unwrap());
+    }
+
+    /// ADR-0025 admin console: `GET /admin-ui/accounts`'s data source must
+    /// actually reflect every OTHER admin action's real effect (credit,
+    /// block, max-tunnels), not a stale/derived snapshot -- proven by mutating
+    /// via the same real methods those admin routes call, then reading back
+    /// through `list_accounts` alone.
+    #[test]
+    fn list_accounts_reports_every_subjects_real_balance_block_and_quota_state() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let alice = ledger.account_for_subject("kc-alice").unwrap();
+        let bob = ledger.account_for_subject("kc-bob").unwrap();
+        ledger.credit(&alice, 500).unwrap();
+        ledger.set_max_tunnels(&alice, 5).unwrap();
+        ledger.set_blocked(&bob, true).unwrap();
+
+        let rows = ledger.list_accounts().unwrap();
+        assert_eq!(rows.len(), 2, "both subjects that have ever logged in appear");
+
+        let alice_row = rows.iter().find(|r| r.subject == "kc-alice").expect("alice present");
+        assert_eq!(alice_row.balance, 500);
+        assert_eq!(alice_row.max_tunnels, 5);
+        assert!(!alice_row.blocked);
+        assert_eq!(alice_row.account_hex.len(), 64, "32-byte account id, hex-encoded");
+
+        let bob_row = rows.iter().find(|r| r.subject == "kc-bob").expect("bob present");
+        assert!(bob_row.blocked);
+        assert_eq!(bob_row.balance, 0);
+        assert_ne!(alice_row.account_hex, bob_row.account_hex, "distinct accounts, distinct ids");
+    }
+
+    #[test]
+    fn list_accounts_is_empty_when_no_subject_has_ever_logged_in() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(ledger.list_accounts().unwrap().is_empty());
     }
 
     /// The ledger half of an admin-triggered account deletion

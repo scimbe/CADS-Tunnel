@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
@@ -645,6 +645,236 @@ fn admin_ui_authed(
     crate::admin_identity::admin_session_from_headers(&st.session_key, &st.admin, headers)
 }
 
+// ===== ADR-0025 integration pass: server-rendered `/admin-ui/*` HTML pages =====
+//
+// Everything below renders what the JSON handlers above already compute/store --
+// no new business logic, only view code, per this pass's own scope. Every page
+// handler gates on [`admin_ui_page_authed`] (never the bare [`admin_ui_authed`]
+// used by the JSON routes), so a logged-out or non-admin visitor always gets a
+// clean redirect or a real rendered 403, never a bodyless status code.
+
+/// Whether the caller is a top-level browser navigation expecting an HTML page, as
+/// opposed to this same console's own `fetch()` calls (default `Accept: */*`, never
+/// `text/html`) or a JSON API test/tool. Lets the four routes earlier ADR-0025
+/// phases already shipped as JSON (`/admin-ui/traffic`, `/admin-ui/admins`,
+/// `/admin-ui/domains`, `/admin-ui/certs`) serve BOTH their already-tested JSON
+/// contract (default, preserved byte-for-byte -- see each handler's own early
+/// `wants_html` branch) AND this pass's HTML page at the exact same path ADR-0025's
+/// own task framing names, without renaming or duplicating either.
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/html"))
+        .unwrap_or(false)
+}
+
+/// The same admin-session gate as [`admin_ui_authed`], but for a browser-navigated
+/// HTML page instead of a JSON API call: a page must never answer with a bare,
+/// bodyless `401`/`403` -- no session at all becomes a redirect to the existing
+/// Keycloak login entry point (`/portal/login`, the SAME Authorization Code flow
+/// every other login on this deployment already uses -- nothing new invented here);
+/// a verified-but-not-an-admin session becomes a real, rendered `403` page.
+///
+/// **Known limitation (ADR-0025 Decision 5 addendum, deliberately left open by
+/// this integration pass):** `/portal/login` mints `ct_portal_session` host-only on
+/// Portal's own hostname; Decision 5 serves the admin console from a DIFFERENT
+/// hostname (`CT_EDGE_ADMIN_UI_HOST`). Per RFC 6265 a host-only cookie is never sent
+/// to a different host, so today this redirect reaches the correct login FLOW but
+/// does not yet leave behind a session `admin_session_from_headers` can read back on
+/// THIS host -- an admin who completes it lands back at the Portal, not the console.
+/// The addendum names two real fixes (widen `ct_portal_session` to a `Domain=`-scoped
+/// cookie shared across the zone, mirroring `gate.rs`'s `CT_GATE_COOKIE_DOMAIN`; or
+/// give admin-ui its own dedicated OIDC login + session, fully mirroring `gate.rs`'s
+/// shape) and explicitly asks that the choice be weighed, not defaulted -- this
+/// integration pass renders/wires what the previous four phases already built and
+/// does not invent either fix. Every route gated by this function is fully correct
+/// and independently testable regardless of which fix lands; only the end-to-end
+/// "click login, land back on admin.<zone> signed in" path is blocked until then.
+fn admin_ui_page_authed(
+    st: &AdminUiState,
+    headers: &HeaderMap,
+) -> Result<crate::admin_identity::AdminSession, Response> {
+    admin_ui_authed(st, headers).map_err(|resp| {
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            Redirect::to("/portal/login").into_response()
+        } else {
+            admin_forbidden_page()
+        }
+    })
+}
+
+/// A real, rendered `403` for a verified session whose email just isn't in the
+/// `admins` table -- distinct from [`admin_ui_page_authed`]'s `401` case (no
+/// session at all, which redirects instead): this visitor IS logged in, just not
+/// an admin, so the honest answer is "wrong account", not a login prompt that
+/// would just loop them back here.
+fn admin_forbidden_page() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html(
+            r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADS-Tunnel Admin — access denied</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
+      display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;max-width:440px;text-align:center}
+ h1{font-size:1.3rem;margin:0 0 .6rem}
+ p{color:#8b949e;font-size:.92rem;line-height:1.6}
+ a{color:#5fb8ab}
+</style></head><body>
+<div class="card">
+<h1>Access denied</h1>
+<p>You're signed in, but this account isn't registered as a CADS-Tunnel admin.
+Ask the super-admin to add your e-mail, or <a href="/portal">go back to the portal</a>.</p>
+</div></body></html>"#
+                .to_string(),
+        ),
+    )
+        .into_response()
+}
+
+/// Shared page chrome for every `/admin-ui/*` HTML page -- deliberately its own
+/// shell, not [`page`] (Portal's own nav points at `/portal/*`, a different surface
+/// with different login and owner-scoped data; reusing it here would put customer
+/// navigation on an admin page and vice versa). Same brand tokens/animations as
+/// [`page`] (docs/design/tokens.md) so the console reads as part of one product.
+fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: &str) -> String {
+    let role_badge = if session.is_super_admin {
+        r#" <span class="badge super">super-admin</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADS-Tunnel Admin — {title}</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-hover:#e39a63;--accent-ink:#20130a;
+       --accent2:#5fb8ab;--accent2-hover:#7cc9bd;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:2.5rem 1rem}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:1000px;width:100%;
+      animation:cardIn .32s ease-out}}
+ @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
+ @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+ h1,h2{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
+ h1{{font-size:1.55rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.05rem;color:var(--muted);margin:1.5rem 0 .6rem}}
+ nav{{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem;margin-bottom:1.2rem;border-bottom:1px solid var(--border);padding-bottom:.9rem}}
+ nav a{{color:var(--accent2);text-decoration:none;font-size:.88rem;font-weight:600;transition:color .15s ease}}
+ nav a:hover{{color:var(--accent2-hover)}}
+ nav .spacer{{flex:1 1 auto}}
+ nav .signed-in-as{{color:var(--muted);font-size:.84rem}}
+ nav .signed-in-as strong{{color:var(--text);font-weight:600}}
+ .badge{{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.68rem;font-weight:700;vertical-align:middle}}
+ .badge.super{{background:#2d1a00;color:#f0c674;border:1px solid #7d4e00}}
+ .badge.blocked{{background:#3d1418;color:#ff9a9a;border:1px solid #6e2530}}
+ .badge.ok{{background:#0d2818;color:#3fb950;border:1px solid #1f5c33}}
+ .badge.warn{{background:#3d2e00;color:#f0c674;border:1px solid #7d4e00}}
+ a.btn,button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;padding:.5rem 1rem;
+      font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;
+      transition:background .15s ease,transform .08s ease}}
+ a.btn:hover,button:hover{{background:var(--accent-hover)}} a.btn:active,button:active{{transform:scale(.96)}}
+ a.btn.sec,button.sec{{background:#21262d;border:1px solid var(--border);color:var(--text);font-weight:500}}
+ a.btn.sec:hover,button.sec:hover{{background:#30363d}}
+ a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
+ a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
+ button:disabled{{opacity:.4;cursor:not-allowed}}
+ table.data{{width:100%;border-collapse:collapse;margin:.4rem 0 1rem;font-size:.86rem}}
+ table.data th,table.data td{{padding:.5rem .6rem;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}}
+ table.data th{{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.04em}}
+ table.data tr:hover td{{background:#1c222b}}
+ table.data code{{font-size:.82rem}}
+ .status-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:.4rem;vertical-align:middle}}
+ .status-dot.live{{background:var(--accent2);animation:pulse 1.6s ease-in-out infinite}}
+ .status-dot.off{{background:var(--muted)}}
+ .tier-rot{{color:#f85149}} .tier-gelb{{color:#f0c674}} .tier-gruen{{color:#3fb950}} .tier-muted{{color:var(--muted)}}
+ input,select{{background:#0d1117;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:.5rem;font:inherit}}
+ input:focus,select:focus{{outline:none;border-color:var(--accent2)}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.15rem .4rem}}
+ form.inline{{display:inline;margin:0}}
+ label{{display:block;margin:.7rem 0;font-size:.88rem}}
+ .help{{color:var(--muted);font-size:.82rem}}
+ p.help{{margin:.2rem 0 1rem}}
+ .msg{{font-size:.84rem;margin:.3rem 0;min-height:1.2em}}
+ .msg.err{{color:#ff9a9a}} .msg.ok{{color:#3fb950}}
+ .section{{margin-bottom:2rem}}
+ .kv{{display:flex;flex-wrap:wrap;gap:1.5rem;margin:.6rem 0 1rem}}
+ .kv .stat{{min-width:120px}} .kv .stat .n{{font-family:var(--serif);font-size:1.5rem;display:block}}
+ .kv .stat .l{{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}}
+ @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
+</style></head><body>
+<div class="card">
+<nav>
+ <a href="/admin-ui/">Dashboard</a>
+ <a href="/admin-ui/traffic">Traffic</a>
+ <a href="/admin-ui/accounts">Accounts</a>
+ <a href="/admin-ui/domains">Domains</a>
+ <a href="/admin-ui/admins">Admins</a>
+ <a href="/admin-ui/certs">Certs</a>
+ <a href="/admin-ui/audit">Audit</a>
+ <span class="spacer"></span>
+ <span class="signed-in-as">Signed in as <strong>{email}</strong>{role_badge}</span>
+ <a href="/admin-ui/logout">Sign out</a>
+</nav>
+{body}
+</div>
+<script>
+ // Render every [data-ts] element's unix-seconds content as a local date/time --
+ // avoids a chrono/humantime dependency for what is purely a display concern.
+ document.querySelectorAll('[data-ts]').forEach(function(el){{
+  var secs = parseInt(el.getAttribute('data-ts'), 10);
+  if(!isNaN(secs) && secs > 0){{ el.textContent = new Date(secs*1000).toLocaleString(); }}
+ }});
+ // Every admin action is a JSON API call (Json<...> extractors, not Form<...>) --
+ // this is the one shared fetch wrapper every page's own inline script below uses.
+ function adminApi(method, url, body){{
+  var opts = {{method: method}};
+  if(body !== undefined){{ opts.headers = {{'Content-Type':'application/json'}}; opts.body = JSON.stringify(body); }}
+  return fetch(url, opts).then(function(r){{
+   if(r.ok) return r;
+   return r.text().then(function(t){{ throw new Error(t || ('HTTP '+r.status)); }});
+  }});
+ }}
+ document.addEventListener('submit', function(ev){{
+  var form = ev.target;
+  if(form.classList && form.classList.contains('confirm-danger')){{
+   var msg = form.getAttribute('data-confirm') || 'Are you sure?';
+   if(!window.confirm(msg)){{ ev.preventDefault(); }}
+  }}
+ }});
+</script>
+</body></html>"#,
+        title = escape(title),
+        email = escape(&session.email),
+        role_badge = role_badge,
+        body = body,
+    )
+}
+
+/// `GET /admin-ui/logout`: clears the admin session cookie (same name/HMAC key as
+/// Portal's `ct_portal_session` -- [`crate::admin_identity::admin_session_from_headers`]
+/// reads it via [`crate::portal::session_claims_for`]) and returns to the public
+/// portal shell. Deliberately local (not `PortalOidc::end_session_redirect`, unlike
+/// `portal::portal_logout`): this route has no `PortalOidc` config in scope, and
+/// clearing this host's own cookie is the only thing an admin-console sign-out needs
+/// to do (see [`admin_ui_page_authed`]'s doc for why the underlying session's origin
+/// is still an open question this pass doesn't resolve).
+async fn admin_ui_logout() -> Response {
+    let mut resp = Redirect::to("/portal").into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie()) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    resp
+}
+
+// ===== end ADR-0025 integration pass shared page chrome =====
+
 /// Build the `/admin-ui/*` router (ADR-0025): account credit/block/unblock/delete,
 /// an admin-identity-gated mirror of the legacy max-tunnels unlock, and
 /// admin-management (list/add/remove).
@@ -683,6 +913,17 @@ pub fn admin_ui_router(
         .route("/admin-ui/traffic", get(admin_ui_traffic))
         .route("/admin-ui/tunnels", get(admin_ui_tunnels))
         .route("/admin-ui/health", get(admin_ui_health))
+        // ADR-0025 integration pass: server-rendered HTML pages. `/admin-ui/traffic`,
+        // `/admin-ui/admins`, `/admin-ui/domains`, `/admin-ui/certs` are ALREADY
+        // routed above as JSON -- their handlers branch on `wants_html` internally
+        // rather than being registered a second time here (axum has exactly one
+        // handler per method+path). `/admin-ui/accounts` and `/admin-ui/audit` are
+        // brand new paths (no prior JSON contract to preserve), so they're plain
+        // HTML-only handlers.
+        .route("/admin-ui/", get(admin_ui_dashboard))
+        .route("/admin-ui/accounts", get(admin_ui_accounts_page))
+        .route("/admin-ui/audit", get(admin_ui_audit_page))
+        .route("/admin-ui/logout", get(admin_ui_logout))
         .with_state(AdminUiState {
             session_key: Arc::from(session_key.to_vec()),
             admin,
@@ -893,6 +1134,16 @@ struct AdminRowResp {
 /// super-admin-only) -- knowing who else has admin access is not itself a
 /// privileged mutation.
 async fn admin_ui_list_admins(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        return match st.admin.list_admins() {
+            Ok(rows) => Html(admin_admins_page_html(&session, &st.admin, &rows)).into_response(),
+            Err(e) => internal_error("admin_ui_list_admins/html", e).into_response(),
+        };
+    }
     if let Err(resp) = admin_ui_authed(&st, &headers) {
         return resp;
     }
@@ -957,6 +1208,93 @@ async fn admin_ui_remove_admin(State(st): State<AdminUiState>, headers: HeaderMa
         }
         Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
     }
+}
+
+/// `GET /admin-ui/admins` HTML branch (ADR-0025 integration pass): the super-admin
+/// row's Remove control is omitted SERVER-SIDE, not merely disabled or left for the
+/// click to 403 -- the task's own requirement ("no delete control rendered for that
+/// row at all, not just a server-side check") is stronger than "the click would be
+/// refused", and this is the one place that guarantee actually lives. A non-super
+/// viewer gets the identical list read-only, with an explicit reason the add/remove
+/// form is missing rather than a button that would just 403 on click.
+fn admin_admins_page_html(
+    session: &crate::admin_identity::AdminSession,
+    admin: &crate::admin_identity::AdminIdentity,
+    rows: &[crate::storage::AdminRow],
+) -> String {
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>E-mail</th><th>Added by</th><th>Added</th><th></th></tr></thead><tbody>"#,
+    );
+    for r in rows {
+        let is_super = admin.is_super_admin(&r.email);
+        let added_by = r.added_by.as_deref().unwrap_or("(startup seed)");
+        let super_badge = if is_super { r#" <span class="badge super">super-admin</span>"# } else { "" };
+        let action_cell = if is_super {
+            r#"<span class="help">cannot be removed</span>"#.to_string()
+        } else if session.is_super_admin {
+            format!(
+                r#"<form class="inline" data-email="{email}" onsubmit="return removeAdmin(event)"><button type="submit" class="danger">Remove</button></form>"#,
+                email = escape(&r.email),
+            )
+        } else {
+            String::new()
+        };
+        table.push_str(&format!(
+            r#"<tr><td>{email}{super_badge}</td><td>{added_by}</td><td><span data-ts="{added_at}">{added_at}</span></td><td>{action_cell}</td></tr>"#,
+            email = escape(&r.email),
+            super_badge = super_badge,
+            added_by = escape(added_by),
+            added_at = r.added_at,
+            action_cell = action_cell,
+        ));
+    }
+    table.push_str("</tbody></table>");
+
+    let manage_section = if session.is_super_admin {
+        r#"<h2>Add an admin</h2>
+<form id="addAdminForm" onsubmit="return addAdmin(event)">
+ <label>E-mail (must be a Google-verified login) <input type="email" name="email" required></label>
+ <button type="submit">Add admin</button>
+</form>
+<p class="msg" id="addMsg"></p>"#
+            .to_string()
+    } else {
+        r#"<p class="help">Only the super-admin can add or remove other admins. You can see who
+currently has access above; the add/remove form is hidden here rather than shown and refused.</p>"#
+            .to_string()
+    };
+
+    let body = format!(
+        r#"<h1>Admins</h1>
+<p class="help">Every account that can reach this console. Access is bound to a verified Google
+login (ADR-0025) -- there is no separate admin password.</p>
+{table}
+{manage_section}
+<script>
+function addAdmin(ev){{
+ ev.preventDefault();
+ var form = ev.target, msg = document.getElementById('addMsg');
+ var email = form.email.value.trim();
+ msg.className = 'msg'; msg.textContent = 'adding…';
+ adminApi('POST', '/admin-ui/admins', {{email: email}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ msg.className = 'msg err'; msg.textContent = 'failed: ' + e.message; }});
+ return false;
+}}
+function removeAdmin(ev){{
+ ev.preventDefault();
+ var email = ev.target.getAttribute('data-email');
+ if(!window.confirm('Remove admin access for ' + email + '?')) return false;
+ adminApi('DELETE', '/admin-ui/admins/' + encodeURIComponent(email))
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('failed: ' + e.message); }});
+ return false;
+}}
+</script>"#,
+        table = table,
+        manage_section = manage_section,
+    );
+    admin_page("admins", session, &body)
 }
 
 fn admin_ui_now_secs() -> i64 {
@@ -1190,6 +1528,25 @@ async fn admin_ui_register_domain(
 /// `GET /admin-ui/domains` (admin-identity-gated): every managed domain +
 /// status, newest first.
 async fn admin_ui_list_domains(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let zones = match st.managed_domains.list_zones() {
+            Ok(v) => v,
+            Err(e) => return internal_error("admin_ui_list_domains/html/zones", e).into_response(),
+        };
+        let disabled = match st.tunnels.list_disabled_hostnames() {
+            Ok(v) => v,
+            Err(e) => return internal_error("admin_ui_list_domains/html/disabled", e).into_response(),
+        };
+        let tunnels = match st.tunnels.all() {
+            Ok(v) => v,
+            Err(e) => return internal_error("admin_ui_list_domains/html/tunnels", e).into_response(),
+        };
+        return Html(admin_domains_page_html(&session, &zones, &disabled, &tunnels)).into_response();
+    }
     if let Err(resp) = admin_ui_authed(&st, &headers) {
         return resp;
     }
@@ -1286,6 +1643,132 @@ async fn admin_ui_add_domain_hostname(
     Json(AddDomainHostnameResp { hostname, cert_dir: cert_dir_str }).into_response()
 }
 
+/// `GET /admin-ui/domains` HTML branch (ADR-0025 Decision 4/6 integration pass):
+/// managed zones + an onboard-a-domain form, a per-hostname disable/enable toggle
+/// (Decision 4's "a natural sibling of the existing revoke call") built from the
+/// union of every LIVE tunnel hostname and every already-disabled one -- a
+/// hostname can be disabled with no live tunnel on it right now (the owner hasn't
+/// recreated it yet), so `disabled` is the authority on current state, not
+/// `tunnels` alone.
+fn admin_domains_page_html(
+    session: &crate::admin_identity::AdminSession,
+    zones: &[crate::storage::ManagedDomainRow],
+    disabled: &[crate::storage::DisabledHostnameRow],
+    tunnels: &[SubjectTunnel],
+) -> String {
+    let mut zones_table = String::from(
+        r#"<table class="data"><thead><tr><th>Zone</th><th>Status</th><th>Added by</th><th>Added</th><th>Add a hostname</th></tr></thead><tbody>"#,
+    );
+    if zones.is_empty() {
+        zones_table.push_str(r#"<tr><td colspan="5" class="help">No domains onboarded yet -- use the form below.</td></tr>"#);
+    }
+    for z in zones {
+        zones_table.push_str(&format!(
+            r#"<tr><td><code>{zone}</code></td><td>{status}</td><td>{added_by}</td><td><span data-ts="{added_at}">{added_at}</span></td>
+<td><form class="inline" data-zone="{zone}" onsubmit="return addHostname(event)">
+ <input type="text" name="subdomain" placeholder="app" required style="width:6rem">
+ <button type="submit" class="sec">Issue cert</button>
+</form></td></tr>"#,
+            zone = escape(&z.zone),
+            status = escape(&z.status),
+            added_by = z.added_by.as_deref().map(escape).unwrap_or_else(|| "-".to_string()),
+            added_at = z.added_at,
+        ));
+    }
+    zones_table.push_str("</tbody></table>");
+
+    let disabled_set: std::collections::HashSet<&str> = disabled.iter().map(|d| d.hostname.as_str()).collect();
+    let mut hostnames: Vec<(String, bool, bool)> = Vec::new(); // (hostname, disabled, has_live_tunnel)
+    for t in tunnels {
+        if let Some(h) = &t.hostname {
+            hostnames.push((h.clone(), disabled_set.contains(h.as_str()), true));
+        }
+    }
+    for d in disabled {
+        if !hostnames.iter().any(|(h, _, _)| h == &d.hostname) {
+            hostnames.push((d.hostname.clone(), true, false));
+        }
+    }
+    hostnames.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut host_table = String::from(
+        r#"<table class="data"><thead><tr><th>Hostname</th><th>State</th><th></th></tr></thead><tbody>"#,
+    );
+    if hostnames.is_empty() {
+        host_table.push_str(r#"<tr><td colspan="3" class="help">No hostnames yet.</td></tr>"#);
+    }
+    for (host, is_disabled, live) in &hostnames {
+        let state = if *is_disabled {
+            r#"<span class="badge blocked">disabled</span>"#.to_string()
+        } else if *live {
+            r#"<span class="badge ok">active</span>"#.to_string()
+        } else {
+            r#"<span class="help">no live tunnel</span>"#.to_string()
+        };
+        let action = if *is_disabled {
+            format!(r#"<button class="sec" data-host="{h}" onclick="return toggleHostname(event,'enable')">Enable</button>"#, h = escape(host))
+        } else {
+            format!(r#"<button class="danger" data-host="{h}" onclick="return toggleHostname(event,'disable')">Disable</button>"#, h = escape(host))
+        };
+        host_table.push_str(&format!(
+            r#"<tr><td><code>{host}</code></td><td>{state}</td><td>{action}</td></tr>"#,
+            host = escape(host),
+        ));
+    }
+    host_table.push_str("</tbody></table>");
+
+    let body = format!(
+        r#"<h1>Domains</h1>
+<p class="help">Zones onboarded beyond bunsenbrenner.org, and every hostname's
+enable/disable state (ADR-0025 Decision 4). DNS delegation to deSEC at the domain's
+registrar is a manual one-time step performed BEFORE onboarding here -- this form only
+issues the apex/wildcard A records and (per-hostname) certs, it never touches a registrar.</p>
+<h2>Managed zones</h2>
+{zones_table}
+<form id="registerForm" onsubmit="return registerDomain(event)">
+ <label>Onboard a new zone (already delegated to deSEC) <input type="text" name="zone" placeholder="example.org" required></label>
+ <button type="submit">Onboard domain</button>
+</form>
+<p class="msg" id="registerMsg"></p>
+<h2>Hostnames</h2>
+{host_table}
+<script>
+function registerDomain(ev){{
+ ev.preventDefault();
+ var form = ev.target, msg = document.getElementById('registerMsg');
+ msg.className = 'msg'; msg.textContent = 'onboarding… (issuing DNS records, this can take a moment)';
+ adminApi('POST', '/admin-ui/domains', {{zone: form.zone.value.trim()}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ msg.className = 'msg err'; msg.textContent = 'failed: ' + e.message; }});
+ return false;
+}}
+function addHostname(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var zone = form.getAttribute('data-zone');
+ var subdomain = form.subdomain.value.trim();
+ form.querySelector('button').disabled = true;
+ adminApi('POST', '/admin-ui/domains/' + encodeURIComponent(zone) + '/hostnames', {{subdomain: subdomain}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ form.querySelector('button').disabled = false; window.alert('cert issuance failed: ' + e.message); }});
+ return false;
+}}
+function toggleHostname(ev, action){{
+ ev.preventDefault();
+ var host = ev.target.getAttribute('data-host');
+ if(action === 'disable' && !window.confirm('Disable ' + host + '? This revokes its live tunnel and blocks re-authorization until re-enabled.')) return false;
+ adminApi('POST', '/admin-ui/hostnames/' + encodeURIComponent(host) + '/' + action)
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('failed: ' + e.message); }});
+ return false;
+}}
+</script>"#,
+        zones_table = zones_table,
+        host_table = host_table,
+    );
+    admin_page("domains", session, &body)
+}
+
 #[derive(Serialize)]
 struct CertStatusResp {
     label: String,
@@ -1319,9 +1802,24 @@ impl From<crate::cert_status::CertStatus> for CertStatusResp {
 /// its own explicit state (see [`crate::cert_status::CertState`]) rather than
 /// omitted -- an admin needs to see gaps, not just healthy entries.
 async fn admin_ui_certs(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let rows = admin_ui_cert_rows(&st);
+        return Html(admin_certs_page_html(&session, rows)).into_response();
+    }
     if let Err(resp) = admin_ui_authed(&st, &headers) {
         return resp;
     }
+    Json(admin_ui_cert_rows(&st)).into_response()
+}
+
+/// The four fixed front-door slots plus every per-managed-domain cert, in ONE
+/// place -- both [`admin_ui_certs`]'s JSON branch and its HTML branch call this,
+/// so the two views can never disagree about which certs exist or their state.
+fn admin_ui_cert_rows(st: &AdminUiState) -> Vec<CertStatusResp> {
     let paths = &st.domain_admin.front_door_certs;
     let mut out = vec![
         crate::cert_status::check("portal", paths.portal.as_deref().map(std::path::Path::new)),
@@ -1338,7 +1836,68 @@ async fn admin_ui_certs(State(st): State<AdminUiState>, headers: HeaderMap) -> R
         }
         Err(e) => eprintln!("ct-cp: admin_ui_certs: list_hostname_certs failed: {e} -- per-domain certs omitted from this response"),
     }
-    Json(out.into_iter().map(CertStatusResp::from).collect::<Vec<_>>()).into_response()
+    out.into_iter().map(CertStatusResp::from).collect()
+}
+
+/// Sort key for the cert-expiry dashboard: an `unreadable` cert needs the most
+/// urgent attention (something is actively broken -- #142-class incident), then
+/// `ok` entries soonest-expiring first (the task's own requirement), then
+/// `not_configured` last (nothing to expire, lowest urgency of the three).
+fn cert_status_sort_key(s: &CertStatusResp) -> (u8, i64) {
+    match s.state {
+        "unreadable" => (0, 0),
+        "ok" => (1, s.days_remaining.unwrap_or(i64::MAX)),
+        _ => (2, 0),
+    }
+}
+
+/// Below this many days remaining, a cert is flagged the same way an `unreadable`
+/// one is -- close enough to expiry that "still technically ok" is the wrong signal
+/// to give an operator glancing at this page (ADR-0025 Decision 6's own framing:
+/// this dashboard exists specifically to make that visible before it becomes an
+/// outage, matching tonight's own #142-class incident).
+const CERT_EXPIRY_WARN_DAYS: i64 = 14;
+
+/// `GET /admin-ui/certs` HTML branch (ADR-0025 Decision 6 integration pass):
+/// soonest-expiring first, with anything under [`CERT_EXPIRY_WARN_DAYS`] or
+/// unreadable visually flagged -- see [`cert_status_sort_key`].
+fn admin_certs_page_html(session: &crate::admin_identity::AdminSession, mut rows: Vec<CertStatusResp>) -> String {
+    rows.sort_by_key(cert_status_sort_key);
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>Hostname</th><th>State</th><th>Days remaining</th><th>Detail</th></tr></thead><tbody>"#,
+    );
+    if rows.is_empty() {
+        table.push_str(r#"<tr><td colspan="4" class="help">No certs to report.</td></tr>"#);
+    }
+    for r in &rows {
+        let flagged = r.state == "unreadable" || r.days_remaining.map(|d| d < CERT_EXPIRY_WARN_DAYS).unwrap_or(false);
+        let (state_html, days_html) = match r.state {
+            "ok" => (
+                if flagged { r#"<span class="badge warn">expiring soon</span>"#.to_string() } else { r#"<span class="badge ok">ok</span>"#.to_string() },
+                r.days_remaining.map(|d| d.to_string()).unwrap_or_default(),
+            ),
+            "unreadable" => (r#"<span class="badge blocked">unreadable</span>"#.to_string(), "-".to_string()),
+            _ => (r#"<span class="help">not configured</span>"#.to_string(), "-".to_string()),
+        };
+        table.push_str(&format!(
+            r#"<tr><td><code>{label}</code></td><td>{state_html}</td><td>{days_html}</td><td class="help">{detail}</td></tr>"#,
+            label = escape(&r.label),
+            state_html = state_html,
+            days_html = days_html,
+            detail = escape(r.reason.as_deref().unwrap_or("")),
+        ));
+    }
+    table.push_str("</tbody></table>");
+    let body = format!(
+        r#"<h1>Certificates</h1>
+<p class="help">Every front-door hostname's TLS cert -- Portal/Auth/MASQUE/Admin plus every
+managed-domain hostname -- and how many days remain before it needs renewal. Sorted
+soonest-expiring first; anything unreadable or under {warn} days is flagged.</p>
+{table}"#,
+        table = table,
+        warn = CERT_EXPIRY_WARN_DAYS,
+    );
+    admin_page("certs", session, &body)
 }
 
 // ===== ADR-0025 Decision 6: read-only observability (traffic/tunnels/health) =====
@@ -1504,6 +2063,13 @@ fn build_traffic_rows(tunnels: &[SubjectTunnel], edge_status: &HashMap<String, E
 /// transport (Decision 3's honest relay-vs-direct-advertised signal, never a
 /// direct-path byte count the edge doesn't have).
 async fn admin_ui_traffic(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        return Html(admin_traffic_page_html(&session)).into_response();
+    }
     if let Err(resp) = admin_ui_authed(&st, &headers) {
         return resp;
     }
@@ -1514,6 +2080,72 @@ async fn admin_ui_traffic(State(st): State<AdminUiState>, headers: HeaderMap) ->
     let tokens: Vec<String> = tunnels.iter().map(|t| t.routing_token.clone()).collect();
     let edge_status = edge_tunnel_status_bulk(&st, &tokens).await;
     Json(build_traffic_rows(&tunnels, &edge_status)).into_response()
+}
+
+/// `GET /admin-ui/traffic` HTML branch (ADR-0025 Decision 3/6 integration pass):
+/// client-fetches its OWN already-shipped JSON endpoints (`/admin-ui/traffic` --
+/// same path, differentiated by [`wants_html`] -- and `/admin-ui/tunnels`) rather
+/// than SSR-ing them, since both need the SAME async edge scrape
+/// [`admin_ui_traffic`]'s and [`admin_ui_tunnels`]'s own JSON branches already do;
+/// duplicating that here would mean two independent code paths that could drift.
+/// Decision 3's own wording is rendered verbatim in the transport column's help
+/// text -- never a byte count for the direct/P2P leg, only "the relay saw N bytes"
+/// (real) alongside "a direct path is currently advertised" (an availability
+/// signal, not a traffic measurement).
+fn admin_traffic_page_html(session: &crate::admin_identity::AdminSession) -> String {
+    let body = r#"<h1>Traffic monitor</h1>
+<p class="help">Relay-plane bytes below are real, edge-measured counts. "Direct P2P" means a
+direct advertisement is currently active for that tunnel -- it is an <strong>availability
+signal</strong>, not a byte count: the edge structurally cannot see traffic that bypasses it
+entirely, so no number is shown for that leg. A tunnel can show relay bytes AND direct P2P at
+once; that mismatch is exactly what this page exists to make visible, not hide.</p>
+<span id="msg" class="help"></span>
+<div id="trafficTable" class="help">Loading…</div>
+<h2>Live tunnel overview</h2>
+<p class="help">Every registered tunnel, which edge it's on, and how long its current
+connection has been up.</p>
+<div id="tunnelsTable" class="help">Loading…</div>
+<script>
+(function(){
+ function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+ function transportBadge(t){
+  return t === 'direct_p2p'
+   ? '<span class="badge ok">direct P2P (advertised)</span>'
+   : '<span class="help">relay</span>';
+ }
+ fetch('/admin-ui/traffic').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+  .then(function(rows){
+   if(!rows.length){ document.getElementById('trafficTable').innerHTML = '<p class="help">No tunnels registered yet.</p>'; return; }
+   var html = '<table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Connected</th>'
+     + '<th>Transport</th><th>Relay bytes in</th><th>Relay bytes out</th></tr></thead><tbody>';
+   rows.forEach(function(t){
+    html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td>'
+      + '<td><span class="status-dot ' + (t.connected ? 'live' : 'off') + '"></span>' + (t.connected ? 'yes' : 'no') + '</td>'
+      + '<td>' + transportBadge(t.transport) + '</td>'
+      + '<td>' + t.bytes_received.toLocaleString() + '</td><td>' + t.bytes_sent.toLocaleString() + '</td></tr>';
+   });
+   html += '</tbody></table>';
+   document.getElementById('trafficTable').innerHTML = html;
+  })
+  .catch(function(s){ document.getElementById('msg').textContent = 'could not load traffic (' + s + ')'; });
+ fetch('/admin-ui/tunnels').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+  .then(function(rows){
+   if(!rows.length){ document.getElementById('tunnelsTable').innerHTML = '<p class="help">No tunnels registered yet.</p>'; return; }
+   var html = '<table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Edge</th>'
+     + '<th>Transport</th><th>Uptime</th><th>Last seen</th></tr></thead><tbody>';
+   rows.forEach(function(t){
+    var uptime = t.uptime_seconds != null ? Math.round(t.uptime_seconds/60) + ' min' : '-';
+    var lastSeen = t.last_seen_unix ? new Date(t.last_seen_unix*1000).toLocaleString() : 'never';
+    html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td><td>' + esc(t.edge_id || '-') + '</td>'
+      + '<td>' + transportBadge(t.transport) + '</td><td>' + uptime + '</td><td>' + esc(lastSeen) + '</td></tr>';
+   });
+   html += '</tbody></table>';
+   document.getElementById('tunnelsTable').innerHTML = html;
+  })
+  .catch(function(s){ document.getElementById('msg').textContent = 'could not load tunnel overview (' + s + ')'; });
+})();
+</script>"#;
+    admin_page("traffic", session, body)
 }
 
 #[derive(Serialize)]
@@ -1703,6 +2335,242 @@ async fn admin_ui_health(State(st): State<AdminUiState>, headers: HeaderMap) -> 
 }
 
 // ===== end ADR-0025 Decision 6 =====
+
+// ===== ADR-0025 integration pass: dashboard, accounts, audit pages =====
+//
+// Brand new paths (no prior JSON contract from an earlier phase to preserve), so
+// these are plain HTML-only handlers -- no `wants_html` branch needed.
+
+/// `GET /admin-ui/` (admin-identity-gated): the dashboard home -- an at-a-glance
+/// health summary (client-fetched from the already-shipped `GET /admin-ui/health`,
+/// Observability phase) plus links to every other section.
+async fn admin_ui_dashboard(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    Html(admin_dashboard_page_html(&session)).into_response()
+}
+
+fn admin_dashboard_page_html(session: &crate::admin_identity::AdminSession) -> String {
+    let body = r#"<h1>Admin console</h1>
+<p class="help">At-a-glance health for the control plane and its edge (ADR-0025).</p>
+<div id="health" class="help">Loading…</div>
+<h2>Sections</h2>
+<ul class="steps">
+ <li><a href="/admin-ui/traffic">Traffic monitor</a> -- relay bytes and transport per tunnel.</li>
+ <li><a href="/admin-ui/accounts">Accounts</a> -- credit, block/unblock, delete, subdomain quota.</li>
+ <li><a href="/admin-ui/domains">Domains</a> -- onboard a zone, manage hostnames.</li>
+ <li><a href="/admin-ui/admins">Admins</a> -- who can reach this console.</li>
+ <li><a href="/admin-ui/certs">Certificates</a> -- front-door and per-domain cert expiry.</li>
+ <li><a href="/admin-ui/audit">Audit log</a> -- every privileged action, who and when.</li>
+</ul>
+<script>
+fetch('/admin-ui/health').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+ .then(function(h){
+  var edge = h.edge;
+  var edgeBadge = !edge.configured ? '<span class="badge warn">not configured</span>'
+    : (edge.healthy ? '<span class="badge ok">healthy</span>' : '<span class="badge blocked">unhealthy</span>');
+  var stats = '<div class="kv">'
+   + '<div class="stat"><span class="n">' + (h.control_plane_ready ? 'OK' : 'DOWN') + '</span><span class="l">Control plane</span></div>'
+   + '<div class="stat"><span class="n">' + edgeBadge + '</span><span class="l">Edge</span></div>';
+  if(edge.active_tunnels != null){ stats += '<div class="stat"><span class="n">' + edge.active_tunnels + '</span><span class="l">Active tunnels</span></div>'; }
+  if(edge.active_agents != null){ stats += '<div class="stat"><span class="n">' + edge.active_agents + '</span><span class="l">Active agents</span></div>'; }
+  stats += '</div>';
+  if(edge.detail){ stats += '<p class="help">' + String(edge.detail).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</p>'; }
+  document.getElementById('health').innerHTML = stats;
+ })
+ .catch(function(s){ document.getElementById('health').textContent = 'could not load health (' + s + ')'; });
+</script>"#;
+    admin_page("dashboard", session, body)
+}
+
+#[derive(Deserialize)]
+struct AccountsPageQuery {
+    q: Option<String>,
+}
+
+/// `GET /admin-ui/accounts?q=<substring>` (admin-identity-gated): account list +
+/// search, wired to the Account Ops phase's per-subject routes. `q` filters by a
+/// case-insensitive substring of either the subject or the account id (hex) --
+/// server-side, so it works with JS disabled and never ships the full account list
+/// to the client just to filter it there.
+///
+/// The listing itself ([`crate::storage::SqliteLedger::list_accounts`]) is new in
+/// this integration pass: the Account Ops phase shipped per-subject credit/block/
+/// delete/max-tunnels routes but never a bulk listing to find a subject from in the
+/// first place, which this page needs to exist at all -- see this session's final
+/// report for why that's flagged as a gap rather than silently worked around.
+async fn admin_ui_accounts_page(State(st): State<AdminUiState>, headers: HeaderMap, Query(q): Query<AccountsPageQuery>) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let rows = match st.ledger.list_accounts() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_accounts_page/list_accounts", e).into_response(),
+    };
+    let query = q.q.unwrap_or_default();
+    let filter = query.trim().to_ascii_lowercase();
+    let filtered: Vec<_> = if filter.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| r.subject.to_ascii_lowercase().contains(&filter) || r.account_hex.contains(&filter))
+            .collect()
+    };
+    Html(admin_accounts_page_html(&session, &filtered, query.trim())).into_response()
+}
+
+fn admin_accounts_page_html(session: &crate::admin_identity::AdminSession, rows: &[crate::storage::AccountSummaryRow], query: &str) -> String {
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>Subject</th><th>Account id</th><th>Balance</th><th>State</th><th>Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
+    );
+    if rows.is_empty() {
+        table.push_str(r#"<tr><td colspan="6" class="help">No accounts match.</td></tr>"#);
+    }
+    for r in rows {
+        let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
+        let block_label = if r.blocked { "Unblock" } else { "Block" };
+        table.push_str(&format!(
+            r#"<tr>
+<td>{subject}</td>
+<td><code style="word-break:break-all">{account}</code></td>
+<td>{balance}</td>
+<td>{state_badge}</td>
+<td>{max_tunnels}</td>
+<td><div style="display:flex;flex-wrap:wrap;gap:.35rem;align-items:center">
+ <form class="inline" data-subject="{subject}" onsubmit="return creditAccount(event)">
+  <input type="number" name="amount" min="1" value="100" style="width:5rem">
+  <button type="submit" class="sec">Credit</button>
+ </form>
+ <button class="sec" data-subject="{subject}" data-blocked="{blocked_flag}" onclick="return toggleBlock(event)">{block_label}</button>
+ <form class="inline" data-subject="{subject}" onsubmit="return setMaxTunnels(event)">
+  <input type="number" name="max" min="1" value="{max_tunnels}" style="width:4rem">
+  <button type="submit" class="sec">Set quota</button>
+ </form>
+ <button class="danger" data-subject="{subject}" onclick="return deleteAccount(event)">Delete</button>
+</div></td>
+</tr>"#,
+            subject = escape(&r.subject),
+            account = escape(&r.account_hex),
+            balance = r.balance,
+            state_badge = state_badge,
+            max_tunnels = r.max_tunnels,
+            blocked_flag = r.blocked,
+            block_label = block_label,
+        ));
+    }
+    table.push_str("</tbody></table>");
+
+    let body = format!(
+        r#"<h1>Accounts</h1>
+<p class="help">Every subject with an account, its credit balance, block state, and
+tunnel-creation quota. Credit grants call the same durable ledger a payment webhook
+credits -- this IS the admin top-up, not a separate mechanism.</p>
+<form method="get" action="/admin-ui/accounts" class="search-form">
+ <label>Search by subject or account id <input type="text" name="q" value="{query}" placeholder="kc-alice"></label>
+ <button type="submit" class="sec">Search</button>
+</form>
+{table}
+<script>
+function creditAccount(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var amount = parseInt(form.amount.value, 10);
+ if(!amount || amount < 1) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/credit', {{amount: amount}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('credit failed: ' + e.message); }});
+ return false;
+}}
+function toggleBlock(ev){{
+ ev.preventDefault();
+ var btn = ev.target;
+ var subject = btn.getAttribute('data-subject');
+ var blocked = btn.getAttribute('data-blocked') === 'true';
+ var action = blocked ? 'unblock' : 'block';
+ if(action === 'block' && !window.confirm('Block ' + subject + '? This refuses new credit-gated issuance and self-service tunnel creation for this account.')) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/' + action)
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert(action + ' failed: ' + e.message); }});
+ return false;
+}}
+function setMaxTunnels(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var max = parseInt(form.max.value, 10);
+ if(!max || max < 1) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/max-tunnels', {{max: max}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('quota update failed: ' + e.message); }});
+ return false;
+}}
+function deleteAccount(ev){{
+ ev.preventDefault();
+ var subject = ev.target.getAttribute('data-subject');
+ if(!window.confirm('Permanently delete ' + subject + '? This revokes every tunnel and deletes every channel, topology, network, and pipeline this account owns, plus the ledger row itself. This cannot be undone.')) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/delete')
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('delete failed: ' + e.message); }});
+ return false;
+}}
+</script>"#,
+        query = escape(query),
+        table = table,
+    );
+    admin_page("accounts", session, &body)
+}
+
+/// `GET /admin-ui/audit` (admin-identity-gated): the most recent admin-audit-log
+/// entries (Foundation phase's `audit_log::SqliteAuditLog::recent`) -- who did
+/// what, to what, and when. Any verified admin may view this (mirrors
+/// `admin_ui_list_admins`'s "viewing isn't itself a privileged mutation" posture);
+/// only the actions themselves are privileged, not reading the record of them.
+async fn admin_ui_audit_page(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entries = match st.audit.recent(200) {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_audit_page/recent", e).into_response(),
+    };
+    Html(admin_audit_page_html(&session, &entries)).into_response()
+}
+
+fn admin_audit_page_html(session: &crate::admin_identity::AdminSession, entries: &[crate::audit_log::AuditLogEntry]) -> String {
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody>"#,
+    );
+    if entries.is_empty() {
+        table.push_str(r#"<tr><td colspan="5" class="help">No admin actions recorded yet.</td></tr>"#);
+    }
+    for e in entries {
+        table.push_str(&format!(
+            r#"<tr><td><span data-ts="{at}">{at}</span></td><td>{actor}</td><td><code>{action}</code></td><td>{target}</td><td class="help">{detail}</td></tr>"#,
+            at = e.at,
+            actor = escape(&e.actor_email),
+            action = escape(&e.action),
+            target = e.target.as_deref().map(escape).unwrap_or_else(|| "-".to_string()),
+            detail = e.detail.as_deref().map(escape).unwrap_or_default(),
+        ));
+    }
+    table.push_str("</tbody></table>");
+    let body = format!(
+        r#"<h1>Audit log</h1>
+<p class="help">Every privileged admin action recorded immutably -- actor, action, target, and
+detail (ADR-0025 Decision 6). The most recent {count} entries, newest first.</p>
+{table}"#,
+        count = entries.len(),
+        table = table,
+    );
+    admin_page("audit", session, &body)
+}
+
+// ===== end ADR-0025 integration pass: dashboard, accounts, audit pages =====
 
 // ===== end ADR-0025 `/admin-ui/*` =====
 
@@ -6395,6 +7263,188 @@ mod tests {
         assert_eq!(auth["state"], "unreadable");
         assert!(auth["reason"].as_str().unwrap().contains("read failed"));
     }
+
+    // ===== ADR-0025 integration pass: `/admin-ui/*` HTML page tests =====
+
+    async fn admin_ui_html_get(app: &Router, path: &str, cookie: Option<&str>) -> Response {
+        let mut b = Request::builder().method("GET").uri(path).header("accept", "text/html,application/xhtml+xml");
+        if let Some(c) = cookie {
+            b = b.header("cookie", c);
+        }
+        app.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// A logged-out visitor to any `/admin-ui/*` PAGE gets a clean redirect to the
+    /// existing login entry point, never a bare `401` -- job #2's own requirement.
+    /// Distinct from [`admin_ui_route_with_no_session_at_all_is_401_not_a_redirect`],
+    /// which proves the JSON API surface keeps its own `401` contract; content
+    /// negotiation ([`wants_html`]) is what tells the two cases apart.
+    #[tokio::test]
+    async fn admin_ui_page_with_no_session_redirects_to_portal_login() {
+        let (app, ..) = test_admin_ui_app();
+        let resp = admin_ui_html_get(&app, "/admin-ui/", None).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "axum's Redirect defaults to 303");
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(loc, "/portal/login", "the SAME login entry point every other Portal page uses");
+    }
+
+    /// A verified-but-not-an-admin session gets a real, rendered `403` page (a
+    /// non-empty HTML body), never a bare status code -- job #2's other half.
+    #[tokio::test]
+    async fn admin_ui_page_for_a_non_admin_session_is_a_real_rendered_403() {
+        let (app, ..) = test_admin_ui_app();
+        let non_admin = session_header_with_email("kc-someone", "not-an-admin@example.com");
+        let resp = admin_ui_html_get(&app, "/admin-ui/", Some(&non_admin)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<html"), "a real page, not an empty/bare 403: {html}");
+        assert!(html.contains("access denied") || html.contains("Access denied"));
+    }
+
+    /// Every `/admin-ui/*` page renders `200` with real HTML for a verified admin
+    /// session -- one broad smoke test across all seven pages, so a future change
+    /// that silently breaks one page's render (a panic, a bad format! arg) is
+    /// caught here rather than only in a screenshot review.
+    #[tokio::test]
+    async fn every_admin_ui_page_renders_ok_for_an_admin_session() {
+        let (app, ledger, _tunnels, admin) = test_admin_ui_app();
+        ledger.account_for_subject("kc-someone").unwrap();
+        admin.add_admin(SUPER_ADMIN, "second@example.com").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        for path in [
+            "/admin-ui/",
+            "/admin-ui/traffic",
+            "/admin-ui/accounts",
+            "/admin-ui/domains",
+            "/admin-ui/admins",
+            "/admin-ui/certs",
+            "/admin-ui/audit",
+        ] {
+            let resp = admin_ui_html_get(&app, path, Some(&super_session)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path} must render OK for an admin session");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("<html"), "{path} must render a real page: {html}");
+        }
+    }
+
+    /// Without an explicit `Accept: text/html`, the four paths this pass shares
+    /// with an earlier phase's already-tested JSON contract (`/admin-ui/traffic`,
+    /// `/admin-ui/admins`, `/admin-ui/domains`, `/admin-ui/certs`) still answer
+    /// JSON -- the content-negotiation branch this pass adds must never change
+    /// their default behavior for an existing caller (a test, a script, another
+    /// service) that doesn't ask for HTML.
+    #[tokio::test]
+    async fn shared_json_html_paths_still_default_to_json_without_an_html_accept_header() {
+        let (app, ..) = test_admin_ui_app();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        for path in ["/admin-ui/traffic", "/admin-ui/admins", "/admin-ui/domains", "/admin-ui/certs"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(path).header("cookie", &super_session).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(!html.contains("<html"), "{path} must still default to JSON, not HTML: {html}");
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|e| panic!("{path} must still be valid JSON: {e}"));
+        }
+    }
+
+    /// ADR-0025's own hard requirement, proven at the RENDER layer (not just the
+    /// route-level 403 [`admin_management_routes_refuse_a_regular_non_super_admin`]
+    /// already proves): a non-super-admin's admins page has NO remove control for
+    /// ANY row (not even for a regular admin they could otherwise imagine removing)
+    /// and no add-admin form -- the task's explicit "don't show a button that will
+    /// just 403" bar, which only a fail-first proof against the rendered markup
+    /// actually establishes.
+    #[tokio::test]
+    async fn admins_page_hides_every_remove_control_and_the_add_form_for_a_non_super_admin() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        admin.add_admin(SUPER_ADMIN, "regular@example.com").unwrap();
+        let regular = session_header_with_email("kc-regular", "regular@example.com");
+        let resp = admin_ui_html_get(&app, "/admin-ui/admins", Some(&regular)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("removeAdmin(event)"), "no row may carry a working remove control: {html}");
+        assert!(!html.contains("id=\"addAdminForm\""), "the add-admin form must not render at all: {html}");
+    }
+
+    /// The super-admin's OWN row never carries a remove control, even when the
+    /// viewer IS the super-admin and every other row does -- "no delete control
+    /// rendered for that row at all", proven per-row, not merely "the page has a
+    /// remove button somewhere".
+    #[tokio::test]
+    async fn admins_page_never_renders_a_remove_control_on_the_super_admins_own_row() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        admin.add_admin(SUPER_ADMIN, "regular@example.com").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let resp = admin_ui_html_get(&app, "/admin-ui/admins", Some(&super_session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        // The regular admin's row DOES get a remove control...
+        assert!(
+            html.contains(&format!(r#"data-email="regular@example.com""#)),
+            "the regular admin's row must carry a working remove control: {html}"
+        );
+        // ...but the super-admin's own row must not, even though this viewer IS
+        // the super-admin and the add/remove form is otherwise shown.
+        assert!(
+            !html.contains(&format!(r#"data-email="{SUPER_ADMIN}""#)),
+            "the super-admin's own row must never carry a remove control: {html}"
+        );
+        assert!(html.contains("cannot be removed"));
+        assert!(html.contains("id=\"addAdminForm\""), "the super-admin DOES see the add form");
+    }
+
+    /// `GET /admin-ui/accounts` lists a real account (from the SAME durable
+    /// ledger every other admin route reads) and its search box filters by
+    /// subject substring server-side -- proving both the new `list_accounts`
+    /// plumbing and the page's `?q=` filter actually work end-to-end, not just
+    /// that the storage method returns rows in isolation.
+    #[tokio::test]
+    async fn accounts_page_lists_real_accounts_and_search_filters_by_subject() {
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        let alice = ledger.account_for_subject("kc-alice").unwrap();
+        ledger.credit(&alice, 250).unwrap();
+        ledger.account_for_subject("kc-bob").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let resp = admin_ui_html_get(&app, "/admin-ui/accounts", Some(&super_session)).await;
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("kc-alice") && html.contains("kc-bob"), "both accounts listed: {html}");
+        assert!(html.contains("250"), "the real credited balance is shown: {html}");
+
+        let filtered = admin_ui_html_get(&app, "/admin-ui/accounts?q=alice", Some(&super_session)).await;
+        let body = to_bytes(filtered.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("kc-alice"), "matching subject still shown: {html}");
+        assert!(!html.contains("kc-bob"), "non-matching subject filtered out: {html}");
+    }
+
+    /// `GET /admin-ui/logout` clears the session cookie -- the one thing an
+    /// admin-console sign-out needs to do locally (see `admin_ui_page_authed`'s
+    /// doc for why the underlying session's origin is otherwise still open).
+    #[tokio::test]
+    async fn admin_ui_logout_clears_the_session_cookie() {
+        let (app, ..) = test_admin_ui_app();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/admin-ui/logout").header("cookie", &super_session).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(set_cookie.contains("ct_portal_session=;"), "clears the session cookie: {set_cookie}");
+        assert!(set_cookie.contains("Max-Age=0"));
+    }
+
+    // ===== end ADR-0025 integration pass: `/admin-ui/*` HTML page tests =====
 
     // ===== end ADR-0025 `/admin-ui/*` tests =====
 
