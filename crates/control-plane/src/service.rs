@@ -5889,6 +5889,11 @@ pub fn persistent_control_plane_router(
                 crate::portal_api::ObservabilityConfig {
                     edge_mesh: Some(edge_mesh.clone()),
                     edge_metrics_url: std::env::var("CT_CP_EDGE_METRICS_URL").ok().filter(|u| !u.is_empty()),
+                    // Operator feedback (2026-08-26): host-system-info panel
+                    // on the admin dashboard. `None` -> `/` inside
+                    // host_info::collect, right for every deployment this
+                    // project ships (one filesystem, per compose.selfhost.yml).
+                    host_info_disk_path: std::env::var("CT_CP_HOST_INFO_DISK_PATH").ok().filter(|s| !s.is_empty()),
                 },
             ))
             .merge(authed_network_router(networks, oidc.clone()))
