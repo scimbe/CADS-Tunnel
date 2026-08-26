@@ -111,3 +111,12 @@ services:
       # Reuse the front door's Portal host (no separate .env key) — without it the
       # one-liner defaults to https://localhost and is useless for a real customer.
       CT_PORTAL_BASE_URL: "https://${PORTAL_PUBLIC_HOST:?set PORTAL_PUBLIC_HOST=<zone>}"
+      # ADR-0025 Decision 6: the admin console's cert-expiry dashboard's own
+      # first fixed slot -- reads THIS cert (already mounted onto the edge
+      # above) off the shared filesystem, mirroring CT_CP_EDGE_CERT_PATH's
+      # existing shared-volume-with-the-edge convention. Without this (and the
+      # matching volume mount below), the dashboard reports "portal" as
+      # not_configured even though the cert genuinely exists and is in use.
+      CT_CP_CERT_PORTAL_PATH: "/certs/portal/fullchain.pem"
+    volumes:
+      - "${PORTAL_CERT_DIR:?set PORTAL_CERT_DIR=<dir with portal fullchain.pem+privkey.pem>}:/certs/portal:ro"

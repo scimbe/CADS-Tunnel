@@ -43,6 +43,16 @@ services:
     cpus: 1.0
     environment:
       CT_CONTROL_PLANE_LISTEN: "0.0.0.0:8090"
+      # ADR-0025 Decision 2: required at every boot, unconditionally -- NOT gated
+      # behind compose.admin.yml. `main.rs`'s `admin_identity::super_admin_email_
+      # from_env` runs before this process serves anything at all and aborts
+      # startup if this is unset (same fail-closed posture as CT_EDGE_ADMIN_TOKEN
+      # below), regardless of whether the admin-ui front-door overlay is even
+      # deployed. It lives here, in the ALWAYS-used base file, for exactly that
+      # reason: leaving it only in compose.admin.yml's documentation (where an
+      # earlier draft of this overlay assumed it belonged) would silently crash-
+      # loop control-plane the moment this branch is deployed at all.
+      CT_ADMIN_SUPER_EMAIL: "${CT_ADMIN_SUPER_EMAIL:?set CT_ADMIN_SUPER_EMAIL=<the one Google account allowed to administer this deployment, e.g. you@gmail.com>}"
       # #214: without this, the portal-session HMAC key falls back to a fresh
       # random one on EVERY restart (main.rs's own documented behavior) --
       # not just this repo's own portal sessions, but the Browser-Plane login

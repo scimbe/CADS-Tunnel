@@ -88,3 +88,14 @@ services:
       # like the Portal's/Auth's via deSEC DNS-01. Never committed -- supplied
       # from the host.
       - "${MASQUE_CERT_DIR:?set MASQUE_CERT_DIR=<host dir with masque fullchain.pem+privkey.pem>}:/certs/masque:ro"
+
+  control-plane:
+    environment:
+      # ADR-0025 Decision 6: the admin console's cert-expiry dashboard's own
+      # third fixed slot -- same shared-volume-with-the-edge convention as
+      # CT_CP_CERT_PORTAL_PATH (compose.frontdoor.yml). Without this (and the
+      # matching volume mount below), the dashboard reports "masque" as
+      # not_configured even though the cert genuinely exists and is in use.
+      CT_CP_CERT_MASQUE_PATH: "/certs/masque/fullchain.pem"
+    volumes:
+      - "${MASQUE_CERT_DIR:?set MASQUE_CERT_DIR=<host dir with masque fullchain.pem+privkey.pem>}:/certs/masque:ro"
