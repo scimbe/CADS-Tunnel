@@ -22,13 +22,17 @@ use crate::state::EdgeState;
 use ct_common::RoutingToken;
 
 /// Build the admin router (#27 revoke, #23 BP4b authorize-host, #153 host-auth dump,
-/// monitoring-feature v1 tunnel-status).
+/// monitoring-feature v1 tunnel-status, ADR-0025 Decision 6 bulk tunnel-status).
 pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
     Router::new()
         .route("/admin/revoke/:token", post(revoke))
         .route("/admin/authorize-host/:token/:host", post(authorize_host))
         .route("/admin/host-auth-dump", get(host_auth_dump))
         .route("/admin/tunnel-status/:token", get(tunnel_status))
+        // Static route, same path prefix as the `:token` one above -- axum/matchit
+        // prefers an exact literal match over a same-position dynamic segment, so
+        // this never collides with a (63-hex-char-short, in any case) real token.
+        .route("/admin/tunnel-status/bulk", post(tunnel_status_bulk))
         .with_state(state)
 }
 
@@ -172,6 +176,45 @@ struct TunnelStatusResp {
     /// 2026-08-01) -- `0` for a tunnel that has never relayed anything.
     bytes_received: u64,
     bytes_sent: u64,
+    /// ADR-0025 Decision 3: whether an Agent currently has a direct/P2P
+    /// listener advertised for this tunnel (`EdgeState::direct_endpoint`).
+    /// This is an AVAILABILITY signal, not a claim that traffic is actually
+    /// flowing over that path -- the edge structurally cannot see direct-path
+    /// bytes (they bypass it entirely), so the admin console must never
+    /// present this as a byte count it doesn't have. See the ADR's own
+    /// wording; the honest framing in the admin UI itself is a later phase.
+    direct: bool,
+    /// ADR-0025 Decision 6: Unix seconds the tunnel's CURRENT unbroken
+    /// connection streak started -- `None` while disconnected (the admin
+    /// console's "uptime" column is `now - this`, only ever shown while
+    /// `connected` is true).
+    connected_since: Option<u64>,
+    /// ADR-0025 Decision 6: Unix seconds of the most recent activity (a
+    /// registration or a relay) for this tunnel -- `None` if it has never
+    /// been seen at all. Unlike `connected_since`, this survives a
+    /// disconnect, which is the entire point of a "last seen" column.
+    last_seen: Option<u64>,
+}
+
+/// Shared by [`tunnel_status`] (single-token) and [`tunnel_status_bulk`]
+/// (ADR-0025 Decision 6) so the two can never answer differently for the same
+/// token -- one real read of [`EdgeState`], not two independently-maintained
+/// call sites.
+fn tunnel_status_of(state: &EdgeState<Connection>, token: &RoutingToken) -> TunnelStatusResp {
+    let registrations = state.registration_count(token);
+    let fallback_parked = state.tcp_parked_for(token);
+    let (bytes_received, bytes_sent) = state.tunnel_bytes(token);
+    let (connected_since, last_seen) = state.connection_timing(token);
+    TunnelStatusResp {
+        connected: registrations > 0 || fallback_parked > 0,
+        registrations,
+        fallback_parked,
+        bytes_received,
+        bytes_sent,
+        direct: state.direct_endpoint(token).is_some(),
+        connected_since,
+        last_seen,
+    }
 }
 
 /// `GET /admin/tunnel-status/:token` (monitoring feature v1, operator decision
@@ -183,7 +226,9 @@ struct TunnelStatusResp {
 /// the operator may query any token directly for cross-tenant visibility,
 /// per the same admin-token trust already granted by every other route on
 /// this router). ADR-0016 still applies: this reveals only connection
-/// liveness and byte volume, never payload or per-connection detail.
+/// liveness and byte volume, never payload or per-connection detail. For
+/// rendering many tunnels at once (the admin console's own dashboard), see
+/// [`tunnel_status_bulk`] -- one HTTP round trip instead of N.
 async fn tunnel_status(
     State(state): State<Arc<EdgeState<Connection>>>,
     headers: HeaderMap,
@@ -195,17 +240,51 @@ async fn tunnel_status(
     let Some(t) = parse_token_hex(&token) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let token = RoutingToken(t);
-    let registrations = state.registration_count(&token);
-    let fallback_parked = state.tcp_parked_for(&token);
-    let (bytes_received, bytes_sent) = state.tunnel_bytes(&token);
-    Ok(Json(TunnelStatusResp {
-        connected: registrations > 0 || fallback_parked > 0,
-        registrations,
-        fallback_parked,
-        bytes_received,
-        bytes_sent,
-    }))
+    Ok(Json(tunnel_status_of(&state, &RoutingToken(t))))
+}
+
+#[derive(serde::Deserialize)]
+struct BulkTunnelStatusReq {
+    tokens: Vec<String>,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct BulkTunnelStatusEntry {
+    /// The exact hex string the caller sent for this entry (not re-derived),
+    /// so the control plane can match it back to its own `routing_token`
+    /// strings by plain equality without needing this endpoint to normalize
+    /// case.
+    token: String,
+    #[serde(flatten)]
+    status: TunnelStatusResp,
+}
+
+/// `POST /admin/tunnel-status/bulk {"tokens": [...]}` (ADR-0025 Decision 6):
+/// the admin console's live tunnel/topology dashboard needs every known
+/// tunnel's status in one round trip -- the control plane's `GET
+/// /admin-ui/tunnels` is the only caller. Same admin-token gate and the same
+/// read-only, liveness-and-byte-volume-only disclosure as the single-token
+/// route above (ADR-0016); a malformed entry in `tokens` is silently skipped
+/// rather than failing the whole batch -- the entire reason to batch this
+/// call is so one bad/stale entry can't cost every other tunnel's row.
+async fn tunnel_status_bulk(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Json(req): Json<BulkTunnelStatusReq>,
+) -> Result<Json<Vec<BulkTunnelStatusEntry>>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let out = req
+        .tokens
+        .into_iter()
+        .filter_map(|hex| {
+            let t = parse_token_hex(&hex)?;
+            let status = tunnel_status_of(&state, &RoutingToken(t));
+            Some(BulkTunnelStatusEntry { token: hex, status })
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 /// Parse a 64-hex string into 32 bytes.

@@ -462,6 +462,13 @@ impl EdgeMeshHandle {
     pub fn lookup_by_host(&self, host: &str) -> rusqlite::Result<Option<(String, String)>> {
         self.store.lookup_by_host(host)
     }
+
+    /// Look up which edge (if any) owns `token`, straight through to the
+    /// underlying registry -- ADR-0025 Decision 6: the admin console's live
+    /// tunnel/topology dashboard's "which edge is this tunnel on" column.
+    pub fn lookup_by_token(&self, token: &str) -> rusqlite::Result<Option<(String, String)>> {
+        self.store.lookup_by_token(token)
+    }
 }
 
 #[derive(Deserialize)]

@@ -5,6 +5,7 @@
 //! server-rendered, self-contained, CSP-safe HTML, and every subject only ever
 //! sees or changes their own data.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Form, Path, State};
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::accounts::AccountId;
 use crate::edge_mesh::EdgeMeshHandle;
 use crate::portal::{escape, session_claims_for, session_subject_for};
-use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
+use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore, SubjectTunnel};
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
@@ -554,6 +555,9 @@ struct AdminUiState {
     managed_domains: Arc<crate::storage::SqliteManagedDomains>,
     /// ADR-0025 Decision 4/6: everything else the domain/hostname routes need.
     domain_admin: DomainAdminConfig,
+    /// ADR-0025 Decision 6: everything the read-only observability routes
+    /// (`/admin-ui/traffic`, `/admin-ui/tunnels`, `/admin-ui/health`) need.
+    observability: ObservabilityConfig,
 }
 
 /// ADR-0025 Decision 4/6: config for the domain/hostname admin routes, bundled
@@ -610,6 +614,25 @@ pub struct FrontDoorCertPaths {
     pub admin_ui: Option<String>,
 }
 
+/// ADR-0025 Decision 6: config for the read-only observability routes
+/// (`/admin-ui/traffic`, `/admin-ui/tunnels`, `/admin-ui/health`), bundled the
+/// same way as [`DomainAdminConfig`] and for the same reason -- a future field
+/// addition doesn't ripple through [`admin_ui_router`]'s already-long
+/// positional argument list.
+#[derive(Clone, Default)]
+pub struct ObservabilityConfig {
+    /// Which edge currently owns a token (ADR-0021's multi-edge ownership
+    /// registry) -- `/admin-ui/tunnels`' `edge_id` column. `None` when this
+    /// deployment never wires one up (a router built with `Default`, e.g. in
+    /// tests that don't exercise this column).
+    pub edge_mesh: Option<EdgeMeshHandle>,
+    /// The edge's `/metrics` URL -- the SAME value `status_router`'s
+    /// `CT_CP_EDGE_METRICS_URL` already reads (`service.rs`). `/admin-ui/health`
+    /// derives the co-located `/healthz` URL from it (both live on the edge's
+    /// `metrics_router`, `crates/edge/src/observe.rs`, on the same listener).
+    pub edge_metrics_url: Option<String>,
+}
+
 /// Resolve + require an admin session for an `/admin-ui/*` handler — the one gate
 /// every route below calls first (mirrors `admin_authed`'s role for the legacy
 /// `/admin/*` shared-token routes, and `account_for_session`'s role for the
@@ -637,6 +660,7 @@ pub fn admin_ui_router(
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
     managed_domains: Arc<crate::storage::SqliteManagedDomains>,
     domain_admin: DomainAdminConfig,
+    observability: ObservabilityConfig,
 ) -> Router {
     Router::new()
         .route("/admin-ui/accounts/:subject/credit", post(admin_ui_credit_account))
@@ -654,6 +678,11 @@ pub fn admin_ui_router(
         .route("/admin-ui/domains", get(admin_ui_list_domains).post(admin_ui_register_domain))
         .route("/admin-ui/domains/:zone/hostnames", post(admin_ui_add_domain_hostname))
         .route("/admin-ui/certs", get(admin_ui_certs))
+        // ADR-0025 Decision 6: read-only traffic/topology/health observability --
+        // no mutation, no audit_log call (see each handler's own doc).
+        .route("/admin-ui/traffic", get(admin_ui_traffic))
+        .route("/admin-ui/tunnels", get(admin_ui_tunnels))
+        .route("/admin-ui/health", get(admin_ui_health))
         .with_state(AdminUiState {
             session_key: Arc::from(session_key.to_vec()),
             admin,
@@ -666,6 +695,7 @@ pub fn admin_ui_router(
             pipelines,
             managed_domains,
             domain_admin,
+            observability,
         })
 }
 
@@ -1310,6 +1340,369 @@ async fn admin_ui_certs(State(st): State<AdminUiState>, headers: HeaderMap) -> R
     }
     Json(out.into_iter().map(CertStatusResp::from).collect::<Vec<_>>()).into_response()
 }
+
+// ===== ADR-0025 Decision 6: read-only observability (traffic/tunnels/health) =====
+//
+// No mutation anywhere below, so no `audit.record` calls -- ADR-0025's own framing
+// ("read-only actions aren't audit-worthy the way grants/blocks/deletes are").
+
+/// ADR-0025 Decision 3: whether an Agent currently has a direct/P2P listener
+/// advertised for a tunnel, translated to the two-value transport label the UI
+/// renders. Deliberately only two values, never "unknown" -- the absence of a
+/// direct advertisement structurally means the tunnel can ONLY be served over
+/// the relay (there is no third path), so this is knowable either way, unlike
+/// a byte count the edge structurally cannot measure for the direct leg. This
+/// is an AVAILABILITY signal ("a direct path is currently advertised"), not a
+/// claim that traffic is actually flowing over it -- seeing the mismatch
+/// between this and the also-reported relay byte counts is exactly what the
+/// admin console exists to make visible, not something to paper over here.
+fn infer_transport(direct_active: bool) -> &'static str {
+    if direct_active { "direct_p2p" } else { "relay" }
+}
+
+/// ADR-0025 Decision 3/6's own wording: "routing token (or its safe display
+/// form)". A routing token is the live identifier that routes traffic to a
+/// tunnel (`RoutingToken`, `ct_common`) -- even though the admin console is
+/// already gated at least as strictly as the shared edge-admin secret, there
+/// is no reason to additionally put the full value into a browser's
+/// DOM/devtools/history when a short prefix+suffix still lets an operator
+/// cross-reference rows across this dashboard and the raw edge admin API.
+/// Not `pub` / not reversible -- this is a display helper, not an encoding.
+fn redact_token_for_display(hex: &str) -> String {
+    if hex.len() <= 12 {
+        return hex.to_string();
+    }
+    format!("{}…{}", &hex[..8], &hex[hex.len() - 4..])
+}
+
+/// ADR-0025 Decision 6: "uptime" is only ever meaningful while a tunnel is
+/// actually connected right now -- `None` while disconnected, regardless of
+/// whether `connected_since` happens to still carry a stale value (it
+/// shouldn't, per `EdgeState`'s own contract, but this function doesn't have
+/// to trust that to be correct). Takes `now` as a parameter rather than
+/// reading the clock itself specifically so it is a plain, deterministic unit
+/// -- see the tests below.
+fn tunnel_uptime_secs(now: i64, connected: bool, connected_since: Option<i64>) -> Option<i64> {
+    if !connected {
+        return None;
+    }
+    connected_since.map(|since| (now - since).max(0))
+}
+
+/// One tunnel's live status, as reported by the edge's `POST
+/// /admin/tunnel-status/bulk` (`crates/edge/src/admin.rs`'s `BulkTunnelStatusEntry`,
+/// flattened). Every field is `#[serde(default)]` so a future edge that omits one
+/// (or an edge running an older binary during a rolling upgrade) degrades to the
+/// same "nothing known yet" default this struct already uses for a tunnel the
+/// bulk response has no entry for at all, rather than failing the whole response.
+#[derive(Deserialize, Clone, Default)]
+struct EdgeBulkStatusEntry {
+    token: String,
+    #[serde(default)]
+    connected: bool,
+    #[serde(default)]
+    registrations: usize,
+    #[serde(default)]
+    fallback_parked: usize,
+    #[serde(default)]
+    bytes_received: u64,
+    #[serde(default)]
+    bytes_sent: u64,
+    #[serde(default)]
+    direct: bool,
+    #[serde(default)]
+    connected_since: Option<i64>,
+    #[serde(default)]
+    last_seen: Option<i64>,
+}
+
+/// Bulk-fetch live status for `tokens` from the edge in ONE HTTP round trip
+/// (`POST /admin/tunnel-status/bulk`) -- the whole reason this exists is so
+/// `/admin-ui/traffic`/`/admin-ui/tunnels` don't make the caller (or this
+/// handler) loop one HTTP call per tunnel the way `portal_api.rs`'s own
+/// `edge_tunnel_status` does for a single subject's small tunnel list.
+/// Best-effort, matching every other edge-admin call in this file: `None`
+/// configured, an unsuccessful response, or a transport/decode error all
+/// return an empty map, so a transient edge/network hiccup degrades every
+/// row to its "nothing known" defaults instead of failing the whole page.
+async fn edge_tunnel_status_bulk(st: &AdminUiState, tokens: &[String]) -> HashMap<String, EdgeBulkStatusEntry> {
+    let Some((edge_url, edge_token)) = &st.domain_admin.edge_admin else {
+        return HashMap::new();
+    };
+    if tokens.is_empty() {
+        return HashMap::new();
+    }
+    let endpoint = format!("{}/admin/tunnel-status/bulk", edge_url.trim_end_matches('/'));
+    let resp = edge_admin_http_client()
+        .post(&endpoint)
+        .header("x-ct-admin-token", edge_token.as_str())
+        .json(&serde_json::json!({ "tokens": tokens }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => match r.json::<Vec<EdgeBulkStatusEntry>>().await {
+            Ok(entries) => entries.into_iter().map(|e| (e.token.clone(), e)).collect(),
+            Err(e) => {
+                eprintln!("ct-cp: edge_tunnel_status_bulk: decoding the edge's response failed: {e}");
+                HashMap::new()
+            }
+        },
+        Ok(r) => {
+            eprintln!("ct-cp: edge_tunnel_status_bulk: edge returned {}", r.status());
+            HashMap::new()
+        }
+        Err(e) => {
+            eprintln!("ct-cp: edge_tunnel_status_bulk: request failed: {}", redact_routing_tokens(&e.to_string()));
+            HashMap::new()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TrafficRow {
+    tunnel_id: String,
+    name: String,
+    hostname: Option<String>,
+    routing_token_display: String,
+    connected: bool,
+    /// ADR-0025 Decision 3: `"relay"` | `"direct_p2p"` -- see [`infer_transport`].
+    transport: &'static str,
+    bytes_received: u64,
+    bytes_sent: u64,
+}
+
+/// Pure join of `tunnels` (the control plane's own tunnel registry,
+/// `SqliteTunnelStore::all`) against `edge_status` (this process's bulk edge
+/// scrape) -- no I/O, so it's directly unit-testable (see the tests below) and
+/// is exactly why [`admin_ui_traffic`] itself stays a thin wrapper around it.
+/// A tunnel with no entry in `edge_status` (never connected since the edge's
+/// own process start, or the scrape failed) reports `connected: false`,
+/// `transport: "relay"` (the honest default -- no direct advertisement is
+/// known, so relay is the only path that could be serving it) and zeroed byte
+/// counts, rather than being omitted from the list.
+fn build_traffic_rows(tunnels: &[SubjectTunnel], edge_status: &HashMap<String, EdgeBulkStatusEntry>) -> Vec<TrafficRow> {
+    tunnels
+        .iter()
+        .map(|t| {
+            let status = edge_status.get(&t.routing_token);
+            TrafficRow {
+                tunnel_id: t.id.clone(),
+                name: t.name.clone(),
+                hostname: t.hostname.clone(),
+                routing_token_display: redact_token_for_display(&t.routing_token),
+                connected: status.map(|s| s.connected).unwrap_or(false),
+                transport: infer_transport(status.map(|s| s.direct).unwrap_or(false)),
+                bytes_received: status.map(|s| s.bytes_received).unwrap_or(0),
+                bytes_sent: status.map(|s| s.bytes_sent).unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
+/// `GET /admin-ui/traffic` (admin-identity-gated, ADR-0025 Decision 6, read-only):
+/// per registered tunnel, its relay byte counts (real, edge-measured) and its
+/// transport (Decision 3's honest relay-vs-direct-advertised signal, never a
+/// direct-path byte count the edge doesn't have).
+async fn admin_ui_traffic(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let tunnels = match st.tunnels.all() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_traffic/tunnels.all", e).into_response(),
+    };
+    let tokens: Vec<String> = tunnels.iter().map(|t| t.routing_token.clone()).collect();
+    let edge_status = edge_tunnel_status_bulk(&st, &tokens).await;
+    Json(build_traffic_rows(&tunnels, &edge_status)).into_response()
+}
+
+#[derive(Serialize)]
+struct TunnelOverviewRow {
+    tunnel_id: String,
+    name: String,
+    hostname: Option<String>,
+    routing_token_display: String,
+    connected: bool,
+    /// QUIC registrations (redundant Agents, #8, count separately from `fallback_parked`).
+    registrations: usize,
+    fallback_parked: usize,
+    /// ADR-0025 Decision 3: `"relay"` | `"direct_p2p"` -- see [`infer_transport`].
+    transport: &'static str,
+    /// ADR-0021's multi-edge ownership registry: which edge this tunnel is
+    /// currently assigned to, `None` when no ownership row exists yet (a
+    /// tunnel with no hostname ever set, or a deployment that hasn't wired the
+    /// registry up at all).
+    edge_id: Option<String>,
+    created_at: i64,
+    /// Seconds the CURRENT connection streak has been up, `None` while
+    /// disconnected. See [`tunnel_uptime_secs`].
+    uptime_seconds: Option<i64>,
+    /// Unix seconds of the most recent activity, `None` if never seen at all
+    /// (survives disconnect -- see `EdgeState::connection_timing`'s own doc).
+    last_seen_unix: Option<i64>,
+}
+
+/// Pure join of `tunnels` against `edge_status` (this process's bulk edge
+/// scrape) and `edge_by_token` (a pre-resolved `routing_token -> edge_id` map,
+/// so this function itself makes no DB calls and is directly unit-testable --
+/// see [`admin_ui_tunnels`] for where `edge_by_token` is actually built). `now`
+/// is threaded through to [`tunnel_uptime_secs`] rather than read here, for the
+/// same testability reason.
+fn build_tunnel_overview_rows(
+    now: i64,
+    tunnels: &[SubjectTunnel],
+    edge_status: &HashMap<String, EdgeBulkStatusEntry>,
+    edge_by_token: &HashMap<String, String>,
+) -> Vec<TunnelOverviewRow> {
+    tunnels
+        .iter()
+        .map(|t| {
+            let status = edge_status.get(&t.routing_token);
+            let connected = status.map(|s| s.connected).unwrap_or(false);
+            TunnelOverviewRow {
+                tunnel_id: t.id.clone(),
+                name: t.name.clone(),
+                hostname: t.hostname.clone(),
+                routing_token_display: redact_token_for_display(&t.routing_token),
+                connected,
+                registrations: status.map(|s| s.registrations).unwrap_or(0),
+                fallback_parked: status.map(|s| s.fallback_parked).unwrap_or(0),
+                transport: infer_transport(status.map(|s| s.direct).unwrap_or(false)),
+                edge_id: edge_by_token.get(&t.routing_token).cloned(),
+                created_at: t.created_at,
+                uptime_seconds: tunnel_uptime_secs(now, connected, status.and_then(|s| s.connected_since)),
+                last_seen_unix: status.and_then(|s| s.last_seen),
+            }
+        })
+        .collect()
+}
+
+/// `GET /admin-ui/tunnels` (admin-identity-gated, ADR-0025 Decision 6, read-only):
+/// live tunnel/topology overview -- every registered tunnel, which edge it's on
+/// (ADR-0021), transport, uptime, and last-seen, aggregated server-side into one
+/// response (one bulk edge scrape, one edge_mesh lookup per tunnel) rather than a
+/// dashboard the UI has to build itself out of N per-token calls.
+async fn admin_ui_tunnels(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let tunnels = match st.tunnels.all() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_tunnels/tunnels.all", e).into_response(),
+    };
+    let tokens: Vec<String> = tunnels.iter().map(|t| t.routing_token.clone()).collect();
+    let edge_status = edge_tunnel_status_bulk(&st, &tokens).await;
+    let mut edge_by_token = HashMap::new();
+    if let Some(mesh) = &st.observability.edge_mesh {
+        for t in &tunnels {
+            match mesh.lookup_by_token(&t.routing_token) {
+                Ok(Some((edge_id, _peer_addr))) => {
+                    edge_by_token.insert(t.routing_token.clone(), edge_id);
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ct-cp: admin_ui_tunnels: edge_mesh lookup for tunnel {} failed: {e}", t.id),
+            }
+        }
+    }
+    let rows = build_tunnel_overview_rows(admin_ui_now_secs(), &tunnels, &edge_status, &edge_by_token);
+    Json(rows).into_response()
+}
+
+#[derive(Serialize, Default)]
+struct EdgeHealthSummary {
+    /// Whether `CT_CP_EDGE_METRICS_URL` is set at all on this deployment --
+    /// every other field is `None` when this is `false`, distinctly from a
+    /// scrape that ran and came back empty/failed (see `detail`).
+    configured: bool,
+    /// The edge's own `/healthz` verdict (#498/#553's real gated-listener
+    /// check, reused as-is -- see `edge_health_summary`'s doc), `None` only
+    /// when `configured` is `false` or the `/healthz` URL couldn't be derived.
+    healthy: Option<bool>,
+    /// The edge `/healthz` response body verbatim (which loops it checked, or
+    /// why it's unhealthy) -- an operator-facing detail line, not parsed
+    /// further here.
+    detail: Option<String>,
+    active_tunnels: Option<i64>,
+    active_agents: Option<i64>,
+    relay_bytes_total: Option<i64>,
+    tcp_fallback_parked: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct HealthResp {
+    /// Same signal as this process's own `/readyz` (`SqliteLedger::ping`) --
+    /// reused directly, not re-derived (see `admin_ui_health`'s doc).
+    control_plane_ready: bool,
+    edge: EdgeHealthSummary,
+}
+
+/// Real HTTP calls against the edge's OWN `/healthz` and `/metrics` (reusing
+/// their exact, already-tested underlying data -- #498/#553's gated-listener
+/// classifier for `/healthz`, `EdgeState`'s live gauges via
+/// `render_edge_metrics` for `/metrics` -- rather than re-deriving either).
+/// `/healthz` is derived from [`ObservabilityConfig::edge_metrics_url`] by
+/// swapping its `/metrics` suffix for `/healthz`: both routes are served from
+/// the SAME `metrics_router` (`crates/edge/src/observe.rs`), so they are
+/// always co-located, and no separate config knob exists (or is needed) for
+/// the second URL.
+async fn edge_health_summary(edge_metrics_url: Option<&str>) -> EdgeHealthSummary {
+    let Some(metrics_url) = edge_metrics_url.filter(|s| !s.is_empty()) else {
+        return EdgeHealthSummary { configured: false, ..Default::default() };
+    };
+    let client = edge_admin_http_client();
+    let metrics_text = match client.get(metrics_url).timeout(std::time::Duration::from_secs(2)).send().await {
+        Ok(r) if r.status().is_success() => r.text().await.ok(),
+        Ok(r) => {
+            eprintln!("ct-cp: edge_health_summary: /metrics scrape returned {}", r.status());
+            None
+        }
+        Err(e) => {
+            eprintln!("ct-cp: edge_health_summary: /metrics scrape failed: {e}");
+            None
+        }
+    };
+    let (active_tunnels, active_agents, relay_bytes_total, tcp_fallback_parked) = match &metrics_text {
+        Some(body) => (
+            crate::service::parse_metric(body, "ct_edge_active_tunnels"),
+            crate::service::parse_metric(body, "ct_edge_active_agents"),
+            crate::service::parse_metric(body, "ct_edge_relay_bytes_total"),
+            crate::service::parse_metric(body, "ct_edge_tcp_fallback_parked"),
+        ),
+        None => (None, None, None, None),
+    };
+    let healthz_url = metrics_url.strip_suffix("/metrics").map(|base| format!("{base}/healthz"));
+    let (healthy, detail) = match &healthz_url {
+        Some(u) => match client.get(u).timeout(std::time::Duration::from_secs(2)).send().await {
+            Ok(r) => {
+                let ok = r.status().is_success();
+                let body = r.text().await.unwrap_or_default();
+                (Some(ok), Some(body.trim().to_string()))
+            }
+            Err(e) => (Some(false), Some(format!("/healthz request failed: {e}"))),
+        },
+        None => (
+            None,
+            Some("CT_CP_EDGE_METRICS_URL does not end in /metrics -- cannot derive the edge's /healthz URL".to_string()),
+        ),
+    };
+    EdgeHealthSummary { configured: true, healthy, detail, active_tunnels, active_agents, relay_bytes_total, tcp_fallback_parked }
+}
+
+/// `GET /admin-ui/health` (admin-identity-gated, ADR-0025 Decision 6, read-only):
+/// one glance at both processes' health -- this control plane's own readiness
+/// (`SqliteLedger::ping`, the same check `/readyz` runs) plus the edge's real
+/// `/healthz` verdict and a handful of its `/metrics` gauges, aggregated so an
+/// admin doesn't have to separately poll two endpoints on two hosts/ports.
+async fn admin_ui_health(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let control_plane_ready = st.ledger.ping().is_ok();
+    let edge = edge_health_summary(st.observability.edge_metrics_url.as_deref()).await;
+    Json(HealthResp { control_plane_ready, edge }).into_response()
+}
+
+// ===== end ADR-0025 Decision 6 =====
 
 // ===== end ADR-0025 `/admin-ui/*` =====
 
@@ -4036,6 +4429,182 @@ mod tests {
         assert_eq!(redact_routing_tokens("returned 503 deadbeef"), "returned 503 deadbeef");
     }
 
+    // ===== ADR-0025 Decision 6: observability (traffic/tunnels) pure-logic tests =====
+    //
+    // `infer_transport`/`redact_token_for_display`/`tunnel_uptime_secs`/
+    // `build_traffic_rows`/`build_tunnel_overview_rows` are pure joins/derivations
+    // with no I/O, unlike the handlers around them -- these are the actual "genuine
+    // logic" ADR-0025 calls out, so they get real unit tests here rather than only
+    // being exercised indirectly through a live edge/DB in an integration test.
+
+    #[test]
+    fn infer_transport_reports_direct_p2p_only_when_a_direct_advertisement_is_active() {
+        // ADR-0025 Decision 3: an availability signal, never a byte count -- exactly
+        // two values, no third "unknown" state (see the fn's own doc comment).
+        assert_eq!(infer_transport(true), "direct_p2p");
+        assert_eq!(infer_transport(false), "relay");
+    }
+
+    #[test]
+    fn redact_token_for_display_keeps_prefix_and_suffix_but_hides_the_middle() {
+        let token = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        assert_eq!(token.len(), 64, "sanity: a real routing token is 64 hex chars");
+        let shown = redact_token_for_display(&token);
+        assert_eq!(shown, "a1b2c3d4…0000");
+        assert!(!shown.contains(&token), "the raw routing token must never appear in the display form");
+        assert!(shown.len() < token.len(), "display form is materially shorter than the real token");
+    }
+
+    #[test]
+    fn redact_token_for_display_leaves_a_short_value_alone() {
+        // The fn's own documented escape hatch (`hex.len() <= 12`) -- exercised so a
+        // short/malformed token can't silently start panicking on the `hex[..8]` slice.
+        assert_eq!(redact_token_for_display("short"), "short");
+        let twelve = "a".repeat(12);
+        assert_eq!(redact_token_for_display(&twelve), twelve);
+    }
+
+    #[test]
+    fn tunnel_uptime_secs_is_none_while_disconnected_even_if_connected_since_is_stale() {
+        // A disconnected tunnel must never show an uptime, regardless of whatever
+        // stale `connected_since` might still be lying around -- the whole reason
+        // this takes `connected` as its own explicit parameter rather than inferring
+        // it from `connected_since.is_some()`.
+        assert_eq!(tunnel_uptime_secs(1_000, false, Some(500)), None);
+        assert_eq!(tunnel_uptime_secs(1_000, false, None), None);
+    }
+
+    #[test]
+    fn tunnel_uptime_secs_is_none_when_connected_but_the_edge_never_reported_a_streak_start() {
+        assert_eq!(tunnel_uptime_secs(1_000, true, None), None);
+    }
+
+    #[test]
+    fn tunnel_uptime_secs_is_now_minus_since_clamped_at_zero() {
+        assert_eq!(tunnel_uptime_secs(1_500, true, Some(1_000)), Some(500));
+        // Clock skew between this process and the edge's `connected_since` report
+        // must never produce a negative uptime.
+        assert_eq!(tunnel_uptime_secs(900, true, Some(1_000)), Some(0));
+    }
+
+    fn test_subject_tunnel(id: &str, routing_token: &str) -> SubjectTunnel {
+        SubjectTunnel {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            hostname: Some(format!("{id}.example.org")),
+            created_at: 1_700_000_000,
+            routing_token: routing_token.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_traffic_rows_defaults_an_unreported_tunnel_to_disconnected_relay_zero_bytes() {
+        // A tunnel the bulk edge scrape has no entry for at all (never connected
+        // since the edge's own process start, or the scrape itself failed) must
+        // still show up as a row -- degraded to the honest defaults, not dropped.
+        let t = test_subject_tunnel("t1", &"a".repeat(64));
+        let rows = build_traffic_rows(std::slice::from_ref(&t), &HashMap::new());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].connected);
+        assert_eq!(rows[0].transport, "relay");
+        assert_eq!(rows[0].bytes_received, 0);
+        assert_eq!(rows[0].bytes_sent, 0);
+    }
+
+    #[test]
+    fn build_traffic_rows_reports_real_bytes_and_direct_transport_for_a_known_tunnel() {
+        let token = "b".repeat(64);
+        let t = test_subject_tunnel("t2", &token);
+        let mut edge_status = HashMap::new();
+        edge_status.insert(
+            token.clone(),
+            EdgeBulkStatusEntry {
+                token: token.clone(),
+                connected: true,
+                bytes_received: 111,
+                bytes_sent: 222,
+                direct: true,
+                ..Default::default()
+            },
+        );
+        let rows = build_traffic_rows(std::slice::from_ref(&t), &edge_status);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].connected);
+        assert_eq!(rows[0].transport, "direct_p2p");
+        assert_eq!(rows[0].bytes_received, 111);
+        assert_eq!(rows[0].bytes_sent, 222);
+    }
+
+    #[test]
+    fn build_traffic_rows_never_puts_the_raw_routing_token_in_the_response() {
+        // The whole reason `redact_token_for_display` exists -- prove the join
+        // actually calls it rather than leaking `t.routing_token` verbatim.
+        let token = "c".repeat(64);
+        let t = test_subject_tunnel("t3", &token);
+        let rows = build_traffic_rows(std::slice::from_ref(&t), &HashMap::new());
+        assert_ne!(rows[0].routing_token_display, token);
+        assert!(rows[0].routing_token_display.len() < token.len());
+    }
+
+    #[test]
+    fn build_tunnel_overview_rows_joins_edge_id_and_reports_uptime_only_while_connected() {
+        let token = "d".repeat(64);
+        let t = test_subject_tunnel("t4", &token);
+        let mut edge_status = HashMap::new();
+        edge_status.insert(
+            token.clone(),
+            EdgeBulkStatusEntry {
+                token: token.clone(),
+                connected: true,
+                registrations: 2,
+                fallback_parked: 1,
+                direct: false,
+                connected_since: Some(1_000),
+                last_seen: Some(1_450),
+                ..Default::default()
+            },
+        );
+        let mut edge_by_token = HashMap::new();
+        edge_by_token.insert(token.clone(), "edge-eu-1".to_string());
+
+        let rows = build_tunnel_overview_rows(1_500, std::slice::from_ref(&t), &edge_status, &edge_by_token);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.connected);
+        assert_eq!(row.registrations, 2);
+        assert_eq!(row.fallback_parked, 1);
+        assert_eq!(row.transport, "relay");
+        assert_eq!(row.edge_id.as_deref(), Some("edge-eu-1"));
+        assert_eq!(row.uptime_seconds, Some(500));
+        assert_eq!(row.last_seen_unix, Some(1_450));
+    }
+
+    #[test]
+    fn build_tunnel_overview_rows_reports_no_uptime_but_keeps_last_seen_for_a_disconnected_tunnel() {
+        // The "last seen" column's entire reason to exist: it must survive a
+        // disconnect even though uptime (correctly) does not.
+        let token = "e".repeat(64);
+        let t = test_subject_tunnel("t5", &token);
+        let mut edge_status = HashMap::new();
+        edge_status.insert(
+            token.clone(),
+            EdgeBulkStatusEntry {
+                token: token.clone(),
+                connected: false,
+                connected_since: None,
+                last_seen: Some(1_000),
+                ..Default::default()
+            },
+        );
+        let rows = build_tunnel_overview_rows(2_000, std::slice::from_ref(&t), &edge_status, &HashMap::new());
+        assert!(!rows[0].connected);
+        assert_eq!(rows[0].uptime_seconds, None);
+        assert_eq!(rows[0].last_seen_unix, Some(1_000));
+        assert_eq!(rows[0].edge_id, None, "no edge_mesh entry for this token -> None, not fabricated");
+    }
+
+    // ===== end ADR-0025 Decision 6 pure-logic tests =====
+
     fn session_header(subject: &str) -> String {
         format!("ct_portal_session={}", sign_session_for_test(KEY, subject))
     }
@@ -5326,6 +5895,7 @@ mod tests {
             pipelines,
             Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
             DomainAdminConfig::default(),
+            ObservabilityConfig::default(),
         );
         (portal_app.merge(admin_app), ledger, tunnels, admin)
     }
@@ -5368,6 +5938,10 @@ mod tests {
             ("POST", "/admin-ui/domains", Some(r#"{"zone":"example.org"}"#)),
             ("POST", "/admin-ui/domains/example.org/hostnames", Some(r#"{"subdomain":"app"}"#)),
             ("GET", "/admin-ui/certs", None),
+            // ADR-0025 Decision 6: read-only observability.
+            ("GET", "/admin-ui/traffic", None),
+            ("GET", "/admin-ui/tunnels", None),
+            ("GET", "/admin-ui/health", None),
         ];
         for (method, path, body) in cases {
             let status = admin_ui_req(&app, method, path, &non_admin, *body).await;
@@ -5532,6 +6106,7 @@ mod tests {
             Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
             managed_domains,
             domain_admin,
+            ObservabilityConfig::default(),
         )
     }
 

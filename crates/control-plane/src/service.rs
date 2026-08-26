@@ -4236,7 +4236,11 @@ async fn live_tunnel_count(s: &StatusState) -> i64 {
 
 /// Parse a Prometheus gauge value by metric name from a metrics exposition body:
 /// the first `<name> <value>` sample line, ignoring `# HELP`/`# TYPE` comments.
-fn parse_metric(body: &str, name: &str) -> Option<i64> {
+/// `pub(crate)`: ADR-0025's `/admin-ui/health` (`portal_api.rs`) reuses this exact
+/// function against the edge's real `/metrics` body, the same "reuse the underlying
+/// data source, don't re-derive" reasoning [`live_tunnel_count`] above already
+/// applies to the tunnel count specifically.
+pub(crate) fn parse_metric(body: &str, name: &str) -> Option<i64> {
     body.lines()
         .filter(|l| !l.starts_with('#'))
         .find_map(|l| {
@@ -5872,6 +5876,15 @@ pub fn persistent_control_plane_router(
                 pipeline_registry.clone(),
                 managed_domains.clone(),
                 domain_admin_config.clone(),
+                // ADR-0025 Decision 6: read-only observability config -- `edge_mesh`
+                // is the SAME handle constructed above (edge_mesh Phase 0), and
+                // `CT_CP_EDGE_METRICS_URL` is the SAME value `status_router` already
+                // reads for its own live-tunnel-count scrape, reused rather than
+                // re-derived (see `edge_health_summary`'s own doc for why).
+                crate::portal_api::ObservabilityConfig {
+                    edge_mesh: Some(edge_mesh.clone()),
+                    edge_metrics_url: std::env::var("CT_CP_EDGE_METRICS_URL").ok().filter(|u| !u.is_empty()),
+                },
             ))
             .merge(authed_network_router(networks, oidc.clone()))
             .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
