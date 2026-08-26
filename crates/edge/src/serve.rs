@@ -1997,8 +1997,15 @@ pub async fn serve_connection(
             let mut cert = vec![0u8; u16::from_be_bytes(cl) as usize];
             recv.read_exact(&mut cert).await?;
             let addr: SocketAddr = std::str::from_utf8(&addr_buf)?.parse()?;
-            state.advertise_direct(RoutingToken(token), addr, cert);
-            send.write_all(b"OK").await?;
+            // #665: was unconditional -- a revoked Agent's own reconnect loop
+            // could deterministically keep re-advertising a direct endpoint
+            // forever (no race needed, unlike the 'B'/'L'/'F' TOCTOU above).
+            // Same refusal shape as the 'H' bind arm just below.
+            if state.advertise_direct(RoutingToken(token), addr, cert) {
+                send.write_all(b"OK").await?;
+            } else {
+                send.write_all(b"NO").await?;
+            }
             send.finish()?;
             Ok(None)
         }
@@ -2324,10 +2331,30 @@ where
     .await
     .map_err(|_| format!("tcp-fallback: role '{role_label}' admission timed out"))??;
     let Some((token, sub_permit)) = admitted else { return Ok(None) };
+    // #665: was the unconditional `park_tcp_agent` -- the 'A'/'K' arms already
+    // closed this exact TOCTOU (#411/#421): `register_host` above checks
+    // `is_revoked` under `registration_lock` and releases it, so a
+    // `revoke_token()` landing in the gap between that release and this park
+    // call previously queued a revoked token as a waiting Agent anyway
+    // (`park_tcp_agent` never refuses). `park_tcp_agent_unless_revoked`
+    // re-checks against the CURRENT revoked state at its own lock
+    // acquisition, so this composition of two independently-atomic checks
+    // fully closes the gap: whichever of register_host / this park call runs
+    // after a revoke completes sees it and refuses.
+    //
+    // The `OK` ack was already written above (register_host's own check is
+    // what gates it) -- a revoke landing in this exact gap now means the
+    // caller silently never receives a live registration (`None` here) rather
+    // than the wire lying about admission. That is the same "quietly refused,
+    // no relay ever happens" outcome #411 already accepts for 'A'/'K"'s own
+    // sub_permit-exhausted case; it does not desync the wire (no second ack is
+    // written), and the state-level property #665 is actually about --a
+    // revoked token must never sit parked as a live waiting Agent-- now holds
+    // for 'B'/'L'/'F' too.
     // Returned UN-awaited: the caller decides whether to await it plainly ('B') or
     // to keep the idle connection alive with `park_and_ping` while waiting ('L').
-    let parked = state.park_tcp_agent(token.clone());
-    Ok(Some((token, parked, sub_permit)))
+    let parked = state.park_tcp_agent_unless_revoked(token.clone());
+    Ok(parked.map(|parked| (token, parked, sub_permit)))
 }
 
 async fn park_and_ping<S>(
