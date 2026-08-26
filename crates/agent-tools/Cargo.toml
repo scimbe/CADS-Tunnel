@@ -14,10 +14,12 @@ license-file.workspace = true
 # #219) were removed in #232: both demos migrated to their own thin Node.js bridges
 # weeks before core's side of that cleanup landed (see
 # docs/onboarding/pipeline-bridge-pattern.md for the pattern that replaces them for any
-# future pipeline). `ct_common::crew`/`ct_common::cookbook` themselves stay, though --
-# #232's own hermetic gate caught that `scimbe/ct-agent`'s `channel_run.rs`
-# (`crew_build_over`) still depends on them directly as a library primitive, so removing
-# the modules would have broken that separate repo's build.
+# future pipeline). `ct_common::crew` itself stays -- #232's own hermetic gate caught
+# that `scimbe/ct-agent`'s `channel_run.rs` (`crew_build_over`) still depends on it
+# directly as a library primitive, so removing the module would have broken that
+# separate repo's build. `ct_common::cookbook` had no such consumer (#455's own
+# thirteen-repo caller survey found none anywhere, including ct-agent) and was removed
+# outright.
 
 [dependencies]
 ct-common = { path = "../common" }
