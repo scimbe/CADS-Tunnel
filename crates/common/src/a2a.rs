@@ -233,152 +233,19 @@ pub async fn a2a_recv<R: AsyncRead + Unpin>(
     Ok(pt)
 }
 
-/// A2A frame tags for the **#104 relay→direct cutover (H2)**: application DATA vs the inline
-/// CUTOVER control marker. Tagging every frame is what makes the cutover **byte-exact** — the
-/// marker travels *in order, on the same reliable framed session* as the application data, so a
-/// receiver draining until the marker loses and duplicates nothing at the seam.
-///
-/// **H3 landed elsewhere, and this is not on the live path (#476).** The doc here used to say
-/// "wiring it into the live `run_channel_session` is H3", which read as a pending step. H3
-/// shipped: [`crate::upgrade::run_upgradable_session_initiator`]/`_responder` carry the
-/// `Offer`/`Ready` coordination in-band over [`crate::noise::noise_pump_multiplexed`]'s control
-/// channel, and ct-agent drives those in production. Nothing — not `upgrade.rs`, not ct-agent —
-/// calls [`a2a_send_framed`]/[`a2a_recv_framed`] or reads these tags.
-///
-/// Kept for the same reason as [`crate::noise::noise_pump_switchable`], whose doc says so of
-/// itself: a focused, frozen proof that a byte-exact seam works, useful to read when changing
-/// the live one. It is **not** a second wire format in service, and a future cutover change
-/// belongs in the multiplexed pump, not here.
-// ---------------------------------------------------------------------------
-// The tagged-frame cutover below is NOT the cutover this system runs (#476).
-//
-// It is an earlier design of the same idea. The live relay→direct handoff is
-// [`crate::upgrade`]'s: its own `TAG_OFFER`/`TAG_READY`/`TAG_ABORT` protocol, finishing with
-// `noise::PumpControl::Cutover`, driven from ct-agent (`p2p.rs`, `channel_run/mod.rs`) through
-// `upgrade::run_upgradable_session`. Nothing reaches the helpers below.
-//
-// Established by walking callers across every consumer of this crate — both repositories plus
-// every workspace member — and classifying each hit against the file's real `#[cfg(test)]`
-// spans rather than its filename. Four items form one unreachable cluster:
-// `a2a_send_framed` → `a2a_send`, and `a2a_drain_relay_until_cutover` → `a2a_recv_framed` →
-// `a2a_recv`. Their only non-test callers are each other. Everything else in this module has a
-// real production root (`a2a_initiate`, `a2a_respond`, `a2a_respond_verified`,
-// `establish_direct_session`, `establish_direct_over_duplex`, `serve_request_loop`,
-// `write_message`, `read_message`).
-//
-// Left in place deliberately: this is public API of a crate other repositories depend on by
-// tag, so removing it is a breaking change and a decision for the operator, not a tidy-up.
-// What is fixed here is the reading: the doc comments below described a live seam, and the
-// #477 hardening on it reads as protection of a path in service. Neither was true, and that
-// direction of error is the dangerous one — it invites reasoning about a mechanism that never
-// runs, and it makes the mechanism that DOES run ([`crate::upgrade`]) look like one option
-// among two.
-// ---------------------------------------------------------------------------
-
-pub const A2A_TAG_DATA: u8 = 0;
-pub const A2A_TAG_CUTOVER: u8 = 1;
-
-/// Send one **tagged** A2A message (`tag ‖ payload` as a single Noise frame): [`A2A_TAG_DATA`]
-/// for application bytes, [`A2A_TAG_CUTOVER`] (payload ignored, send empty) for the cutover
-/// marker. A tagged session and an untagged [`a2a_send`] session must not be mixed on one wire.
-pub async fn a2a_send_framed<W: AsyncWrite + Unpin>(
-    send: &mut W,
-    session: &mut TransportState,
-    tag: u8,
-    payload: &[u8],
-) -> io::Result<()> {
-    if payload.len() > A2A_MAX_MESSAGE - 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a2a framed message exceeds the Noise plaintext limit; chunk it",
-        ));
-    }
-    let mut m = Vec::with_capacity(1 + payload.len());
-    m.push(tag);
-    m.extend_from_slice(payload);
-    a2a_send(send, session, &m).await
-}
-
-/// Receive one **tagged** A2A message → `(tag, payload)`. Rejects an empty frame (no tag byte).
-pub async fn a2a_recv_framed<R: AsyncRead + Unpin>(
-    recv: &mut R,
-    session: &mut TransportState,
-) -> io::Result<(u8, Vec<u8>)> {
-    let mut m = a2a_recv(recv, session).await?;
-    if m.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty a2a frame: missing tag"));
-    }
-    let tag = m.remove(0);
-    Ok((tag, m))
-}
-
-/// #477: [`a2a_drain_relay_until_cutover`] is a brief handoff seam (drain whatever arrived on
-/// the relay before the peer's already-in-flight cutover marker catches up), not a bulk
-/// transfer path — bound both its total bytes and its wall-clock so a peer that keeps
-/// streaming DATA and never sends [`A2A_TAG_CUTOVER`] can't drive the receiver toward
-/// unbounded memory growth or an unbounded wait.
-pub const DRAIN_UNTIL_CUTOVER_MAX_BYTES: usize = 4 * 1024 * 1024;
-const DRAIN_UNTIL_CUTOVER_DEADLINE: Duration = Duration::from_secs(30);
-
-/// **Receiver side of the #104 cutover (H2) — as designed, not as deployed (#476).** The
-/// handoff that actually runs is [`crate::upgrade`]'s; see the block comment above
-/// [`A2A_TAG_DATA`]. Read the paragraphs below as a specification of this seam, not as a
-/// description of what protects a live session.
-///
-/// Drain application DATA messages from the RELAY
-/// session **in order** until the [`A2A_TAG_CUTOVER`] marker arrives, returning them; after this
-/// the caller switches to reading the DIRECT session (`a2a_recv_framed`). Because the marker is
-/// in-order on the same reliable framed session, no application bytes are lost or duplicated at
-/// the seam. An unknown tag is a protocol error.
-///
-/// #477: bounded to [`DRAIN_UNTIL_CUTOVER_MAX_BYTES`] total and
-/// [`DRAIN_UNTIL_CUTOVER_DEADLINE`] wall-clock — this is meant to be a brief handoff, not a bulk
-/// transfer path; a peer that keeps streaming DATA past either bound is treated as a protocol
-/// error rather than allowed to grow the receiver's memory or hold it open indefinitely.
-pub async fn a2a_drain_relay_until_cutover<R: AsyncRead + Unpin>(
-    relay_recv: &mut R,
-    relay_session: &mut TransportState,
-) -> io::Result<Vec<Vec<u8>>> {
-    tokio::time::timeout(DRAIN_UNTIL_CUTOVER_DEADLINE, async {
-        let mut drained = Vec::new();
-        let mut total = 0usize;
-        loop {
-            let (tag, payload) = a2a_recv_framed(relay_recv, relay_session).await?;
-            match tag {
-                A2A_TAG_DATA => {
-                    total += payload.len();
-                    if total > DRAIN_UNTIL_CUTOVER_MAX_BYTES {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "a2a: cutover drain exceeded {DRAIN_UNTIL_CUTOVER_MAX_BYTES} bytes \
-                                 without a CUTOVER marker (#477)"
-                            ),
-                        ));
-                    }
-                    drained.push(payload);
-                }
-                A2A_TAG_CUTOVER => return Ok(drained),
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unknown a2a frame tag during cutover drain",
-                    ))
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_elapsed| {
-        Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "a2a: cutover drain exceeded {DRAIN_UNTIL_CUTOVER_DEADLINE:?} without a CUTOVER \
-                 marker (#477)"
-            ),
-        ))
-    })
-}
+// #476: the TAGGED cutover cluster built on top of a2a_send/a2a_recv above
+// (a2a_send_framed/a2a_recv_framed/a2a_drain_relay_until_cutover, A2A_TAG_DATA/
+// A2A_TAG_CUTOVER/DRAIN_UNTIL_CUTOVER_MAX_BYTES) was removed here -- an earlier,
+// never-wired design for the #104 relay->direct cutover, fully superseded by
+// crate::upgrade's own TAG_OFFER/TAG_READY/TAG_ABORT protocol (which IS what
+// ct-agent drives in production). a2a_send/a2a_recv themselves are NOT part of
+// that dead cluster -- they're the general encrypt-send/recv-decrypt primitives
+// over an established session, and ct-agent's own test suite (p2p.rs, channel.rs)
+// imports and calls them directly, so they stay. Confirmed the tagged cluster's
+// unreachability via a repo-wide caller survey across both CADS-Tunnel and
+// ct-agent before removal; its only non-test callers were within itself. Public
+// API of a crate other repos depend on by tag, so this only takes effect for a
+// consumer that pins a tag containing this commit.
 
 /// **#104 direct-P2P — bring a freshly-connected direct link up as an A2A Noise_IK session.**
 /// Given the two halves of a just-dialed direct byte stream (quinn `SendStream`/`RecvStream`, or
@@ -567,64 +434,10 @@ mod tests {
     use super::*;
     use crate::noise::generate_static_keypair;
 
-    #[tokio::test]
-    async fn relay_to_direct_cutover_preserves_byte_exact_message_order() {
-        // #104-H2 (frozen): the sender streams application messages over the RELAY Noise_IK
-        // session, emits an in-line CUTOVER marker, then streams the rest over a freshly-
-        // established DIRECT Noise_IK session; the receiver drains the relay until the marker,
-        // then reads the direct session. The full monotonic sequence [0..6) arrives complete +
-        // in order — no byte lost or duplicated at the seam. Two independent sessions, each over
-        // its own duplex (relay + direct), model the two transports.
-        let a = generate_static_keypair(); // sender static
-        let b = generate_static_keypair(); // receiver static
-        let (a_priv, b_priv, b_pub) = (a.private, b.private, b.public);
-
-        // relay: sender writes ra_w → receiver reads ra_r; receiver writes rb_w → sender reads rb_r
-        let (mut ra_w, mut ra_r) = tokio::io::duplex(4096);
-        let (mut rb_w, mut rb_r) = tokio::io::duplex(4096);
-        // direct: same shape on separate streams
-        let (mut da_w, mut da_r) = tokio::io::duplex(4096);
-        let (mut db_w, mut db_r) = tokio::io::duplex(4096);
-
-        let recv_task = tokio::spawn(async move {
-            // Establish the relay session, drain its DATA until the cutover marker.
-            let (mut relay, _peer) = a2a_respond_with_peer_key(&mut rb_w, &mut ra_r, &b_priv).await.expect("relay respond");
-            let relay_msgs = a2a_drain_relay_until_cutover(&mut ra_r, &mut relay)
-                .await
-                .expect("drain relay to cutover");
-            // Establish the direct session, read the post-cutover DATA.
-            let (mut direct, _peer) = a2a_respond_with_peer_key(&mut db_w, &mut da_r, &b_priv).await.expect("direct respond");
-            let mut direct_msgs = Vec::new();
-            for _ in 0..3 {
-                let (tag, p) = a2a_recv_framed(&mut da_r, &mut direct).await.expect("direct recv");
-                assert_eq!(tag, A2A_TAG_DATA, "post-cutover frames are DATA");
-                direct_msgs.push(p);
-            }
-            (relay_msgs, direct_msgs)
-        });
-
-        // Sender: relay session first, three DATA frames, then the CUTOVER marker.
-        let mut relay = a2a_initiate(&mut ra_w, &mut rb_r, &a_priv, &b_pub).await.expect("relay initiate");
-        for i in 0u8..3 {
-            a2a_send_framed(&mut ra_w, &mut relay, A2A_TAG_DATA, &[i]).await.expect("relay send");
-        }
-        a2a_send_framed(&mut ra_w, &mut relay, A2A_TAG_CUTOVER, &[]).await.expect("cutover marker");
-        // Direct session, the remaining three DATA frames.
-        let mut direct = a2a_initiate(&mut da_w, &mut db_r, &a_priv, &b_pub).await.expect("direct initiate");
-        for i in 3u8..6 {
-            a2a_send_framed(&mut da_w, &mut direct, A2A_TAG_DATA, &[i]).await.expect("direct send");
-        }
-
-        let (relay_msgs, direct_msgs) = recv_task.await.expect("recv task");
-        let got: Vec<u8> = relay_msgs.iter().chain(direct_msgs.iter()).map(|m| m[0]).collect();
-        assert_eq!(
-            got,
-            vec![0, 1, 2, 3, 4, 5],
-            "byte-exact, in-order, no gap/dup across the relay→direct cutover seam"
-        );
-        assert_eq!(relay_msgs.len(), 3, "exactly the pre-cutover messages came over the relay");
-        assert_eq!(direct_msgs.len(), 3, "exactly the post-cutover messages came over the direct path");
-    }
+    // #476: relay_to_direct_cutover_preserves_byte_exact_message_order removed here --
+    // it exercised only the dead a2a_send_framed/a2a_recv_framed/a2a_drain_relay_until_cutover
+    // cluster removed above. crate::upgrade's own tests cover the cutover mechanism that's
+    // actually live.
 
     #[tokio::test]
     async fn two_agents_establish_a_session_and_exchange_data_both_ways() {
