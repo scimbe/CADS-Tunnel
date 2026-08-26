@@ -289,6 +289,18 @@ pub fn portal_router(oidc: Option<PortalOidc>, session_key: &[u8]) -> Router {
     portal_router_with(oidc, session_key, exchange, allowed_domains, require_verified_email)
 }
 
+/// ADR-0025 Decision 5 addendum: `CT_GATE_COOKIE_DOMAIN` widens `ct_portal_session` to a
+/// `Domain=`-scoped cookie shared across the zone, same env var and same reasoning as
+/// `gate_router`'s own `cookie_domain` (that router already requires this deployment to
+/// have it set for Browser-Plane channel gating, so admin-ui reuses it rather than adding
+/// a second knob for the same "share a session across every `*.<zone>` subdomain" need).
+/// `None` (unset) keeps the pre-existing host-only cookie -- byte-for-byte unchanged
+/// behavior for a deployment that hasn't opted in, matching every other "absent unless
+/// configured" switch in this codebase.
+pub(crate) fn configured_cookie_domain() -> Option<String> {
+    std::env::var("CT_GATE_COOKIE_DOMAIN").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Any non-empty value other than `"0"`/`"false"` (case-insensitive) counts as
 /// truthy — matches this project's other opt-in-flag env vars
 /// (`CT_EDGE_REQUIRE_HOST_AUTH` etc.).
@@ -689,7 +701,7 @@ async fn portal_callback(
                 .and_then(|v| sanitized_next(Some(v)))
                 .unwrap_or_else(|| "/portal/home".to_string());
             let mut resp = Redirect::to(&target).into_response();
-            set_cookie(&mut resp, &session_cookie(&token));
+            set_cookie(&mut resp, &session_cookie(&token, configured_cookie_domain().as_deref()));
             set_cookie(&mut resp, &cleared_state_cookie());
             set_cookie(&mut resp, &cleared_next_cookie());
             resp
@@ -726,7 +738,7 @@ async fn portal_logout(State(st): State<PortalState>) -> Response {
         Some(cfg) => Redirect::to(&cfg.end_session_redirect()).into_response(),
         None => Redirect::to("/portal").into_response(),
     };
-    set_cookie(&mut resp, &cleared_session_cookie());
+    set_cookie(&mut resp, &cleared_session_cookie(configured_cookie_domain().as_deref()));
     resp
 }
 
@@ -908,12 +920,28 @@ pub(crate) fn sign_session_with_email_for_test(key: &[u8], subject: &str, email:
 /// weaken anything: it's still HttpOnly + Secure + SameSite=Lax, and only `/me/*` topology
 /// handlers even look at it (every other `/me/*` router stays bearer-token-only).
 /// Set by the callback once a session is minted.
-fn session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax")
+/// ADR-0025 Decision 5 addendum: `domain` (from [`configured_cookie_domain`]) widens
+/// this to a `Domain=`-scoped cookie shared across the zone -- e.g. `admin.<zone>` can
+/// then read the session Portal's own login minted, closing the gap
+/// `admin_ui_page_authed`'s doc comment names (login reaches the right flow but doesn't
+/// leave behind a session the admin console can read back). `None` keeps the original
+/// host-only cookie, unchanged.
+fn session_cookie(token: &str, domain: Option<&str>) -> String {
+    match domain {
+        Some(d) => format!("{SESSION_COOKIE}={token}; Domain={d}; Path=/; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax"),
+        None => format!("{SESSION_COOKIE}={token}; Path=/; Max-Age={SESSION_TTL_SECS}; HttpOnly; Secure; SameSite=Lax"),
+    }
 }
 
-pub(crate) fn cleared_session_cookie() -> String {
-    format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+/// `domain` MUST match whatever [`session_cookie`] minted (same reasoning `gate.rs`'s own
+/// cleared-cookie pair documents) -- a clear whose `Domain=` doesn't match the original
+/// cookie's is a no-op from the browser's perspective, leaving a stale, still-valid
+/// session behind.
+pub(crate) fn cleared_session_cookie(domain: Option<&str>) -> String {
+    match domain {
+        Some(d) => format!("{SESSION_COOKIE}=; Domain={d}; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"),
+        None => format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax"),
+    }
 }
 
 /// #436: was `bytes.iter().map(|b| format!("{b:02x}")).collect()` -- one heap
@@ -2456,7 +2484,7 @@ mod tests {
 
     #[test]
     fn session_cookie_carries_the_hardening_flags() {
-        let c = session_cookie("tok123");
+        let c = session_cookie("tok123", None);
         assert!(c.starts_with("ct_portal_session=tok123;"));
         for flag in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
             assert!(c.contains(flag), "cookie sets {flag}");
@@ -2464,5 +2492,39 @@ mod tests {
         // #237-follow: Path=/ specifically (not just any Path=... substring match), so the
         // browser actually attaches this cookie to /me/topologies* requests too.
         assert!(c.contains("Path=/;"), "scoped to the whole site, not just /portal");
+        assert!(!c.contains("Domain="), "no Domain= when unconfigured -- stays host-only");
+    }
+
+    /// ADR-0025 Decision 5 addendum: with a configured domain, the cookie widens to
+    /// `Domain=`-scoped -- the actual fix that lets `admin.<zone>` read a session Portal's
+    /// own login minted on a different hostname.
+    #[test]
+    fn session_cookie_widens_to_domain_scoped_when_configured() {
+        let c = session_cookie("tok123", Some(".bunsenbrenner.org"));
+        assert!(c.contains("Domain=.bunsenbrenner.org;"), "widened to the configured zone: {c}");
+        for flag in ["HttpOnly", "Secure", "SameSite=Lax"] {
+            assert!(c.contains(flag), "widening must not drop hardening flags: {c}");
+        }
+    }
+
+    /// The clear MUST carry the same `Domain=` the mint used, or the browser treats it as a
+    /// different cookie and leaves the real, zone-wide session behind (see
+    /// `cleared_session_cookie`'s own doc comment).
+    #[test]
+    fn cleared_session_cookie_matches_domain_scoping_when_configured() {
+        let cleared = cleared_session_cookie(Some(".bunsenbrenner.org"));
+        assert!(cleared.contains("Domain=.bunsenbrenner.org;"), "clear must match the mint's Domain=: {cleared}");
+        assert!(cleared.contains("Max-Age=0"), "still an actual clear: {cleared}");
+        assert!(!cleared_session_cookie(None).contains("Domain="), "unconfigured clear stays host-only");
+    }
+
+    #[test]
+    fn configured_cookie_domain_trims_and_treats_empty_as_unset() {
+        std::env::set_var("CT_GATE_COOKIE_DOMAIN", " .bunsenbrenner.org ");
+        assert_eq!(configured_cookie_domain().as_deref(), Some(".bunsenbrenner.org"));
+        std::env::set_var("CT_GATE_COOKIE_DOMAIN", "");
+        assert_eq!(configured_cookie_domain(), None, "empty is not a valid domain");
+        std::env::remove_var("CT_GATE_COOKIE_DOMAIN");
+        assert_eq!(configured_cookie_domain(), None, "unset stays unset");
     }
 }

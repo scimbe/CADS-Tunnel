@@ -518,7 +518,7 @@ managed by Keycloak, not this page -- use <strong>Open Account Console</strong> 
 page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
 <a class="btn" href="/portal/logout">Sign out</a>"#;
     let mut resp = Html(page("account deleted", body, claims.email.as_deref())).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie()) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     resp
@@ -867,7 +867,7 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
 /// is still an open question this pass doesn't resolve).
 async fn admin_ui_logout() -> Response {
     let mut resp = Redirect::to("/portal").into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie()) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     resp
