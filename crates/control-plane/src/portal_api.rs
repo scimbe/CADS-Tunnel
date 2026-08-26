@@ -591,6 +591,18 @@ pub struct DomainAdminConfig {
     /// /admin-ui/certs`) -- each `None` renders as `NotConfigured`, never
     /// silently omitted from the response.
     pub front_door_certs: FrontDoorCertPaths,
+    /// This deployment's own root domain (`CT_CP_PLATFORM_ZONE`, e.g.
+    /// `bunsenbrenner.org`) -- deliberately separate from `managed_domains`
+    /// (the customer-onboarded-zone registry `POST /admin-ui/domains` writes
+    /// to). The platform's own zone was never "onboarded" through that flow
+    /// (it predates this admin console and isn't a customer tenant), so it's
+    /// absent from that table by design -- but an operator looking at
+    /// `/admin-ui/domains` reasonably expects to see the domain the whole
+    /// platform actually runs on somewhere on that page (operator feedback,
+    /// 2026-08-26: "why don't I see bunsenbrenner.org?"). `None` when unset
+    /// reproduces the exact pre-existing behavior (no platform row rendered,
+    /// just the explanatory caption) -- purely additive, opt-in config.
+    pub platform_zone: Option<String>,
 }
 
 /// Where + how to issue a subdomain cert under a managed zone
@@ -1545,7 +1557,7 @@ async fn admin_ui_list_domains(State(st): State<AdminUiState>, headers: HeaderMa
             Ok(v) => v,
             Err(e) => return internal_error("admin_ui_list_domains/html/tunnels", e).into_response(),
         };
-        return Html(admin_domains_page_html(&session, &zones, &disabled, &tunnels)).into_response();
+        return Html(admin_domains_page_html(&session, &zones, &disabled, &tunnels, st.domain_admin.platform_zone.as_deref())).into_response();
     }
     if let Err(resp) = admin_ui_authed(&st, &headers) {
         return resp;
@@ -1655,7 +1667,19 @@ fn admin_domains_page_html(
     zones: &[crate::storage::ManagedDomainRow],
     disabled: &[crate::storage::DisabledHostnameRow],
     tunnels: &[SubjectTunnel],
+    platform_zone: Option<&str>,
 ) -> String {
+    let platform_row = match platform_zone {
+        Some(z) => format!(
+            r#"<table class="data"><thead><tr><th>Zone</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>{z}</code></td><td><span class="badge ok">platform</span> this deployment's own root domain -- always active, not part of the onboarded-zone registry below</td></tr>
+</tbody></table>"#,
+            z = escape(z),
+        ),
+        None => String::from(
+            r#"<p class="help">No <code>CT_CP_PLATFORM_ZONE</code> configured for this deployment, so the platform's own root domain isn't shown here.</p>"#,
+        ),
+    };
     let mut zones_table = String::from(
         r#"<table class="data"><thead><tr><th>Zone</th><th>Status</th><th>Added by</th><th>Added</th><th>Add a hostname</th></tr></thead><tbody>"#,
     );
@@ -1717,12 +1741,22 @@ fn admin_domains_page_html(
     }
     host_table.push_str("</tbody></table>");
 
+    let mut known_zones: Vec<&str> = zones.iter().map(|z| z.zone.as_str()).collect();
+    if let Some(z) = platform_zone {
+        known_zones.push(z);
+    }
+    let known_zones_json = serde_json::to_string(&known_zones).unwrap_or_else(|_| "[]".to_string());
+
     let body = format!(
         r#"<h1>Domains</h1>
-<p class="help">Zones onboarded beyond bunsenbrenner.org, and every hostname's
-enable/disable state (ADR-0025 Decision 4). DNS delegation to deSEC at the domain's
-registrar is a manual one-time step performed BEFORE onboarding here -- this form only
-issues the apex/wildcard A records and (per-hostname) certs, it never touches a registrar.</p>
+<p class="help">Every zone this platform serves. The <strong>Platform</strong> row below is this
+deployment's own root domain -- it predates this console and was never "onboarded" through the
+form beneath Managed zones, which is only for zones added AFTER this console existed. DNS
+delegation to deSEC at a new zone's registrar is a manual one-time step performed BEFORE
+onboarding here -- that form only issues the apex/wildcard A records and (per-hostname) certs, it
+never touches a registrar.</p>
+<h2>Platform</h2>
+{platform_row}
 <h2>Managed zones</h2>
 {zones_table}
 <form id="registerForm" onsubmit="return registerDomain(event)">
@@ -1730,9 +1764,57 @@ issues the apex/wildcard A records and (per-hostname) certs, it never touches a 
  <button type="submit">Onboard domain</button>
 </form>
 <p class="msg" id="registerMsg"></p>
+<h2>Traffic by domain</h2>
+<p class="help">Relay-plane bytes from <a href="/admin-ui/traffic">Traffic monitor</a>, summed per
+zone by matching each tunnel's hostname against the zones above (exact apex match or a
+<code>*.zone</code> subdomain). Same "relay bytes are real, direct P2P is availability-only"
+caveat as the Traffic monitor page applies here too.</p>
+<div id="domainTrafficTable" class="help">Loading…</div>
 <h2>Hostnames</h2>
 {host_table}
 <script>
+var CT_KNOWN_ZONES = {known_zones_json};
+(function(){{
+ function esc(s){{ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }}
+ function zoneFor(hostname){{
+  if(!hostname) return null;
+  var best = null;
+  CT_KNOWN_ZONES.forEach(function(z){{
+   if(hostname === z || hostname.slice(-(z.length + 1)) === '.' + z){{
+    if(!best || z.length > best.length) best = z;
+   }}
+  }});
+  return best;
+ }}
+ fetch('/admin-ui/traffic').then(function(r){{ return r.ok ? r.json() : Promise.reject(r.status); }})
+  .then(function(rows){{
+   var byZone = {{}}, other = {{bytes_received: 0, bytes_sent: 0, tunnels: 0}};
+   rows.forEach(function(t){{
+    var z = zoneFor(t.hostname);
+    var bucket = z ? (byZone[z] || (byZone[z] = {{bytes_received: 0, bytes_sent: 0, tunnels: 0}})) : other;
+    bucket.bytes_received += t.bytes_received || 0;
+    bucket.bytes_sent += t.bytes_sent || 0;
+    bucket.tunnels += 1;
+   }});
+   var zoneNames = Object.keys(byZone);
+   if(!zoneNames.length && !other.tunnels){{
+    document.getElementById('domainTrafficTable').innerHTML = '<p class="help">No tunnels registered yet.</p>';
+    return;
+   }}
+   var html = '<table class="data"><thead><tr><th>Zone</th><th>Tunnels</th><th>Relay bytes in</th><th>Relay bytes out</th></tr></thead><tbody>';
+   zoneNames.sort().forEach(function(z){{
+    var b = byZone[z];
+    html += '<tr><td><code>' + esc(z) + '</code></td><td>' + b.tunnels + '</td><td>' + b.bytes_received.toLocaleString() + '</td><td>' + b.bytes_sent.toLocaleString() + '</td></tr>';
+   }});
+   if(other.tunnels){{
+    html += '<tr><td><span class="help">(unmatched hostname)</span></td><td>' + other.tunnels + '</td><td>' + other.bytes_received.toLocaleString() + '</td><td>' + other.bytes_sent.toLocaleString() + '</td></tr>';
+   }}
+   html += '</tbody></table>';
+   document.getElementById('domainTrafficTable').innerHTML = html;
+   window.ctSortableInit(document.getElementById('domainTrafficTable'));
+  }})
+  .catch(function(s){{ document.getElementById('domainTrafficTable').innerHTML = '<p class="msg err">could not load traffic (' + s + ')</p>'; }});
+}})();
 function registerDomain(ev){{
  ev.preventDefault();
  var form = ev.target, msg = document.getElementById('registerMsg');
@@ -7156,6 +7238,49 @@ mod tests {
         let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(managed_domains.zone("example.org").unwrap().is_none());
+    }
+
+    /// Operator feedback (2026-08-26): "why don't I see bunsenbrenner.org in
+    /// Domains?" -- the platform's own root domain was never `POST
+    /// /admin-ui/domains`-onboarded, so it never appeared in `managed_domains`.
+    /// With `CT_CP_PLATFORM_ZONE` configured, the Domains page must show it in
+    /// its own "Platform" row, distinct from the onboarded-zone table.
+    #[tokio::test]
+    async fn admin_ui_domains_page_shows_the_platform_zone_row_when_configured() {
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { platform_zone: Some("bunsenbrenner.org".to_string()), ..Default::default() },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let resp = admin_ui_html_get(&app, "/admin-ui/domains", Some(&super_session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("bunsenbrenner.org"), "platform zone must be rendered: {html}");
+        assert!(html.contains("platform"), "platform zone must be labeled as such, not just listed: {html}");
+    }
+
+    /// Without `CT_CP_PLATFORM_ZONE` set (the pre-existing default), the Domains
+    /// page must say so explicitly rather than silently rendering nothing where
+    /// the platform row would go -- an operator staring at an empty section with
+    /// no explanation is exactly the confusion this whole feature responds to.
+    #[tokio::test]
+    async fn admin_ui_domains_page_explains_the_platform_zone_gap_when_unconfigured() {
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let resp = admin_ui_html_get(&app, "/admin-ui/domains", Some(&super_session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains("CT_CP_PLATFORM_ZONE"),
+            "an unconfigured platform zone must be explained, not just absent: {html}"
+        );
     }
 
     /// `POST /admin-ui/domains/:zone/hostnames` against a zone that was never
