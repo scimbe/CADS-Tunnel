@@ -3723,7 +3723,7 @@ fn login_gate_html(id: &str, require_login: bool, allow_any_login: bool, login_a
         // owner reads the mode before the list it overrides.
         let any_checked = if allow_any_login { " checked" } else { "" };
         let any_note = if allow_any_login {
-            r#"<p class="k">Any signed-in account may enter -- the access list below is ignored while this is on.</p>"#
+            r#"<p class="help">Any signed-in account may enter -- the access list below is ignored while this is on.</p>"#
         } else {
             ""
         };
@@ -3743,7 +3743,7 @@ fn login_gate_html(id: &str, require_login: bool, allow_any_login: bool, login_a
             })
             .collect::<String>();
         let empty_note = if login_allowlist.is_empty() {
-            r#"<p class="k">No one is allowed in yet -- add an email below.</p>"#
+            r#"<p class="help">No one is allowed in yet -- add an email below.</p>"#
         } else {
             ""
         };
@@ -3775,7 +3775,7 @@ fn login_gate_html(id: &str, require_login: bool, allow_any_login: bool, login_a
                     )
                 })
                 .collect::<String>();
-            format!(r#"<div class="row"><p class="k">Pending access requests:</p><ul class="login-allowlist">{items}</ul></div>"#)
+            format!(r#"<div class="row"><p class="help">Pending access requests:</p><ul class="login-allowlist">{items}</ul></div>"#)
         };
         format!(
             r#"<div class="row">{allow_any_form}<ul class="login-allowlist">{items}</ul>{empty_note}
@@ -3881,8 +3881,16 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
             } else {
                 String::new()
             };
+            // data-search: lowercased name+hostname, read by the search box's JS
+            // filter below -- client-side (an account's own tunnel count is small,
+            // no round trip needed) and independent of what's actually displayed
+            // (escape() already HTML-escapes it, so this is safe as an attribute
+            // value even though it's built from user-supplied tunnel names).
+            let search_key = escape(
+                &format!("{} {}", t.name, t.hostname.as_deref().unwrap_or_default()).to_lowercase(),
+            );
             format!(
-                r#"<div class="tunnel-card">
+                r#"<div class="tunnel-card" data-search="{search_key}">
 <div class="row"><span class="v">{name}{host}{status_badge}</span></div>
 {owner_actions}{bytes_line}{tier}{login_gate}
 </div>"#,
@@ -3925,18 +3933,33 @@ may become available for your account &mdash; contact the operator if you need a
     };
     // ADR-0025 layout pass: a quota summary bar above the grid pulls the
     // owned/max numbers (previously buried in the "Create another tunnel"
-    // paragraph further down) up to where they're immediately visible, and
-    // .tunnel-grid lays tunnels out side by side instead of one long column
-    // -- the concrete "portal/tunnels needs this too" ask (2026-08-26).
+    // paragraph further down) up to where they're immediately visible. The
+    // tunnel-grid pass (2026-08-26) also tried a two-up card layout; reverted
+    // same day on live feedback -- tunnel cards vary a lot in height depending
+    // on their own state (login gate expanded, allow-list size), so side by
+    // side just looked broken, not deliberate. Still single-column, just wider.
     let quota_pct = owned_count.checked_mul(100).and_then(|n| n.checked_div(max_tunnels)).map(|p| p.min(100)).unwrap_or(100);
     let quota_bar = format!(
         r#"<div class="quota-bar"><span class="q-l">Using <strong>{owned_count}</strong> of <strong>{max_tunnels}</strong> tunnel{plural} included in your plan</span>
 <div class="quota-track"><div class="quota-fill" style="width:{quota_pct}%"></div></div></div>"#,
         plural = if max_tunnels == 1 { "" } else { "s" },
     );
+    // Search box (2026-08-26 live ask): only worth showing once there's more
+    // than a couple tunnels to search through. Client-side filter over the
+    // data-search attribute already on each .tunnel-card -- an account's own
+    // tunnel count is always small (quota-bounded), so no server round trip.
+    let search_box = if tunnels.len() > 2 {
+        r#"<div class="search" style="margin-bottom:1rem;max-width:320px">
+ <input type="text" id="tunnelSearch" placeholder="Search tunnels..." autocomplete="off"
+  oninput="document.querySelectorAll('.tunnel-card').forEach(function(c){var q=this.value.trim().toLowerCase();c.style.display=(!q||(c.getAttribute('data-search')||'').indexOf(q)!==-1)?'':'none';}.bind(this))">
+</div>"#
+    } else {
+        ""
+    };
     let body = format!(
         r#"<h1>Your tunnels</h1>
 {quota_bar}
+{search_box}
 <div class="tunnel-grid">
 {rows}
 </div>
@@ -4035,7 +4058,12 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  /* Additive only -- does not touch the existing .tunnel-card rule below (kept
     exactly as-is: no max-height/overflow-y on the resting card, see the
     only_the_access_list_scrolls_internally_not_the_whole_tunnel_card test). */
- .tunnel-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1rem;align-items:start}}
+ /* Single column, not a multi-up grid (tried and reverted, live operator feedback
+    2026-08-26): a tunnel's card height varies a lot with its own state (require-
+    login expanded, allow-list size, pending requests) -- placed side by side, two
+    very different heights just look broken rather than like a deliberate layout.
+    Still gets real benefit from the wider .card (860px, was 640px) below. */
+ .tunnel-grid{{display:flex;flex-direction:column;gap:1rem}}
  .quota-bar{{background:#131820;border:1px solid var(--border);border-radius:12px;padding:.9rem 1.2rem;
       display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:1.4rem}}
  .quota-bar .q-l{{font-size:.85rem;color:var(--muted)}}
@@ -4056,7 +4084,13 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  .row:nth-child(1){{animation-delay:0ms}} .row:nth-child(2){{animation-delay:30ms}}
  .row:nth-child(3){{animation-delay:60ms}} .row:nth-child(4){{animation-delay:90ms}}
  .row:nth-child(n+5){{animation-delay:120ms}}
- .k{{color:var(--muted);flex-shrink:0}} .v{{word-break:break-all;min-width:0}}
+ .k{{color:var(--muted);flex-shrink:0}} .v{{overflow-wrap:break-word;min-width:0}}
+ /* Aggressive mid-word breaking belongs only to genuinely unbreakable content
+    (a long token/hex id, no natural break points) -- applying it to the whole
+    .v span broke readable prose (a tunnel's name, hostname, and live-status
+    label, all packed into one .v span) mid-word once the card had less spare
+    width than the old page ever gave it. Live-reported 2026-08-26. */
+ .v code{{word-break:break-all}}
  nav a{{color:var(--accent2);text-decoration:none;margin-right:1rem;font-size:.9rem;transition:color .15s ease}}
  nav a:hover{{color:var(--accent2-hover)}} nav{{margin-bottom:1.2rem}}
  nav .signed-in-as{{color:var(--muted);margin-right:1rem;font-size:.9rem}}
