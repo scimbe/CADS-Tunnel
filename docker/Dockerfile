@@ -120,8 +120,20 @@ COPY --from=builder /build/bin/masque-proxy /usr/local/bin/masque-proxy
 # tracks it as a distinct, explicitly-scoped follow-up).
 FROM runtime-base AS production
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl tini \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini bash openssl \
     && rm -rf /var/lib/apt/lists/*
+# ADR-0025 Decision 4 (multi-domain onboarding, `crates/control-plane/src/
+# cert_issuer.rs`): `POST /admin-ui/domains/:zone/hostnames` shells out to this
+# SAME script (bash + openssl are installed above for exactly this -- acme.sh's
+# own installer/issuance both need them). `bash`, not just `sh`, because
+# `lib-acme.sh` uses bash-array syntax (`local server_flag=(...)`) internally.
+COPY scripts/lib-acme.sh /app/scripts/lib-acme.sh
+# `CT_CP_ACME_HOME` (default `/data/acme`, `service.rs`) must be writable by
+# this image's non-root uid 65532 for acme.sh to install itself + keep its
+# account state there -- `/data` is already the control-plane's own named
+# volume (see compose.selfhost.yml's `cpdata:/data`), so this directory
+# persists across restarts the same way the rest of its durable state does.
+RUN mkdir -p /data/acme && chown 65532:65532 /data/acme
 USER 65532:65532
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/bin/tini", "--"]

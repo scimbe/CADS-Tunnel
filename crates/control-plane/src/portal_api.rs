@@ -5,12 +5,13 @@
 //! server-rendered, self-contained, CSP-safe HTML, and every subject only ever
 //! sees or changes their own data.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Form, Path, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::accounts::AccountId;
 use crate::edge_mesh::EdgeMeshHandle;
 use crate::portal::{escape, session_claims_for, session_subject_for};
-use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore};
+use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore, SubjectTunnel};
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
@@ -517,11 +518,2061 @@ managed by Keycloak, not this page -- use <strong>Open Account Console</strong> 
 page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
 <a class="btn" href="/portal/logout">Sign out</a>"#;
     let mut resp = Html(page("account deleted", body, claims.email.as_deref())).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie()) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     resp
 }
+
+// ===== ADR-0025: `/admin-ui/*` -- admin-identity-gated account/user operations =====
+//
+// Every route below requires a verified admin session (`admin_ui_authed`, wrapping
+// `admin_identity::admin_session_from_headers`), NOT the shared `x-ct-admin-token`
+// the pre-existing `/admin/*` routes above use -- that token stays for edge-to-edge
+// internal calls (ADR-0025 task framing), this surface is what a real admin-console
+// UI session drives. Every successful mutation is recorded via `audit`
+// (`crate::audit_log::SqliteAuditLog`) -- ADR-0025 Decision 6's "operator must be
+// able to see everything" convention applied to the admin surface itself.
+
+/// Shared state for the `/admin-ui/*` routes. Kept as its own router/state
+/// (mirrors [`AccountDeleteState`]'s own reasoning) rather than widening `ApiState`:
+/// `ApiState` is built once in `portal_api_router` and exercised by many pre-existing
+/// tests that construct it directly with a fixed field set, and the admin-identity/
+/// audit-log values this needs don't exist at that call site's callers before
+/// ADR-0025.
+#[derive(Clone)]
+struct AdminUiState {
+    session_key: Arc<[u8]>,
+    admin: Arc<crate::admin_identity::AdminIdentity>,
+    audit: Arc<crate::audit_log::SqliteAuditLog>,
+    ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+    networks: Arc<crate::storage::SqliteNetworkStore>,
+    pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    /// ADR-0025 Decision 4: the onboarded-zone registry.
+    managed_domains: Arc<crate::storage::SqliteManagedDomains>,
+    /// ADR-0025 Decision 4/6: everything else the domain/hostname routes need.
+    domain_admin: DomainAdminConfig,
+    /// ADR-0025 Decision 6: everything the read-only observability routes
+    /// (`/admin-ui/traffic`, `/admin-ui/tunnels`, `/admin-ui/health`) need.
+    observability: ObservabilityConfig,
+}
+
+/// ADR-0025 Decision 4/6: config for the domain/hostname admin routes, bundled
+/// into one struct (rather than five more positional params on
+/// [`admin_ui_router`]) so a future field addition doesn't ripple through
+/// every call site's positional argument list.
+#[derive(Clone, Default)]
+pub struct DomainAdminConfig {
+    /// Edge admin API base + shared token (`CT_CP_EDGE_ADMIN_URL`/`_TOKEN`) --
+    /// same config [`portal_api_router`]'s own `edge_admin` param takes,
+    /// reused here for the hostname-disable route's revoke call.
+    pub edge_admin: Option<(String, String)>,
+    /// The public IP a newly onboarded zone's A records should point at
+    /// (`CT_CP_DNS_EDGE_IP`) -- same value `portal_api_router`'s own DNS
+    /// autopilot uses for auto-assigned Standard-tier hostnames.
+    pub dns_edge_ip: Option<String>,
+    /// The deSEC API token (`DESEC_TOKEN`). Kept as a raw value here (not a
+    /// pre-built `DesecClient`) because [`DesecClient`] is bound to exactly
+    /// ONE zone at construction (`DESEC_DOMAIN`) -- onboarding a NEW zone
+    /// needs a fresh, differently-zoned client per call
+    /// ([`desec_client_for_zone`]), built from this token.
+    pub desec_token: Option<String>,
+    /// `DESEC_API_BASE`, if the operator overrode the default.
+    pub desec_api_base: Option<String>,
+    /// Subdomain cert issuance config (`POST /admin-ui/domains/:zone/hostnames`)
+    /// -- `None` when `CT_CP_LIB_ACME_PATH` isn't configured, in which case
+    /// that route `503`s with a clear reason instead of trying and failing
+    /// opaquely partway through a subprocess call.
+    pub managed_cert: Option<ManagedCertConfig>,
+    /// Front-door cert file paths for the expiry dashboard (`GET
+    /// /admin-ui/certs`) -- each `None` renders as `NotConfigured`, never
+    /// silently omitted from the response.
+    pub front_door_certs: FrontDoorCertPaths,
+}
+
+/// Where + how to issue a subdomain cert under a managed zone
+/// ([`crate::cert_issuer::issue_cert`]'s config, plus the base directory
+/// individual hostnames' cert dirs nest under).
+#[derive(Clone)]
+pub struct ManagedCertConfig {
+    pub acme: crate::cert_issuer::AcmeConfig,
+    pub cert_base_dir: String,
+}
+
+/// Configured front-door cert file paths this control-plane process can read
+/// directly off its own filesystem (mirrors `CT_CP_EDGE_CERT_PATH`'s existing
+/// shared-volume-with-the-edge convention, `service.rs`) -- `GET
+/// /admin-ui/certs`'s fixed four slots, before any per-managed-domain certs.
+#[derive(Clone, Default)]
+pub struct FrontDoorCertPaths {
+    pub portal: Option<String>,
+    pub auth: Option<String>,
+    pub masque: Option<String>,
+    pub admin_ui: Option<String>,
+}
+
+/// ADR-0025 Decision 6: config for the read-only observability routes
+/// (`/admin-ui/traffic`, `/admin-ui/tunnels`, `/admin-ui/health`), bundled the
+/// same way as [`DomainAdminConfig`] and for the same reason -- a future field
+/// addition doesn't ripple through [`admin_ui_router`]'s already-long
+/// positional argument list.
+#[derive(Clone, Default)]
+pub struct ObservabilityConfig {
+    /// Which edge currently owns a token (ADR-0021's multi-edge ownership
+    /// registry) -- `/admin-ui/tunnels`' `edge_id` column. `None` when this
+    /// deployment never wires one up (a router built with `Default`, e.g. in
+    /// tests that don't exercise this column).
+    pub edge_mesh: Option<EdgeMeshHandle>,
+    /// The edge's `/metrics` URL -- the SAME value `status_router`'s
+    /// `CT_CP_EDGE_METRICS_URL` already reads (`service.rs`). `/admin-ui/health`
+    /// derives the co-located `/healthz` URL from it (both live on the edge's
+    /// `metrics_router`, `crates/edge/src/observe.rs`, on the same listener).
+    pub edge_metrics_url: Option<String>,
+}
+
+/// Resolve + require an admin session for an `/admin-ui/*` handler — the one gate
+/// every route below calls first (mirrors `admin_authed`'s role for the legacy
+/// `/admin/*` shared-token routes, and `account_for_session`'s role for the
+/// self-service `/portal/*` routes). `401`/`403` per `admin_session_from_headers`'s
+/// own contract (no session / not verified vs. verified-but-not-an-admin).
+fn admin_ui_authed(
+    st: &AdminUiState,
+    headers: &HeaderMap,
+) -> Result<crate::admin_identity::AdminSession, Response> {
+    crate::admin_identity::admin_session_from_headers(&st.session_key, &st.admin, headers)
+}
+
+// ===== ADR-0025 integration pass: server-rendered `/admin-ui/*` HTML pages =====
+//
+// Everything below renders what the JSON handlers above already compute/store --
+// no new business logic, only view code, per this pass's own scope. Every page
+// handler gates on [`admin_ui_page_authed`] (never the bare [`admin_ui_authed`]
+// used by the JSON routes), so a logged-out or non-admin visitor always gets a
+// clean redirect or a real rendered 403, never a bodyless status code.
+
+/// Whether the caller is a top-level browser navigation expecting an HTML page, as
+/// opposed to this same console's own `fetch()` calls (default `Accept: */*`, never
+/// `text/html`) or a JSON API test/tool. Lets the four routes earlier ADR-0025
+/// phases already shipped as JSON (`/admin-ui/traffic`, `/admin-ui/admins`,
+/// `/admin-ui/domains`, `/admin-ui/certs`) serve BOTH their already-tested JSON
+/// contract (default, preserved byte-for-byte -- see each handler's own early
+/// `wants_html` branch) AND this pass's HTML page at the exact same path ADR-0025's
+/// own task framing names, without renaming or duplicating either.
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/html"))
+        .unwrap_or(false)
+}
+
+/// The same admin-session gate as [`admin_ui_authed`], but for a browser-navigated
+/// HTML page instead of a JSON API call: a page must never answer with a bare,
+/// bodyless `401`/`403` -- no session at all becomes a redirect to the existing
+/// Keycloak login entry point (`/portal/login`, the SAME Authorization Code flow
+/// every other login on this deployment already uses -- nothing new invented here);
+/// a verified-but-not-an-admin session becomes a real, rendered `403` page.
+///
+/// **Known limitation (ADR-0025 Decision 5 addendum, deliberately left open by
+/// this integration pass):** `/portal/login` mints `ct_portal_session` host-only on
+/// Portal's own hostname; Decision 5 serves the admin console from a DIFFERENT
+/// hostname (`CT_EDGE_ADMIN_UI_HOST`). Per RFC 6265 a host-only cookie is never sent
+/// to a different host, so today this redirect reaches the correct login FLOW but
+/// does not yet leave behind a session `admin_session_from_headers` can read back on
+/// THIS host -- an admin who completes it lands back at the Portal, not the console.
+/// The addendum names two real fixes (widen `ct_portal_session` to a `Domain=`-scoped
+/// cookie shared across the zone, mirroring `gate.rs`'s `CT_GATE_COOKIE_DOMAIN`; or
+/// give admin-ui its own dedicated OIDC login + session, fully mirroring `gate.rs`'s
+/// shape) and explicitly asks that the choice be weighed, not defaulted -- this
+/// integration pass renders/wires what the previous four phases already built and
+/// does not invent either fix. Every route gated by this function is fully correct
+/// and independently testable regardless of which fix lands; only the end-to-end
+/// "click login, land back on admin.<zone> signed in" path is blocked until then.
+fn admin_ui_page_authed(
+    st: &AdminUiState,
+    headers: &HeaderMap,
+) -> Result<crate::admin_identity::AdminSession, Response> {
+    admin_ui_authed(st, headers).map_err(|resp| {
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            Redirect::to("/portal/login").into_response()
+        } else {
+            admin_forbidden_page()
+        }
+    })
+}
+
+/// A real, rendered `403` for a verified session whose email just isn't in the
+/// `admins` table -- distinct from [`admin_ui_page_authed`]'s `401` case (no
+/// session at all, which redirects instead): this visitor IS logged in, just not
+/// an admin, so the honest answer is "wrong account", not a login prompt that
+/// would just loop them back here.
+fn admin_forbidden_page() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html(
+            r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADS-Tunnel Admin — access denied</title>
+<style>
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:#0e1116;color:#e6edf3;
+      display:flex;min-height:100vh;align-items:center;justify-content:center;padding:1rem}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:2rem;max-width:440px;text-align:center}
+ h1{font-size:1.3rem;margin:0 0 .6rem}
+ p{color:#8b949e;font-size:.92rem;line-height:1.6}
+ a{color:#5fb8ab}
+</style></head><body>
+<div class="card">
+<h1>Access denied</h1>
+<p>You're signed in, but this account isn't registered as a CADS-Tunnel admin.
+Ask the super-admin to add your e-mail, or <a href="/portal">go back to the portal</a>.</p>
+</div></body></html>"#
+                .to_string(),
+        ),
+    )
+        .into_response()
+}
+
+/// Shared page chrome for every `/admin-ui/*` HTML page -- deliberately its own
+/// shell, not [`page`] (Portal's own nav points at `/portal/*`, a different surface
+/// with different login and owner-scoped data; reusing it here would put customer
+/// navigation on an admin page and vice versa). Same brand tokens/animations as
+/// [`page`] (docs/design/tokens.md) so the console reads as part of one product.
+fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: &str) -> String {
+    let role_badge = if session.is_super_admin {
+        r#" <span class="badge super">super-admin</span>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CADS-Tunnel Admin — {title}</title>
+<style>
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+       --accent:#d98a4f;--accent-hover:#e39a63;--accent-ink:#20130a;
+       --accent2:#5fb8ab;--accent2-hover:#7cc9bd;
+       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
+      display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:2.5rem 1rem}}
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:1000px;width:100%;
+      animation:cardIn .32s ease-out}}
+ @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
+ @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
+ h1,h2{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
+ h1{{font-size:1.55rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.05rem;color:var(--muted);margin:1.5rem 0 .6rem}}
+ nav{{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem;margin-bottom:1.2rem;border-bottom:1px solid var(--border);padding-bottom:.9rem}}
+ nav a{{color:var(--accent2);text-decoration:none;font-size:.88rem;font-weight:600;transition:color .15s ease}}
+ nav a:hover{{color:var(--accent2-hover)}}
+ nav .spacer{{flex:1 1 auto}}
+ nav .signed-in-as{{color:var(--muted);font-size:.84rem}}
+ nav .signed-in-as strong{{color:var(--text);font-weight:600}}
+ .badge{{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.68rem;font-weight:700;vertical-align:middle}}
+ .badge.super{{background:#2d1a00;color:#f0c674;border:1px solid #7d4e00}}
+ .badge.blocked{{background:#3d1418;color:#ff9a9a;border:1px solid #6e2530}}
+ .badge.ok{{background:#0d2818;color:#3fb950;border:1px solid #1f5c33}}
+ .badge.warn{{background:#3d2e00;color:#f0c674;border:1px solid #7d4e00}}
+ a.btn,button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;padding:.5rem 1rem;
+      font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;
+      transition:background .15s ease,transform .08s ease}}
+ a.btn:hover,button:hover{{background:var(--accent-hover)}} a.btn:active,button:active{{transform:scale(.96)}}
+ a.btn.sec,button.sec{{background:#21262d;border:1px solid var(--border);color:var(--text);font-weight:500}}
+ a.btn.sec:hover,button.sec:hover{{background:#30363d}}
+ a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
+ a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
+ button:disabled{{opacity:.4;cursor:not-allowed}}
+ table.data{{width:100%;border-collapse:collapse;margin:.4rem 0 1rem;font-size:.86rem}}
+ table.data th,table.data td{{padding:.5rem .6rem;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}}
+ table.data th{{color:var(--muted);font-weight:600;font-size:.74rem;text-transform:uppercase;letter-spacing:.04em}}
+ table.data tr:hover td{{background:#1c222b}}
+ table.data code{{font-size:.82rem}}
+ .status-dot{{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:.4rem;vertical-align:middle}}
+ .status-dot.live{{background:var(--accent2);animation:pulse 1.6s ease-in-out infinite}}
+ .status-dot.off{{background:var(--muted)}}
+ .tier-rot{{color:#f85149}} .tier-gelb{{color:#f0c674}} .tier-gruen{{color:#3fb950}} .tier-muted{{color:var(--muted)}}
+ input,select{{background:#0d1117;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:.5rem;font:inherit}}
+ input:focus,select:focus{{outline:none;border-color:var(--accent2)}}
+ code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.15rem .4rem}}
+ form.inline{{display:inline;margin:0}}
+ label{{display:block;margin:.7rem 0;font-size:.88rem}}
+ .help{{color:var(--muted);font-size:.82rem}}
+ p.help{{margin:.2rem 0 1rem}}
+ .msg{{font-size:.84rem;margin:.3rem 0;min-height:1.2em}}
+ .msg.err{{color:#ff9a9a}} .msg.ok{{color:#3fb950}}
+ .section{{margin-bottom:2rem}}
+ .kv{{display:flex;flex-wrap:wrap;gap:1.5rem;margin:.6rem 0 1rem}}
+ .kv .stat{{min-width:120px}} .kv .stat .n{{font-family:var(--serif);font-size:1.5rem;display:block}}
+ .kv .stat .l{{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}}
+ @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
+</style></head><body>
+<div class="card">
+<nav>
+ <a href="/admin-ui/">Dashboard</a>
+ <a href="/admin-ui/traffic">Traffic</a>
+ <a href="/admin-ui/accounts">Accounts</a>
+ <a href="/admin-ui/domains">Domains</a>
+ <a href="/admin-ui/admins">Admins</a>
+ <a href="/admin-ui/certs">Certs</a>
+ <a href="/admin-ui/audit">Audit</a>
+ <span class="spacer"></span>
+ <span class="signed-in-as">Signed in as <strong>{email}</strong>{role_badge}</span>
+ <a href="/admin-ui/logout">Sign out</a>
+</nav>
+{body}
+</div>
+<script>
+ // Render every [data-ts] element's unix-seconds content as a local date/time --
+ // avoids a chrono/humantime dependency for what is purely a display concern.
+ document.querySelectorAll('[data-ts]').forEach(function(el){{
+  var secs = parseInt(el.getAttribute('data-ts'), 10);
+  if(!isNaN(secs) && secs > 0){{ el.textContent = new Date(secs*1000).toLocaleString(); }}
+ }});
+ // Every admin action is a JSON API call (Json<...> extractors, not Form<...>) --
+ // this is the one shared fetch wrapper every page's own inline script below uses.
+ function adminApi(method, url, body){{
+  var opts = {{method: method}};
+  if(body !== undefined){{ opts.headers = {{'Content-Type':'application/json'}}; opts.body = JSON.stringify(body); }}
+  return fetch(url, opts).then(function(r){{
+   if(r.ok) return r;
+   return r.text().then(function(t){{ throw new Error(t || ('HTTP '+r.status)); }});
+  }});
+ }}
+ document.addEventListener('submit', function(ev){{
+  var form = ev.target;
+  if(form.classList && form.classList.contains('confirm-danger')){{
+   var msg = form.getAttribute('data-confirm') || 'Are you sure?';
+   if(!window.confirm(msg)){{ ev.preventDefault(); }}
+  }}
+ }});
+</script>
+</body></html>"#,
+        title = escape(title),
+        email = escape(&session.email),
+        role_badge = role_badge,
+        body = body,
+    )
+}
+
+/// `GET /admin-ui/logout`: clears the admin session cookie (same name/HMAC key as
+/// Portal's `ct_portal_session` -- [`crate::admin_identity::admin_session_from_headers`]
+/// reads it via [`crate::portal::session_claims_for`]) and returns to the public
+/// portal shell. Deliberately local (not `PortalOidc::end_session_redirect`, unlike
+/// `portal::portal_logout`): this route has no `PortalOidc` config in scope, and
+/// clearing this host's own cookie is the only thing an admin-console sign-out needs
+/// to do (see [`admin_ui_page_authed`]'s doc for why the underlying session's origin
+/// is still an open question this pass doesn't resolve).
+async fn admin_ui_logout() -> Response {
+    let mut resp = Redirect::to("/portal").into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    resp
+}
+
+// ===== end ADR-0025 integration pass shared page chrome =====
+
+/// Build the `/admin-ui/*` router (ADR-0025): account credit/block/unblock/delete,
+/// an admin-identity-gated mirror of the legacy max-tunnels unlock, and
+/// admin-management (list/add/remove).
+pub fn admin_ui_router(
+    session_key: &[u8],
+    admin: Arc<crate::admin_identity::AdminIdentity>,
+    audit: Arc<crate::audit_log::SqliteAuditLog>,
+    ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
+    channels: Arc<crate::storage::SqliteChannelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+    networks: Arc<crate::storage::SqliteNetworkStore>,
+    pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    managed_domains: Arc<crate::storage::SqliteManagedDomains>,
+    domain_admin: DomainAdminConfig,
+    observability: ObservabilityConfig,
+) -> Router {
+    Router::new()
+        .route("/admin-ui/accounts/:subject/credit", post(admin_ui_credit_account))
+        .route("/admin-ui/accounts/:subject/block", post(admin_ui_block_account))
+        .route("/admin-ui/accounts/:subject/unblock", post(admin_ui_unblock_account))
+        .route("/admin-ui/accounts/:subject/delete", post(admin_ui_delete_account))
+        .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
+        .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
+        .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
+        // ADR-0025 Decision 4/6: hostname disable/enable + multi-domain onboarding
+        // + cert-expiry dashboard. See each handler's own doc for its exact contract.
+        .route("/admin-ui/hostnames/:host/disable", post(admin_ui_disable_hostname))
+        .route("/admin-ui/hostnames/:host/enable", post(admin_ui_enable_hostname))
+        .route("/admin-ui/hostnames/disabled", get(admin_ui_list_disabled_hostnames))
+        .route("/admin-ui/domains", get(admin_ui_list_domains).post(admin_ui_register_domain))
+        .route("/admin-ui/domains/:zone/hostnames", post(admin_ui_add_domain_hostname))
+        .route("/admin-ui/certs", get(admin_ui_certs))
+        // ADR-0025 Decision 6: read-only traffic/topology/health observability --
+        // no mutation, no audit_log call (see each handler's own doc).
+        .route("/admin-ui/traffic", get(admin_ui_traffic))
+        .route("/admin-ui/tunnels", get(admin_ui_tunnels))
+        .route("/admin-ui/health", get(admin_ui_health))
+        // ADR-0025 integration pass: server-rendered HTML pages. `/admin-ui/traffic`,
+        // `/admin-ui/admins`, `/admin-ui/domains`, `/admin-ui/certs` are ALREADY
+        // routed above as JSON -- their handlers branch on `wants_html` internally
+        // rather than being registered a second time here (axum has exactly one
+        // handler per method+path). `/admin-ui/accounts` and `/admin-ui/audit` are
+        // brand new paths (no prior JSON contract to preserve), so they're plain
+        // HTML-only handlers.
+        .route("/admin-ui/", get(admin_ui_dashboard))
+        .route("/admin-ui/accounts", get(admin_ui_accounts_page))
+        .route("/admin-ui/audit", get(admin_ui_audit_page))
+        .route("/admin-ui/logout", get(admin_ui_logout))
+        .with_state(AdminUiState {
+            session_key: Arc::from(session_key.to_vec()),
+            admin,
+            audit,
+            ledger,
+            tunnels,
+            channels,
+            topologies,
+            networks,
+            pipelines,
+            managed_domains,
+            domain_admin,
+            observability,
+        })
+}
+
+#[derive(Deserialize)]
+struct CreditReq {
+    amount: u64,
+}
+
+#[derive(Serialize)]
+struct CreditResp {
+    balance: u64,
+}
+
+/// `POST /admin-ui/accounts/:subject/credit {amount}` (admin-identity-gated):
+/// grant `amount` credits to `subject`'s account. Wraps `SqliteLedger::credit`
+/// directly -- the same durable ledger the payment webhook credits -- no
+/// payment-intent step; this IS the admin top-up.
+async fn admin_ui_credit_account(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<CreditReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_credit_account/account_for_subject", e).into_response(),
+    };
+    let balance = match st.ledger.credit(&account, req.amount) {
+        Ok(b) => b,
+        Err(e) => return internal_error("admin_ui_credit_account/credit", e).into_response(),
+    };
+    let _ = st.audit.record(
+        &session.email,
+        "credit_grant",
+        Some(&subject),
+        Some(&format!("+{} credits (new balance {balance})", req.amount)),
+    );
+    Json(CreditResp { balance }).into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/block` (admin-identity-gated): the admin
+/// console's block action. `SqliteLedger::debit`/`debit_and_record_issuance` (the
+/// credit-gated token-issuance admission path) and `create_tunnel` above (the
+/// self-service tunnel-creation admission path) both check this flag -- see
+/// their doc comments; a block flag nobody checks is worthless.
+async fn admin_ui_block_account(State(st): State<AdminUiState>, headers: HeaderMap, Path(subject): Path<String>) -> Response {
+    admin_ui_set_blocked(st, headers, subject, true, "account_block").await
+}
+
+/// `POST /admin-ui/accounts/:subject/unblock` (admin-identity-gated): the inverse
+/// of [`admin_ui_block_account`].
+async fn admin_ui_unblock_account(State(st): State<AdminUiState>, headers: HeaderMap, Path(subject): Path<String>) -> Response {
+    admin_ui_set_blocked(st, headers, subject, false, "account_unblock").await
+}
+
+async fn admin_ui_set_blocked(
+    st: AdminUiState,
+    headers: HeaderMap,
+    subject: String,
+    blocked: bool,
+    action: &str,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_blocked/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_blocked(&account, blocked) {
+        return internal_error("admin_ui_set_blocked/set_blocked", e).into_response();
+    }
+    let _ = st.audit.record(&session.email, action, Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/delete` (admin-identity-gated): the
+/// admin-target-any-account variant of [`delete_account`] -- same resource
+/// cascade (owned tunnels revoked; channels/topologies/networks/pipelines
+/// deleted), PLUS the ledger account row itself removed
+/// (`SqliteLedger::delete_account_for_subject`). Self-service `delete_account`
+/// deliberately leaves that row (Keycloak still owns the caller's own identity,
+/// and a returning login would just re-create it); an admin deleting someone
+/// else's account has no such expectation, so this actually removes it.
+///
+/// Does **not** strip `subject`'s e-mail from other accounts' channel/topology
+/// share lists the way [`delete_account`] strips the CALLER's own verified
+/// e-mail — unlike that self-service path, an admin acting on a bare `subject`
+/// string has no verified e-mail for that account in hand here (accounts are
+/// pseudonymous by design, ADR-0012); scrubbing a specific e-mail from other
+/// accounts' share lists once it's known is still available via the existing
+/// self-service primitives (`remove_allowlist_entries_for_email`/
+/// `remove_shares_by_email`).
+async fn admin_ui_delete_account(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Same best-effort, independently-logged cascade shape as `delete_account`
+    // (2026-08-24 gap fix: log every step's failure, never `let _ =` it away).
+    if let Ok(owned) = st.tunnels.list_for_subject(&subject) {
+        for t in owned {
+            if let Err(e) = st.tunnels.revoke(&subject, &t.id, now) {
+                eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            }
+        }
+    }
+    if let Ok(owned) = st.channels.channels_owned_by(&subject) {
+        for c in owned {
+            if let Err(e) = st.channels.delete_channel(&subject, &c) {
+                eprintln!("ct-cp: admin account deletion for {subject}: deleting channel {} failed: {e}", hex(&c.0));
+            }
+        }
+    }
+    if let Err(e) = st.topologies.delete_all_owned_by(&subject) {
+        eprintln!("ct-cp: admin account deletion for {subject}: deleting owned topologies failed: {e}");
+    }
+    if let Ok(owned) = st.networks.list(&subject) {
+        for id in owned {
+            if let Err(e) = st.networks.delete(&subject, &id) {
+                eprintln!("ct-cp: admin account deletion for {subject}: deleting network {id} failed: {e}");
+            }
+        }
+    }
+    if let Ok(all) = st.pipelines.list() {
+        for (id, owner) in all {
+            if owner == subject {
+                if let Err(e) = st.pipelines.unpublish(&subject, &id) {
+                    eprintln!("ct-cp: admin account deletion for {subject}: unpublishing pipeline {id} failed: {e}");
+                }
+            }
+        }
+    }
+    if let Err(e) = st.ledger.delete_account_for_subject(&subject) {
+        eprintln!("ct-cp: admin account deletion for {subject}: removing ledger row failed: {e}");
+    }
+
+    let _ = st.audit.record(&session.email, "account_delete", Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/max-tunnels {max}` (admin-identity-gated):
+/// the admin-identity-gated mirror of [`admin_set_max_tunnels`] -- same effect
+/// (raises/lowers `subject`'s tunnel-count limit), reachable by a verified admin
+/// session instead of the shared `x-ct-admin-token`. The legacy
+/// `/admin/accounts/:subject/max-tunnels` route stays mounted unchanged for
+/// edge-to-edge/internal callers that only hold the shared token -- ADR-0025's
+/// task framing keeps that mechanism for those callers rather than replacing it.
+async fn admin_ui_set_max_tunnels(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetMaxTunnelsReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_max_tunnels/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_max_tunnels(&account, req.max) {
+        return internal_error("admin_ui_set_max_tunnels/set", e).into_response();
+    }
+    let _ = st
+        .audit
+        .record(&session.email, "max_tunnels_set", Some(&subject), Some(&format!("max={}", req.max)));
+    StatusCode::OK.into_response()
+}
+
+#[derive(Serialize)]
+struct AdminRowResp {
+    email: String,
+    added_by: Option<String>,
+    added_at: i64,
+}
+
+/// `GET /admin-ui/admins` (admin-identity-gated): list current admins for the
+/// admin-console UI to render. Any verified admin may view this (not
+/// super-admin-only) -- knowing who else has admin access is not itself a
+/// privileged mutation.
+async fn admin_ui_list_admins(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        return match st.admin.list_admins() {
+            Ok(rows) => Html(admin_admins_page_html(&session, &st.admin, &rows)).into_response(),
+            Err(e) => internal_error("admin_ui_list_admins/html", e).into_response(),
+        };
+    }
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    match st.admin.list_admins() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| AdminRowResp { email: r.email, added_by: r.added_by, added_at: r.added_at })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error("admin_ui_list_admins", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddAdminReq {
+    email: String,
+}
+
+/// `POST /admin-ui/admins {email}` (admin-identity-gated, super-admin-only):
+/// add a new admin. Requires the CALLER be the super-admin -- checked here (an
+/// honest `403` before even calling `AdminIdentity::add_admin`, so a
+/// non-super-admin gets a clear reason rather than a generic failure) AND again
+/// inside `add_admin` itself (defense in depth, ADR-0025 Decision 2).
+async fn admin_ui_add_admin(State(st): State<AdminUiState>, headers: HeaderMap, Json(req): Json<AddAdminReq>) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if !session.is_super_admin {
+        return (StatusCode::FORBIDDEN, "only the super-admin may add admins").into_response();
+    }
+    let email = req.email.trim();
+    if email.is_empty() {
+        return (StatusCode::BAD_REQUEST, "email is required").into_response();
+    }
+    match st.admin.add_admin(&session.email, email) {
+        Ok(()) => {
+            let _ = st.audit.record(&session.email, "admin_add", Some(email), None);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    }
+}
+
+/// `DELETE /admin-ui/admins/:email` (admin-identity-gated, super-admin-only):
+/// remove an admin. Same super-admin gate as [`admin_ui_add_admin`];
+/// `AdminIdentity::remove_admin` additionally refuses the super-admin's own row
+/// unconditionally, regardless of who is asking (ADR-0025 Decision 2).
+async fn admin_ui_remove_admin(State(st): State<AdminUiState>, headers: HeaderMap, Path(email): Path<String>) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if !session.is_super_admin {
+        return (StatusCode::FORBIDDEN, "only the super-admin may remove admins").into_response();
+    }
+    match st.admin.remove_admin(&session.email, &email) {
+        Ok(()) => {
+            let _ = st.audit.record(&session.email, "admin_remove", Some(&email), None);
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::FORBIDDEN, e.to_string()).into_response(),
+    }
+}
+
+/// `GET /admin-ui/admins` HTML branch (ADR-0025 integration pass): the super-admin
+/// row's Remove control is omitted SERVER-SIDE, not merely disabled or left for the
+/// click to 403 -- the task's own requirement ("no delete control rendered for that
+/// row at all, not just a server-side check") is stronger than "the click would be
+/// refused", and this is the one place that guarantee actually lives. A non-super
+/// viewer gets the identical list read-only, with an explicit reason the add/remove
+/// form is missing rather than a button that would just 403 on click.
+fn admin_admins_page_html(
+    session: &crate::admin_identity::AdminSession,
+    admin: &crate::admin_identity::AdminIdentity,
+    rows: &[crate::storage::AdminRow],
+) -> String {
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>E-mail</th><th>Added by</th><th>Added</th><th></th></tr></thead><tbody>"#,
+    );
+    for r in rows {
+        let is_super = admin.is_super_admin(&r.email);
+        let added_by = r.added_by.as_deref().unwrap_or("(startup seed)");
+        let super_badge = if is_super { r#" <span class="badge super">super-admin</span>"# } else { "" };
+        let action_cell = if is_super {
+            r#"<span class="help">cannot be removed</span>"#.to_string()
+        } else if session.is_super_admin {
+            format!(
+                r#"<form class="inline" data-email="{email}" onsubmit="return removeAdmin(event)"><button type="submit" class="danger">Remove</button></form>"#,
+                email = escape(&r.email),
+            )
+        } else {
+            String::new()
+        };
+        table.push_str(&format!(
+            r#"<tr><td>{email}{super_badge}</td><td>{added_by}</td><td><span data-ts="{added_at}">{added_at}</span></td><td>{action_cell}</td></tr>"#,
+            email = escape(&r.email),
+            super_badge = super_badge,
+            added_by = escape(added_by),
+            added_at = r.added_at,
+            action_cell = action_cell,
+        ));
+    }
+    table.push_str("</tbody></table>");
+
+    let manage_section = if session.is_super_admin {
+        r#"<h2>Add an admin</h2>
+<form id="addAdminForm" onsubmit="return addAdmin(event)">
+ <label>E-mail (must be a Google-verified login) <input type="email" name="email" required></label>
+ <button type="submit">Add admin</button>
+</form>
+<p class="msg" id="addMsg"></p>"#
+            .to_string()
+    } else {
+        r#"<p class="help">Only the super-admin can add or remove other admins. You can see who
+currently has access above; the add/remove form is hidden here rather than shown and refused.</p>"#
+            .to_string()
+    };
+
+    let body = format!(
+        r#"<h1>Admins</h1>
+<p class="help">Every account that can reach this console. Access is bound to a verified Google
+login (ADR-0025) -- there is no separate admin password.</p>
+{table}
+{manage_section}
+<script>
+function addAdmin(ev){{
+ ev.preventDefault();
+ var form = ev.target, msg = document.getElementById('addMsg');
+ var email = form.email.value.trim();
+ msg.className = 'msg'; msg.textContent = 'adding…';
+ adminApi('POST', '/admin-ui/admins', {{email: email}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ msg.className = 'msg err'; msg.textContent = 'failed: ' + e.message; }});
+ return false;
+}}
+function removeAdmin(ev){{
+ ev.preventDefault();
+ var email = ev.target.getAttribute('data-email');
+ if(!window.confirm('Remove admin access for ' + email + '?')) return false;
+ adminApi('DELETE', '/admin-ui/admins/' + encodeURIComponent(email))
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('failed: ' + e.message); }});
+ return false;
+}}
+</script>"#,
+        table = table,
+        manage_section = manage_section,
+    );
+    admin_page("admins", session, &body)
+}
+
+fn admin_ui_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `POST /admin-ui/hostnames/:host/disable` (admin-identity-gated): revoke
+/// authorization for `host` AND prevent it being re-authorized until an
+/// explicit [`admin_ui_enable_hostname`] reverses it.
+///
+/// Two independent effects, matching the task's own split:
+/// 1. **Prevent future re-authorization** -- [`crate::storage::SqliteTunnelStore::
+///    disable_hostname`] marks the row; the enforcer is `authorize_hostname`'s
+///    own `is_hostname_disabled` check (the ADR's "flag needs an enforcer"
+///    discipline, same shape as the blocked-account check).
+/// 2. **Revoke the currently-live authorization**, if any -- reuses the exact
+///    same edge machinery [`delete_tunnel`] already uses (`POST
+///    /admin/revoke/:token` via [`edge_admin_http_client`]), looking the
+///    routing token up via [`crate::storage::SqliteTunnelStore::
+///    routing_token_for_hostname`]. Best-effort and logged like every other
+///    edge-admin call in this file: a hostname with no live tunnel on it right
+///    now still gets step 1 (there's simply nothing to revoke).
+async fn admin_ui_disable_hostname(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(host): Path<String>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(host) = ct_common::normalize_hostname(&host) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    if let Err(e) = st.tunnels.disable_hostname(&host, &session.email, admin_ui_now_secs()) {
+        return internal_error("admin_ui_disable_hostname/disable_hostname", e).into_response();
+    }
+
+    let mut detail = "no live tunnel on this hostname to revoke".to_string();
+    if let Some((edge_url, edge_token)) = &st.domain_admin.edge_admin {
+        match st.tunnels.routing_token_for_hostname(&host) {
+            Ok(Some(token)) => {
+                let endpoint = format!("{}/admin/revoke/{}", edge_url.trim_end_matches('/'), token);
+                match edge_admin_http_client()
+                    .post(&endpoint)
+                    .header("x-ct-admin-token", edge_token.as_str())
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => detail = "revoked the live tunnel on this hostname".to_string(),
+                    Ok(r) => {
+                        detail = format!("edge revoke returned {}", r.status());
+                        eprintln!("ct-cp: admin_ui_disable_hostname: edge revoke for {host} returned {}", r.status());
+                    }
+                    Err(e) => {
+                        let redacted = redact_routing_tokens(&e.to_string());
+                        detail = format!("edge revoke failed: {redacted}");
+                        eprintln!("ct-cp: admin_ui_disable_hostname: edge revoke for {host} failed: {redacted}");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("ct-cp: admin_ui_disable_hostname: routing_token_for_hostname for {host} failed: {e}"),
+        }
+    }
+    let _ = st.audit.record(&session.email, "hostname_disable", Some(&host), Some(&detail));
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/hostnames/:host/enable` (admin-identity-gated): reverse
+/// [`admin_ui_disable_hostname`]'s block. Deliberately does NOT re-push an
+/// edge authorize-host call itself -- disabling revoked any live tunnel's
+/// registration, so this only permits the NEXT ordinary authorize_hostname
+/// call (the owner recreating the tunnel, or the admin re-provisioning it) to
+/// succeed again.
+async fn admin_ui_enable_hostname(State(st): State<AdminUiState>, headers: HeaderMap, Path(host): Path<String>) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(host) = ct_common::normalize_hostname(&host) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    match st.tunnels.enable_hostname(&host) {
+        Ok(was_disabled) => {
+            let _ = st.audit.record(
+                &session.email,
+                "hostname_enable",
+                Some(&host),
+                Some(if was_disabled { "was disabled" } else { "was not disabled (no-op)" }),
+            );
+            StatusCode::OK.into_response()
+        }
+        Err(e) => internal_error("admin_ui_enable_hostname/enable_hostname", e).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct DisabledHostnameResp {
+    hostname: String,
+    disabled_by: String,
+    disabled_at: i64,
+}
+
+/// `GET /admin-ui/hostnames/disabled` (admin-identity-gated): every currently
+/// admin-disabled hostname -- the console's own visibility into what it has
+/// blocked, mirroring [`admin_ui_list_admins`]'s "any verified admin may view"
+/// posture (viewing isn't itself a privileged mutation).
+async fn admin_ui_list_disabled_hostnames(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    match st.tunnels.list_disabled_hostnames() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| DisabledHostnameResp { hostname: r.hostname, disabled_by: r.disabled_by, disabled_at: r.disabled_at })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error("admin_ui_list_disabled_hostnames", e).into_response(),
+    }
+}
+
+/// Build a [`DesecClient`] scoped to `zone` from a raw token (ADR-0025 Decision
+/// 4): [`DesecClient::from_env`]/the module-wide client `portal_api_router`
+/// already builds are bound to exactly ONE zone (`DESEC_DOMAIN`) at
+/// construction and refuse (`guard_under_zone`) any host outside it -- onboarding
+/// a genuinely NEW zone needs a differently-zoned client, built here via
+/// [`DesecClient::from_lookup`] rather than `from_env` reading the process
+/// environment (which still only ever names the ORIGINAL zone).
+fn desec_client_for_zone(zone: &str, token: &str, api_base: Option<&str>) -> Option<DesecClient> {
+    let token = token.to_string();
+    let zone = zone.to_string();
+    let api_base = api_base.map(str::to_string);
+    DesecClient::from_lookup(move |k| match k {
+        "DESEC_TOKEN" => Some(token.clone()),
+        "DESEC_DOMAIN" => Some(zone.clone()),
+        "DESEC_API_BASE" => api_base.clone(),
+        _ => None,
+    })
+}
+
+#[derive(Deserialize)]
+struct RegisterDomainReq {
+    zone: String,
+}
+
+#[derive(Serialize)]
+struct ManagedDomainResp {
+    zone: String,
+    added_by: Option<String>,
+    added_at: i64,
+    status: String,
+}
+
+/// `POST /admin-ui/domains {zone}` (admin-identity-gated, ADR-0025 Decision 4):
+/// register a new zone as managed. Does **not** attempt DNS delegation --
+/// per the ADR, that's the documented one-time human step at the registrar,
+/// assumed already done by the time this is called. Issues the apex + wildcard
+/// A records via [`DesecClient::set_a`], pointed at [`DomainAdminConfig::
+/// dns_edge_ip`], and only inserts the `managed_domains` row once BOTH
+/// succeed -- a `DesecClient` call failing (e.g. the zone isn't actually under
+/// deSEC's management yet) reports a clear, actionable error and leaves NO
+/// half-registered row behind, rather than a zone that looks managed but has
+/// no real DNS.
+async fn admin_ui_register_domain(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterDomainReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(zone) = ct_common::normalize_hostname(req.zone.trim()) else {
+        return (StatusCode::BAD_REQUEST, "invalid zone").into_response();
+    };
+    match st.managed_domains.zone(&zone) {
+        Ok(Some(_)) => return (StatusCode::CONFLICT, format!("{zone} is already managed")).into_response(),
+        Ok(None) => {}
+        Err(e) => return internal_error("admin_ui_register_domain/zone", e).into_response(),
+    }
+    let Some(token) = st.domain_admin.desec_token.as_deref().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DESEC_TOKEN is not configured on this deployment -- cannot manage DNS for a new zone",
+        )
+            .into_response();
+    };
+    let Some(edge_ip) = st.domain_admin.dns_edge_ip.as_deref().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CT_CP_DNS_EDGE_IP is not configured -- cannot point the new zone's A records anywhere",
+        )
+            .into_response();
+    };
+    let Some(client) = desec_client_for_zone(&zone, token, st.domain_admin.desec_api_base.as_deref()) else {
+        return internal_error("admin_ui_register_domain/desec_client_for_zone", "failed to build a deSEC client").into_response();
+    };
+    if let Err(e) = client.set_a(&zone, edge_ip).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("apex A record for {zone} failed -- is the zone actually delegated to deSEC yet? ({e})"),
+        )
+            .into_response();
+    }
+    let wildcard = format!("*.{zone}");
+    if let Err(e) = client.set_a(&wildcard, edge_ip).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "the apex A record for {zone} WAS created, but the wildcard record for {wildcard} failed: {e} \
+                 -- retrying this call is safe (both records are idempotent upserts)"
+            ),
+        )
+            .into_response();
+    }
+    let now = admin_ui_now_secs();
+    match st.managed_domains.add_zone(&zone, &session.email, now, "active") {
+        Ok(_) => {
+            let _ = st.audit.record(&session.email, "domain_register", Some(&zone), Some("apex+wildcard A records issued"));
+            Json(ManagedDomainResp { zone, added_by: Some(session.email), added_at: now, status: "active".to_string() }).into_response()
+        }
+        Err(e) => internal_error("admin_ui_register_domain/add_zone", e).into_response(),
+    }
+}
+
+/// `GET /admin-ui/domains` (admin-identity-gated): every managed domain +
+/// status, newest first.
+async fn admin_ui_list_domains(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let zones = match st.managed_domains.list_zones() {
+            Ok(v) => v,
+            Err(e) => return internal_error("admin_ui_list_domains/html/zones", e).into_response(),
+        };
+        let disabled = match st.tunnels.list_disabled_hostnames() {
+            Ok(v) => v,
+            Err(e) => return internal_error("admin_ui_list_domains/html/disabled", e).into_response(),
+        };
+        let tunnels = match st.tunnels.all() {
+            Ok(v) => v,
+            Err(e) => return internal_error("admin_ui_list_domains/html/tunnels", e).into_response(),
+        };
+        return Html(admin_domains_page_html(&session, &zones, &disabled, &tunnels)).into_response();
+    }
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    match st.managed_domains.list_zones() {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|r| ManagedDomainResp { zone: r.zone, added_by: r.added_by, added_at: r.added_at, status: r.status })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => internal_error("admin_ui_list_domains", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddDomainHostnameReq {
+    subdomain: String,
+}
+
+#[derive(Serialize)]
+struct AddDomainHostnameResp {
+    hostname: String,
+    cert_dir: String,
+}
+
+/// `POST /admin-ui/domains/:zone/hostnames {subdomain}` (admin-identity-gated,
+/// ADR-0025 Decision 4): given an already-managed zone, issue a cert for
+/// `subdomain.zone` via [`crate::cert_issuer::issue_cert`] (`lib-acme.sh`'s
+/// `issue_cert`, shelled out to -- see that module's doc for why). Runs the
+/// blocking subprocess call on `spawn_blocking` so it doesn't stall this
+/// handler's async worker for the (potentially tens-of-seconds) duration of a
+/// real ACME issuance.
+async fn admin_ui_add_domain_hostname(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(zone): Path<String>,
+    Json(req): Json<AddDomainHostnameReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let Some(zone) = ct_common::normalize_hostname(&zone) else {
+        return (StatusCode::BAD_REQUEST, "invalid zone").into_response();
+    };
+    match st.managed_domains.zone(&zone) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("{zone} is not a managed domain -- register it first via POST /admin-ui/domains"),
+            )
+                .into_response()
+        }
+        Err(e) => return internal_error("admin_ui_add_domain_hostname/zone", e).into_response(),
+    }
+    let subdomain = req.subdomain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if subdomain.is_empty() || subdomain.contains('.') {
+        return (
+            StatusCode::BAD_REQUEST,
+            "subdomain must be a single label (e.g. \"app\"), not a full hostname",
+        )
+            .into_response();
+    }
+    let Some(hostname) = ct_common::normalize_hostname(&format!("{subdomain}.{zone}")) else {
+        return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
+    };
+    let Some(cert_cfg) = st.domain_admin.managed_cert.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cert issuance is not configured on this deployment (CT_CP_LIB_ACME_PATH unset)",
+        )
+            .into_response();
+    };
+    let cert_dir = std::path::PathBuf::from(&cert_cfg.cert_base_dir).join(&hostname);
+    let issue_result = {
+        let hostname = hostname.clone();
+        let cert_dir = cert_dir.clone();
+        tokio::task::spawn_blocking(move || crate::cert_issuer::issue_cert(&cert_cfg.acme, &hostname, &cert_dir)).await
+    };
+    match issue_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, format!("cert issuance for {hostname} failed: {e}")).into_response(),
+        Err(e) => return internal_error("admin_ui_add_domain_hostname/spawn_blocking", e).into_response(),
+    }
+    let cert_dir_str = cert_dir.to_string_lossy().into_owned();
+    if let Err(e) =
+        st.managed_domains
+            .record_hostname_cert(&hostname, &zone, &cert_dir_str, &session.email, admin_ui_now_secs())
+    {
+        return internal_error("admin_ui_add_domain_hostname/record_hostname_cert", e).into_response();
+    }
+    let _ = st.audit.record(&session.email, "domain_hostname_cert_issue", Some(&hostname), Some(&format!("zone={zone}")));
+    Json(AddDomainHostnameResp { hostname, cert_dir: cert_dir_str }).into_response()
+}
+
+/// `GET /admin-ui/domains` HTML branch (ADR-0025 Decision 4/6 integration pass):
+/// managed zones + an onboard-a-domain form, a per-hostname disable/enable toggle
+/// (Decision 4's "a natural sibling of the existing revoke call") built from the
+/// union of every LIVE tunnel hostname and every already-disabled one -- a
+/// hostname can be disabled with no live tunnel on it right now (the owner hasn't
+/// recreated it yet), so `disabled` is the authority on current state, not
+/// `tunnels` alone.
+fn admin_domains_page_html(
+    session: &crate::admin_identity::AdminSession,
+    zones: &[crate::storage::ManagedDomainRow],
+    disabled: &[crate::storage::DisabledHostnameRow],
+    tunnels: &[SubjectTunnel],
+) -> String {
+    let mut zones_table = String::from(
+        r#"<table class="data"><thead><tr><th>Zone</th><th>Status</th><th>Added by</th><th>Added</th><th>Add a hostname</th></tr></thead><tbody>"#,
+    );
+    if zones.is_empty() {
+        zones_table.push_str(r#"<tr><td colspan="5" class="help">No domains onboarded yet -- use the form below.</td></tr>"#);
+    }
+    for z in zones {
+        zones_table.push_str(&format!(
+            r#"<tr><td><code>{zone}</code></td><td>{status}</td><td>{added_by}</td><td><span data-ts="{added_at}">{added_at}</span></td>
+<td><form class="inline" data-zone="{zone}" onsubmit="return addHostname(event)">
+ <input type="text" name="subdomain" placeholder="app" required style="width:6rem">
+ <button type="submit" class="sec">Issue cert</button>
+</form></td></tr>"#,
+            zone = escape(&z.zone),
+            status = escape(&z.status),
+            added_by = z.added_by.as_deref().map(escape).unwrap_or_else(|| "-".to_string()),
+            added_at = z.added_at,
+        ));
+    }
+    zones_table.push_str("</tbody></table>");
+
+    let disabled_set: std::collections::HashSet<&str> = disabled.iter().map(|d| d.hostname.as_str()).collect();
+    let mut hostnames: Vec<(String, bool, bool)> = Vec::new(); // (hostname, disabled, has_live_tunnel)
+    for t in tunnels {
+        if let Some(h) = &t.hostname {
+            hostnames.push((h.clone(), disabled_set.contains(h.as_str()), true));
+        }
+    }
+    for d in disabled {
+        if !hostnames.iter().any(|(h, _, _)| h == &d.hostname) {
+            hostnames.push((d.hostname.clone(), true, false));
+        }
+    }
+    hostnames.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut host_table = String::from(
+        r#"<table class="data"><thead><tr><th>Hostname</th><th>State</th><th></th></tr></thead><tbody>"#,
+    );
+    if hostnames.is_empty() {
+        host_table.push_str(r#"<tr><td colspan="3" class="help">No hostnames yet.</td></tr>"#);
+    }
+    for (host, is_disabled, live) in &hostnames {
+        let state = if *is_disabled {
+            r#"<span class="badge blocked">disabled</span>"#.to_string()
+        } else if *live {
+            r#"<span class="badge ok">active</span>"#.to_string()
+        } else {
+            r#"<span class="help">no live tunnel</span>"#.to_string()
+        };
+        let action = if *is_disabled {
+            format!(r#"<button class="sec" data-host="{h}" onclick="return toggleHostname(event,'enable')">Enable</button>"#, h = escape(host))
+        } else {
+            format!(r#"<button class="danger" data-host="{h}" onclick="return toggleHostname(event,'disable')">Disable</button>"#, h = escape(host))
+        };
+        host_table.push_str(&format!(
+            r#"<tr><td><code>{host}</code></td><td>{state}</td><td>{action}</td></tr>"#,
+            host = escape(host),
+        ));
+    }
+    host_table.push_str("</tbody></table>");
+
+    let body = format!(
+        r#"<h1>Domains</h1>
+<p class="help">Zones onboarded beyond bunsenbrenner.org, and every hostname's
+enable/disable state (ADR-0025 Decision 4). DNS delegation to deSEC at the domain's
+registrar is a manual one-time step performed BEFORE onboarding here -- this form only
+issues the apex/wildcard A records and (per-hostname) certs, it never touches a registrar.</p>
+<h2>Managed zones</h2>
+{zones_table}
+<form id="registerForm" onsubmit="return registerDomain(event)">
+ <label>Onboard a new zone (already delegated to deSEC) <input type="text" name="zone" placeholder="example.org" required></label>
+ <button type="submit">Onboard domain</button>
+</form>
+<p class="msg" id="registerMsg"></p>
+<h2>Hostnames</h2>
+{host_table}
+<script>
+function registerDomain(ev){{
+ ev.preventDefault();
+ var form = ev.target, msg = document.getElementById('registerMsg');
+ msg.className = 'msg'; msg.textContent = 'onboarding… (issuing DNS records, this can take a moment)';
+ adminApi('POST', '/admin-ui/domains', {{zone: form.zone.value.trim()}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ msg.className = 'msg err'; msg.textContent = 'failed: ' + e.message; }});
+ return false;
+}}
+function addHostname(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var zone = form.getAttribute('data-zone');
+ var subdomain = form.subdomain.value.trim();
+ form.querySelector('button').disabled = true;
+ adminApi('POST', '/admin-ui/domains/' + encodeURIComponent(zone) + '/hostnames', {{subdomain: subdomain}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ form.querySelector('button').disabled = false; window.alert('cert issuance failed: ' + e.message); }});
+ return false;
+}}
+function toggleHostname(ev, action){{
+ ev.preventDefault();
+ var host = ev.target.getAttribute('data-host');
+ if(action === 'disable' && !window.confirm('Disable ' + host + '? This revokes its live tunnel and blocks re-authorization until re-enabled.')) return false;
+ adminApi('POST', '/admin-ui/hostnames/' + encodeURIComponent(host) + '/' + action)
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('failed: ' + e.message); }});
+ return false;
+}}
+</script>"#,
+        zones_table = zones_table,
+        host_table = host_table,
+    );
+    admin_page("domains", session, &body)
+}
+
+#[derive(Serialize)]
+struct CertStatusResp {
+    label: String,
+    state: &'static str,
+    days_remaining: Option<i64>,
+    not_after_unix: Option<i64>,
+    reason: Option<String>,
+}
+
+impl From<crate::cert_status::CertStatus> for CertStatusResp {
+    fn from(s: crate::cert_status::CertStatus) -> Self {
+        match s.state {
+            crate::cert_status::CertState::Ok { days_remaining, not_after_unix } => {
+                CertStatusResp { label: s.label, state: "ok", days_remaining: Some(days_remaining), not_after_unix: Some(not_after_unix), reason: None }
+            }
+            crate::cert_status::CertState::NotConfigured => {
+                CertStatusResp { label: s.label, state: "not_configured", days_remaining: None, not_after_unix: None, reason: None }
+            }
+            crate::cert_status::CertState::Unreadable { reason } => {
+                CertStatusResp { label: s.label, state: "unreadable", days_remaining: None, not_after_unix: None, reason: Some(reason) }
+            }
+        }
+    }
+}
+
+/// `GET /admin-ui/certs` (admin-identity-gated, ADR-0025 Decision 6): for
+/// every currently-configured front-door cert (Portal/Auth/MASQUE/Admin, per
+/// [`DomainAdminConfig::front_door_certs`]) plus every per-managed-domain cert
+/// ([`crate::storage::SqliteManagedDomains::list_hostname_certs`]), report
+/// days-until-expiry. A missing/unreadable/unconfigured cert is reported as
+/// its own explicit state (see [`crate::cert_status::CertState`]) rather than
+/// omitted -- an admin needs to see gaps, not just healthy entries.
+async fn admin_ui_certs(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let rows = admin_ui_cert_rows(&st);
+        return Html(admin_certs_page_html(&session, rows)).into_response();
+    }
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    Json(admin_ui_cert_rows(&st)).into_response()
+}
+
+/// The four fixed front-door slots plus every per-managed-domain cert, in ONE
+/// place -- both [`admin_ui_certs`]'s JSON branch and its HTML branch call this,
+/// so the two views can never disagree about which certs exist or their state.
+fn admin_ui_cert_rows(st: &AdminUiState) -> Vec<CertStatusResp> {
+    let paths = &st.domain_admin.front_door_certs;
+    let mut out = vec![
+        crate::cert_status::check("portal", paths.portal.as_deref().map(std::path::Path::new)),
+        crate::cert_status::check("auth", paths.auth.as_deref().map(std::path::Path::new)),
+        crate::cert_status::check("masque", paths.masque.as_deref().map(std::path::Path::new)),
+        crate::cert_status::check("admin-ui", paths.admin_ui.as_deref().map(std::path::Path::new)),
+    ];
+    match st.managed_domains.list_hostname_certs() {
+        Ok(rows) => {
+            for r in rows {
+                let path = std::path::PathBuf::from(&r.cert_dir).join("fullchain.pem");
+                out.push(crate::cert_status::check(r.hostname, Some(path.as_path())));
+            }
+        }
+        Err(e) => eprintln!("ct-cp: admin_ui_certs: list_hostname_certs failed: {e} -- per-domain certs omitted from this response"),
+    }
+    out.into_iter().map(CertStatusResp::from).collect()
+}
+
+/// Sort key for the cert-expiry dashboard: an `unreadable` cert needs the most
+/// urgent attention (something is actively broken -- #142-class incident), then
+/// `ok` entries soonest-expiring first (the task's own requirement), then
+/// `not_configured` last (nothing to expire, lowest urgency of the three).
+fn cert_status_sort_key(s: &CertStatusResp) -> (u8, i64) {
+    match s.state {
+        "unreadable" => (0, 0),
+        "ok" => (1, s.days_remaining.unwrap_or(i64::MAX)),
+        _ => (2, 0),
+    }
+}
+
+/// Below this many days remaining, a cert is flagged the same way an `unreadable`
+/// one is -- close enough to expiry that "still technically ok" is the wrong signal
+/// to give an operator glancing at this page (ADR-0025 Decision 6's own framing:
+/// this dashboard exists specifically to make that visible before it becomes an
+/// outage, matching tonight's own #142-class incident).
+const CERT_EXPIRY_WARN_DAYS: i64 = 14;
+
+/// `GET /admin-ui/certs` HTML branch (ADR-0025 Decision 6 integration pass):
+/// soonest-expiring first, with anything under [`CERT_EXPIRY_WARN_DAYS`] or
+/// unreadable visually flagged -- see [`cert_status_sort_key`].
+fn admin_certs_page_html(session: &crate::admin_identity::AdminSession, mut rows: Vec<CertStatusResp>) -> String {
+    rows.sort_by_key(cert_status_sort_key);
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>Hostname</th><th>State</th><th>Days remaining</th><th>Detail</th></tr></thead><tbody>"#,
+    );
+    if rows.is_empty() {
+        table.push_str(r#"<tr><td colspan="4" class="help">No certs to report.</td></tr>"#);
+    }
+    for r in &rows {
+        let flagged = r.state == "unreadable" || r.days_remaining.map(|d| d < CERT_EXPIRY_WARN_DAYS).unwrap_or(false);
+        let (state_html, days_html) = match r.state {
+            "ok" => (
+                if flagged { r#"<span class="badge warn">expiring soon</span>"#.to_string() } else { r#"<span class="badge ok">ok</span>"#.to_string() },
+                r.days_remaining.map(|d| d.to_string()).unwrap_or_default(),
+            ),
+            "unreadable" => (r#"<span class="badge blocked">unreadable</span>"#.to_string(), "-".to_string()),
+            _ => (r#"<span class="help">not configured</span>"#.to_string(), "-".to_string()),
+        };
+        table.push_str(&format!(
+            r#"<tr><td><code>{label}</code></td><td>{state_html}</td><td>{days_html}</td><td class="help">{detail}</td></tr>"#,
+            label = escape(&r.label),
+            state_html = state_html,
+            days_html = days_html,
+            detail = escape(r.reason.as_deref().unwrap_or("")),
+        ));
+    }
+    table.push_str("</tbody></table>");
+    let body = format!(
+        r#"<h1>Certificates</h1>
+<p class="help">Every front-door hostname's TLS cert -- Portal/Auth/MASQUE/Admin plus every
+managed-domain hostname -- and how many days remain before it needs renewal. Sorted
+soonest-expiring first; anything unreadable or under {warn} days is flagged.</p>
+{table}"#,
+        table = table,
+        warn = CERT_EXPIRY_WARN_DAYS,
+    );
+    admin_page("certs", session, &body)
+}
+
+// ===== ADR-0025 Decision 6: read-only observability (traffic/tunnels/health) =====
+//
+// No mutation anywhere below, so no `audit.record` calls -- ADR-0025's own framing
+// ("read-only actions aren't audit-worthy the way grants/blocks/deletes are").
+
+/// ADR-0025 Decision 3: whether an Agent currently has a direct/P2P listener
+/// advertised for a tunnel, translated to the two-value transport label the UI
+/// renders. Deliberately only two values, never "unknown" -- the absence of a
+/// direct advertisement structurally means the tunnel can ONLY be served over
+/// the relay (there is no third path), so this is knowable either way, unlike
+/// a byte count the edge structurally cannot measure for the direct leg. This
+/// is an AVAILABILITY signal ("a direct path is currently advertised"), not a
+/// claim that traffic is actually flowing over it -- seeing the mismatch
+/// between this and the also-reported relay byte counts is exactly what the
+/// admin console exists to make visible, not something to paper over here.
+fn infer_transport(direct_active: bool) -> &'static str {
+    if direct_active { "direct_p2p" } else { "relay" }
+}
+
+/// ADR-0025 Decision 3/6's own wording: "routing token (or its safe display
+/// form)". A routing token is the live identifier that routes traffic to a
+/// tunnel (`RoutingToken`, `ct_common`) -- even though the admin console is
+/// already gated at least as strictly as the shared edge-admin secret, there
+/// is no reason to additionally put the full value into a browser's
+/// DOM/devtools/history when a short prefix+suffix still lets an operator
+/// cross-reference rows across this dashboard and the raw edge admin API.
+/// Not `pub` / not reversible -- this is a display helper, not an encoding.
+fn redact_token_for_display(hex: &str) -> String {
+    if hex.len() <= 12 {
+        return hex.to_string();
+    }
+    format!("{}…{}", &hex[..8], &hex[hex.len() - 4..])
+}
+
+/// ADR-0025 Decision 6: "uptime" is only ever meaningful while a tunnel is
+/// actually connected right now -- `None` while disconnected, regardless of
+/// whether `connected_since` happens to still carry a stale value (it
+/// shouldn't, per `EdgeState`'s own contract, but this function doesn't have
+/// to trust that to be correct). Takes `now` as a parameter rather than
+/// reading the clock itself specifically so it is a plain, deterministic unit
+/// -- see the tests below.
+fn tunnel_uptime_secs(now: i64, connected: bool, connected_since: Option<i64>) -> Option<i64> {
+    if !connected {
+        return None;
+    }
+    connected_since.map(|since| (now - since).max(0))
+}
+
+/// One tunnel's live status, as reported by the edge's `POST
+/// /admin/tunnel-status/bulk` (`crates/edge/src/admin.rs`'s `BulkTunnelStatusEntry`,
+/// flattened). Every field is `#[serde(default)]` so a future edge that omits one
+/// (or an edge running an older binary during a rolling upgrade) degrades to the
+/// same "nothing known yet" default this struct already uses for a tunnel the
+/// bulk response has no entry for at all, rather than failing the whole response.
+#[derive(Deserialize, Clone, Default)]
+struct EdgeBulkStatusEntry {
+    token: String,
+    #[serde(default)]
+    connected: bool,
+    #[serde(default)]
+    registrations: usize,
+    #[serde(default)]
+    fallback_parked: usize,
+    #[serde(default)]
+    bytes_received: u64,
+    #[serde(default)]
+    bytes_sent: u64,
+    #[serde(default)]
+    direct: bool,
+    #[serde(default)]
+    connected_since: Option<i64>,
+    #[serde(default)]
+    last_seen: Option<i64>,
+}
+
+/// Bulk-fetch live status for `tokens` from the edge in ONE HTTP round trip
+/// (`POST /admin/tunnel-status/bulk`) -- the whole reason this exists is so
+/// `/admin-ui/traffic`/`/admin-ui/tunnels` don't make the caller (or this
+/// handler) loop one HTTP call per tunnel the way `portal_api.rs`'s own
+/// `edge_tunnel_status` does for a single subject's small tunnel list.
+/// Best-effort, matching every other edge-admin call in this file: `None`
+/// configured, an unsuccessful response, or a transport/decode error all
+/// return an empty map, so a transient edge/network hiccup degrades every
+/// row to its "nothing known" defaults instead of failing the whole page.
+async fn edge_tunnel_status_bulk(st: &AdminUiState, tokens: &[String]) -> HashMap<String, EdgeBulkStatusEntry> {
+    let Some((edge_url, edge_token)) = &st.domain_admin.edge_admin else {
+        return HashMap::new();
+    };
+    if tokens.is_empty() {
+        return HashMap::new();
+    }
+    let endpoint = format!("{}/admin/tunnel-status/bulk", edge_url.trim_end_matches('/'));
+    let resp = edge_admin_http_client()
+        .post(&endpoint)
+        .header("x-ct-admin-token", edge_token.as_str())
+        .json(&serde_json::json!({ "tokens": tokens }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => match r.json::<Vec<EdgeBulkStatusEntry>>().await {
+            Ok(entries) => entries.into_iter().map(|e| (e.token.clone(), e)).collect(),
+            Err(e) => {
+                eprintln!("ct-cp: edge_tunnel_status_bulk: decoding the edge's response failed: {e}");
+                HashMap::new()
+            }
+        },
+        Ok(r) => {
+            eprintln!("ct-cp: edge_tunnel_status_bulk: edge returned {}", r.status());
+            HashMap::new()
+        }
+        Err(e) => {
+            eprintln!("ct-cp: edge_tunnel_status_bulk: request failed: {}", redact_routing_tokens(&e.to_string()));
+            HashMap::new()
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TrafficRow {
+    tunnel_id: String,
+    name: String,
+    hostname: Option<String>,
+    routing_token_display: String,
+    connected: bool,
+    /// ADR-0025 Decision 3: `"relay"` | `"direct_p2p"` -- see [`infer_transport`].
+    transport: &'static str,
+    bytes_received: u64,
+    bytes_sent: u64,
+}
+
+/// Pure join of `tunnels` (the control plane's own tunnel registry,
+/// `SqliteTunnelStore::all`) against `edge_status` (this process's bulk edge
+/// scrape) -- no I/O, so it's directly unit-testable (see the tests below) and
+/// is exactly why [`admin_ui_traffic`] itself stays a thin wrapper around it.
+/// A tunnel with no entry in `edge_status` (never connected since the edge's
+/// own process start, or the scrape failed) reports `connected: false`,
+/// `transport: "relay"` (the honest default -- no direct advertisement is
+/// known, so relay is the only path that could be serving it) and zeroed byte
+/// counts, rather than being omitted from the list.
+fn build_traffic_rows(tunnels: &[SubjectTunnel], edge_status: &HashMap<String, EdgeBulkStatusEntry>) -> Vec<TrafficRow> {
+    tunnels
+        .iter()
+        .map(|t| {
+            let status = edge_status.get(&t.routing_token);
+            TrafficRow {
+                tunnel_id: t.id.clone(),
+                name: t.name.clone(),
+                hostname: t.hostname.clone(),
+                routing_token_display: redact_token_for_display(&t.routing_token),
+                connected: status.map(|s| s.connected).unwrap_or(false),
+                transport: infer_transport(status.map(|s| s.direct).unwrap_or(false)),
+                bytes_received: status.map(|s| s.bytes_received).unwrap_or(0),
+                bytes_sent: status.map(|s| s.bytes_sent).unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
+/// `GET /admin-ui/traffic` (admin-identity-gated, ADR-0025 Decision 6, read-only):
+/// per registered tunnel, its relay byte counts (real, edge-measured) and its
+/// transport (Decision 3's honest relay-vs-direct-advertised signal, never a
+/// direct-path byte count the edge doesn't have).
+async fn admin_ui_traffic(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        return Html(admin_traffic_page_html(&session)).into_response();
+    }
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let tunnels = match st.tunnels.all() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_traffic/tunnels.all", e).into_response(),
+    };
+    let tokens: Vec<String> = tunnels.iter().map(|t| t.routing_token.clone()).collect();
+    let edge_status = edge_tunnel_status_bulk(&st, &tokens).await;
+    Json(build_traffic_rows(&tunnels, &edge_status)).into_response()
+}
+
+/// `GET /admin-ui/traffic` HTML branch (ADR-0025 Decision 3/6 integration pass):
+/// client-fetches its OWN already-shipped JSON endpoints (`/admin-ui/traffic` --
+/// same path, differentiated by [`wants_html`] -- and `/admin-ui/tunnels`) rather
+/// than SSR-ing them, since both need the SAME async edge scrape
+/// [`admin_ui_traffic`]'s and [`admin_ui_tunnels`]'s own JSON branches already do;
+/// duplicating that here would mean two independent code paths that could drift.
+/// Decision 3's own wording is rendered verbatim in the transport column's help
+/// text -- never a byte count for the direct/P2P leg, only "the relay saw N bytes"
+/// (real) alongside "a direct path is currently advertised" (an availability
+/// signal, not a traffic measurement).
+fn admin_traffic_page_html(session: &crate::admin_identity::AdminSession) -> String {
+    let body = r#"<h1>Traffic monitor</h1>
+<p class="help">Relay-plane bytes below are real, edge-measured counts. "Direct P2P" means a
+direct advertisement is currently active for that tunnel -- it is an <strong>availability
+signal</strong>, not a byte count: the edge structurally cannot see traffic that bypasses it
+entirely, so no number is shown for that leg. A tunnel can show relay bytes AND direct P2P at
+once; that mismatch is exactly what this page exists to make visible, not hide.</p>
+<span id="msg" class="help"></span>
+<div id="trafficTable" class="help">Loading…</div>
+<h2>Live tunnel overview</h2>
+<p class="help">Every registered tunnel, which edge it's on, and how long its current
+connection has been up.</p>
+<div id="tunnelsTable" class="help">Loading…</div>
+<script>
+(function(){
+ function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+ function transportBadge(t){
+  return t === 'direct_p2p'
+   ? '<span class="badge ok">direct P2P (advertised)</span>'
+   : '<span class="help">relay</span>';
+ }
+ fetch('/admin-ui/traffic').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+  .then(function(rows){
+   if(!rows.length){ document.getElementById('trafficTable').innerHTML = '<p class="help">No tunnels registered yet.</p>'; return; }
+   var html = '<table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Connected</th>'
+     + '<th>Transport</th><th>Relay bytes in</th><th>Relay bytes out</th></tr></thead><tbody>';
+   rows.forEach(function(t){
+    html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td>'
+      + '<td><span class="status-dot ' + (t.connected ? 'live' : 'off') + '"></span>' + (t.connected ? 'yes' : 'no') + '</td>'
+      + '<td>' + transportBadge(t.transport) + '</td>'
+      + '<td>' + t.bytes_received.toLocaleString() + '</td><td>' + t.bytes_sent.toLocaleString() + '</td></tr>';
+   });
+   html += '</tbody></table>';
+   document.getElementById('trafficTable').innerHTML = html;
+  })
+  .catch(function(s){ document.getElementById('msg').textContent = 'could not load traffic (' + s + ')'; });
+ fetch('/admin-ui/tunnels').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+  .then(function(rows){
+   if(!rows.length){ document.getElementById('tunnelsTable').innerHTML = '<p class="help">No tunnels registered yet.</p>'; return; }
+   var html = '<table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Edge</th>'
+     + '<th>Transport</th><th>Uptime</th><th>Last seen</th></tr></thead><tbody>';
+   rows.forEach(function(t){
+    var uptime = t.uptime_seconds != null ? Math.round(t.uptime_seconds/60) + ' min' : '-';
+    var lastSeen = t.last_seen_unix ? new Date(t.last_seen_unix*1000).toLocaleString() : 'never';
+    html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td><td>' + esc(t.edge_id || '-') + '</td>'
+      + '<td>' + transportBadge(t.transport) + '</td><td>' + uptime + '</td><td>' + esc(lastSeen) + '</td></tr>';
+   });
+   html += '</tbody></table>';
+   document.getElementById('tunnelsTable').innerHTML = html;
+  })
+  .catch(function(s){ document.getElementById('msg').textContent = 'could not load tunnel overview (' + s + ')'; });
+})();
+</script>"#;
+    admin_page("traffic", session, body)
+}
+
+#[derive(Serialize)]
+struct TunnelOverviewRow {
+    tunnel_id: String,
+    name: String,
+    hostname: Option<String>,
+    routing_token_display: String,
+    connected: bool,
+    /// QUIC registrations (redundant Agents, #8, count separately from `fallback_parked`).
+    registrations: usize,
+    fallback_parked: usize,
+    /// ADR-0025 Decision 3: `"relay"` | `"direct_p2p"` -- see [`infer_transport`].
+    transport: &'static str,
+    /// ADR-0021's multi-edge ownership registry: which edge this tunnel is
+    /// currently assigned to, `None` when no ownership row exists yet (a
+    /// tunnel with no hostname ever set, or a deployment that hasn't wired the
+    /// registry up at all).
+    edge_id: Option<String>,
+    created_at: i64,
+    /// Seconds the CURRENT connection streak has been up, `None` while
+    /// disconnected. See [`tunnel_uptime_secs`].
+    uptime_seconds: Option<i64>,
+    /// Unix seconds of the most recent activity, `None` if never seen at all
+    /// (survives disconnect -- see `EdgeState::connection_timing`'s own doc).
+    last_seen_unix: Option<i64>,
+}
+
+/// Pure join of `tunnels` against `edge_status` (this process's bulk edge
+/// scrape) and `edge_by_token` (a pre-resolved `routing_token -> edge_id` map,
+/// so this function itself makes no DB calls and is directly unit-testable --
+/// see [`admin_ui_tunnels`] for where `edge_by_token` is actually built). `now`
+/// is threaded through to [`tunnel_uptime_secs`] rather than read here, for the
+/// same testability reason.
+fn build_tunnel_overview_rows(
+    now: i64,
+    tunnels: &[SubjectTunnel],
+    edge_status: &HashMap<String, EdgeBulkStatusEntry>,
+    edge_by_token: &HashMap<String, String>,
+) -> Vec<TunnelOverviewRow> {
+    tunnels
+        .iter()
+        .map(|t| {
+            let status = edge_status.get(&t.routing_token);
+            let connected = status.map(|s| s.connected).unwrap_or(false);
+            TunnelOverviewRow {
+                tunnel_id: t.id.clone(),
+                name: t.name.clone(),
+                hostname: t.hostname.clone(),
+                routing_token_display: redact_token_for_display(&t.routing_token),
+                connected,
+                registrations: status.map(|s| s.registrations).unwrap_or(0),
+                fallback_parked: status.map(|s| s.fallback_parked).unwrap_or(0),
+                transport: infer_transport(status.map(|s| s.direct).unwrap_or(false)),
+                edge_id: edge_by_token.get(&t.routing_token).cloned(),
+                created_at: t.created_at,
+                uptime_seconds: tunnel_uptime_secs(now, connected, status.and_then(|s| s.connected_since)),
+                last_seen_unix: status.and_then(|s| s.last_seen),
+            }
+        })
+        .collect()
+}
+
+/// `GET /admin-ui/tunnels` (admin-identity-gated, ADR-0025 Decision 6, read-only):
+/// live tunnel/topology overview -- every registered tunnel, which edge it's on
+/// (ADR-0021), transport, uptime, and last-seen, aggregated server-side into one
+/// response (one bulk edge scrape, one edge_mesh lookup per tunnel) rather than a
+/// dashboard the UI has to build itself out of N per-token calls.
+async fn admin_ui_tunnels(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let tunnels = match st.tunnels.all() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_tunnels/tunnels.all", e).into_response(),
+    };
+    let tokens: Vec<String> = tunnels.iter().map(|t| t.routing_token.clone()).collect();
+    let edge_status = edge_tunnel_status_bulk(&st, &tokens).await;
+    let mut edge_by_token = HashMap::new();
+    if let Some(mesh) = &st.observability.edge_mesh {
+        for t in &tunnels {
+            match mesh.lookup_by_token(&t.routing_token) {
+                Ok(Some((edge_id, _peer_addr))) => {
+                    edge_by_token.insert(t.routing_token.clone(), edge_id);
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ct-cp: admin_ui_tunnels: edge_mesh lookup for tunnel {} failed: {e}", t.id),
+            }
+        }
+    }
+    let rows = build_tunnel_overview_rows(admin_ui_now_secs(), &tunnels, &edge_status, &edge_by_token);
+    Json(rows).into_response()
+}
+
+#[derive(Serialize, Default)]
+struct EdgeHealthSummary {
+    /// Whether `CT_CP_EDGE_METRICS_URL` is set at all on this deployment --
+    /// every other field is `None` when this is `false`, distinctly from a
+    /// scrape that ran and came back empty/failed (see `detail`).
+    configured: bool,
+    /// The edge's own `/healthz` verdict (#498/#553's real gated-listener
+    /// check, reused as-is -- see `edge_health_summary`'s doc), `None` only
+    /// when `configured` is `false` or the `/healthz` URL couldn't be derived.
+    healthy: Option<bool>,
+    /// The edge `/healthz` response body verbatim (which loops it checked, or
+    /// why it's unhealthy) -- an operator-facing detail line, not parsed
+    /// further here.
+    detail: Option<String>,
+    active_tunnels: Option<i64>,
+    active_agents: Option<i64>,
+    relay_bytes_total: Option<i64>,
+    tcp_fallback_parked: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct HealthResp {
+    /// Same signal as this process's own `/readyz` (`SqliteLedger::ping`) --
+    /// reused directly, not re-derived (see `admin_ui_health`'s doc).
+    control_plane_ready: bool,
+    edge: EdgeHealthSummary,
+}
+
+/// Real HTTP calls against the edge's OWN `/healthz` and `/metrics` (reusing
+/// their exact, already-tested underlying data -- #498/#553's gated-listener
+/// classifier for `/healthz`, `EdgeState`'s live gauges via
+/// `render_edge_metrics` for `/metrics` -- rather than re-deriving either).
+/// `/healthz` is derived from [`ObservabilityConfig::edge_metrics_url`] by
+/// swapping its `/metrics` suffix for `/healthz`: both routes are served from
+/// the SAME `metrics_router` (`crates/edge/src/observe.rs`), so they are
+/// always co-located, and no separate config knob exists (or is needed) for
+/// the second URL.
+async fn edge_health_summary(edge_metrics_url: Option<&str>) -> EdgeHealthSummary {
+    let Some(metrics_url) = edge_metrics_url.filter(|s| !s.is_empty()) else {
+        return EdgeHealthSummary { configured: false, ..Default::default() };
+    };
+    let client = edge_admin_http_client();
+    let metrics_text = match client.get(metrics_url).timeout(std::time::Duration::from_secs(2)).send().await {
+        Ok(r) if r.status().is_success() => r.text().await.ok(),
+        Ok(r) => {
+            eprintln!("ct-cp: edge_health_summary: /metrics scrape returned {}", r.status());
+            None
+        }
+        Err(e) => {
+            eprintln!("ct-cp: edge_health_summary: /metrics scrape failed: {e}");
+            None
+        }
+    };
+    let (active_tunnels, active_agents, relay_bytes_total, tcp_fallback_parked) = match &metrics_text {
+        Some(body) => (
+            crate::service::parse_metric(body, "ct_edge_active_tunnels"),
+            crate::service::parse_metric(body, "ct_edge_active_agents"),
+            crate::service::parse_metric(body, "ct_edge_relay_bytes_total"),
+            crate::service::parse_metric(body, "ct_edge_tcp_fallback_parked"),
+        ),
+        None => (None, None, None, None),
+    };
+    let healthz_url = metrics_url.strip_suffix("/metrics").map(|base| format!("{base}/healthz"));
+    let (healthy, detail) = match &healthz_url {
+        Some(u) => match client.get(u).timeout(std::time::Duration::from_secs(2)).send().await {
+            Ok(r) => {
+                let ok = r.status().is_success();
+                let body = r.text().await.unwrap_or_default();
+                (Some(ok), Some(body.trim().to_string()))
+            }
+            Err(e) => (Some(false), Some(format!("/healthz request failed: {e}"))),
+        },
+        None => (
+            None,
+            Some("CT_CP_EDGE_METRICS_URL does not end in /metrics -- cannot derive the edge's /healthz URL".to_string()),
+        ),
+    };
+    EdgeHealthSummary { configured: true, healthy, detail, active_tunnels, active_agents, relay_bytes_total, tcp_fallback_parked }
+}
+
+/// `GET /admin-ui/health` (admin-identity-gated, ADR-0025 Decision 6, read-only):
+/// one glance at both processes' health -- this control plane's own readiness
+/// (`SqliteLedger::ping`, the same check `/readyz` runs) plus the edge's real
+/// `/healthz` verdict and a handful of its `/metrics` gauges, aggregated so an
+/// admin doesn't have to separately poll two endpoints on two hosts/ports.
+async fn admin_ui_health(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let control_plane_ready = st.ledger.ping().is_ok();
+    let edge = edge_health_summary(st.observability.edge_metrics_url.as_deref()).await;
+    Json(HealthResp { control_plane_ready, edge }).into_response()
+}
+
+// ===== end ADR-0025 Decision 6 =====
+
+// ===== ADR-0025 integration pass: dashboard, accounts, audit pages =====
+//
+// Brand new paths (no prior JSON contract from an earlier phase to preserve), so
+// these are plain HTML-only handlers -- no `wants_html` branch needed.
+
+/// `GET /admin-ui/` (admin-identity-gated): the dashboard home -- an at-a-glance
+/// health summary (client-fetched from the already-shipped `GET /admin-ui/health`,
+/// Observability phase) plus links to every other section.
+async fn admin_ui_dashboard(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    Html(admin_dashboard_page_html(&session)).into_response()
+}
+
+fn admin_dashboard_page_html(session: &crate::admin_identity::AdminSession) -> String {
+    let body = r#"<h1>Admin console</h1>
+<p class="help">At-a-glance health for the control plane and its edge (ADR-0025).</p>
+<div id="health" class="help">Loading…</div>
+<h2>Sections</h2>
+<ul class="steps">
+ <li><a href="/admin-ui/traffic">Traffic monitor</a> -- relay bytes and transport per tunnel.</li>
+ <li><a href="/admin-ui/accounts">Accounts</a> -- credit, block/unblock, delete, subdomain quota.</li>
+ <li><a href="/admin-ui/domains">Domains</a> -- onboard a zone, manage hostnames.</li>
+ <li><a href="/admin-ui/admins">Admins</a> -- who can reach this console.</li>
+ <li><a href="/admin-ui/certs">Certificates</a> -- front-door and per-domain cert expiry.</li>
+ <li><a href="/admin-ui/audit">Audit log</a> -- every privileged action, who and when.</li>
+</ul>
+<script>
+fetch('/admin-ui/health').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+ .then(function(h){
+  var edge = h.edge;
+  var edgeBadge = !edge.configured ? '<span class="badge warn">not configured</span>'
+    : (edge.healthy ? '<span class="badge ok">healthy</span>' : '<span class="badge blocked">unhealthy</span>');
+  var stats = '<div class="kv">'
+   + '<div class="stat"><span class="n">' + (h.control_plane_ready ? 'OK' : 'DOWN') + '</span><span class="l">Control plane</span></div>'
+   + '<div class="stat"><span class="n">' + edgeBadge + '</span><span class="l">Edge</span></div>';
+  if(edge.active_tunnels != null){ stats += '<div class="stat"><span class="n">' + edge.active_tunnels + '</span><span class="l">Active tunnels</span></div>'; }
+  if(edge.active_agents != null){ stats += '<div class="stat"><span class="n">' + edge.active_agents + '</span><span class="l">Active agents</span></div>'; }
+  stats += '</div>';
+  if(edge.detail){ stats += '<p class="help">' + String(edge.detail).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</p>'; }
+  document.getElementById('health').innerHTML = stats;
+ })
+ .catch(function(s){ document.getElementById('health').textContent = 'could not load health (' + s + ')'; });
+</script>"#;
+    admin_page("dashboard", session, body)
+}
+
+#[derive(Deserialize)]
+struct AccountsPageQuery {
+    q: Option<String>,
+}
+
+/// `GET /admin-ui/accounts?q=<substring>` (admin-identity-gated): account list +
+/// search, wired to the Account Ops phase's per-subject routes. `q` filters by a
+/// case-insensitive substring of either the subject or the account id (hex) --
+/// server-side, so it works with JS disabled and never ships the full account list
+/// to the client just to filter it there.
+///
+/// The listing itself ([`crate::storage::SqliteLedger::list_accounts`]) is new in
+/// this integration pass: the Account Ops phase shipped per-subject credit/block/
+/// delete/max-tunnels routes but never a bulk listing to find a subject from in the
+/// first place, which this page needs to exist at all -- see this session's final
+/// report for why that's flagged as a gap rather than silently worked around.
+async fn admin_ui_accounts_page(State(st): State<AdminUiState>, headers: HeaderMap, Query(q): Query<AccountsPageQuery>) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let rows = match st.ledger.list_accounts() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_accounts_page/list_accounts", e).into_response(),
+    };
+    let query = q.q.unwrap_or_default();
+    let filter = query.trim().to_ascii_lowercase();
+    let filtered: Vec<_> = if filter.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| r.subject.to_ascii_lowercase().contains(&filter) || r.account_hex.contains(&filter))
+            .collect()
+    };
+    Html(admin_accounts_page_html(&session, &filtered, query.trim())).into_response()
+}
+
+fn admin_accounts_page_html(session: &crate::admin_identity::AdminSession, rows: &[crate::storage::AccountSummaryRow], query: &str) -> String {
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>Subject</th><th>Account id</th><th>Balance</th><th>State</th><th>Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
+    );
+    if rows.is_empty() {
+        table.push_str(r#"<tr><td colspan="6" class="help">No accounts match.</td></tr>"#);
+    }
+    for r in rows {
+        let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
+        let block_label = if r.blocked { "Unblock" } else { "Block" };
+        table.push_str(&format!(
+            r#"<tr>
+<td>{subject}</td>
+<td><code style="word-break:break-all">{account}</code></td>
+<td>{balance}</td>
+<td>{state_badge}</td>
+<td>{max_tunnels}</td>
+<td><div style="display:flex;flex-wrap:wrap;gap:.35rem;align-items:center">
+ <form class="inline" data-subject="{subject}" onsubmit="return creditAccount(event)">
+  <input type="number" name="amount" min="1" value="100" style="width:5rem">
+  <button type="submit" class="sec">Credit</button>
+ </form>
+ <button class="sec" data-subject="{subject}" data-blocked="{blocked_flag}" onclick="return toggleBlock(event)">{block_label}</button>
+ <form class="inline" data-subject="{subject}" onsubmit="return setMaxTunnels(event)">
+  <input type="number" name="max" min="1" value="{max_tunnels}" style="width:4rem">
+  <button type="submit" class="sec">Set quota</button>
+ </form>
+ <button class="danger" data-subject="{subject}" onclick="return deleteAccount(event)">Delete</button>
+</div></td>
+</tr>"#,
+            subject = escape(&r.subject),
+            account = escape(&r.account_hex),
+            balance = r.balance,
+            state_badge = state_badge,
+            max_tunnels = r.max_tunnels,
+            blocked_flag = r.blocked,
+            block_label = block_label,
+        ));
+    }
+    table.push_str("</tbody></table>");
+
+    let body = format!(
+        r#"<h1>Accounts</h1>
+<p class="help">Every subject with an account, its credit balance, block state, and
+tunnel-creation quota. Credit grants call the same durable ledger a payment webhook
+credits -- this IS the admin top-up, not a separate mechanism.</p>
+<form method="get" action="/admin-ui/accounts" class="search-form">
+ <label>Search by subject or account id <input type="text" name="q" value="{query}" placeholder="kc-alice"></label>
+ <button type="submit" class="sec">Search</button>
+</form>
+{table}
+<script>
+function creditAccount(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var amount = parseInt(form.amount.value, 10);
+ if(!amount || amount < 1) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/credit', {{amount: amount}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('credit failed: ' + e.message); }});
+ return false;
+}}
+function toggleBlock(ev){{
+ ev.preventDefault();
+ var btn = ev.target;
+ var subject = btn.getAttribute('data-subject');
+ var blocked = btn.getAttribute('data-blocked') === 'true';
+ var action = blocked ? 'unblock' : 'block';
+ if(action === 'block' && !window.confirm('Block ' + subject + '? This refuses new credit-gated issuance and self-service tunnel creation for this account.')) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/' + action)
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert(action + ' failed: ' + e.message); }});
+ return false;
+}}
+function setMaxTunnels(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var max = parseInt(form.max.value, 10);
+ if(!max || max < 1) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/max-tunnels', {{max: max}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('quota update failed: ' + e.message); }});
+ return false;
+}}
+function deleteAccount(ev){{
+ ev.preventDefault();
+ var subject = ev.target.getAttribute('data-subject');
+ if(!window.confirm('Permanently delete ' + subject + '? This revokes every tunnel and deletes every channel, topology, network, and pipeline this account owns, plus the ledger row itself. This cannot be undone.')) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/delete')
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('delete failed: ' + e.message); }});
+ return false;
+}}
+</script>"#,
+        query = escape(query),
+        table = table,
+    );
+    admin_page("accounts", session, &body)
+}
+
+/// `GET /admin-ui/audit` (admin-identity-gated): the most recent admin-audit-log
+/// entries (Foundation phase's `audit_log::SqliteAuditLog::recent`) -- who did
+/// what, to what, and when. Any verified admin may view this (mirrors
+/// `admin_ui_list_admins`'s "viewing isn't itself a privileged mutation" posture);
+/// only the actions themselves are privileged, not reading the record of them.
+async fn admin_ui_audit_page(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let entries = match st.audit.recent(200) {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_audit_page/recent", e).into_response(),
+    };
+    Html(admin_audit_page_html(&session, &entries)).into_response()
+}
+
+fn admin_audit_page_html(session: &crate::admin_identity::AdminSession, entries: &[crate::audit_log::AuditLogEntry]) -> String {
+    let mut table = String::from(
+        r#"<table class="data"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody>"#,
+    );
+    if entries.is_empty() {
+        table.push_str(r#"<tr><td colspan="5" class="help">No admin actions recorded yet.</td></tr>"#);
+    }
+    for e in entries {
+        table.push_str(&format!(
+            r#"<tr><td><span data-ts="{at}">{at}</span></td><td>{actor}</td><td><code>{action}</code></td><td>{target}</td><td class="help">{detail}</td></tr>"#,
+            at = e.at,
+            actor = escape(&e.actor_email),
+            action = escape(&e.action),
+            target = e.target.as_deref().map(escape).unwrap_or_else(|| "-".to_string()),
+            detail = e.detail.as_deref().map(escape).unwrap_or_default(),
+        ));
+    }
+    table.push_str("</tbody></table>");
+    let body = format!(
+        r#"<h1>Audit log</h1>
+<p class="help">Every privileged admin action recorded immutably -- actor, action, target, and
+detail (ADR-0025 Decision 6). The most recent {count} entries, newest first.</p>
+{table}"#,
+        count = entries.len(),
+        table = table,
+    );
+    admin_page("audit", session, &body)
+}
+
+// ===== end ADR-0025 integration pass: dashboard, accounts, audit pages =====
+
+// ===== end ADR-0025 `/admin-ui/*` =====
 
 /// A new tunnel from the create form. #439 follow-up: linked from the UI
 /// (`tunnels_html`'s create-another-tunnel form) whenever the caller's owned
@@ -723,6 +2774,30 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
     let Some(host) = tunnel.hostname.as_deref() else {
         return;
     };
+    // ADR-0025: the enforcer for `POST /admin-ui/hostnames/:host/disable` -- this
+    // is the ONE function every path that would (re-)authorize a hostname at the
+    // edge already funnels through (auto-provision, admin_provision_tunnel,
+    // create_tunnel), so it is the one place the check needs to live. Fails
+    // CLOSED on a storage error (skips authorization) rather than open: the whole
+    // point of this check is a security control an admin explicitly asked for,
+    // and a transient DB hiccup letting a disabled hostname back onto the edge
+    // would defeat it silently -- a spurious skip on a healthy, non-disabled
+    // hostname self-heals on the next call, which a live block being bypassed
+    // does not.
+    match st.tunnels.is_hostname_disabled(host) {
+        Ok(true) => {
+            eprintln!(
+                "ct-cp: edge authorize-host SKIPPED for {host} -- hostname is admin-disabled \
+                 (ADR-0025); re-enable it via /admin-ui/hostnames/{host}/enable first"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("ct-cp: is_hostname_disabled check for {host} failed: {e} -- authorize SKIPPED (fail-closed)");
+            return;
+        }
+    }
     // #23 BP4b-c: authorize the hostname at the edge (host -> routing token)
     // so the agent's 'H' bind is accepted under CT_EDGE_REQUIRE_HOST_AUTH.
     if let Some(edge) = &st.edge_admin {
@@ -798,18 +2873,34 @@ async fn create_tunnel(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
     }
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
+    };
+    // ADR-0025: the tunnel-creation admission gate for an admin-blocked account --
+    // checked before the max-tunnels gate below so a blocked account gets an
+    // honest "you are blocked" rather than being told it's merely over its quota.
+    // This is the OTHER real admission point the admin console's block action
+    // relies on, alongside `SqliteLedger::debit`/`debit_and_record_issuance` --
+    // portal-created tunnels never call those (they're free within the account's
+    // `max_tunnels`), so without this check here specifically, a blocked account
+    // could still self-serve new tunnels.
+    match st.ledger.is_blocked(&account) {
+        Ok(true) => {
+            return (StatusCode::FORBIDDEN, "this account is blocked from creating tunnels").into_response()
+        }
+        Ok(false) => {}
+        Err(e) => return internal_error("create_tunnel/is_blocked", e).into_response(),
+    }
     // #214: the Standard tier's default is 1 tunnel per account, but an
     // operator can raise this for a SPECIFIC account (SqliteLedger::
     // set_max_tunnels, via POST /admin/accounts/:subject/max-tunnels) to
     // unlock self-service creation of additional subdomains -- so the gate
     // compares against that account's own limit, not a hardcoded "ever own
     // one at all".
-    let max = match st.ledger.account_for_subject(&subject) {
-        Ok(account) => match st.ledger.max_tunnels(&account) {
-            Ok(m) => m,
-            Err(e) => return internal_error("create_tunnel/max_tunnels", e).into_response(),
-        },
-        Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
+    let max = match st.ledger.max_tunnels(&account) {
+        Ok(m) => m,
+        Err(e) => return internal_error("create_tunnel/max_tunnels", e).into_response(),
     };
     let hostname = st
         .dns
@@ -3206,6 +5297,182 @@ mod tests {
         assert_eq!(redact_routing_tokens("returned 503 deadbeef"), "returned 503 deadbeef");
     }
 
+    // ===== ADR-0025 Decision 6: observability (traffic/tunnels) pure-logic tests =====
+    //
+    // `infer_transport`/`redact_token_for_display`/`tunnel_uptime_secs`/
+    // `build_traffic_rows`/`build_tunnel_overview_rows` are pure joins/derivations
+    // with no I/O, unlike the handlers around them -- these are the actual "genuine
+    // logic" ADR-0025 calls out, so they get real unit tests here rather than only
+    // being exercised indirectly through a live edge/DB in an integration test.
+
+    #[test]
+    fn infer_transport_reports_direct_p2p_only_when_a_direct_advertisement_is_active() {
+        // ADR-0025 Decision 3: an availability signal, never a byte count -- exactly
+        // two values, no third "unknown" state (see the fn's own doc comment).
+        assert_eq!(infer_transport(true), "direct_p2p");
+        assert_eq!(infer_transport(false), "relay");
+    }
+
+    #[test]
+    fn redact_token_for_display_keeps_prefix_and_suffix_but_hides_the_middle() {
+        let token = format!("a1b2c3d4e5f6{}", "0".repeat(52));
+        assert_eq!(token.len(), 64, "sanity: a real routing token is 64 hex chars");
+        let shown = redact_token_for_display(&token);
+        assert_eq!(shown, "a1b2c3d4…0000");
+        assert!(!shown.contains(&token), "the raw routing token must never appear in the display form");
+        assert!(shown.len() < token.len(), "display form is materially shorter than the real token");
+    }
+
+    #[test]
+    fn redact_token_for_display_leaves_a_short_value_alone() {
+        // The fn's own documented escape hatch (`hex.len() <= 12`) -- exercised so a
+        // short/malformed token can't silently start panicking on the `hex[..8]` slice.
+        assert_eq!(redact_token_for_display("short"), "short");
+        let twelve = "a".repeat(12);
+        assert_eq!(redact_token_for_display(&twelve), twelve);
+    }
+
+    #[test]
+    fn tunnel_uptime_secs_is_none_while_disconnected_even_if_connected_since_is_stale() {
+        // A disconnected tunnel must never show an uptime, regardless of whatever
+        // stale `connected_since` might still be lying around -- the whole reason
+        // this takes `connected` as its own explicit parameter rather than inferring
+        // it from `connected_since.is_some()`.
+        assert_eq!(tunnel_uptime_secs(1_000, false, Some(500)), None);
+        assert_eq!(tunnel_uptime_secs(1_000, false, None), None);
+    }
+
+    #[test]
+    fn tunnel_uptime_secs_is_none_when_connected_but_the_edge_never_reported_a_streak_start() {
+        assert_eq!(tunnel_uptime_secs(1_000, true, None), None);
+    }
+
+    #[test]
+    fn tunnel_uptime_secs_is_now_minus_since_clamped_at_zero() {
+        assert_eq!(tunnel_uptime_secs(1_500, true, Some(1_000)), Some(500));
+        // Clock skew between this process and the edge's `connected_since` report
+        // must never produce a negative uptime.
+        assert_eq!(tunnel_uptime_secs(900, true, Some(1_000)), Some(0));
+    }
+
+    fn test_subject_tunnel(id: &str, routing_token: &str) -> SubjectTunnel {
+        SubjectTunnel {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            hostname: Some(format!("{id}.example.org")),
+            created_at: 1_700_000_000,
+            routing_token: routing_token.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_traffic_rows_defaults_an_unreported_tunnel_to_disconnected_relay_zero_bytes() {
+        // A tunnel the bulk edge scrape has no entry for at all (never connected
+        // since the edge's own process start, or the scrape itself failed) must
+        // still show up as a row -- degraded to the honest defaults, not dropped.
+        let t = test_subject_tunnel("t1", &"a".repeat(64));
+        let rows = build_traffic_rows(std::slice::from_ref(&t), &HashMap::new());
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].connected);
+        assert_eq!(rows[0].transport, "relay");
+        assert_eq!(rows[0].bytes_received, 0);
+        assert_eq!(rows[0].bytes_sent, 0);
+    }
+
+    #[test]
+    fn build_traffic_rows_reports_real_bytes_and_direct_transport_for_a_known_tunnel() {
+        let token = "b".repeat(64);
+        let t = test_subject_tunnel("t2", &token);
+        let mut edge_status = HashMap::new();
+        edge_status.insert(
+            token.clone(),
+            EdgeBulkStatusEntry {
+                token: token.clone(),
+                connected: true,
+                bytes_received: 111,
+                bytes_sent: 222,
+                direct: true,
+                ..Default::default()
+            },
+        );
+        let rows = build_traffic_rows(std::slice::from_ref(&t), &edge_status);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].connected);
+        assert_eq!(rows[0].transport, "direct_p2p");
+        assert_eq!(rows[0].bytes_received, 111);
+        assert_eq!(rows[0].bytes_sent, 222);
+    }
+
+    #[test]
+    fn build_traffic_rows_never_puts_the_raw_routing_token_in_the_response() {
+        // The whole reason `redact_token_for_display` exists -- prove the join
+        // actually calls it rather than leaking `t.routing_token` verbatim.
+        let token = "c".repeat(64);
+        let t = test_subject_tunnel("t3", &token);
+        let rows = build_traffic_rows(std::slice::from_ref(&t), &HashMap::new());
+        assert_ne!(rows[0].routing_token_display, token);
+        assert!(rows[0].routing_token_display.len() < token.len());
+    }
+
+    #[test]
+    fn build_tunnel_overview_rows_joins_edge_id_and_reports_uptime_only_while_connected() {
+        let token = "d".repeat(64);
+        let t = test_subject_tunnel("t4", &token);
+        let mut edge_status = HashMap::new();
+        edge_status.insert(
+            token.clone(),
+            EdgeBulkStatusEntry {
+                token: token.clone(),
+                connected: true,
+                registrations: 2,
+                fallback_parked: 1,
+                direct: false,
+                connected_since: Some(1_000),
+                last_seen: Some(1_450),
+                ..Default::default()
+            },
+        );
+        let mut edge_by_token = HashMap::new();
+        edge_by_token.insert(token.clone(), "edge-eu-1".to_string());
+
+        let rows = build_tunnel_overview_rows(1_500, std::slice::from_ref(&t), &edge_status, &edge_by_token);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.connected);
+        assert_eq!(row.registrations, 2);
+        assert_eq!(row.fallback_parked, 1);
+        assert_eq!(row.transport, "relay");
+        assert_eq!(row.edge_id.as_deref(), Some("edge-eu-1"));
+        assert_eq!(row.uptime_seconds, Some(500));
+        assert_eq!(row.last_seen_unix, Some(1_450));
+    }
+
+    #[test]
+    fn build_tunnel_overview_rows_reports_no_uptime_but_keeps_last_seen_for_a_disconnected_tunnel() {
+        // The "last seen" column's entire reason to exist: it must survive a
+        // disconnect even though uptime (correctly) does not.
+        let token = "e".repeat(64);
+        let t = test_subject_tunnel("t5", &token);
+        let mut edge_status = HashMap::new();
+        edge_status.insert(
+            token.clone(),
+            EdgeBulkStatusEntry {
+                token: token.clone(),
+                connected: false,
+                connected_since: None,
+                last_seen: Some(1_000),
+                ..Default::default()
+            },
+        );
+        let rows = build_tunnel_overview_rows(2_000, std::slice::from_ref(&t), &edge_status, &HashMap::new());
+        assert!(!rows[0].connected);
+        assert_eq!(rows[0].uptime_seconds, None);
+        assert_eq!(rows[0].last_seen_unix, Some(1_000));
+        assert_eq!(rows[0].edge_id, None, "no edge_mesh entry for this token -> None, not fabricated");
+    }
+
+    // ===== end ADR-0025 Decision 6 pure-logic tests =====
+
     fn session_header(subject: &str) -> String {
         format!("ct_portal_session={}", sign_session_for_test(KEY, subject))
     }
@@ -4303,6 +6570,77 @@ mod tests {
         assert_eq!(created.routing_token, routing_token);
     }
 
+    /// ADR-0025 "flag needs an enforcer" fail-first proof: a hostname an admin
+    /// has disabled must never reach the edge's authorize-host call, even via
+    /// the operator-only `admin_provision_tunnel` escape hatch -- the row
+    /// still gets CREATED (disabling a hostname doesn't retroactively forbid
+    /// naming it), but `authorize_hostname`'s edge push must be skipped.
+    /// Without the `is_hostname_disabled` check in `authorize_hostname`, this
+    /// test fails: the mock endpoint receives the call.
+    #[tokio::test]
+    async fn admin_provision_tunnel_never_authorizes_a_disabled_hostname_at_the_edge() {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x77u8; 32];
+        let host = "blocked.bunsenbrenner.org";
+
+        let received = Arc::new(std::sync::Mutex::new(0u32));
+        let mock = Router::new()
+            .route(
+                "/admin/authorize-host/:token/:host",
+                post({
+                    let received = received.clone();
+                    move || {
+                        let received = received.clone();
+                        async move {
+                            *received.lock().unwrap() += 1;
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        tunnels.disable_hostname(host, "admin@example.com", 1000).unwrap();
+
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels.clone(),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+            None,
+            None,
+            EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
+            Some(secret),
+        );
+
+        let body = format!(r#"{{"subject":"someone","name":"blocked","hostname":"{host}"}}"#);
+        let req = Request::post("/admin/provision-tunnel")
+            .header("content-type", "application/json")
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the tunnel ROW is still created");
+
+        assert_eq!(
+            tunnels.list_for_subject("someone").unwrap()[0].hostname.as_deref(),
+            Some(host),
+            "disabling a hostname doesn't forbid naming a new tunnel with it"
+        );
+        assert_eq!(
+            *received.lock().unwrap(),
+            0,
+            "authorize-host must NEVER be called at the edge for a disabled hostname"
+        );
+    }
+
     #[tokio::test]
     async fn admin_set_max_tunnels_unlocks_self_service_creation_for_one_specific_account() {
         // #214: remote asked to self-service-create MORE than the Standard
@@ -4371,6 +6709,744 @@ mod tests {
 
         assert_eq!(tunnels.list_for_subject(remote).unwrap().len(), 3, "remote really owns 3 real tunnel rows, not just 3 successful responses");
     }
+
+    // ===== ADR-0025 `/admin-ui/*` tests =====
+
+    const SUPER_ADMIN: &str = "super@example.com";
+
+    /// One app merging BOTH the self-service portal API and the `/admin-ui/*`
+    /// router over the SAME `ledger`/`tunnels` `Arc`s -- exactly how
+    /// `service.rs`'s `persistent_control_plane_router` wires them together in
+    /// production, which matters for the blocked-account test below (the block
+    /// action and the tunnel-creation attempt must observe the same storage).
+    fn test_admin_ui_app() -> (
+        Router,
+        Arc<SqliteLedger>,
+        Arc<SqliteTunnelStore>,
+        Arc<crate::admin_identity::AdminIdentity>,
+    ) {
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
+        let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
+        let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+
+        let portal_app = portal_api_router(
+            KEY,
+            ledger.clone(),
+            tunnels.clone(),
+            enrollment,
+            bootstrap,
+            "https://portal.example",
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            None,
+        );
+        let admin_app = admin_ui_router(
+            KEY,
+            admin.clone(),
+            audit,
+            ledger.clone(),
+            tunnels.clone(),
+            channels,
+            topologies,
+            networks,
+            pipelines,
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+            ObservabilityConfig::default(),
+        );
+        (portal_app.merge(admin_app), ledger, tunnels, admin)
+    }
+
+    async fn admin_ui_req(app: &Router, method: &str, path: &str, cookie: &str, json_body: Option<&str>) -> StatusCode {
+        let mut b = Request::builder().method(method).uri(path).header("cookie", cookie);
+        let body = match json_body {
+            Some(j) => {
+                b = b.header("content-type", "application/json");
+                Body::from(j.to_string())
+            }
+            None => Body::empty(),
+        };
+        app.clone().oneshot(b.body(body).unwrap()).await.unwrap().status()
+    }
+
+    /// Every `/admin-ui/*` route must refuse a session that is verified (a real
+    /// `email_verified` IdP assertion, per `admin_session_from_headers`) but not
+    /// in the `admins` table -- `403`, not merely "not 200".
+    #[tokio::test]
+    async fn every_admin_ui_route_refuses_a_verified_but_non_admin_session_403() {
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        ledger.account_for_subject("kc-target").unwrap();
+        let non_admin = session_header_with_email("kc-someone", "not-an-admin@example.com");
+
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("POST", "/admin-ui/accounts/kc-target/credit", Some(r#"{"amount":10}"#)),
+            ("POST", "/admin-ui/accounts/kc-target/block", None),
+            ("POST", "/admin-ui/accounts/kc-target/unblock", None),
+            ("POST", "/admin-ui/accounts/kc-target/delete", None),
+            ("POST", "/admin-ui/accounts/kc-target/max-tunnels", Some(r#"{"max":3}"#)),
+            ("GET", "/admin-ui/admins", None),
+            ("POST", "/admin-ui/admins", Some(r#"{"email":"new@example.com"}"#)),
+            ("DELETE", "/admin-ui/admins/someone@example.com", None),
+            // ADR-0025 Decision 4/6: hostname disable/enable + domain onboarding + certs.
+            ("POST", "/admin-ui/hostnames/blocked.example/disable", None),
+            ("POST", "/admin-ui/hostnames/blocked.example/enable", None),
+            ("GET", "/admin-ui/hostnames/disabled", None),
+            ("GET", "/admin-ui/domains", None),
+            ("POST", "/admin-ui/domains", Some(r#"{"zone":"example.org"}"#)),
+            ("POST", "/admin-ui/domains/example.org/hostnames", Some(r#"{"subdomain":"app"}"#)),
+            ("GET", "/admin-ui/certs", None),
+            // ADR-0025 Decision 6: read-only observability.
+            ("GET", "/admin-ui/traffic", None),
+            ("GET", "/admin-ui/tunnels", None),
+            ("GET", "/admin-ui/health", None),
+        ];
+        for (method, path, body) in cases {
+            let status = admin_ui_req(&app, method, path, &non_admin, *body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} must 403 a verified non-admin session");
+        }
+    }
+
+    /// No session at all -> `401` (distinct from the 403-for-verified-non-admin
+    /// case above), on a representative route -- `admin_session_from_headers`'s
+    /// own `401`-vs-`403` contract is exhaustively unit-tested in
+    /// `admin_identity.rs`; this just proves the ROUTING actually reaches that
+    /// same check rather than, say, redirecting like the self-service `/portal/*`
+    /// routes do.
+    #[tokio::test]
+    async fn admin_ui_route_with_no_session_at_all_is_401_not_a_redirect() {
+        let (app, ..) = test_admin_ui_app();
+        let resp = app
+            .oneshot(Request::post("/admin-ui/accounts/kc-target/block").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `admin_ui_add_admin`/`admin_ui_remove_admin` require the SUPER-admin
+    /// specifically -- a regular (non-super) admin is an admin (passes
+    /// `admin_ui_authed`) but must still be refused here, with the target admin
+    /// row provably untouched.
+    #[tokio::test]
+    async fn admin_management_routes_refuse_a_regular_non_super_admin() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        admin.add_admin(SUPER_ADMIN, "regular-admin@example.com").unwrap();
+        let regular = session_header_with_email("kc-regular", "regular-admin@example.com");
+
+        let status = admin_ui_req(&app, "POST", "/admin-ui/admins", &regular, Some(r#"{"email":"third@example.com"}"#)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!admin.is_admin("third@example.com"), "the refused add must not have happened");
+
+        let status = admin_ui_req(&app, "DELETE", "/admin-ui/admins/regular-admin@example.com", &regular, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(admin.is_admin("regular-admin@example.com"), "the refused remove must not have happened");
+    }
+
+    #[tokio::test]
+    async fn super_admin_can_add_list_and_remove_a_regular_admin() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let status = admin_ui_req(&app, "POST", "/admin-ui/admins", &super_session, Some(r#"{"email":"second@example.com"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(admin.is_admin("second@example.com"));
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/admin-ui/admins")
+                    .header("cookie", &super_session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json.as_array().unwrap().iter().any(|r| r["email"] == "second@example.com"),
+            "listing includes the newly added admin: {json}"
+        );
+
+        let status = admin_ui_req(&app, "DELETE", "/admin-ui/admins/second@example.com", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!admin.is_admin("second@example.com"));
+    }
+
+    #[tokio::test]
+    async fn admin_ui_credit_route_credits_the_target_accounts_real_ledger_balance() {
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        let account = ledger.account_for_subject("kc-target").unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 0);
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/credit", &super_session, Some(r#"{"amount":500}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ledger.balance(&account).unwrap(), 500, "the real durable ledger balance actually moved");
+    }
+
+    /// Fail-first proof (ADR-0025): before `create_tunnel`'s `is_blocked` check
+    /// existed, this exact sequence (admin blocks the account, then that
+    /// account's own session tries `/portal/tunnels`) returned `303 See Other`
+    /// (self-service creation succeeded) instead of `403` -- the block flag was
+    /// set in storage but nothing on the tunnel-creation path ever read it. This
+    /// proves the check is real: the admin-console block action, the self-service
+    /// tunnel-creation admission path, and the SAME underlying account row.
+    #[tokio::test]
+    async fn a_blocked_account_is_refused_when_it_tries_to_create_a_tunnel() {
+        let (app, ledger, tunnels, _admin) = test_admin_ui_app();
+        let account = ledger.account_for_subject("kc-blocked").unwrap();
+        // Raise the limit so a refusal can only be the blocked check, never the
+        // (also-real, separately tested) max-tunnels quota.
+        ledger.set_max_tunnels(&account, 5).unwrap();
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-blocked/block", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ledger.is_blocked(&account).unwrap());
+
+        assert_eq!(
+            post_form(&app, "/portal/tunnels", "kc-blocked", "name=my-tunnel").await,
+            StatusCode::FORBIDDEN,
+            "a blocked account must be refused tunnel creation, not merely quota-limited"
+        );
+        assert!(tunnels.list_for_subject("kc-blocked").unwrap().is_empty(), "no tunnel was actually created");
+
+        // Unblock: the same account can now create normally -- proves the check
+        // is a live gate, not an accidental permanent lockout once blocked.
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-blocked/unblock", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(post_form(&app, "/portal/tunnels", "kc-blocked", "name=my-tunnel").await, StatusCode::SEE_OTHER);
+        assert_eq!(tunnels.list_for_subject("kc-blocked").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_ui_delete_account_cascades_and_removes_the_ledger_row_for_any_subject() {
+        let (app, ledger, tunnels, _admin) = test_admin_ui_app();
+        tunnels.create("kc-target", "t1", None).unwrap();
+        let account = ledger.account_for_subject("kc-target").unwrap();
+        ledger.credit(&account, 42).unwrap();
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/delete", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert!(tunnels.list_for_subject("kc-target").unwrap().is_empty(), "owned tunnels revoked");
+        // account_for_subject idempotently RE-CREATES a fresh (zero-balance)
+        // account for an unseen subject -- so a freshly-minted, different id with
+        // a zero balance proves the OLD funded row is really gone, not merely
+        // left alone.
+        let recreated = ledger.account_for_subject("kc-target").unwrap();
+        assert_ne!(recreated.0, account.0, "a fresh account id was minted -- the old row is gone");
+        assert_eq!(ledger.balance(&recreated).unwrap(), 0);
+    }
+
+    // ===== ADR-0025 Decision 4/6: hostname disable/enable + domains + certs =====
+
+    /// Builds a standalone `/admin-ui/*` app (not via [`test_admin_ui_app`], which
+    /// always uses an empty [`DomainAdminConfig`]) so each test below can inject
+    /// its own edge-admin/deSEC mock + `managed_domains` store.
+    fn domain_admin_ui_app(tunnels: Arc<SqliteTunnelStore>, managed_domains: Arc<crate::storage::SqliteManagedDomains>, domain_admin: DomainAdminConfig) -> Router {
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        admin_ui_router(
+            KEY,
+            admin,
+            audit,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels,
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            managed_domains,
+            domain_admin,
+            ObservabilityConfig::default(),
+        )
+    }
+
+    /// Fail-first proof of both halves of ADR-0025's hostname-disable contract:
+    /// the CURRENTLY-live tunnel on that hostname gets revoked at the edge (the
+    /// same `POST /admin/revoke/:token` primitive `delete_tunnel` uses), AND the
+    /// hostname is marked disabled so a FUTURE `authorize_hostname` call would be
+    /// refused (proven directly against `is_hostname_disabled`, since the
+    /// enforcement itself is proven end-to-end by
+    /// `admin_provision_tunnel_never_authorizes_a_disabled_hostname_at_the_edge`
+    /// above). `enable` then reverses only the future-block half.
+    #[tokio::test]
+    async fn admin_ui_disable_hostname_revokes_the_live_tunnel_and_blocks_future_reauthorization() {
+        use axum::extract::Path as AxPath;
+        let host = "blocked.example.org";
+        let received: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = Router::new().route(
+            "/admin/revoke/:token",
+            post({
+                let received = received.clone();
+                move |AxPath(token): AxPath<String>| {
+                    let received = received.clone();
+                    async move {
+                        received.lock().unwrap().push(token);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let created = match tunnels.create("alice", "site", Some(host)).unwrap() {
+            crate::storage::CreateTunnelOutcome::Created(t) => t,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let app = domain_admin_ui_app(
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { edge_admin: Some((format!("http://{addr}"), "edge-secret".to_string())), ..Default::default() },
+        );
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", &format!("/admin-ui/hostnames/{host}/disable"), &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[created.routing_token.clone()],
+            "the tunnel currently on this hostname was revoked at the edge"
+        );
+        assert!(tunnels.is_hostname_disabled(host).unwrap());
+
+        // enable reverses the future-block half.
+        let status = admin_ui_req(&app, "POST", &format!("/admin-ui/hostnames/{host}/enable"), &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!tunnels.is_hostname_disabled(host).unwrap());
+    }
+
+    /// A hostname with no live tunnel still gets disabled (nothing to revoke,
+    /// but the future-block half must still apply) -- and the response is still
+    /// `200`, not an error, since "nothing to revoke" isn't a failure.
+    #[tokio::test]
+    async fn admin_ui_disable_hostname_with_no_live_tunnel_still_blocks_future_reauthorization() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(), // no edge_admin configured at all
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/hostnames/never-existed.example/disable", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(tunnels.is_hostname_disabled("never-existed.example").unwrap());
+    }
+
+    #[tokio::test]
+    async fn admin_ui_register_domain_issues_apex_and_wildcard_a_records_then_persists_the_zone() {
+        let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = Router::new().route(
+            "/domains/:domain/rrsets/",
+            axum::routing::patch({
+                let captured = captured.clone();
+                move |body: String| {
+                    let captured = captured.clone();
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig {
+                desec_token: Some("t".to_string()),
+                desec_api_base: Some(format!("http://{addr}")),
+                dns_edge_ip: Some("9.9.9.9".to_string()),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let bodies = captured.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "apex + wildcard A records, both pushed: {bodies:?}");
+        assert!(bodies.iter().any(|b| b.contains("\"subname\":\"\"") && b.contains("9.9.9.9")), "apex record present: {bodies:?}");
+        assert!(bodies.iter().any(|b| b.contains("\"subname\":\"*\"") && b.contains("9.9.9.9")), "wildcard record present: {bodies:?}");
+
+        let zone = managed_domains.zone("example.org").unwrap().expect("zone persisted");
+        assert_eq!(zone.status, "active");
+        assert_eq!(zone.added_by.as_deref(), Some(SUPER_ADMIN));
+
+        // Re-registering an already-managed zone is a conflict, not a second DNS push.
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(captured.lock().unwrap().len(), 2, "no new DNS calls for an already-managed zone");
+
+        let listed = admin_ui_req(&app, "GET", "/admin-ui/domains", &super_session, None).await;
+        assert_eq!(listed, StatusCode::OK);
+    }
+
+    /// Fail-first proof of "do not half-register a broken zone": when the apex
+    /// A-record push fails (e.g. the zone isn't actually delegated to deSEC
+    /// yet), the handler must report a clear error AND leave no `managed_domains`
+    /// row behind -- a zone that "looks managed" with no real DNS is worse than
+    /// having to retry.
+    #[tokio::test]
+    async fn admin_ui_register_domain_leaves_no_row_behind_when_the_apex_record_push_fails() {
+        let mock = Router::new().route("/domains/:domain/rrsets/", axum::routing::patch(|| async { StatusCode::BAD_REQUEST }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig {
+                desec_token: Some("t".to_string()),
+                desec_api_base: Some(format!("http://{addr}")),
+                dns_edge_ip: Some("9.9.9.9".to_string()),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"never-delegated.example"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            managed_domains.zone("never-delegated.example").unwrap().is_none(),
+            "a failed apex DNS push must not leave a managed_domains row behind"
+        );
+    }
+
+    /// `POST /admin-ui/domains` without `DESEC_TOKEN`/`CT_CP_DNS_EDGE_IP`
+    /// configured reports a clear `503`, not a confusing failure deep inside a
+    /// DNS client construction -- and, same as the failure-path test above,
+    /// leaves no row behind.
+    #[tokio::test]
+    async fn admin_ui_register_domain_503s_clearly_when_desec_is_not_configured() {
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig::default(),
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains", &super_session, Some(r#"{"zone":"example.org"}"#)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(managed_domains.zone("example.org").unwrap().is_none());
+    }
+
+    /// `POST /admin-ui/domains/:zone/hostnames` against a zone that was never
+    /// registered via `POST /admin-ui/domains` must `404`, not silently try to
+    /// issue a cert for it anyway.
+    #[tokio::test]
+    async fn admin_ui_add_domain_hostname_404s_for_an_unmanaged_zone() {
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains/never-registered.example/hostnames", &super_session, Some(r#"{"subdomain":"app"}"#)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Proves the full cert-issuance plumbing against a FAKE `issue_cert` (never
+    /// touches real acme.sh/deSEC), and that a successful issuance is recorded in
+    /// `managed_domains` so `GET /admin-ui/certs` can find it afterward.
+    #[tokio::test]
+    async fn admin_ui_add_domain_hostname_issues_a_cert_and_records_it_for_the_certs_dashboard() {
+        let dir = std::env::temp_dir().join(format!("ct-cp-domainhostname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("lib-acme.sh");
+        std::fs::write(
+            &script,
+            r#"issue_cert() {
+  local host="$1" dir="$2"
+  mkdir -p "$dir"
+  echo "cert" > "$dir/fullchain.pem"
+  echo "key" > "$dir/privkey.pem"
+}
+"#,
+        )
+        .unwrap();
+
+        let managed_domains = Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap());
+        managed_domains.add_zone("example.org", SUPER_ADMIN, 1000, "active").unwrap();
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            managed_domains.clone(),
+            DomainAdminConfig {
+                managed_cert: Some(ManagedCertConfig {
+                    acme: crate::cert_issuer::AcmeConfig {
+                        lib_acme_path: script.to_string_lossy().into_owned(),
+                        acme_home: dir.join("acme-home").to_string_lossy().into_owned(),
+                        acme_email: "acme-test@example.com".to_string(),
+                        desec_token: Some("t".to_string()),
+                    },
+                    cert_base_dir: dir.join("certs").to_string_lossy().into_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/domains/example.org/hostnames", &super_session, Some(r#"{"subdomain":"app"}"#)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let rows = managed_domains.list_hostname_certs().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hostname, "app.example.org");
+        assert_eq!(rows[0].zone, "example.org");
+        assert!(std::path::Path::new(&rows[0].cert_dir).join("fullchain.pem").is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /admin-ui/certs`: a front-door slot with no path configured reports
+    /// `not_configured`; one pointed at a missing file reports `unreadable`
+    /// (never silently omitted from the response, per ADR-0025's own
+    /// requirement) -- proven together so the two states are visibly distinct.
+    #[tokio::test]
+    async fn admin_ui_certs_reports_not_configured_and_unreadable_as_distinct_explicit_states() {
+        let app = domain_admin_ui_app(
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig {
+                front_door_certs: FrontDoorCertPaths {
+                    portal: None,
+                    auth: Some("/does/not/exist/fullchain.pem".to_string()),
+                    masque: None,
+                    admin_ui: None,
+                },
+                ..Default::default()
+            },
+        );
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let req = Request::get("/admin-ui/certs")
+            .header("cookie", &super_session)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 4, "all four fixed front-door slots always appear: {entries:?}");
+
+        let portal = entries.iter().find(|e| e["label"] == "portal").unwrap();
+        assert_eq!(portal["state"], "not_configured");
+
+        let auth = entries.iter().find(|e| e["label"] == "auth").unwrap();
+        assert_eq!(auth["state"], "unreadable");
+        assert!(auth["reason"].as_str().unwrap().contains("read failed"));
+    }
+
+    // ===== ADR-0025 integration pass: `/admin-ui/*` HTML page tests =====
+
+    async fn admin_ui_html_get(app: &Router, path: &str, cookie: Option<&str>) -> Response {
+        let mut b = Request::builder().method("GET").uri(path).header("accept", "text/html,application/xhtml+xml");
+        if let Some(c) = cookie {
+            b = b.header("cookie", c);
+        }
+        app.clone().oneshot(b.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// A logged-out visitor to any `/admin-ui/*` PAGE gets a clean redirect to the
+    /// existing login entry point, never a bare `401` -- job #2's own requirement.
+    /// Distinct from [`admin_ui_route_with_no_session_at_all_is_401_not_a_redirect`],
+    /// which proves the JSON API surface keeps its own `401` contract; content
+    /// negotiation ([`wants_html`]) is what tells the two cases apart.
+    #[tokio::test]
+    async fn admin_ui_page_with_no_session_redirects_to_portal_login() {
+        let (app, ..) = test_admin_ui_app();
+        let resp = admin_ui_html_get(&app, "/admin-ui/", None).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "axum's Redirect defaults to 303");
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(loc, "/portal/login", "the SAME login entry point every other Portal page uses");
+    }
+
+    /// A verified-but-not-an-admin session gets a real, rendered `403` page (a
+    /// non-empty HTML body), never a bare status code -- job #2's other half.
+    #[tokio::test]
+    async fn admin_ui_page_for_a_non_admin_session_is_a_real_rendered_403() {
+        let (app, ..) = test_admin_ui_app();
+        let non_admin = session_header_with_email("kc-someone", "not-an-admin@example.com");
+        let resp = admin_ui_html_get(&app, "/admin-ui/", Some(&non_admin)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<html"), "a real page, not an empty/bare 403: {html}");
+        assert!(html.contains("access denied") || html.contains("Access denied"));
+    }
+
+    /// Every `/admin-ui/*` page renders `200` with real HTML for a verified admin
+    /// session -- one broad smoke test across all seven pages, so a future change
+    /// that silently breaks one page's render (a panic, a bad format! arg) is
+    /// caught here rather than only in a screenshot review.
+    #[tokio::test]
+    async fn every_admin_ui_page_renders_ok_for_an_admin_session() {
+        let (app, ledger, _tunnels, admin) = test_admin_ui_app();
+        ledger.account_for_subject("kc-someone").unwrap();
+        admin.add_admin(SUPER_ADMIN, "second@example.com").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        for path in [
+            "/admin-ui/",
+            "/admin-ui/traffic",
+            "/admin-ui/accounts",
+            "/admin-ui/domains",
+            "/admin-ui/admins",
+            "/admin-ui/certs",
+            "/admin-ui/audit",
+        ] {
+            let resp = admin_ui_html_get(&app, path, Some(&super_session)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path} must render OK for an admin session");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("<html"), "{path} must render a real page: {html}");
+        }
+    }
+
+    /// Without an explicit `Accept: text/html`, the four paths this pass shares
+    /// with an earlier phase's already-tested JSON contract (`/admin-ui/traffic`,
+    /// `/admin-ui/admins`, `/admin-ui/domains`, `/admin-ui/certs`) still answer
+    /// JSON -- the content-negotiation branch this pass adds must never change
+    /// their default behavior for an existing caller (a test, a script, another
+    /// service) that doesn't ask for HTML.
+    #[tokio::test]
+    async fn shared_json_html_paths_still_default_to_json_without_an_html_accept_header() {
+        let (app, ..) = test_admin_ui_app();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        for path in ["/admin-ui/traffic", "/admin-ui/admins", "/admin-ui/domains", "/admin-ui/certs"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(path).header("cookie", &super_session).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let html = String::from_utf8_lossy(&body);
+            assert!(!html.contains("<html"), "{path} must still default to JSON, not HTML: {html}");
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_else(|e| panic!("{path} must still be valid JSON: {e}"));
+        }
+    }
+
+    /// ADR-0025's own hard requirement, proven at the RENDER layer (not just the
+    /// route-level 403 [`admin_management_routes_refuse_a_regular_non_super_admin`]
+    /// already proves): a non-super-admin's admins page has NO remove control for
+    /// ANY row (not even for a regular admin they could otherwise imagine removing)
+    /// and no add-admin form -- the task's explicit "don't show a button that will
+    /// just 403" bar, which only a fail-first proof against the rendered markup
+    /// actually establishes.
+    #[tokio::test]
+    async fn admins_page_hides_every_remove_control_and_the_add_form_for_a_non_super_admin() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        admin.add_admin(SUPER_ADMIN, "regular@example.com").unwrap();
+        let regular = session_header_with_email("kc-regular", "regular@example.com");
+        let resp = admin_ui_html_get(&app, "/admin-ui/admins", Some(&regular)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!html.contains("removeAdmin(event)"), "no row may carry a working remove control: {html}");
+        assert!(!html.contains("id=\"addAdminForm\""), "the add-admin form must not render at all: {html}");
+    }
+
+    /// The super-admin's OWN row never carries a remove control, even when the
+    /// viewer IS the super-admin and every other row does -- "no delete control
+    /// rendered for that row at all", proven per-row, not merely "the page has a
+    /// remove button somewhere".
+    #[tokio::test]
+    async fn admins_page_never_renders_a_remove_control_on_the_super_admins_own_row() {
+        let (app, _ledger, _tunnels, admin) = test_admin_ui_app();
+        admin.add_admin(SUPER_ADMIN, "regular@example.com").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let resp = admin_ui_html_get(&app, "/admin-ui/admins", Some(&super_session)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        // The regular admin's row DOES get a remove control...
+        assert!(
+            html.contains(&format!(r#"data-email="regular@example.com""#)),
+            "the regular admin's row must carry a working remove control: {html}"
+        );
+        // ...but the super-admin's own row must not, even though this viewer IS
+        // the super-admin and the add/remove form is otherwise shown.
+        assert!(
+            !html.contains(&format!(r#"data-email="{SUPER_ADMIN}""#)),
+            "the super-admin's own row must never carry a remove control: {html}"
+        );
+        assert!(html.contains("cannot be removed"));
+        assert!(html.contains("id=\"addAdminForm\""), "the super-admin DOES see the add form");
+    }
+
+    /// `GET /admin-ui/accounts` lists a real account (from the SAME durable
+    /// ledger every other admin route reads) and its search box filters by
+    /// subject substring server-side -- proving both the new `list_accounts`
+    /// plumbing and the page's `?q=` filter actually work end-to-end, not just
+    /// that the storage method returns rows in isolation.
+    #[tokio::test]
+    async fn accounts_page_lists_real_accounts_and_search_filters_by_subject() {
+        let (app, ledger, _tunnels, _admin) = test_admin_ui_app();
+        let alice = ledger.account_for_subject("kc-alice").unwrap();
+        ledger.credit(&alice, 250).unwrap();
+        ledger.account_for_subject("kc-bob").unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        let resp = admin_ui_html_get(&app, "/admin-ui/accounts", Some(&super_session)).await;
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("kc-alice") && html.contains("kc-bob"), "both accounts listed: {html}");
+        assert!(html.contains("250"), "the real credited balance is shown: {html}");
+
+        let filtered = admin_ui_html_get(&app, "/admin-ui/accounts?q=alice", Some(&super_session)).await;
+        let body = to_bytes(filtered.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("kc-alice"), "matching subject still shown: {html}");
+        assert!(!html.contains("kc-bob"), "non-matching subject filtered out: {html}");
+    }
+
+    /// `GET /admin-ui/logout` clears the session cookie -- the one thing an
+    /// admin-console sign-out needs to do locally (see `admin_ui_page_authed`'s
+    /// doc for why the underlying session's origin is otherwise still open).
+    #[tokio::test]
+    async fn admin_ui_logout_clears_the_session_cookie() {
+        let (app, ..) = test_admin_ui_app();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/admin-ui/logout").header("cookie", &super_session).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let set_cookie = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(set_cookie.contains("ct_portal_session=;"), "clears the session cookie: {set_cookie}");
+        assert!(set_cookie.contains("Max-Age=0"));
+    }
+
+    // ===== end ADR-0025 integration pass: `/admin-ui/*` HTML page tests =====
+
+    // ===== end ADR-0025 `/admin-ui/*` tests =====
 
     #[tokio::test]
     async fn install_page_carries_the_tunnels_own_assigned_hostname_not_a_bare_mesh_tunnel() {

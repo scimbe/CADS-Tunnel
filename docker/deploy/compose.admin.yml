@@ -1,0 +1,93 @@
+# Optional admin console overlay (ADR-0025: Admin Console, Multi-Admin,
+# Multi-Domain Management). Mounts the admin-identity-gated /admin-ui/* pages
+# (traffic monitor, account credit/block/delete, domain onboarding, admin
+# management, cert-expiry dashboard, audit log) on their OWN front-door
+# hostname, reached over :443 exactly like every other Browser-Plane surface.
+# See docs/adr/0025-admin-console-and-multi-domain-management.md.
+#
+# Decision 5: this is a NEW HOSTNAME on the EXISTING control-plane process --
+# no new container, no new database. Mirrors compose.frontdoor.yml's own
+# (simpler, no-sidecar) Portal registration pattern, not compose.masque.yml's
+# sidecar-service one, since there is no second backend here.
+#
+# OFF BY DEFAULT: opt in by naming it explicitly, same convention as every
+# other overlay here. Prereq: the edge's :443 front door must already be
+# enabled (compose.frontdoor.yml):
+#
+#   docker compose \
+#     -f docker/deploy/compose.selfhost.yml \
+#     -f docker/deploy/compose.frontdoor.yml \
+#     [-f docker/deploy/compose.sso.yml] \
+#     -f docker/deploy/compose.admin.yml \
+#     --env-file docker/deploy/.env up --build -d
+#
+# .env keys this overlay reads:
+#   ADMIN_UI_PUBLIC_HOST   the hostname routed to the admin console (e.g.
+#                          admin.<zone>), its DNS pointed at this edge like
+#                          every other front-door hostname. Served + terminated
+#                          at :443. Deliberately a DIFFERENT hostname from
+#                          PORTAL_PUBLIC_HOST -- see the cookie-scope note below.
+#   ADMIN_UI_CERT_DIR      host dir with the BYO cert for ADMIN_UI_PUBLIC_HOST --
+#                          fullchain.pem + privkey.pem (LE via deSEC DNS-01,
+#                          same mechanism as every other front-door cert here --
+#                          scripts/lib-acme.sh).  Never committed.
+#
+# CT_ADMIN_SUPER_EMAIL (the one Google account allowed to administer this
+# deployment and the only one that may add/remove other admins, ADR-0025
+# Decision 2) is NOT set here -- it is required unconditionally by
+# control-plane's own startup (fail-closed, regardless of whether this overlay
+# is even deployed), so it lives in the ALWAYS-used compose.selfhost.yml
+# instead. Set it once in .env either way; see that file's own comment for why.
+#
+# DNS/ACME for a NEW managed domain (beyond ADMIN_UI_PUBLIC_HOST/PORTAL_PUBLIC_
+# HOST themselves, i.e. onboarding a second customer-facing zone via the admin
+# console's own "Domains" page, ADR-0025 Decision 4) reuses infrastructure this
+# overlay does NOT itself configure: DESEC_TOKEN / DESEC_API_BASE (the same
+# deSEC account token the Portal's own DNS autopilot already needs --
+# CT_CP_DNS_EDGE_IP below is the same edge public IP those auto-assigned A
+# records already point at) and CT_CP_LIB_ACME_PATH (defaults to
+# /app/scripts/lib-acme.sh, already shipped in the production image -- override
+# only for a non-container / different-layout run). Delegating a new zone's
+# nameservers to deSEC at the registrar remains a manual, one-time, per-domain
+# step the admin performs BEFORE onboarding it here (ADR-0025 Decision 4) --
+# nothing in this system can automate that hop.
+#
+# KNOWN LIMITATION (ADR-0025 Decision 5 addendum, not resolved by this overlay):
+# admin.<zone> and PORTAL_PUBLIC_HOST are deliberately different hostnames, and
+# the admin session cookie Portal's own login mints is host-only (no Domain=)
+# -- so today, logging in at /portal/login does NOT leave behind a session this
+# hostname can read; visiting this URL still 401s until a follow-up phase
+# either widens that cookie's scope or gives the admin console its own login.
+# The identity/authorization checks themselves are correct and tested either
+# way -- see admin_ui_page_authed's doc comment (portal_api.rs) for the two
+# named options and why neither was picked here by default.
+
+name: ct-selfhost
+
+services:
+  edge:
+    environment:
+      CT_EDGE_ADMIN_UI_HOST: "${ADMIN_UI_PUBLIC_HOST:?set ADMIN_UI_PUBLIC_HOST=admin.<zone>}"
+      # Decision 5: the SAME backend as Portal (control-plane:8090) -- no new
+      # container. Fixed, not read from .env, mirroring CT_EDGE_AUTH_ADDR's own
+      # hardcoded "keycloak:8080" in compose.sso.yml -- this never varies
+      # per-deployment the way a public hostname does.
+      CT_EDGE_ADMIN_UI_ADDR: "control-plane:8090"
+      CT_EDGE_ADMIN_UI_CERT: "/certs/admin-ui/fullchain.pem"
+      CT_EDGE_ADMIN_UI_KEY: "/certs/admin-ui/privkey.pem"
+    volumes:
+      # BYO cert for ADMIN_UI_PUBLIC_HOST (fullchain.pem + privkey.pem), obtained
+      # like the Portal's/Auth's via deSEC DNS-01. Never committed -- supplied
+      # from the host.
+      - "${ADMIN_UI_CERT_DIR:?set ADMIN_UI_CERT_DIR=<host dir with admin-ui fullchain.pem+privkey.pem>}:/certs/admin-ui:ro"
+
+  control-plane:
+    environment:
+      # ADR-0025 Decision 6/Domain Ops: the cert-expiry dashboard's fourth fixed
+      # slot -- reads this front door's OWN cert off the shared filesystem,
+      # same shared-volume-with-the-edge convention CT_CP_EDGE_CERT_PATH
+      # already uses (service.rs). Set unconditionally by this overlay since
+      # ADMIN_UI_CERT_DIR is already required above for the edge's own mount.
+      CT_CP_CERT_ADMIN_UI_PATH: "/certs/admin-ui/fullchain.pem"
+    volumes:
+      - "${ADMIN_UI_CERT_DIR:?set ADMIN_UI_CERT_DIR=<host dir with admin-ui fullchain.pem+privkey.pem>}:/certs/admin-ui:ro"

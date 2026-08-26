@@ -1311,6 +1311,16 @@ pub struct SqliteLedger {
     conn: Mutex<Connection>,
 }
 
+/// One row of [`SqliteLedger::list_accounts`] (ADR-0025 admin console).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummaryRow {
+    pub subject: String,
+    pub account_hex: String,
+    pub balance: u64,
+    pub blocked: bool,
+    pub max_tunnels: u32,
+}
+
 sqlite_store_ctors!(SqliteLedger);
 
 impl SqliteLedger {
@@ -1348,6 +1358,12 @@ impl SqliteLedger {
         // for every one. DEFAULT 1 keeps every existing account's behavior
         // unchanged on a pre-existing DB.
         ensure_column(&conn, "accounts", "max_tunnels", "INTEGER NOT NULL DEFAULT 1")?;
+        // ADR-0025 (admin console): an admin-blocked account is refused at every
+        // credit-gated admission point (`debit`/`debit_and_record_issuance`) and at
+        // the self-service tunnel-creation gate (`portal_api::create_tunnel`) --
+        // see [`Self::is_blocked`]'s doc for the "a flag nobody checks is worthless"
+        // reasoning. DEFAULT 0 keeps every existing account unblocked on upgrade.
+        ensure_column(&conn, "accounts", "blocked", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1387,6 +1403,103 @@ impl SqliteLedger {
             |r| r.get(0),
         )
         .optional()
+    }
+
+    /// `(balance, blocked)` in one row read -- used by [`Self::debit`] and
+    /// [`Self::debit_and_record_issuance`] so the blocked check and the balance
+    /// read are the same snapshot inside their transaction, not two separate
+    /// queries that could observe an admin's concurrent block/unblock between them.
+    fn balance_and_blocked_of(conn: &Connection, id: &AccountId) -> rusqlite::Result<Option<(i64, bool)>> {
+        conn.query_row(
+            "SELECT balance, blocked FROM accounts WHERE account = ?1",
+            params![&id.0[..]],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+    }
+
+    /// Whether `account` is admin-blocked (ADR-0025 Decision 6 / the admin
+    /// console's block action). Checked by [`Self::debit`]/
+    /// [`Self::debit_and_record_issuance`] (the credit-gated token-issuance
+    /// admission path) and by `portal_api::create_tunnel` (the self-service
+    /// tunnel-creation admission path) -- this codebase has an explicit standing
+    /// lesson that a block flag nobody checks is worthless, so both real
+    /// admission points enforce it, not just this accessor existing.
+    pub fn is_blocked(&self, account: &AccountId) -> rusqlite::Result<bool> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT blocked FROM accounts WHERE account = ?1",
+                params![&account.0[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(0) != 0)
+    }
+
+    /// Set (or clear) `account`'s blocked flag -- the admin console's block/
+    /// unblock action. No-op (not an error) if `account` doesn't exist yet,
+    /// matching [`Self::set_max_tunnels`]'s own convention.
+    pub fn set_blocked(&self, account: &AccountId, blocked: bool) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "UPDATE accounts SET blocked = ?1 WHERE account = ?2",
+            params![blocked as i64, &account.0[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Remove `subject`'s account row and its `account_subjects` mapping entirely
+    /// -- the ledger half of an admin-triggered account deletion
+    /// (`portal_api::admin_ui_delete_account`). Self-service account deletion
+    /// deliberately does NOT do this (Keycloak still owns that caller's identity
+    /// and a returning login would just re-create the account row); an admin
+    /// deleting someone else's account has no such expectation, so this actually
+    /// removes the row. No-op if `subject` has no account yet.
+    pub fn delete_account_for_subject(&self, subject: &str) -> rusqlite::Result<()> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let account: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT account FROM account_subjects WHERE subject = ?1",
+                params![subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = account {
+            tx.execute("DELETE FROM accounts WHERE account = ?1", params![&bytes[..]])?;
+            tx.execute("DELETE FROM account_subjects WHERE subject = ?1", params![subject])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every known subject's account state (ADR-0025 admin console, `GET
+    /// /admin-ui/accounts`) -- subject, account id (hex), balance, blocked, and
+    /// max_tunnels, one row per `account_subjects` entry. ADR-0012 deliberately
+    /// keeps ordinary self-service code from ever enumerating other subjects'
+    /// accounts; this is the narrow admin-only exception (mirrors admin_identity's
+    /// own "narrow, explicit carve-out" framing), reachable only via the
+    /// admin-session-gated `/admin-ui/*` surface, never a self-service route.
+    pub fn list_accounts(&self) -> rusqlite::Result<Vec<AccountSummaryRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels
+             FROM account_subjects s JOIN accounts a ON a.account = s.account
+             ORDER BY s.subject",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let account: Vec<u8> = r.get(1)?;
+                Ok(AccountSummaryRow {
+                    subject: r.get(0)?,
+                    account_hex: account.iter().map(|b| format!("{b:02x}")).collect(),
+                    balance: r.get::<_, i64>(2)?.max(0) as u64,
+                    blocked: r.get::<_, i64>(3)? != 0,
+                    max_tunnels: r.get::<_, i64>(4)?.max(0) as u32,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Open a fresh account with a zero balance; returns its id.
@@ -1530,7 +1643,15 @@ impl SqliteLedger {
     pub fn debit(&self, id: &AccountId, amount: u64) -> Result<u64, LedgerOpError> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
-        let bal = Self::balance_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let (bal, blocked) =
+            Self::balance_and_blocked_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        // ADR-0025: an admin-blocked account is refused here regardless of
+        // balance -- checked before the balance comparison so a blocked-but-funded
+        // account gets the same refusal as a blocked-and-broke one, not a
+        // misleading InsufficientCredit.
+        if blocked {
+            return Err(LedgerOpError::Ledger(LedgerError::AccountBlocked));
+        }
         let bal_u = bal as u64;
         if bal_u < amount {
             return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
@@ -1596,12 +1717,12 @@ impl SqliteLedger {
     ) -> Result<u64, LedgerOpError> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
-        let bal = tx
-            .query_row("SELECT balance FROM accounts WHERE account = ?1", params![&id.0[..]], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?
-            .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        let (bal, blocked) =
+            Self::balance_and_blocked_of(&tx, id)?.ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))?;
+        // ADR-0025: same "blocked wins over InsufficientCredit" ordering as `debit`.
+        if blocked {
+            return Err(LedgerOpError::Ledger(LedgerError::AccountBlocked));
+        }
         let bal_u = bal as u64;
         if bal_u < amount {
             return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit {
@@ -1749,6 +1870,15 @@ pub struct SubjectTunnel {
     /// invalidate the live registration (#27 RB1). It is a routing identifier,
     /// not the Noise capability (which is still never persisted).
     pub routing_token: String,
+}
+
+/// One row of `disabled_hostnames` (ADR-0025) -- the admin console's own
+/// listing of what it has blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisabledHostnameRow {
+    pub hostname: String,
+    pub disabled_by: String,
+    pub disabled_at: i64,
 }
 
 /// Rot/Gelb/Grün certificate-tier state for one hostname (#233 admission
@@ -2047,6 +2177,16 @@ impl SqliteTunnelStore {
                  note         TEXT NOT NULL DEFAULT '',
                  requested_at INTEGER NOT NULL,
                  PRIMARY KEY (hostname, email)
+             );
+             -- ADR-0025 (admin console): a hostname an admin has explicitly disabled.
+             -- The enforcer lives in `portal_api::authorize_hostname` -- see
+             -- `is_hostname_disabled`'s own doc for why the check belongs there rather
+             -- than anywhere else (every path that would (re-)authorize a hostname at
+             -- the edge funnels through that one function).
+             CREATE TABLE IF NOT EXISTS disabled_hostnames (
+                 hostname     TEXT PRIMARY KEY,
+                 disabled_by  TEXT NOT NULL,
+                 disabled_at  INTEGER NOT NULL
              );",
         )?;
         // #406: nothing previously enforced one-tunnel-per-hostname -- `idx_subject_tunnels_
@@ -2393,6 +2533,72 @@ impl SqliteTunnelStore {
             .optional()?
             .map(|n| n != 0)
             .unwrap_or(false))
+    }
+
+    /// ADR-0025 (admin console): mark `hostname` disabled -- the enforcer,
+    /// [`Self::is_hostname_disabled`], is consulted by `portal_api::
+    /// authorize_hostname` (every path that would (re-)authorize a hostname at
+    /// the edge funnels through that one function), so once this returns, no
+    /// future authorize-host push for `hostname` succeeds until
+    /// [`Self::enable_hostname`] reverses it. Idempotent: disabling an
+    /// already-disabled hostname just refreshes who/when.
+    pub fn disable_hostname(&self, hostname: &str, disabled_by: &str, at: i64) -> rusqlite::Result<()> {
+        self.writer.lock_safe().execute(
+            "INSERT INTO disabled_hostnames (hostname, disabled_by, disabled_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(hostname) DO UPDATE SET disabled_by = excluded.disabled_by, disabled_at = excluded.disabled_at",
+            params![hostname, disabled_by, at],
+        )?;
+        Ok(())
+    }
+
+    /// Reverse [`Self::disable_hostname`]. Returns whether a row was actually
+    /// removed (`false` if `hostname` wasn't disabled). Deliberately does NOT
+    /// re-push the edge authorize-host call itself -- disabling one revoked the
+    /// tunnel's live routing-token registration (see the `/admin-ui/hostnames/
+    /// :host/disable` handler), so simply lifting the block here only permits
+    /// the NEXT ordinary authorize_hostname call (e.g. the owner recreating the
+    /// tunnel) to succeed again.
+    pub fn enable_hostname(&self, hostname: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .writer
+            .lock_safe()
+            .execute("DELETE FROM disabled_hostnames WHERE hostname = ?1", params![hostname])?;
+        Ok(n > 0)
+    }
+
+    /// Whether `hostname` is currently admin-disabled -- the one check
+    /// [`crate::portal_api::authorize_hostname`] makes before ever pushing an
+    /// authorize-host call to the edge (ADR-0025's "flag needs an enforcer"
+    /// discipline, same shape as [`crate::accounts::AccountId`]'s block flag).
+    pub fn is_hostname_disabled(&self, hostname: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT 1 FROM disabled_hostnames WHERE hostname = ?1",
+                params![hostname],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every disabled hostname, most-recently-disabled first -- the admin
+    /// console's own visibility into what it has blocked.
+    pub fn list_disabled_hostnames(&self) -> rusqlite::Result<Vec<DisabledHostnameRow>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT hostname, disabled_by, disabled_at FROM disabled_hostnames ORDER BY disabled_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DisabledHostnameRow {
+                    hostname: r.get(0)?,
+                    disabled_by: r.get(1)?,
+                    disabled_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// #501: enable/disable the "any authenticated account may enter" mode for a
@@ -5204,6 +5410,248 @@ impl SqliteTopologyStore {
     }
 }
 
+/// Bare CRUD on the `admins` table (ADR-0025 Decision 1/2): who may reach the
+/// admin console at all, kept entirely separate from the pseudonymous
+/// `AccountId`/ledger schema above -- a real Google email, not an opaque
+/// account. This store has NO policy (who may add/remove whom, the
+/// super-admin's un-removability) -- that lives in `admin_identity::AdminIdentity`,
+/// which wraps this store. `email` is stored lowercased, matching every other
+/// email column in this file (e.g. `tunnel_login_allowlist`).
+pub struct SqliteAdminStore {
+    conn: Mutex<Connection>,
+}
+
+sqlite_store_ctors!(SqliteAdminStore);
+
+impl SqliteAdminStore {
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS admins (
+                 email    TEXT PRIMARY KEY,
+                 added_by TEXT,
+                 added_at INTEGER NOT NULL
+             );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Whether `email` (any casing) has a row in `admins`.
+    pub fn is_admin(&self, email: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .lock_safe()
+            .query_row(
+                "SELECT 1 FROM admins WHERE email = ?1",
+                params![email.to_ascii_lowercase()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Insert `email` as an admin if not already present (idempotent). `added_by`
+    /// is the acting admin's email -- `None` only for the startup seed of the
+    /// super-admin itself, which has no human actor.
+    pub fn add_admin_row(&self, email: &str, added_by: Option<&str>, added_at: i64) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "INSERT OR IGNORE INTO admins (email, added_by, added_at) VALUES (?1, ?2, ?3)",
+            params![
+                email.to_ascii_lowercase(),
+                added_by.map(|s| s.to_ascii_lowercase()),
+                added_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove `email`'s admin row, if present. Returns whether a row was actually
+    /// removed. No policy enforced here -- see the struct doc.
+    pub fn remove_admin_row(&self, email: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "DELETE FROM admins WHERE email = ?1",
+            params![email.to_ascii_lowercase()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every admin row, most-recently-added first -- for the admin-management UI
+    /// (later phase).
+    pub fn list_admins(&self) -> rusqlite::Result<Vec<AdminRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare("SELECT email, added_by, added_at FROM admins ORDER BY added_at DESC")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AdminRow {
+                    email: r.get(0)?,
+                    added_by: r.get(1)?,
+                    added_at: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// One row of the `admins` table (ADR-0025) -- for the admin-management UI's listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminRow {
+    pub email: String,
+    pub added_by: Option<String>,
+    pub added_at: i64,
+}
+
+/// Bare CRUD on `managed_domains` + `managed_domain_hostnames` (ADR-0025
+/// Decision 4: multi-domain onboarding). No policy here (mirrors
+/// [`SqliteAdminStore`]'s own split) -- `domain_admin`'s handlers own the real
+/// DNS/cert side effects and decide what `status` means; this store just
+/// persists whatever they decide.
+///
+/// `managed_domains` is the onboarded-zone registry (`POST /admin-ui/domains`);
+/// `managed_domain_hostnames` records every subdomain cert issued under one of
+/// those zones (`POST /admin-ui/domains/:zone/hostnames`) so the cert-expiry
+/// dashboard (`GET /admin-ui/certs`) knows which per-domain cert files exist
+/// without scanning the filesystem.
+pub struct SqliteManagedDomains {
+    conn: Mutex<Connection>,
+}
+
+sqlite_store_ctors!(SqliteManagedDomains);
+
+impl SqliteManagedDomains {
+    fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS managed_domains (
+                 zone     TEXT PRIMARY KEY,
+                 added_by TEXT,
+                 added_at INTEGER NOT NULL,
+                 status   TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS managed_domain_hostnames (
+                 hostname  TEXT PRIMARY KEY,
+                 zone      TEXT NOT NULL,
+                 cert_dir  TEXT NOT NULL,
+                 issued_by TEXT,
+                 issued_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_managed_domain_hostnames_zone
+                 ON managed_domain_hostnames (zone);",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Register `zone` as managed. Returns `false` (no-op) if `zone` is already
+    /// present -- the caller (`domain_admin::register_domain`) treats that as
+    /// "already onboarded", not an error, since the real work (DNS records) is
+    /// idempotent too.
+    pub fn add_zone(&self, zone: &str, added_by: &str, added_at: i64, status: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock_safe().execute(
+            "INSERT OR IGNORE INTO managed_domains (zone, added_by, added_at, status) VALUES (?1, ?2, ?3, ?4)",
+            params![zone, added_by, added_at, status],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn zone(&self, zone: &str) -> rusqlite::Result<Option<ManagedDomainRow>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT zone, added_by, added_at, status FROM managed_domains WHERE zone = ?1",
+                params![zone],
+                |r| {
+                    Ok(ManagedDomainRow {
+                        zone: r.get(0)?,
+                        added_by: r.get(1)?,
+                        added_at: r.get(2)?,
+                        status: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Every managed domain, most-recently-added first.
+    pub fn list_zones(&self) -> rusqlite::Result<Vec<ManagedDomainRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT zone, added_by, added_at, status FROM managed_domains ORDER BY added_at DESC")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ManagedDomainRow {
+                    zone: r.get(0)?,
+                    added_by: r.get(1)?,
+                    added_at: r.get(2)?,
+                    status: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record a subdomain cert issued under a managed zone (idempotent upsert --
+    /// a re-issued cert just refreshes `issued_at`/`issued_by`/`cert_dir`).
+    pub fn record_hostname_cert(
+        &self,
+        hostname: &str,
+        zone: &str,
+        cert_dir: &str,
+        issued_by: &str,
+        issued_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "INSERT INTO managed_domain_hostnames (hostname, zone, cert_dir, issued_by, issued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(hostname) DO UPDATE SET
+                 cert_dir = excluded.cert_dir, issued_by = excluded.issued_by, issued_at = excluded.issued_at",
+            params![hostname, zone, cert_dir, issued_by, issued_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every subdomain cert issued under any managed zone -- the cert-expiry
+    /// dashboard's source of which per-domain cert files to check.
+    pub fn list_hostname_certs(&self) -> rusqlite::Result<Vec<ManagedDomainHostnameRow>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT hostname, zone, cert_dir, issued_by, issued_at FROM managed_domain_hostnames ORDER BY hostname",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ManagedDomainHostnameRow {
+                    hostname: r.get(0)?,
+                    zone: r.get(1)?,
+                    cert_dir: r.get(2)?,
+                    issued_by: r.get(3)?,
+                    issued_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// One row of `managed_domains` (ADR-0025 Decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDomainRow {
+    pub zone: String,
+    pub added_by: Option<String>,
+    pub added_at: i64,
+    pub status: String,
+}
+
+/// One row of `managed_domain_hostnames` (ADR-0025 Decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDomainHostnameRow {
+    pub hostname: String,
+    pub zone: String,
+    pub cert_dir: String,
+    pub issued_by: Option<String>,
+    pub issued_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7344,6 +7792,115 @@ mod tests {
         assert_eq!(ledger.balance(&acct).unwrap(), 10, "balance intact");
     }
 
+    /// ADR-0025 (admin console): fail-first proof that `debit` — the credit-gated
+    /// token-issuance admission path (`billing.rs`'s own doc: "the economic gate on
+    /// tunnel creation") — actually refuses a blocked account, and does so BEFORE
+    /// the balance check (a funded-but-blocked account gets `AccountBlocked`, not a
+    /// misleading `InsufficientCredit`), with no mutation on refusal.
+    #[test]
+    fn debit_refuses_a_blocked_account_regardless_of_balance() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 100).unwrap();
+        ledger.set_blocked(&acct, true).unwrap();
+        assert!(
+            matches!(ledger.debit(&acct, 1), Err(LedgerOpError::Ledger(LedgerError::AccountBlocked))),
+            "a blocked account's debit must be refused even though it can afford it"
+        );
+        assert_eq!(ledger.balance(&acct).unwrap(), 100, "the refused debit left the balance intact");
+    }
+
+    /// Same admission gate, the idempotency-key-carrying sibling call site
+    /// (`debit_and_record_issuance`, used by every issuance call that supplies a
+    /// retry key).
+    #[test]
+    fn debit_and_record_issuance_refuses_a_blocked_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 100).unwrap();
+        ledger.set_blocked(&acct, true).unwrap();
+        let err = ledger.debit_and_record_issuance(&acct, 1, &[0x22u8; 32], &[0x33u8; 32], 1_000);
+        assert!(matches!(err, Err(LedgerOpError::Ledger(LedgerError::AccountBlocked))));
+        assert_eq!(ledger.issuance_for_key(&acct, &[0x22u8; 32]).unwrap(), None, "no issuance was recorded");
+    }
+
+    #[test]
+    fn unblocking_an_account_restores_its_debit_capability() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        ledger.credit(&acct, 10).unwrap();
+        ledger.set_blocked(&acct, true).unwrap();
+        assert!(ledger.debit(&acct, 1).is_err(), "blocked: refused");
+        ledger.set_blocked(&acct, false).unwrap();
+        assert_eq!(ledger.debit(&acct, 1).unwrap(), 9, "unblocked: same ledger, now succeeds");
+    }
+
+    #[test]
+    fn is_blocked_defaults_false_for_a_never_blocked_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let acct = ledger.open_account().unwrap();
+        assert!(!ledger.is_blocked(&acct).unwrap());
+    }
+
+    /// ADR-0025 admin console: `GET /admin-ui/accounts`'s data source must
+    /// actually reflect every OTHER admin action's real effect (credit,
+    /// block, max-tunnels), not a stale/derived snapshot -- proven by mutating
+    /// via the same real methods those admin routes call, then reading back
+    /// through `list_accounts` alone.
+    #[test]
+    fn list_accounts_reports_every_subjects_real_balance_block_and_quota_state() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let alice = ledger.account_for_subject("kc-alice").unwrap();
+        let bob = ledger.account_for_subject("kc-bob").unwrap();
+        ledger.credit(&alice, 500).unwrap();
+        ledger.set_max_tunnels(&alice, 5).unwrap();
+        ledger.set_blocked(&bob, true).unwrap();
+
+        let rows = ledger.list_accounts().unwrap();
+        assert_eq!(rows.len(), 2, "both subjects that have ever logged in appear");
+
+        let alice_row = rows.iter().find(|r| r.subject == "kc-alice").expect("alice present");
+        assert_eq!(alice_row.balance, 500);
+        assert_eq!(alice_row.max_tunnels, 5);
+        assert!(!alice_row.blocked);
+        assert_eq!(alice_row.account_hex.len(), 64, "32-byte account id, hex-encoded");
+
+        let bob_row = rows.iter().find(|r| r.subject == "kc-bob").expect("bob present");
+        assert!(bob_row.blocked);
+        assert_eq!(bob_row.balance, 0);
+        assert_ne!(alice_row.account_hex, bob_row.account_hex, "distinct accounts, distinct ids");
+    }
+
+    #[test]
+    fn list_accounts_is_empty_when_no_subject_has_ever_logged_in() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(ledger.list_accounts().unwrap().is_empty());
+    }
+
+    /// The ledger half of an admin-triggered account deletion
+    /// (`portal_api::admin_ui_delete_account`): the account row and its subject
+    /// mapping are both actually gone, not merely zeroed -- proven by
+    /// `account_for_subject` minting a FRESH (different) account id afterward,
+    /// which only happens when no `account_subjects` row remains.
+    #[test]
+    fn delete_account_for_subject_removes_the_row_so_a_later_login_gets_a_fresh_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let original = ledger.account_for_subject("kc-gone").unwrap();
+        ledger.credit(&original, 42).unwrap();
+
+        ledger.delete_account_for_subject("kc-gone").unwrap();
+
+        let recreated = ledger.account_for_subject("kc-gone").unwrap();
+        assert_ne!(recreated.0, original.0, "a fresh account id was minted -- the old row is really gone");
+        assert_eq!(ledger.balance(&recreated).unwrap(), 0, "the fresh account starts at zero, not the old balance");
+    }
+
+    #[test]
+    fn delete_account_for_subject_is_a_no_op_for_a_subject_with_no_account() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(ledger.delete_account_for_subject("kc-never-logged-in").is_ok());
+    }
+
     #[test]
     fn debit_and_record_issuance_is_replayed_from_the_idempotency_key_without_a_second_debit_272() {
         // #272: a caller retrying after a lost response (the debit committed, but the
@@ -8348,5 +8905,106 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    // ===== ADR-0025: disabled_hostnames (SqliteTunnelStore) =====
+
+    /// Fail-first proof: an ordinary hostname must NOT read as disabled --
+    /// otherwise every other assertion in this group would pass vacuously.
+    #[test]
+    fn a_hostname_nobody_ever_disabled_is_not_disabled() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        assert!(!store.is_hostname_disabled("never-touched.example").unwrap());
+    }
+
+    #[test]
+    fn disable_hostname_is_visible_via_is_hostname_disabled_and_reversible_via_enable() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.disable_hostname("evil.example", "admin@example.com", 1000).unwrap();
+        assert!(store.is_hostname_disabled("evil.example").unwrap());
+
+        let removed = store.enable_hostname("evil.example").unwrap();
+        assert!(removed, "enable_hostname must report the row it just removed");
+        assert!(!store.is_hostname_disabled("evil.example").unwrap());
+    }
+
+    #[test]
+    fn enable_hostname_on_a_never_disabled_host_is_a_harmless_no_op() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        assert!(!store.enable_hostname("never-disabled.example").unwrap());
+    }
+
+    #[test]
+    fn disable_hostname_is_idempotent_and_refreshes_who_and_when() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.disable_hostname("host.example", "first-admin@example.com", 100).unwrap();
+        store.disable_hostname("host.example", "second-admin@example.com", 200).unwrap();
+        let rows = store.list_disabled_hostnames().unwrap();
+        assert_eq!(rows.len(), 1, "re-disabling must not duplicate the row");
+        assert_eq!(rows[0].disabled_by, "second-admin@example.com");
+        assert_eq!(rows[0].disabled_at, 200);
+    }
+
+    #[test]
+    fn list_disabled_hostnames_is_newest_first() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.disable_hostname("a.example", "admin@example.com", 100).unwrap();
+        store.disable_hostname("b.example", "admin@example.com", 200).unwrap();
+        let rows = store.list_disabled_hostnames().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].hostname, "b.example", "newest first");
+        assert_eq!(rows[1].hostname, "a.example");
+    }
+
+    // ===== ADR-0025: SqliteManagedDomains =====
+
+    #[test]
+    fn add_zone_then_zone_round_trips_and_a_second_add_is_a_no_op() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        assert!(store.add_zone("example.org", "admin@example.com", 1000, "active").unwrap());
+        // Re-adding the same zone must not error or overwrite -- "already onboarded".
+        assert!(!store.add_zone("example.org", "someone-else@example.com", 2000, "active").unwrap());
+
+        let row = store.zone("example.org").unwrap().expect("zone exists");
+        assert_eq!(row.added_by.as_deref(), Some("admin@example.com"), "the FIRST add wins");
+        assert_eq!(row.added_at, 1000);
+        assert_eq!(row.status, "active");
+    }
+
+    #[test]
+    fn zone_is_none_for_a_never_registered_domain() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        assert_eq!(store.zone("never-onboarded.example").unwrap(), None);
+    }
+
+    #[test]
+    fn list_zones_is_newest_first() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        store.add_zone("a.example", "admin@example.com", 100, "active").unwrap();
+        store.add_zone("b.example", "admin@example.com", 200, "active").unwrap();
+        let rows = store.list_zones().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].zone, "b.example");
+        assert_eq!(rows[1].zone, "a.example");
+    }
+
+    #[test]
+    fn record_hostname_cert_round_trips_and_upserts_on_reissue() {
+        let store = SqliteManagedDomains::open_in_memory().unwrap();
+        store
+            .record_hostname_cert("app.example.org", "example.org", "/certs/managed/app.example.org", "admin@example.com", 1000)
+            .unwrap();
+        let rows = store.list_hostname_certs().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].zone, "example.org");
+        assert_eq!(rows[0].cert_dir, "/certs/managed/app.example.org");
+
+        // Re-issuance (e.g. renewal) upserts, not duplicates.
+        store
+            .record_hostname_cert("app.example.org", "example.org", "/certs/managed/app.example.org", "admin@example.com", 2000)
+            .unwrap();
+        let rows = store.list_hostname_certs().unwrap();
+        assert_eq!(rows.len(), 1, "re-issuing the same hostname's cert must not duplicate the row");
+        assert_eq!(rows[0].issued_at, 2000);
     }
 }

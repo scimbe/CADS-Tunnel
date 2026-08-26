@@ -261,6 +261,14 @@ services:
       # a working SMTP sender — before that, requiring it would have locked out
       # every self-registered user (which is why it shipped defaulting to off).
       CT_GATE_REQUIRE_VERIFIED_EMAIL: "1"
+      # ADR-0025 Decision 6: the admin console's cert-expiry dashboard's own
+      # second fixed slot -- same shared-volume-with-the-edge convention as
+      # CT_CP_CERT_PORTAL_PATH (compose.frontdoor.yml). Without this (and the
+      # matching volume mount below), the dashboard reports "auth" as
+      # not_configured even though the cert genuinely exists and is in use.
+      CT_CP_CERT_AUTH_PATH: "/certs/auth/fullchain.pem"
+    volumes:
+      - "${AUTH_CERT_DIR:?set AUTH_CERT_DIR=<host dir with auth fullchain.pem+privkey.pem>}:/certs/auth:ro"
     depends_on:
       keycloak:
         condition: service_healthy

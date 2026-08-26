@@ -39,6 +39,12 @@ pub enum LedgerError {
     /// already rejects, mirrored here so `SqliteLedger::credit` is self-defending
     /// regardless of caller, not just the one call site #83 happened to fix first.
     CreditAmountTooLarge { amount: u64 },
+    /// ADR-0025 (admin console): the account is admin-blocked -- refused
+    /// regardless of balance. Only [`crate::storage::SqliteLedger::debit`] and
+    /// [`crate::storage::SqliteLedger::debit_and_record_issuance`] can produce
+    /// this today; the in-memory [`Ledger`] above has no blocked concept (it
+    /// backs `http.rs`'s test-infra surface, not a real admission path).
+    AccountBlocked,
 }
 
 impl std::fmt::Display for LedgerError {
@@ -54,6 +60,7 @@ impl std::fmt::Display for LedgerError {
             LedgerError::CreditAmountTooLarge { amount } => {
                 write!(f, "credit amount {amount} exceeds the maximum {}", i64::MAX)
             }
+            LedgerError::AccountBlocked => write!(f, "this account is blocked"),
         }
     }
 }

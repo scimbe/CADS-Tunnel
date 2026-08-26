@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Start here
+
+This repo is maintained as part of a two-repo mandate (`CADS-Tunnel` + `ct-agent`) for
+the operator, scimbe. Before working here, read
+`/home/becke/workspace/.claude/MAINTAINER_BRIEFING.md` (workspace-root, one level up) —
+it covers standing directives (a recurring GitHub-issue-processing loop, the ADR-0024
+MASQUE rollout, the ADR-0025 admin console build) and hard safety rules learned from real
+incidents (tmpfs build crashes, stacking builds on a running `Workflow`, `rm -rf`
+permission denials) that apply here as much as anywhere else in the workspace. **Keeping
+that file (and this pointer) current is every reading session's own standing task** —
+fix it in place when it's stale, don't leave it for a future session to trip over.
+
 ## What this repository is
 
 `CADS-Tunnel` is a **zero-knowledge tunnel**, implemented as a Rust workspace — crates `ct-common`, `ct-edge`, `ct-agent`, `ct-client`, `ct-control-plane`, `ct-dns` (an end-to-end-encrypted data path with a thin, provider-blind control plane). Application code lives under `crates/`; build and test with Cargo (the hermetic Docker gate is the canonical check — see `scripts/`). The `main` branch has a full commit history.

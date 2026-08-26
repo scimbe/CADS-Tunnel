@@ -567,6 +567,22 @@ pub struct EdgeState<H> {
     /// (an entry is only created by `note_relay`, reachable only after a
     /// real relay actually happened on an already-registered token).
     tunnel_bytes: Mutex<HashMap<RoutingToken, (u64, u64)>>,
+    /// ADR-0025 Decision 6: wall-clock (Unix seconds) the token's CURRENT
+    /// unbroken registration streak started -- set the moment the first Agent
+    /// registers (mirrors [`active_tunnels_gauge`](Self::active_tunnels_gauge)'s
+    /// own "was the entry empty before this push" condition), removed the
+    /// moment the LAST live registration for the token drops. The admin
+    /// console's tunnel-overview dashboard's "uptime" is `now - this`, and is
+    /// therefore only ever reported while the token is actually connected --
+    /// a token that reconnects starts a fresh streak, it does not resume the
+    /// old one.
+    connected_since: Mutex<HashMap<RoutingToken, u64>>,
+    /// ADR-0025 Decision 6: wall-clock (Unix seconds) of the most recent
+    /// registration OR relay activity for a token. Unlike `connected_since`,
+    /// this is **never removed** on disconnect -- the whole point of
+    /// "last-seen" is that a currently-offline tunnel still reports when it
+    /// was last seen, which `connected_since` alone cannot answer once cleared.
+    last_seen: Mutex<HashMap<RoutingToken, u64>>,
     /// #282 follow-up: `agents`/`candidates`/`direct`/`hosts` are four
     /// independent mutexes with no shared critical section of their own, which
     /// left a narrow but real TOCTOU window between [`remove_registration`]'s
@@ -619,6 +635,8 @@ impl<H: Clone> EdgeState<H> {
             relay_bytes: Counter::default(),
             failovers: Counter::default(),
             tunnel_bytes: Mutex::new(HashMap::new()),
+            connected_since: Mutex::new(HashMap::new()),
+            last_seen: Mutex::new(HashMap::new()),
             registration_lock: Mutex::new(()),
             active_tunnels_gauge: AtomicU64::new(0),
             total_registrations_gauge: AtomicU64::new(0),
@@ -960,6 +978,11 @@ impl<H: Clone> EdgeState<H> {
         let entry = bytes.entry(token.clone()).or_insert((0, 0));
         entry.0 += client_to_agent;
         entry.1 += agent_to_client;
+        drop(bytes);
+        // ADR-0025 Decision 6: relay activity is "seen" too, not just a fresh
+        // registration -- a long-lived, already-registered tunnel that never
+        // re-registers must still show recent activity, not a stale timestamp.
+        self.last_seen.lock_safe().insert(token.clone(), Self::wall_now());
     }
 
     /// Cumulative `(bytes received from the client, bytes sent to the
@@ -979,6 +1002,20 @@ impl<H: Clone> EdgeState<H> {
     pub fn tunnel_bytes(&self, token: &RoutingToken) -> (u64, u64) {
         self.tunnel_bytes.lock_safe().get(token).copied().unwrap_or((0, 0))
     }
+
+    /// ADR-0025 Decision 6: `(connected_since, last_seen)`, both Unix seconds --
+    /// the admin console's tunnel-overview dashboard's raw timing inputs. See
+    /// the two fields' own doc comments for exactly when each is set/cleared;
+    /// this is a plain read of both, deliberately NOT computing "uptime" itself
+    /// (that subtraction happens where "now" is meaningfully callable/testable,
+    /// the HTTP handler, not here).
+    pub fn connection_timing(&self, token: &RoutingToken) -> (Option<u64>, Option<u64>) {
+        (
+            self.connected_since.lock_safe().get(token).copied(),
+            self.last_seen.lock_safe().get(token).copied(),
+        )
+    }
+
     pub fn note_failover(&self) {
         self.failovers.inc();
     }
@@ -1038,7 +1075,10 @@ impl<H: Clone> EdgeState<H> {
     /// purpose, so more than one simultaneous Client can be served).
     pub fn park_tcp_agent(&self, token: RoutingToken) -> oneshot::Receiver<BoxedStream> {
         let (tx, rx) = oneshot::channel();
-        self.tcp_agents.lock_safe().entry(token).or_default().push_back(tx);
+        self.tcp_agents.lock_safe().entry(token.clone()).or_default().push_back(tx);
+        // ADR-0025 Decision 6: a fallback-only tunnel (never QUIC-registered) must
+        // still show up as connected/uptime-tracked -- see `note_connected`'s doc.
+        self.note_connected(&token, Self::wall_now());
         // Instrumented so a fallback-only Agent is visible at all (see `tcp_parks`).
         self.tcp_parks.inc();
         self.tcp_parked_gauge.fetch_add(1, Ordering::Relaxed);
@@ -1216,17 +1256,46 @@ impl<H: Clone> EdgeState<H> {
     /// so this must never call back into `register`).
     fn register_locked(&self, token: RoutingToken, handle: H) -> u64 {
         let id = self.next_reg.fetch_add(1, Ordering::Relaxed);
+        let now = Self::wall_now();
         {
             let mut agents = self.agents.write_safe();
-            let entry = agents.entry(token).or_default();
+            let entry = agents.entry(token.clone()).or_default();
             if entry.is_empty() {
                 self.active_tunnels_gauge.fetch_add(1, Ordering::Relaxed);
             }
             entry.push((id, handle));
         }
+        self.note_connected(&token, now);
         self.total_registrations_gauge.fetch_add(1, Ordering::Relaxed);
         self.registrations.inc();
         id
+    }
+
+    /// ADR-0025 Decision 6: record `token` as connected/active as of `now` --
+    /// `last_seen` unconditionally moves forward, while `connected_since` is
+    /// only ever set the FIRST time this fires after a disconnect (`or_insert`,
+    /// not `insert`), so a token already known to be connected keeps its real
+    /// streak start rather than having it pushed forward by every subsequent
+    /// registration or relay. Shared by [`register_locked`](Self::register_locked)
+    /// (QUIC) and [`park_tcp_agent`](Self::park_tcp_agent) (TCP fallback) --
+    /// either transport counts as "connected" (mirrors `tunnel_status`'s own
+    /// `registrations > 0 || fallback_parked > 0` #544 contract), and
+    /// [`note_relay`] separately keeps `last_seen` moving for an
+    /// already-registered tunnel between registration events.
+    fn note_connected(&self, token: &RoutingToken, now: u64) {
+        self.connected_since.lock_safe().entry(token.clone()).or_insert(now);
+        self.last_seen.lock_safe().insert(token.clone(), now);
+    }
+
+    /// Current wall-clock time in Unix seconds, `0` on a clock error (matches
+    /// this codebase's existing `SystemTime::now()` convention, e.g.
+    /// `audit_log.rs::now_secs`) -- used only for the ADR-0025 admin-console
+    /// timing fields below, never for anything security-relevant.
+    fn wall_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 
     /// Register the Agent tunnel and record its Edge-observed peer candidate —
@@ -1359,6 +1428,12 @@ impl<H: Clone> EdgeState<H> {
         // logged that pointed at the actual cause.
         if !self.has_tcp_agent(token) {
             self.clear_hosts_for(token);
+            // ADR-0025 Decision 6: same #661 reasoning as the hostname-route clear
+            // just above -- the QUIC side alone going empty is not "disconnected"
+            // while a TCP-fallback registration for the same token is still live,
+            // so `connected_since` (which "uptime" is computed from) must not be
+            // cleared out from under a tunnel that is still actually serving.
+            self.connected_since.lock_safe().remove(token);
         }
     }
 
@@ -1391,6 +1466,11 @@ impl<H: Clone> EdgeState<H> {
         self.direct.write_safe().remove(token);
         self.tcp_agents.lock_safe().remove(token);
         self.clear_hosts_for(token);
+        // ADR-0025 Decision 6: unlike `remove_registration`, this always tears
+        // down BOTH transports (the `tcp_agents.remove` above), so unlike that
+        // function this needs no #661 has_tcp_agent guard -- it is unconditionally
+        // a full disconnect.
+        self.connected_since.lock_safe().remove(token);
     }
 
     /// Revoke `token` (#27 RB3): tear down its live registrations and any hostname
@@ -1632,6 +1712,113 @@ mod tests {
         assert_eq!(state.tunnel_bytes(&token(1)), (125, 45), "token 1 unaffected by token 2's relay");
         // The fleet-wide total (#10 O2) still reflects both directions of both tokens.
         assert_eq!(state.relay_bytes_total(), 125 + 45 + 7 + 3);
+    }
+
+    fn wall_now_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn connected_since_is_set_on_first_registration_and_cleared_on_full_disconnect() {
+        // ADR-0025 Decision 6: the admin console's "uptime" input.
+        let state: EdgeState<u32> = EdgeState::new();
+        let t = token(60);
+        assert_eq!(state.connection_timing(&t), (None, None), "never registered -> no timing at all");
+
+        let before = wall_now_for_test();
+        let id_a = state.register(t.clone(), 1);
+        let after = wall_now_for_test();
+        let (since, seen) = state.connection_timing(&t);
+        let since = since.expect("connected_since set on first registration");
+        let seen = seen.expect("last_seen set on first registration");
+        assert!(since >= before && since <= after, "connected_since is real wall-clock, not a placeholder");
+        assert_eq!(since, seen, "first-ever activity: both timestamps coincide");
+
+        // A second, redundant registration (#8) must NOT push connected_since
+        // forward -- the streak already started with the first agent.
+        let id_b = state.register(t.clone(), 2);
+        assert_eq!(state.connection_timing(&t).0, Some(since), "redundant registration does not reset the streak start");
+
+        // Evicting one of two redundant agents leaves the tunnel connected.
+        state.remove_registration(&t, id_a);
+        assert_eq!(state.connection_timing(&t).0, Some(since), "still connected -> streak start unchanged");
+
+        // Evicting the LAST agent -> fully disconnected -> connected_since is
+        // cleared, but last_seen is NOT (the whole point of "last seen").
+        state.remove_registration(&t, id_b);
+        let (since3, seen3) = state.connection_timing(&t);
+        assert_eq!(since3, None, "fully disconnected -> no live streak to report");
+        assert!(seen3.is_some(), "last-seen must survive disconnect -- that's what it's for");
+    }
+
+    #[test]
+    fn park_tcp_agent_also_sets_connected_since_and_last_seen_for_a_fallback_only_tunnel() {
+        // #544's own "either transport counts as connected" contract, extended to
+        // the ADR-0025 timing fields -- a fallback-only Agent must not be invisible
+        // to the admin console's uptime column just because it never used QUIC.
+        let state: EdgeState<u32> = EdgeState::new();
+        let t = token(61);
+        assert_eq!(state.connection_timing(&t), (None, None));
+        let _rx = state.park_tcp_agent(t.clone());
+        let (since, seen) = state.connection_timing(&t);
+        assert!(since.is_some() && seen.is_some());
+    }
+
+    #[test]
+    fn connected_since_survives_a_quic_teardown_while_a_tcp_fallback_registration_is_still_live_661() {
+        // Same #661 scenario `remove_registration`'s own hosts-clearing guard
+        // already covers -- connected_since must not be wiped out from under a
+        // tunnel that is still actually serving over the OTHER transport.
+        let state: EdgeState<u32> = EdgeState::new();
+        let t = token(62);
+        let id = state.register(t.clone(), 1);
+        let since_before = state.connection_timing(&t).0.expect("connected via QUIC");
+        let _rx = state.park_tcp_agent(t.clone()); // also live over TCP fallback now
+        state.remove_registration(&t, id); // QUIC side drops...
+        assert_eq!(
+            state.connection_timing(&t).0,
+            Some(since_before),
+            "TCP fallback still live -> streak must not reset (#661)"
+        );
+    }
+
+    #[test]
+    fn note_relay_advances_activity_without_fabricating_or_resetting_a_connection() {
+        let state: EdgeState<u32> = EdgeState::new();
+        // A relay against an ALREADY-registered token is activity, not a new
+        // connection -- connected_since must not move.
+        let registered = token(63);
+        state.register(registered.clone(), 1);
+        let since = state.connection_timing(&registered).0.unwrap();
+        state.note_relay(&registered, 10, 5, RelayKind::DataPlane);
+        assert_eq!(state.connection_timing(&registered).0, Some(since));
+
+        // A relay against a token that was NEVER registered (note_relay never
+        // touches `agents`, per its own doc comment) must set last_seen but must
+        // NOT fabricate a connected_since -- relaying alone proves activity, not
+        // a live registration.
+        let never_registered = token(64);
+        state.note_relay(&never_registered, 1, 1, RelayKind::DataPlane);
+        let (since, seen) = state.connection_timing(&never_registered);
+        assert_eq!(since, None, "relaying alone is not a registration");
+        assert!(seen.is_some());
+    }
+
+    #[test]
+    fn remove_clears_connected_since_unconditionally_but_keeps_last_seen() {
+        // Unlike `remove_registration` (single-id, #661-guarded), `remove` tears
+        // down BOTH transports at once -- always a real full disconnect.
+        let state: EdgeState<u32> = EdgeState::new();
+        let t = token(65);
+        state.register(t.clone(), 1);
+        let _rx = state.park_tcp_agent(t.clone());
+        state.remove(&t);
+        let (since, seen) = state.connection_timing(&t);
+        assert_eq!(since, None, "remove() is a full disconnect regardless of transport");
+        assert!(seen.is_some(), "last-seen still survives");
     }
 
     #[test]

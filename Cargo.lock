@@ -612,6 +612,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tower",
+ "x509-parser",
 ]
 
 [[package]]

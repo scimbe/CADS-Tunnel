@@ -3828,6 +3828,23 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         let tls = build_front_door_cert("MASQUE", "CT_EDGE_MASQUE_CERT", "CT_EDGE_MASQUE_KEY");
                         proxies.insert(host.to_ascii_lowercase(), (addr, tls));
                     }
+                    // ADR-0025 Decision 5: the admin console is a new hostname on the
+                    // EXISTING control-plane process, not a new service -- fronted
+                    // exactly like Portal/Auth IdP/MASQUE above (same TLS-terminate-
+                    // and-forward arm), but with its OWN `_ADDR` rather than reusing
+                    // `CT_CP_PROXY_ADDR`: Decision 5's own addendum (docs/adr/0025-*)
+                    // notes the admin console's session cookie is scoped to THIS
+                    // distinct hostname, separate from Portal's, so keeping the proxy
+                    // target independently configurable (even though an operator will
+                    // normally point both at the same `control-plane:8090`) avoids
+                    // silently coupling the two if that ever changes.
+                    if let (Some(host), Some(addr)) = (
+                        std::env::var("CT_EDGE_ADMIN_UI_HOST").ok().filter(|s| !s.is_empty()),
+                        resolve_proxy_addr(std::env::var("CT_EDGE_ADMIN_UI_ADDR").ok()),
+                    ) {
+                        let tls = build_front_door_cert("Admin UI", "CT_EDGE_ADMIN_UI_CERT", "CT_EDGE_ADMIN_UI_KEY");
+                        proxies.insert(host.to_ascii_lowercase(), (addr, tls));
+                    }
                     // #233: the shared front-door wildcard cert backing the Gelb
                     // tier — same env-var/loading convention as Portal/Auth IdP
                     // above. `None` (unset, or unusable per #142) means every
