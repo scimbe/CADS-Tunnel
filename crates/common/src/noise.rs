@@ -209,6 +209,16 @@ fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8])
     Ok(2 + len)
 }
 
+/// ct-agent#105: same opt-in switch as `a2a::write_message`'s request/response logging
+/// (`crates/common/src/a2a.rs`) -- kept as a separate check here (rather than importing
+/// across modules) because `noise_pump` is the transport-layer bracket around those
+/// app-layer logs: if a plaintext chunk logged here, on its way INTO/OUT OF the cipher,
+/// already differs from what `write_message`/`serve_request_loop` logged on the app
+/// side, the corruption is inside the pump/transport, not the dispatch handler above it.
+fn debug_a2a_timing_enabled() -> bool {
+    std::env::var_os("CT_DEBUG_A2A_TIMING").is_some()
+}
+
 pub async fn noise_pump<C, P>(
     transport: snow::TransportState,
     cipher: C,
@@ -239,6 +249,12 @@ where
                 let _ = c_write.shutdown().await;
                 return Ok::<(), io::Error>(());
             }
+            if debug_a2a_timing_enabled() {
+                eprintln!(
+                    "ct-a2a-timing: noise_pump outbound plaintext read n={n} head={:?}",
+                    String::from_utf8_lossy(&buf[..n.min(96)]),
+                );
+            }
             // #189: encrypt+frame the app bytes via the shared primitive (no tag on the base wire).
             let total = seal_frame(&ts, &buf[..n], &mut ct)?;
             c_write.write_all(&ct[..total]).await?;
@@ -261,6 +277,12 @@ where
                 }
             };
             let len = ts.lock().unwrap().read_message(&fr[..n], &mut pt).map_err(noise_err)?;
+            if debug_a2a_timing_enabled() {
+                eprintln!(
+                    "ct-a2a-timing: noise_pump inbound plaintext decrypted len={len} head={:?}",
+                    String::from_utf8_lossy(&pt[..len.min(96)]),
+                );
+            }
             p_write.write_all(&pt[..len]).await?;
             p_write.flush().await?;
         }
