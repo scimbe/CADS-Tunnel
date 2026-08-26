@@ -29,6 +29,11 @@ pub enum EnrollError {
     /// public key (#88 SEC88c) — the redeemer didn't prove it holds the private
     /// key for the key it's binding.
     BadProof,
+    /// #663: the token was never redeemed before its `expires_at` -- a leaked
+    /// unredeemed token now has a bounded lifetime instead of being exploitable
+    /// forever. It's still consumed on this outcome (single-use, same as an
+    /// already-used one), so it can't be retried indefinitely either.
+    Expired,
 }
 
 impl std::fmt::Display for EnrollError {
@@ -37,6 +42,7 @@ impl std::fmt::Display for EnrollError {
             EnrollError::UnknownToken => write!(f, "unknown join token"),
             EnrollError::TokenAlreadyUsed => write!(f, "join token already used"),
             EnrollError::BadProof => write!(f, "join-token proof-of-possession invalid"),
+            EnrollError::Expired => write!(f, "join token expired"),
         }
     }
 }
