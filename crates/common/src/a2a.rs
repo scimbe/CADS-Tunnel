@@ -456,6 +456,21 @@ pub async fn write_message<W: AsyncWrite + Unpin>(send: &mut W, msg: &[u8]) -> i
             ),
         ));
     }
+    // ct-agent#105: opt-in, same switch as the handshake timing above -- pins whether a
+    // corrupted/truncated response (live-observed: a physics fragment's leading field
+    // missing between ct-agent 0.4.16 and 0.7.4's concurrent-serve mode, #200) already
+    // left this call's plaintext malformed (a dispatch-side bug) or was still correct
+    // here and got mangled in flight below (a transport-side bug, e.g. noise_pump/quinn
+    // stream backpressure under genuinely concurrent streams). Logs the PLAINTEXT
+    // app-layer frame (MCP JSON-RPC), before Noise encryption -- no wire secrets in it.
+    if debug_a2a_timing_enabled() {
+        eprintln!(
+            "ct-a2a-timing: write_message len={} head={:?} tail={:?}",
+            msg.len(),
+            String::from_utf8_lossy(&msg[..msg.len().min(96)]),
+            String::from_utf8_lossy(&msg[msg.len().saturating_sub(32)..]),
+        );
+    }
     send.write_all(&frame(msg)).await?;
     send.flush().await?;
     Ok(())
@@ -527,6 +542,18 @@ where
                 ))
             }
         };
+        // ct-agent#105: log what this loop actually RECEIVED, same switch as write_message's
+        // outbound log above -- if a request already arrives short/mangled here, the bug is
+        // upstream of `handle` (dispatch/subprocess-capture side); if it's correct here but
+        // `write_message`'s log for the resulting response is already wrong, the bug is inside
+        // `handle`; if both logs are correct, the bug is downstream, in the pump/transport.
+        if debug_a2a_timing_enabled() {
+            eprintln!(
+                "ct-a2a-timing: serve_request_loop received len={} head={:?}",
+                request.len(),
+                String::from_utf8_lossy(&request[..request.len().min(96)]),
+            );
+        }
         let response = handle(request).await;
         // #135 L2.2: guarded write — an oversize response errors the loop rather than truncating the
         // u16 length and corrupting the session.
