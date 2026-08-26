@@ -77,9 +77,33 @@ pub fn acme_broker_router(
     edge_admin: Option<(String, String)>,
 ) -> Router {
     Router::new()
+        // #666/#671: the routing token is a bearer credential -- carrying it in the URL
+        // path means it lands in every proxy/LB/access log between here and the agent.
+        // The `:hostname`-only routes below (token via the `x-ct-agent-token` header
+        // instead) are the fix; the original `:token/:hostname` routes stay mounted,
+        // unchanged, for back-compat during a mixed-version rollout (an older `ct-agent`
+        // still calling the path form must keep working). Both forward to the same
+        // inner logic -- only how the token is extracted differs.
         .route("/agent/acme-admission/:token/:hostname", get(admission))
+        .route("/agent/acme-admission/:hostname", get(admission_via_header))
         .route("/agent/acme-issuance-complete/:token/:hostname", post(issuance_complete))
+        .route("/agent/acme-issuance-complete/:hostname", post(issuance_complete_via_header))
         .with_state(AcmeBrokerState { edge_mesh, tunnels, edge_admin })
+}
+
+/// #666/#671: header carrying the routing token for the `:hostname`-only route forms,
+/// so it never appears in a URL path/log. Distinct from `x-ct-admin-token` (a different
+/// credential, the shared edge-admin secret) and from `authorization: Bearer` (reserved
+/// in case this endpoint ever sits behind infrastructure that inspects that header).
+const AGENT_TOKEN_HEADER: &str = "x-ct-agent-token";
+
+fn token_from_header(headers: &axum::http::HeaderMap) -> Result<String, (StatusCode, String)> {
+    headers
+        .get(AGENT_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .ok_or((StatusCode::UNAUTHORIZED, format!("missing or empty {AGENT_TOKEN_HEADER} header")))
 }
 
 /// Push this hostname's current **channel** tier to the edge (#233) — which
@@ -205,6 +229,25 @@ async fn admission(
     State(state): State<AcmeBrokerState>,
     Path((token, hostname)): Path<(String, String)>,
 ) -> Result<([(axum::http::HeaderName, &'static str); 1], Json<AdmissionResponse>), (StatusCode, String)> {
+    admission_inner(state, token, hostname).await
+}
+
+/// #666/#671: same as [`admission`], token via the `x-ct-agent-token` header instead
+/// of the URL path.
+async fn admission_via_header(
+    State(state): State<AcmeBrokerState>,
+    Path(hostname): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], Json<AdmissionResponse>), (StatusCode, String)> {
+    let token = token_from_header(&headers)?;
+    admission_inner(state, token, hostname).await
+}
+
+async fn admission_inner(
+    state: AcmeBrokerState,
+    token: String,
+    hostname: String,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], Json<AdmissionResponse>), (StatusCode, String)> {
     authorize(&state, &token, &hostname).await?;
     let admission = state
         .tunnels
@@ -224,6 +267,25 @@ async fn admission(
 async fn issuance_complete(
     State(state): State<AcmeBrokerState>,
     Path((token, hostname)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    issuance_complete_inner(state, token, hostname).await
+}
+
+/// #666/#671: same as [`issuance_complete`], token via the `x-ct-agent-token` header
+/// instead of the URL path.
+async fn issuance_complete_via_header(
+    State(state): State<AcmeBrokerState>,
+    Path(hostname): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = token_from_header(&headers)?;
+    issuance_complete_inner(state, token, hostname).await
+}
+
+async fn issuance_complete_inner(
+    state: AcmeBrokerState,
+    token: String,
+    hostname: String,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize(&state, &token, &hostname).await?;
     // #261: a valid routing token for this hostname is who-can-call, not
@@ -580,6 +642,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #666/#671: the token must be acceptable via the `x-ct-agent-token` header on the
+    /// `:hostname`-only route, not just the URL path -- this is the whole point of the
+    /// fix (URL paths land in access logs, a header carrying the same bearer credential
+    /// does not). A missing/empty header, or the wrong token in a present header, must
+    /// both be refused exactly like the path form's wrong-token case.
+    #[tokio::test]
+    async fn admission_accepts_the_routing_token_via_header_not_just_url_path_666() {
+        let (edge_mesh, tunnels) = stores();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        let app = acme_broker_router(edge_mesh, tunnels, None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/agent/acme-admission/app.example.com")
+                    .header(AGENT_TOKEN_HEADER, &t.routing_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a correct token via the header must be admitted");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: AdmissionResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.status, "rot");
+
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/agent/acme-admission/app.example.com").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no header at all must be refused, not treated as no-owner");
+
+        let resp = app
+            .oneshot(
+                Request::get("/agent/acme-admission/app.example.com")
+                    .header(AGENT_TOKEN_HEADER, "wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a wrong token via the header is refused exactly like the path form");
+    }
+
+    /// #666/#671: same header-based acceptance, mirrored for `issuance-complete` --
+    /// proves the fix covers both endpoints named in the issue, not just admission.
+    #[tokio::test]
+    async fn issuance_complete_accepts_the_routing_token_via_header_666() {
+        let (edge_mesh, tunnels) = stores();
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        tunnels.enter_gelb_queue("app.example.com", 0).unwrap();
+        tunnels.offer_claim("app.example.com", "letsencrypt", 0, now_secs() + 100).unwrap();
+        let app = acme_broker_router(edge_mesh, tunnels, None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/agent/acme-issuance-complete/app.example.com")
+                    .header(AGENT_TOKEN_HEADER, &t.routing_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a correct token via the header must be accepted");
+
+        let resp = app
+            .oneshot(Request::post("/agent/acme-issuance-complete/app.example.com").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no header at all must be refused");
     }
 
     #[tokio::test]

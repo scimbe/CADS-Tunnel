@@ -54,9 +54,9 @@ issue_cert() {
   # silently breaks TLS termination on the very next container recreate (found
   # live, 2026-08-25, ADR-0024 M4: the masque cert this same function issued came
   # up with the edge logging "MASQUE TLS cert configured but UNUSABLE (Permission
-  # denied)" and falling back to unterminated/plaintext proxying -- #142). The
-  # private key itself is still only host-readable by anyone with access to this
-  # machine at all, same as every other secret in docker/deploy/.env.
+  # denied)" and falling back to unterminated/plaintext proxying -- #657/#658).
+  # The private key itself is still only host-readable by anyone with access to
+  # this machine at all, same as every other secret in docker/deploy/.env.
   chmod 644 "$key"
   ok "cert installed at $dir ($([ "${STAGING:-0}" = "1" ] && echo staging || echo production))"
 }
