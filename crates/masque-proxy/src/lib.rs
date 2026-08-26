@@ -153,40 +153,64 @@ impl Default for Config {
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(config.listen).await?;
     let expected_path = Arc::new(expected_connect_udp_path(config.target));
+    // #662: this semaphore now gates admitted TUNNELS (authenticated CONNECT-UDP
+    // streams), not raw TCP connections -- see handle_request. A max_concurrent_streams
+    // cap on the h2 Builder below bounds how many streams one connection can even
+    // present to that per-tunnel check.
     let admission = Arc::new(Semaphore::new(config.max_concurrent_tunnels));
     let target = config.target;
     let idle_timeout = config.idle_timeout;
     let shared_token = config.shared_token;
+    let max_concurrent_tunnels = config.max_concurrent_tunnels;
 
     loop {
         let (io, _peer) = listener.accept().await?;
         let expected_path = expected_path.clone();
         let admission = admission.clone();
         tokio::spawn(async move {
-            // #559: a connection that can't get a permit is refused immediately, not
-            // queued -- an unbounded queue is the same resource-exhaustion shape as no
-            // bound at all, just with extra steps.
-            let Ok(_permit) = admission.try_acquire_owned() else {
-                return;
-            };
-            if let Err(e) = serve_connection(io, target, expected_path, idle_timeout, shared_token).await {
+            if let Err(e) = serve_connection(
+                io,
+                target,
+                expected_path,
+                idle_timeout,
+                shared_token,
+                admission,
+                max_concurrent_tunnels,
+            )
+            .await
+            {
                 eprintln!("masque-proxy: connection ended with error: {e}");
             }
         });
     }
 }
 
+/// #662: an unauthenticated caller must not be able to stall here forever and hold
+/// the connection's slot open -- there is no admission permit at stake during the
+/// handshake any more (see [`run`]), but an unbounded handshake would still let a
+/// caller pin a TCP connection/task/fd indefinitely, so it's bounded to the same
+/// window as the post-handshake tunnel idle timeout.
 async fn serve_connection(
     io: TcpStream,
     target: SocketAddr,
     expected_path: Arc<String>,
     idle_timeout: Duration,
     shared_token: [u8; 32],
+    admission: Arc<Semaphore>,
+    max_concurrent_tunnels: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut conn = h2::server::Builder::new()
-        .enable_connect_protocol()
-        .handshake::<_, Bytes>(io)
-        .await?;
+    let mut conn = tokio::time::timeout(
+        idle_timeout,
+        h2::server::Builder::new()
+            .enable_connect_protocol()
+            // Defense in depth alongside the per-tunnel admission permit below: bounds
+            // how many streams h2 itself will let one connection present at once,
+            // independent of the app-level check.
+            .max_concurrent_streams(max_concurrent_tunnels as u32)
+            .handshake::<_, Bytes>(io),
+    )
+    .await
+    .map_err(|_| "h2 handshake timed out")??;
 
     // ADR-0024 M4: found live, causing every real CONNECT-UDP request to hang
     // until the client gave up -- `handle_request` was previously awaited INLINE
@@ -209,8 +233,11 @@ async fn serve_connection(
     while let Some(result) = conn.accept().await {
         let (req, respond) = result?;
         let expected_path = expected_path.clone();
+        let admission = admission.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_request(req, respond, target, &expected_path, idle_timeout, &shared_token).await {
+            if let Err(e) =
+                handle_request(req, respond, target, &expected_path, idle_timeout, &shared_token, admission).await
+            {
                 eprintln!("masque-proxy: request handling ended with error: {e}");
             }
         });
@@ -225,6 +252,7 @@ async fn handle_request(
     expected_path: &str,
     idle_timeout: Duration,
     shared_token: &[u8; 32],
+    admission: Arc<Semaphore>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let is_connect_udp = req.method() == Method::CONNECT
         && req.extensions().get::<Protocol>() == Some(&Protocol::from_static("connect-udp"));
@@ -242,6 +270,17 @@ async fn handle_request(
         respond.send_reset(h2::Reason::REFUSED_STREAM);
         return Ok(());
     }
+
+    // #662: admission is now checked per TUNNEL (this point -- past auth, one per h2
+    // stream), not per TCP connection. An unauthenticated caller can no longer pin a
+    // permit at all (fixes the slowloris permanent-DoS shape); an authenticated but
+    // misbehaving caller opening many streams on one connection is capped the same
+    // way a swarm of separate connections would be -- same undifferentiated refusal
+    // path as a wrong token/target, so no oracle for "admission full" vs "bad auth".
+    let Ok(_permit) = admission.try_acquire_owned() else {
+        respond.send_reset(h2::Reason::REFUSED_STREAM);
+        return Ok(());
+    };
 
     let response = Response::builder().status(200).body(()).unwrap();
     let mut send_stream = respond.send_response(response, false)?;

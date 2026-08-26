@@ -319,3 +319,84 @@ async fn a_request_with_no_or_wrong_token_gets_refused_even_for_the_correct_targ
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_stalled_connections_do_not_starve_a_legitimate_tunnel() {
+    // #662(A): an unauthenticated caller that opens a TCP connection and never sends
+    // the h2 preface used to pin an admission permit for the connection's entire
+    // (unbounded) lifetime -- enough such connections (max_concurrent_tunnels worth)
+    // permanently exhausted the semaphore, refusing every legitimate agent forever.
+    // Regression: with max_concurrent_tunnels stalled attacker connections already
+    // open and held (never handshaking), a legitimate authenticated tunnel must
+    // still succeed -- admission is now checked per authenticated TUNNEL, not per
+    // raw TCP connection, so the stalled connections never touch the semaphore.
+    let target = spawn_udp_echo_target().await;
+    let token = [0x99u8; 32];
+    let max_concurrent_tunnels = 2;
+
+    let listen_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = listen_probe.local_addr().unwrap();
+    drop(listen_probe);
+
+    let config = Config {
+        listen: proxy_addr,
+        target,
+        max_concurrent_tunnels,
+        idle_timeout: Duration::from_secs(5),
+        shared_token: token,
+    };
+    tokio::spawn(masque_proxy::run(config));
+
+    // Open exactly `max_concurrent_tunnels` attacker connections and hold them open
+    // without ever sending a single byte -- if admission were still pinned at raw
+    // TCP-accept time (the pre-fix behavior), this alone exhausts the semaphore.
+    let mut stalled_attackers = Vec::new();
+    for _ in 0..max_concurrent_tunnels {
+        let io = 'connect: {
+            for _ in 0..50 {
+                if let Ok(io) = tokio::net::TcpStream::connect(proxy_addr).await {
+                    break 'connect io;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("masque-proxy never started accepting on {proxy_addr}");
+        };
+        stalled_attackers.push(io); // kept alive (not dropped) for the rest of the test
+    }
+
+    // A legitimate, fully-authenticated caller must still get through.
+    let client_io = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    let (send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+    tokio::spawn(connection);
+
+    let mut send_request = send_request.ready().await.unwrap();
+    for _ in 0..50 {
+        if send_request.is_extended_connect_protocol_enabled() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(send_request.is_extended_connect_protocol_enabled());
+
+    let path = format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port());
+    let mut request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("https://{proxy_addr}{path}"))
+        .header("x-ct-masque-token", hex_token(&token))
+        .body(())
+        .unwrap();
+    request.extensions_mut().insert(Protocol::from_static("connect-udp"));
+
+    let (response_fut, _client_send) = send_request.send_request(request, true).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(2), response_fut)
+        .await
+        .expect(
+            "a legitimate authenticated tunnel must succeed promptly even while \
+             max_concurrent_tunnels unauthenticated connections are stalled pre-handshake",
+        )
+        .unwrap();
+    assert_eq!(response.status(), 200, "the legitimate tunnel must be admitted, not refused for lack of a free permit");
+
+    drop(stalled_attackers); // keep them alive up to this point, not before
+}
