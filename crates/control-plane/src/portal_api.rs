@@ -766,6 +766,17 @@ Ask the super-admin to add your e-mail, or <a href="/portal">go back to the port
         .into_response()
 }
 
+// Rail-nav icons (ADR-0025 layout pass): plain inline SVG, stroke="currentColor" so
+// each picks up .rail-link's own color (muted at rest, teal on hover/active) for free
+// -- no separate light/dark icon asset, no extra HTTP request.
+const ICON_DASHBOARD: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>"#;
+const ICON_TRAFFIC: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg>"#;
+const ICON_ACCOUNTS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20c1.5-4 5-5.5 7.5-5.5s6 1.5 7.5 5.5"/></svg>"#;
+const ICON_DOMAINS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 4 6 4 9s-1.5 6.3-4 9c-2.5-2.7-4-6-4-9s1.5-6.3 4-9z"/></svg>"#;
+const ICON_ADMINS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/></svg>"#;
+const ICON_CERTS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>"#;
+const ICON_AUDIT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l5 5v13H6z"/><path d="M14 3v5h5M9 12h6M9 16h6"/></svg>"#;
+
 /// Shared page chrome for every `/admin-ui/*` HTML page -- deliberately its own
 /// shell, not [`page`] (Portal's own nav points at `/portal/*`, a different surface
 /// with different login and owner-scoped data; reusing it here would put customer
@@ -777,36 +788,115 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
     } else {
         ""
     };
+    // ADR-0025 layout pass (operator feedback 2026-08-26: "furchtbar strukturiert" --
+    // the seven nav links + role badge + signed-in-as + sign-out crammed into one row
+    // was the concrete complaint). A left nav rail replaces that row; colors/type are
+    // UNCHANGED from docs/design/tokens.md -- this is a structure-only rework, not a
+    // re-theme (two earlier full re-themes were already rejected as "still generic",
+    // see that file's own history; reinventing brand tokens here would repeat that).
+    let rail_link = |href: &str, label: &str, icon: &str| -> String {
+        let on = if href == title_to_href(title) { " on" } else { "" };
+        format!(r#"<a class="rail-link{on}" href="{href}">{icon}<span>{label}</span></a>"#, on = on, href = href, icon = icon, label = label)
+    };
+    fn title_to_href(title: &str) -> &'static str {
+        match title {
+            "dashboard" => "/admin-ui/",
+            "traffic" => "/admin-ui/traffic",
+            "accounts" => "/admin-ui/accounts",
+            "domains" => "/admin-ui/domains",
+            "admins" => "/admin-ui/admins",
+            "certs" => "/admin-ui/certs",
+            "audit" => "/admin-ui/audit",
+            _ => "",
+        }
+    }
+    let nav_links = [
+        rail_link("/admin-ui/", "Dashboard", ICON_DASHBOARD),
+        rail_link("/admin-ui/traffic", "Traffic", ICON_TRAFFIC),
+        rail_link("/admin-ui/accounts", "Accounts", ICON_ACCOUNTS),
+        rail_link("/admin-ui/domains", "Domains", ICON_DOMAINS),
+        rail_link("/admin-ui/admins", "Admins", ICON_ADMINS),
+        rail_link("/admin-ui/certs", "Certs", ICON_CERTS),
+        rail_link("/admin-ui/audit", "Audit log", ICON_AUDIT),
+    ]
+    .concat();
+    let initials: String = session
+        .email
+        .split(['@', '.'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CADS-Tunnel Admin — {title}</title>
 <style>
- :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#9aa4b0;
+ :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--border2:#21262d;--text:#e6edf3;--muted:#9aa4b0;
        --accent:#d98a4f;--accent-hover:#e39a63;--accent-ink:#20130a;
-       --accent2:#5fb8ab;--accent2-hover:#7cc9bd;
+       --accent2:#5fb8ab;--accent2-hover:#7cc9bd;--rail-w:225px;
        --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
+ *{{box-sizing:border-box}}
  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
-      font-size:16px;line-height:1.55;
-      display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:2.5rem 1rem}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:1100px;width:100%;
-      animation:cardIn .32s ease-out}}
+      font-size:16px;line-height:1.55}}
  @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
  @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
- h1,h2{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
- h1{{font-size:1.6rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.1rem;color:var(--muted);margin:1.5rem 0 .6rem}}
- nav{{display:flex;flex-wrap:wrap;align-items:center;gap:.3rem 1rem;margin-bottom:1.2rem;border-bottom:1px solid var(--border);padding-bottom:.9rem}}
- nav a{{color:var(--accent2);text-decoration:none;font-size:.92rem;font-weight:600;transition:color .15s ease}}
- nav a:hover{{color:var(--accent2-hover)}}
+ h1,h2,h3{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
+ h1{{font-size:1.6rem;margin:.1rem 0 1.1rem}} h2{{font-size:1.05rem;color:var(--muted);margin:1.6rem 0 .6rem}}
+ /* ---- App shell: nav rail + main content, replaces the old single centered card ---- */
+ .shell{{display:flex;min-height:100vh}}
+ .rail{{width:var(--rail-w);flex:0 0 auto;background:var(--panel);border-right:1px solid var(--border);
+      display:flex;flex-direction:column;padding:1.25rem .9rem;position:sticky;top:0;height:100vh}}
+ .brand{{display:flex;align-items:center;gap:.55rem;padding:.3rem .4rem 1.3rem;border-bottom:1px solid var(--border2);margin-bottom:1rem}}
+ .brand .mark{{width:24px;height:24px;border-radius:6px;background:linear-gradient(135deg,var(--accent),var(--accent2));position:relative;flex:0 0 auto}}
+ .brand .mark::after{{content:"";position:absolute;inset:6px;border-radius:3px;background:var(--bg)}}
+ .brand .name{{font-family:var(--serif);font-weight:600;font-size:.98rem;letter-spacing:-.01em;line-height:1.25}}
+ .brand .sub{{display:block;font-size:.64rem;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}}
+ .rail-link{{display:flex;align-items:center;gap:.65rem;padding:.55rem .6rem;border-radius:8px;text-decoration:none;
+      color:var(--muted);font-size:.9rem;font-weight:500;transition:background .15s ease,color .15s ease}}
+ .rail-link:hover{{background:var(--border2);color:var(--text)}}
+ .rail-link.on{{background:#1c2530;color:var(--accent2);font-weight:600}}
+ .rail-link svg{{width:17px;height:17px;flex:0 0 auto;color:var(--muted)}}
+ .rail-link.on svg,.rail-link:hover svg{{color:currentColor}}
+ .rail-foot{{margin-top:auto;padding-top:1rem;border-top:1px solid var(--border2)}}
+ .who{{display:flex;align-items:center;gap:.55rem;padding:.4rem}}
+ .who .av{{width:26px;height:26px;border-radius:50%;background:var(--border2);display:flex;align-items:center;justify-content:center;
+      font-size:.68rem;font-weight:700;color:var(--accent2);flex:0 0 auto}}
+ .who .meta{{min-width:0}}
+ .who .email{{font-size:.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}}
+ .signout{{display:block;margin-top:.4rem;font-size:.8rem;color:var(--muted);text-decoration:none;padding:.4rem}}
+ .signout:hover{{color:var(--text)}}
+ .main{{flex:1 1 auto;min-width:0;padding:2.1rem 2.6rem 3rem;max-width:1180px}}
+ /* ---- KPI stat grid: replaces the old plain .kv row of numbers ---- */
+ .kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.85rem;margin-bottom:1rem}}
+ .kpi{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;animation:cardIn .32s ease-out backwards}}
+ .kpi:nth-child(1){{animation-delay:0ms}} .kpi:nth-child(2){{animation-delay:40ms}} .kpi:nth-child(3){{animation-delay:80ms}}
+ .kpi:nth-child(4){{animation-delay:120ms}} .kpi:nth-child(n+5){{animation-delay:160ms}}
+ .kpi .label{{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);display:flex;align-items:center;gap:.4rem}}
+ .kpi .value{{font-family:var(--serif);font-size:1.5rem;margin-top:.3rem;font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:.4rem;flex-wrap:wrap}}
+ .kpi .value .unit{{font-family:var(--sans,inherit);font-size:.72rem;color:var(--muted);font-weight:500}}
+ /* ---- Section cards: replaces the old bare <ul class="steps"> of links ---- */
+ .cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.85rem}}
+ .seccard{{display:block;text-decoration:none;color:var(--text);background:var(--panel);border:1px solid var(--border);
+      border-radius:12px;padding:1rem 1.1rem;transition:border-color .15s ease,transform .12s ease,background .15s ease;
+      animation:cardIn .3s ease-out backwards}}
+ .seccard:nth-child(1){{animation-delay:0ms}} .seccard:nth-child(2){{animation-delay:40ms}} .seccard:nth-child(3){{animation-delay:80ms}}
+ .seccard:nth-child(4){{animation-delay:120ms}} .seccard:nth-child(5){{animation-delay:160ms}} .seccard:nth-child(6){{animation-delay:200ms}}
+ .seccard:hover{{border-color:var(--accent2);transform:translateY(-2px);background:#1a212b}}
+ .seccard .icon{{width:32px;height:32px;border-radius:8px;background:#1c2530;display:flex;align-items:center;justify-content:center;margin-bottom:.65rem}}
+ .seccard .icon svg{{width:17px;height:17px;color:var(--accent2)}}
+ .seccard h3{{font-size:.95rem;margin-bottom:.25rem}}
+ .seccard p{{margin:0;color:var(--muted);font-size:.82rem;line-height:1.5}}
  nav .spacer{{flex:1 1 auto}}
- nav .signed-in-as{{color:var(--muted);font-size:.88rem}}
- nav .signed-in-as strong{{color:var(--text);font-weight:600}}
  .badge{{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.72rem;font-weight:700;vertical-align:middle}}
  .badge.super{{background:#2d1a00;color:#f0c674;border:1px solid #7d4e00}}
  .badge.blocked{{background:#3d1418;color:#ff9a9a;border:1px solid #6e2530}}
  .badge.ok{{background:#0d2818;color:#3fb950;border:1px solid #1f5c33}}
  .badge.warn{{background:#3d2e00;color:#f0c674;border:1px solid #7d4e00}}
+ .badge.platform{{background:#12242b;color:var(--accent2);border:1px solid #1e4a52}}
  a.btn,button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;padding:.5rem 1rem;
       font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;
       transition:background .15s ease,transform .08s ease}}
@@ -816,11 +906,17 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
  a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
  a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
  button:disabled{{opacity:.4;cursor:not-allowed}}
- table.data{{width:100%;border-collapse:collapse;margin:.4rem 0 1rem;font-size:.92rem}}
- table.data th,table.data td{{padding:.55rem .6rem;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}}
- table.data th{{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.03em}}
- table.data tr:hover td{{background:#1c222b}}
+ /* ---- Tables: more breathing room, sticky header, right-aligned tabular numbers ---- */
+ .tablewrap{{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--panel);margin:.4rem 0 1.4rem}}
+ table.data{{width:100%;border-collapse:collapse;font-size:.89rem;min-width:480px}}
+ table.data th,table.data td{{padding:.65rem .85rem;text-align:left;vertical-align:middle}}
+ table.data thead th{{position:sticky;top:0;background:var(--panel);color:var(--muted);font-weight:600;font-size:.72rem;
+      text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border)}}
+ table.data tbody tr{{border-bottom:1px solid var(--border2);transition:background .12s ease}}
+ table.data tbody tr:last-child{{border-bottom:0}}
+ table.data tbody tr:hover td{{background:#1a212b}}
  table.data code{{font-size:.86rem}}
+ table.data td.num,table.data th.num{{font-variant-numeric:tabular-nums;text-align:right}}
  table.data th.sortable{{cursor:pointer;user-select:none;white-space:nowrap}}
  table.data th.sortable:hover{{color:var(--text)}}
  table.data th.sortable .sort-arrow{{display:inline-block;width:.9em;opacity:.55}}
@@ -836,7 +932,7 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
  form.inline{{display:inline;margin:0}}
  label{{display:block;margin:.7rem 0;font-size:.92rem}}
  .help{{color:var(--muted);font-size:.86rem;line-height:1.5}}
- p.help{{margin:.2rem 0 1rem}}
+ p.help{{margin:.2rem 0 1rem;max-width:70ch}}
  .msg{{font-size:.88rem;margin:.3rem 0;min-height:1.2em}}
  .msg.err{{color:#ff9a9a}} .msg.ok{{color:#3fb950}}
  .section{{margin-bottom:2rem}}
@@ -844,21 +940,27 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
  .kv .stat{{min-width:120px}} .kv .stat .n{{font-family:var(--serif);font-size:1.5rem;display:block}}
  .kv .stat .l{{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.03em}}
  @media (prefers-reduced-motion: reduce){{ *{{animation:none!important;transition:none!important}} }}
+ @media (max-width:880px){{
+  .shell{{flex-direction:column}}
+  .rail{{width:100%;height:auto;position:relative;flex-direction:row;align-items:center;padding:.7rem .9rem;overflow-x:auto;gap:.2rem}}
+  .brand{{border:0;padding:0 .8rem 0 0;margin:0}}
+  .rail-link span{{display:none}}
+  .rail-foot{{display:none}}
+  .main{{padding:1.4rem 1.1rem 3rem}}
+ }}
 </style></head><body>
-<div class="card">
-<nav>
- <a href="/admin-ui/">Dashboard</a>
- <a href="/admin-ui/traffic">Traffic</a>
- <a href="/admin-ui/accounts">Accounts</a>
- <a href="/admin-ui/domains">Domains</a>
- <a href="/admin-ui/admins">Admins</a>
- <a href="/admin-ui/certs">Certs</a>
- <a href="/admin-ui/audit">Audit</a>
- <span class="spacer"></span>
- <span class="signed-in-as">Signed in as <strong>{email}</strong>{role_badge}</span>
- <a href="/admin-ui/logout">Sign out</a>
+<div class="shell">
+<nav class="rail">
+ <div class="brand"><div class="mark"></div><div><span class="name">CADS-Tunnel</span><span class="sub">Admin console</span></div></div>
+ <div class="railnav">{nav_links}</div>
+ <div class="rail-foot">
+  <div class="who" title="Signed in as {email}"><div class="av">{initials}</div><div class="meta"><div class="email">{email}</div>{role_badge}</div></div>
+  <a class="signout" href="/admin-ui/logout">Sign out</a>
+ </div>
 </nav>
+<div class="main">
 {body}
+</div>
 </div>
 <script>
  // Render every [data-ts] element's unix-seconds content as a local date/time --
@@ -1309,7 +1411,7 @@ fn admin_admins_page_html(
     rows: &[crate::storage::AdminRow],
 ) -> String {
     let mut table = String::from(
-        r#"<table class="data"><thead><tr><th>E-mail</th><th>Added by</th><th>Added</th><th></th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>E-mail</th><th>Added by</th><th>Added</th><th></th></tr></thead><tbody>"#,
     );
     for r in rows {
         let is_super = admin.is_super_admin(&r.email);
@@ -1334,7 +1436,7 @@ fn admin_admins_page_html(
             action_cell = action_cell,
         ));
     }
-    table.push_str("</tbody></table>");
+    table.push_str("</tbody></table></div>");
 
     let manage_section = if session.is_super_admin {
         r#"<h2>Add an admin</h2>
@@ -1745,9 +1847,9 @@ fn admin_domains_page_html(
 ) -> String {
     let platform_row = match platform_zone {
         Some(z) => format!(
-            r#"<table class="data"><thead><tr><th>Zone</th><th>Role</th></tr></thead><tbody>
-<tr><td><code>{z}</code></td><td><span class="badge ok">platform</span> this deployment's own root domain -- always active, not part of the onboarded-zone registry below</td></tr>
-</tbody></table>"#,
+            r#"<div class="tablewrap"><table class="data"><thead><tr><th>Zone</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>{z}</code></td><td><span class="badge platform">platform</span> this deployment's own root domain -- always active, not part of the onboarded-zone registry below</td></tr>
+</tbody></table></div>"#,
             z = escape(z),
         ),
         None => String::from(
@@ -1755,7 +1857,7 @@ fn admin_domains_page_html(
         ),
     };
     let mut zones_table = String::from(
-        r#"<table class="data"><thead><tr><th>Zone</th><th>Status</th><th>Added by</th><th>Added</th><th>Add a hostname</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Zone</th><th>Status</th><th>Added by</th><th>Added</th><th>Add a hostname</th></tr></thead><tbody>"#,
     );
     if zones.is_empty() {
         zones_table.push_str(r#"<tr><td colspan="5" class="help">No domains onboarded yet -- use the form below.</td></tr>"#);
@@ -1773,7 +1875,7 @@ fn admin_domains_page_html(
             added_at = z.added_at,
         ));
     }
-    zones_table.push_str("</tbody></table>");
+    zones_table.push_str("</tbody></table></div>");
 
     let disabled_set: std::collections::HashSet<&str> = disabled.iter().map(|d| d.hostname.as_str()).collect();
     let mut hostnames: Vec<(String, bool, bool)> = Vec::new(); // (hostname, disabled, has_live_tunnel)
@@ -1790,7 +1892,7 @@ fn admin_domains_page_html(
     hostnames.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut host_table = String::from(
-        r#"<table class="data"><thead><tr><th>Hostname</th><th>State</th><th></th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Hostname</th><th>State</th><th></th></tr></thead><tbody>"#,
     );
     if hostnames.is_empty() {
         host_table.push_str(r#"<tr><td colspan="3" class="help">No hostnames yet.</td></tr>"#);
@@ -1813,7 +1915,7 @@ fn admin_domains_page_html(
             host = escape(host),
         ));
     }
-    host_table.push_str("</tbody></table>");
+    host_table.push_str("</tbody></table></div>");
 
     let mut known_zones: Vec<&str> = zones.iter().map(|z| z.zone.as_str()).collect();
     if let Some(z) = platform_zone {
@@ -1875,15 +1977,15 @@ var CT_KNOWN_ZONES = {known_zones_json};
     document.getElementById('domainTrafficTable').innerHTML = '<p class="help">No tunnels registered yet.</p>';
     return;
    }}
-   var html = '<table class="data"><thead><tr><th>Zone</th><th>Tunnels</th><th>Relay bytes in</th><th>Relay bytes out</th></tr></thead><tbody>';
+   var html = '<div class="tablewrap"><table class="data"><thead><tr><th>Zone</th><th class="num">Tunnels</th><th class="num">Relay bytes in</th><th class="num">Relay bytes out</th></tr></thead><tbody>';
    zoneNames.sort().forEach(function(z){{
     var b = byZone[z];
-    html += '<tr><td><code>' + esc(z) + '</code></td><td>' + b.tunnels + '</td><td>' + b.bytes_received.toLocaleString() + '</td><td>' + b.bytes_sent.toLocaleString() + '</td></tr>';
+    html += '<tr><td><code>' + esc(z) + '</code></td><td class="num">' + b.tunnels + '</td><td class="num" data-sort="' + b.bytes_received + '">' + b.bytes_received.toLocaleString() + '</td><td class="num" data-sort="' + b.bytes_sent + '">' + b.bytes_sent.toLocaleString() + '</td></tr>';
    }});
    if(other.tunnels){{
-    html += '<tr><td><span class="help">(unmatched hostname)</span></td><td>' + other.tunnels + '</td><td>' + other.bytes_received.toLocaleString() + '</td><td>' + other.bytes_sent.toLocaleString() + '</td></tr>';
+    html += '<tr><td><span class="help">(unmatched hostname)</span></td><td class="num">' + other.tunnels + '</td><td class="num" data-sort="' + other.bytes_received + '">' + other.bytes_received.toLocaleString() + '</td><td class="num" data-sort="' + other.bytes_sent + '">' + other.bytes_sent.toLocaleString() + '</td></tr>';
    }}
-   html += '</tbody></table>';
+   html += '</tbody></table></div>';
    document.getElementById('domainTrafficTable').innerHTML = html;
    window.ctSortableInit(document.getElementById('domainTrafficTable'));
   }})
@@ -2020,7 +2122,7 @@ const CERT_EXPIRY_WARN_DAYS: i64 = 14;
 fn admin_certs_page_html(session: &crate::admin_identity::AdminSession, mut rows: Vec<CertStatusResp>) -> String {
     rows.sort_by_key(cert_status_sort_key);
     let mut table = String::from(
-        r#"<table class="data"><thead><tr><th>Hostname</th><th>State</th><th>Days remaining</th><th>Detail</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Hostname</th><th>State</th><th class="num">Days remaining</th><th>Detail</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
         table.push_str(r#"<tr><td colspan="4" class="help">No certs to report.</td></tr>"#);
@@ -2036,14 +2138,14 @@ fn admin_certs_page_html(session: &crate::admin_identity::AdminSession, mut rows
             _ => (r#"<span class="help">not configured</span>"#.to_string(), "-".to_string()),
         };
         table.push_str(&format!(
-            r#"<tr><td><code>{label}</code></td><td>{state_html}</td><td>{days_html}</td><td class="help">{detail}</td></tr>"#,
+            r#"<tr><td><code>{label}</code></td><td>{state_html}</td><td class="num">{days_html}</td><td class="help">{detail}</td></tr>"#,
             label = escape(&r.label),
             state_html = state_html,
             days_html = days_html,
             detail = escape(r.reason.as_deref().unwrap_or("")),
         ));
     }
-    table.push_str("</tbody></table>");
+    table.push_str("</tbody></table></div>");
     let body = format!(
         r#"<h1>Certificates</h1>
 <p class="help">Every front-door hostname's TLS cert -- Portal/Auth/MASQUE/Admin plus every
@@ -2272,15 +2374,16 @@ connection has been up.</p>
  fetch('/admin-ui/traffic').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
   .then(function(rows){
    if(!rows.length){ document.getElementById('trafficTable').innerHTML = '<p class="help">No tunnels registered yet.</p>'; return; }
-   var html = '<table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Connected</th>'
-     + '<th>Transport</th><th>Relay bytes in</th><th>Relay bytes out</th></tr></thead><tbody>';
+   var html = '<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Connected</th>'
+     + '<th>Transport</th><th class="num">Relay bytes in</th><th class="num">Relay bytes out</th></tr></thead><tbody>';
    rows.forEach(function(t){
     html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td>'
       + '<td><span class="status-dot ' + (t.connected ? 'live' : 'off') + '"></span>' + (t.connected ? 'yes' : 'no') + '</td>'
       + '<td>' + transportBadge(t.transport) + '</td>'
-      + '<td>' + t.bytes_received.toLocaleString() + '</td><td>' + t.bytes_sent.toLocaleString() + '</td></tr>';
+      + '<td class="num" data-sort="' + t.bytes_received + '">' + t.bytes_received.toLocaleString() + '</td>'
+      + '<td class="num" data-sort="' + t.bytes_sent + '">' + t.bytes_sent.toLocaleString() + '</td></tr>';
    });
-   html += '</tbody></table>';
+   html += '</tbody></table></div>';
    document.getElementById('trafficTable').innerHTML = html;
    window.ctSortableInit(document.getElementById('trafficTable'));
   })
@@ -2288,7 +2391,7 @@ connection has been up.</p>
  fetch('/admin-ui/tunnels').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
   .then(function(rows){
    if(!rows.length){ document.getElementById('tunnelsTable').innerHTML = '<p class="help">No tunnels registered yet.</p>'; return; }
-   var html = '<table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Edge</th>'
+   var html = '<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Hostname</th><th>Edge</th>'
      + '<th>Transport</th><th>Uptime</th><th>Last seen</th></tr></thead><tbody>';
    rows.forEach(function(t){
     var uptime = t.uptime_seconds != null ? Math.round(t.uptime_seconds/60) + ' min' : '-';
@@ -2296,7 +2399,7 @@ connection has been up.</p>
     html += '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.hostname || '-') + '</td><td>' + esc(t.edge_id || '-') + '</td>'
       + '<td>' + transportBadge(t.transport) + '</td><td data-sort="' + (t.uptime_seconds || 0) + '">' + uptime + '</td><td data-sort="' + (t.last_seen_unix || 0) + '">' + esc(lastSeen) + '</td></tr>';
    });
-   html += '</tbody></table>';
+   html += '</tbody></table></div>';
    document.getElementById('tunnelsTable').innerHTML = html;
    window.ctSortableInit(document.getElementById('tunnelsTable'));
   })
@@ -2531,66 +2634,76 @@ async fn admin_ui_dashboard(State(st): State<AdminUiState>, headers: HeaderMap) 
 }
 
 fn admin_dashboard_page_html(session: &crate::admin_identity::AdminSession) -> String {
-    let body = r#"<h1>Admin console</h1>
+    // ADR-0025 layout pass: KPI grids replace the old plain .kv rows, and the
+    // Sections list is now a grid of clickable cards instead of a bare <ul> --
+    // that bullet list of six links was the single biggest piece of the
+    // operator's "furchtbar strukturiert" (terribly structured) feedback
+    // (2026-08-26). Data flow is unchanged: same /admin-ui/health and
+    // /admin-ui/system fetches, just building .kpis markup instead of .kv.
+    let body = format!(
+        r#"<h1>Admin console</h1>
 <p class="help">At-a-glance health for the control plane and its edge (ADR-0025).</p>
-<div id="health" class="help">Loading…</div>
+<div id="health" class="kpis"><div class="kpi help">Loading…</div></div>
 <h2>Host system</h2>
 <p class="help">The machine this control-plane process is actually running on -- not the platform's own
 traffic/tunnel state (that's everywhere else in this console), just the box underneath it.</p>
-<div id="hostSystem" class="help">Loading…</div>
+<div id="hostSystem" class="kpis"><div class="kpi help">Loading…</div></div>
 <h2>Sections</h2>
-<ul class="steps">
- <li><a href="/admin-ui/traffic">Traffic monitor</a> -- relay bytes and transport per tunnel.</li>
- <li><a href="/admin-ui/accounts">Accounts</a> -- credit, block/unblock, delete, subdomain quota.</li>
- <li><a href="/admin-ui/domains">Domains</a> -- onboard a zone, manage hostnames.</li>
- <li><a href="/admin-ui/admins">Admins</a> -- who can reach this console.</li>
- <li><a href="/admin-ui/certs">Certificates</a> -- front-door and per-domain cert expiry.</li>
- <li><a href="/admin-ui/audit">Audit log</a> -- every privileged action, who and when.</li>
-</ul>
+<div class="cards">
+ <a class="seccard" href="/admin-ui/traffic"><div class="icon">{icon_traffic}</div><h3>Traffic monitor</h3><p>Relay bytes and transport per tunnel.</p></a>
+ <a class="seccard" href="/admin-ui/accounts"><div class="icon">{icon_accounts}</div><h3>Accounts</h3><p>Credit, block/unblock, delete, subdomain quota.</p></a>
+ <a class="seccard" href="/admin-ui/domains"><div class="icon">{icon_domains}</div><h3>Domains</h3><p>Onboard a zone, manage hostnames.</p></a>
+ <a class="seccard" href="/admin-ui/admins"><div class="icon">{icon_admins}</div><h3>Admins</h3><p>Who can reach this console.</p></a>
+ <a class="seccard" href="/admin-ui/certs"><div class="icon">{icon_certs}</div><h3>Certificates</h3><p>Front-door and per-domain cert expiry.</p></a>
+ <a class="seccard" href="/admin-ui/audit"><div class="icon">{icon_audit}</div><h3>Audit log</h3><p>Every privileged action, who and when.</p></a>
+</div>
 <script>
-fetch('/admin-ui/health').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
- .then(function(h){
+fetch('/admin-ui/health').then(function(r){{return r.ok?r.json():Promise.reject(r.status);}})
+ .then(function(h){{
   var edge = h.edge;
   var edgeBadge = !edge.configured ? '<span class="badge warn">not configured</span>'
     : (edge.healthy ? '<span class="badge ok">healthy</span>' : '<span class="badge blocked">unhealthy</span>');
-  var stats = '<div class="kv">'
-   + '<div class="stat"><span class="n">' + (h.control_plane_ready ? 'OK' : 'DOWN') + '</span><span class="l">Control plane</span></div>'
-   + '<div class="stat"><span class="n">' + edgeBadge + '</span><span class="l">Edge</span></div>';
-  if(edge.active_tunnels != null){ stats += '<div class="stat"><span class="n">' + edge.active_tunnels + '</span><span class="l">Active tunnels</span></div>'; }
-  if(edge.active_agents != null){ stats += '<div class="stat"><span class="n">' + edge.active_agents + '</span><span class="l">Active agents</span></div>'; }
-  stats += '</div>';
-  if(edge.detail){ stats += '<p class="help">' + String(edge.detail).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</p>'; }
+  var stats = '<div class="kpi"><div class="label">Control plane</div><div class="value">' + (h.control_plane_ready ? 'OK' : 'DOWN') + '</div></div>'
+   + '<div class="kpi"><div class="label">Edge</div><div class="value" style="font-size:1.1rem">' + edgeBadge + '</div></div>';
+  if(edge.active_tunnels != null){{ stats += '<div class="kpi"><div class="label">Active tunnels</div><div class="value">' + edge.active_tunnels + '</div></div>'; }}
+  if(edge.active_agents != null){{ stats += '<div class="kpi"><div class="label">Active agents</div><div class="value">' + edge.active_agents + '</div></div>'; }}
+  if(edge.detail){{ stats += '<div class="kpi help" style="grid-column:1/-1">' + String(edge.detail).replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</div>'; }}
   document.getElementById('health').innerHTML = stats;
- })
- .catch(function(s){ document.getElementById('health').textContent = 'could not load health (' + s + ')'; });
-fetch('/admin-ui/system').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
- .then(function(s){
-  function gb(bytes){ return bytes == null ? null : (bytes / (1024*1024*1024)).toFixed(1) + ' GB'; }
-  function fmtUptime(secs){
+ }})
+ .catch(function(s){{ document.getElementById('health').innerHTML = '<div class="kpi msg err">could not load health (' + s + ')</div>'; }});
+fetch('/admin-ui/system').then(function(r){{return r.ok?r.json():Promise.reject(r.status);}})
+ .then(function(s){{
+  function gb(bytes){{ return bytes == null ? null : (bytes / (1024*1024*1024)).toFixed(1) + ' GB'; }}
+  function fmtUptime(secs){{
    if(secs == null) return '-';
    var d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
    return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm';
-  }
+  }}
   var memPct = (s.mem_total_bytes && s.mem_available_bytes != null)
    ? Math.round(100 * (s.mem_total_bytes - s.mem_available_bytes) / s.mem_total_bytes) + '% used'
    : null;
   var diskPct = (s.disk_total_bytes && s.disk_available_bytes != null)
    ? Math.round(100 * (s.disk_total_bytes - s.disk_available_bytes) / s.disk_total_bytes) + '% used'
    : null;
-  var html = '<div class="kv">'
-   + '<div class="stat"><span class="n">' + (s.hostname || '-') + '</span><span class="l">Hostname</span></div>'
-   + '<div class="stat"><span class="n">' + (s.kernel || '-') + '</span><span class="l">Kernel</span></div>'
-   + '<div class="stat"><span class="n">' + fmtUptime(s.uptime_seconds) + '</span><span class="l">Host uptime</span></div>'
-   + '<div class="stat"><span class="n">' + s.cpu_count + '</span><span class="l">CPUs</span></div>'
-   + '<div class="stat"><span class="n">' + (s.load_avg_1m != null ? s.load_avg_1m.toFixed(2) + ' / ' + s.load_avg_5m.toFixed(2) + ' / ' + s.load_avg_15m.toFixed(2) : '-') + '</span><span class="l">Load (1/5/15m)</span></div>'
-   + '<div class="stat"><span class="n">' + (gb(s.mem_available_bytes) || '-') + ' free of ' + (gb(s.mem_total_bytes) || '-') + '</span><span class="l">Memory' + (memPct ? ' (' + memPct + ')' : '') + '</span></div>'
-   + '<div class="stat"><span class="n">' + (gb(s.disk_available_bytes) || '-') + ' free of ' + (gb(s.disk_total_bytes) || '-') + '</span><span class="l">Disk' + (diskPct ? ' (' + diskPct + ')' : '') + ' -- ' + (s.disk_mount || s.disk_path_checked) + '</span></div>'
-   + '</div>';
+  var html = '<div class="kpi"><div class="label">Hostname</div><div class="value" style="font-size:1.1rem">' + (s.hostname || '-') + '</div></div>'
+   + '<div class="kpi"><div class="label">Kernel</div><div class="value" style="font-size:.95rem">' + (s.kernel || '-') + '</div></div>'
+   + '<div class="kpi"><div class="label">Host uptime</div><div class="value">' + fmtUptime(s.uptime_seconds) + '</div></div>'
+   + '<div class="kpi"><div class="label">CPUs</div><div class="value">' + s.cpu_count + '</div></div>'
+   + '<div class="kpi"><div class="label">Load (1/5/15m)</div><div class="value" style="font-size:1.15rem">' + (s.load_avg_1m != null ? s.load_avg_1m.toFixed(2) + ' / ' + s.load_avg_5m.toFixed(2) + ' / ' + s.load_avg_15m.toFixed(2) : '-') + '</div></div>'
+   + '<div class="kpi"><div class="label">Memory' + (memPct ? ' (' + memPct + ')' : '') + '</div><div class="value">' + (gb(s.mem_available_bytes) || '-') + '<span class="unit">free of ' + (gb(s.mem_total_bytes) || '-') + '</span></div></div>'
+   + '<div class="kpi"><div class="label">Disk' + (diskPct ? ' (' + diskPct + ')' : '') + '</div><div class="value">' + (gb(s.disk_available_bytes) || '-') + '<span class="unit">free of ' + (gb(s.disk_total_bytes) || '-') + ' -- ' + (s.disk_mount || s.disk_path_checked) + '</span></div></div>';
   document.getElementById('hostSystem').innerHTML = html;
- })
- .catch(function(s){ document.getElementById('hostSystem').textContent = 'could not load host system info (' + s + ')'; });
-</script>"#;
-    admin_page("dashboard", session, body)
+ }})
+ .catch(function(s){{ document.getElementById('hostSystem').innerHTML = '<div class="kpi msg err">could not load host system info (' + s + ')</div>'; }});
+</script>"#,
+        icon_traffic = ICON_TRAFFIC,
+        icon_accounts = ICON_ACCOUNTS,
+        icon_domains = ICON_DOMAINS,
+        icon_admins = ICON_ADMINS,
+        icon_certs = ICON_CERTS,
+        icon_audit = ICON_AUDIT,
+    );
+    admin_page("dashboard", session, &body)
 }
 
 #[derive(Deserialize)]
@@ -2665,7 +2778,7 @@ fn admin_accounts_page_html(
     emails: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut table = String::from(
-        r#"<table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th>Balance</th><th>State</th><th>Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
         table.push_str(r#"<tr><td colspan="7" class="help">No accounts match.</td></tr>"#);
@@ -2679,9 +2792,9 @@ fn admin_accounts_page_html(
 <td>{subject}</td>
 <td>{email}</td>
 <td><code style="word-break:break-all">{account}</code></td>
-<td>{balance}</td>
+<td class="num">{balance}</td>
 <td>{state_badge}</td>
-<td>{max_tunnels}</td>
+<td class="num">{max_tunnels}</td>
 <td><div style="display:flex;flex-wrap:wrap;gap:.35rem;align-items:center">
  <form class="inline" data-subject="{subject}" onsubmit="return creditAccount(event)">
   <input type="number" name="amount" min="1" value="100" style="width:5rem">
@@ -2705,7 +2818,7 @@ fn admin_accounts_page_html(
             block_label = block_label,
         ));
     }
-    table.push_str("</tbody></table>");
+    table.push_str("</tbody></table></div>");
 
     let body = format!(
         r#"<h1>Accounts</h1>
@@ -2790,14 +2903,14 @@ async fn admin_ui_audit_page(State(st): State<AdminUiState>, headers: HeaderMap)
 
 fn admin_audit_page_html(session: &crate::admin_identity::AdminSession, entries: &[crate::audit_log::AuditLogEntry]) -> String {
     let mut table = String::from(
-        r#"<table class="data"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead><tbody>"#,
     );
     if entries.is_empty() {
         table.push_str(r#"<tr><td colspan="5" class="help">No admin actions recorded yet.</td></tr>"#);
     }
     for e in entries {
         table.push_str(&format!(
-            r#"<tr><td><span data-ts="{at}">{at}</span></td><td>{actor}</td><td><code>{action}</code></td><td>{target}</td><td class="help">{detail}</td></tr>"#,
+            r#"<tr><td data-sort="{at}"><span data-ts="{at}">{at}</span></td><td>{actor}</td><td><code>{action}</code></td><td>{target}</td><td class="help">{detail}</td></tr>"#,
             at = e.at,
             actor = escape(&e.actor_email),
             action = escape(&e.action),
@@ -2805,7 +2918,7 @@ fn admin_audit_page_html(session: &crate::admin_identity::AdminSession, entries:
             detail = e.detail.as_deref().map(escape).unwrap_or_default(),
         ));
     }
-    table.push_str("</tbody></table>");
+    table.push_str("</tbody></table></div>");
     let body = format!(
         r#"<h1>Audit log</h1>
 <p class="help">Every privileged admin action recorded immutably -- actor, action, target, and
@@ -3810,9 +3923,23 @@ may become available for your account &mdash; contact the operator if you need a
             plural = if max_tunnels == 1 { "" } else { "s" }
         )
     };
+    // ADR-0025 layout pass: a quota summary bar above the grid pulls the
+    // owned/max numbers (previously buried in the "Create another tunnel"
+    // paragraph further down) up to where they're immediately visible, and
+    // .tunnel-grid lays tunnels out side by side instead of one long column
+    // -- the concrete "portal/tunnels needs this too" ask (2026-08-26).
+    let quota_pct = owned_count.checked_mul(100).and_then(|n| n.checked_div(max_tunnels)).map(|p| p.min(100)).unwrap_or(100);
+    let quota_bar = format!(
+        r#"<div class="quota-bar"><span class="q-l">Using <strong>{owned_count}</strong> of <strong>{max_tunnels}</strong> tunnel{plural} included in your plan</span>
+<div class="quota-track"><div class="quota-fill" style="width:{quota_pct}%"></div></div></div>"#,
+        plural = if max_tunnels == 1 { "" } else { "s" },
+    );
     let body = format!(
         r#"<h1>Your tunnels</h1>
+{quota_bar}
+<div class="tunnel-grid">
 {rows}
+</div>
 <p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
 assigned hostname (e.g. <code>site-a1b2c3d4.bunsenbrenner.org</code>) &mdash; already set up for
 you above, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
@@ -3898,9 +4025,23 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
        --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
       display:flex;min-height:100vh;align-items:flex-start;justify-content:center;padding:3rem 1rem}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:640px;width:100%;
+ /* ADR-0025 layout pass (operator feedback 2026-08-26): widened from 640px so
+    /portal/tunnels can lay tunnels out as a real grid (.tunnel-grid below)
+    instead of a cramped single column -- simpler pages (account, install)
+    just get more breathing room, nothing about their own layout changes. */
+ .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2rem;max-width:860px;width:100%;
       animation:cardIn .32s ease-out}}
  @keyframes cardIn{{from{{opacity:0;transform:translateY(6px)}}to{{opacity:1;transform:translateY(0)}}}}
+ /* Additive only -- does not touch the existing .tunnel-card rule below (kept
+    exactly as-is: no max-height/overflow-y on the resting card, see the
+    only_the_access_list_scrolls_internally_not_the_whole_tunnel_card test). */
+ .tunnel-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1rem;align-items:start}}
+ .quota-bar{{background:#131820;border:1px solid var(--border);border-radius:12px;padding:.9rem 1.2rem;
+      display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-bottom:1.4rem}}
+ .quota-bar .q-l{{font-size:.85rem;color:var(--muted)}}
+ .quota-bar .q-l strong{{color:var(--text)}}
+ .quota-track{{width:110px;height:6px;background:#21262d;border-radius:99px;overflow:hidden;flex:0 0 auto}}
+ .quota-fill{{height:100%;background:var(--accent2);border-radius:99px}}
  @keyframes checkIn{{0%{{opacity:0;transform:scale(.85)}}60%{{opacity:1;transform:scale(1.03)}}100%{{transform:scale(1)}}}}
  @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
  h1,h2{{font-family:var(--serif);font-weight:600;letter-spacing:-.01em}}
