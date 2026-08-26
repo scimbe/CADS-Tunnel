@@ -3,10 +3,10 @@
 # stdin, write your result on stdout. One invocation per call — that's the whole
 # contract (see docs/agent-onboarding.md's "Bootstrap honesty" note).
 #
-# Swap this for anything: a shell one-liner, a Python script, a call to `claude -p`,
-# a call to a local LLM, a call to hardware you own (a sensor read, a Raspberry Pi
-# GPIO toggle, whatever your idea needs) -- the tunnel and the auction don't care
-# what's on the other end, only that it answers on stdout.
+# `cat`, not `read -r`: the platform delivers the request WITHOUT a trailing
+# newline, and `read -r` returns nonzero at EOF-without-newline — under
+# `set -e` that kills the handler with empty output before it ever answers.
+# `cat` reads everything up to EOF regardless of framing.
 set -euo pipefail
-read -r request
+request=$(cat)
 echo "Hello, world! You said: ${request}"

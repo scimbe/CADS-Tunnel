@@ -71,7 +71,17 @@ you need it (custom role tags, joining someone else's pipeline, browser-facing s
    ```
 2. **Get an OIDC account** (the one human-gated step): self-register via the realm portal if your
    email domain is allowed, or ask the maintainer for an operator account. For headless token
-   minting, use the realm's `admin-cli` client with `grant_type=password` against the token endpoint.
+   minting, use the realm's `admin-cli` client with `grant_type=password` against the token endpoint —
+   and pass every field with curl's `--data-urlencode`, never plain `-d`: with `-d`, a `+` in your
+   account email is form-decoded into a space server-side and the realm answers a baffling
+   `Invalid user credentials` for a password that is actually correct (reproduced live). The token
+   expires after ~5 minutes; re-mint rather than debugging a mysterious 401:
+   ```
+   TOKEN=$(curl -s -X POST <issuer>/protocol/openid-connect/token \
+     --data-urlencode 'client_id=admin-cli' --data-urlencode 'grant_type=password' \
+     --data-urlencode "username=<your email>" --data-urlencode "password=<your password>" \
+     | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+   ```
 3. **Build + sign your AgentCard** — a signed JSON identity naming your `role_tags` + skills. This is
    `channel agent-card` (NOT a `card publish` command); it reads `CT_CHANNEL_HOLDER_KEY` +
    `CT_AGENT_CARD_*` and writes `<CT_AGENT_CARD_OUT>/.well-known/agent-card.json`:
@@ -118,11 +128,21 @@ Self-service admission:
 
 1. You already minted holder + noise keys in A.1 (`ct-agent channel init`).
 2. **Get your grant.** Either the operator signs it for you from your public keys —
-   `ct-agent channel grant` (operator side, reads `CT_CHANNEL_OPERATOR_KEY` + `CT_GRANT_*`, prints the
-   `CT_CHANNEL_GRANT` hex you use) — or, if the operator has registered the channel authority with
-   the control plane (`ct-agent channel register`), you add yourself via
+   `ct-agent channel grant` (operator side, reads `CT_CHANNEL_OPERATOR_KEY` + `CT_GRANT_CHANNEL`,
+   `CT_GRANT_MEMBER_HOLDER`, `CT_GRANT_DIRECTION=initiate|accept`, `CT_GRANT_EXPIRES` (unix
+   seconds); prints the `CT_CHANNEL_GRANT` hex you use; fully offline, no server involved) — or,
+   if the operator has registered the channel authority with the control plane
+   (`ct-agent channel register`), you add yourself via
    `POST /me/channels/:channel/members` with your OIDC bearer token. Everything you send is public
-   (holder pubkey, noise pubkey, attestation) — safe to post anywhere.
+   (holder pubkey, noise pubkey, attestation) — safe to post anywhere. The exact body (verified
+   live — the field names are NOT `holder_pubkey`/`attestation`):
+   ```json
+   {"holder": "<64 hex>", "noise_pubkey": "<64 hex>", "noise_attestation": "<128 hex>"}
+   ```
+   All three come straight out of `ct-agent channel member-material`. Note that a grant alone is
+   NOT enough against a shared edge: the channel must be registered (`channel register`, reads the
+   channel id from `CT_GRANT_CHANNEL`) **and** each member added, or admission fails with
+   `[not-member]` however valid your grant's signature is.
 3. **Run your role**, relay-only (no dialable address needed). `CT_CHANNEL_BROKER` and
    `CT_CHANNEL_RELAY` are **not** the tunnel's main edge port (`4433`, the Mesh-Plane
    rendezvous listener) — the Agent-Fabric channel broker and relay are separate listeners,
@@ -155,11 +175,17 @@ discoverable the same way at `GET /registry/pipelines`:
   "id": "my-new-pipeline",
   "operator_pubkey_hex": "<64 hex — your channel-operator public key, from `channel operator-init`>",
   "roles": [
-    { "service": "text_generation", "units": 1, "tag": "physics" },
-    { "service": "text_generation", "units": 1, "tag": "art" }
+    { "service": "TextGeneration", "units": 1, "tag": "physics" },
+    { "service": "TextGeneration", "units": 1, "tag": "art" }
   ]
 }
 ```
+Careful with the two spellings of a service, they are NOT interchangeable: in **spec JSON** the
+`ServiceType` value is PascalCase (`TextGeneration` | `CodeGeneration` | `SecurityReview` |
+`SafetyCheck` — a snake_case value here fails to deserialize and the publish is rejected), while
+the **service slug** used by `CT_AGENT_SERVICES` and the MCP tool name `service/<slug>` is
+snake_case (`text_generation` etc.). The hello-world template's `pipeline-spec.json` shows the
+correct spec-side form.
 Any agent can `GET /registry/pipelines`, check its declared services/role_tags against each spec's
 roles (the same match `ct_common::pipeline::pipelines_supported_by_services` computes), and follow B
 to join. Once every role has a matching online offer, the pipeline convenes (an auction per role,
@@ -267,6 +293,38 @@ env vars you set:
 
 Call `tools/list` first — it only ever lists what your own env actually turned on, so it's the
 authoritative answer for "what can I call on this peer" without guessing from this table.
+
+**Making the call from the client side** (verified live — this was previously undocumented
+anywhere, including here): the *initiate*-side `ct-agent channel` sends exactly one JSON-RPC
+request over the channel and exits when you set `CT_CHANNEL_CALL` to the raw JSON-RPC **method**
+and (optionally) `CT_CHANNEL_CALL_PARAMS` to its params object. For a service call the method is
+`tools/call` — the tool name goes *inside* the params, it is NOT the method itself:
+
+```
+CT_CHANNEL_ROLE=initiate CT_CHANNEL_RELAY_ONLY=1 \
+CT_CHANNEL_BROKER=<edge host>:4435 CT_CHANNEL_RELAY=<edge host>:4436 \
+CT_CHANNEL_HOLDER_KEY=<yours> CT_CHANNEL_NOISE_KEY=<yours> CT_CHANNEL_GRANT=<yours, direction=initiate> \
+CT_CHANNEL_CALL=tools/call \
+CT_CHANNEL_CALL_PARAMS='{"name":"service/text_generation","arguments":{"input":"hello"}}' \
+  ct-agent channel
+# → {"jsonrpc":"2.0","id":1,"result":{"output":"…"}} on stdout
+```
+
+`CT_CHANNEL_CALL=tools/list` with no params enumerates the peer's tools the same way. Three
+sharp edges, all reproduced live: (1) setting `CT_CHANNEL_CALL=service/<slug>` directly gets a
+`-32601 unknown method` — the slug is a tool *name*, not a method; (2) `CT_CHANNEL_CALL_SERVICE`
+looks like the obvious shortcut but is currently a silent no-op — the process exits 0 having done
+nothing (ct-agent#94); (3) if the call stalls at `plane-brokered Initiate` or exits silently with
+no output, you landed between the serving side's park windows — simply re-run; the initiate side
+has no admission retry yet (ct-agent#95).
+
+**Writing the handler on the serve side:** the request is delivered to
+`CT_AGENT_SERVICE_HANDLER_CMD`'s stdin **without a trailing newline**. Read it with
+`request=$(cat)`, never `read -r` — `read -r` returns non-zero at EOF-without-newline, which
+under `set -e` kills the handler before it answers, and the caller sees
+`service handler exited exit status: 1` while your own terminal shows nothing. The handler file
+must also be executable (`chmod +x`) — a missing bit surfaces to the *caller* as
+`exit status: 126: Permission denied`, again with nothing on your side.
 
 Note for readers of `ct_common::mcp`'s source: that module also defines `chat`, `propose`, and
 `settlement/*` tools. They're real, tested code, but **no shipped binary wires them up** — don't
