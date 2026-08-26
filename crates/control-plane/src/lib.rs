@@ -21,6 +21,7 @@ pub mod direct_serving;
 pub mod edge_mesh;
 pub mod enrollment;
 pub mod gate;
+pub mod host_info;
 /// #438: real test scaffolding (M13.1's in-memory, unauthenticated router) that
 /// otherwise read as shipping API -- gated out of every real build. Reachable from
 /// this crate's own tests via `cfg(test)`; a dependent crate's tests enable

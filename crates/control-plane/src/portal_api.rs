@@ -643,6 +643,12 @@ pub struct ObservabilityConfig {
     /// derives the co-located `/healthz` URL from it (both live on the edge's
     /// `metrics_router`, `crates/edge/src/observe.rs`, on the same listener).
     pub edge_metrics_url: Option<String>,
+    /// Operator feedback (2026-08-26): "mehr informationen ueber das system
+    /// auf dem der cads tunnel gerade laeuft" -- which path `GET /admin-ui/
+    /// system`'s disk-usage figure measures (`CT_CP_HOST_INFO_DISK_PATH`,
+    /// `None` defaults to `/` inside [`crate::host_info::collect`] -- see its
+    /// own doc for why `/` is right for every deployment this project ships).
+    pub host_info_disk_path: Option<String>,
     /// Operator feedback (2026-08-26): the Accounts page should show each
     /// account's email and be searchable by it, not just by the opaque
     /// Keycloak subject id. The ledger's own `account_subjects` table has no
@@ -992,6 +998,7 @@ pub fn admin_ui_router(
         .route("/admin-ui/traffic", get(admin_ui_traffic))
         .route("/admin-ui/tunnels", get(admin_ui_tunnels))
         .route("/admin-ui/health", get(admin_ui_health))
+        .route("/admin-ui/system", get(admin_ui_system))
         // ADR-0025 integration pass: server-rendered HTML pages. `/admin-ui/traffic`,
         // `/admin-ui/admins`, `/admin-ui/domains`, `/admin-ui/certs` are ALREADY
         // routed above as JSON -- their handlers branch on `wants_html` internally
@@ -2485,6 +2492,26 @@ async fn admin_ui_health(State(st): State<AdminUiState>, headers: HeaderMap) -> 
     Json(HealthResp { control_plane_ready, edge }).into_response()
 }
 
+/// `GET /admin-ui/system` (admin-identity-gated, read-only): host-level info
+/// for the machine this control-plane process is actually running on --
+/// hostname, kernel, uptime, load average, CPU count, memory, disk (see
+/// [`crate::host_info`] for exactly what's read and why). Operator feedback
+/// (2026-08-26): the console showed plenty about the *platform's* state
+/// (tunnels, traffic, accounts) but nothing about the *box* it runs on.
+/// [`crate::host_info::collect`] does blocking file/subprocess I/O, so it
+/// runs on `spawn_blocking` -- same convention `admin_ui_add_domain_hostname`
+/// already uses for its own (much slower) subprocess call.
+async fn admin_ui_system(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let disk_path = st.observability.host_info_disk_path.clone();
+    match tokio::task::spawn_blocking(move || crate::host_info::collect(disk_path.as_deref())).await {
+        Ok(info) => Json(info).into_response(),
+        Err(e) => internal_error("admin_ui_system/spawn_blocking", e).into_response(),
+    }
+}
+
 // ===== end ADR-0025 Decision 6 =====
 
 // ===== ADR-0025 integration pass: dashboard, accounts, audit pages =====
@@ -2507,6 +2534,10 @@ fn admin_dashboard_page_html(session: &crate::admin_identity::AdminSession) -> S
     let body = r#"<h1>Admin console</h1>
 <p class="help">At-a-glance health for the control plane and its edge (ADR-0025).</p>
 <div id="health" class="help">Loading…</div>
+<h2>Host system</h2>
+<p class="help">The machine this control-plane process is actually running on -- not the platform's own
+traffic/tunnel state (that's everywhere else in this console), just the box underneath it.</p>
+<div id="hostSystem" class="help">Loading…</div>
 <h2>Sections</h2>
 <ul class="steps">
  <li><a href="/admin-ui/traffic">Traffic monitor</a> -- relay bytes and transport per tunnel.</li>
@@ -2532,6 +2563,32 @@ fetch('/admin-ui/health').then(function(r){return r.ok?r.json():Promise.reject(r
   document.getElementById('health').innerHTML = stats;
  })
  .catch(function(s){ document.getElementById('health').textContent = 'could not load health (' + s + ')'; });
+fetch('/admin-ui/system').then(function(r){return r.ok?r.json():Promise.reject(r.status);})
+ .then(function(s){
+  function gb(bytes){ return bytes == null ? null : (bytes / (1024*1024*1024)).toFixed(1) + ' GB'; }
+  function fmtUptime(secs){
+   if(secs == null) return '-';
+   var d = Math.floor(secs / 86400), h = Math.floor((secs % 86400) / 3600), m = Math.floor((secs % 3600) / 60);
+   return (d ? d + 'd ' : '') + (h ? h + 'h ' : '') + m + 'm';
+  }
+  var memPct = (s.mem_total_bytes && s.mem_available_bytes != null)
+   ? Math.round(100 * (s.mem_total_bytes - s.mem_available_bytes) / s.mem_total_bytes) + '% used'
+   : null;
+  var diskPct = (s.disk_total_bytes && s.disk_available_bytes != null)
+   ? Math.round(100 * (s.disk_total_bytes - s.disk_available_bytes) / s.disk_total_bytes) + '% used'
+   : null;
+  var html = '<div class="kv">'
+   + '<div class="stat"><span class="n">' + (s.hostname || '-') + '</span><span class="l">Hostname</span></div>'
+   + '<div class="stat"><span class="n">' + (s.kernel || '-') + '</span><span class="l">Kernel</span></div>'
+   + '<div class="stat"><span class="n">' + fmtUptime(s.uptime_seconds) + '</span><span class="l">Host uptime</span></div>'
+   + '<div class="stat"><span class="n">' + s.cpu_count + '</span><span class="l">CPUs</span></div>'
+   + '<div class="stat"><span class="n">' + (s.load_avg_1m != null ? s.load_avg_1m.toFixed(2) + ' / ' + s.load_avg_5m.toFixed(2) + ' / ' + s.load_avg_15m.toFixed(2) : '-') + '</span><span class="l">Load (1/5/15m)</span></div>'
+   + '<div class="stat"><span class="n">' + (gb(s.mem_available_bytes) || '-') + ' free of ' + (gb(s.mem_total_bytes) || '-') + '</span><span class="l">Memory' + (memPct ? ' (' + memPct + ')' : '') + '</span></div>'
+   + '<div class="stat"><span class="n">' + (gb(s.disk_available_bytes) || '-') + ' free of ' + (gb(s.disk_total_bytes) || '-') + '</span><span class="l">Disk' + (diskPct ? ' (' + diskPct + ')' : '') + ' -- ' + (s.disk_mount || s.disk_path_checked) + '</span></div>'
+   + '</div>';
+  document.getElementById('hostSystem').innerHTML = html;
+ })
+ .catch(function(s){ document.getElementById('hostSystem').textContent = 'could not load host system info (' + s + ')'; });
 </script>"#;
     admin_page("dashboard", session, body)
 }
@@ -7021,6 +7078,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Operator feedback (2026-08-26): host-system-info panel. `GET
+    /// /admin-ui/system` must (a) gate like every other admin-identity route
+    /// and (b) actually return real data from the host this test runs on --
+    /// `host_info::collect`'s own unit tests already prove the /proc parsing
+    /// in isolation; this proves the HTTP route wires it up correctly end to
+    /// end (right status, right content type, a real positive CPU count).
+    #[tokio::test]
+    async fn admin_ui_system_requires_a_session_and_returns_real_host_data() {
+        let (app, ..) = test_admin_ui_app();
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/admin-ui/system").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "no session at all must be 401, matching every other JSON admin route");
+
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "GET", "/admin-ui/system", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let resp = app
+            .oneshot(Request::get("/admin-ui/system").header("cookie", &super_session).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let info: crate::host_info::HostInfo = serde_json::from_slice(&body).expect("must be valid HostInfo JSON");
+        assert!(info.cpu_count >= 1, "must report a real positive CPU count: {info:?}");
     }
 
     /// `admin_ui_add_admin`/`admin_ui_remove_admin` require the SUPER-admin
