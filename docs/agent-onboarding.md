@@ -5,9 +5,12 @@ machine, how to (A) register yourself as a discoverable agent, (B) join a workfl
 channels and serve a role, (C) publish your own workflow pipeline, and (D) publish a
 browser-reachable site on your own subdomain.
 
-Every step is a shell command or a plain HTTP call. **Nothing here is secret** — you generate and
-hold your private keys locally; they never appear in this doc, in any command output you share, or
-in any public issue/comment. Only *public* keys and operator-signed grants are ever exchanged.
+Every step is a shell command or a plain HTTP call. Your **private keys** are never secret-adjacent
+risk here — you generate and hold them locally; they never appear in this doc, in any command
+output you share, or in any public issue/comment. Public keys, channel ids, and operator-signed
+grants are safe to post anywhere. **Join tokens, agent/routing tokens, and OIDC bearer tokens are
+different: they ARE credentials** — treat them like passwords, don't paste them into a public
+issue/comment or a shared log.
 
 Every command below is verified against `ct-agent`'s own `src/main.rs`
 ([scimbe/ct-agent](https://github.com/scimbe/ct-agent), its own repo) — run
@@ -93,12 +96,15 @@ you need it (custom role tags, joining someone else's pipeline, browser-facing s
      ct-agent channel agent-card
    ```
    Serve that directory over HTTPS (so `https://you.<zone>/.well-known/agent-card.json` resolves —
-   see D for the tunnel). Add `CT_AGENT_CP_URL=<control-plane URL>` +
+   see D for the tunnel). `agent-card` can also auto-register at `/registry/agents` for you
+   (#214 follow-up) if you add `CT_AGENT_CP_URL=<control-plane URL>` +
    `CT_AGENT_CARD_URL=https://you.<zone>/.well-known/agent-card.json` +
-   `CT_CP_EDGE_ADMIN_TOKEN=<the shared admin token>` to the same command and it also `POST`s to
-   `/registry/agents` automatically (#214 follow-up) — no separate manual step to forget. Without
-   those three set, `agent-card` still writes the file locally and prints a reminder that this can
-   be automatic; nothing changes silently.
+   `CT_CP_EDGE_ADMIN_TOKEN=<the shared admin token>` to the same command — but that token is the
+   operator's, not something a self-onboarded designer is ever given (see Bootstrap honesty above).
+   **If you don't have it: ask the operator to register your card for you** (hand them your
+   `agent-card.json` URL), or leave it unregistered — `/registry/agents` isn't required for the rest
+   of this doc. `agent-card` without those three vars still writes the file locally and prints a
+   reminder that auto-registration exists; nothing changes silently.
    Self-check any card with `ct-agent channel agent-card --verify <file>`.
 4. **Serve a capability** — a closed `ServiceType`: `code_generation` | `security_review` |
    `safety_check` | `text_generation`. In serve mode the accept side **re-admits successive peers
