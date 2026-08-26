@@ -1091,24 +1091,39 @@ fn cleared_next_cookie() -> String {
 /// ADR-0025 Decision 5 addendum: the actual fix for "login started on a
 /// non-canonical host never completes" (the class the __Host- state cookie
 /// makes structurally impossible to solve by widening a cookie's `Domain=`).
-/// If the request didn't arrive on `redirect_uri`'s own host (read via
-/// `x-forwarded-host`, the same header `gate.rs`'s own host-aware routes
-/// already trust), bounce it to that canonical host's `/portal/login` BEFORE
-/// any state/next cookie is minted -- carrying the intended post-login target
-/// as a plain query param (not yet a cookie, so no cookie-domain problem to
-/// solve at this hop either). The entire OIDC round trip then always happens
-/// on exactly one host, satisfying `__Host-`'s contract by construction; only
-/// the FINAL session cookie (already `Domain=`-scoped via
-/// [`configured_cookie_domain`], and NOT `__Host-`-prefixed) needs to cross
-/// back to the originating host, which it already does correctly.
+/// If the request didn't arrive on `redirect_uri`'s own host, bounce it to
+/// that canonical host's `/portal/login` BEFORE any state/next cookie is
+/// minted -- carrying the intended post-login target as a plain query param
+/// (not yet a cookie, so no cookie-domain problem to solve at this hop
+/// either). The entire OIDC round trip then always happens on exactly one
+/// host, satisfying `__Host-`'s contract by construction; only the FINAL
+/// session cookie (already `Domain=`-scoped via [`configured_cookie_domain`],
+/// and NOT `__Host-`-prefixed) needs to cross back to the originating host,
+/// which it already does correctly.
+///
+/// Host detection: `x-forwarded-host` first (an HTTP-aware fronting proxy,
+/// e.g. Caddy -- same header `gate.rs`'s own routes already trust), falling
+/// back to the plain `Host` header. The fallback is NOT a minor nicety --
+/// found live, first real deploy of this fix: `ct-edge`'s own front door
+/// (`crates/edge/src/serve.rs`'s `FrontDoorRoute::Proxy` arm) is a raw
+/// byte-level `copy_bidirectional` pipe after TLS termination, not an
+/// HTTP-aware reverse proxy -- it never sets `x-forwarded-host` (nothing
+/// does, on this path), but the browser's original `Host:` header rides
+/// through completely unmodified. Checking `x-forwarded-host`-only left this
+/// fix a no-op against the actual production topology; the CSRF error
+/// persisted identically after "fixing" it. Both header names are checked so
+/// this keeps working whether `ct-edge`'s raw pipe or a real HTTP proxy sits
+/// in front.
 ///
 /// Returns `None` (proceed normally) when already on the canonical host, when
-/// `x-forwarded-host` is absent (a direct/dev request with no fronting proxy --
-/// nothing to bounce from), or when `redirect_uri` is unparseable.
+/// neither header is present, or when `redirect_uri` is unparseable.
 fn redirect_to_canonical_login_host(headers: &HeaderMap, redirect_uri: &str, next: Option<&str>) -> Option<Response> {
     let (scheme, rest) = redirect_uri.split_once("://")?;
     let canonical_host = rest.split('/').next()?;
-    let request_host = headers.get("x-forwarded-host").and_then(|v| v.to_str().ok())?;
+    let request_host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|v| v.to_str().ok())?;
     if request_host.eq_ignore_ascii_case(canonical_host) {
         return None;
     }
@@ -1872,6 +1887,41 @@ mod tests {
             "no state/next cookie minted on the bounce -- it would be scoped to the wrong host: {:?}",
             resp.headers().get("set-cookie")
         );
+    }
+
+    /// The ACTUAL production scenario, not just the header a fronting HTTP proxy
+    /// would add: `ct-edge`'s own front door is a raw byte-level pipe after TLS
+    /// termination (`FrontDoorRoute::Proxy`'s `copy_bidirectional` in
+    /// `crates/edge/src/serve.rs`) -- it never sets `x-forwarded-host`, only the
+    /// browser's own `Host:` header survives, unmodified. Fail-first against the
+    /// FIRST version of this fix (merged, deployed, and live-verified via curl --
+    /// but only with `x-forwarded-host` set, which nothing in production ever
+    /// sets): this test uses ONLY `Host`, no `x-forwarded-host` at all, and would
+    /// have failed against that version (the bounce never fires, straight to
+    /// Keycloak with a doomed state cookie -- the exact "invalid or missing CSRF
+    /// state" reported live against the real deployment after that first fix).
+    #[tokio::test]
+    async fn login_bounces_using_the_plain_host_header_when_no_forwarding_proxy_sets_x_forwarded_host_0025() {
+        let cfg = PortalOidc {
+            authorize_url: "https://kc.example/realms/ct/protocol/openid-connect/auth".into(),
+            token_url: "https://kc.example/realms/ct/protocol/openid-connect/token".into(),
+            client_id: "ct-portal".into(),
+            redirect_uri: "https://portal.example/portal/callback".into(),
+        };
+        let app = portal_router(Some(cfg), TEST_KEY);
+        let resp = app
+            .oneshot(
+                Request::get("/portal/login")
+                    .header(axum::http::header::HOST, "admin.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "a redirect, not straight to Keycloak");
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(loc, "https://portal.example/portal/login", "bounces via the plain Host header alone");
+        assert!(resp.headers().get("set-cookie").is_none(), "no cookie minted on the bounce");
     }
 
     /// The bounce must not fire when already on the canonical host -- otherwise
