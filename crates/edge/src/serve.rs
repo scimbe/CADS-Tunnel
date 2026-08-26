@@ -2248,16 +2248,38 @@ where
         let mut token_buf = [0u8; 32];
         stream.read_exact(&mut token_buf).await?;
         let token = RoutingToken(token_buf);
+        let mut th_buf = [0u8; 8];
+        edge_trace(format_args!("admit '{role_label}' token={} -> read", token_hex(&token, &mut th_buf)));
         let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
         if tcp_agent_cap.is_some() && sub_permit.is_none() {
+            edge_trace(format_args!(
+                "admit '{role_label}' token={} -> NO (sub_permit exhausted, #410)",
+                token_hex(&token, &mut th_buf)
+            ));
             stream.write_all(b"NO").await?;
             stream.flush().await?;
             return Ok::<_, BoxError>((token, None, None));
         }
         let parked = state.park_tcp_agent_unless_revoked(token.clone());
+        // #589 forensics (2026-08-26 sort recurrence): this is the ONE step the
+        // pre-existing `tcp_fallback_pool=N` figure in the give-up error message
+        // (8c06c41) can't see -- it only observes the CONSUMER side (a browser
+        // finding nothing to drain). This traces the PRODUCER side: did this
+        // specific admission attempt actually leave a live entry in
+        // `tcp_agents`, and how deep is the pool for this token right after.
+        // Only a live recurrence with CT_EDGE_TRACE on can tell "the agent's
+        // parks are silently failing to land" apart from "they land fine but
+        // die/get consumed before a browser arrives" -- both look identical
+        // from the consumer-side count alone.
         if parked.is_some() {
+            edge_trace(format_args!(
+                "admit '{role_label}' token={} -> OK, parked (pool now {})",
+                token_hex(&token, &mut th_buf),
+                state.tcp_parked_for(&token)
+            ));
             stream.write_all(b"OK").await?;
         } else {
+            edge_trace(format_args!("admit '{role_label}' token={} -> NO (revoked, #665)", token_hex(&token, &mut th_buf)));
             stream.write_all(b"NO").await?;
         }
         stream.flush().await?;
@@ -2303,8 +2325,14 @@ where
         let mut token_buf = [0u8; 32];
         stream.read_exact(&mut token_buf).await?;
         let token = RoutingToken(token_buf);
+        let mut th_buf = [0u8; 8];
+        edge_trace(format_args!("admit '{role_label}' token={} -> read", token_hex(&token, &mut th_buf)));
         let sub_permit = tcp_agent_cap.and_then(|cap| cap.try_admit());
         if tcp_agent_cap.is_some() && sub_permit.is_none() {
+            edge_trace(format_args!(
+                "admit '{role_label}' token={} -> NO (sub_permit exhausted, #410)",
+                token_hex(&token, &mut th_buf)
+            ));
             stream.write_all(b"NO").await?;
             stream.flush().await?;
             return Ok::<_, BoxError>(None);
@@ -2320,10 +2348,18 @@ where
         let host = std::str::from_utf8(&host).map_err(|_| "hostname is not valid UTF-8")?.to_string();
         // Same gates as the QUIC 'H' bind: authorization (#23 BP4b) + takeover-safe.
         if !state.host_bind_allowed(&host, &token) || state.register_host(&host, token.clone()).is_err() {
+            edge_trace(format_args!(
+                "admit '{role_label}' token={} host={host} -> NO (host_bind_allowed/register_host refused)",
+                token_hex(&token, &mut th_buf)
+            ));
             stream.write_all(b"NO").await?;
             stream.flush().await?;
             return Ok::<_, BoxError>(None);
         }
+        edge_trace(format_args!(
+            "admit '{role_label}' token={} host={host} -> register_host OK, writing ack",
+            token_hex(&token, &mut th_buf)
+        ));
         stream.write_all(b"OK").await?;
         stream.flush().await?;
         Ok(Some((token, sub_permit)))
@@ -2354,6 +2390,27 @@ where
     // Returned UN-awaited: the caller decides whether to await it plainly ('B') or
     // to keep the idle connection alive with `park_and_ping` while waiting ('L').
     let parked = state.park_tcp_agent_unless_revoked(token.clone());
+    // #589 forensics (2026-08-26 sort recurrence, same reasoning as
+    // admit_tcp_agent_a's own trace above): this is the step the existing
+    // consumer-side `tcp_fallback_pool=N` figure can't see -- whether THIS
+    // admission's park actually landed, and the resulting pool depth right
+    // after. The `OK` ack above is written on `register_host` success alone
+    // and predates this call, so agent-side "registered OK" logs are NOT
+    // proof this park succeeded -- exactly the gap this trace closes for a
+    // future live recurrence.
+    let mut th_buf = [0u8; 8];
+    if parked.is_some() {
+        edge_trace(format_args!(
+            "admit '{role_label}' token={} -> parked (pool now {})",
+            token_hex(&token, &mut th_buf),
+            state.tcp_parked_for(&token)
+        ));
+    } else {
+        edge_trace(format_args!(
+            "admit '{role_label}' token={} -> park refused (revoked, #665) -- ack already sent OK, caller gets nothing",
+            token_hex(&token, &mut th_buf)
+        ));
+    }
     Ok(parked.map(|parked| (token, parked, sub_permit)))
 }
 
