@@ -1230,13 +1230,38 @@ impl<H: Clone> EdgeState<H> {
     }
 
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
-    /// the address and cert DER a Client uses to connect directly.
-    pub fn advertise_direct(&self, token: RoutingToken, addr: SocketAddr, cert: Vec<u8>) {
+    /// the address and cert DER a Client uses to connect directly. Returns
+    /// `false` (and records nothing) for a revoked token (#665) -- unlike
+    /// every other arm ('A'/'K'/'H'), this one had no revocation check at
+    /// all, so a revoked Agent's own reconnect loop could deterministically
+    /// (no race needed) keep re-advertising a direct endpoint forever, which
+    /// [`Self::direct_endpoint`] would then hand to any token-bearing client,
+    /// bypassing `until_revoked()` (which only guards edge-mediated splices)
+    /// entirely -- a client dialing that endpoint reaches the origin P2P
+    /// directly. Checked under `registration_lock` for the same reason as
+    /// [`register_host`](Self::register_host)'s own #411 revocation check:
+    /// one lock hold, not a separate check every caller has to remember.
+    pub fn advertise_direct(&self, token: RoutingToken, addr: SocketAddr, cert: Vec<u8>) -> bool {
+        let _guard = self.registration_lock.lock_safe();
+        if self.is_revoked(&token) {
+            return false;
+        }
         self.direct.write_safe().insert(token, (addr, cert));
+        true
     }
 
-    /// The Agent's advertised direct-path `(addr, cert)` for `token`, if any.
+    /// The Agent's advertised direct-path `(addr, cert)` for `token`, if any --
+    /// `None` (the same "nothing advertised" sentinel) for a revoked token
+    /// (#665), even if a stale entry somehow still exists in `self.direct`.
+    /// Belt-and-suspenders alongside [`Self::advertise_direct`]'s own refusal:
+    /// `revoke_token`/`remove_locked` already sweep `self.direct` on revoke,
+    /// so in the steady state this never has anything to filter -- this
+    /// closes the same class of gap for any future direct-map write path that
+    /// forgets the revocation check the way this one originally did.
     pub fn direct_endpoint(&self, token: &RoutingToken) -> Option<(SocketAddr, Vec<u8>)> {
+        if self.is_revoked(token) {
+            return None;
+        }
         self.direct.read_safe().get(token).cloned()
     }
 
@@ -2186,6 +2211,61 @@ mod tests {
     }
 
     #[test]
+    fn revoke_and_browser_plane_admit_race_never_leaves_a_revoked_token_parked_665() {
+        // #665: `admit_tcp_agent_b` (serve.rs's shared 'B'/'L'/'F' admission body)
+        // calls `register_host` then, separately, parks -- two independent
+        // `registration_lock` acquisitions, not one held across both. Before this
+        // fix the second step was a plain `park_tcp_agent`, which never checks
+        // revocation at all, so a `revoke_token` landing in the gap between the
+        // two acquisitions left a revoked token parked as a live waiting Agent
+        // anyway. Same "prove the actual property with real threads" style as
+        // #421's `revoke_and_register_race_never_leaves_a_revoked_token_registered_421`
+        // -- this races the exact two-call composition `admit_tcp_agent_b` now
+        // performs (`register_host` then `park_tcp_agent_unless_revoked`), not
+        // just one of the two primitives in isolation.
+        use std::sync::Arc;
+
+        let state: Arc<EdgeState<u32>> = Arc::new(EdgeState::new());
+
+        for round in 0u32..300 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&round.to_be_bytes());
+            let t = RoutingToken(bytes);
+            let host = format!("round-{round}.example");
+            state.authorize_host(&host, t.clone());
+
+            let mut handles = Vec::new();
+            {
+                let state = Arc::clone(&state);
+                let t = t.clone();
+                let host = host.clone();
+                handles.push(std::thread::spawn(move || {
+                    // Mirrors admit_tcp_agent_b's own two-step body exactly.
+                    if state.register_host(&host, t.clone()).is_ok() {
+                        let _ = state.park_tcp_agent_unless_revoked(t);
+                    }
+                }));
+            }
+            {
+                let state = Arc::clone(&state);
+                let t = t.clone();
+                handles.push(std::thread::spawn(move || {
+                    state.revoke_token(&t);
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert!(state.is_revoked(&t), "sanity: revoke always runs each round");
+            assert!(
+                !state.has_tcp_agent(&t),
+                "round {round}: a revoked token ended up parked as a live waiting TCP-fallback agent -- the race is not closed"
+            );
+        }
+    }
+
+    #[test]
     fn seed_revoked_tokens_blocks_registration_without_touching_a_live_one_327() {
         // #327: boot-time replay from the control plane's durable record must
         // block re-registration of a previously-revoked token, exactly like a
@@ -2382,6 +2462,48 @@ mod tests {
         state.register(token(6), 1u32);
         state.remove(&token(6));
         assert_eq!(state.direct_endpoint(&token(6)), None);
+    }
+
+    /// #665: unlike every other registration arm ('A'/'K'/'H'), `advertise_direct`
+    /// had no revocation check at all -- a revoked Agent's own reconnect loop
+    /// could deterministically (no race needed) keep re-advertising a direct
+    /// endpoint forever, which a client could then dial to reach the origin P2P
+    /// directly, bypassing `until_revoked()` entirely.
+    #[test]
+    fn advertise_direct_refuses_a_revoked_token_665() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let revoked = token(7);
+        state.revoke_token(&revoked);
+        assert!(
+            !state.advertise_direct(revoked.clone(), addr, vec![1, 2, 3]),
+            "a revoked token must never acquire a live direct-path advertisement"
+        );
+        assert_eq!(state.direct_endpoint(&revoked), None, "the refused advertisement must not be recorded");
+
+        let live = token(8);
+        assert!(state.advertise_direct(live.clone(), addr, vec![4, 5, 6]), "an unrevoked token advertises normally");
+        assert_eq!(state.direct_endpoint(&live), Some((addr, vec![4, 5, 6])));
+    }
+
+    /// #665: belt-and-suspenders alongside `advertise_direct`'s own refusal --
+    /// even if a stale entry somehow still exists in `self.direct` for a token
+    /// that gets revoked afterward, `direct_endpoint` must never hand it out.
+    #[test]
+    fn direct_endpoint_returns_none_for_a_revoked_token_even_with_a_stale_entry_665() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let t = token(9);
+        assert!(state.advertise_direct(t.clone(), addr, vec![7, 7]), "advertised while still live");
+        assert_eq!(state.direct_endpoint(&t), Some((addr, vec![7, 7])), "readable before revoke");
+
+        state.revoke_token(&t);
+        assert_eq!(
+            state.direct_endpoint(&t),
+            None,
+            "must return the no-endpoint sentinel once revoked, even though revoke_token's own \
+             self.direct sweep already independently removes the entry"
+        );
     }
 
     #[tokio::test]
