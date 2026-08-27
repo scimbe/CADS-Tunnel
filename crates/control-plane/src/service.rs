@@ -2447,9 +2447,10 @@ const EDITOR_JS: &str = r#"
  function shortId(s){s=String(s);return s.length>14?s.slice(0,10)+'…':s;}
  function clearSrc(){if(src){src.classList.remove('linking');src=null;}}
  function edgeExists(a,b){var f=false;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=true;});return f;}
- function addEdgeEl(a,b){var first=svg.querySelector('.node');if(!first)return;first.insertAdjacentHTML('beforebegin','<path data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"/>');var np=first.previousElementSibling;if(np)np.setAttribute('class','edge');redraw();}
+ function updateEdgeCount(){var el=document.getElementById('edgecount');if(!el)return;var n=svg.querySelectorAll('.edge').length;el.textContent=n+' link'+(n===1?'':'s');}
+ function addEdgeEl(a,b){var first=svg.querySelector('.node');if(!first)return;first.insertAdjacentHTML('beforebegin','<path data-a="'+xesc(a)+'" data-b="'+xesc(b)+'"/>');var np=first.previousElementSibling;if(np)np.setAttribute('class','edge');redraw();updateEdgeCount();}
  function linkPick(g){var id=g.getAttribute('data-node');if(!src){src=g;g.classList.add('linking');say('connect: pick the target agent');return;}var a=src.getAttribute('data-node');clearSrc();if(a===id){say('connect: pick two different agents');return;}if(edgeExists(a,id)){say('already linked');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:id})}).then(function(r){if(r.ok){addEdgeEl(a,id);say('linked '+shortId(a)+' — '+shortId(id));}else{say('link failed ('+r.status+')');}}).catch(function(){say('link failed');});}
- function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();var dot=liveDotFor(a,b);if(dot)dot.remove();say('unlinked '+shortId(a)+' — '+shortId(b));}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
+ function removeEdge(ed){var a=ed.getAttribute('data-a'),b=ed.getAttribute('data-b');fetch('/me/topologies/'+encodeURIComponent(tid)+'/edges',{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({a:a,b:b})}).then(function(r){if(r.ok){ed.remove();var dot=liveDotFor(a,b);if(dot)dot.remove();updateEdgeCount();say('unlinked '+shortId(a)+' — '+shortId(b));}else{say('unlink failed ('+r.status+')');}}).catch(function(){say('unlink failed');});}
  function findEdgeEl(a,b){var f=null;svg.querySelectorAll('.edge').forEach(function(ed){var x=ed.getAttribute('data-a'),y=ed.getAttribute('data-b');if((x===a&&y===b)||(x===b&&y===a))f=ed;});return f;}
  // Video-conferencing feature (#276-video-call, the browser-originated channel case):
  // a channel a browser ct-agent registered via POST /me/channels is otherwise invisible
@@ -2832,6 +2833,9 @@ fn render_topology_editor(
         String::new()
     };
 
+    let agent_count_label = format!("{na} agent{s}", na = agents.len(), s = if agents.len() == 1 { "" } else { "s" });
+    let edge_count_label = format!("{ne} link{s}", ne = edges.len(), s = if edges.len() == 1 { "" } else { "s" });
+
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -2839,7 +2843,7 @@ fn render_topology_editor(
          <body data-tid=\"{tid}\" data-owner=\"{is_owner}\">\
          <header class=\"bar\"><span class=\"title\">Topology Editor</span>\
          <span class=\"chip\">net:{uuid}</span>\
-         <span class=\"chip\" id=\"agentcount\">{na} agents</span><span class=\"chip\" id=\"edgecount\">{ne} links</span>\
+         <span class=\"chip\" id=\"agentcount\">{agent_count_label}</span><span class=\"chip\" id=\"edgecount\">{edge_count_label}</span>\
          <span class=\"hint\">drag nodes to arrange</span>\
          <div class=\"modebtn\" role=\"group\" aria-label=\"editor complexity\">\
          <button type=\"button\" id=\"modeeasy\">Easy</button><button type=\"button\" id=\"modeflex\">Flexible</button></div>\
@@ -2862,8 +2866,6 @@ fn render_topology_editor(
          <script>{js}</script></body></html>",
         uuid = esc(&t.net_uuid),
         tid = esc(&t.id),
-        na = agents.len(),
-        ne = edges.len(),
         mode_dis = if is_owner { "" } else { " disabled" },
         css = EDITOR_CSS,
         js = EDITOR_JS,
@@ -8582,6 +8584,43 @@ mod tests {
         // An empty topology still yields a valid page with an empty-state hint (no panic).
         let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[]);
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
+    }
+
+    #[test]
+    fn topology_editor_counts_are_grammatically_correct_and_live_updated_on_edge_changes() {
+        // #698 finding 7: the header chips read "1 agents"/"1 links" for a singular
+        // count -- guard the pluralization at the server-render boundary.
+        let t = crate::topology::Topology { id: "t1".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
+        let one_agent = vec![("agent-1".to_string(), "peer".to_string())];
+        let one_edge = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
+        let singular = render_topology_editor(&t, &one_agent, &one_edge, "baseline", true, &[]);
+        assert!(singular.contains("id=\"agentcount\">1 agent<"), "singular agent count has no trailing s");
+        assert!(singular.contains("id=\"edgecount\">1 link<"), "singular edge count has no trailing s");
+
+        let three_agents = vec![
+            ("agent-1".to_string(), "peer".to_string()),
+            ("agent-2".to_string(), "peer".to_string()),
+            ("agent-3".to_string(), "peer".to_string()),
+        ];
+        let plural = render_topology_editor(&t, &three_agents, &[], "baseline", true, &[]);
+        assert!(plural.contains("id=\"agentcount\">3 agents<"), "plural agent count keeps the s");
+        assert!(plural.contains("id=\"edgecount\">0 links<"), "zero edges is plural, not singular");
+
+        // #698 finding 3: the link counter reads "0 links" until reload even after a
+        // connection is drawn/removed client-side -- addEdgeEl/removeEdge must patch
+        // #edgecount's textContent themselves rather than relying on the stale
+        // server-rendered value from page load.
+        let js = EDITOR_JS;
+        assert!(
+            js.contains("function updateEdgeCount()") && js.contains("getElementById('edgecount')"),
+            "a live counter updater targeting #edgecount must exist in the shipped JS"
+        );
+        let add_fn_start = js.find("function addEdgeEl(").expect("addEdgeEl exists");
+        let add_fn_body = &js[add_fn_start..add_fn_start + 320];
+        assert!(add_fn_body.contains("updateEdgeCount()"), "addEdgeEl must refresh the live link counter, not just redraw()");
+        let remove_fn_start = js.find("function removeEdge(").expect("removeEdge exists");
+        let remove_fn_body = &js[remove_fn_start..remove_fn_start + 400];
+        assert!(remove_fn_body.contains("updateEdgeCount()"), "removeEdge must refresh the live link counter on successful unlink");
     }
 
     #[test]
