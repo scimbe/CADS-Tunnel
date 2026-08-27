@@ -1859,7 +1859,23 @@ async fn topology_editor(
         .topologies
         .shares_for(&t.owner, &t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(axum::response::Html(render_topology_editor(&t, &agents, &edges, mode.as_str(), is_owner, &shares)))
+    // #698: whether an operator key is already bound -- the editor's own missing step
+    // (a topology "authorizes real channel admission" only once this is done, per the
+    // /portal/topologies intro text, but the guided flow never used to surface it).
+    let operator_bound = state
+        .topologies
+        .operator(&t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .is_some();
+    Ok(axum::response::Html(render_topology_editor(
+        &t,
+        &agents,
+        &edges,
+        mode.as_str(),
+        is_owner,
+        &shares,
+        operator_bound,
+    )))
 }
 
 /// A caller-supplied candidate link + its measured latency cost, the input to the overlay
@@ -2546,6 +2562,29 @@ const EDITOR_JS: &str = r#"
  if(sharesEl){sharesEl.querySelectorAll('.unshare').forEach(function(btn){btn.addEventListener('click',function(){unshare(btn.getAttribute('data-email'),btn.closest('.sharee'));});});}
  if(shareBtn&&shareEmail){shareBtn.addEventListener('click',function(){var email=shareEmail.value.trim();if(!email){say('enter an email address');return;}fetch('/me/topologies/'+encodeURIComponent(tid)+'/share',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:email})}).then(function(r){if(r.ok){addShareRow(email);shareEmail.value='';say('shared with '+email);}else{say('share failed ('+r.status+')');}}).catch(function(){say('share failed');});});}
 
+ // #698 finding 1: the "Bind an operator key" panel -- wires PUT …/operator with the
+ // pubkey/proof `ct-agent channel bind-topology` prints. On success, flips
+ // data-operator-bound so the guide/status chip update immediately (no reload needed,
+ // matching #698 finding 3's live-counter lesson) and the panel removes itself.
+ var opBindBtn=document.getElementById('opBindBtn'),opPubkey=document.getElementById('opPubkey'),opProof=document.getElementById('opProof'),opStatusEl=document.getElementById('opstatus');
+ if(opBindBtn&&opPubkey&&opProof){opBindBtn.addEventListener('click',function(){
+  var pk=opPubkey.value.trim(),pf=opProof.value.trim();
+  if(!/^[0-9a-fA-F]{64}$/.test(pk)){say('operator_pubkey must be 64 hex characters');return;}
+  if(!/^[0-9a-fA-F]{128}$/.test(pf)){say('proof must be 128 hex characters');return;}
+  fetch('/me/topologies/'+encodeURIComponent(tid)+'/operator',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({operator_pubkey:pk,proof:pf})})
+   .then(function(r){
+    if(r.ok){
+     document.body.setAttribute('data-operator-bound','true');
+     if(opStatusEl)opStatusEl.textContent='operator: bound';
+     var panel=document.getElementById('opbind');if(panel&&panel.remove)panel.remove();
+     renderGuide();
+     say('operator key bound');
+    }else{
+     say(r.status===404?'bind failed: not owner, no such topology, or invalid proof-of-possession':'bind failed ('+r.status+')');
+    }
+   }).catch(function(){say('bind failed');});
+ });}
+
  // Easy/Flexible presentation toggle: purely a client-side view preference,
  // persisted in localStorage -- the real graph/API underneath is identical
  // either way. Easy hides the overlay-mode/suggest planning tools; Flexible
@@ -2582,6 +2621,7 @@ const EDITOR_JS: &str = r#"
  function brokerPort(){return netInfo?netInfo.channel_broker_port:4435;}
 
  var guide=document.getElementById('guide');
+ function operatorBound(){return document.body.getAttribute('data-operator-bound')==='true';}
  function graphState(){
   var agents=svg.querySelectorAll('.node').length;
   var edges=svg.querySelectorAll('.edge').length;
@@ -2592,7 +2632,11 @@ const EDITOR_JS: &str = r#"
   if(s.agents===0)return{n:1,text:'Add your first agent to get started'};
   if(s.agents===1)return{n:2,text:'Add a second agent, or run this one as a super-peer'};
   if(s.edges===0)return{n:3,text:'Click Connect, then click two agents to link them'};
-  return{n:4,text:'Click any agent or connection above for its setup command'};
+  // #698 finding 1: a wired graph with no operator key bound authorizes nothing --
+  // this is the step the old guide silently skipped straight past.
+  if(document.body.getAttribute('data-owner')==='true'&&!operatorBound())
+   return{n:4,text:'Bind an operator key so these links actually authorize admission'};
+  return{n:5,text:'Click any agent or connection above for its setup command'};
  }
  function renderGuide(){
   if(!guide)return;
@@ -2633,6 +2677,8 @@ const EDITOR_JS: &str = r#"
    html='<p class="lede">Same command as before, on a second machine -- or check "super-peer" before Add to run this agent as a LAN relay for others.</p>'+cmdBlock('New agent identity','ct-agent channel init');
   }else if(step.n===3){
    html='<p class="lede">Click <strong>Connect</strong> in the toolbar, then click two agent cards on the canvas to draw a link between them.</p>';
+  }else if(step.n===4){
+   html='<p class="lede">These links won\'t authorize any real admission until this topology is bound to an operator key. Run the first command once if you don\'t already have an operator key, then the second with this topology\'s id and paste its two output lines into the "Bind an operator key" panel below the canvas. The private key never leaves your machine -- only a signature proving you hold it is sent here.</p>'+cmdBlock('New operator identity (once)','ct-agent channel operator-init')+cmdBlock('Sign this topology\'s binding proof','CT_CHANNEL_OPERATOR_KEY=... CT_TOPOLOGY_ID='+tid+' \\\nct-agent channel bind-topology');
   }else{
    html='<p class="lede">Click any agent card for its identity/super-peer command, or any connection line for how to wire that specific link.</p>';
   }
@@ -2703,6 +2749,7 @@ fn render_topology_editor(
     mode: &str,
     is_owner: bool,
     shares: &[String],
+    operator_bound: bool,
 ) -> String {
     use std::f64::consts::PI;
     let esc = crate::portal::escape;
@@ -2836,14 +2883,40 @@ fn render_topology_editor(
     let agent_count_label = format!("{na} agent{s}", na = agents.len(), s = if agents.len() == 1 { "" } else { "s" });
     let edge_count_label = format!("{ne} link{s}", ne = edges.len(), s = if edges.len() == 1 { "" } else { "s" });
 
+    // #698 finding 1: a topology "authorizes real channel admission only once bound to
+    // an operator key" (the intro text's own promise), but nothing in the guided flow
+    // ever surfaced that step -- a user could reach the end of Easy/Flexible mode with a
+    // fully-wired graph that still authorizes nothing, no indication anything was
+    // missing. `ct-agent channel bind-topology` (added alongside this fix) is the
+    // producer for the `proof`; this panel is the consumer, owner-only like share
+    // management, shown only while unbound so a bound topology doesn't keep nagging.
+    let operator_section = if is_owner && !operator_bound {
+        format!(
+            "<div class=\"panel\" id=\"opbind\"><h2>Bind an operator key</h2>\
+             <p class=\"help\">Required before this topology's links authorize any real \
+             admission -- run <code>ct-agent channel operator-init</code> once (if you don't \
+             already have an operator key), then <code>CT_CHANNEL_OPERATOR_KEY=... \
+             CT_TOPOLOGY_ID={tid} ct-agent channel bind-topology</code> and paste its two \
+             output lines below. The private key never leaves your machine -- only a \
+             signature proving you hold it is sent here.</p>\
+             <input id=\"opPubkey\" placeholder=\"operator_pubkey (64 hex)\" aria-label=\"operator public key\"/>\
+             <input id=\"opProof\" placeholder=\"proof (128 hex)\" aria-label=\"operator binding proof\"/>\
+             <button id=\"opBindBtn\">Bind</button></div>",
+            tid = esc(&t.id),
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>Topology Editor — {uuid}</title><style>{css}</style></head>\
-         <body data-tid=\"{tid}\" data-owner=\"{is_owner}\">\
+         <body data-tid=\"{tid}\" data-owner=\"{is_owner}\" data-operator-bound=\"{operator_bound}\">\
          <header class=\"bar\"><span class=\"title\">Topology Editor</span>\
          <span class=\"chip\">net:{uuid}</span>\
          <span class=\"chip\" id=\"agentcount\">{agent_count_label}</span><span class=\"chip\" id=\"edgecount\">{edge_count_label}</span>\
+         <span class=\"chip\" id=\"opstatus\">operator: {op_status}</span>\
          <span class=\"hint\">drag nodes to arrange</span>\
          <div class=\"modebtn\" role=\"group\" aria-label=\"editor complexity\">\
          <button type=\"button\" id=\"modeeasy\">Easy</button><button type=\"button\" id=\"modeflex\">Flexible</button></div>\
@@ -2858,7 +2931,7 @@ fn render_topology_editor(
          <div class=\"guide\" id=\"guide\" role=\"button\" tabindex=\"0\" aria-label=\"current step -- click for details\"></div>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
          preserveAspectRatio=\"xMidYMid meet\" role=\"application\" aria-label=\"topology node graph\">\
-         {content}</svg></div>{share_section}\
+         {content}</svg></div>{share_section}{operator_section}\
          <div class=\"drawer-backdrop\" id=\"drawerbackdrop\"></div>\
          <aside class=\"drawer\" id=\"drawer\" aria-label=\"details\">\
          <div class=\"drawer-head\"><h2></h2><button type=\"button\" class=\"drawer-close\" id=\"drawerclose\" aria-label=\"close\">&times;</button></div>\
@@ -2867,6 +2940,7 @@ fn render_topology_editor(
         uuid = esc(&t.net_uuid),
         tid = esc(&t.id),
         mode_dis = if is_owner { "" } else { " disabled" },
+        op_status = if operator_bound { "bound" } else { "not bound" },
         css = EDITOR_CSS,
         js = EDITOR_JS,
     )
@@ -8553,7 +8627,7 @@ mod tests {
             ("agent-2".to_string(), "agent-3".to_string(), None),
             ("agent-1".to_string(), "agent-3".to_string(), None),
         ];
-        let html = render_topology_editor(&t, &agents, &edges, "smart-route", true, &[]);
+        let html = render_topology_editor(&t, &agents, &edges, "smart-route", true, &[], false);
 
         // A complete, self-contained HTML document.
         assert!(html.starts_with("<!doctype html>") && html.contains("</html>"), "full HTML doc");
@@ -8577,12 +8651,12 @@ mod tests {
 
         // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
         let evil = vec![("<script>alert(1)</script>".to_string(), "peer".to_string())];
-        let evil_html = render_topology_editor(&t, &evil, &[], "baseline", true, &[]);
+        let evil_html = render_topology_editor(&t, &evil, &[], "baseline", true, &[], false);
         assert!(!evil_html.contains("<script>alert(1)"), "hostile agent id is escaped");
         assert!(evil_html.contains("&lt;script&gt;alert(1)"), "escaped form is present");
 
         // An empty topology still yields a valid page with an empty-state hint (no panic).
-        let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[]);
+        let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[], false);
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
     }
 
@@ -8593,7 +8667,7 @@ mod tests {
         let t = crate::topology::Topology { id: "t1".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
         let one_agent = vec![("agent-1".to_string(), "peer".to_string())];
         let one_edge = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
-        let singular = render_topology_editor(&t, &one_agent, &one_edge, "baseline", true, &[]);
+        let singular = render_topology_editor(&t, &one_agent, &one_edge, "baseline", true, &[], false);
         assert!(singular.contains("id=\"agentcount\">1 agent<"), "singular agent count has no trailing s");
         assert!(singular.contains("id=\"edgecount\">1 link<"), "singular edge count has no trailing s");
 
@@ -8602,7 +8676,7 @@ mod tests {
             ("agent-2".to_string(), "peer".to_string()),
             ("agent-3".to_string(), "peer".to_string()),
         ];
-        let plural = render_topology_editor(&t, &three_agents, &[], "baseline", true, &[]);
+        let plural = render_topology_editor(&t, &three_agents, &[], "baseline", true, &[], false);
         assert!(plural.contains("id=\"agentcount\">3 agents<"), "plural agent count keeps the s");
         assert!(plural.contains("id=\"edgecount\">0 links<"), "zero edges is plural, not singular");
 
@@ -8624,6 +8698,56 @@ mod tests {
     }
 
     #[test]
+    fn topology_editor_surfaces_operator_binding_as_a_real_guided_step_698() {
+        // #698 finding 1: the guided flow's own intro text promised a step ("bound to an
+        // operator key... see the editor's own hint for that step") that never existed
+        // anywhere in Easy/Flexible mode or the wizard -- a user could reach the end with
+        // a fully-wired graph that authorized nothing, no indication anything was missing.
+        // `ct-agent channel bind-topology` (shipped alongside this) is the missing
+        // producer for PUT /me/topologies/:id/operator's `proof`; this pins the consumer
+        // side: an owner-only status chip + bind panel while unbound, gone once bound,
+        // and a real guide step (not a dead end) pointing at the actual command.
+        let t = crate::topology::Topology { id: "topo-42".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
+        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
+        let edges = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
+
+        // Owner, unbound: status chip says so, the bind panel with both input fields is
+        // present, and the topology id is embedded so the copy-paste command is complete.
+        let unbound = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false);
+        assert!(unbound.contains("data-operator-bound=\"false\""), "unbound state flagged on body");
+        assert!(unbound.contains("id=\"opstatus\">operator: not bound<"), "status chip reads not bound");
+        assert!(unbound.contains("id=\"opbind\""), "bind panel present while unbound");
+        assert!(unbound.contains("id=\"opPubkey\"") && unbound.contains("id=\"opProof\"") && unbound.contains("id=\"opBindBtn\""), "bind panel has both inputs + the button");
+        assert!(unbound.contains("CT_TOPOLOGY_ID=topo-42"), "the copy-paste command is complete, not a template the user has to fill in blind");
+        assert!(unbound.contains("ct-agent channel bind-topology"), "points at the real producer command, not a dead end");
+
+        // Owner, bound: status flips, the panel is gone (no more nagging once done).
+        let bound = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], true);
+        assert!(bound.contains("data-operator-bound=\"true\""), "bound state flagged on body");
+        assert!(bound.contains("id=\"opstatus\">operator: bound<"), "status chip reads bound");
+        assert!(!bound.contains("id=\"opbind\""), "bind panel is gone once bound -- it doesn't keep nagging");
+
+        // Non-owner, unbound: the bind panel is owner-gated like share management --
+        // a collaborator can SEE the status but can't attempt the (owner-only) bind.
+        let viewer = render_topology_editor(&t, &agents, &edges, "baseline", false, &[], false);
+        assert!(viewer.contains("id=\"opstatus\">operator: not bound<"), "a viewer still sees the status");
+        assert!(!viewer.contains("id=\"opbind\""), "a non-owner never gets the bind form -- binding is owner-only");
+
+        // The JS: a real guide step (not the old silent skip straight to the generic
+        // fallback), wired to the actual endpoint with the field names it expects.
+        let js = EDITOR_JS;
+        assert!(js.contains("function operatorBound()"), "reads the live bound state off the DOM");
+        assert!(js.contains("Bind an operator key so these links actually authorize admission"), "guide step 4 text present");
+        assert!(js.contains("ct-agent channel bind-topology"), "drawer step 4 references the real command");
+        let bind_start = js.find("var opBindBtn=").expect("bind handler exists");
+        let bind_body = &js[bind_start..bind_start + 900];
+        assert!(bind_body.contains("/operator'"), "wired to PUT …/operator");
+        assert!(bind_body.contains("operator_pubkey:pk") && bind_body.contains("proof:pf"), "posts the exact field names the endpoint expects");
+        assert!(bind_body.contains("method:'PUT'"), "uses PUT, matching the endpoint");
+        assert!(bind_body.contains("data-operator-bound','true'"), "flips the live DOM state on success -- no reload needed, same lesson as finding 3");
+    }
+
+    #[test]
     fn topology_editor_has_an_easy_flexible_toggle_and_a_guided_contextual_drawer() {
         // UX overhaul, round 2 (geführter Weg): a bulk always-on commands panel dumped
         // every one-liner at once, which is exactly the "loaded with bulk of information"
@@ -8642,7 +8766,7 @@ mod tests {
         };
         let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "super-peer".to_string())];
         let edges = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
-        let html = render_topology_editor(&t, &agents, &edges, "baseline", true, &[]);
+        let html = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false);
 
         assert!(html.contains("id=\"modeeasy\"") && html.contains("id=\"modeflex\""), "easy/flexible toggle present");
         assert!(html.contains("class=\"flex-only\""), "advanced-only controls (overlay mode, suggest) are marked for the easy-mode CSS to hide");
@@ -8679,7 +8803,7 @@ mod tests {
             net_uuid: "uuid-xyz".into(),
         };
         let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
-        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[]);
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
 
         // The Connect tool is present and starts un-armed (a11y state exposed).
         assert!(html.contains("id=\"link\"") && html.contains("aria-pressed=\"false\""), "Connect tool present, un-armed");
@@ -8717,7 +8841,7 @@ mod tests {
             net_uuid: "uuid-xyz".into(),
         };
         let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
-        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[]);
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
 
         // The action itself: a button wired to a real sync routine, not a stub.
         assert!(html.contains("id=\"syncchan\""), "Sync my channels button present");
