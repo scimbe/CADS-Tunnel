@@ -149,14 +149,19 @@ async fn push_channel_tier(
             return false;
         }
     };
+    // #666: routing token via the `x-ct-routing-token` header, not the URL path --
+    // mirrors this same module's own `x-ct-agent-token` fix for the agent-facing
+    // routes, applied here to the CP->edge admin hop (edge/src/admin.rs's
+    // `:host`-only route).
     let endpoint = format!(
-        "{}/admin/authorize-host/{routing_token}/{hostname}{}",
+        "{}/admin/authorize-host/{hostname}{}",
         url.trim_end_matches('/'),
         if gelb { "?channel_tier=gelb" } else { "" }
     );
     match crate::portal_api::edge_admin_http_client()
         .post(&endpoint)
         .header("x-ct-admin-token", token.as_str())
+        .header("x-ct-routing-token", routing_token.as_str())
         .send()
         .await
     {
@@ -919,22 +924,26 @@ mod tests {
         assert!(a.assigned_ca.is_some());
     }
 
-    /// A minimal mock edge admin API recording every `authorize-host` call it
-    /// receives (path, including query string, plus the admin-token header).
-    async fn spawn_mock_edge_admin() -> (String, Arc<Mutex<Vec<(String, Option<String>)>>>) {
+    /// A minimal mock edge admin API recording every `authorize-host` call it receives:
+    /// (path incl. query string, the admin-token header, the #666 routing-token header).
+    /// #666: mounts only the `:host`-only header-form route -- `push_channel_tier` (the
+    /// real caller) forwards via that route now, not the legacy `:token/:host` path
+    /// form, so a call landing here at all already proves the header form is in use.
+    async fn spawn_mock_edge_admin() -> (String, Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>) {
         use axum::extract::{OriginalUri, State as AxState};
-        let calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls: Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         async fn authorize_host(
-            AxState(calls): AxState<Arc<Mutex<Vec<(String, Option<String>)>>>>,
+            AxState(calls): AxState<Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>>,
             OriginalUri(uri): OriginalUri,
             headers: axum::http::HeaderMap,
         ) -> StatusCode {
             let token_hdr = headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()).map(str::to_string);
-            calls.lock().unwrap().push((uri.to_string(), token_hdr));
+            let routing_hdr = headers.get("x-ct-routing-token").and_then(|v| v.to_str().ok()).map(str::to_string);
+            calls.lock().unwrap().push((uri.to_string(), token_hdr, routing_hdr));
             StatusCode::OK
         }
         let app = Router::new()
-            .route("/admin/authorize-host/:token/:host", axum::routing::post(authorize_host))
+            .route("/admin/authorize-host/:host", axum::routing::post(authorize_host))
             .with_state(calls.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -968,12 +977,12 @@ mod tests {
             assert_eq!(seen.len(), 2, "promotion push + same-tick re-affirm push");
             for call in seen.iter() {
                 assert!(
-                    call.0.contains(&format!("/admin/authorize-host/{}/app.example.com", t.routing_token))
-                        && call.0.contains("channel_tier=gelb"),
+                    call.0.contains("/admin/authorize-host/app.example.com") && call.0.contains("channel_tier=gelb"),
                     "{}",
                     call.0
                 );
-                assert_eq!(call.1.as_deref(), Some("sekret"));
+                assert_eq!(call.1.as_deref(), Some("sekret"), "admin-token header");
+                assert_eq!(call.2.as_deref(), Some(t.routing_token.as_str()), "#666: routing token via header, not path");
             }
         }
 
@@ -1064,18 +1073,23 @@ mod tests {
 
     /// Like [`spawn_mock_edge_admin`], but every call fails (500) while `failing` is
     /// true -- lets a test force `push_channel_tier` to report failure on demand.
+    /// #666: mounts the `:host`-only header-form route, matching the real caller.
     async fn spawn_mock_edge_admin_with_failure_toggle(
-    ) -> (String, Arc<Mutex<Vec<(String, Option<String>)>>>, Arc<std::sync::atomic::AtomicBool>) {
+    ) -> (String, Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>, Arc<std::sync::atomic::AtomicBool>) {
         use axum::extract::{OriginalUri, State as AxState};
-        let calls: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls: Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         async fn authorize_host(
-            AxState((calls, failing)): AxState<(Arc<Mutex<Vec<(String, Option<String>)>>>, Arc<std::sync::atomic::AtomicBool>)>,
+            AxState((calls, failing)): AxState<(
+                Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>,
+                Arc<std::sync::atomic::AtomicBool>,
+            )>,
             OriginalUri(uri): OriginalUri,
             headers: axum::http::HeaderMap,
         ) -> StatusCode {
             let token_hdr = headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()).map(str::to_string);
-            calls.lock().unwrap().push((uri.to_string(), token_hdr));
+            let routing_hdr = headers.get("x-ct-routing-token").and_then(|v| v.to_str().ok()).map(str::to_string);
+            calls.lock().unwrap().push((uri.to_string(), token_hdr, routing_hdr));
             if failing.load(std::sync::atomic::Ordering::SeqCst) {
                 StatusCode::INTERNAL_SERVER_ERROR
             } else {
@@ -1083,7 +1097,7 @@ mod tests {
             }
         }
         let app = Router::new()
-            .route("/admin/authorize-host/:token/:host", axum::routing::post(authorize_host))
+            .route("/admin/authorize-host/:host", axum::routing::post(authorize_host))
             .with_state((calls.clone(), failing.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1145,7 +1159,7 @@ mod tests {
         let calls_before = calls.lock().unwrap().len();
         sweep_once(&tunnels, &edge_mesh, &edge_admin).await.unwrap();
         let revert_calls_since: usize =
-            calls.lock().unwrap()[calls_before..].iter().filter(|(uri, _)| !uri.contains("channel_tier=")).count();
+            calls.lock().unwrap()[calls_before..].iter().filter(|(uri, _, _)| !uri.contains("channel_tier=")).count();
         assert_eq!(revert_calls_since, 0, "a confirmed revert is never re-pushed");
     }
 

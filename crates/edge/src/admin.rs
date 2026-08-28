@@ -27,6 +27,15 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
     Router::new()
         .route("/admin/revoke/:token", post(revoke))
         .route("/admin/authorize-host/:token/:host", post(authorize_host))
+        // #666: the routing token is a bearer credential -- carrying it in the URL path
+        // means it lands in every proxy/LB/access log between the control plane and this
+        // edge. This `:host`-only route (token via the `x-ct-routing-token` header
+        // instead) is the fix, mirroring the CP-side #666/#671 fix already applied to
+        // `acme_broker.rs`'s agent-facing routes. The original `:token/:host` route above
+        // stays mounted, unchanged, for back-compat during a mixed CP/edge-version
+        // rollout. Both forward to the same inner logic -- only how the token is
+        // extracted differs.
+        .route("/admin/authorize-host/:host", post(authorize_host_via_header))
         .route("/admin/host-auth-dump", get(host_auth_dump))
         .route("/admin/tunnel-status/:token", get(tunnel_status))
         // Static route, same path prefix as the `:token` one above -- axum/matchit
@@ -43,6 +52,17 @@ fn admin_authed(state: &EdgeState<Connection>, headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(parse_token_hex)
         .is_some_and(|a| state.admin_revoke_ok(&a))
+}
+
+/// #666: header carrying the routing token for the `:host`-only `authorize-host` route
+/// form, so it never appears in a URL path/log. Distinct from `x-ct-admin-token` (the
+/// shared edge-admin secret, already header-borne and unaffected by this fix) and from
+/// `acme_broker.rs`'s `x-ct-agent-token` (same idea, different hop: that one is CP-facing
+/// agent traffic, this one is CP-to-edge admin traffic).
+const ROUTING_TOKEN_HEADER: &str = "x-ct-routing-token";
+
+fn routing_token_from_header(headers: &HeaderMap) -> Option<String> {
+    headers.get(ROUTING_TOKEN_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string).filter(|s| !s.is_empty())
 }
 
 /// Serve the admin API on `listen` until the process ends.
@@ -105,6 +125,28 @@ async fn authorize_host(
     if !admin_authed(&state, &headers) {
         return StatusCode::UNAUTHORIZED;
     }
+    authorize_host_inner(state, token, host, q).await
+}
+
+/// #666: same as [`authorize_host`], routing token via the `x-ct-routing-token` header
+/// instead of the URL path — the CP→edge internal hop's half of the #666 fix (the
+/// agent-facing CP routes were already fixed via `x-ct-agent-token`).
+async fn authorize_host_via_header(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Path(host): Path<String>,
+    Query(q): Query<ChannelTierQuery>,
+) -> StatusCode {
+    if !admin_authed(&state, &headers) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Some(token) = routing_token_from_header(&headers) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    authorize_host_inner(state, token, host, q).await
+}
+
+async fn authorize_host_inner(state: Arc<EdgeState<Connection>>, token: String, host: String, q: ChannelTierQuery) -> StatusCode {
     let host = host.trim();
     match parse_token_hex(&token) {
         Some(t) if !host.is_empty() => {
@@ -384,6 +426,49 @@ mod tests {
         assert_eq!(post(Some(secret_hex)).await.unwrap().status(), StatusCode::OK);
         assert!(state.host_bind_allowed("help.bunsenbrenner.org", &tok_token));
         assert!(!state.host_bind_allowed("evil.example", &tok_token), "only the authorized host");
+    }
+
+    /// #666: the routing token must be acceptable via the `x-ct-routing-token` header on
+    /// the `:host`-only route, not just the URL path -- this is the whole point of the
+    /// fix (URL paths land in access logs, a header carrying the same bearer credential
+    /// does not). Admin auth (`x-ct-admin-token`) is still required exactly as before;
+    /// a missing/empty routing-token header must be refused distinctly (400) from a
+    /// missing/wrong admin token (401).
+    #[tokio::test]
+    async fn authorize_host_accepts_the_routing_token_via_header_not_just_url_path_666() {
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x66u8; 32];
+        state.set_admin_token(secret);
+        state.require_host_auth();
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let tok = "dd".repeat(32);
+        let tok_token = RoutingToken([0xdd; 32]);
+
+        let post = |admin_auth: Option<&str>, routing_token: Option<&str>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::post("/admin/authorize-host/help2.bunsenbrenner.org");
+            if let Some(a) = admin_auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            if let Some(t) = routing_token {
+                req = req.header(ROUTING_TOKEN_HEADER, t);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // No admin auth at all -> 401, regardless of routing-token header.
+        assert_eq!(post(None, Some(&tok)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(!state.host_bind_allowed("help2.bunsenbrenner.org", &tok_token));
+
+        // Correct admin auth, but no routing-token header -> 400, not treated as
+        // "no owner" and not silently ignored.
+        assert_eq!(post(Some(&secret_hex), None).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert!(!state.host_bind_allowed("help2.bunsenbrenner.org", &tok_token));
+
+        // Correct admin auth + routing token via header -> 200, host now bind-allowed --
+        // matches the path-form route's own outcome exactly.
+        assert_eq!(post(Some(&secret_hex), Some(&tok)).await.unwrap().status(), StatusCode::OK);
+        assert!(state.host_bind_allowed("help2.bunsenbrenner.org", &tok_token));
     }
 
     #[tokio::test]
