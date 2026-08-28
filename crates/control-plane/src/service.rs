@@ -3532,7 +3532,7 @@ async fn room_create(
 /// the IdP's job via `email_verified`, checked at claim time), just enough to reject
 /// obvious garbage before it lands in the allow-list: one `@`, a non-empty local part
 /// and a domain part containing at least one `.`, total length bounded.
-fn plausible_email(email: &str) -> bool {
+pub(crate) fn plausible_email(email: &str) -> bool {
     if email.is_empty() || email.len() > 254 {
         return false;
     }
@@ -5974,7 +5974,7 @@ pub fn persistent_control_plane_router(
         // machine-writer-gated `POST` self-register (same `CT_CP_EDGE_ADMIN_TOKEN` as the other
         // agent-facing writers). Mounted unconditionally (no OIDC dependency): autonomous agents
         // self-enroll M2M and any peer searches — neither has a browser-interactive login path.
-        .merge(agent_directory_router(agent_directory, admin_token))
+        .merge(agent_directory_router(agent_directory.clone(), admin_token))
         // #174 B: the workflow-pipeline registry — POST publish (admin-gated) + public GET
         // discovery, so a designer can publish a PipelineSpec agents scan to find workflows to join.
         .merge(pipeline_registry_router(pipeline_registry.clone(), admin_token))
@@ -6062,6 +6062,7 @@ pub fn persistent_control_plane_router(
             .merge(crate::portal_api::channel_claim_router(
                 session_key,
                 channels.clone(),
+                Some(agent_directory.clone()),
                 &portal_base_url,
                 &edge_cert_path,
             ))
