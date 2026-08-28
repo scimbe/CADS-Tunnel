@@ -4209,6 +4209,15 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
   const done = () => {{ const orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(()=>{{ btn.textContent = orig; }}, 1600); }};
   if(navigator.clipboard && navigator.clipboard.writeText){{ navigator.clipboard.writeText(text).then(done).catch(()=>{{}}); }}
  }}
+ // Like copyCode, but for a compact inline identifier (a channel id, a holder pubkey,
+ // an operator pubkey) that isn't wrapped in a full .code-block -- the text to copy is
+ // passed directly rather than read from a sibling <code>, so it works for any small
+ // "row" layout (channel manage page, agent-search results) without the heavier
+ // code-block markup a copy-pasteable command block needs.
+ function copyText(btn, text){{
+  const done = () => {{ const orig = btn.textContent; btn.textContent = 'Copied'; setTimeout(()=>{{ btn.textContent = orig; }}, 1600); }};
+  if(navigator.clipboard && navigator.clipboard.writeText){{ navigator.clipboard.writeText(text).then(done).catch(()=>{{}}); }}
+ }}
  // Generic OS/shell tab toggle (e.g. install page's bash vs PowerShell "Run it"
  // step): switches which sibling .code-block is visible and which .tab-btn is
  // marked active, all within the same .tab-row's parent -- no new JS framework,
@@ -4857,7 +4866,7 @@ fn owned_channels_html(owned: &[ct_common::channel::ChannelId]) -> String {
             .map(|c| {
                 let channel_hex = escape(&hex(&c.0));
                 format!(
-                    r#"<div class="row"><span class="v"><code>{channel_hex}</code></span><span><a class="btn sec" href="/portal/channels/{channel_hex}/manage">Manage</a></span></div>"#
+                    r#"<div class="row"><span class="v"><code>{channel_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{channel_hex}')">Copy</button></span><span><a class="btn sec" href="/portal/channels/{channel_hex}/manage">Manage</a></span></div>"#
                 )
             })
             .collect::<Vec<_>>()
@@ -5072,7 +5081,7 @@ fn manage_channel_html(
                     None => String::new(),
                 };
                 format!(
-                    r#"<div class="row"><span class="v"><code>{holder_hex}</code>{noise_note}</span>
+                    r#"<div class="row"><span class="v"><code>{holder_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{holder_hex}')">Copy</button>{noise_note}</span>
  <span><form class="inline" method="post" action="/portal/channels/{channel_hex}/manage/remove-member/{holder_hex}">
  <button class="danger" type="submit">Remove</button></form></span></div>"#
                 )
@@ -5115,7 +5124,8 @@ async function searchAgents() {{
   const rows = await resp.json();
   if (rows.length === 0) {{ box.textContent = 'no matches'; return; }}
   box.innerHTML = rows.map(r =>
-    '<div class="row"><span class="v">' + r.label + ' <code>' + r.holder_pubkey.slice(0, 16) + '…</code></span>' +
+    '<div class="row"><span class="v">' + r.label + ' <code>' + r.holder_pubkey.slice(0, 16) + '…</code>' +
+    ' <button class="copy-btn" type="button" onclick="copyText(this,\'' + r.holder_pubkey + '\')">Copy</button></span>' +
     '<span><button type="button" onclick="fillHolder(\'' + r.holder_pubkey + '\')">Use this key</button></span></div>'
   ).join('');
 }}
@@ -5128,8 +5138,8 @@ async function searchAgents() {{
         r#"<h1>Manage channel</h1>
 {created_banner}
 {error_banner}
-<div class="row"><span class="k">Channel id</span><span class="v"><code>{channel_hex}</code></span></div>
-<div class="row"><span class="k">Operator pubkey</span><span class="v"><code>{operator_hex}</code></span></div>
+<div class="row"><span class="k">Channel id</span><span class="v"><code>{channel_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{channel_hex}')">Copy</button></span></div>
+<div class="row"><span class="k">Operator pubkey</span><span class="v"><code>{operator_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{operator_hex}')">Copy</button></span></div>
 
 <h2>Members</h2>
 {member_rows}
@@ -9814,6 +9824,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(manage_html.contains("Channel created"));
         assert!(manage_html.contains(&operator_hex), "operator pubkey shown");
+        // A copy-to-clipboard button for both the channel id and the operator pubkey
+        // -- pasting these into `ct-agent channel` env config is the whole point of
+        // showing them, and triple-click-select is unnecessary friction a one-click
+        // copy removes.
+        assert!(manage_html.contains(&format!("copyText(this,'{channel_hex}')")), "channel id has a copy button");
+        assert!(manage_html.contains(&format!("copyText(this,'{operator_hex}')")), "operator pubkey has a copy button");
 
         // ...but a non-owner is refused, not shown a leaked page.
         assert_eq!(get(&app, &format!("/portal/channels/{channel_hex}/manage"), Some("bob")).await.0, StatusCode::FORBIDDEN);
@@ -9888,6 +9904,7 @@ mod tests {
 
         let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
         assert!(manage_html.contains(&holder_hex), "new member listed on the manage page");
+        assert!(manage_html.contains(&format!("copyText(this,'{holder_hex}')")), "member holder pubkey has a copy button");
         assert!(
             manage_html.contains(&format!("/portal/channels/{ch_hex}/manage/remove-member/{holder_hex}")),
             "a remove form is offered for it"
@@ -10036,7 +10053,16 @@ mod tests {
             "https://portal.example",
             "/nonexistent/ct-edge-ca.der",
         );
-        let ch_hex = "cc".repeat(32);
+        let ch = ct_common::channel::ChannelId([0xcc; 32]);
+        channels.register_channel(&ch, &[0xdd; 32], "alice").unwrap();
+        let ch_hex = hex(&ch.0);
+
+        // The operator's stated preference: BOTH a click-to-select picker AND a way to
+        // copy the raw identifier -- the manage page's search block wires up fillHolder
+        // (click to select) and copyText (click to copy) together on every result row.
+        let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
+        assert!(manage_html.contains("onclick=\"fillHolder("), "click-to-select is wired");
+        assert!(manage_html.contains("onclick=\"copyText(this,"), "click-to-copy is wired alongside it");
 
         // Matches by role.
         let (status, body) = get(&app, &format!("/portal/channels/{ch_hex}/manage/search-agents?q=physics"), None).await;
