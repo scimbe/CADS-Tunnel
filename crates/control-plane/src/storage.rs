@@ -4113,6 +4113,39 @@ impl SqliteChannelStore {
             .is_some())
     }
 
+    /// Whether `holder` is a member of any channel visible to `subject` (#698 finding 5):
+    /// a channel `subject` owns, or one they're allow-listed on by `subject_email`. Mirrors
+    /// the exact "account related channels" relationship [`topology_edge_channel`] already
+    /// checks for an edge's attached channel (owned-by OR allow-listed-on) — reused here
+    /// rather than inventing a new notion of "related to the caller".
+    ///
+    /// Purely an informational signal, never an authorization gate: a topology can
+    /// legitimately reference an agent that hasn't joined any channel yet, or one
+    /// belonging to a collaborator's channel this caller can't see. This only tells the
+    /// UI whether `holder` is something the caller can independently corroborate, so an
+    /// obviously-fake or mistyped id doesn't render as silently identical to a real,
+    /// working agent.
+    pub fn holder_visible_to(
+        &self,
+        subject: &str,
+        subject_email: Option<&str>,
+        holder: &[u8; 32],
+    ) -> rusqlite::Result<bool> {
+        for channel in self.channels_owned_by(subject)? {
+            if self.is_member(&channel, holder)? {
+                return Ok(true);
+            }
+        }
+        if let Some(email) = subject_email {
+            for (channel, _) in self.channels_for_email(email)? {
+                if self.is_member(&channel, holder)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Remove `holder` from `channel`. Owner-scoped, idempotent; `false` if not the
     /// owner (or unknown channel).
     pub fn remove_member(
@@ -4713,6 +4746,13 @@ impl SqliteTopologyStore {
         // semantics (authorized_channels/topology_authorizes) are unchanged by it; a
         // super-peer node is still just an agent id in the edge graph. Additive (#44).
         ensure_column(&conn, "topology_agents", "kind", "TEXT NOT NULL DEFAULT 'peer'")?;
+        // #698 finding 6: an optional, owner-set human-readable alias for the agent --
+        // every node otherwise rendered the same truncated `a1a1a1a1…`-style holder-key
+        // prefix, which becomes impossible to tell apart once several agents share a
+        // near-identical real-key prefix. Nullable + additive (#44); agent-scoped (not
+        // topology-scoped) like `kind`, so it survives a revoke/reassign cycle the same
+        // way -- `persist`'s `ON CONFLICT` update deliberately never touches this column.
+        ensure_column(&conn, "topology_agents", "label", "TEXT")?;
         // #107-complex: an edge may explicitly name a REAL, separately-registered channel
         // (from SqliteChannelStore) it carries, instead of only ever relying on the
         // implicit, derived channel_id_for_link(a, b). Nullable + additive (#44): most
@@ -5189,6 +5229,32 @@ impl SqliteTopologyStore {
         Ok(n > 0)
     }
 
+    /// Set (or, with `label: None`/empty-after-trim, clear) `agent`'s human-readable
+    /// **alias** in the topology graph (#698 finding 6). Scoped to the agent's own
+    /// registered owner (`by`) -- the exact same authority [`set_agent_kind`] already
+    /// enforces, never the topology owner's authority: a collaborator may alias their
+    /// OWN agent, not someone else's. `false` (no-op) if `agent` has never been touched
+    /// (no row to update) or `by` isn't its owner. Capped at 40 chars so a node card
+    /// (fixed-width in the SVG layout) never has to truncate an alias mid-render the
+    /// way the old bare-key label did.
+    pub fn set_agent_label(&self, by: &str, agent: &str, label: Option<&str>) -> Result<bool, String> {
+        let trimmed = label.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(l) = trimmed {
+            if l.chars().count() > 40 {
+                return Err("label must be 40 characters or fewer".to_string());
+            }
+        }
+        let n = self
+            .writer
+            .lock_safe()
+            .execute(
+                "UPDATE topology_agents SET label = ?3 WHERE agent = ?1 AND owner = ?2",
+                params![agent, by, trimmed],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
     /// The current assignment for `agent`, if it has ever been touched.
     pub fn assignment(&self, agent: &str) -> rusqlite::Result<Option<crate::topology::AgentAssignment>> {
         Self::load(&self.read(), agent)
@@ -5229,15 +5295,17 @@ impl SqliteTopologyStore {
     }
 
     /// Like [`agents_in`](Self::agents_in), but pairs each agent with its node **kind**
-    /// (`"peer"`/`"super-peer"`, #107-complex) — what the editor's richer node rendering
-    /// needs; `agents_in` stays as-is for the (kind-indifferent) optimizer/authorization
-    /// call sites.
-    pub fn agents_with_kind(&self, topology: &str) -> rusqlite::Result<Vec<(String, String)>> {
+    /// (`"peer"`/`"super-peer"`, #107-complex) and its optional owner-set **label**
+    /// (`#698` finding 6) — what the editor's richer node rendering needs; `agents_in`
+    /// stays as-is for the (kind/label-indifferent) optimizer/authorization call sites.
+    pub fn agents_with_kind(&self, topology: &str) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
         let conn = self.read();
         let mut stmt = conn
-            .prepare("SELECT agent, kind FROM topology_agents WHERE topology = ?1 ORDER BY agent")?;
+            .prepare("SELECT agent, kind, label FROM topology_agents WHERE topology = ?1 ORDER BY agent")?;
         let agents = stmt
-            .query_map(params![topology], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map(params![topology], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(agents)
     }
@@ -6308,6 +6376,42 @@ mod tests {
             ));
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_agent_label_is_owner_scoped_trims_clears_and_caps_length_698() {
+        // #698 finding 6: an owner-set alias, same authority shape as set_agent_kind.
+        let store = SqliteTopologyStore::open_in_memory().unwrap();
+        store.assign("alice", "agent-1", "net-1").unwrap();
+
+        // A stranger (not the agent's owner) cannot label it.
+        assert!(!store.set_agent_label("mallory", "agent-1", Some("mine now")).unwrap());
+        assert_eq!(store.agents_with_kind("net-1").unwrap()[0].2, None, "rejected label leaves it unset");
+
+        // The owner can set a label; leading/trailing whitespace is trimmed.
+        assert!(store.set_agent_label("alice", "agent-1", Some("  kali-desktop-2  ")).unwrap());
+        assert_eq!(store.agents_with_kind("net-1").unwrap()[0].2.as_deref(), Some("kali-desktop-2"));
+
+        // An all-whitespace (or empty) label clears it, same as `None`.
+        assert!(store.set_agent_label("alice", "agent-1", Some("   ")).unwrap());
+        assert_eq!(store.agents_with_kind("net-1").unwrap()[0].2, None, "whitespace-only label clears");
+        assert!(store.set_agent_label("alice", "agent-1", Some("re-set")).unwrap());
+        assert!(store.set_agent_label("alice", "agent-1", None).unwrap());
+        assert_eq!(store.agents_with_kind("net-1").unwrap()[0].2, None, "None clears an existing label");
+
+        // Over the length cap is rejected outright (no silent truncation).
+        let too_long = "x".repeat(41);
+        assert!(store.set_agent_label("alice", "agent-1", Some(&too_long)).is_err());
+        assert!(store.set_agent_label("alice", "agent-1", Some(&"x".repeat(40))).unwrap(), "exactly 40 is fine");
+
+        // An agent that has never been touched has no row to update: no-op, not an error.
+        assert!(!store.set_agent_label("alice", "never-touched", Some("x")).unwrap());
+
+        // A label survives a revoke/reassign cycle -- agent-scoped like `kind`, not
+        // topology-scoped (persist()'s ON CONFLICT never touches this column).
+        store.revoke("alice", "agent-1").unwrap();
+        store.assign("alice", "agent-1", "net-2").unwrap();
+        assert_eq!(store.agents_with_kind("net-2").unwrap()[0].2.as_deref(), Some(&"x".repeat(40)[..]));
     }
 
     #[test]
@@ -8339,6 +8443,45 @@ mod tests {
         // Owner may re-key their own channel (agent rotates its operator key).
         assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
         assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+    }
+
+    #[test]
+    fn holder_visible_to_checks_owned_and_allowlisted_channels_not_just_any_membership_698() {
+        // #698 finding 5: "flag an id that isn't a channel member visible to the caller" --
+        // reuses the exact owned-OR-allowlisted "account related" relationship
+        // topology_edge_channel already established, applied to a holder key instead of a
+        // channel id. A holder being a member of SOME channel isn't enough on its own if
+        // the caller has no relationship to that channel at all.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let owned = ChannelId([0xa1; 32]);
+        let allowlisted = ChannelId([0xb2; 32]);
+        let unrelated = ChannelId([0xc3; 32]);
+        assert!(s.register_channel(&owned, &[0x11u8; 32], "alice").unwrap());
+        assert!(s.register_channel(&allowlisted, &[0x22u8; 32], "carol").unwrap());
+        assert!(s.register_channel(&unrelated, &[0x33u8; 32], "carol").unwrap());
+        assert!(s.allowlist_add(&allowlisted, "carol", "alice@example.test", 1_000).unwrap());
+
+        let on_owned = [0xd1u8; 32];
+        let on_allowlisted = [0xd2u8; 32];
+        let on_unrelated = [0xd3u8; 32];
+        let nowhere = [0xd4u8; 32];
+        assert!(s.add_member(&owned, "alice", &on_owned, &[0u8; 32], &[0u8; 64]).unwrap());
+        assert!(s.add_member(&allowlisted, "carol", &on_allowlisted, &[0u8; 32], &[0u8; 64]).unwrap());
+        assert!(s.add_member(&unrelated, "carol", &on_unrelated, &[0u8; 32], &[0u8; 64]).unwrap());
+
+        // A member of a channel alice owns: visible.
+        assert!(s.holder_visible_to("alice", Some("alice@example.test"), &on_owned).unwrap());
+        // A member of a channel alice is only allow-listed (not owner) on: visible too.
+        assert!(s.holder_visible_to("alice", Some("alice@example.test"), &on_allowlisted).unwrap());
+        // A member of a channel alice has NO relationship to at all: not visible, even
+        // though it's a perfectly real member of a perfectly real channel.
+        assert!(!s.holder_visible_to("alice", Some("alice@example.test"), &on_unrelated).unwrap());
+        // A holder that isn't a member of anything: not visible.
+        assert!(!s.holder_visible_to("alice", Some("alice@example.test"), &nowhere).unwrap());
+        // No verified e-mail (e.g. a bearer-token caller): only the owned-channel check
+        // runs, allow-listed relationships are unreachable without it.
+        assert!(s.holder_visible_to("alice", None, &on_owned).unwrap());
+        assert!(!s.holder_visible_to("alice", None, &on_allowlisted).unwrap());
     }
 
     #[test]

@@ -1098,6 +1098,7 @@ pub struct AuthedTopologyState {
 /// * `GET  /me/topologies` → the caller's topologies
 /// * `GET  /me/topologies/:id` → a composite view `{id, net_uuid, agents, edges}`
 /// * `POST /me/topologies/:id/agents` `{agent}` → assign (exclusive; `409` if already in a topology)
+/// * `PUT  /me/topologies/:id/agents/:agent/label` `{label}` → set/clear an alias (#698 finding 6)
 /// * `POST /me/topologies/:id/edges` `{a, b}` → wire an undirected edge
 pub fn authed_topology_router(
     topologies: Arc<SqliteTopologyStore>,
@@ -1114,6 +1115,7 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/suggest", post(topology_suggest))
         .route("/me/topologies/:id/editor", get(topology_editor))
         .route("/me/topologies/:id/agents", post(topology_assign))
+        .route("/me/topologies/:id/agents/:agent/label", axum::routing::put(topology_set_agent_label))
         .route("/me/topologies/:id/edges", post(topology_add_edge).delete(topology_remove_edge))
         .route("/me/topologies/:id/edges/channel", axum::routing::put(topology_edge_channel))
         .route("/me/topologies/:id/share", post(topology_share_add))
@@ -1712,12 +1714,29 @@ struct EdgeView {
     channel: Option<String>,
 }
 
+/// One agent node in a topology's composite view (#107-complex `kind`, #698 `label`/
+/// `verified`).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentView {
+    id: String,
+    /// `"peer"` or `"super-peer"` (#107-complex).
+    kind: String,
+    /// Owner-set human-readable alias (#698 finding 6), if any — the editor renders this
+    /// instead of the truncated holder-key prefix when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// Whether `id` is a channel member visible to the CALLER (#698 finding 5) — a
+    /// channel they own, or are allow-listed on. Purely a UI signal (see
+    /// [`storage::SqliteChannelStore::holder_visible_to`]'s doc for why this never gates
+    /// composition); a non-hex `id` is always unverified.
+    verified: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 struct TopologyView {
     id: String,
     net_uuid: String,
-    /// `(agent id, kind)` — kind is `"peer"` or `"super-peer"` (#107-complex).
-    agents: Vec<(String, String)>,
+    agents: Vec<AgentView>,
     edges: Vec<EdgeView>,
     /// The overlay mode (#107-ui-mode): `baseline` (direct) vs `smart-route`/`shortcut`
     /// (complex-adaptive). Legacy/absent rows read back as `baseline`.
@@ -1725,6 +1744,17 @@ struct TopologyView {
     /// Whether the CALLER owns this topology (vs. viewing it as a share, #107-complex) —
     /// lets a client distinguish "my topology" from "shared with me" without a second call.
     owner: String,
+}
+
+/// Whether `agent` is a channel member visible to `subject` (#698 finding 5) — see
+/// [`storage::SqliteChannelStore::holder_visible_to`]. `agent` must first decode as a
+/// 64-hex holder key at all; a plain string id (e.g. a test fixture like `"agent-1"`, or
+/// a typo) is never verifiable and reports `false` without a DB round-trip.
+fn agent_verified(channels: &SqliteChannelStore, subject: &str, email: Option<&str>, agent: &str) -> bool {
+    match hex_decode_32(agent) {
+        Some(holder) => channels.holder_visible_to(subject, email, &holder).unwrap_or(false),
+        None => false,
+    }
 }
 
 /// Resolve `id` as a topology owned by `owner`, or a `404` (owner isolation — a topology
@@ -1782,7 +1812,13 @@ async fn topology_view(
     let agents = state
         .topologies
         .agents_with_kind(&t.id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|(id, kind, label)| {
+            let verified = agent_verified(&state.channels, &subject, email.as_deref(), &id);
+            AgentView { id, kind, label, verified }
+        })
+        .collect();
     let edges = state
         .topologies
         .edges_with_channel(&t.id)
@@ -1839,10 +1875,16 @@ async fn topology_editor(
     let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
     let t = viewable_topology(&state, &subject, email.as_deref(), &id)?;
     let is_owner = t.owner == subject;
-    let agents = state
+    let agents: Vec<(String, String, Option<String>, bool)> = state
         .topologies
         .agents_with_kind(&t.id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|(id, kind, label)| {
+            let verified = agent_verified(&state.channels, &subject, email.as_deref(), &id);
+            (id, kind, label, verified)
+        })
+        .collect();
     let edges = state
         .topologies
         .edges_with_channel(&t.id)
@@ -1980,6 +2022,22 @@ struct AssignReq {
     /// enforces (never the topology's own owner/collaborator authority).
     #[serde(default)]
     kind: Option<String>,
+    /// #698 finding 6: an optional human-readable alias, applied via `set_agent_label`
+    /// under the same agent-owner authority as `kind`. Absent/empty leaves any
+    /// previously-set label untouched (this is "assign", not "relabel") -- use
+    /// `PUT …/agents/:agent/label` to change or clear an existing alias later.
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// The response to a successful [`topology_assign`] (#698 finding 5): beyond the `200`
+/// status the caller already checks, `verified` tells the UI whether the just-added
+/// `agent` is a channel member it can independently corroborate, so the editor can
+/// surface a visible warning immediately on add rather than only on the next full
+/// graph render.
+#[derive(Serialize, Deserialize)]
+struct AssignResp {
+    verified: bool,
 }
 
 async fn topology_assign(
@@ -1987,7 +2045,7 @@ async fn topology_assign(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(req): Json<AssignReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<Json<AssignResp>, (StatusCode, String)> {
     let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
     // #107-complex: the caller must own the topology OR be a collaborator it's shared with
     // (view access is the prerequisite for wiring in an agent at all); viewable_topology
@@ -2009,7 +2067,48 @@ async fn topology_assign(
             .set_agent_kind(&subject, &req.agent, kind)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
-    Ok(StatusCode::OK)
+    if let Some(label) = req.label.as_deref().filter(|l| !l.trim().is_empty()) {
+        state
+            .topologies
+            .set_agent_label(&subject, &req.agent, Some(label))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+    let verified = agent_verified(&state.channels, &subject, email.as_deref(), &req.agent);
+    Ok(Json(AssignResp { verified }))
+}
+
+#[derive(Deserialize)]
+struct AgentLabelReq {
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `PUT /me/topologies/:id/agents/:agent/label {label}` (#698 finding 6): set (or, with
+/// `label: null`/absent/empty, clear) `agent`'s human-readable alias, rendered instead of
+/// the truncated holder-key prefix that made near-identical real keys indistinguishable in
+/// the graph. Scoped to the agent's own registered owner (`by` inside `set_agent_label`) --
+/// the same authority [`topology_assign`]'s `kind`/`label` fields already use, never the
+/// topology owner's authority: a collaborator may relabel their OWN agent, not someone
+/// else's. `:id` only gates that the caller can at least view this topology (the same
+/// `viewable_topology` check every other agent-scoped write in this router makes); the
+/// actual write authority is the agent-owner check inside the store method.
+async fn topology_set_agent_label(
+    State(state): State<AuthedTopologyState>,
+    headers: HeaderMap,
+    Path((id, agent)): Path<(String, String)>,
+    Json(req): Json<AgentLabelReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let (subject, email) = topology_actor_of(&state.session_key, &state.verifier, &headers)?;
+    viewable_topology(&state, &subject, email.as_deref(), &id)?;
+    let ok = state
+        .topologies
+        .set_agent_label(&subject, &agent, req.label.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if ok {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "agent not found, or caller is not its owner".to_string()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2335,8 +2434,8 @@ fn render_topology_status(
 /// attributes, where `var()` is unsupported), so every node/edge colour flows through a
 /// class.
 const EDITOR_CSS: &str = r#"
-:root{--bg:#f6f8fa;--panel:#fff;--ink:#1f2328;--muted:#59636e;--line:#d1d9e0;--accent:#2da44e;--accent2:#0969da;--edge:#8c959f;--node:#fff;--nodeln:#d1d9e0}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--panel:#161b22;--ink:#e6edf3;--muted:#8b949e;--line:#30363d;--accent:#3fb950;--accent2:#58a6ff;--edge:#484f58;--node:#1c2128;--nodeln:#30363d}}
+:root{--bg:#f6f8fa;--panel:#fff;--ink:#1f2328;--muted:#59636e;--line:#d1d9e0;--accent:#2da44e;--accent2:#0969da;--warn:#9a6700;--edge:#8c959f;--node:#fff;--nodeln:#d1d9e0}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--panel:#161b22;--ink:#e6edf3;--muted:#8b949e;--line:#30363d;--accent:#3fb950;--accent2:#58a6ff;--warn:#d29922;--edge:#484f58;--node:#1c2128;--nodeln:#30363d}}
 *{box-sizing:border-box}html,body{height:100%}
 body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);display:flex;flex-direction:column}
 header.bar{display:flex;align-items:center;flex-wrap:wrap;gap:.9rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
@@ -2368,6 +2467,9 @@ svg[data-linkmode="1"] .edge{cursor:pointer;stroke-width:5px}
 .node.superpeer .card{stroke:var(--accent2);stroke-width:2px}
 .node.superpeer .accent{fill:var(--accent2)}
 .badge{fill:var(--accent2)}.badge-t{fill:#fff;font:700 9px ui-monospace,monospace;pointer-events:none}
+.node.unverified .card{stroke:var(--warn);stroke-width:1.5px;stroke-dasharray:4 2}
+.warnbadge{fill:var(--warn)}.warnbadge-t{fill:#fff;font:700 10px ui-monospace,monospace;text-anchor:middle;pointer-events:none}
+.node .sublabel{fill:var(--muted);font:500 9px ui-monospace,SFMono-Regular,Menlo,monospace;pointer-events:none}
 .live-dot circle{fill:var(--accent);opacity:.94}
 .live-dot text{fill:#fff;font:700 9px ui-monospace,monospace;text-anchor:middle;dominant-baseline:central;pointer-events:none}
 label.sp{color:var(--muted);font-size:.82rem;display:flex;align-items:center;gap:.3rem;margin-left:0}
@@ -2554,7 +2656,7 @@ const EDITOR_JS: &str = r#"
  // (the server lays out the new node with correct geometry). Exclusive-membership 409 is surfaced.
  var addBtn=document.getElementById('addagent'),agIn=document.getElementById('agent');
  var kindIn=document.getElementById('agentkind');
- if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}var kind=(kindIn&&kindIn.checked)?'super-peer':'peer';fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a,kind:kind})}).then(function(r){if(r.ok){say('added '+shortId(a));location.reload();}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
+ if(addBtn&&agIn){addBtn.addEventListener('click',function(){var a=agIn.value.trim();if(!a){say('enter an agent id');return;}var kind=(kindIn&&kindIn.checked)?'super-peer':'peer';fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agent:a,kind:kind})}).then(function(r){if(r.ok){return r.json().then(function(p){var warn=p&&p.verified===false?' -- not a known channel member on your account, check the id':'';say('added '+shortId(a)+warn);location.reload();});}else if(r.status===409){say('that agent is already in a topology');}else{say('add failed ('+r.status+')');}}).catch(function(){say('add failed');});});}
  // #107-complex: owner-only share management.
  var shareBtn=document.getElementById('shareBtn'),shareEmail=document.getElementById('shareEmail'),sharesEl=document.getElementById('shares');
  function addShareRow(email){if(!sharesEl)return;var s=document.createElement('span');s.className='sharee';s.textContent=email+' ';var btn=document.createElement('button');btn.className='unshare';btn.setAttribute('data-email',email);btn.setAttribute('aria-label','stop sharing with '+email);btn.textContent='×';btn.addEventListener('click',function(){unshare(email,s);});s.appendChild(btn);sharesEl.appendChild(s);}
@@ -2688,15 +2790,35 @@ const EDITOR_JS: &str = r#"
 
  function openNodeDrawer(g){
   var id=g.getAttribute('data-node'),kind=g.getAttribute('data-kind')||'peer',isSp=kind==='super-peer';
+  var label=g.getAttribute('data-label')||'',verified=g.getAttribute('data-verified')!=='false';
   var host=edgeHost(),port=brokerPort();
   var html='<label>Agent id (holder key)</label><input readonly value="'+esc2(id)+'">';
+  // #698 finding 5: the same unverified note the node's own <title> tooltip carries,
+  // surfaced here too since not every input device shows an SVG title on hover.
+  if(!verified){
+   html+='<p class="lede" style="margin-top:.6rem;color:var(--warn)">Not a member of any channel visible to your account -- unverified: may be offline, mistyped, or unrelated to your account.</p>';
+  }
+  // #698 finding 6: an editable alias, same row2 input+button shape as the edge
+  // drawer's channel field below.
+  html+='<label style="margin-top:.9rem">Display alias (optional)</label>';
+  html+='<div class="row2"><input id="labelIn" placeholder="a short, memorable name" maxlength="40" value="'+esc2(label)+'"><button type="button" id="labelSave">Save</button></div>';
   html+='<p class="lede" style="margin-top:.8rem">Kind: <strong>'+esc2(kind)+'</strong>'+(isSp?' -- routes other LAN members through it.':' -- a regular channel member.')+'</p>';
   if(isSp){
    html+=cmdBlock('Run this super-peer','CT_CHANNEL_SUPER_PEER_LISTEN=0.0.0.0:9443 \\\nCT_CHANNEL_SUPER_PEER_UPSTREAM='+host+':'+port+' \\\nct-agent channel super-peer');
   }
   html+=cmdBlock('Re-derive this agent’s identity (if needed)','ct-agent channel init');
   html+='<p class="drawer-foot">More: docs.bunsenbrenner.org/how-to/run-a-super-peer</p>';
-  openDrawer('Agent '+shortId(id),html);
+  openDrawer('Agent '+(label?esc2(label):shortId(id)),html);
+  var labelIn=document.getElementById('labelIn'),labelSave=document.getElementById('labelSave');
+  if(labelSave)labelSave.addEventListener('click',function(){
+   var next=(labelIn.value||'').trim();
+   fetch('/me/topologies/'+encodeURIComponent(tid)+'/agents/'+encodeURIComponent(id)+'/label',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({label:next?next:null})})
+    // Reload rather than a partial DOM patch: an alias appearing/disappearing shifts
+    // the node's own label/sub-label layout (see render_topology_editor's label_y),
+    // which the server is the single source of truth for.
+    .then(function(r){if(r.ok){say(next?'alias set':'alias cleared');location.reload();}else{say('alias update failed ('+r.status+')');}})
+    .catch(function(){say('alias update failed');});
+  });
  }
 
  function openEdgeDrawer(ed){
@@ -2744,7 +2866,8 @@ const EDITOR_JS: &str = r#"
 /// pre-selected in the toggle.
 fn render_topology_editor(
     t: &crate::topology::Topology,
-    agents: &[(String, String)],
+    // `(agent id, kind, label, verified)` — see `AgentView`'s fields.
+    agents: &[(String, String, Option<String>, bool)],
     edges: &[(String, String, Option<[u8; 32]>)],
     mode: &str,
     is_owner: bool,
@@ -2765,7 +2888,7 @@ fn render_topology_editor(
     let pos: std::collections::HashMap<&str, (f64, f64)> = agents
         .iter()
         .enumerate()
-        .map(|(i, (a, _))| {
+        .map(|(i, (a, _, _, _))| {
             if n == 1 {
                 (a.as_str(), (CX, CY))
             } else {
@@ -2809,31 +2932,70 @@ fn render_topology_editor(
         // #107-complex: a super-peer node gets a distinct class (`node superpeer`, styled in
         // EDITOR_CSS) and a small "SP" badge instead of the plain accent bar -- a peer routing
         // through it is a visually distinguishable graph shape, not just a same-looking agent.
+        //
+        // #698 finding 6: an owner-set alias (if any) is the primary label, with the
+        // truncated raw key demoted to a small sub-label underneath -- so real, near-
+        // identical holder-key prefixes stop being the ONLY thing distinguishing nodes,
+        // without hiding the underlying id a user may still need (e.g. to match a CLI
+        // command's output). No alias set: same truncated-key-only rendering as before.
+        //
+        // #698 finding 5: an agent id that isn't a channel member visible to the CALLER
+        // (see `agent_verified`) gets a dashed amber outline + a "?" badge (top-left, the
+        // SP badge's mirror position) plus an explicit note in its `<title>` tooltip --
+        // flagged, not blocked: a topology can legitimately reference an agent that
+        // hasn't joined a channel yet.
         let node_svg: String = agents
             .iter()
-            .map(|(a, kind)| {
+            .map(|(a, kind, label, verified)| {
                 let (x, y) = pos[a.as_str()];
                 // Truncate long ids for the card face (raw, then escape).
                 let raw: String = a.chars().take(16).collect();
-                let label = if a.chars().count() > 16 { format!("{raw}…") } else { raw };
+                let key_label = if a.chars().count() > 16 { format!("{raw}…") } else { raw };
+                let (primary_label, sublabel) = match label {
+                    Some(l) => (l.clone(), format!("<text class=\"sublabel\" x=\"0\" y=\"16\" text-anchor=\"middle\">{}</text>", esc(&key_label))),
+                    None => (key_label, String::new()),
+                };
                 let is_sp = kind == "super-peer";
-                let cls = if is_sp { "node superpeer" } else { "node" };
-                let badge = if is_sp {
+                let mut cls = if is_sp { "node superpeer".to_string() } else { "node".to_string() };
+                if !*verified {
+                    cls.push_str(" unverified");
+                }
+                let sp_badge = if is_sp {
                     "<rect class=\"badge\" x=\"32\" y=\"-34\" width=\"28\" height=\"16\" rx=\"8\" ry=\"8\"/>\
                      <text class=\"badge-t\" x=\"46\" y=\"-22\" text-anchor=\"middle\">SP</text>"
                 } else {
                     ""
                 };
+                let warn_badge = if !*verified {
+                    "<rect class=\"warnbadge\" x=\"-60\" y=\"-34\" width=\"20\" height=\"16\" rx=\"8\" ry=\"8\"/>\
+                     <text class=\"warnbadge-t\" x=\"-50\" y=\"-22\">?</text>"
+                } else {
+                    ""
+                };
+                let title = if *verified {
+                    String::new()
+                } else {
+                    "<title>Not a member of any channel visible to your account -- unverified, may be offline, mistyped, or unrelated to you.</title>".to_string()
+                };
+                let aria = if *verified {
+                    format!("agent {a}", a = esc(a))
+                } else {
+                    format!("agent {a} (unverified -- not a known channel member)", a = esc(a))
+                };
                 format!(
-                    "<g class=\"{cls}\" data-node=\"{id}\" data-kind=\"{kind}\" data-cx=\"{x:.1}\" data-cy=\"{y:.1}\" \
-                     transform=\"translate({x:.1},{y:.1})\" tabindex=\"0\" role=\"listitem\" aria-label=\"agent {id}\">\
+                    "<g class=\"{cls}\" data-node=\"{id}\" data-kind=\"{kind}\" data-label=\"{label_attr}\" \
+                     data-verified=\"{verified}\" data-cx=\"{x:.1}\" data-cy=\"{y:.1}\" \
+                     transform=\"translate({x:.1},{y:.1})\" tabindex=\"0\" role=\"listitem\" aria-label=\"{aria}\">\
+                     {title}\
                      <rect class=\"card\" x=\"-60\" y=\"-22\" width=\"120\" height=\"44\" rx=\"12\" ry=\"12\" filter=\"url(#nsh)\"/>\
                      <rect class=\"accent\" x=\"-60\" y=\"-22\" width=\"120\" height=\"4\" rx=\"2\"/>\
                      <circle class=\"handle\" cx=\"60\" cy=\"0\" r=\"4\"/>\
-                     <text class=\"label\" x=\"0\" y=\"5\" text-anchor=\"middle\">{label}</text>{badge}</g>",
+                     <text class=\"label\" x=\"0\" y=\"{label_y}\" text-anchor=\"middle\">{primary_label}</text>{sublabel}{sp_badge}{warn_badge}</g>",
                     id = esc(a),
                     kind = esc(kind),
-                    label = esc(&label),
+                    label_attr = esc(label.as_deref().unwrap_or("")),
+                    label_y = if sublabel.is_empty() { 5 } else { -1 },
+                    primary_label = esc(&primary_label),
                 )
             })
             .collect();
@@ -8071,7 +8233,13 @@ mod tests {
         assert_eq!(view.status(), StatusCode::OK);
         let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
         let v: TopologyView = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v.agents, vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())]);
+        assert_eq!(
+            v.agents,
+            vec![
+                AgentView { id: "agent-1".to_string(), kind: "peer".to_string(), label: None, verified: false },
+                AgentView { id: "agent-2".to_string(), kind: "peer".to_string(), label: None, verified: false },
+            ]
+        );
         assert_eq!(v.edges.len(), 1);
         assert_eq!(v.edges[0].a, "agent-1");
         assert_eq!(v.edges[0].b, "agent-2");
@@ -8441,8 +8609,14 @@ mod tests {
         let view = send("GET", format!("/me/topologies/{tid}"), &alice_cookie, String::new()).await.unwrap();
         let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
         let v: TopologyView = serde_json::from_slice(&body).unwrap();
-        assert!(v.agents.contains(&("bob-relay".to_string(), "super-peer".to_string())), "bob-relay recorded as a super-peer");
-        assert!(v.agents.contains(&("alice-peer".to_string(), "peer".to_string())), "alice-peer stays a plain peer");
+        assert!(
+            v.agents.contains(&AgentView { id: "bob-relay".to_string(), kind: "super-peer".to_string(), label: None, verified: false }),
+            "bob-relay recorded as a super-peer"
+        );
+        assert!(
+            v.agents.contains(&AgentView { id: "alice-peer".to_string(), kind: "peer".to_string(), label: None, verified: false }),
+            "alice-peer stays a plain peer"
+        );
 
         // Bob still can't govern: no operator-bind, can't delete the share list.
         assert_eq!(
@@ -8584,6 +8758,185 @@ mod tests {
         assert_eq!(v.edges[0].channel, None, "cleared");
     }
 
+    #[tokio::test]
+    async fn topology_agent_verification_flags_and_aliases_are_owner_scoped_698() {
+        // #698 findings 5 + 6: an agent id that isn't a channel member visible to the
+        // caller is flagged (never hard-blocked -- assign still succeeds), and an
+        // owner-set alias is stored, returned, and rendered in place of the truncated
+        // key. Mirrors the setup shape of the sibling `topology_edge_channel_*_107_complex`
+        // test above (owned-vs-allowlisted-vs-unrelated channel relationships).
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ct_common::channel::ChannelId;
+        use tower::ServiceExt;
+
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+
+        // A real channel alice owns, with one real member.
+        let owned = ChannelId([0xa1u8; 32]);
+        assert!(channels.register_channel(&owned, &[0x11u8; 32], "alice").unwrap());
+        let real_holder = [0xd1u8; 32];
+        assert!(channels.add_member(&owned, "alice", &real_holder, &[0u8; 32], &[0u8; 64]).unwrap());
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+
+        let app = authed_topology_router(
+            topologies,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            channels,
+        );
+        let alice_cookie = format!(
+            "ct_portal_session={}",
+            crate::portal::sign_session_with_email_for_test(session_key, "alice", "alice@example.test")
+        );
+        let bob_cookie = format!(
+            "ct_portal_session={}",
+            crate::portal::sign_session_with_email_for_test(session_key, "bob", "bob@example.test")
+        );
+        let send = |method: &str, path: String, cookie: &str, body: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&path)
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        let created = send("POST", "/me/topologies".into(), &alice_cookie, String::new()).await.unwrap();
+        let body = to_bytes(created.into_body(), 1 << 16).await.unwrap();
+        let tid = serde_json::from_slice::<TopologyCreatedResp>(&body).unwrap().id;
+
+        // A fake/mistyped id (not 64-hex at all): assign still succeeds (never blocked),
+        // but the response flags it as unverified.
+        let fake = send("POST", format!("/me/topologies/{tid}/agents"), &alice_cookie, r#"{"agent":"a1a1a1a1"}"#.into())
+            .await.unwrap();
+        assert_eq!(fake.status(), StatusCode::OK, "an unverifiable id is flagged, not rejected");
+        let fake_body = to_bytes(fake.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AssignResp>(&fake_body).unwrap().verified,
+            false,
+            "a non-hex id can never be a real holder key"
+        );
+
+        // A well-formed 64-hex id that just isn't a member of any channel alice can see:
+        // also flagged, still not blocked.
+        let stranger = [0xeeu8; 32];
+        let unknown = send(
+            "POST",
+            format!("/me/topologies/{tid}/agents"),
+            &alice_cookie,
+            format!(r#"{{"agent":"{}"}}"#, hex(&stranger)),
+        )
+        .await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::OK);
+        let unknown_body = to_bytes(unknown.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<AssignResp>(&unknown_body).unwrap().verified, false);
+
+        // A real channel member alice owns: verified true, and the assign-time `label`
+        // field is applied in the same call.
+        let real = send(
+            "POST",
+            format!("/me/topologies/{tid}/agents"),
+            &alice_cookie,
+            format!(r#"{{"agent":"{}","label":"  kali-desktop  "}}"#, hex(&real_holder)),
+        )
+        .await.unwrap();
+        assert_eq!(real.status(), StatusCode::OK);
+        let real_body = to_bytes(real.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AssignResp>(&real_body).unwrap().verified,
+            true,
+            "a real member of a channel alice owns is verified"
+        );
+
+        // The composite view reflects all three: verified flags + the applied label
+        // (trimmed).
+        let view = send("GET", format!("/me/topologies/{tid}"), &alice_cookie, String::new()).await.unwrap();
+        let body = to_bytes(view.into_body(), 1 << 16).await.unwrap();
+        let v: TopologyView = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v.agents.contains(&AgentView { id: "a1a1a1a1".to_string(), kind: "peer".to_string(), label: None, verified: false })
+        );
+        assert!(v.agents.contains(&AgentView {
+            id: hex(&stranger),
+            kind: "peer".to_string(),
+            label: None,
+            verified: false
+        }));
+        assert!(v.agents.contains(&AgentView {
+            id: hex(&real_holder),
+            kind: "peer".to_string(),
+            label: Some("kali-desktop".to_string()),
+            verified: true
+        }));
+
+        // Relabeling via the dedicated endpoint: the agent's owner (alice) may change it.
+        assert_eq!(
+            send(
+                "PUT",
+                format!("/me/topologies/{tid}/agents/{}/label", hex(&real_holder)),
+                &alice_cookie,
+                r#"{"label":"renamed"}"#.into(),
+            )
+            .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let view2 = send("GET", format!("/me/topologies/{tid}"), &alice_cookie, String::new()).await.unwrap();
+        let body2 = to_bytes(view2.into_body(), 1 << 16).await.unwrap();
+        let v2: TopologyView = serde_json::from_slice(&body2).unwrap();
+        assert!(v2.agents.iter().any(|a| a.id == hex(&real_holder) && a.label.as_deref() == Some("renamed")));
+
+        // Bob isn't the agent's owner (alice's first-touch `assign` registered her as
+        // owner) -- even though the topology was never shared with him, so
+        // `viewable_topology` itself already 404s him; either way he cannot relabel it.
+        assert_eq!(
+            send(
+                "PUT",
+                format!("/me/topologies/{tid}/agents/{}/label", hex(&real_holder)),
+                &bob_cookie,
+                r#"{"label":"stolen"}"#.into(),
+            )
+            .await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Clearing (`label: null`) removes it.
+        assert_eq!(
+            send(
+                "PUT",
+                format!("/me/topologies/{tid}/agents/{}/label", hex(&real_holder)),
+                &alice_cookie,
+                r#"{"label":null}"#.into(),
+            )
+            .await.unwrap().status(),
+            StatusCode::OK
+        );
+        let view3 = send("GET", format!("/me/topologies/{tid}"), &alice_cookie, String::new()).await.unwrap();
+        let body3 = to_bytes(view3.into_body(), 1 << 16).await.unwrap();
+        let v3: TopologyView = serde_json::from_slice(&body3).unwrap();
+        assert!(v3.agents.iter().any(|a| a.id == hex(&real_holder) && a.label.is_none()), "cleared");
+
+        // The rendered editor page reflects both: an "unverified" node modifier class +
+        // warning badge for the flagged agents, and the alias (before it was cleared
+        // above) rendered as the node's primary label with the raw key demoted to a
+        // sub-label.
+        let editor = send("GET", format!("/me/topologies/{tid}/editor"), &alice_cookie, String::new()).await.unwrap();
+        let editor_body = to_bytes(editor.into_body(), 1 << 16).await.unwrap();
+        let html = String::from_utf8(editor_body.to_vec()).unwrap();
+        assert!(html.contains("class=\"node unverified\""), "unverified nodes carry the modifier class");
+        assert!(html.contains("class=\"warnbadge\""), "unverified nodes render the warning badge");
+        assert!(
+            html.contains(&format!("<g class=\"node\" data-node=\"{}\"", hex(&real_holder))),
+            "the verified real member's own class stays plain -- not flagged unverified"
+        );
+    }
+
     #[test]
     fn topology_svg_diagram_has_a_node_per_agent_and_a_line_per_edge() {
         // #107 "live diagram": the status page renders an inline SVG node-graph.
@@ -8617,9 +8970,9 @@ mod tests {
             net_uuid: "uuid-xyz".into(),
         };
         let agents = vec![
-            ("agent-1".to_string(), "peer".to_string()),
-            ("agent-2".to_string(), "peer".to_string()),
-            ("agent-3".to_string(), "peer".to_string()),
+            ("agent-1".to_string(), "peer".to_string(), None, false),
+            ("agent-2".to_string(), "peer".to_string(), None, false),
+            ("agent-3".to_string(), "peer".to_string(), None, false),
         ];
         // A complex (non-direct) wiring: a triangle among three agents.
         let edges = vec![
@@ -8637,7 +8990,10 @@ mod tests {
             assert!(!html.contains(external), "no external asset: {external:?}");
         }
         // The full (complex) graph is preserved: one draggable node per agent, one edge per link.
-        assert_eq!(html.matches("class=\"node\"").count(), 3, "one node per agent");
+        // #698 finding 5: a non-hex fixture id like "agent-1" is never verified, so every
+        // node here also carries the "unverified" modifier class -- count by `data-node=`
+        // (unambiguous, one per agent) rather than an exact `class="node"` match.
+        assert_eq!(html.matches("data-node=\"").count(), 3, "one node per agent");
         assert_eq!(html.matches("class=\"edge\"").count(), 3, "one bezier edge per link");
         assert!(html.contains("data-node=\"agent-2\"") && html.contains("data-cx="), "draggable node geometry");
         assert!(html.contains("net:uuid-xyz"), "shows the net-uuid");
@@ -8650,7 +9006,7 @@ mod tests {
         assert!(html.contains("/mode") && html.contains("/suggest"), "wired to the owner endpoints");
 
         // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
-        let evil = vec![("<script>alert(1)</script>".to_string(), "peer".to_string())];
+        let evil = vec![("<script>alert(1)</script>".to_string(), "peer".to_string(), None, false)];
         let evil_html = render_topology_editor(&t, &evil, &[], "baseline", true, &[], false);
         assert!(!evil_html.contains("<script>alert(1)"), "hostile agent id is escaped");
         assert!(evil_html.contains("&lt;script&gt;alert(1)"), "escaped form is present");
@@ -8661,20 +9017,51 @@ mod tests {
     }
 
     #[test]
+    fn topology_editor_renders_aliases_as_the_primary_label_and_flags_unverified_nodes_698() {
+        // #698 findings 5 + 6, rendering-only (no HTTP round-trip -- the verified check
+        // itself is covered end-to-end by the sibling
+        // `topology_agent_verification_flags_and_aliases_are_owner_scoped_698` test).
+        let t = crate::topology::Topology { id: "t1".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
+        let agents = vec![
+            // Aliased + verified: primary label is the alias, raw key demoted to a
+            // sub-label, no warning badge.
+            ("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1".to_string(), "peer".to_string(), Some("kali-desktop".to_string()), true),
+            // No alias, unverified: falls back to the truncated key as before, PLUS the
+            // dashed-outline modifier class, the "?" badge, and a tooltip.
+            ("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2".to_string(), "peer".to_string(), None, false),
+        ];
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
+
+        // The aliased node: alias as the primary text, truncated key as a sub-label --
+        // BOTH visible (finding 6 asked for a human label, not for hiding the id).
+        assert!(html.contains(">kali-desktop</text>"), "alias is the primary label");
+        assert!(html.contains("class=\"sublabel\""), "raw (truncated) key demoted to a sub-label when an alias is set");
+        assert!(html.contains("a1a1a1a1a1a1a1a1…"), "the truncated raw key is still present, just secondary");
+        assert!(html.contains("<g class=\"node\" data-node=\"a1a1"), "verified node has no unverified modifier");
+
+        // The unaliased, unverified node: old truncated-key-only label, no sub-label,
+        // but a dashed border + warning badge + tooltip flag it.
+        assert!(html.contains("<g class=\"node unverified\" data-node=\"b2b2"), "unverified modifier class present");
+        assert!(html.contains("class=\"warnbadge\""), "warning badge rendered");
+        assert!(html.contains("Not a member of any channel visible to your account"), "explanatory tooltip present");
+        assert!(html.contains(">b2b2b2b2b2b2b2b2…</text>"), "no alias set -> falls back to the truncated key as the primary label");
+    }
+
+    #[test]
     fn topology_editor_counts_are_grammatically_correct_and_live_updated_on_edge_changes() {
         // #698 finding 7: the header chips read "1 agents"/"1 links" for a singular
         // count -- guard the pluralization at the server-render boundary.
         let t = crate::topology::Topology { id: "t1".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
-        let one_agent = vec![("agent-1".to_string(), "peer".to_string())];
+        let one_agent = vec![("agent-1".to_string(), "peer".to_string(), None, false)];
         let one_edge = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
         let singular = render_topology_editor(&t, &one_agent, &one_edge, "baseline", true, &[], false);
         assert!(singular.contains("id=\"agentcount\">1 agent<"), "singular agent count has no trailing s");
         assert!(singular.contains("id=\"edgecount\">1 link<"), "singular edge count has no trailing s");
 
         let three_agents = vec![
-            ("agent-1".to_string(), "peer".to_string()),
-            ("agent-2".to_string(), "peer".to_string()),
-            ("agent-3".to_string(), "peer".to_string()),
+            ("agent-1".to_string(), "peer".to_string(), None, false),
+            ("agent-2".to_string(), "peer".to_string(), None, false),
+            ("agent-3".to_string(), "peer".to_string(), None, false),
         ];
         let plural = render_topology_editor(&t, &three_agents, &[], "baseline", true, &[], false);
         assert!(plural.contains("id=\"agentcount\">3 agents<"), "plural agent count keeps the s");
@@ -8708,7 +9095,10 @@ mod tests {
         // side: an owner-only status chip + bind panel while unbound, gone once bound,
         // and a real guide step (not a dead end) pointing at the actual command.
         let t = crate::topology::Topology { id: "topo-42".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
-        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
+        let agents = vec![
+            ("agent-1".to_string(), "peer".to_string(), None, false),
+            ("agent-2".to_string(), "peer".to_string(), None, false),
+        ];
         let edges = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
 
         // Owner, unbound: status chip says so, the bind panel with both input fields is
@@ -8764,7 +9154,10 @@ mod tests {
             owner: "alice".into(),
             net_uuid: "uuid-xyz".into(),
         };
-        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "super-peer".to_string())];
+        let agents = vec![
+            ("agent-1".to_string(), "peer".to_string(), None, false),
+            ("agent-2".to_string(), "super-peer".to_string(), None, false),
+        ];
         let edges = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
         let html = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false);
 
@@ -8802,7 +9195,10 @@ mod tests {
             owner: "alice".into(),
             net_uuid: "uuid-xyz".into(),
         };
-        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
+        let agents = vec![
+            ("agent-1".to_string(), "peer".to_string(), None, false),
+            ("agent-2".to_string(), "peer".to_string(), None, false),
+        ];
         let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
 
         // The Connect tool is present and starts un-armed (a11y state exposed).
@@ -8840,7 +9236,10 @@ mod tests {
             owner: "alice".into(),
             net_uuid: "uuid-xyz".into(),
         };
-        let agents = vec![("agent-1".to_string(), "peer".to_string()), ("agent-2".to_string(), "peer".to_string())];
+        let agents = vec![
+            ("agent-1".to_string(), "peer".to_string(), None, false),
+            ("agent-2".to_string(), "peer".to_string(), None, false),
+        ];
         let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
 
         // The action itself: a button wired to a real sync routine, not a stub.
