@@ -3161,15 +3161,13 @@ async fn authorize_hostname(st: &ApiState, tunnel: &crate::storage::SubjectTunne
     // #23 BP4b-c: authorize the hostname at the edge (host -> routing token)
     // so the agent's 'H' bind is accepted under CT_EDGE_REQUIRE_HOST_AUTH.
     if let Some(edge) = &st.edge_admin {
-        let endpoint = format!(
-            "{}/admin/authorize-host/{}/{}",
-            edge.url.trim_end_matches('/'),
-            tunnel.routing_token,
-            host
-        );
+        // #666: routing token via the `x-ct-routing-token` header, not the URL path --
+        // see `acme_broker.rs::push_channel_tier`'s identical fix for this same route.
+        let endpoint = format!("{}/admin/authorize-host/{}", edge.url.trim_end_matches('/'), host);
         match edge_admin_http_client()
             .post(&endpoint)
             .header("x-ct-admin-token", edge.token.as_ref())
+            .header("x-ct-routing-token", tunnel.routing_token.as_str())
             .send()
             .await
         {
@@ -6725,17 +6723,25 @@ mod tests {
         // A Vec, not a single slot: the happy path now hits this endpoint twice
         // (the plain authorize, then the #233 synchronous Rot->Gelb channel-tier
         // push) -- a single slot would silently only keep the last one.
+        // #666: mounts the `:host`-only header-form route -- `authorize_hostname` (the
+        // real caller) forwards the routing token via `x-ct-routing-token` now, not the
+        // URL path.
         let received: Arc<Mutex<Vec<(String, String, String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         let mock = Router::new()
             .route(
-                "/admin/authorize-host/:token/:host",
+                "/admin/authorize-host/:host",
                 post(
                     |AxState(rec): AxState<Arc<Mutex<Vec<(String, String, String, Option<String>)>>>>,
                      headers: AxHeaderMap,
                      uri: AxUri,
-                     AxPath((token, host)): AxPath<(String, String)>| async move {
+                     AxPath(host): AxPath<String>| async move {
                         let auth = headers
                             .get("x-ct-admin-token")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let token = headers
+                            .get("x-ct-routing-token")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("")
                             .to_string();
@@ -6852,7 +6858,7 @@ mod tests {
         let seen = seen_token.clone();
         let conn = connected.clone();
         let mock = Router::new()
-            .route("/admin/authorize-host/:token/:host", post(|| async { StatusCode::OK }))
+            .route("/admin/authorize-host/:host", post(|| async { StatusCode::OK }))
             .route(
                 "/admin/tunnel-status/:token",
                 axum::routing::get(move |AxState(_): AxState<()>, headers: AxHeaderMap, AxPath(token): AxPath<String>| {
@@ -7012,7 +7018,7 @@ mod tests {
         let received = Arc::new(std::sync::Mutex::new(0u32));
         let mock = Router::new()
             .route(
-                "/admin/authorize-host/:token/:host",
+                "/admin/authorize-host/:host",
                 post({
                     let received = received.clone();
                     move || {

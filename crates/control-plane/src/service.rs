@@ -1566,6 +1566,16 @@ fn edge_authorize_host_router(
 ) -> Router {
     Router::new()
         .route("/registry/authorize-host/:token/:host", post(authorize_host_proxy))
+        // #666: the routing token is a bearer credential -- carrying it in the URL path
+        // means it lands in every proxy/LB/access log between the caller and this public
+        // control-plane endpoint (arguably the MOST exposed hop of the #666 family, since
+        // this route is deliberately public-HTTPS-reachable, unlike the edge's own
+        // loopback-only admin API). This `:host`-only route (token via the
+        // `x-ct-routing-token` header instead) is the fix, matching the same pattern
+        // already applied to `acme_broker.rs` (agent-facing routes) and
+        // `edge/src/admin.rs` (the CP->edge admin hop). The original `:token/:host`
+        // route stays mounted, unchanged, for back-compat.
+        .route("/registry/authorize-host/:host", post(authorize_host_proxy_via_header))
         .with_state(EdgeAuthorizeState {
             edge_admin_url: Arc::from(edge_admin_url),
             edge_admin_token: Arc::from(edge_admin_token),
@@ -1586,6 +1596,31 @@ async fn authorize_host_proxy(
     State(state): State<EdgeAuthorizeState>,
     headers: HeaderMap,
     Path((token, host)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    authorize_host_proxy_inner(state, headers, token, host).await
+}
+
+/// #666: same as [`authorize_host_proxy`], routing token via the `x-ct-routing-token`
+/// header instead of the URL path.
+async fn authorize_host_proxy_via_header(
+    State(state): State<EdgeAuthorizeState>,
+    headers: HeaderMap,
+    Path(host): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = headers
+        .get("x-ct-routing-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .ok_or((StatusCode::BAD_REQUEST, "missing or empty x-ct-routing-token header".to_string()))?
+        .to_string();
+    authorize_host_proxy_inner(state, headers, token, host).await
+}
+
+async fn authorize_host_proxy_inner(
+    state: EdgeAuthorizeState,
+    headers: HeaderMap,
+    token: String,
+    host: String,
 ) -> Result<StatusCode, (StatusCode, String)> {
     require_admin(&headers, &state.admin_token, "authorizing a hostname requires the admin token")?;
     let host = ct_common::normalize_hostname(&host)
@@ -1625,16 +1660,15 @@ async fn authorize_host_proxy(
             ));
         }
     }
-    let endpoint = format!(
-        "{}/admin/authorize-host/{}/{}",
-        state.edge_admin_url.trim_end_matches('/'),
-        token,
-        host
-    );
+    // #666: forward to the edge via its `x-ct-routing-token` header route, not the
+    // legacy `:token/:host` path form -- matches `acme_broker.rs`/`portal_api.rs`'s
+    // identical fix for their own edge calls.
+    let endpoint = format!("{}/admin/authorize-host/{}", state.edge_admin_url.trim_end_matches('/'), host);
     let resp = state
         .http
         .post(&endpoint)
         .header("x-ct-admin-token", state.edge_admin_token.as_ref())
+        .header("x-ct-routing-token", token.as_str())
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("edge unreachable: {e}")))?;
@@ -9529,17 +9563,22 @@ mod tests {
         let admin = [0x7au8; 32];
         let edge_admin_token = "edge-secret";
 
-        // Mock edge admin API: records the exact path it was hit on.
+        // Mock edge admin API: records the exact (routing-token-header, host) it was hit
+        // on. #666: the proxy now forwards via the header route, not the legacy path
+        // form -- mirrors what the real edge's `:host`-only route reads.
         let hit = Arc::new(std::sync::Mutex::new(None::<String>));
         let hit2 = hit.clone();
         let mock_edge = Router::new().route(
-            "/admin/authorize-host/:token/:host",
-            post(move |axum::extract::Path((token, host)): axum::extract::Path<(String, String)>, headers: HeaderMap| {
+            "/admin/authorize-host/:host",
+            post(move |axum::extract::Path(host): axum::extract::Path<String>, headers: HeaderMap| {
                 let hit = hit2.clone();
                 async move {
                     if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(edge_admin_token) {
                         return StatusCode::UNAUTHORIZED;
                     }
+                    let Some(token) = headers.get("x-ct-routing-token").and_then(|v| v.to_str().ok()) else {
+                        return StatusCode::BAD_REQUEST;
+                    };
                     *hit.lock().unwrap() = Some(format!("{token}/{host}"));
                     StatusCode::OK
                 }
@@ -9593,6 +9632,83 @@ mod tests {
         );
     }
 
+    /// #666: the `/registry/authorize-host/:host` route (token via `x-ct-routing-token`
+    /// header) is the MOST exposed hop of the #666 finding -- this is the public,
+    /// internet-facing proxy, unlike the edge's own loopback-only admin API. Proves it's
+    /// wired the same way the path form is: admin-gated, forwards to the edge, records
+    /// ownership -- and that a missing routing-token header is refused, not silently
+    /// forwarded with an empty/wrong token.
+    #[tokio::test]
+    async fn authorize_host_proxy_accepts_the_routing_token_via_header_not_just_url_path_666() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x8cu8; 32];
+        let edge_admin_token = "edge-secret-666";
+        let hit = Arc::new(std::sync::Mutex::new(None::<String>));
+        let hit2 = hit.clone();
+        let mock_edge = Router::new().route(
+            "/admin/authorize-host/:host",
+            post(move |axum::extract::Path(host): axum::extract::Path<String>, headers: HeaderMap| {
+                let hit = hit2.clone();
+                async move {
+                    if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(edge_admin_token) {
+                        return StatusCode::UNAUTHORIZED;
+                    }
+                    let token = headers.get("x-ct-routing-token").and_then(|v| v.to_str().ok()).unwrap_or_default();
+                    *hit.lock().unwrap() = Some(format!("{token}/{host}"));
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock_edge).await.unwrap() });
+
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        mesh_store.heartbeat("primary", "test", None, now_secs() as i64).unwrap();
+        let edge_mesh = crate::edge_mesh::EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary"));
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let app = edge_authorize_host_router(format!("http://{addr}"), edge_admin_token.to_string(), Some(admin), edge_mesh, tunnels);
+        let routing_token = hex_encode(&[0xef; 32]);
+
+        let call = |admin_auth: Option<String>, routing: Option<String>| {
+            let mut req = Request::post("/registry/authorize-host/header-demo.bunsenbrenner.org");
+            if let Some(a) = admin_auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            if let Some(t) = routing {
+                req = req.header("x-ct-routing-token", t);
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // No admin token -> 401, edge never contacted.
+        assert_eq!(call(None, Some(routing_token.clone())).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(hit.lock().unwrap().is_none());
+
+        // Correct admin token but no routing-token header -> 400, not forwarded.
+        assert_eq!(
+            call(Some(hex_encode(&admin)), None).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "a missing routing-token header must be refused, not silently forwarded"
+        );
+        assert!(hit.lock().unwrap().is_none());
+
+        // Both present -> 200, forwarded to the edge with the routing token via header.
+        assert_eq!(
+            call(Some(hex_encode(&admin)), Some(routing_token.clone())).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(hit.lock().unwrap().as_deref(), Some(format!("{routing_token}/header-demo.bunsenbrenner.org")).as_deref());
+        assert_eq!(
+            mesh_store.lookup_by_token(&routing_token).unwrap().map(|(id, _)| id),
+            Some("primary".to_string()),
+            "ownership recorded after a successful header-form proxy call"
+        );
+    }
+
     /// #504: a hostname owned by a portal tunnel must refuse an authorize-host for any
     /// OTHER token with 409 — the tunnel's Gelb/ACME machinery re-authorizes the
     /// canonical token on its own schedule, so a proxy-authorized foreign token was
@@ -9608,8 +9724,9 @@ mod tests {
         let edge_admin_token = "edge-secret-504";
         let edge_hits = Arc::new(std::sync::Mutex::new(0u32));
         let edge_hits2 = edge_hits.clone();
+        // #666: the proxy forwards via the edge's `:host`-only header route now.
         let mock_edge = Router::new().route(
-            "/admin/authorize-host/:token/:host",
+            "/admin/authorize-host/:host",
             post(move || {
                 let hits = edge_hits2.clone();
                 async move {
@@ -9675,9 +9792,10 @@ mod tests {
         let edge_admin_token = "edge-secret-402";
         let hit = Arc::new(std::sync::Mutex::new(false));
         let hit2 = hit.clone();
+        // #666: the proxy forwards via the edge's `:host`-only header route now.
         let mock_edge = Router::new()
             .route(
-                "/admin/authorize-host/:token/:host",
+                "/admin/authorize-host/:host",
                 post(move || {
                     let hit = hit2.clone();
                     async move {
