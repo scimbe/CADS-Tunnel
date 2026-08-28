@@ -4416,6 +4416,12 @@ existing tunnels/channels or anyone else's data.</p>
 struct ClaimState {
     session_key: Arc<[u8]>,
     channels: Arc<crate::storage::SqliteChannelStore>,
+    /// The public agent directory (`GET /registry/agents`'s own backing store) -- reused
+    /// read-only by the "search existing agents" picker on [`manage_channel_page`], so
+    /// adding a member you already know by role/skill doesn't require copy-pasting its
+    /// raw holder pubkey. `None` when no directory is wired (matches every other
+    /// best-effort/optional integration on this portal -- the picker just doesn't render).
+    agents: Option<Arc<crate::storage::SqliteAgentDirectory>>,
     /// Public portal origin -- same value/purpose as [`ApiState::portal_base`],
     /// duplicated here rather than merging the two states (see the struct doc).
     portal_base: Arc<str>,
@@ -4429,17 +4435,31 @@ struct ClaimState {
 /// Build the channel-allowlist claim router (#248-follow): a `GET`/`POST` page for
 /// people to self-serve their claim from a browser, plus the pre-existing `POST
 /// .../claim` JSON API for programmatic callers, session-cookie authed either way.
+/// Also the owner side (added later, same day as the "search by name" picker below):
+/// create a channel, add/remove members, manage the allow-list, deposit grants --
+/// closing the gap where only the invitee half of channel setup had a portal page at
+/// all (confirmed live: no `/portal/...` route existed anywhere for the owner
+/// operations before this).
 /// Mount alongside [`portal_api_router`] wherever the channel store is already in scope.
 /// `portal_base`/`edge_cert_path` are the same values `install_page`/`pki_router`
 /// already use elsewhere (see [`ApiState::portal_base`], `pki_router`'s `cert_path`).
 pub fn channel_claim_router(
     session_key: &[u8],
     channels: Arc<crate::storage::SqliteChannelStore>,
+    agents: Option<Arc<crate::storage::SqliteAgentDirectory>>,
     portal_base: &str,
     edge_cert_path: &str,
 ) -> Router {
     Router::new()
         .route("/portal/channels", get(channels_page))
+        .route("/portal/channels/new", get(new_channel_page).post(new_channel_submit))
+        .route("/portal/channels/:channel/manage", get(manage_channel_page))
+        .route("/portal/channels/:channel/manage/search-agents", get(manage_search_agents))
+        .route("/portal/channels/:channel/manage/add-member", post(manage_add_member))
+        .route("/portal/channels/:channel/manage/remove-member/:holder", post(manage_remove_member))
+        .route("/portal/channels/:channel/manage/allowlist-add", post(manage_allowlist_add))
+        .route("/portal/channels/:channel/manage/remove-allowlist/:email", post(manage_allowlist_remove))
+        .route("/portal/channels/:channel/manage/deposit-grant", post(manage_deposit_grant))
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
         .route("/portal/channels/:channel/grant", get(fetch_deposited_grant))
         .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
@@ -4448,6 +4468,7 @@ pub fn channel_claim_router(
         .with_state(ClaimState {
             session_key: Arc::from(session_key.to_vec()),
             channels,
+            agents,
             portal_base: Arc::from(portal_base),
             edge_cert_path: Arc::from(edge_cert_path),
         })
@@ -4797,27 +4818,68 @@ async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Resp
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
+    // Owned channels don't need a verified e-mail (ownership is keyed on the OIDC
+    // subject, not e-mail) -- fetch these regardless of whether the invited-channels
+    // half below can render.
+    let owned = match st.channels.channels_owned_by(&claims.subject) {
+        Ok(v) => v,
+        Err(e) => return internal_error("channels_page/channels_owned_by", e).into_response(),
+    };
     let Some(email) = claims.email else {
-        return Html(page(
-            "your channels",
-            r#"<h1>Your channels</h1><p class="help">Your session has no verified e-mail, so channel
-invitations (which are matched by e-mail) can't be shown. Log in again with an identity
-provider that verifies e-mail.</p>"#,
-            None,
-        ))
-        .into_response();
+        let body = format!(
+            r#"<h1>Your channels</h1>
+{owned_section}
+<h2>Channels you're invited to</h2>
+<p class="help">Your session has no verified e-mail, so channel invitations (which are matched by
+e-mail) can't be shown here. Log in again with an identity provider that verifies e-mail.</p>"#,
+            owned_section = owned_channels_html(&owned),
+        );
+        return Html(page("your channels", &body, None)).into_response();
     };
     let entries = match st.channels.channels_for_email(&email) {
         Ok(v) => v,
         Err(e) => return internal_error("channels_page/channels_for_email", e).into_response(),
     };
-    Html(channels_html(&entries, Some(&email))).into_response()
+    Html(channels_html(&owned, &entries, Some(&email))).into_response()
+}
+
+/// The "channels you own" half of `channels_page`: a create-channel entry point plus a
+/// link to each owned channel's [`manage_channel_page`] -- the owner-side counterpart
+/// [`channels_html`]'s invitee list never covered (#666-follow-up, self-service channel
+/// setup: creating a channel and adding its first member was API/CLI-only before this,
+/// confirmed live to have no portal path at all).
+fn owned_channels_html(owned: &[ct_common::channel::ChannelId]) -> String {
+    let rows = if owned.is_empty() {
+        r#"<p class="help">You don't own any channels yet.</p>"#.to_string()
+    } else {
+        owned
+            .iter()
+            .map(|c| {
+                let channel_hex = escape(&hex(&c.0));
+                format!(
+                    r#"<div class="row"><span class="v"><code>{channel_hex}</code></span><span><a class="btn sec" href="/portal/channels/{channel_hex}/manage">Manage</a></span></div>"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"<h2>Channels you own</h2>
+<p class="help">Create a channel, then add yourself (or anyone else) as a member -- no
+<code>ct-agent</code> CLI or raw API calls needed for this part.</p>
+{rows}
+<a class="btn sec" href="/portal/channels/new">Create a channel</a>"#
+    )
 }
 
 /// Render the "Your Channels" list: each row is a channel id (the only stable,
 /// non-secret identifier a channel has in this schema -- there's no separate
 /// human name) plus a status badge, and a Claim link for anything pending.
-fn channels_html(entries: &[(ct_common::channel::ChannelId, Option<u64>)], email: Option<&str>) -> String {
+fn channels_html(
+    owned: &[ct_common::channel::ChannelId],
+    entries: &[(ct_common::channel::ChannelId, Option<u64>)],
+    email: Option<&str>,
+) -> String {
     let rows = if entries.is_empty() {
         r#"<p class="help">No channel invitations yet. A channel owner adds your e-mail to their
 allow-list (<code>ct-agent channel allowlist add &lt;your-email&gt;</code> or the owner's own
@@ -4844,14 +4906,469 @@ portal), and it appears here automatically -- nothing to request.</p>"#
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let owned_section = owned_channels_html(owned);
     let body = format!(
         r#"<h1>Your channels</h1>
+{owned_section}
+<h2>Channels you're invited to</h2>
 <p class="help">Channels your e-mail has been invited to (matched against your verified
 sign-in e-mail) -- claim a pending one to add yourself as a member, no manual
 exchange with the owner needed.</p>
 {rows}"#
     );
     page("your channels", &body, email)
+}
+
+#[derive(Deserialize)]
+struct NewChannelReq {
+    operator_pubkey: String,
+}
+
+/// `GET /portal/channels/new`: the owner-side entry point [`channels_page`]'s "Create a
+/// channel" button links to. Only `operator_pubkey` is asked for -- the channel id itself
+/// is a bare 32-byte value with no required derivation (`ChannelId` is a plain newtype;
+/// `channel_id_for_link`'s derivation is a *convenience* for the two-known-parties case,
+/// never a server-side requirement, confirmed reading `SqliteChannelStore::register_channel`
+/// directly), so the portal mints one itself rather than making the owner compute or paste
+/// one. The operator PRIVATE key never touches this server or this form -- `ct-agent
+/// channel operator-init` stays the only place it's generated, same invariant every other
+/// channel page on this portal already holds.
+async fn new_channel_page(State(st): State<ClaimState>, headers: HeaderMap) -> Response {
+    if crate::portal::session_claims_for(&st.session_key, &headers).is_none() {
+        return Redirect::to("/portal?next=/portal/channels/new").into_response();
+    }
+    Html(new_channel_html(None)).into_response()
+}
+
+fn new_channel_html(error: Option<&str>) -> String {
+    let banner = match error {
+        Some(msg) => format!(r#"<div class="warn">{}</div>"#, escape(msg)),
+        None => String::new(),
+    };
+    let body = format!(
+        r#"<h1>Create a channel</h1>
+<p class="help">You'll be its operator -- the identity that signs membership grants. Run
+<code>ct-agent channel operator-init</code> locally first (the private key never leaves your
+machine) and paste the printed <code>operator_pubkey</code> below. The channel id itself is minted
+by this server -- it's a public, non-secret address, not a secret to protect.</p>
+{banner}
+<form method="post" action="/portal/channels/new">
+ <label>Operator public key (64 hex chars)<input type="text" name="operator_pubkey" placeholder="operator_pubkey from `ct-agent channel operator-init`" required pattern="[0-9a-fA-F]{{64}}" size="70"></label>
+ <button type="submit">Create channel</button>
+</form>
+<a class="btn sec" href="/portal/channels">Back to your channels</a>"#
+    );
+    page("create a channel", &body, None)
+}
+
+async fn new_channel_submit(State(st): State<ClaimState>, headers: HeaderMap, Form(req): Form<NewChannelReq>) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal?next=/portal/channels/new").into_response();
+    };
+    let Some(operator) = crate::service::hex_decode_32(req.operator_pubkey.trim()) else {
+        return Html(new_channel_html(Some("operator_pubkey must be 64 hex characters"))).into_response();
+    };
+    // Non-secret, non-derived -- see `new_channel_page`'s doc for why any 32 random
+    // bytes are a valid channel id.
+    let mut channel = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut channel);
+    match st.channels.register_channel(&ct_common::channel::ChannelId(channel), &operator, &claims.subject) {
+        Ok(true) => Redirect::to(&format!("/portal/channels/{}/manage?created=true", hex(&channel))).into_response(),
+        Ok(false) => {
+            // Vanishingly unlikely (a fresh random 32 bytes colliding with an existing
+            // channel owned by someone else) -- handled rather than unwrapped so a
+            // pathological RNG failure surfaces as a retryable error, not a panic.
+            Html(new_channel_html(Some("channel id collision, please try again"))).into_response()
+        }
+        Err(e) => internal_error("new_channel_submit/register_channel", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ManageQuery {
+    #[serde(default)]
+    created: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// `GET /portal/channels/:channel/manage`: the owner console for one channel --
+/// members, allow-list, and the three forms that add/allow-list/deposit-grant, all
+/// without leaving the browser. Owner-scoped the same way every `/me/channels/*` API
+/// route already is: [`SqliteChannelStore::members_of`] returns `None` for a
+/// non-owner or unknown channel, which this renders as a plain 403 rather than
+/// distinguishing "not yours" from "doesn't exist" (the same anti-leak posture
+/// [`channel_members_list`] already documents).
+async fn manage_channel_page(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Query(q): Query<ManageQuery>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    let channel = ct_common::channel::ChannelId(channel);
+    let members = match st.channels.members_of(&channel, &claims.subject) {
+        Ok(Some(m)) => m,
+        Ok(None) => return (StatusCode::FORBIDDEN, "not the channel owner").into_response(),
+        Err(e) => return internal_error("manage_channel_page/members_of", e).into_response(),
+    };
+    let operator = match st.channels.operator_pubkey(&channel) {
+        Ok(Some(o)) => o,
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown channel").into_response(),
+        Err(e) => return internal_error("manage_channel_page/operator_pubkey", e).into_response(),
+    };
+    let allowlist = match st.channels.allowlist_list(&channel, &claims.subject) {
+        Ok(Some(a)) => a,
+        Ok(None) => return (StatusCode::FORBIDDEN, "not the channel owner").into_response(),
+        Err(e) => return internal_error("manage_channel_page/allowlist_list", e).into_response(),
+    };
+    Html(manage_channel_html(
+        &channel_hex,
+        &hex(&operator),
+        &members,
+        &allowlist,
+        q.created,
+        q.error.as_deref(),
+        st.agents.is_some(),
+        claims.email.as_deref(),
+    ))
+    .into_response()
+}
+
+fn manage_channel_html(
+    channel_hex: &str,
+    operator_hex: &str,
+    members: &[([u8; 32], Option<[u8; 32]>)],
+    allowlist: &[String],
+    created: bool,
+    error: Option<&str>,
+    search_available: bool,
+    email: Option<&str>,
+) -> String {
+    let channel_hex = escape(channel_hex);
+    let created_banner = if created {
+        r#"<div class="warn" style="border-color:#238636;background:#0d2818;color:#3fb950">Channel created. Add yourself (or anyone else) as a member below.</div>"#
+    } else {
+        ""
+    };
+    let error_banner = match error {
+        Some(msg) => format!(r#"<div class="warn">{}</div>"#, escape(msg)),
+        None => String::new(),
+    };
+    let member_rows = if members.is_empty() {
+        r#"<p class="help">No members yet.</p>"#.to_string()
+    } else {
+        members
+            .iter()
+            .map(|(holder, noise)| {
+                let holder_hex = escape(&hex(holder));
+                let noise_note = match noise {
+                    Some(n) => format!(r#" <span class="help">noise: <code>{}…</code></span>"#, escape(&hex(n)[..16])),
+                    None => String::new(),
+                };
+                format!(
+                    r#"<div class="row"><span class="v"><code>{holder_hex}</code>{noise_note}</span>
+ <span><form class="inline" method="post" action="/portal/channels/{channel_hex}/manage/remove-member/{holder_hex}">
+ <button class="danger" type="submit">Remove</button></form></span></div>"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let allowlist_rows = if allowlist.is_empty() {
+        r#"<p class="help">No allow-listed e-mails.</p>"#.to_string()
+    } else {
+        allowlist
+            .iter()
+            .map(|e| {
+                let e = escape(e);
+                format!(
+                    r#"<div class="row"><span class="v">{e}</span>
+ <span><form class="inline" method="post" action="/portal/channels/{channel_hex}/manage/remove-allowlist/{e}">
+ <button class="danger" type="submit">Remove</button></form></span></div>"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let search_block = if search_available {
+        format!(
+            r#"<div id="agent-search">
+ <label>Search agents by role or skill<input type="text" id="agent-search-q" placeholder="e.g. text_generation"></label>
+ <button type="button" onclick="searchAgents()">Search</button>
+ <div id="agent-search-results" class="help"></div>
+</div>
+<script>
+function fillHolder(pk) {{ document.getElementById('f-holder').value = pk; }}
+async function searchAgents() {{
+  const q = document.getElementById('agent-search-q').value.trim();
+  const box = document.getElementById('agent-search-results');
+  if (!q) {{ box.textContent = ''; return; }}
+  box.textContent = 'searching…';
+  const resp = await fetch('/portal/channels/{channel_hex}/manage/search-agents?q=' + encodeURIComponent(q));
+  if (!resp.ok) {{ box.textContent = 'search failed'; return; }}
+  const rows = await resp.json();
+  if (rows.length === 0) {{ box.textContent = 'no matches'; return; }}
+  box.innerHTML = rows.map(r =>
+    '<div class="row"><span class="v">' + r.label + ' <code>' + r.holder_pubkey.slice(0, 16) + '…</code></span>' +
+    '<span><button type="button" onclick="fillHolder(\'' + r.holder_pubkey + '\')">Use this key</button></span></div>'
+  ).join('');
+}}
+</script>"#
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        r#"<h1>Manage channel</h1>
+{created_banner}
+{error_banner}
+<div class="row"><span class="k">Channel id</span><span class="v"><code>{channel_hex}</code></span></div>
+<div class="row"><span class="k">Operator pubkey</span><span class="v"><code>{operator_hex}</code></span></div>
+
+<h2>Members</h2>
+{member_rows}
+<h3>Add a member</h3>
+<p class="help">The holder/noise pubkeys and attestation come from that member's own
+<code>ct-agent channel member-material</code> run (private keys never touch this server) --
+adding yourself as the first member? Set <code>CT_CHANNEL_BRIDGE_HOLDER</code> to your OWN holder
+pubkey when you run it, see <a href="https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/"
+target="_blank" rel="noopener">Serve your own service, solo</a> for why that's sound.</p>
+{search_block}
+<form method="post" action="/portal/channels/{channel_hex}/manage/add-member">
+ <label>Holder pubkey (64 hex)<input type="text" name="holder" id="f-holder" required pattern="[0-9a-fA-F]{{64}}" size="70"></label>
+ <label>Noise pubkey (64 hex)<input type="text" name="noise_pubkey" required pattern="[0-9a-fA-F]{{64}}" size="70"></label>
+ <label>Noise attestation (128 hex)<input type="text" name="noise_attestation" required pattern="[0-9a-fA-F]{{128}}" size="70"></label>
+ <button type="submit">Add member</button>
+</form>
+
+<h2>Allow-list (let someone claim membership themselves)</h2>
+<p class="help">An allow-listed e-mail appears in that person's own <a href="/portal/channels">Your
+channels</a> page with a Claim button -- no key material to hand them.</p>
+{allowlist_rows}
+<form method="post" action="/portal/channels/{channel_hex}/manage/allowlist-add">
+ <label>E-mail<input type="email" name="email" required></label>
+ <button type="submit">Allow-list</button>
+</form>
+
+<h2>Deposit a grant</h2>
+<p class="help">Paste the <code>CT_CHANNEL_GRANT</code> hex from <code>ct-agent channel grant</code> so
+the member can fetch it automatically from their own claim/onboarding page -- otherwise you'd hand it
+to them out of band.</p>
+<form method="post" action="/portal/channels/{channel_hex}/manage/deposit-grant">
+ <label>Holder pubkey (64 hex)<input type="text" name="holder" required pattern="[0-9a-fA-F]{{64}}" size="70"></label>
+ <label>Grant (278 hex)<textarea name="grant" required rows="3" style="width:100%"></textarea></label>
+ <button type="submit">Deposit grant</button>
+</form>
+
+<a class="btn sec" href="/portal/channels">Back to your channels</a>"#
+    );
+    page("manage channel", &body, email)
+}
+
+#[derive(Deserialize)]
+struct AddMemberFormReq {
+    holder: String,
+    noise_pubkey: String,
+    noise_attestation: String,
+}
+
+async fn manage_add_member(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Form(req): Form<AddMemberFormReq>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let manage_url = format!("/portal/channels/{channel_hex}/manage");
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    let (Some(holder), Some(noise_pubkey), Some(noise_attestation)) = (
+        crate::service::hex_decode_32(req.holder.trim()),
+        crate::service::hex_decode_32(req.noise_pubkey.trim()),
+        crate::service::hex_decode_64(req.noise_attestation.trim()),
+    ) else {
+        return Redirect::to(&format!("{manage_url}?error=malformed+holder%2Fnoise_pubkey%2Fnoise_attestation")).into_response();
+    };
+    // #101 SEC101b, same bar as the JSON API (`channel_add_member`) and the claim
+    // flow (`do_claim`): the Noise key must be attested by the holder itself.
+    if !ct_common::channel::verify_member_noise_attestation(
+        &ct_common::channel::ChannelId(channel),
+        &holder,
+        &noise_pubkey,
+        &noise_attestation,
+    ) {
+        return Redirect::to(&format!("{manage_url}?error=noise_attestation+does+not+verify")).into_response();
+    }
+    match st
+        .channels
+        .add_member(&ct_common::channel::ChannelId(channel), &claims.subject, &holder, &noise_pubkey, &noise_attestation)
+    {
+        Ok(true) => Redirect::to(&manage_url).into_response(),
+        Ok(false) => Redirect::to(&format!("{manage_url}?error=not+the+channel+owner")).into_response(),
+        Err(e) => internal_error("manage_add_member/add_member", e).into_response(),
+    }
+}
+
+async fn manage_remove_member(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path((channel_hex, holder_hex)): Path<(String, String)>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let manage_url = format!("/portal/channels/{channel_hex}/manage");
+    let (Some(channel), Some(holder)) = (crate::service::hex_decode_32(&channel_hex), crate::service::hex_decode_32(&holder_hex)) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel or holder").into_response();
+    };
+    match st.channels.remove_member(&ct_common::channel::ChannelId(channel), &claims.subject, &holder) {
+        Ok(_) => Redirect::to(&manage_url).into_response(),
+        Err(e) => internal_error("manage_remove_member/remove_member", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct AllowlistFormReq {
+    email: String,
+}
+
+async fn manage_allowlist_add(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Form(req): Form<AllowlistFormReq>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let manage_url = format!("/portal/channels/{channel_hex}/manage");
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    if !crate::service::plausible_email(req.email.trim()) {
+        return Redirect::to(&format!("{manage_url}?error=malformed+email")).into_response();
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match st.channels.allowlist_add(&ct_common::channel::ChannelId(channel), &claims.subject, req.email.trim(), now) {
+        Ok(_) => Redirect::to(&manage_url).into_response(),
+        Err(e) => internal_error("manage_allowlist_add/allowlist_add", e).into_response(),
+    }
+}
+
+async fn manage_allowlist_remove(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path((channel_hex, email)): Path<(String, String)>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let manage_url = format!("/portal/channels/{channel_hex}/manage");
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    match st.channels.allowlist_remove(&ct_common::channel::ChannelId(channel), &claims.subject, &email) {
+        Ok(_) => Redirect::to(&manage_url).into_response(),
+        Err(e) => internal_error("manage_allowlist_remove/allowlist_remove", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DepositGrantFormReq {
+    holder: String,
+    grant: String,
+}
+
+async fn manage_deposit_grant(
+    State(st): State<ClaimState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Form(req): Form<DepositGrantFormReq>,
+) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let manage_url = format!("/portal/channels/{channel_hex}/manage");
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    let Some(holder) = crate::service::hex_decode_32(req.holder.trim()) else {
+        return Redirect::to(&format!("{manage_url}?error=malformed+holder")).into_response();
+    };
+    let grant = req.grant.trim().to_ascii_lowercase();
+    if grant.len() != 278 || !grant.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Redirect::to(&format!("{manage_url}?error=grant+must+be+the+278-hex-char+signed+wire+encoding")).into_response();
+    }
+    let holder_hex = hex(&holder);
+    if grant[128..192] != channel_hex.to_ascii_lowercase() || grant[192..256] != holder_hex {
+        return Redirect::to(&format!("{manage_url}?error=grant+does+not+match+this+channel%2Fholder")).into_response();
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match st.channels.deposit_grant(&ct_common::channel::ChannelId(channel), &claims.subject, &holder, &grant, now) {
+        Ok(crate::storage::GrantDepositOutcome::Deposited) => Redirect::to(&manage_url).into_response(),
+        Ok(crate::storage::GrantDepositOutcome::NotOwner) => Redirect::to(&format!("{manage_url}?error=not+the+channel+owner")).into_response(),
+        Ok(crate::storage::GrantDepositOutcome::NotAMember) => {
+            Redirect::to(&format!("{manage_url}?error=that+holder+is+not+a+member+yet+--+add+it+first")).into_response()
+        }
+        Err(e) => internal_error("manage_deposit_grant/deposit_grant", e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchAgentsQuery {
+    q: String,
+}
+
+#[derive(Serialize)]
+struct AgentSearchRow {
+    holder_pubkey: String,
+    label: String,
+}
+
+/// `GET /portal/channels/:channel/manage/search-agents?q=<role or skill token>`: the
+/// "click, don't copy" picker on [`manage_channel_page`]'s add-member form. Backed by
+/// the SAME public agent directory `GET /registry/agents` already searches (exact-token
+/// match against `role_tags`/`skill_ids` -- there is no free-text "name" anywhere in
+/// this system for a holder pubkey, confirmed reading every table in `storage.rs`; role/
+/// skill tags are the closest real, searchable handle that exists today). Matches on
+/// EITHER role or skill (an OR, not the directory's own role-AND-skill search) so a
+/// single query box works for both facets without the caller needing to know which one
+/// a given agent used. Read-only, no session/owner check needed -- this is exactly the
+/// same public data `GET /registry/agents` already exposes to anyone, just re-shaped
+/// for a click-to-fill picker instead of a raw JSON scan.
+async fn manage_search_agents(State(st): State<ClaimState>, Query(q): Query<SearchAgentsQuery>) -> Response {
+    let Some(agents) = &st.agents else {
+        return Json(Vec::<AgentSearchRow>::new()).into_response();
+    };
+    let query = q.q.trim();
+    if query.is_empty() {
+        return Json(Vec::<AgentSearchRow>::new()).into_response();
+    }
+    let by_role = agents.search(Some(query), None).unwrap_or_default();
+    let by_skill = agents.search(None, Some(query)).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let rows: Vec<AgentSearchRow> = by_role
+        .into_iter()
+        .chain(by_skill)
+        .filter(|e| seen.insert(e.holder_pubkey.clone()))
+        .map(|e| {
+            let mut tags = e.role_tags;
+            tags.extend(e.skill_ids);
+            let label = if tags.is_empty() { "(no role/skill tags)".to_string() } else { tags.join(", ") };
+            AgentSearchRow { holder_pubkey: e.holder_pubkey, label: escape(&label) }
+        })
+        .take(20)
+        .collect();
+    Json(rows).into_response()
 }
 
 #[derive(Deserialize)]
@@ -8617,7 +9134,7 @@ mod tests {
         let ch = ChannelId([0x6eu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let holder_sk = SigningKey::from_bytes(&[0xc5u8; 32]);
@@ -8757,7 +9274,7 @@ mod tests {
         let ch = ChannelId([0x5cu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let holder_sk = SigningKey::from_bytes(&[0xc3u8; 32]);
@@ -8889,7 +9406,7 @@ mod tests {
         use crate::storage::SqliteChannelStore;
 
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
-        let app = channel_claim_router(KEY, channels, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let (status, html) = get(&app, "/portal/channels/not-hex-and-also-not-64-chars/claim", Some("nat-subject")).await;
         assert_eq!(status, StatusCode::OK, "renders an error page, not a raw error status");
@@ -8910,7 +9427,7 @@ mod tests {
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let ch = ChannelId([0x6bu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
-        let app = channel_claim_router(KEY, channels, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
 
@@ -8933,7 +9450,7 @@ mod tests {
         use crate::storage::SqliteChannelStore;
 
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
-        let app = channel_claim_router(KEY, channels, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let resp = app
             .clone()
@@ -8962,7 +9479,7 @@ mod tests {
         let ch = ChannelId([0x7au8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
 
@@ -9053,7 +9570,7 @@ mod tests {
         std::fs::write(&cert_path, der).unwrap();
         let cert_path_str = cert_path.to_string_lossy().into_owned();
 
-        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", &cert_path_str);
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", &cert_path_str);
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
         let holder_sk = SigningKey::from_bytes(&[0xc7u8; 32]);
@@ -9152,7 +9669,7 @@ mod tests {
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
 
-        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
         let holder_sk = SigningKey::from_bytes(&[0xc9u8; 32]);
@@ -9212,7 +9729,7 @@ mod tests {
             .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000, None)
             .unwrap().claimed());
 
-        let app = channel_claim_router(KEY, channels.clone(), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         // Logged out -> bounced, not a raw 401/500.
@@ -9255,6 +9772,304 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert!(body.contains("No channel invitations yet"));
+    }
+
+    /// The owner-side console added alongside the "search by name" picker: create a
+    /// channel entirely from the browser, see it in "Channels you own", and confirm a
+    /// non-owner is refused the manage page -- the exact gap #666-follow-up found live
+    /// (no portal path existed anywhere for this before).
+    #[tokio::test]
+    async fn new_channel_creates_it_and_lists_it_owner_scoped() {
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let operator_hex = "aa".repeat(32);
+
+        // Logged out -> bounced.
+        assert_eq!(get(&app, "/portal/channels/new", None).await.0, StatusCode::SEE_OTHER);
+
+        // Malformed operator_pubkey -> re-renders the form with an error, not a 500.
+        let status = post_form(&app, "/portal/channels/new", "alice", "operator_pubkey=not-hex").await;
+        assert_eq!(status, StatusCode::OK, "re-renders the form (200), doesn't redirect on a validation error");
+
+        // A real create redirects straight to the new channel's manage page.
+        let resp = post_form_response(&app, "/portal/channels/new", "alice", &format!("operator_pubkey={operator_hex}")).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+        assert!(location.starts_with("/portal/channels/") && location.contains("/manage?created=true"), "{location}");
+        let channel_hex = location.trim_start_matches("/portal/channels/").split('/').next().unwrap().to_string();
+
+        // Owned channels round-trip through the storage layer for real.
+        let owned = channels.channels_owned_by("alice").unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(hex(&owned[0].0), channel_hex);
+        assert_eq!(channels.operator_pubkey(&owned[0]).unwrap().map(|o| hex(&o)), Some(operator_hex.clone()));
+
+        // Shows up on the owner's "your channels" page...
+        let (_s, list_html) = get(&app, "/portal/channels", Some("alice")).await;
+        assert!(list_html.contains(&channel_hex), "owned channel listed");
+        assert!(list_html.contains(&format!("/portal/channels/{channel_hex}/manage")), "links to manage");
+
+        // ...the owner can open the manage page (with the just-created banner)...
+        let (status, manage_html) = get(&app, &format!("/portal/channels/{channel_hex}/manage?created=true"), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(manage_html.contains("Channel created"));
+        assert!(manage_html.contains(&operator_hex), "operator pubkey shown");
+
+        // ...but a non-owner is refused, not shown a leaked page.
+        assert_eq!(get(&app, &format!("/portal/channels/{channel_hex}/manage"), Some("bob")).await.0, StatusCode::FORBIDDEN);
+        // An unknown channel id -> not found, distinct from a real 403.
+        assert_eq!(
+            get(&app, &format!("/portal/channels/{}/manage", "bb".repeat(32)), Some("alice")).await.0,
+            StatusCode::FORBIDDEN,
+            "members_of can't distinguish unknown-channel from not-owner by design -- both 403"
+        );
+    }
+
+    /// Adding a member from the manage page enforces the exact same #101 SEC101b
+    /// attestation check the JSON API (`channel_add_member`) and the claim flow
+    /// (`do_claim`) already do -- proven here rather than assumed, since this is a
+    /// THIRD independent call site for the same security-critical check.
+    #[tokio::test]
+    async fn manage_add_member_enforces_attestation_and_round_trips_removal() {
+        use ct_common::channel::{member_noise_attest_bytes, ChannelId};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x11; 32]);
+        channels.register_channel(&ch, &[0x22; 32], "alice").unwrap();
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let ch_hex = hex(&ch.0);
+
+        let holder_sk = SigningKey::from_bytes(&[0x33; 32]);
+        let holder = holder_sk.verifying_key().to_bytes();
+        let noise = [0x44u8; 32];
+        let good_attest = holder_sk.sign(&member_noise_attest_bytes(&ch, &holder, &noise)).to_bytes();
+        let holder_hex = hex(&holder);
+        let noise_hex = hex(&noise);
+
+        // A forged/wrong attestation is refused, not silently accepted.
+        let bad_attest_hex = "00".repeat(64);
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/add-member"),
+            "alice",
+            &format!("holder={holder_hex}&noise_pubkey={noise_hex}&noise_attestation={bad_attest_hex}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(resp.headers().get("location").unwrap().to_str().unwrap().contains("error="));
+        assert!(channels.members_of(&ch, "alice").unwrap().unwrap().is_empty(), "forged attestation never added");
+
+        // A non-owner can't add a member either, even with a genuinely valid attestation.
+        let good_attest_hex = hex(&good_attest);
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/add-member"),
+            "mallory",
+            &format!("holder={holder_hex}&noise_pubkey={noise_hex}&noise_attestation={good_attest_hex}"),
+        )
+        .await;
+        assert!(resp.headers().get("location").unwrap().to_str().unwrap().contains("not+the+channel+owner"));
+        assert!(channels.members_of(&ch, "alice").unwrap().unwrap().is_empty());
+
+        // The real owner, with a genuinely valid attestation, succeeds.
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/add-member"),
+            "alice",
+            &format!("holder={holder_hex}&noise_pubkey={noise_hex}&noise_attestation={good_attest_hex}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!resp.headers().get("location").unwrap().to_str().unwrap().contains("error="));
+        let members = channels.members_of(&ch, "alice").unwrap().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(hex(&members[0].0), holder_hex);
+
+        let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
+        assert!(manage_html.contains(&holder_hex), "new member listed on the manage page");
+        assert!(
+            manage_html.contains(&format!("/portal/channels/{ch_hex}/manage/remove-member/{holder_hex}")),
+            "a remove form is offered for it"
+        );
+
+        // Remove round-trips cleanly.
+        assert_eq!(
+            post_form(&app, &format!("/portal/channels/{ch_hex}/manage/remove-member/{holder_hex}"), "alice", "").await,
+            StatusCode::SEE_OTHER
+        );
+        assert!(channels.members_of(&ch, "alice").unwrap().unwrap().is_empty(), "removed");
+    }
+
+    /// The allow-list form closes the loop the operator actually asked for: an owner
+    /// who doesn't have a member's key material yet can still let them self-serve a
+    /// claim, entirely from the portal, no CLI/curl on either side.
+    #[tokio::test]
+    async fn manage_allowlist_add_and_remove_round_trip() {
+        use crate::portal::sign_session_with_email_for_test;
+        use ct_common::channel::ChannelId;
+
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x55; 32]);
+        channels.register_channel(&ch, &[0x66; 32], "alice").unwrap();
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let ch_hex = hex(&ch.0);
+
+        assert_eq!(
+            post_form(&app, &format!("/portal/channels/{ch_hex}/manage/allowlist-add"), "alice", "email=teammate%40example.com").await,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(channels.allowlist_list(&ch, "alice").unwrap().unwrap(), vec!["teammate@example.com".to_string()]);
+
+        let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
+        assert!(manage_html.contains("teammate@example.com"));
+
+        // It's now genuinely discoverable on the INVITEE's own "your channels" page --
+        // the whole point of the allow-list, proven end to end (email-to-channel matching
+        // itself is covered by channels_page_lists_only_the_sessions_own_invitations_with_claim_status).
+        let invitee_cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "teammate", "teammate@example.com"));
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/portal/channels").header("cookie", invitee_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let invitee_html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(invitee_html.contains(&ch_hex), "the allow-listed teammate sees the channel as pending");
+
+        assert_eq!(
+            post_form(
+                &app,
+                &format!("/portal/channels/{ch_hex}/manage/remove-allowlist/teammate%40example.com"),
+                "alice",
+                ""
+            )
+            .await,
+            StatusCode::SEE_OTHER
+        );
+        assert!(channels.allowlist_list(&ch, "alice").unwrap().unwrap().is_empty(), "removed");
+    }
+
+    /// Deposit-grant validates shape and channel/holder embedding exactly like the
+    /// JSON API does -- a malformed or mismatched grant is refused with a specific
+    /// error, never silently stored.
+    #[tokio::test]
+    async fn manage_deposit_grant_validates_before_storing() {
+        use ct_common::channel::ChannelId;
+
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ChannelId([0x77; 32]);
+        channels.register_channel(&ch, &[0x88; 32], "alice").unwrap();
+        let holder = [0x99u8; 32];
+        let holder_hex = hex(&holder);
+        let ch_hex = hex(&ch.0);
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+
+        // Wrong length -> refused before ever reaching storage.
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/deposit-grant"),
+            "alice",
+            &format!("holder={holder_hex}&grant=deadbeef"),
+        )
+        .await;
+        assert!(resp.headers().get("location").unwrap().to_str().unwrap().contains("278-hex-char"));
+
+        // Right length, embedded ids don't match this channel/holder -> refused.
+        let mut wrong_grant = "00".repeat(64) + &"ff".repeat(32) + &"ee".repeat(32);
+        wrong_grant.push_str(&"0".repeat(278 - wrong_grant.len()));
+        assert_eq!(wrong_grant.len(), 278);
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/deposit-grant"),
+            "alice",
+            &format!("holder={holder_hex}&grant={wrong_grant}"),
+        )
+        .await;
+        assert!(resp.headers().get("location").unwrap().to_str().unwrap().contains("does+not+match"));
+
+        // Not yet a member -> refused with the specific "add it first" error, even
+        // with correctly embedded ids.
+        let mut right_ids_grant = "00".repeat(64) + &ch_hex + &holder_hex;
+        right_ids_grant.push_str(&"0".repeat(278 - right_ids_grant.len()));
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/deposit-grant"),
+            "alice",
+            &format!("holder={holder_hex}&grant={right_ids_grant}"),
+        )
+        .await;
+        assert!(resp.headers().get("location").unwrap().to_str().unwrap().contains("add+it+first"));
+
+        // Add the member (bypassing attestation via direct storage, since this test is
+        // about deposit-grant, not #101), then the same grant deposits cleanly.
+        channels.add_member(&ch, "alice", &holder, &[0u8; 32], &[0u8; 64]).unwrap();
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/channels/{ch_hex}/manage/deposit-grant"),
+            "alice",
+            &format!("holder={holder_hex}&grant={right_ids_grant}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert!(!resp.headers().get("location").unwrap().to_str().unwrap().contains("error="));
+    }
+
+    /// The "search by name" picker (agent role/skill directory, click-to-fill the
+    /// holder pubkey field) -- proves it actually reaches the same public directory
+    /// `GET /registry/agents` search does, matches on EITHER role or skill, and is a
+    /// harmless empty list when no directory is wired at all.
+    #[tokio::test]
+    async fn manage_search_agents_matches_role_or_skill_and_degrades_without_a_directory() {
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let agents = Arc::new(crate::storage::SqliteAgentDirectory::open_in_memory().unwrap());
+        agents.register("aa".repeat(32).as_str(), "https://alice.example/card.json", &["physics".to_string()], &[], 0).unwrap();
+        agents
+            .register("bb".repeat(32).as_str(), "https://bob.example/card.json", &[], &["text_generation".to_string()], 0)
+            .unwrap();
+
+        let app = channel_claim_router(
+            KEY,
+            channels.clone(),
+            Some(agents.clone()),
+            "https://portal.example",
+            "/nonexistent/ct-edge-ca.der",
+        );
+        let ch_hex = "cc".repeat(32);
+
+        // Matches by role.
+        let (status, body) = get(&app, &format!("/portal/channels/{ch_hex}/manage/search-agents?q=physics"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&"aa".repeat(32)), "role match found: {body}");
+        assert!(!body.contains(&"bb".repeat(32)), "no false-positive skill row");
+
+        // Matches by skill (the OR, not just role).
+        let (status, body) = get(&app, &format!("/portal/channels/{ch_hex}/manage/search-agents?q=text_generation"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(&"bb".repeat(32)), "skill match found: {body}");
+
+        // No directory wired at all -> empty JSON, not an error (matches the picker's
+        // own "silently doesn't render" degrade path).
+        let app_no_dir = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let (status, body) = get(&app_no_dir, &format!("/portal/channels/{ch_hex}/manage/search-agents?q=physics"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]");
+    }
+
+    /// Like [`post_form`], but returns the whole response (for reading `location`
+    /// headers / non-303 status codes) instead of just the status code.
+    async fn post_form_response(app: &Router, path: &str, subject: &str, form: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::post(path)
+                    .header("cookie", session_header(subject))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
