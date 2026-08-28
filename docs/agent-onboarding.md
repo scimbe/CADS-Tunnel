@@ -22,6 +22,17 @@ Every command below is verified against `ct-agent`'s own `src/main.rs`
   need either an OIDC account (self-register if your email domain is allowed, else ask the
   maintainer) **or** an operator to sign your channel grant / mint you a join token. Everything
   *else* is self-service and provider-blind.
+- **Broker-mediated channels (`CT_CHANNEL_BROKER`/`CT_CHANNEL_RELAY`, what persistent `--serve` uses)
+  are NEVER offline-only, unlike direct-address (`CT_CHANNEL_ADDR`).** Source-verified against
+  `crates/edge/src/channel_authorize.rs`: every broker-mediated join calls the control plane's
+  `/internal/channel/authorize`, whose durable `channel_members` table is the sole source of truth —
+  the edge holds no membership state of its own. A correctly-signed `CT_CHANNEL_GRANT` is necessary
+  but not sufficient; skipping `channel register` + the membership POST is the single most common
+  reason a broker-mediated join is refused despite a valid grant, and it will silently look like a
+  grant problem, not a registration one. If you're setting up persistent serve for your own service
+  and don't have a second party's `holder_pubkey` to derive a channel id against yet, see
+  [Serve your own service, solo](https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/)
+  rather than B below, which assumes a known counterpart.
 - Two different "services" env vars, don't conflate them:
   - `CT_AGENT_SERVICES` — the `service/<slug>` tools you actually **serve** (with a handler).
   - `CT_AGENT_OFFER_SERVICES` — the catalog your #147 **auction offer** advertises (`CT_AGENT_OFFER_*`).
@@ -109,7 +120,11 @@ you need it (custom role tags, joining someone else's pipeline, browser-facing s
 4. **Serve a capability** — a closed `ServiceType`: `code_generation` | `security_review` |
    `safety_check` | `text_generation`. In serve mode the accept side **re-admits successive peers
    automatically** (#179) — it parks, serves a peer, then loops back to admit the next — so no
-   external restart loop is needed. It runs over a real channel, so you need the join env from B:
+   external restart loop is needed. It runs over a real channel, so you need the join env from B —
+   **or**, if you don't have a counterpart's `holder_pubkey` yet (serving your own service to
+   whoever you grant later, not joining someone else's pipeline), see [Serve your own service,
+   solo](https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/) instead — B's
+   `member-material`/`CT_CHANNEL_BRIDGE_HOLDER` step assumes a known second party:
    ```
    CT_AGENT_SERVICE_HANDLER_CMD=./my-handler.sh \
    CT_AGENT_SERVICES=text_generation \
@@ -346,6 +361,9 @@ operator only ever sees that a channel exists between two holder keys, never you
 
 ## See also
 
+- [Serve your own service, solo](https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/)
+  — the minimal path for persistent serve when you're both operator and the only member so far, no
+  pipeline and no known counterpart needed.
 - [`onboarding/pipeline-bridge-pattern.md`](onboarding/pipeline-bridge-pattern.md) — how a
   published pipeline (C) fronts itself with a public HTTP bridge, without any core code change.
 - `https://bunsenbrenner.org/` — live counts of registered tunnels, published pipelines, and
