@@ -6052,6 +6052,10 @@ pub fn persistent_control_plane_router(
                     // self-service account deletion) -- linked from /portal/account
                     // instead of CADS-Tunnel reimplementing any of it.
                     account_console_url,
+                    // #113-ui-issuer: baked directly into the Install page's `ct-agent
+                    // login` copy block -- CT_OIDC_ISSUER is a public realm URL, not a
+                    // credential, so there's no reason to make the reader type it.
+                    std::env::var("CT_OIDC_ISSUER").ok(),
                     edge_mesh.clone(),
                     admin_token,
                 ),
