@@ -86,6 +86,10 @@ pub struct PaidTier {
     pub relay_free_gb: Option<u32>,
     /// Business-only: a free-text note shown instead of a fixed price.
     pub note: Option<String>,
+    /// The Paddle Price id (`pri_...`) `crate::paddle`'s checkout-creation call
+    /// bills against for this tier. `None` means this tier can't be checked out
+    /// via Paddle yet (e.g. Business, which is individually negotiated).
+    pub paddle_price_id: Option<String>,
 }
 
 /// The Free tier's numbers -- always zero-price by definition, so it carries no
@@ -139,6 +143,20 @@ impl PricingConfig {
             || self.business.is_some()
     }
 
+    /// Look up a paid tier by its lower-case plan name (the same strings
+    /// `SqliteLedger::set_plan`/`plan_for` store, e.g. `"starter"`). `None` if
+    /// unknown or not configured -- `crate::paddle`'s checkout handler uses
+    /// this to find the Paddle Price id to bill.
+    pub fn tier(&self, name: &str) -> Option<&PaidTier> {
+        match name {
+            "starter" => self.starter.as_ref(),
+            "medium" => self.medium.as_ref(),
+            "pro" => self.pro.as_ref(),
+            "business" => self.business.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Read every `CT_PRICING_*` var from the process environment. Never fails --
     /// a missing or unparseable var is simply absent from the result (fail-soft,
     /// see this module's doc comment).
@@ -167,6 +185,7 @@ impl PricingConfig {
                 tunnels: u32_var(&format!("CT_PRICING_{prefix}_TUNNELS")),
                 relay_free_gb: u32_var(&format!("CT_PRICING_{prefix}_RELAY_GB")),
                 note,
+                paddle_price_id: get(&format!("CT_PRICING_{prefix}_PADDLE_PRICE_ID")).filter(|s| !s.trim().is_empty()),
             })
         };
         PricingConfig {

@@ -6225,6 +6225,14 @@ pub fn persistent_control_plane_router(
                 oidc.clone(),
                 crate::ai_usage::AiBackendConfig::from_env(),
             ))
+            // Merchant-of-Record payment integration (Paddle) -- see
+            // `crate::paddle`'s own doc for the double-gate (api_key configured
+            // AND CT_CHECKOUT_ENABLED=true) before /me/checkout is reachable.
+            .merge(crate::paddle::paddle_router(
+                ledger.clone(),
+                oidc.clone(),
+                crate::paddle::PaddleConfig::from_env(),
+            ))
             // Keycloak/account overhaul: "delete my account and all data" cascades
             // across every store keyed by a portal subject -- see
             // `account_delete_router`'s doc comment for why this stays a separate

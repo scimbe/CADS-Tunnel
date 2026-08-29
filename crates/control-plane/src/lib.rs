@@ -34,6 +34,7 @@ pub mod installer;
 pub mod issuance;
 pub mod keycloak_admin;
 pub mod oidc;
+pub mod paddle;
 pub mod payment;
 pub mod portal;
 pub mod portal_api;
