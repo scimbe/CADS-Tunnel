@@ -43,6 +43,19 @@ binary and run it natively instead; it's a small, self-contained static-ish bina
 
 ## Step 1 — mint an OIDC bearer token
 
+Preferred: `ct-agent login` (ct-agent#114), an RFC 8628 device-code flow against the
+realm's public `ct-agent-cli` client — no password ever touches a script or the
+command line, and the token is stored + refreshed automatically for every later
+`ct-agent channel register`/`allowlist` call in this doc:
+
+```bash
+CT_OIDC_ISSUER=https://auth.<zone>/realms/<realm> ct-agent login
+```
+
+`mint-oidc-token.sh` (ROPC via the `admin-cli` client, `docs/agent-onboarding.md` §A.2)
+still works and remains useful for a headless box with no browser to complete the
+device flow, or for a one-off `curl` you don't want `ct-agent` involved in at all:
+
 ```bash
 OIDC_ISSUER_BASE=https://auth.<zone>/realms/<realm> \
 OIDC_USERNAME=you@example.com \
@@ -52,9 +65,7 @@ OIDC_PASSWORD='...' \
 
 Prints the bare `access_token` to stdout. **Short-lived** (a Keycloak realm default
 is minutes) — mint fresh for each provisioning batch rather than caching it across
-a long session. `client_id` defaults to `admin-cli` (the public client
-`docs/agent-onboarding.md` §A.2 documents for headless token minting via
-`grant_type=password`).
+a long session.
 
 ## Step 2 — mint an operator identity (once)
 

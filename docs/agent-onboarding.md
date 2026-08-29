@@ -84,12 +84,21 @@ you need it (custom role tags, joining someone else's pipeline, browser-facing s
    eval "$(ct-agent channel init)"     # exports CT_CHANNEL_HOLDER_KEY, CT_CHANNEL_NOISE_KEY, + *_PUBKEY
    ```
 2. **Get an OIDC account** (the one human-gated step): self-register via the realm portal if your
-   email domain is allowed, or ask the maintainer for an operator account. For headless token
-   minting, use the realm's `admin-cli` client with `grant_type=password` against the token endpoint —
-   and pass every field with curl's `--data-urlencode`, never plain `-d`: with `-d`, a `+` in your
-   account email is form-decoded into a space server-side and the realm answers a baffling
-   `Invalid user credentials` for a password that is actually correct (reproduced live). The token
-   expires after ~5 minutes; re-mint rather than debugging a mysterious 401:
+   email domain is allowed, or ask the maintainer for an operator account. Then get a bearer token
+   with `ct-agent login` (ct-agent#114) — an RFC 8628 device-code flow against the realm's public
+   `ct-agent-cli` client: it prints a URL + short code, you authorize in any browser, and it stores
+   the token locally (refreshed automatically afterwards, `docs/channel.md` on `ct-agent` has the
+   full reference):
+   ```
+   CT_OIDC_ISSUER=<issuer> ct-agent login
+   ```
+   This replaces the previous `admin-cli`/`grant_type=password` ROPC recipe (raw account password
+   on the command line) — kept below only for a headless box where a browser genuinely isn't
+   available to complete the device flow. Pass every field with curl's `--data-urlencode`, never
+   plain `-d`: with `-d`, a `+` in your account email is form-decoded into a space server-side and
+   the realm answers a baffling `Invalid user credentials` for a password that is actually correct
+   (reproduced live). The token expires after ~5 minutes; re-mint rather than debugging a
+   mysterious 401:
    ```
    TOKEN=$(curl -s -X POST <issuer>/protocol/openid-connect/token \
      --data-urlencode 'client_id=admin-cli' --data-urlencode 'grant_type=password' \
