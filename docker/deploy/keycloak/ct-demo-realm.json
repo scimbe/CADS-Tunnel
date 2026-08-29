@@ -176,7 +176,7 @@
       "config": {
         "clientId": "${KC_GOOGLE_CLIENT_ID:}",
         "clientSecret": "${KC_GOOGLE_CLIENT_SECRET:}",
-        "syncMode": "IMPORT"
+        "syncMode": "FORCE"
       }
     },
     {
@@ -189,7 +189,7 @@
       "config": {
         "clientId": "${KC_GITHUB_CLIENT_ID:}",
         "clientSecret": "${KC_GITHUB_CLIENT_SECRET:}",
-        "syncMode": "IMPORT"
+        "syncMode": "FORCE"
       }
     },
     {
@@ -202,7 +202,39 @@
       "config": {
         "clientId": "${KC_GITLAB_CLIENT_ID:}",
         "clientSecret": "${KC_GITLAB_CLIENT_SECRET:}",
-        "syncMode": "IMPORT"
+        "syncMode": "FORCE"
+      }
+    }
+  ],
+  "identityProviderMappers": [
+    {
+      "name": "email-importer",
+      "identityProviderAlias": "google",
+      "identityProviderMapper": "google-user-attribute-mapper",
+      "config": {
+        "claim": "email",
+        "user.attribute": "email",
+        "syncMode": "FORCE"
+      }
+    },
+    {
+      "name": "email-importer",
+      "identityProviderAlias": "github",
+      "identityProviderMapper": "github-user-attribute-mapper",
+      "config": {
+        "claim": "email",
+        "user.attribute": "email",
+        "syncMode": "FORCE"
+      }
+    },
+    {
+      "name": "email-importer",
+      "identityProviderAlias": "gitlab",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": {
+        "claim": "email",
+        "user.attribute": "email",
+        "syncMode": "FORCE"
       }
     }
   ],
