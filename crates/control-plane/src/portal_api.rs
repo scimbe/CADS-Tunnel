@@ -2932,7 +2932,7 @@ git-ignored file, created directly on the server from your own local copy of the
         return admin_page("pricing", session, body);
     }
 
-    let fmt_cents = |c: u32| format!("{}.{:02} €", c / 100, c % 100);
+    let fmt_cents = |c: u32| crate::pricing::gross_price_label(c, cfg.vat_mode);
     let cell = |v: Option<String>| v.unwrap_or_else(|| r#"<span class="help">-</span>"#.to_string());
 
     let mut plans_js = String::from("[");
@@ -3009,6 +3009,13 @@ git-ignored file, created directly on the server from your own local copy of the
             .map(|t| format!("<td>{}</td>", cell(t.relay_free_gb.map(|g| format!("{g} GB/month")))))
             .collect::<String>()
     ));
+    // Presentation review finding: "credits" appeared as bare numbers with no
+    // unit or worked example, and the AI features they actually pay for were
+    // never named anywhere on the page -- both fixed by naming the real rates
+    // (already flowing through `cfg`, no numbers of this function's own) as
+    // their own rows, not just a bundle size.
+    let standard_ai_note = cell(cfg.standard_ai_credits_per_1k_tokens.map(|c| format!("{c} Credits / 1,000 tokens")));
+    let whisper_note = cell(cfg.standard_stt_credits_per_minute.map(|c| format!("{c} Credits / minute")));
 
     let body = format!(
         r#"<h1>Pricing preview</h1>
@@ -3016,14 +3023,48 @@ git-ignored file, created directly on the server from your own local copy of the
 The real numbers live only in this server's <code>docker/deploy/.env.pricing</code>, never
 committed. This page is the mechanism only; add <code>workflow-maintainer@gmail.com</code> as an
 admin (via the Admins page) to give them the same view.</p>
+
+<div class="card" style="margin-bottom:1.2rem">
+ <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem">
+  <strong data-lang="de">Vorschau der Kunden-Ansprache</strong><strong data-lang="en" style="display:none">Customer-facing copy preview</strong>
+  <div>
+   <button class="sec" data-set-lang="de" onclick="return setPageLang('de')">Deutsch</button>
+   <button class="sec" data-set-lang="en" onclick="return setPageLang('en')">English</button>
+  </div>
+ </div>
+ <p data-lang="de">Kein Wettbewerber (ngrok, Cloudflare Tunnel, Tailscale) kann Ihren Tunnel-Traffic
+  strukturell mitlesen -- Sie können es auch nicht, wir strukturell erst recht nicht (Noise-verschlüsselt
+  Ende-zu-Ende). Standard-KI läuft auf eigener, EU-gehosteter Infrastruktur -- Ihre Daten verlassen nie
+  unsere Server, kein Auftragsverarbeitungsvertrag mit Dritten nötig.</p>
+ <p data-lang="en" style="display:none">No competitor (ngrok, Cloudflare Tunnel, Tailscale) can structurally
+  read your tunnel traffic -- Noise-encrypted end to end. Standard AI runs on our own, EU-hosted
+  infrastructure -- your data never leaves our servers, no third-party data processing agreement needed.</p>
+</div>
+
+<div class="card" style="margin-bottom:1.2rem">
+ <strong data-lang="de">Was sind Credits?</strong><strong data-lang="en" style="display:none">What are Credits?</strong>
+ <p data-lang="de">Credits sind die Nutzungswährung dieser Plattform -- sie decken KI-Chat-Anfragen
+  (Standard-KI, selbst gehostet), Sprachtranskription (Whisper) und Relay-Bandbreite oberhalb des
+  Freikontingents ab. Jeder Plan enthält ein monatliches Credit-Guthaben; verbrauchte Credits werden
+  nach echter Nutzung abgerechnet, nicht pauschal.</p>
+ <p data-lang="en" style="display:none">Credits are this platform's usage currency -- they cover AI chat
+  requests (Standard AI, self-hosted), speech transcription (Whisper), and relay bandwidth above the free
+  quota. Every plan includes a monthly credit allotment; credits are spent against real usage, not a flat
+  fee.</p>
+ <div class="kv"><div>Standard-KI (Chat)</div><div>{standard_ai_note}</div></div>
+ <div class="kv"><div>Whisper (Transkription)</div><div>{whisper_note}</div></div>
+</div>
+
 <div class="tablewrap"><table class="data">
 <thead><tr><th></th>{cols}</tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
 
-<h2>Booking flow preview</h2>
-<p class="help">A non-functional mockup of what a customer would see -- pick a plan below to
-preview the review screen. Nothing here is wired to real billing yet.</p>
+<h2 data-lang="de">Buchprozess-Vorschau</h2><h2 data-lang="en" style="display:none">Booking flow preview</h2>
+<p class="help" data-lang="de">Ein nicht-funktionaler Entwurf dessen, was ein Kunde sehen würde -- Plan
+ auswählen für die Vorschau. Hier ist noch nichts an ein echtes Zahlungssystem angebunden.</p>
+<p class="help" data-lang="en" style="display:none">A non-functional mockup of what a customer would
+ see -- pick a plan below to preview the review screen. Nothing here is wired to real billing yet.</p>
 <div id="bookingPicker" class="cards"></div>
 <div id="bookingReview" style="display:none" class="card" style="max-width:28rem">
  <h3 id="reviewPlanName"></h3>
@@ -3036,6 +3077,18 @@ preview the review screen. Nothing here is wired to real billing yet.</p>
  <button class="sec" onclick="document.getElementById('bookingReview').style.display='none'">Back</button>
 </div>
 <script>
+function setPageLang(lang){{
+ document.querySelectorAll('[data-lang]').forEach(function(el){{
+  el.style.display = (el.getAttribute('data-lang') === lang) ? '' : 'none';
+ }});
+ try {{ localStorage.setItem('ct-pricing-preview-lang', lang); }} catch (e) {{}}
+ return false;
+}}
+(function(){{
+ var saved = null;
+ try {{ saved = localStorage.getItem('ct-pricing-preview-lang'); }} catch (e) {{}}
+ setPageLang(saved === 'en' ? 'en' : 'de');
+}})();
 var PLANS = {plans_js};
 (function(){{
  var picker = document.getElementById('bookingPicker');
@@ -3061,6 +3114,8 @@ var PLANS = {plans_js};
         cols = cols,
         rows = rows,
         plans_js = plans_js,
+        standard_ai_note = standard_ai_note,
+        whisper_note = whisper_note,
     );
     admin_page("pricing", session, &body)
 }
