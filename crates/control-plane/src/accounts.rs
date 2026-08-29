@@ -45,6 +45,12 @@ pub enum LedgerError {
     /// this today; the in-memory [`Ledger`] above has no blocked concept (it
     /// backs `http.rs`'s test-infra surface, not a real admission path).
     AccountBlocked,
+    /// The device+user fingerprint `ct-agent signup` reported is already tied to the
+    /// configured maximum number of distinct accounts (anti-abuse: repeat free-account
+    /// creation on the same machine). Only [`crate::storage::SqliteLedger::
+    /// account_for_subject_with_device_cap`] produces this -- it never blocks a
+    /// *returning* subject, only the creation of a brand-new account.
+    DeviceLimitExceeded,
 }
 
 impl std::fmt::Display for LedgerError {
@@ -61,6 +67,10 @@ impl std::fmt::Display for LedgerError {
                 write!(f, "credit amount {amount} exceeds the maximum {}", i64::MAX)
             }
             LedgerError::AccountBlocked => write!(f, "this account is blocked"),
+            LedgerError::DeviceLimitExceeded => write!(
+                f,
+                "this device is already linked to the maximum number of free accounts"
+            ),
         }
     }
 }

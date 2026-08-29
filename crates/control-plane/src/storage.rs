@@ -1379,6 +1379,11 @@ pub struct AccountSummaryRow {
     pub blocked: bool,
     pub max_tunnels: u32,
     pub max_channels: u32,
+    /// The `ct-agent signup` device+user fingerprint this account was created with, if
+    /// any (anti-abuse repeat-signup cap) -- `None` for accounts created before this
+    /// existed, or created via a path that doesn't report one (portal browser signup,
+    /// admin-provisioned tenants).
+    pub device_fingerprint: Option<String>,
 }
 
 sqlite_store_ctors!(SqliteLedger);
@@ -1430,6 +1435,12 @@ impl SqliteLedger {
         // see [`Self::is_blocked`]'s doc for the "a flag nobody checks is worthless"
         // reasoning. DEFAULT 0 keeps every existing account unblocked on upgrade.
         ensure_column(&conn, "accounts", "blocked", "INTEGER NOT NULL DEFAULT 0")?;
+        // Anti-abuse (repeat free-account creation): the machine+OS-user fingerprint hash
+        // `ct-agent signup` reports, captured only at account-creation time -- see
+        // `account_for_subject_with_device_cap`. NULL for every pre-existing account and
+        // for accounts created via any other path (portal browser signup, admin-issued
+        // join tokens), which carry no such signal and are never capped by it.
+        ensure_column(&conn, "accounts", "device_fingerprint", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1576,7 +1587,7 @@ impl SqliteLedger {
     pub fn list_accounts(&self) -> rusqlite::Result<Vec<AccountSummaryRow>> {
         let conn = self.conn.lock_safe();
         let mut stmt = conn.prepare(
-            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels, a.max_channels
+            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels, a.max_channels, a.device_fingerprint
              FROM account_subjects s JOIN accounts a ON a.account = s.account
              ORDER BY s.subject",
         )?;
@@ -1590,6 +1601,7 @@ impl SqliteLedger {
                     blocked: r.get::<_, i64>(3)? != 0,
                     max_tunnels: r.get::<_, i64>(4)?.max(0) as u32,
                     max_channels: r.get::<_, i64>(5)?.max(0) as u32,
+                    device_fingerprint: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1648,6 +1660,79 @@ impl SqliteLedger {
         };
         tx.commit()?;
         Ok(account)
+    }
+
+    /// Like [`Self::account_for_subject`], but for the self-service `ct-agent signup`
+    /// path only (`portal_api::me_signup`): when `subject` has no account yet AND
+    /// `device_fingerprint` is `Some`, refuses to create one if that fingerprint is
+    /// already tied to `cap` or more distinct existing accounts
+    /// ([`LedgerError::DeviceLimitExceeded`]). A *returning* subject (one that already
+    /// has an account) is never capped, regardless of fingerprint -- the cap only
+    /// gates the creation of a brand-new account, matching the "raise the bar on
+    /// repeat signup, don't lock out an existing user" intent. `cap == 0` disables the
+    /// check entirely (treated as "no limit configured"). The fingerprint is recorded
+    /// only at creation time and never overwritten afterward, mirroring
+    /// `account_for_subject`'s own "first login wins" idempotency.
+    pub fn account_for_subject_with_device_cap(
+        &self,
+        subject: &str,
+        device_fingerprint: Option<&str>,
+        cap: u32,
+    ) -> Result<AccountId, LedgerOpError> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let existing: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT account FROM account_subjects WHERE subject = ?1",
+                params![subject],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let account = if let Some(bytes) = existing {
+            let a = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                LedgerOpError::Db(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    "account_subjects.account is not 32 bytes".into(),
+                ))
+            })?;
+            AccountId(a)
+        } else {
+            if let Some(fp) = device_fingerprint.filter(|_| cap > 0) {
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(DISTINCT account) FROM accounts WHERE device_fingerprint = ?1",
+                    params![fp],
+                    |r| r.get(0),
+                )?;
+                if count.max(0) as u32 >= cap {
+                    return Err(LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded));
+                }
+            }
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            tx.execute(
+                "INSERT INTO accounts (account, balance, device_fingerprint) VALUES (?1, 0, ?2)",
+                params![&bytes[..], device_fingerprint],
+            )?;
+            tx.execute(
+                "INSERT INTO account_subjects (subject, account) VALUES (?1, ?2)",
+                params![subject, &bytes[..]],
+            )?;
+            AccountId(bytes)
+        };
+        tx.commit()?;
+        Ok(account)
+    }
+
+    /// Admin-only reset (ADR-0025 admin console, `/admin-ui/accounts`): null out one
+    /// account's device fingerprint, freeing one slot under that hash's cap without
+    /// touching any sibling account that shares it. No-op if `account` doesn't exist.
+    pub fn clear_device_fingerprint(&self, account: &AccountId) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "UPDATE accounts SET device_fingerprint = NULL WHERE account = ?1",
+            params![&account.0[..]],
+        )?;
+        Ok(())
     }
 
     /// Readiness probe: can this process actually read its database?
@@ -8473,6 +8558,83 @@ mod tests {
         // The bound account is a real, usable account.
         ledger.credit(&a1, 10).unwrap();
         assert_eq!(ledger.balance(&a1).unwrap(), 10);
+    }
+
+    #[test]
+    fn device_cap_refuses_a_third_distinct_account_on_the_same_fingerprint() {
+        // Anti-abuse (repeat free-account creation): `ct-agent signup` reports a
+        // device+user fingerprint; the 3rd DISTINCT account on the same hash is
+        // refused once the cap (2, in this test) is already met.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let fp = Some("deadbeef-fingerprint");
+        ledger.account_for_subject_with_device_cap("subj-a", fp, 2).unwrap();
+        ledger.account_for_subject_with_device_cap("subj-b", fp, 2).unwrap();
+        let err = ledger
+            .account_for_subject_with_device_cap("subj-c", fp, 2)
+            .expect_err("a 3rd distinct account on a cap-2 fingerprint must be refused");
+        assert!(
+            matches!(err, LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded)),
+            "wrong error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn device_cap_never_blocks_a_returning_subject() {
+        // The cap only gates the creation of a brand-new account -- a subject that
+        // already has one (even sharing a fingerprint already at its cap) is never
+        // refused by a later call, e.g. `ct-agent signup` invoked again for a
+        // second tunnel.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let fp = Some("shared-machine-fingerprint");
+        let a1 = ledger.account_for_subject_with_device_cap("subj-a", fp, 1).unwrap();
+        // Cap is already 1/1 for this fingerprint -- a fresh subject would be refused...
+        assert!(matches!(
+            ledger.account_for_subject_with_device_cap("subj-b", fp, 1),
+            Err(LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded))
+        ));
+        // ...but subj-a itself is unaffected, returns the same account, no error.
+        let a1_again = ledger.account_for_subject_with_device_cap("subj-a", fp, 1).unwrap();
+        assert_eq!(a1, a1_again);
+    }
+
+    #[test]
+    fn device_cap_skips_the_check_entirely_without_a_fingerprint_or_cap() {
+        // No fingerprint reported (any caller that isn't `ct-agent signup`, e.g. the
+        // portal browser's `create_tunnel`) or `cap == 0` (not configured): behaves
+        // exactly like the plain, uncapped `account_for_subject` -- unlimited
+        // distinct accounts, fail-open by design.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        for i in 0..5 {
+            ledger
+                .account_for_subject_with_device_cap(&format!("subj-{i}"), None, 2)
+                .unwrap();
+        }
+        let fp = Some("cap-disabled-fingerprint");
+        for i in 0..5 {
+            ledger
+                .account_for_subject_with_device_cap(&format!("subj-cap0-{i}"), fp, 0)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn clear_device_fingerprint_frees_a_slot_without_touching_siblings() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let fp = Some("reset-me-fingerprint");
+        let a1 = ledger.account_for_subject_with_device_cap("subj-a", fp, 2).unwrap();
+        let a2 = ledger.account_for_subject_with_device_cap("subj-b", fp, 2).unwrap();
+        // Cap is 2/2 -- a 3rd is refused.
+        assert!(ledger.account_for_subject_with_device_cap("subj-c", fp, 2).is_err());
+        // Clearing subj-a's fingerprint frees exactly one slot.
+        ledger.clear_device_fingerprint(&a1).unwrap();
+        ledger.account_for_subject_with_device_cap("subj-c", fp, 2).unwrap();
+        // subj-b's own fingerprint is untouched by clearing subj-a's.
+        let rows = ledger.list_accounts().unwrap();
+        let b_row = rows.iter().find(|r| r.subject == "subj-b").unwrap();
+        assert_eq!(b_row.device_fingerprint.as_deref(), Some("reset-me-fingerprint"));
+        let a_row = rows.iter().find(|r| r.subject == "subj-a").unwrap();
+        assert_eq!(a_row.device_fingerprint, None);
+        let _ = a2;
     }
 
     #[test]

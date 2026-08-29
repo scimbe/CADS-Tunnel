@@ -284,6 +284,11 @@ async fn buy_token(
                 // concept and can never produce this -- kept for match exhaustiveness
                 // (the variant is shared with SqliteLedger's real, blocked-aware debit).
                 LedgerError::AccountBlocked => StatusCode::FORBIDDEN,
+                // Anti-abuse device cap: only `SqliteLedger::
+                // account_for_subject_with_device_cap` can produce this -- this
+                // in-memory Ledger has no such concept, kept for match exhaustiveness
+                // (the variant is shared with SqliteLedger's).
+                LedgerError::DeviceLimitExceeded => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (code, e.to_string())
         })?;
