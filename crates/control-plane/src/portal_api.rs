@@ -1188,6 +1188,7 @@ pub fn admin_ui_router(
         .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
         .route("/admin-ui/accounts/:subject/max-channels", post(admin_ui_set_max_channels))
         .route("/admin-ui/accounts/:subject/clear-device-fingerprint", post(admin_ui_clear_device_fingerprint))
+        .route("/admin-ui/accounts/:subject/plan", post(admin_ui_set_plan))
         .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
         .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
         // ADR-0025 Decision 4/6: hostname disable/enable + multi-domain onboarding
@@ -1335,6 +1336,43 @@ async fn admin_ui_clear_device_fingerprint(
     let _ = st
         .audit
         .record(&session.email, "device_fingerprint_cleared", Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct SetPlanReq {
+    /// `""` (empty) clears the plan back to Free; any other value is stored
+    /// verbatim (`crate::ai_usage::PREMIUM_AI_PLANS` checks against
+    /// "medium"/"pro"/"business" specifically, case-sensitive).
+    plan: String,
+}
+
+/// `POST /admin-ui/accounts/:subject/plan {plan}` (admin-identity-gated): the
+/// operator lever for which paid plan an account is on -- until real
+/// self-service billing exists, this is how scimbe marks an account as
+/// Starter/Medium/Pro/Business (unlocking e.g. Premium AI at Medium+, per
+/// `ai_usage::PREMIUM_AI_PLANS`). Once a payment-provider webhook exists, it
+/// can write this same column instead, with zero schema change.
+async fn admin_ui_set_plan(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetPlanReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_plan/account_for_subject", e).into_response(),
+    };
+    let plan = req.plan.trim();
+    let plan = if plan.is_empty() { None } else { Some(plan) };
+    if let Err(e) = st.ledger.set_plan(&account, plan) {
+        return internal_error("admin_ui_set_plan/set", e).into_response();
+    }
+    let _ = st.audit.record(&session.email, "plan_set", Some(&subject), Some(plan.unwrap_or("free")));
     StatusCode::OK.into_response()
 }
 
@@ -3099,10 +3137,10 @@ fn admin_accounts_page_html(
     emails: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut table = String::from(
-        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Signup device</th><th>Actions</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th>Plan</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Signup device</th><th>Actions</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
-        table.push_str(r#"<tr><td colspan="9" class="help">No accounts match.</td></tr>"#);
+        table.push_str(r#"<tr><td colspan="10" class="help">No accounts match.</td></tr>"#);
     }
     for r in rows {
         let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
@@ -3122,6 +3160,19 @@ fn admin_accounts_page_html(
             ),
             None => r#"<span class="help">-</span>"#.to_string(),
         };
+        let plan_value = r.plan.as_deref().unwrap_or("");
+        let plan_option = |value: &str, label: &str| {
+            let selected = if plan_value == value { " selected" } else { "" };
+            format!(r#"<option value="{value}"{selected}>{label}</option>"#)
+        };
+        let plan_options = format!(
+            "{}{}{}{}{}",
+            plan_option("", "Free"),
+            plan_option("starter", "Starter"),
+            plan_option("medium", "Medium"),
+            plan_option("pro", "Pro"),
+            plan_option("business", "Business"),
+        );
         table.push_str(&format!(
             r#"<tr>
 <td>{subject}</td>
@@ -3129,6 +3180,12 @@ fn admin_accounts_page_html(
 <td><code style="word-break:break-all">{account}</code></td>
 <td class="num">{balance}</td>
 <td>{state_badge}</td>
+<td>
+ <form class="inline" data-subject="{subject}" onsubmit="return setPlan(event)">
+  <select name="plan">{plan_options}</select>
+  <button type="submit" class="sec">Set</button>
+ </form>
+</td>
 <td class="num">{max_tunnels}</td>
 <td class="num">{max_channels}</td>
 <td>{device_cell}</td>
@@ -3154,6 +3211,7 @@ fn admin_accounts_page_html(
             account = escape(&r.account_hex),
             balance = r.balance,
             state_badge = state_badge,
+            plan_options = plan_options,
             max_tunnels = r.max_tunnels,
             max_channels = r.max_channels,
             device_cell = device_cell,
@@ -3198,6 +3256,16 @@ function toggleBlock(ev){{
  adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/' + action)
   .then(function(){{ location.reload(); }})
   .catch(function(e){{ window.alert(action + ' failed: ' + e.message); }});
+ return false;
+}}
+function setPlan(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var plan = form.plan.value;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/plan', {{plan: plan}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('plan update failed: ' + e.message); }});
  return false;
 }}
 function setMaxTunnels(ev){{

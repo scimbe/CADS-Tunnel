@@ -704,6 +704,11 @@ async fn buy_token(
                         LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => {
                             StatusCode::INTERNAL_SERVER_ERROR
                         }
+                        // Free-tier AI-usage cap: only `ai_usage`'s debit calls can
+                        // produce this -- unreachable here, kept for exhaustiveness.
+                        LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded) => {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
                         LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     (code, e.to_string())
@@ -731,6 +736,11 @@ async fn buy_token(
                     // Anti-abuse device cap: unreachable via debit() on an already-
                     // existing account, same reasoning as the keyed arm above.
                     LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                    // Free-tier AI-usage cap: only `ai_usage`'s debit calls can
+                    // produce this -- unreachable here, kept for exhaustiveness.
+                    LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded) => {
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
                     LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -4155,6 +4165,9 @@ async fn me_issue(
             // `me_signup` account-creation path) can produce this -- unreachable via
             // debit() on an already-existing account, kept for match exhaustiveness.
             LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Free-tier AI-usage cap: only `ai_usage`'s debit calls can produce
+            // this -- unreachable here, kept for match exhaustiveness.
+            LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded) => StatusCode::INTERNAL_SERVER_ERROR,
             LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match &idempotency_key {
@@ -6203,6 +6216,14 @@ pub fn persistent_control_plane_router(
                 ledger.clone(),
                 oidc.clone(),
                 AUTHED_ISSUES_PER_WINDOW,
+            ))
+            // AI-usage metering (`/me/ai/*`) -- always mounted, fails soft (503)
+            // per-route when its specific backend isn't configured, matching
+            // `authed_billing_router`'s own "/me/* always mounted" posture (#328).
+            .merge(crate::ai_usage::ai_usage_router(
+                ledger.clone(),
+                oidc.clone(),
+                crate::ai_usage::AiBackendConfig::from_env(),
             ))
             // Keycloak/account overhaul: "delete my account and all data" cascades
             // across every store keyed by a portal subject -- see

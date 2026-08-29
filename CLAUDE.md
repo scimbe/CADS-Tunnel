@@ -109,3 +109,16 @@ Rust application code lives in a Cargo workspace under `crates/`. Supporting tre
 - NEVER create documentation files unless explicitly requested
 - Use `superclaude commit` for commit messages when committing
 - For any non-trivial task, first check whether a skill in `~/.claude/skills/` fits (via the `using-agent-skills` meta-skill) before solving it by hand
+
+## Pricing/legal display rule (2026-08-29, operator directive)
+
+**Every customer-facing price must carry its VAT disclosure right next to the price
+itself, not only in the Impressum** (Preisangabenverordnung; the §19 UStG Kleinunternehmer
+exemption note is a separate, additional requirement while that status applies).
+Never format a price as a bare string — always go through
+`crate::pricing::gross_price_label(cents, vat_mode)` (HTML contexts) or
+`vat_mode.disclosure_note()` (plain-text contexts like an invoice or email). The active
+`VatMode` is configured via `CT_PRICING_VAT_MODE` (`crate::pricing::PricingConfig`), not
+hardcoded — it must change the moment the Kleinunternehmer revenue threshold is crossed,
+and nothing currently watches for that, so treat any change of business VAT status as a
+reason to update this env var immediately.

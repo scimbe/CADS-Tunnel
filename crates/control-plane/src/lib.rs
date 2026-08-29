@@ -9,6 +9,7 @@
 
 pub mod accounts;
 pub mod acme_broker;
+pub mod ai_usage;
 pub mod admin_identity;
 pub mod audit_log;
 pub mod billing;
