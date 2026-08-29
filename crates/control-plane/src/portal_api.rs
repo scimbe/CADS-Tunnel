@@ -4513,6 +4513,7 @@ pub fn channel_claim_router(
         .route("/portal/channels/:channel/manage/allowlist-add", post(manage_allowlist_add))
         .route("/portal/channels/:channel/manage/remove-allowlist/:email", post(manage_allowlist_remove))
         .route("/portal/channels/:channel/manage/deposit-grant", post(manage_deposit_grant))
+        .route("/portal/channels/:channel/manage/delete", post(manage_delete_channel))
         .route("/portal/channels/:channel/claim", get(claim_page).post(claim_channel))
         .route("/portal/channels/:channel/grant", get(fetch_deposited_grant))
         .route("/portal/channels/:channel/claim-form", post(claim_page_submit))
@@ -5220,6 +5221,13 @@ to them out of band.</p>
  <button type="submit">Deposit grant</button>
 </form>
 
+<h2>Delete this channel</h2>
+<p class="help">Permanently deletes the channel, every member, and every allow-listed e-mail. Grants
+already handed out (or deposited above) stop working immediately. This cannot be undone.</p>
+<form method="post" action="/portal/channels/{channel_hex}/manage/delete" onsubmit="return window.confirm('Permanently delete this channel? This removes every member and allow-list entry and cannot be undone.');">
+ <button class="danger" type="submit">Delete channel</button>
+</form>
+
 <a class="btn sec" href="/portal/channels">Back to your channels</a>"#
     );
     page("manage channel", &body, email)
@@ -5287,6 +5295,30 @@ async fn manage_remove_member(
     match st.channels.remove_member(&ct_common::channel::ChannelId(channel), &claims.subject, &holder) {
         Ok(_) => Redirect::to(&manage_url).into_response(),
         Err(e) => internal_error("manage_remove_member/remove_member", e).into_response(),
+    }
+}
+
+/// #113-ui-delete: the manage page had every member/allowlist-entry `Remove` action but
+/// no way to delete the CHANNEL itself -- `DELETE /me/channels/:channel`
+/// (`SqliteChannelStore::delete_channel`) already existed and is unit-tested (service.rs
+/// `channel_delete_route_is_owner_scoped_and_fully_deregisters`), the only path that ever
+/// called it from this portal was the whole-account-deletion cascade. Found live by the
+/// operator ("ich kann keinen channel loeschen?").
+async fn manage_delete_channel(State(st): State<ClaimState>, headers: HeaderMap, Path(channel_hex): Path<String>) -> Response {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+    };
+    let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
+    };
+    match st.channels.delete_channel(&claims.subject, &ct_common::channel::ChannelId(channel)) {
+        // `delete_channel` returning `false` means the caller isn't the owner (or the
+        // channel doesn't exist) -- same "don't distinguish unknown-channel from
+        // not-owner" posture the manage page already takes everywhere else (403, not a
+        // silently-ignored redirect that would look like it worked).
+        Ok(true) => Redirect::to("/portal/channels").into_response(),
+        Ok(false) => (StatusCode::FORBIDDEN, "not the channel owner").into_response(),
+        Err(e) => internal_error("manage_delete_channel/delete_channel", e).into_response(),
     }
 }
 
@@ -10064,6 +10096,46 @@ mod tests {
             StatusCode::SEE_OTHER
         );
         assert!(channels.members_of(&ch, "alice").unwrap().unwrap().is_empty(), "removed");
+    }
+
+    /// #113-ui-delete: the manage page's every other row had a Remove action, but the
+    /// channel itself had no delete button anywhere -- `DELETE /me/channels/:channel`
+    /// existed and was already unit-tested, just never wired to any portal UI. Found
+    /// live by the operator ("ich kann keinen channel loeschen?").
+    #[tokio::test]
+    async fn manage_delete_channel_is_owner_scoped_and_actually_deletes() {
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ct_common::channel::ChannelId([0x55; 32]);
+        channels.register_channel(&ch, &[0x66; 32], "alice").unwrap();
+        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let ch_hex = hex(&ch.0);
+
+        // The button is present on the owner's manage page.
+        let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
+        assert!(
+            manage_html.contains(&format!("/portal/channels/{ch_hex}/manage/delete")),
+            "delete form present on the manage page: {manage_html}"
+        );
+        assert!(manage_html.contains("window.confirm"), "destructive action is confirmed client-side before it fires");
+
+        // A non-owner can't delete someone else's channel.
+        assert_eq!(
+            post_form(&app, &format!("/portal/channels/{ch_hex}/manage/delete"), "mallory", "").await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(channels.channels_owned_by("alice").unwrap().iter().any(|c| hex(&c.0) == ch_hex), "mallory's attempt left it intact");
+
+        // The real owner can, and it's actually gone afterward -- not just a redirect
+        // that looks like success while the row survives.
+        let resp = post_form_response(&app, &format!("/portal/channels/{ch_hex}/manage/delete"), "alice", "").await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap().to_str().unwrap(), "/portal/channels");
+        assert!(channels.channels_owned_by("alice").unwrap().is_empty(), "channel actually deleted, not just redirected away from");
+        assert_eq!(
+            get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await.0,
+            StatusCode::FORBIDDEN,
+            "re-visiting the manage page for a deleted channel is refused, not a stale 200"
+        );
     }
 
     /// The allow-list form closes the loop the operator actually asked for: an owner
