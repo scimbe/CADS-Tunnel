@@ -106,6 +106,11 @@ struct ApiState {
     /// account deletion) — `None` when OIDC isn't configured, in which case the
     /// account page simply omits the link rather than pointing at nothing.
     account_console_url: Option<Arc<str>>,
+    /// The realm's own OIDC issuer URL (`CT_OIDC_ISSUER`), e.g.
+    /// `https://auth.example/realms/ct-demo` -- `None` when OIDC isn't configured.
+    /// Baked directly into the Install page's `ct-agent login` copy block so a user
+    /// never has to know or type this value themselves (#113-ui-issuer).
+    oidc_issuer: Option<Arc<str>>,
     /// Records which edge owns a tunnel's (token, hostname) once it's authorized —
     /// the multi-edge ownership registry's first hook point (edge_mesh Phase 0).
     /// Always present (no config gate): purely additive bookkeeping alongside the
@@ -130,6 +135,7 @@ pub fn portal_api_router(
     edge_admin: Option<(String, String)>,
     dns: Option<(DesecClient, String)>,
     account_console_url: Option<String>,
+    oidc_issuer: Option<String>,
     edge_mesh: EdgeMeshHandle,
     admin_token: Option<[u8; 32]>,
 ) -> Router {
@@ -149,6 +155,7 @@ pub fn portal_api_router(
             edge_ip: Arc::from(edge_ip),
         }),
         account_console_url: account_console_url.map(Arc::from),
+        oidc_issuer: oidc_issuer.map(Arc::from),
         edge_mesh,
         admin_token,
     };
@@ -3463,8 +3470,19 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
         .as_deref()
         .map(|h| format!("\nCT_AGENT_HOSTNAME={h}   # this tunnel's own assigned hostname -- for CT_AGENT_MODE=browser and `ct-agent certificate`"))
         .unwrap_or_default();
+    // #113-ui-issuer: also in the SAME .env this page already has the reader `source`
+    // before running the agent -- so `ct-agent login` (Agent-Fabric channels) needs
+    // nothing typed beyond the command itself, no separate value to look up or copy.
+    // CT_OIDC_ISSUER is a public realm URL, not a credential -- safe to bake in
+    // directly, same trust level as CT_AGENT_CP_URL/CT_AGENT_EDGE above. Omitted
+    // entirely (not a broken placeholder) when OIDC isn't configured at all.
+    let oidc_issuer_line = st
+        .oidc_issuer
+        .as_deref()
+        .map(|iss| format!("\nCT_OIDC_ISSUER={iss}   # only needed for `ct-agent login` (Agent-Fabric channels, optional)"))
+        .unwrap_or_default();
     let env_block = format!(
-        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_EDGE_CERT_URL={cp}{hostname_line}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
+        "CT_AGENT_JOIN_TOKEN={jt}\nCT_AGENT_TOKEN={rt}\nCT_AGENT_ID={id}\nCT_AGENT_CP_URL={cp}\nCT_AGENT_EDGE={edge}\nCT_AGENT_EDGE_CERT_URL={cp}{hostname_line}{oidc_issuer_line}\nCT_AGENT_ORIGIN=127.0.0.1:8080   # <- change to your own service's host:port",
         jt = token,
         rt = routing_token,
         id = id,
@@ -3483,6 +3501,31 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     // Cargo cross-compile convention (this repo has no Windows CI/build docs
     // that say otherwise).
     let run_cmd_ps = "Get-Content .env | ForEach-Object {\n  if ($_ -match '^\\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$') {\n    $value = $matches[2] -replace '\\s+#.*$', ''\n    [System.Environment]::SetEnvironmentVariable($matches[1], $value.Trim(), 'Process')\n  }\n}\n.\\target\\release\\ct-agent.exe onboard";
+    // #113-ui-issuer: Agent-Fabric channels (`ct-agent channel register`/`allowlist`)
+    // need a separate OIDC bearer token, obtained via `ct-agent login`. CT_OIDC_ISSUER
+    // now rides in the SAME .env block above (sourced before this ever runs), so
+    // nothing here needs to repeat or re-derive it -- just the bare command. Omitted
+    // entirely (no broken/empty section) when OIDC isn't configured on this
+    // deployment at all.
+    let channel_login_section = if st.oidc_issuer.is_some() {
+        r#"<h2>Optional: log in for Agent-Fabric channels</h2>
+<p class="help">Only needed if this agent will also use
+<a href="https://github.com/scimbe/ct-agent/blob/main/docs/channel.md">channels</a>
+(<code>channel register</code>/<code>channel allowlist</code>) -- plain tunnelling above needs
+none of this. Run once, on the same machine, after sourcing the <code>.env</code> above
+(it already carries <code>CT_OIDC_ISSUER</code>):</p>
+<div class="code-block">
+ <div class="code-block-head"><span>shell</span><button class="copy-btn" onclick="copyCode(this)" type="button">Copy</button></div>
+ <pre><code>./target/release/ct-agent login</code></pre>
+</div>
+<p class="help">Prints a URL + short code -- open it in any browser and authorize. The token is
+then stored and refreshed automatically; <code>channel register</code>/<code>allowlist</code> pick
+it up with no further setup.</p>
+"#
+        .to_string()
+    } else {
+        String::new()
+    };
     let body = format!(
         r#"<h1>Install an agent</h1>
 <p class="help">Save this <strong>on the machine you want to expose</strong> &mdash;
@@ -3529,6 +3572,7 @@ as <code>.env</code> <strong>next to the binary, on the machine you want to expo
  for troubleshooting.</p>
 </details>
 
+{channel_login_section}
 <a class="btn sec" href="/portal/tunnels">Back to tunnels</a>"#,
     );
     Html(page("install", &body, claims.email.as_deref())).into_response()
@@ -6467,6 +6511,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             None,
         );
@@ -6578,6 +6623,7 @@ mod tests {
             None,
             None,
             Some("https://auth.example/realms/ct-demo/account".to_string()),
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             None,
         );
@@ -6920,6 +6966,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             Some(secret),
         );
@@ -6974,6 +7021,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             Some(secret),
         );
@@ -7036,6 +7084,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             Some(secret),
         );
@@ -7220,6 +7269,7 @@ mod tests {
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
             None,
+            None, // oidc_issuer (test)
             edge_mesh,
             None,
         );
@@ -7311,6 +7361,7 @@ mod tests {
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             Some((desec, "1.2.3.4".to_string())),
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(mesh_store.clone(), Arc::from("primary")),
             None,
         );
@@ -7423,6 +7474,7 @@ mod tests {
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()), Arc::from("primary")),
             None,
         );
@@ -7460,6 +7512,7 @@ mod tests {
             None, // no edge_admin
             None,
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()), Arc::from("primary")),
             None,
         );
@@ -7491,6 +7544,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
             Some(secret),
         );
@@ -7575,6 +7629,7 @@ mod tests {
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             None,
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
             Some(secret),
         );
@@ -7629,6 +7684,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
             Some(secret),
         );
@@ -7707,6 +7763,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             None,
         );
@@ -8607,6 +8664,7 @@ mod tests {
             None,
             Some((desec, "1.2.3.4".to_string())),
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(mesh_store, Arc::from("primary")),
             None,
         );
@@ -8636,6 +8694,7 @@ mod tests {
             None,
             None,
             None,
+            None, // oidc_issuer (test)
             EdgeMeshHandle::new(no_dns_mesh, Arc::from("primary")),
             None,
         );
@@ -8690,6 +8749,7 @@ mod tests {
             None,
             Some((desec, "45.133.9.145".to_string())),
             None,
+            None, // oidc_issuer (test)
             test_edge_mesh(),
             None,
         );
@@ -8916,6 +8976,51 @@ mod tests {
         // The .env block itself is OS-agnostic and must appear exactly once,
         // not duplicated in a PowerShell-specific rendering.
         assert_eq!(html.matches("CT_AGENT_JOIN_TOKEN=").count(), 1, ".env content is not duplicated for PowerShell");
+        // #113-ui-issuer: test_app() has no OIDC configured, so the channel-login
+        // section (and its .env line) must be omitted entirely -- never a broken
+        // placeholder shown as if it worked.
+        assert!(!html.contains("CT_OIDC_ISSUER="), "no OIDC issuer line when OIDC isn't configured");
+        assert!(!html.contains("ct-agent login"), "no channel-login section when OIDC isn't configured");
+    }
+
+    #[tokio::test]
+    async fn install_page_bakes_the_real_oidc_issuer_into_the_env_block_when_configured() {
+        // Same shape as test_app() (see above) but with oidc_issuer actually set --
+        // isolate this one test rather than changing test_app()'s default, since
+        // most other tests in this module assert install-page content assuming OIDC
+        // is unconfigured (the more common self-hosted case without SSO set up).
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger,
+            tunnels,
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            Some("https://auth.example/realms/ct-demo".to_string()),
+            test_edge_mesh(),
+            None,
+        );
+        post_form(&app, "/portal/tunnels", "alice", "name=web").await;
+        let id = first_id(&get(&app, "/portal/tunnels", Some("alice")).await.1);
+        let (status, html) = get(&app, &format!("/portal/tunnels/{id}/install"), Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The real value rides in the SAME .env block as the other tokens -- not a
+        // separate copy-paste step, and never a placeholder the reader has to fill in.
+        assert!(
+            html.contains("CT_OIDC_ISSUER=https://auth.example/realms/ct-demo"),
+            "the real issuer URL is baked directly into the .env block"
+        );
+        assert_eq!(html.matches("CT_OIDC_ISSUER=").count(), 1, "the issuer line is not duplicated");
+        // The login command itself needs nothing typed beyond the binary name --
+        // the .env sourced just above it already carries CT_OIDC_ISSUER.
+        assert!(html.contains("<pre><code>./target/release/ct-agent login</code></pre>"), "bare login command, no repeated/placeholder issuer");
+        assert!(html.contains("Agent-Fabric channels"), "the optional channel-login section is shown");
     }
 
     /// #512 was written to stop the ct-agent pin from scattering again — "seven pins with
