@@ -16,10 +16,12 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 
-use crate::accounts::AccountId;
+use crate::accounts::{AccountId, LedgerError};
 use crate::edge_mesh::EdgeMeshHandle;
 use crate::portal::{escape, session_claims_for, session_subject_for};
-use crate::storage::{GrantError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore, SubjectTunnel};
+use crate::storage::{
+    GrantError, LedgerOpError, SqliteBootstrap, SqliteEnrollment, SqliteLedger, SqliteTunnelStore, SubjectTunnel,
+};
 use ct_common::TenantId;
 use ct_dns::provider::DesecClient;
 
@@ -121,10 +123,27 @@ struct ApiState {
     /// auto-assigns one). `None` disables the route entirely (404s), matching
     /// this crate's "absent unless configured" convention.
     admin_token: Option<[u8; 32]>,
+    /// OIDC verifier for `/me/signup`'s Bearer-token auth (`ct-agent signup`, the
+    /// CLI-driven counterpart to the portal browser's session-cookie `create_tunnel`).
+    /// `None` when OIDC isn't configured -- matches this crate's "absent unless
+    /// configured" convention (#543): [`portal_api_router`] (the original, still-used-
+    /// by-every-existing-caller entry point) passes `None`, so nothing that doesn't
+    /// know about this new path needs to change; [`portal_api_router_with_verifier`]
+    /// is the one real callers should use to actually get `/me/signup` live.
+    verifier: Option<crate::oidc::OidcVerifierHandle>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
 /// `edge_admin` is `(base_url, admin_token)` for the edge revoke API (#27 RB4b).
+///
+/// This is the original entry point every existing caller (production wiring, every
+/// test in this file) already uses -- kept with its original signature so none of them
+/// need to change. It always passes `verifier: None` to
+/// [`portal_api_router_with_verifier`], which means `/me/signup` (`ct-agent signup`'s
+/// anti-abuse-capped CLI entry point) is simply absent (404) on a router built this way,
+/// same "absent unless configured" posture as `dns`/`edge_admin` above. Real production
+/// wiring that wants `/me/signup` live should call
+/// [`portal_api_router_with_verifier`] directly instead.
 pub fn portal_api_router(
     session_key: &[u8],
     ledger: Arc<SqliteLedger>,
@@ -138,6 +157,44 @@ pub fn portal_api_router(
     oidc_issuer: Option<String>,
     edge_mesh: EdgeMeshHandle,
     admin_token: Option<[u8; 32]>,
+) -> Router {
+    portal_api_router_with_verifier(
+        session_key,
+        ledger,
+        tunnels,
+        enrollment,
+        bootstrap,
+        portal_base,
+        edge_admin,
+        dns,
+        account_console_url,
+        oidc_issuer,
+        edge_mesh,
+        admin_token,
+        None,
+    )
+}
+
+/// Like [`portal_api_router`], plus an optional OIDC verifier that -- when `Some` --
+/// additionally mounts `POST /me/signup` and `GET /device-limit-reached`
+/// (`ct-agent signup`'s Bearer-authenticated, device-cap-checked counterpart to the
+/// portal browser's session-cookie `create_tunnel`). `verifier: None` behaves exactly
+/// like [`portal_api_router`] (those two routes absent, 404).
+#[allow(clippy::too_many_arguments)]
+pub fn portal_api_router_with_verifier(
+    session_key: &[u8],
+    ledger: Arc<SqliteLedger>,
+    tunnels: Arc<SqliteTunnelStore>,
+    enrollment: Arc<SqliteEnrollment>,
+    bootstrap: Arc<SqliteBootstrap>,
+    portal_base: &str,
+    edge_admin: Option<(String, String)>,
+    dns: Option<(DesecClient, String)>,
+    account_console_url: Option<String>,
+    oidc_issuer: Option<String>,
+    edge_mesh: EdgeMeshHandle,
+    admin_token: Option<[u8; 32]>,
+    verifier: Option<crate::oidc::OidcVerifierHandle>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -158,8 +215,9 @@ pub fn portal_api_router(
         oidc_issuer: oidc_issuer.map(Arc::from),
         edge_mesh,
         admin_token,
+        verifier: verifier.clone(),
     };
-    Router::new()
+    let mut router = Router::new()
         .route("/portal/account", get(account_page))
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
@@ -170,8 +228,13 @@ pub fn portal_api_router(
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
         .route("/admin/provision-tunnel", post(admin_provision_tunnel))
         .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
-        .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
-        .with_state(state)
+        .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels));
+    if verifier.is_some() {
+        router = router
+            .route("/me/signup", post(me_signup))
+            .route("/device-limit-reached", get(device_limit_reached_page));
+    }
+    router.with_state(state)
 }
 
 #[derive(Deserialize)]
@@ -1121,6 +1184,7 @@ pub fn admin_ui_router(
         .route("/admin-ui/accounts/:subject/delete", post(admin_ui_delete_account))
         .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
         .route("/admin-ui/accounts/:subject/max-channels", post(admin_ui_set_max_channels))
+        .route("/admin-ui/accounts/:subject/clear-device-fingerprint", post(admin_ui_clear_device_fingerprint))
         .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
         .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
         // ADR-0025 Decision 4/6: hostname disable/enable + multi-domain onboarding
@@ -1239,6 +1303,34 @@ async fn admin_ui_set_blocked(
         return internal_error("admin_ui_set_blocked/set_blocked", e).into_response();
     }
     let _ = st.audit.record(&session.email, action, Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/clear-device-fingerprint` (admin-identity-gated):
+/// the manual-reset half of the `ct-agent signup` device-cap anti-abuse mechanism
+/// (`SqliteLedger::account_for_subject_with_device_cap`). Not self-service by design --
+/// scimbe reads a reset request (support email) and decides, then clears this one
+/// account's fingerprint here, freeing a slot under that hash's cap without touching
+/// any sibling account that shares it.
+async fn admin_ui_clear_device_fingerprint(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_clear_device_fingerprint/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.clear_device_fingerprint(&account) {
+        return internal_error("admin_ui_clear_device_fingerprint/clear", e).into_response();
+    }
+    let _ = st
+        .audit
+        .record(&session.email, "device_fingerprint_cleared", Some(&subject), None);
     StatusCode::OK.into_response()
 }
 
@@ -2840,15 +2932,29 @@ fn admin_accounts_page_html(
     emails: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut table = String::from(
-        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Actions</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Signup device</th><th>Actions</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
-        table.push_str(r#"<tr><td colspan="8" class="help">No accounts match.</td></tr>"#);
+        table.push_str(r#"<tr><td colspan="9" class="help">No accounts match.</td></tr>"#);
     }
     for r in rows {
         let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
         let block_label = if r.blocked { "Unblock" } else { "Block" };
         let email = emails.get(&r.subject).map(|e| escape(e)).unwrap_or_else(|| r#"<span class="help">-</span>"#.to_string());
+        // Anti-abuse (repeat free-account creation, `ct-agent signup`): only accounts
+        // created via that path carry a fingerprint at all -- everything else (portal
+        // browser signup, admin-provisioned tenants) shows "-" and gets no Clear button,
+        // since there's nothing to clear.
+        let device_cell = match &r.device_fingerprint {
+            Some(fp) => format!(
+                r#"<code style="word-break:break-all" title="{full}">{short}…</code>
+ <button class="sec" data-subject="{subject}" onclick="return clearDeviceFingerprint(event)">Clear</button>"#,
+                full = escape(fp),
+                short = escape(&fp.chars().take(12).collect::<String>()),
+                subject = escape(&r.subject),
+            ),
+            None => r#"<span class="help">-</span>"#.to_string(),
+        };
         table.push_str(&format!(
             r#"<tr>
 <td>{subject}</td>
@@ -2858,6 +2964,7 @@ fn admin_accounts_page_html(
 <td>{state_badge}</td>
 <td class="num">{max_tunnels}</td>
 <td class="num">{max_channels}</td>
+<td>{device_cell}</td>
 <td><div style="display:flex;flex-wrap:wrap;gap:.35rem;align-items:center">
  <form class="inline" data-subject="{subject}" onsubmit="return creditAccount(event)">
   <input type="number" name="amount" min="1" value="100" style="width:5rem">
@@ -2882,6 +2989,7 @@ fn admin_accounts_page_html(
             state_badge = state_badge,
             max_tunnels = r.max_tunnels,
             max_channels = r.max_channels,
+            device_cell = device_cell,
             blocked_flag = r.blocked,
             block_label = block_label,
         ));
@@ -2954,6 +3062,15 @@ function deleteAccount(ev){{
  adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/delete')
   .then(function(){{ location.reload(); }})
   .catch(function(e){{ window.alert('delete failed: ' + e.message); }});
+ return false;
+}}
+function clearDeviceFingerprint(ev){{
+ ev.preventDefault();
+ var subject = ev.target.getAttribute('data-subject');
+ if(!window.confirm('Clear the signup-device fingerprint for ' + subject + '? Only do this after reviewing a real reset request -- it frees one slot under that device\'s free-account cap.')) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/clear-device-fingerprint')
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('clear failed: ' + e.message); }});
  return false;
 }}
 </script>"#,
@@ -3310,7 +3427,11 @@ async fn create_tunnel(
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tunnel name required").into_response();
     }
-    let account = match st.ledger.account_for_subject(&subject) {
+    // `device_fingerprint: None` here degrades `account_for_subject_with_device_cap` to
+    // identical behavior to the plain `account_for_subject` this used to call -- the
+    // repeat-signup device cap only applies to the `ct-agent signup` path (`me_signup`),
+    // which is the only caller that has a fingerprint to report.
+    let account = match st.ledger.account_for_subject_with_device_cap(&subject, None, DEVICE_SIGNUP_CAP) {
         Ok(a) => a,
         Err(e) => return internal_error("create_tunnel/account_for_subject", e).into_response(),
     };
@@ -3375,6 +3496,125 @@ async fn create_tunnel(
     };
     authorize_hostname(&st, &tunnel).await;
     Redirect::to("/portal/tunnels").into_response()
+}
+
+/// Anti-abuse (repeat free-account creation): the cap on distinct accounts sharing one
+/// `ct-agent signup`-reported device+user fingerprint hash. A plain, publicly-inspectable
+/// constant, not a business secret like the pricing numbers -- see the plan's own framing
+/// ("the specific cap ... stay simple constants").
+const DEVICE_SIGNUP_CAP: u32 = 2;
+
+#[derive(Deserialize)]
+struct MeSignupReq {
+    name: String,
+    /// `sha256(machine_id || "\0" || os_username)`, computed client-side by `ct-agent
+    /// signup` -- see its own doc for exactly what feeds the hash. `None` from any
+    /// caller that isn't ct-agent's new signup flow; the cap simply doesn't apply then
+    /// (`account_for_subject_with_device_cap`'s own fail-open behavior).
+    device_fingerprint: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MeSignupResp {
+    routing_token: String,
+    hostname: Option<String>,
+}
+
+/// `POST /me/signup` (Bearer-JWT-authenticated, `ct-agent signup`'s own entry point):
+/// the CLI-driven counterpart to the portal browser's `create_tunnel` -- same admission
+/// rules (blocked check, `max_tunnels` gate, atomic owned-limit create, edge-authorize +
+/// DNS), reached via the OIDC access token `ct-agent login`'s device-code flow already
+/// obtains instead of a portal session cookie. The one thing this path adds over
+/// `create_tunnel`: when the caller reports a device fingerprint, a brand-new account is
+/// refused past `DEVICE_SIGNUP_CAP` distinct accounts already tied to that same hash
+/// (anti-abuse: repeat free-account creation on one machine). Returns the routing token
+/// directly so the CLI can start serving with zero manual copy-paste.
+async fn me_signup(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<MeSignupReq>,
+) -> Result<Json<MeSignupResp>, (StatusCode, String)> {
+    let Some(verifier) = &st.verifier else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "OIDC verifier not configured".to_string()));
+    };
+    let subject = crate::service::subject_of(verifier, &headers)?;
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tunnel name required".to_string()));
+    }
+    let account = match st.ledger.account_for_subject_with_device_cap(
+        &subject,
+        req.device_fingerprint.as_deref(),
+        DEVICE_SIGNUP_CAP,
+    ) {
+        Ok(a) => a,
+        Err(LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded)) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!(
+                    "this device is already linked to {DEVICE_SIGNUP_CAP} free accounts -- \
+                     email support@bunsenbrenner.org to request a reset (see \
+                     https://bunsenbrenner.org/device-limit-reached)"
+                ),
+            ))
+        }
+        Err(e) => return Err(internal_error("me_signup/account_for_subject_with_device_cap", e)),
+    };
+    match st.ledger.is_blocked(&account) {
+        Ok(true) => return Err((StatusCode::FORBIDDEN, "this account is blocked from creating tunnels".to_string())),
+        Ok(false) => {}
+        Err(e) => return Err(internal_error("me_signup/is_blocked", e)),
+    }
+    let max = st.ledger.max_tunnels(&account).map_err(|e| internal_error("me_signup/max_tunnels", e))?;
+    let hostname = st
+        .dns
+        .as_ref()
+        .map(|d| auto_hostname(d.client.domain(), name, &subject))
+        .as_deref()
+        .and_then(ct_common::normalize_hostname);
+    let display_name = hostname.as_deref().and_then(|h| h.split('.').next()).unwrap_or(name);
+    let tunnel = match st.tunnels.create_if_under_owned_limit(&subject, display_name, hostname.as_deref(), max) {
+        Ok(crate::storage::CreateTunnelOutcome::Created(t)) => t,
+        Ok(crate::storage::CreateTunnelOutcome::OverLimit) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "the Standard tier includes one tunnel per account; additional tunnels are a planned \
+                 paid-tier feature (or ask the operator to raise your account's limit)"
+                    .to_string(),
+            ))
+        }
+        Ok(crate::storage::CreateTunnelOutcome::HostnameTaken) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "that name is already taken by one of your tunnels (hostnames derive deterministically \
+                 from the name) -- pick a different name"
+                    .to_string(),
+            ))
+        }
+        Err(e) => return Err(internal_error("me_signup/create_if_under_owned_limit", e)),
+    };
+    authorize_hostname(&st, &tunnel).await;
+    Ok(Json(MeSignupResp { routing_token: tunnel.routing_token, hostname: tunnel.hostname }))
+}
+
+/// `GET /device-limit-reached`: a small static page for the anti-abuse device cap's
+/// error message to point at (both `ct-agent signup`'s CLI error and this page name the
+/// same support address) -- explains the cap and how to request a manual reset. Reset is
+/// deliberately NOT self-service; see `admin_ui_clear_device_fingerprint`'s own doc.
+async fn device_limit_reached_page() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Device limit reached</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="font-family:system-ui,sans-serif;max-width:38rem;margin:3rem auto;padding:0 1rem;line-height:1.5">
+<h1>Device limit reached</h1>
+<p>To keep the Free plan fair for everyone, each device is limited to a small number of
+free accounts. If you've hit this limit and have a genuine reason to need another one
+(replaced hardware, a shared family/office machine, etc.), email
+<a href="mailto:support@bunsenbrenner.org">support@bunsenbrenner.org</a> from the account
+email you'd like unblocked, with a short explanation. This isn't automatic -- a person
+reviews each request.</p>
+</body></html>"#,
+    )
 }
 
 /// `POST /portal/tunnels/{id}/delete` (#27): revoke one of the caller's tunnels.

@@ -697,6 +697,13 @@ async fn buy_token(
                         }
                         // ADR-0025: the account is admin-blocked.
                         LedgerOpError::Ledger(LedgerError::AccountBlocked) => StatusCode::FORBIDDEN,
+                        // Anti-abuse device cap: only `account_for_subject_with_device_cap`
+                        // (the `me_signup` account-creation path) can produce this --
+                        // unreachable here, this closure only ever debits an account that
+                        // already exists. Kept for match exhaustiveness.
+                        LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
                         LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     (code, e.to_string())
@@ -721,6 +728,11 @@ async fn buy_token(
                     }
                     // ADR-0025: the account is admin-blocked.
                     LedgerOpError::Ledger(LedgerError::AccountBlocked) => StatusCode::FORBIDDEN,
+                    // Anti-abuse device cap: unreachable via debit() on an already-
+                    // existing account, same reasoning as the keyed arm above.
+                    LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
                     LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (code, e.to_string())
@@ -4139,6 +4151,10 @@ async fn me_issue(
             LedgerOpError::Ledger(LedgerError::CreditAmountTooLarge { .. }) => StatusCode::INTERNAL_SERVER_ERROR,
             // ADR-0025: the account is admin-blocked.
             LedgerOpError::Ledger(LedgerError::AccountBlocked) => StatusCode::FORBIDDEN,
+            // Anti-abuse device cap: only `account_for_subject_with_device_cap` (the
+            // `me_signup` account-creation path) can produce this -- unreachable via
+            // debit() on an already-existing account, kept for match exhaustiveness.
+            LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => StatusCode::INTERNAL_SERVER_ERROR,
             LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match &idempotency_key {
@@ -6078,7 +6094,11 @@ pub fn persistent_control_plane_router(
             crate::portal::portal_router(oidc_cfg.clone(), session_key)
                 .merge(crate::gate::gate_router(tunnels.clone(), oidc_cfg, session_key, oidc.clone()))
                 .merge(
-                crate::portal_api::portal_api_router(
+                // `_with_verifier`: real production wiring, so `POST /me/signup`
+                // (`ct-agent signup`'s anti-abuse-capped CLI entry point) is actually
+                // live here, not just in the (unchanged-signature) `portal_api_router`
+                // every existing test still uses.
+                crate::portal_api::portal_api_router_with_verifier(
                     session_key,
                     ledger.clone(),
                     tunnels.clone(),
@@ -6107,6 +6127,7 @@ pub fn persistent_control_plane_router(
                     std::env::var("CT_OIDC_ISSUER").ok(),
                     edge_mesh.clone(),
                     admin_token,
+                    Some(oidc.clone()),
                 ),
             )
             // #248-follow: the session-authed channel-allowlist self-service claim —
@@ -11393,6 +11414,70 @@ mod tests {
             v["account"].as_str().is_some_and(|a| !a.is_empty()),
             "carries the account id"
         );
+    }
+
+    #[tokio::test]
+    async fn me_signup_creates_a_tunnel_and_is_capped_by_device_fingerprint() {
+        // `ct-agent signup`'s entry point: Bearer-authed (same as /me/account above),
+        // and the anti-abuse device cap (2, the production constant) refuses a 3rd
+        // distinct account sharing one fingerprint -- but never a returning subject.
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity()).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let signup = |app: axum::Router, sub: &str, fp: &str| {
+            let jwt = jwt_for(sub);
+            let body = serde_json::json!({ "name": "my-tunnel", "device_fingerprint": fp }).to_string();
+            app.oneshot(
+                Request::post("/me/signup")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+
+        let resp = signup(app.clone(), "device-user-a", "shared-hw-hash").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "1st distinct account on this fingerprint succeeds");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["routing_token"].as_str().is_some_and(|t| !t.is_empty()), "returns a usable routing token");
+
+        let resp = signup(app.clone(), "device-user-b", "shared-hw-hash").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "2nd distinct account on this fingerprint succeeds");
+
+        let resp = signup(app.clone(), "device-user-c", "shared-hw-hash").await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "3rd distinct account on the same fingerprint is refused"
+        );
+
+        // A caller with NO fingerprint at all is never capped by this mechanism.
+        let jwt = jwt_for("device-user-d");
+        let body = serde_json::json!({ "name": "no-fp-tunnel" }).to_string();
+        let resp = app
+            .oneshot(
+                Request::post("/me/signup")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "no fingerprint reported -> never capped");
     }
 
     #[tokio::test]
