@@ -4987,13 +4987,13 @@ struct NewChannelReq {
 /// channel operator-init` stays the only place it's generated, same invariant every other
 /// channel page on this portal already holds.
 async fn new_channel_page(State(st): State<ClaimState>, headers: HeaderMap) -> Response {
-    if crate::portal::session_claims_for(&st.session_key, &headers).is_none() {
+    let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal?next=/portal/channels/new").into_response();
-    }
-    Html(new_channel_html(None)).into_response()
+    };
+    Html(new_channel_html(None, claims.email.as_deref())).into_response()
 }
 
-fn new_channel_html(error: Option<&str>) -> String {
+fn new_channel_html(error: Option<&str>, email: Option<&str>) -> String {
     let banner = match error {
         Some(msg) => format!(r#"<div class="warn">{}</div>"#, escape(msg)),
         None => String::new(),
@@ -5011,7 +5011,7 @@ by this server -- it's a public, non-secret address, not a secret to protect.</p
 </form>
 <a class="btn sec" href="/portal/channels">Back to your channels</a>"#
     );
-    page("create a channel", &body, None)
+    page("create a channel", &body, email)
 }
 
 async fn new_channel_submit(State(st): State<ClaimState>, headers: HeaderMap, Form(req): Form<NewChannelReq>) -> Response {
@@ -5019,7 +5019,7 @@ async fn new_channel_submit(State(st): State<ClaimState>, headers: HeaderMap, Fo
         return Redirect::to("/portal?next=/portal/channels/new").into_response();
     };
     let Some(operator) = crate::service::hex_decode_32(req.operator_pubkey.trim()) else {
-        return Html(new_channel_html(Some("operator_pubkey must be 64 hex characters"))).into_response();
+        return Html(new_channel_html(Some("operator_pubkey must be 64 hex characters"), claims.email.as_deref())).into_response();
     };
     // Non-secret, non-derived -- see `new_channel_page`'s doc for why any 32 random
     // bytes are a valid channel id.
@@ -5031,7 +5031,7 @@ async fn new_channel_submit(State(st): State<ClaimState>, headers: HeaderMap, Fo
             // Vanishingly unlikely (a fresh random 32 bytes colliding with an existing
             // channel owned by someone else) -- handled rather than unwrapped so a
             // pathological RNG failure surfaces as a retryable error, not a panic.
-            Html(new_channel_html(Some("channel id collision, please try again"))).into_response()
+            Html(new_channel_html(Some("channel id collision, please try again"), claims.email.as_deref())).into_response()
         }
         Err(e) => internal_error("new_channel_submit/register_channel", e).into_response(),
     }
@@ -9944,6 +9944,49 @@ mod tests {
             StatusCode::FORBIDDEN,
             "members_of can't distinguish unknown-channel from not-owner by design -- both 403"
         );
+    }
+
+    /// #113-ui-email follow-up to #492: every OTHER channel page (the owned-channels
+    /// list, the manage page) threads the session's verified email into `page()`'s
+    /// shared "Signed in as" nav line -- `/portal/channels/new` alone forgot to,
+    /// both on first load and on every re-render after a validation error. Found
+    /// live by the operator ("bei der channel registrierung sehe ich keine mail
+    /// adresse") while creating a channel via SSO.
+    #[tokio::test]
+    async fn new_channel_page_shows_the_signed_in_email_113() {
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/portal/channels/new")
+                    .header("cookie", session_header_with_email("alice", "alice@example.com"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("Signed in as") && html.contains("alice@example.com"), "GET /new: {html}");
+
+        // Also on the re-rendered form after a validation error -- not just the
+        // clean initial load (this is exactly the path new_channel_html's second
+        // and third call sites take, both previously hardcoded `None`).
+        let resp = app
+            .oneshot(
+                Request::post("/portal/channels/new")
+                    .header("cookie", session_header_with_email("alice", "alice@example.com"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("operator_pubkey=not-hex"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("Signed in as") && html.contains("alice@example.com"), "POST /new validation error: {html}");
     }
 
     /// Adding a member from the manage page enforces the exact same #101 SEC101b
