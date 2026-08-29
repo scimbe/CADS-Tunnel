@@ -4308,6 +4308,11 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
   padding:.35rem .8rem;font-size:.78rem;font-weight:600;cursor:pointer}}
  .tab-btn:hover{{color:#e6edf3}}
  .tab-btn.active{{background:#0d1117;color:#e6edf3;border-bottom-color:#0d1117}}
+ /* Generic content-panel tab group (channel manage page's three admission
+    mechanisms) -- same .tab-row/.tab-btn look as the bash/PowerShell toggle
+    above, but switches arbitrary .tab-panel blocks instead of .code-block
+    ones, via showPanel() below. */
+ .tab-panel{{border:1px solid #30363d;border-radius:0 8px 8px 8px;padding:.9rem 1rem;margin-bottom:1.2rem}}
  details{{margin:1.1rem 0;border:1px solid #30363d;border-radius:8px;padding:.7rem .9rem}}
  summary{{cursor:pointer;color:#58a6ff;font-weight:600}}
  summary:hover{{color:#79c0ff}}
@@ -4346,6 +4351,20 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
   for(var i=0;i<buttons.length;i++){{ buttons[i].classList.toggle('active', buttons[i] === btn); }}
   var blocks = group.querySelectorAll('.code-block[data-tab]');
   for(var j=0;j<blocks.length;j++){{ blocks[j].style.display = (blocks[j].id === showId) ? '' : 'none'; }}
+ }}
+ // Same idea as showTab above, but for arbitrary .tab-panel content blocks (the
+ // channel manage page's three admission-mechanism tabs) rather than the
+ // narrower .code-block[data-tab] bash/PowerShell switcher -- kept as a
+ // separate function rather than widening showTab's selector, so neither one's
+ // behavior can regress for its own existing page.
+ function showPanel(btn, showId){{
+  var row = btn.closest('.tab-row');
+  if(!row) return;
+  var group = row.parentElement;
+  var buttons = row.querySelectorAll('.tab-btn');
+  for(var i=0;i<buttons.length;i++){{ buttons[i].classList.toggle('active', buttons[i] === btn); }}
+  var panels = group.querySelectorAll('.tab-panel[data-tab]');
+  for(var j=0;j<panels.length;j++){{ panels[j].style.display = (panels[j].id === showId) ? '' : 'none'; }}
  }}
  // Progressive enhancement for any `form.fade-out-submit` (tunnel Revoke,
  // login-allowlist Remove): fade/collapse the enclosing .tunnel-card or <li>
@@ -5282,14 +5301,26 @@ async function searchAgents() {{
 <div class="row"><span class="k">Channel id</span><span class="v"><code>{channel_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{channel_hex}')">Copy</button></span></div>
 <div class="row"><span class="k">Operator pubkey</span><span class="v"><code>{operator_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{operator_hex}')">Copy</button></span></div>
 
-<h2>Members</h2>
+<h2>Add someone to this channel</h2>
+<p class="help">Three ways to admit a member -- pick the tab that matches what you already have
+from them.</p>
+<div class="tab-row">
+ <button type="button" class="tab-btn active" onclick="showPanel(this,'admit-direct')">Add directly</button>
+ <button type="button" class="tab-btn" onclick="showPanel(this,'admit-allowlist')">Allow-list by e-mail</button>
+ <button type="button" class="tab-btn" onclick="showPanel(this,'admit-grant')">Deposit a grant</button>
+</div>
+
+<div class="tab-panel" id="admit-direct" data-tab>
+<p class="help">Use this when you already have their exact holder + noise pubkeys and attestation
+-- they ran <code>ct-agent channel member-material</code> themselves and sent you the output
+(private keys never touch this server). Membership takes effect immediately, no further action
+needed from them. Adding yourself as the first member? Set <code>CT_CHANNEL_BRIDGE_HOLDER</code>
+to your OWN holder pubkey when you run it, see
+<a href="https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/" target="_blank"
+rel="noopener">Serve your own service, solo</a> for why that's sound.</p>
+<h3>Members</h3>
 {member_rows}
 <h3>Add a member</h3>
-<p class="help">The holder/noise pubkeys and attestation come from that member's own
-<code>ct-agent channel member-material</code> run (private keys never touch this server) --
-adding yourself as the first member? Set <code>CT_CHANNEL_BRIDGE_HOLDER</code> to your OWN holder
-pubkey when you run it, see <a href="https://docs.bunsenbrenner.org/how-to/serve-your-own-service-solo/"
-target="_blank" rel="noopener">Serve your own service, solo</a> for why that's sound.</p>
 {search_block}
 <form method="post" action="/portal/channels/{channel_hex}/manage/add-member">
  <label>Holder pubkey (64 hex)<input type="text" name="holder" id="f-holder" required pattern="[0-9a-fA-F]{{64}}" size="70"></label>
@@ -5297,25 +5328,33 @@ target="_blank" rel="noopener">Serve your own service, solo</a> for why that's s
  <label>Noise attestation (128 hex)<input type="text" name="noise_attestation" required pattern="[0-9a-fA-F]{{128}}" size="70"></label>
  <button type="submit">Add member</button>
 </form>
+</div>
 
-<h2>Allow-list (let someone claim membership themselves)</h2>
-<p class="help">An allow-listed e-mail appears in that person's own <a href="/portal/channels">Your
-channels</a> page with a Claim button -- no key material to hand them.</p>
+<div class="tab-panel" id="admit-allowlist" style="display:none" data-tab>
+<p class="help">Use this when you only know their e-mail. It appears on their own
+<a href="/portal/channels">Your channels</a> page with a Claim button -- they generate their own
+keys and claim membership themselves, so no key material ever passes through you.</p>
+<h3>Allow-listed e-mails</h3>
 {allowlist_rows}
+<h3>Allow-list an e-mail</h3>
 <form method="post" action="/portal/channels/{channel_hex}/manage/allowlist-add">
  <label>E-mail<input type="email" name="email" required></label>
  <button type="submit">Allow-list</button>
 </form>
+</div>
 
-<h2>Deposit a grant</h2>
-<p class="help">Paste the <code>CT_CHANNEL_GRANT</code> hex from <code>ct-agent channel grant</code> so
-the member can fetch it automatically from their own claim/onboarding page -- otherwise you'd hand it
-to them out of band.</p>
+<div class="tab-panel" id="admit-grant" style="display:none" data-tab>
+<p class="help">Use this when you've already run <code>ct-agent channel grant</code> for them
+offline, out of band from this portal. Paste the result here so it's waiting for them
+automatically on their own claim/onboarding page, instead of sending the grant hex to them
+directly yourself.</p>
+<h3>Deposit a grant</h3>
 <form method="post" action="/portal/channels/{channel_hex}/manage/deposit-grant">
  <label>Holder pubkey (64 hex)<input type="text" name="holder" required pattern="[0-9a-fA-F]{{64}}" size="70"></label>
  <label>Grant (278 hex)<textarea name="grant" required rows="3" style="width:100%"></textarea></label>
  <button type="submit">Deposit grant</button>
 </form>
+</div>
 
 <h2>Delete this channel</h2>
 <p class="help">Permanently deletes the channel, every member, and every allow-listed e-mail. Grants
