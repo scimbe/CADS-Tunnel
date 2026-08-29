@@ -289,6 +289,10 @@ async fn buy_token(
                 // in-memory Ledger has no such concept, kept for match exhaustiveness
                 // (the variant is shared with SqliteLedger's).
                 LedgerError::DeviceLimitExceeded => StatusCode::INTERNAL_SERVER_ERROR,
+                // Free-tier AI-usage cap: only `SqliteLedger`'s `debit_ai_chat`/
+                // `debit_ai_transcribe` can produce this -- this in-memory Ledger
+                // has no such concept, kept for match exhaustiveness.
+                LedgerError::FreeAiCapExceeded => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (code, e.to_string())
         })?;

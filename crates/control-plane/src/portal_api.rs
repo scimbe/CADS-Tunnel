@@ -1188,6 +1188,7 @@ pub fn admin_ui_router(
         .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
         .route("/admin-ui/accounts/:subject/max-channels", post(admin_ui_set_max_channels))
         .route("/admin-ui/accounts/:subject/clear-device-fingerprint", post(admin_ui_clear_device_fingerprint))
+        .route("/admin-ui/accounts/:subject/plan", post(admin_ui_set_plan))
         .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
         .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
         // ADR-0025 Decision 4/6: hostname disable/enable + multi-domain onboarding
@@ -1335,6 +1336,43 @@ async fn admin_ui_clear_device_fingerprint(
     let _ = st
         .audit
         .record(&session.email, "device_fingerprint_cleared", Some(&subject), None);
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct SetPlanReq {
+    /// `""` (empty) clears the plan back to Free; any other value is stored
+    /// verbatim (`crate::ai_usage::PREMIUM_AI_PLANS` checks against
+    /// "medium"/"pro"/"business" specifically, case-sensitive).
+    plan: String,
+}
+
+/// `POST /admin-ui/accounts/:subject/plan {plan}` (admin-identity-gated): the
+/// operator lever for which paid plan an account is on -- until real
+/// self-service billing exists, this is how scimbe marks an account as
+/// Starter/Medium/Pro/Business (unlocking e.g. Premium AI at Medium+, per
+/// `ai_usage::PREMIUM_AI_PLANS`). Once a payment-provider webhook exists, it
+/// can write this same column instead, with zero schema change.
+async fn admin_ui_set_plan(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetPlanReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_plan/account_for_subject", e).into_response(),
+    };
+    let plan = req.plan.trim();
+    let plan = if plan.is_empty() { None } else { Some(plan) };
+    if let Err(e) = st.ledger.set_plan(&account, plan) {
+        return internal_error("admin_ui_set_plan/set", e).into_response();
+    }
+    let _ = st.audit.record(&session.email, "plan_set", Some(&subject), Some(plan.unwrap_or("free")));
     StatusCode::OK.into_response()
 }
 
@@ -2894,7 +2932,7 @@ git-ignored file, created directly on the server from your own local copy of the
         return admin_page("pricing", session, body);
     }
 
-    let fmt_cents = |c: u32| format!("{}.{:02} €", c / 100, c % 100);
+    let fmt_cents = |c: u32| crate::pricing::gross_price_label(c, cfg.vat_mode);
     let cell = |v: Option<String>| v.unwrap_or_else(|| r#"<span class="help">-</span>"#.to_string());
 
     let mut plans_js = String::from("[");
@@ -2971,6 +3009,13 @@ git-ignored file, created directly on the server from your own local copy of the
             .map(|t| format!("<td>{}</td>", cell(t.relay_free_gb.map(|g| format!("{g} GB/month")))))
             .collect::<String>()
     ));
+    // Presentation review finding: "credits" appeared as bare numbers with no
+    // unit or worked example, and the AI features they actually pay for were
+    // never named anywhere on the page -- both fixed by naming the real rates
+    // (already flowing through `cfg`, no numbers of this function's own) as
+    // their own rows, not just a bundle size.
+    let standard_ai_note = cell(cfg.standard_ai_credits_per_1k_tokens.map(|c| format!("{c} Credits / 1,000 tokens")));
+    let whisper_note = cell(cfg.standard_stt_credits_per_minute.map(|c| format!("{c} Credits / minute")));
 
     let body = format!(
         r#"<h1>Pricing preview</h1>
@@ -2978,14 +3023,48 @@ git-ignored file, created directly on the server from your own local copy of the
 The real numbers live only in this server's <code>docker/deploy/.env.pricing</code>, never
 committed. This page is the mechanism only; add <code>workflow-maintainer@gmail.com</code> as an
 admin (via the Admins page) to give them the same view.</p>
+
+<div class="card" style="margin-bottom:1.2rem">
+ <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem">
+  <strong data-lang="de">Vorschau der Kunden-Ansprache</strong><strong data-lang="en" style="display:none">Customer-facing copy preview</strong>
+  <div>
+   <button class="sec" data-set-lang="de" onclick="return setPageLang('de')">Deutsch</button>
+   <button class="sec" data-set-lang="en" onclick="return setPageLang('en')">English</button>
+  </div>
+ </div>
+ <p data-lang="de">Kein Wettbewerber (ngrok, Cloudflare Tunnel, Tailscale) kann Ihren Tunnel-Traffic
+  strukturell mitlesen -- Sie können es auch nicht, wir strukturell erst recht nicht (Noise-verschlüsselt
+  Ende-zu-Ende). Standard-KI läuft auf eigener, EU-gehosteter Infrastruktur -- Ihre Daten verlassen nie
+  unsere Server, kein Auftragsverarbeitungsvertrag mit Dritten nötig.</p>
+ <p data-lang="en" style="display:none">No competitor (ngrok, Cloudflare Tunnel, Tailscale) can structurally
+  read your tunnel traffic -- Noise-encrypted end to end. Standard AI runs on our own, EU-hosted
+  infrastructure -- your data never leaves our servers, no third-party data processing agreement needed.</p>
+</div>
+
+<div class="card" style="margin-bottom:1.2rem">
+ <strong data-lang="de">Was sind Credits?</strong><strong data-lang="en" style="display:none">What are Credits?</strong>
+ <p data-lang="de">Credits sind die Nutzungswährung dieser Plattform -- sie decken KI-Chat-Anfragen
+  (Standard-KI, selbst gehostet), Sprachtranskription (Whisper) und Relay-Bandbreite oberhalb des
+  Freikontingents ab. Jeder Plan enthält ein monatliches Credit-Guthaben; verbrauchte Credits werden
+  nach echter Nutzung abgerechnet, nicht pauschal.</p>
+ <p data-lang="en" style="display:none">Credits are this platform's usage currency -- they cover AI chat
+  requests (Standard AI, self-hosted), speech transcription (Whisper), and relay bandwidth above the free
+  quota. Every plan includes a monthly credit allotment; credits are spent against real usage, not a flat
+  fee.</p>
+ <div class="kv"><div>Standard-KI (Chat)</div><div>{standard_ai_note}</div></div>
+ <div class="kv"><div>Whisper (Transkription)</div><div>{whisper_note}</div></div>
+</div>
+
 <div class="tablewrap"><table class="data">
 <thead><tr><th></th>{cols}</tr></thead>
 <tbody>{rows}</tbody>
 </table></div>
 
-<h2>Booking flow preview</h2>
-<p class="help">A non-functional mockup of what a customer would see -- pick a plan below to
-preview the review screen. Nothing here is wired to real billing yet.</p>
+<h2 data-lang="de">Buchprozess-Vorschau</h2><h2 data-lang="en" style="display:none">Booking flow preview</h2>
+<p class="help" data-lang="de">Ein nicht-funktionaler Entwurf dessen, was ein Kunde sehen würde -- Plan
+ auswählen für die Vorschau. Hier ist noch nichts an ein echtes Zahlungssystem angebunden.</p>
+<p class="help" data-lang="en" style="display:none">A non-functional mockup of what a customer would
+ see -- pick a plan below to preview the review screen. Nothing here is wired to real billing yet.</p>
 <div id="bookingPicker" class="cards"></div>
 <div id="bookingReview" style="display:none" class="card" style="max-width:28rem">
  <h3 id="reviewPlanName"></h3>
@@ -2998,6 +3077,18 @@ preview the review screen. Nothing here is wired to real billing yet.</p>
  <button class="sec" onclick="document.getElementById('bookingReview').style.display='none'">Back</button>
 </div>
 <script>
+function setPageLang(lang){{
+ document.querySelectorAll('[data-lang]').forEach(function(el){{
+  el.style.display = (el.getAttribute('data-lang') === lang) ? '' : 'none';
+ }});
+ try {{ localStorage.setItem('ct-pricing-preview-lang', lang); }} catch (e) {{}}
+ return false;
+}}
+(function(){{
+ var saved = null;
+ try {{ saved = localStorage.getItem('ct-pricing-preview-lang'); }} catch (e) {{}}
+ setPageLang(saved === 'en' ? 'en' : 'de');
+}})();
 var PLANS = {plans_js};
 (function(){{
  var picker = document.getElementById('bookingPicker');
@@ -3023,6 +3114,8 @@ var PLANS = {plans_js};
         cols = cols,
         rows = rows,
         plans_js = plans_js,
+        standard_ai_note = standard_ai_note,
+        whisper_note = whisper_note,
     );
     admin_page("pricing", session, &body)
 }
@@ -3099,10 +3192,10 @@ fn admin_accounts_page_html(
     emails: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut table = String::from(
-        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Signup device</th><th>Actions</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th>Plan</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Signup device</th><th>Actions</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
-        table.push_str(r#"<tr><td colspan="9" class="help">No accounts match.</td></tr>"#);
+        table.push_str(r#"<tr><td colspan="10" class="help">No accounts match.</td></tr>"#);
     }
     for r in rows {
         let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
@@ -3122,6 +3215,19 @@ fn admin_accounts_page_html(
             ),
             None => r#"<span class="help">-</span>"#.to_string(),
         };
+        let plan_value = r.plan.as_deref().unwrap_or("");
+        let plan_option = |value: &str, label: &str| {
+            let selected = if plan_value == value { " selected" } else { "" };
+            format!(r#"<option value="{value}"{selected}>{label}</option>"#)
+        };
+        let plan_options = format!(
+            "{}{}{}{}{}",
+            plan_option("", "Free"),
+            plan_option("starter", "Starter"),
+            plan_option("medium", "Medium"),
+            plan_option("pro", "Pro"),
+            plan_option("business", "Business"),
+        );
         table.push_str(&format!(
             r#"<tr>
 <td>{subject}</td>
@@ -3129,6 +3235,12 @@ fn admin_accounts_page_html(
 <td><code style="word-break:break-all">{account}</code></td>
 <td class="num">{balance}</td>
 <td>{state_badge}</td>
+<td>
+ <form class="inline" data-subject="{subject}" onsubmit="return setPlan(event)">
+  <select name="plan">{plan_options}</select>
+  <button type="submit" class="sec">Set</button>
+ </form>
+</td>
 <td class="num">{max_tunnels}</td>
 <td class="num">{max_channels}</td>
 <td>{device_cell}</td>
@@ -3154,6 +3266,7 @@ fn admin_accounts_page_html(
             account = escape(&r.account_hex),
             balance = r.balance,
             state_badge = state_badge,
+            plan_options = plan_options,
             max_tunnels = r.max_tunnels,
             max_channels = r.max_channels,
             device_cell = device_cell,
@@ -3198,6 +3311,16 @@ function toggleBlock(ev){{
  adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/' + action)
   .then(function(){{ location.reload(); }})
   .catch(function(e){{ window.alert(action + ' failed: ' + e.message); }});
+ return false;
+}}
+function setPlan(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var plan = form.plan.value;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/plan', {{plan: plan}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('plan update failed: ' + e.message); }});
  return false;
 }}
 function setMaxTunnels(ev){{

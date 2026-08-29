@@ -14,6 +14,64 @@
 //! the same fail-soft posture as this crate's other optional config (e.g.
 //! `oidc_issuer: Option<Arc<str>>`).
 
+/// Which VAT disclosure a price display must carry, next to the price itself, not
+/// just in the Impressum (Preisangabenverordnung; the §19 UStG exemption note is
+/// its own separate legal requirement while it applies). See this crate's
+/// `CLAUDE.md`, "Pricing/legal display rule" -- every price-rendering call site
+/// MUST go through [`gross_price_label`], never format a bare price string.
+/// Configured, not hardcoded: crossing the Kleinunternehmer revenue threshold
+/// changes which note is legally correct, and nothing else watches for that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VatMode {
+    /// §19 UStG small-business exemption: no VAT is charged or shown.
+    Kleinunternehmer,
+    /// Standard German VAT (19%), already included in the displayed price.
+    Standard19,
+    /// Reduced German VAT (7%), already included in the displayed price.
+    Reduced7,
+}
+
+impl VatMode {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "kleinunternehmer" => Some(Self::Kleinunternehmer),
+            "standard19" => Some(Self::Standard19),
+            "reduced7" => Some(Self::Reduced7),
+            _ => None,
+        }
+    }
+
+    /// The disclosure text required next to every consumer-facing price.
+    pub fn disclosure_note(self) -> &'static str {
+        match self {
+            VatMode::Kleinunternehmer => "zzgl. keiner Umsatzsteuer (§19 UStG, Kleinunternehmerregelung)",
+            VatMode::Standard19 => "inkl. 19% USt.",
+            VatMode::Reduced7 => "inkl. 7% USt.",
+        }
+    }
+}
+
+impl Default for VatMode {
+    /// scimbe's current documented status as of 2026-08-29; change via
+    /// `CT_PRICING_VAT_MODE` the moment that status changes, not by editing this.
+    fn default() -> Self {
+        VatMode::Kleinunternehmer
+    }
+}
+
+/// A price string that ALREADY carries its mandatory VAT disclosure -- see
+/// [`VatMode`]'s doc. Every place this codebase shows a customer-facing price
+/// must call this (or, for a non-HTML context like an invoice or email,
+/// `vat_mode.disclosure_note()` directly) instead of formatting cents by hand.
+pub fn gross_price_label(cents: u32, vat_mode: VatMode) -> String {
+    format!(
+        "{}.{:02}&nbsp;€ <span class=\"vat-note\">({})</span>",
+        cents / 100,
+        cents % 100,
+        vat_mode.disclosure_note()
+    )
+}
+
 /// One paid plan tier's numbers -- absent entirely (not just `None` fields) when
 /// its price var isn't set, so a partially-filled-in `.env.pricing` renders only
 /// the tiers that are actually configured.
@@ -28,6 +86,10 @@ pub struct PaidTier {
     pub relay_free_gb: Option<u32>,
     /// Business-only: a free-text note shown instead of a fixed price.
     pub note: Option<String>,
+    /// The Paddle Price id (`pri_...`) `crate::paddle`'s checkout-creation call
+    /// bills against for this tier. `None` means this tier can't be checked out
+    /// via Paddle yet (e.g. Business, which is individually negotiated).
+    pub paddle_price_id: Option<String>,
 }
 
 /// The Free tier's numbers -- always zero-price by definition, so it carries no
@@ -44,18 +106,55 @@ pub struct PricingConfig {
     pub standard_stt_credits_per_minute: Option<u32>,
     pub premium_ai_margin_percent: Option<u32>,
     pub relay_overage_credits_per_gb: Option<u32>,
+    /// Free-tier AI-usage hard caps (pricing model §2.1a) -- lifetime, independent
+    /// of credit balance. `None` disables the cap entirely (`crate::ai_usage`'s
+    /// debit calls skip the check), not "unlimited by design" -- an operator who
+    /// wants the cap enforced must set these.
+    pub free_ai_request_cap: Option<u32>,
+    pub free_ai_seconds_cap: Option<u32>,
     pub free: FreeTier,
     pub starter: Option<PaidTier>,
     pub medium: Option<PaidTier>,
     pub pro: Option<PaidTier>,
     pub business: Option<PaidTier>,
+    /// Which VAT disclosure to render next to every price -- see [`VatMode`].
+    /// Always has a value (defaults to scimbe's current documented status), so
+    /// this alone never makes [`Self::is_configured`] return `true`.
+    pub vat_mode: VatMode,
 }
 
 impl PricingConfig {
-    /// Whether ANY pricing var is set at all -- the preview page's "not
-    /// configured" gate.
+    /// Whether any REAL pricing data is set -- the preview page's "not
+    /// configured" gate. Deliberately excludes `vat_mode`: that field always has
+    /// a value (it defaults to scimbe's current status, not `None`), so a
+    /// `!= PricingConfig::default()` comparison would wrongly call the page
+    /// "configured" the moment `CT_PRICING_VAT_MODE` alone is set with every
+    /// other var still absent.
     pub fn is_configured(&self) -> bool {
-        self != &PricingConfig::default()
+        self.standard_ai_credits_per_1k_tokens.is_some()
+            || self.standard_stt_credits_per_minute.is_some()
+            || self.premium_ai_margin_percent.is_some()
+            || self.relay_overage_credits_per_gb.is_some()
+            || self.free.tunnels.is_some()
+            || self.free.relay_free_gb.is_some()
+            || self.starter.is_some()
+            || self.medium.is_some()
+            || self.pro.is_some()
+            || self.business.is_some()
+    }
+
+    /// Look up a paid tier by its lower-case plan name (the same strings
+    /// `SqliteLedger::set_plan`/`plan_for` store, e.g. `"starter"`). `None` if
+    /// unknown or not configured -- `crate::paddle`'s checkout handler uses
+    /// this to find the Paddle Price id to bill.
+    pub fn tier(&self, name: &str) -> Option<&PaidTier> {
+        match name {
+            "starter" => self.starter.as_ref(),
+            "medium" => self.medium.as_ref(),
+            "pro" => self.pro.as_ref(),
+            "business" => self.business.as_ref(),
+            _ => None,
+        }
     }
 
     /// Read every `CT_PRICING_*` var from the process environment. Never fails --
@@ -86,6 +185,7 @@ impl PricingConfig {
                 tunnels: u32_var(&format!("CT_PRICING_{prefix}_TUNNELS")),
                 relay_free_gb: u32_var(&format!("CT_PRICING_{prefix}_RELAY_GB")),
                 note,
+                paddle_price_id: get(&format!("CT_PRICING_{prefix}_PADDLE_PRICE_ID")).filter(|s| !s.trim().is_empty()),
             })
         };
         PricingConfig {
@@ -93,6 +193,8 @@ impl PricingConfig {
             standard_stt_credits_per_minute: u32_var("CT_PRICING_STANDARD_STT_CREDITS_PER_MINUTE"),
             premium_ai_margin_percent: u32_var("CT_PRICING_PREMIUM_AI_MARGIN_PERCENT"),
             relay_overage_credits_per_gb: u32_var("CT_PRICING_RELAY_OVERAGE_CREDITS_PER_GB"),
+            free_ai_request_cap: u32_var("CT_PRICING_FREE_AI_REQUEST_CAP"),
+            free_ai_seconds_cap: u32_var("CT_PRICING_FREE_AI_SECONDS_CAP"),
             free: FreeTier {
                 tunnels: u32_var("CT_PRICING_FREE_TUNNELS"),
                 relay_free_gb: u32_var("CT_PRICING_FREE_RELAY_GB"),
@@ -101,6 +203,7 @@ impl PricingConfig {
             medium: paid_tier("MEDIUM", "Medium"),
             pro: paid_tier("PRO", "Pro"),
             business: paid_tier("BUSINESS", "Business"),
+            vat_mode: get("CT_PRICING_VAT_MODE").as_deref().and_then(VatMode::from_str).unwrap_or_default(),
         }
     }
 }
@@ -120,6 +223,40 @@ mod tests {
         let cfg = PricingConfig::from_lookup(lookup(&[]));
         assert_eq!(cfg, PricingConfig::default());
         assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn vat_mode_alone_does_not_count_as_configured() {
+        // vat_mode always has a value, unlike every other field -- setting ONLY
+        // it, with no real pricing data, must not flip is_configured() to true.
+        let cfg = PricingConfig::from_lookup(lookup(&[("CT_PRICING_VAT_MODE", "standard19")]));
+        assert_eq!(cfg.vat_mode, VatMode::Standard19);
+        assert!(!cfg.is_configured(), "vat_mode alone is not real pricing data");
+    }
+
+    #[test]
+    fn vat_mode_defaults_to_kleinunternehmer_and_is_configurable() {
+        assert_eq!(PricingConfig::from_lookup(lookup(&[])).vat_mode, VatMode::Kleinunternehmer);
+        assert_eq!(
+            PricingConfig::from_lookup(lookup(&[("CT_PRICING_VAT_MODE", "Standard19")])).vat_mode,
+            VatMode::Standard19,
+            "case-insensitive"
+        );
+        assert_eq!(
+            PricingConfig::from_lookup(lookup(&[("CT_PRICING_VAT_MODE", "garbage")])).vat_mode,
+            VatMode::Kleinunternehmer,
+            "an unparseable value falls back to the default, not an error"
+        );
+    }
+
+    #[test]
+    fn gross_price_label_always_carries_the_disclosure_note() {
+        // Obviously-fake placeholder amount, not a real plan price.
+        let label = gross_price_label(1234, VatMode::Kleinunternehmer);
+        assert!(label.contains("12.34"));
+        assert!(label.contains("§19 UStG"));
+        let label19 = gross_price_label(1234, VatMode::Standard19);
+        assert!(label19.contains("19% USt."));
     }
 
     #[test]

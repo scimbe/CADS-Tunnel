@@ -704,6 +704,11 @@ async fn buy_token(
                         LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => {
                             StatusCode::INTERNAL_SERVER_ERROR
                         }
+                        // Free-tier AI-usage cap: only `ai_usage`'s debit calls can
+                        // produce this -- unreachable here, kept for exhaustiveness.
+                        LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded) => {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
                         LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     };
                     (code, e.to_string())
@@ -731,6 +736,11 @@ async fn buy_token(
                     // Anti-abuse device cap: unreachable via debit() on an already-
                     // existing account, same reasoning as the keyed arm above.
                     LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                    // Free-tier AI-usage cap: only `ai_usage`'s debit calls can
+                    // produce this -- unreachable here, kept for exhaustiveness.
+                    LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded) => {
                         StatusCode::INTERNAL_SERVER_ERROR
                     }
                     LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -4155,6 +4165,9 @@ async fn me_issue(
             // `me_signup` account-creation path) can produce this -- unreachable via
             // debit() on an already-existing account, kept for match exhaustiveness.
             LedgerOpError::Ledger(LedgerError::DeviceLimitExceeded) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Free-tier AI-usage cap: only `ai_usage`'s debit calls can produce
+            // this -- unreachable here, kept for match exhaustiveness.
+            LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded) => StatusCode::INTERNAL_SERVER_ERROR,
             LedgerOpError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match &idempotency_key {
@@ -4270,6 +4283,11 @@ const STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 static ISSUE_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNAUTH_WRITE_RATE_LIMITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PAYMENT_WEBHOOK_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Paid-tier alerting (fresh-eyes review): the same #561 shape, for Paddle's
+/// real webhook and for `/me/ai/*` backend failures. See `StatusResp`'s doc
+/// for each field.
+static PADDLE_WEBHOOK_REJECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AI_BACKEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Requests per IP per minute the unauthenticated-write limiter is armed at, or `0`
 /// when it is not armed at all (#572).
 ///
@@ -4305,12 +4323,41 @@ fn note_payment_webhook_rejected(why: &str) -> u64 {
     n
 }
 
+/// Like [`note_payment_webhook_rejected`], for Paddle's own webhook
+/// (`crate::paddle`) -- same reasoning, real provider instead of the internal
+/// placeholder scheme.
+pub(crate) fn note_paddle_webhook_rejected(why: &str) -> u64 {
+    let n = PADDLE_WEBHOOK_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!("ct-control-plane: Paddle webhook REFUSED ({why}) -- {n} so far. Either CT_PADDLE_WEBHOOK_SECRET does not match Paddle's, or someone is forging webhooks.");
+    n
+}
+
+/// A `/me/ai/*` request that failed reaching or parsing its backend
+/// (`crate::ai_usage`) -- the paid-tier-aware "AI backend down" signal a
+/// watcher should alert on.
+pub(crate) fn note_ai_backend_failure(why: &str) -> u64 {
+    let n = AI_BACKEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!("ct-control-plane: AI backend request FAILED ({why}) -- {n} so far.");
+    n
+}
+
 /// #561: the three counters above, for `/status`.
 fn refusal_counters() -> (u64, u64, u64) {
     (
         ISSUE_RATE_LIMITED.load(std::sync::atomic::Ordering::Relaxed),
         UNAUTH_WRITE_RATE_LIMITED.load(std::sync::atomic::Ordering::Relaxed),
         PAYMENT_WEBHOOK_REJECTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Paid-tier alerting counters (`paddle_webhook_rejected`, `ai_backend_failures`),
+/// kept SEPARATE from [`refusal_counters`] rather than widening its tuple, since
+/// several existing call sites (including tests) destructure that 3-tuple by
+/// position and a 5-tuple would be a silent, easy-to-miss breakage at each one.
+fn paid_tier_alert_counters() -> (u64, u64) {
+    (
+        PADDLE_WEBHOOK_REJECTED.load(std::sync::atomic::Ordering::Relaxed),
+        AI_BACKEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -4366,6 +4413,23 @@ pub struct StatusResp {
     /// never got a usable key", since both mean the same thing from here: nothing
     /// under `/me/*` will authenticate successfully until this reads `true`.
     pub oidc_enabled: bool,
+    /// Paid-tier alerting (fresh-eyes review: "no alerting for the things that
+    /// now carry SLA/refund weight"): Paddle webhooks refused because their
+    /// signature did not verify -- same "a refusal nobody can see is not the
+    /// system working" reasoning as `payment_webhook_rejected` above, for the
+    /// real payment provider instead of the internal placeholder scheme.
+    pub paddle_webhook_rejected: u64,
+    /// Paid-tier alerting: `/me/ai/*` requests that failed reaching or parsing
+    /// their configured backend (`BAD_GATEWAY`) since start -- the signal a
+    /// paid-tier-aware watcher should alert on ("AI backend down"), which
+    /// otherwise only ever reached the one caller who happened to hit it.
+    pub ai_backend_failures: u64,
+    /// Whether any account is on a paid plan right now -- the qualifier that
+    /// turns "control plane down" from a general incident into one that also
+    /// owes someone an SLA/refund conversation. `false` on a deployment with
+    /// no paid customers yet, same "0 vs not-yet-configured" honesty as
+    /// `unauth_write_limit_per_min` above.
+    pub has_paid_accounts: bool,
 }
 
 /// Build the status router (F4.1): `GET /status` returns aggregated counts as
@@ -4413,7 +4477,7 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         s.pipeline_registry.clone(),
         s.agent_directory.clone(),
     );
-    let (ready, agents, pipelines_published, agents_directory, accounts, payments_confirmed) =
+    let (ready, agents, pipelines_published, agents_directory, accounts, payments_confirmed, has_paid_accounts) =
         tokio::task::spawn_blocking(move || {
             (
                 ledger.ping().is_ok(),
@@ -4422,10 +4486,12 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
                 agent_directory.count().unwrap_or(0),
                 ledger.account_count().unwrap_or(0),
                 ledger.confirmed_payment_count().unwrap_or(0),
+                ledger.has_paid_accounts().unwrap_or(false),
             )
         })
         .await
-        .unwrap_or((false, 0, 0, 0, 0, 0));
+        .unwrap_or((false, 0, 0, 0, 0, 0, false));
+    let (paddle_webhook_rejected, ai_backend_failures) = paid_tier_alert_counters();
     StatusResp {
         ready,
         tunnels: live_tunnel_count(s).await,
@@ -4445,13 +4511,20 @@ async fn aggregate_status(s: &StatusState) -> StatusResp {
         unauth_write_rate_limited: refusal_counters().1,
         payment_webhook_rejected: refusal_counters().2,
         unauth_write_limit_per_min: unauth_write_limit_per_min(),
+        paddle_webhook_rejected,
+        ai_backend_failures,
+        has_paid_accounts,
     }
 }
 
-/// Overwrite the three #561 refusal counters with their live values (#561).
+/// Overwrite the #561-style refusal/alert counters with their live values.
 ///
 /// Called on every cache-serving path, never on the fresh path, where
-/// `aggregate_status` has just read them itself.
+/// `aggregate_status` has just read them itself. `has_paid_accounts` is a real
+/// store read, not a process-wide atomic, so it stays whatever the last fresh
+/// aggregation observed -- acceptable staleness within `STATUS_CACHE_TTL`
+/// (5s), same tradeoff every other store-backed field on a cached response
+/// already makes.
 fn refresh_refusal_counters(resp: &mut StatusResp) {
     let (issue, unauth, webhook) = refusal_counters();
     resp.issue_rate_limited = issue;
@@ -4460,6 +4533,9 @@ fn refresh_refusal_counters(resp: &mut StatusResp) {
     // #572: armed-or-not travels with the count on every cache-serving path too, so a
     // cached response can never pair a live count with a stale reading of the switch.
     resp.unauth_write_limit_per_min = unauth_write_limit_per_min();
+    let (paddle_webhook_rejected, ai_backend_failures) = paid_tier_alert_counters();
+    resp.paddle_webhook_rejected = paddle_webhook_rejected;
+    resp.ai_backend_failures = ai_backend_failures;
 }
 
 async fn status_handler(State(s): State<StatusState>) -> Json<StatusResp> {
@@ -6235,6 +6311,22 @@ pub fn persistent_control_plane_router(
                 ledger.clone(),
                 oidc.clone(),
                 AUTHED_ISSUES_PER_WINDOW,
+            ))
+            // AI-usage metering (`/me/ai/*`) -- always mounted, fails soft (503)
+            // per-route when its specific backend isn't configured, matching
+            // `authed_billing_router`'s own "/me/* always mounted" posture (#328).
+            .merge(crate::ai_usage::ai_usage_router(
+                ledger.clone(),
+                oidc.clone(),
+                crate::ai_usage::AiBackendConfig::from_env(),
+            ))
+            // Merchant-of-Record payment integration (Paddle) -- see
+            // `crate::paddle`'s own doc for the double-gate (api_key configured
+            // AND CT_CHECKOUT_ENABLED=true) before /me/checkout is reachable.
+            .merge(crate::paddle::paddle_router(
+                ledger.clone(),
+                oidc.clone(),
+                crate::paddle::PaddleConfig::from_env(),
             ))
             // Keycloak/account overhaul: "delete my account and all data" cascades
             // across every store keyed by a portal subject -- see

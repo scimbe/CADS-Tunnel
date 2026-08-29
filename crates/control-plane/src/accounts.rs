@@ -51,6 +51,12 @@ pub enum LedgerError {
     /// account_for_subject_with_device_cap`] produces this -- it never blocks a
     /// *returning* subject, only the creation of a brand-new account.
     DeviceLimitExceeded,
+    /// A Free-tier account's lifetime AI-usage hard cap (requests or seconds,
+    /// pricing model §2.1a) is already reached -- independent of credit balance.
+    /// Only [`crate::storage::SqliteLedger::debit_ai_chat`]/
+    /// [`crate::storage::SqliteLedger::debit_ai_transcribe`] produce this, and
+    /// only for an account with no `plan` set.
+    FreeAiCapExceeded,
 }
 
 impl std::fmt::Display for LedgerError {
@@ -71,6 +77,9 @@ impl std::fmt::Display for LedgerError {
                 f,
                 "this device is already linked to the maximum number of free accounts"
             ),
+            LedgerError::FreeAiCapExceeded => {
+                write!(f, "the Free plan's AI-usage limit is reached -- upgrade to continue")
+            }
         }
     }
 }

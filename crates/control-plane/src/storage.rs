@@ -1370,6 +1370,18 @@ pub struct SqliteLedger {
     conn: Mutex<Connection>,
 }
 
+/// One account's AI-usage state (`SqliteLedger::ai_usage_for`), for the
+/// self-service "how much have I used against my caps" view (`GET /me/ai/usage`)
+/// -- the customer-facing counterpart to `debit_ai_chat`/`debit_ai_transcribe`'s
+/// server-side enforcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiUsageSnapshot {
+    pub balance: u64,
+    pub plan: Option<String>,
+    pub free_requests_used: u32,
+    pub free_seconds_used: u32,
+}
+
 /// One row of [`SqliteLedger::list_accounts`] (ADR-0025 admin console).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSummaryRow {
@@ -1384,6 +1396,9 @@ pub struct AccountSummaryRow {
     /// existed, or created via a path that doesn't report one (portal browser signup,
     /// admin-provisioned tenants).
     pub device_fingerprint: Option<String>,
+    /// The paid plan this account is on, `None` for Free -- see the `plan`
+    /// column's doc comment (`from_connection`).
+    pub plan: Option<String>,
 }
 
 sqlite_store_ctors!(SqliteLedger);
@@ -1441,6 +1456,19 @@ impl SqliteLedger {
         // for accounts created via any other path (portal browser signup, admin-issued
         // join tokens), which carry no such signal and are never capped by it.
         ensure_column(&conn, "accounts", "device_fingerprint", "TEXT")?;
+        // AI-usage metering (`crate::ai_usage`): which paid plan this account is on,
+        // NULL meaning Free. Admin-settable today (mirrors max_tunnels/max_channels'
+        // own pattern) since self-service billing doesn't exist yet -- once it does,
+        // a payment-provider webhook can write this same column instead of a human
+        // admin action, with zero schema change.
+        ensure_column(&conn, "accounts", "plan", "TEXT")?;
+        // Free-tier AI-usage hard cap (pricing model §2.1a): lifetime (not monthly)
+        // counters, independent of credit balance -- see `ai_usage::debit_ai_chat`/
+        // `debit_ai_transcribe`'s own doc for why this is a SEPARATE ceiling on top
+        // of the credit debit, not a replacement for it. Never reset once a plan
+        // upgrade happens; a paid plan simply stops checking these columns at all.
+        ensure_column(&conn, "accounts", "free_ai_requests_used", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "accounts", "free_ai_seconds_used", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1587,7 +1615,7 @@ impl SqliteLedger {
     pub fn list_accounts(&self) -> rusqlite::Result<Vec<AccountSummaryRow>> {
         let conn = self.conn.lock_safe();
         let mut stmt = conn.prepare(
-            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels, a.max_channels, a.device_fingerprint
+            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels, a.max_channels, a.device_fingerprint, a.plan
              FROM account_subjects s JOIN accounts a ON a.account = s.account
              ORDER BY s.subject",
         )?;
@@ -1602,6 +1630,7 @@ impl SqliteLedger {
                     max_tunnels: r.get::<_, i64>(4)?.max(0) as u32,
                     max_channels: r.get::<_, i64>(5)?.max(0) as u32,
                     device_fingerprint: r.get(6)?,
+                    plan: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1735,6 +1764,141 @@ impl SqliteLedger {
         Ok(())
     }
 
+    /// The paid plan `account` is on, or `None` for Free. See the `plan` column's
+    /// doc comment (`from_connection`) for why this is admin-settable today
+    /// rather than derived from a real subscription.
+    pub fn plan_for(&self, account: &AccountId) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock_safe()
+            .query_row("SELECT plan FROM accounts WHERE account = ?1", params![&account.0[..]], |r| r.get(0))
+            .optional()
+            .map(Option::flatten)
+    }
+
+    /// Set (or clear, `None`) `account`'s plan -- an admin-only action
+    /// (`/admin-ui/accounts/:subject/plan`) until real self-service billing
+    /// exists, same "operator lever" shape as [`Self::set_max_tunnels`]. No-op if
+    /// `account` doesn't exist yet.
+    pub fn set_plan(&self, account: &AccountId, plan: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute("UPDATE accounts SET plan = ?1 WHERE account = ?2", params![plan, &account.0[..]])?;
+        Ok(())
+    }
+
+    /// This account's AI-usage state, for the self-service "how much have I used"
+    /// view (`GET /me/ai/usage`) -- see [`AiUsageSnapshot`].
+    pub fn ai_usage_for(&self, account: &AccountId) -> rusqlite::Result<Option<AiUsageSnapshot>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT balance, plan, free_ai_requests_used, free_ai_seconds_used FROM accounts WHERE account = ?1",
+                params![&account.0[..]],
+                |r| {
+                    Ok(AiUsageSnapshot {
+                        balance: r.get::<_, i64>(0)?.max(0) as u64,
+                        plan: r.get(1)?,
+                        free_requests_used: r.get::<_, i64>(2)?.max(0) as u32,
+                        free_seconds_used: r.get::<_, i64>(3)?.max(0) as u32,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Meter one Standard-KI chat/completion request: debits `credits_cost` from
+    /// `account`'s balance and, ONLY for a Free-tier account (no `plan` set) with
+    /// `free_cap_requests` configured, additionally enforces the lifetime
+    /// free-request hard cap (pricing model §2.1a) -- a SEPARATE ceiling on top
+    /// of the credit debit, not a replacement for it: a Free-tier account still
+    /// spends real trial credits, this cap exists so leftover or topped-up
+    /// credits alone can't buy unlimited "free" usage. A paid-plan account is
+    /// never subject to this cap, and its counter is never incremented.
+    pub fn debit_ai_chat(&self, account: &AccountId, credits_cost: u64, free_cap_requests: Option<u32>) -> Result<(), LedgerOpError> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let (balance, blocked, plan, requests_used) = Self::ai_row(&tx, account)?;
+        if blocked {
+            return Err(LedgerOpError::Ledger(LedgerError::AccountBlocked));
+        }
+        let is_free_tier = plan.is_none();
+        if is_free_tier {
+            if let Some(cap) = free_cap_requests {
+                if requests_used >= cap {
+                    return Err(LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded));
+                }
+            }
+        }
+        Self::check_balance(balance, credits_cost)?;
+        if is_free_tier {
+            tx.execute(
+                "UPDATE accounts SET balance = balance - ?1, free_ai_requests_used = free_ai_requests_used + 1 WHERE account = ?2",
+                params![credits_cost as i64, &account.0[..]],
+            )?;
+        } else {
+            tx.execute("UPDATE accounts SET balance = balance - ?1 WHERE account = ?2", params![credits_cost as i64, &account.0[..]])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Like [`Self::debit_ai_chat`], but for Whisper transcription: `duration_seconds`
+    /// is a client-reported figure (this MVP trusts it -- see `ai_usage`'s own doc
+    /// for why that's a documented, accepted limitation, not an oversight) that
+    /// accrues against the lifetime free-seconds cap instead of a request count.
+    pub fn debit_ai_transcribe(
+        &self,
+        account: &AccountId,
+        credits_cost: u64,
+        duration_seconds: u32,
+        free_cap_seconds: Option<u32>,
+    ) -> Result<(), LedgerOpError> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        let (balance, blocked, plan, _requests_used) = Self::ai_row(&tx, account)?;
+        let seconds_used: u32 = tx
+            .query_row("SELECT free_ai_seconds_used FROM accounts WHERE account = ?1", params![&account.0[..]], |r| r.get::<_, i64>(0))?
+            .max(0) as u32;
+        if blocked {
+            return Err(LedgerOpError::Ledger(LedgerError::AccountBlocked));
+        }
+        let is_free_tier = plan.is_none();
+        if is_free_tier {
+            if let Some(cap) = free_cap_seconds {
+                if seconds_used >= cap {
+                    return Err(LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded));
+                }
+            }
+        }
+        Self::check_balance(balance, credits_cost)?;
+        if is_free_tier {
+            tx.execute(
+                "UPDATE accounts SET balance = balance - ?1, free_ai_seconds_used = free_ai_seconds_used + ?2 WHERE account = ?3",
+                params![credits_cost as i64, duration_seconds, &account.0[..]],
+            )?;
+        } else {
+            tx.execute("UPDATE accounts SET balance = balance - ?1 WHERE account = ?2", params![credits_cost as i64, &account.0[..]])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Shared row fetch for both AI-debit methods: `(balance, blocked, plan, free_ai_requests_used)`.
+    fn ai_row(tx: &rusqlite::Transaction, account: &AccountId) -> Result<(i64, bool, Option<String>, u32), LedgerOpError> {
+        tx.query_row(
+            "SELECT balance, blocked, plan, free_ai_requests_used FROM accounts WHERE account = ?1",
+            params![&account.0[..]],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0, r.get(2)?, r.get::<_, i64>(3)?.max(0) as u32)),
+        )
+        .optional()?
+        .ok_or(LedgerOpError::Ledger(LedgerError::UnknownAccount))
+    }
+
+    fn check_balance(balance: i64, credits_cost: u64) -> Result<(), LedgerOpError> {
+        if balance < credits_cost as i64 {
+            return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: balance.max(0) as u64, requested: credits_cost }));
+        }
+        Ok(())
+    }
+
     /// Readiness probe: can this process actually read its database?
     ///
     /// #541: this used to run `SELECT 1`, which reads no page of the database file at all --
@@ -1772,6 +1936,17 @@ impl SqliteLedger {
         self.conn
             .lock_safe()
             .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+    }
+
+    /// Whether ANY account is on a paid plan right now -- paid-tier alerting's
+    /// qualifier (`StatusResp::has_paid_accounts`). A cheap `EXISTS` rather than
+    /// `list_accounts()`, since `/status` reads this on every aggregation.
+    pub fn has_paid_accounts(&self) -> rusqlite::Result<bool> {
+        self.conn.lock_safe().query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE plan IS NOT NULL)",
+            [],
+            |r| r.get::<_, i64>(0),
+        ).map(|n| n != 0)
     }
 
     /// Number of confirmed payments — for the status view (F4.1).
@@ -8635,6 +8810,34 @@ mod tests {
         let a_row = rows.iter().find(|r| r.subject == "subj-a").unwrap();
         assert_eq!(a_row.device_fingerprint, None);
         let _ = a2;
+    }
+
+    #[test]
+    fn plan_defaults_to_free_and_is_set_per_account_only() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let a1 = ledger.account_for_subject("plan-a").unwrap();
+        let a2 = ledger.account_for_subject("plan-b").unwrap();
+        assert_eq!(ledger.plan_for(&a1).unwrap(), None, "Free by default");
+        ledger.set_plan(&a1, Some("pro")).unwrap();
+        assert_eq!(ledger.plan_for(&a1).unwrap().as_deref(), Some("pro"));
+        assert_eq!(ledger.plan_for(&a2).unwrap(), None, "a sibling account is untouched");
+        ledger.set_plan(&a1, None).unwrap();
+        assert_eq!(ledger.plan_for(&a1).unwrap(), None, "clearing back to Free");
+    }
+
+    #[test]
+    fn has_paid_accounts_is_true_only_once_someone_actually_has_a_plan() {
+        // Paid-tier alerting's qualifier (StatusResp::has_paid_accounts).
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(!ledger.has_paid_accounts().unwrap(), "no accounts at all yet");
+        let free_account = ledger.account_for_subject("free-only").unwrap();
+        assert!(!ledger.has_paid_accounts().unwrap(), "a Free account alone doesn't count");
+        let paid_account = ledger.account_for_subject("paid-user").unwrap();
+        ledger.set_plan(&paid_account, Some("starter")).unwrap();
+        assert!(ledger.has_paid_accounts().unwrap(), "one paid account is enough");
+        ledger.set_plan(&paid_account, None).unwrap();
+        assert!(!ledger.has_paid_accounts().unwrap(), "clearing the only paid plan flips it back");
+        let _ = free_account;
     }
 
     #[test]

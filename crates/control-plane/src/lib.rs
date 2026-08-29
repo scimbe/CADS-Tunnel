@@ -9,6 +9,7 @@
 
 pub mod accounts;
 pub mod acme_broker;
+pub mod ai_usage;
 pub mod admin_identity;
 pub mod audit_log;
 pub mod billing;
@@ -33,6 +34,7 @@ pub mod installer;
 pub mod issuance;
 pub mod keycloak_admin;
 pub mod oidc;
+pub mod paddle;
 pub mod payment;
 pub mod portal;
 pub mod portal_api;
