@@ -2580,18 +2580,27 @@ const EDITOR_JS: &str = r#"
  var msg=document.getElementById('msg');
  function say(t){if(msg)msg.textContent=t;}
  var modeSel=document.getElementById('mode');
+ var budgetWrap=document.getElementById('budgetwrap');
+ var budgetInput=document.getElementById('shortcutBudget');
+ function syncBudgetVisibility(){if(budgetWrap)budgetWrap.style.display=(modeSel&&modeSel.value==='shortcut')?'':'none';}
  if(modeSel){modeSel.addEventListener('change',function(){
+  syncBudgetVisibility();
   fetch('/me/topologies/'+encodeURIComponent(tid)+'/mode',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({mode:modeSel.value})})
    .then(function(r){say(r.ok?'mode: '+modeSel.value:'mode change failed ('+r.status+')');});
  });}
  var sug=document.getElementById('suggest');
  if(sug){sug.addEventListener('click',function(){
   var links=[];svg.querySelectorAll('.edge').forEach(function(ed){links.push({a:ed.getAttribute('data-a'),b:ed.getAttribute('data-b'),cost:1});});
-  fetch('/me/topologies/'+encodeURIComponent(tid)+'/suggest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({links:links})})
+  // #113-ui-budget: only the "Adaptive + shortcuts" mode's own extra-links budget is ever
+  // sent -- 0 in every other mode, matching add_shortcuts' no-op-at-0 behavior server-side
+  // (previously silently 0 in EVERY mode, so picking "shortcuts" never actually added any).
+  var budget=(modeSel&&modeSel.value==='shortcut'&&budgetInput)?(parseInt(budgetInput.value,10)||0):0;
+  fetch('/me/topologies/'+encodeURIComponent(tid)+'/suggest',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({links:links,shortcut_budget:budget})})
    .then(function(r){return r.ok?r.json():Promise.reject(r.status);})
    .then(function(p){say('suggested '+p.links.length+' links, cost '+p.total_cost+(p.connected?' (connected)':' (partition)'));})
    .catch(function(s){say('suggest unavailable ('+s+')');});
  });}
+ syncBudgetVisibility();
  // #107-ui-compose: click-to-connect — toggle Connect, then click two agents to draw a new
  // overlay link; it POSTs the existing owner `…/edges` endpoint and the edge appears live.
  var src=null;
@@ -3122,6 +3131,9 @@ fn render_topology_editor(
          <label class=\"sp\"><input type=\"checkbox\" id=\"agentkind\"/> super-peer</label>\
          <button id=\"addagent\">Add</button>\
          <button id=\"syncchan\" class=\"primary\">Sync my channels</button>\
+         <label class=\"flex-only\" id=\"budgetwrap\" style=\"display:{budget_display}\">shortcuts \
+         <input id=\"shortcutBudget\" type=\"number\" min=\"0\" max=\"{max_budget}\" value=\"0\" \
+         aria-label=\"shortcut budget (extra links suggest may add beyond the min-latency tree)\"/></label>\
          <button id=\"suggest\" class=\"primary flex-only\">Suggest overlay</button>\
          <span id=\"msg\"></span></header>\
          <div class=\"guide\" id=\"guide\" role=\"button\" tabindex=\"0\" aria-label=\"current step -- click for details\"></div>\
@@ -3137,6 +3149,8 @@ fn render_topology_editor(
         tid = esc(&t.id),
         mode_dis = if is_owner { "" } else { " disabled" },
         op_status = if operator_bound { "bound" } else { "not bound" },
+        budget_display = if mode == "shortcut" { "" } else { "none" },
+        max_budget = MAX_SUGGEST_BUDGET,
         css = EDITOR_CSS,
         js = EDITOR_JS,
     )
@@ -9039,6 +9053,18 @@ mod tests {
         assert!(html.contains("id=\"suggest\""), "suggest button present");
         assert!(html.contains("data-tid=\"t1\""), "topology id embedded for the REST fetches");
         assert!(html.contains("/mode") && html.contains("/suggest"), "wired to the owner endpoints");
+        // #113-ui-budget: the shortcut-budget input actually exists and its value reaches the
+        // suggest POST -- before this, `shortcut_budget` was hardcoded to the struct default
+        // (0) client-side, so picking "Adaptive + shortcuts" never added a single shortcut.
+        assert!(html.contains("id=\"shortcutBudget\""), "shortcut-budget input present");
+        assert!(html.contains("shortcut_budget:budget"), "the input's value is sent to /suggest, not a hardcoded 0");
+        assert!(html.contains("max=\"16\""), "capped to MAX_SUGGEST_BUDGET so the input can't submit a value the server would 400 on");
+        // Hidden by default outside "shortcut" mode (this fixture is "smart-route")...
+        assert!(html.contains("id=\"budgetwrap\" style=\"display:none\""), "budget input hidden when mode != shortcut");
+        // ...and server-rendered visible when the topology's current mode already is "shortcut"
+        // (not just toggled client-side after a JS mode change).
+        let shortcut_html = render_topology_editor(&t, &agents, &edges, "shortcut", true, &[], false);
+        assert!(shortcut_html.contains("id=\"budgetwrap\" style=\"display:\">"), "budget input visible when mode == shortcut");
 
         // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
         let evil = vec![("<script>alert(1)</script>".to_string(), "peer".to_string(), None, false)];
