@@ -1364,6 +1364,7 @@ pub struct AccountSummaryRow {
     pub balance: u64,
     pub blocked: bool,
     pub max_tunnels: u32,
+    pub max_channels: u32,
 }
 
 sqlite_store_ctors!(SqliteLedger);
@@ -1403,6 +1404,12 @@ impl SqliteLedger {
         // for every one. DEFAULT 1 keeps every existing account's behavior
         // unchanged on a pre-existing DB.
         ensure_column(&conn, "accounts", "max_tunnels", "INTEGER NOT NULL DEFAULT 1")?;
+        // #113-ui-limits: same idea for Agent-Fabric channels, which had NO cap at all
+        // before this (unlike tunnels' max_tunnels) -- default 100 is generous enough
+        // that no real Standard-tier account should ever hit it by accident, while
+        // still bounding the previously-unbounded `channels` table an operator could
+        // otherwise be flooded with. Raised per-account the same way as max_tunnels.
+        ensure_column(&conn, "accounts", "max_channels", "INTEGER NOT NULL DEFAULT 100")?;
         // ADR-0025 (admin console): an admin-blocked account is refused at every
         // credit-gated admission point (`debit`/`debit_and_record_issuance`) and at
         // the self-service tunnel-creation gate (`portal_api::create_tunnel`) --
@@ -1436,6 +1443,33 @@ impl SqliteLedger {
     pub fn set_max_tunnels(&self, account: &AccountId, max: u32) -> rusqlite::Result<()> {
         self.conn.lock_safe().execute(
             "UPDATE accounts SET max_tunnels = ?1 WHERE account = ?2",
+            params![max, &account.0[..]],
+        )?;
+        Ok(())
+    }
+
+    /// The most Agent-Fabric channels `account` may own at once (default 100, the
+    /// Standard tier) -- what [`Self::set_max_channels`] raises for a specific
+    /// account. Same shape as [`Self::max_tunnels`].
+    pub fn max_channels(&self, account: &AccountId) -> rusqlite::Result<u32> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT max_channels FROM accounts WHERE account = ?1",
+                params![&account.0[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(100).max(0) as u32)
+    }
+
+    /// Raise (or lower) the channel-registration limit for one SPECIFIC account --
+    /// an operator-only action; `SqliteChannelStore::register_channel`'s own gate is
+    /// the only thing that reads this. No-op (not an error) if `account` doesn't
+    /// exist yet, same as [`Self::set_max_tunnels`].
+    pub fn set_max_channels(&self, account: &AccountId, max: u32) -> rusqlite::Result<()> {
+        self.conn.lock_safe().execute(
+            "UPDATE accounts SET max_channels = ?1 WHERE account = ?2",
             params![max, &account.0[..]],
         )?;
         Ok(())
@@ -1528,7 +1562,7 @@ impl SqliteLedger {
     pub fn list_accounts(&self) -> rusqlite::Result<Vec<AccountSummaryRow>> {
         let conn = self.conn.lock_safe();
         let mut stmt = conn.prepare(
-            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels
+            "SELECT s.subject, a.account, a.balance, a.blocked, a.max_tunnels, a.max_channels
              FROM account_subjects s JOIN accounts a ON a.account = s.account
              ORDER BY s.subject",
         )?;
@@ -1541,6 +1575,7 @@ impl SqliteLedger {
                     balance: r.get::<_, i64>(2)?.max(0) as u64,
                     blocked: r.get::<_, i64>(3)? != 0,
                     max_tunnels: r.get::<_, i64>(4)?.max(0) as u32,
+                    max_channels: r.get::<_, i64>(5)?.max(0) as u32,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1881,6 +1916,14 @@ pub enum CreateTunnelOutcome {
     Created(SubjectTunnel),
     OverLimit,
     HostnameTaken,
+}
+
+/// How [`SqliteChannelStore::register_channel_if_under_owned_limit`] resolved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterChannelOutcome {
+    Registered,
+    OwnedByAnother,
+    OverLimit,
 }
 
 impl CreateTunnelOutcome {
@@ -3821,6 +3864,50 @@ impl SqliteChannelStore {
             params![&channel.0[..], &operator_pubkey[..], owner],
         )?;
         Ok(true)
+    }
+
+    /// Like [`Self::register_channel`], but additionally enforces a per-owner
+    /// channel-count limit (#113-ui-limits -- channels had NO cap at all before
+    /// this, unlike tunnels' `max_tunnels`/`create_if_under_owned_limit`). Deliberately
+    /// a separate method rather than widening `register_channel`'s own signature:
+    /// that function has 45+ existing call sites (mostly test fixtures seeding an
+    /// owned channel, which don't want or need limit enforcement); only the two
+    /// real user-facing creation paths (`POST /me/channels`, the portal's New
+    /// Channel form) should ever call this one. The count check runs under the
+    /// SAME writer lock as the insert (race-free, same reasoning as #432's tunnel
+    /// fix), and — matching `register_channel`'s own idempotent-re-key behavior —
+    /// re-registering a channel already owned by `owner` is never blocked by the
+    /// limit, only genuinely NEW channels are.
+    pub fn register_channel_if_under_owned_limit(
+        &self,
+        channel: &ChannelId,
+        operator_pubkey: &[u8; 32],
+        owner: &str,
+        max: u32,
+    ) -> rusqlite::Result<RegisterChannelOutcome> {
+        let conn = self.writer.lock_safe();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT owner FROM channels WHERE channel = ?1",
+                params![&channel.0[..]],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if matches!(existing, Some(ref o) if o != owner) {
+            return Ok(RegisterChannelOutcome::OwnedByAnother);
+        }
+        if existing.is_none() {
+            let owned_count: u32 =
+                conn.query_row("SELECT COUNT(*) FROM channels WHERE owner = ?1", params![owner], |r| r.get(0))?;
+            if owned_count >= max {
+                return Ok(RegisterChannelOutcome::OverLimit);
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO channels (channel, operator, owner) VALUES (?1, ?2, ?3)",
+            params![&channel.0[..], &operator_pubkey[..], owner],
+        )?;
+        Ok(RegisterChannelOutcome::Registered)
     }
 
     /// The operator public key for `channel`, if registered (the edge's lookup).
@@ -8392,6 +8479,23 @@ mod tests {
     }
 
     #[test]
+    fn max_channels_defaults_to_100_and_is_raised_per_account_only() {
+        // #113-ui-limits: same shape as max_tunnels, but channels had NO cap at
+        // all before this -- default 100 (not 1) since the Standard tier's own
+        // channel entitlement is meant to be generous, unlike the single-tunnel
+        // default.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let a1 = ledger.account_for_subject("remote-maintainer").unwrap();
+        let a2 = ledger.account_for_subject("someone-else").unwrap();
+        assert_eq!(ledger.max_channels(&a1).unwrap(), 100, "default is 100, the Standard tier");
+        assert_eq!(ledger.max_channels(&a2).unwrap(), 100);
+
+        ledger.set_max_channels(&a1, 5).unwrap();
+        assert_eq!(ledger.max_channels(&a1).unwrap(), 5, "raised (or lowered) for the specified account");
+        assert_eq!(ledger.max_channels(&a2).unwrap(), 100, "a different account's limit is untouched");
+    }
+
+    #[test]
     fn subject_account_survives_reopen() {
         let path = temp_db_path();
         let acct;
@@ -8443,6 +8547,62 @@ mod tests {
         // Owner may re-key their own channel (agent rotates its operator key).
         assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
         assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+    }
+
+    #[test]
+    fn register_channel_if_under_owned_limit_enforces_the_cap_atomically_and_never_blocks_a_re_key() {
+        // #113-ui-limits: channels had no cap at all before this. Three things this
+        // must get right: (1) the Nth-plus-1 NEW channel is refused once `owner`
+        // already owns `max`, (2) re-registering (re-keying) a channel the SAME
+        // owner already owns is NEVER blocked by the limit -- only genuinely new
+        // channels count against it, matching register_channel's own idempotent-
+        // re-key behavior, (3) a different owner's count is untouched.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let op = [0x77u8; 32];
+
+        // Fill alice up to a limit of 2.
+        let ch1 = ChannelId([0x01; 32]);
+        let ch2 = ChannelId([0x02; 32]);
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch1, &op, "alice", 2).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch2, &op, "alice", 2).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
+
+        // A third NEW channel is refused -- alice already owns 2, the limit.
+        let ch3 = ChannelId([0x03; 32]);
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch3, &op, "alice", 2).unwrap(),
+            RegisterChannelOutcome::OverLimit
+        );
+        assert_eq!(s.operator_pubkey(&ch3).unwrap(), None, "refused, never created");
+
+        // Re-registering (re-keying) an ALREADY-OWNED channel is never blocked by
+        // the limit, even though alice is already at the cap.
+        let new_op = [0x88u8; 32];
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch1, &new_op, "alice", 2).unwrap(),
+            RegisterChannelOutcome::Registered,
+            "re-keying an owned channel is not a NEW channel, so the limit doesn't apply"
+        );
+        assert_eq!(s.operator_pubkey(&ch1).unwrap(), Some(new_op));
+
+        // Owned-by-another still refused the same way as plain register_channel,
+        // regardless of the (irrelevant, since it's refused first) limit.
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch1, &op, "mallory", 100).unwrap(),
+            RegisterChannelOutcome::OwnedByAnother
+        );
+
+        // A different owner's own count is untouched by alice's limit/usage.
+        let ch4 = ChannelId([0x04; 32]);
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch4, &op, "carol", 1).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
     }
 
     #[test]

@@ -170,6 +170,7 @@ pub fn portal_api_router(
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
         .route("/admin/provision-tunnel", post(admin_provision_tunnel))
         .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
+        .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
         .with_state(state)
 }
 
@@ -297,6 +298,33 @@ async fn admin_set_max_tunnels(
     };
     if let Err(e) = st.ledger.set_max_tunnels(&account, req.max) {
         return internal_error("admin_set_max_tunnels/set", e).into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct SetMaxChannelsReq {
+    max: u32,
+}
+
+/// `POST /admin/accounts/:subject/max-channels {max}` (operator-only, #113-ui-limits):
+/// same shape as [`admin_set_max_tunnels`], for the Agent-Fabric channel-count limit
+/// (`POST /portal/channels/new` and `POST /me/channels` both read it).
+async fn admin_set_max_channels(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetMaxChannelsReq>,
+) -> Response {
+    if let Err(code) = admin_authed(&headers, st.admin_token) {
+        return code.into_response();
+    }
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_set_max_channels/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_max_channels(&account, req.max) {
+        return internal_error("admin_set_max_channels/set", e).into_response();
     }
     StatusCode::OK.into_response()
 }
@@ -1092,6 +1120,7 @@ pub fn admin_ui_router(
         .route("/admin-ui/accounts/:subject/unblock", post(admin_ui_unblock_account))
         .route("/admin-ui/accounts/:subject/delete", post(admin_ui_delete_account))
         .route("/admin-ui/accounts/:subject/max-tunnels", post(admin_ui_set_max_tunnels))
+        .route("/admin-ui/accounts/:subject/max-channels", post(admin_ui_set_max_channels))
         .route("/admin-ui/admins", get(admin_ui_list_admins).post(admin_ui_add_admin))
         .route("/admin-ui/admins/:email", delete(admin_ui_remove_admin))
         // ADR-0025 Decision 4/6: hostname disable/enable + multi-domain onboarding
@@ -1314,6 +1343,32 @@ async fn admin_ui_set_max_tunnels(
     let _ = st
         .audit
         .record(&session.email, "max_tunnels_set", Some(&subject), Some(&format!("max={}", req.max)));
+    StatusCode::OK.into_response()
+}
+
+/// `POST /admin-ui/accounts/:subject/max-channels {max}` (admin-identity-gated):
+/// the admin-identity-gated mirror of [`admin_set_max_channels`], same shape as
+/// [`admin_ui_set_max_tunnels`].
+async fn admin_ui_set_max_channels(
+    State(st): State<AdminUiState>,
+    headers: HeaderMap,
+    Path(subject): Path<String>,
+    Json(req): Json<SetMaxChannelsReq>,
+) -> Response {
+    let session = match admin_ui_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("admin_ui_set_max_channels/account_for_subject", e).into_response(),
+    };
+    if let Err(e) = st.ledger.set_max_channels(&account, req.max) {
+        return internal_error("admin_ui_set_max_channels/set", e).into_response();
+    }
+    let _ = st
+        .audit
+        .record(&session.email, "max_channels_set", Some(&subject), Some(&format!("max={}", req.max)));
     StatusCode::OK.into_response()
 }
 
@@ -2785,10 +2840,10 @@ fn admin_accounts_page_html(
     emails: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut table = String::from(
-        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th>Actions</th></tr></thead><tbody>"#,
+        r#"<div class="tablewrap"><table class="data"><thead><tr><th>Subject</th><th>Email</th><th>Account id</th><th class="num">Balance</th><th>State</th><th class="num">Max tunnels</th><th class="num">Max channels</th><th>Actions</th></tr></thead><tbody>"#,
     );
     if rows.is_empty() {
-        table.push_str(r#"<tr><td colspan="7" class="help">No accounts match.</td></tr>"#);
+        table.push_str(r#"<tr><td colspan="8" class="help">No accounts match.</td></tr>"#);
     }
     for r in rows {
         let state_badge = if r.blocked { r#"<span class="badge blocked">blocked</span>"# } else { r#"<span class="badge ok">active</span>"# };
@@ -2802,6 +2857,7 @@ fn admin_accounts_page_html(
 <td class="num">{balance}</td>
 <td>{state_badge}</td>
 <td class="num">{max_tunnels}</td>
+<td class="num">{max_channels}</td>
 <td><div style="display:flex;flex-wrap:wrap;gap:.35rem;align-items:center">
  <form class="inline" data-subject="{subject}" onsubmit="return creditAccount(event)">
   <input type="number" name="amount" min="1" value="100" style="width:5rem">
@@ -2810,7 +2866,11 @@ fn admin_accounts_page_html(
  <button class="sec" data-subject="{subject}" data-blocked="{blocked_flag}" onclick="return toggleBlock(event)">{block_label}</button>
  <form class="inline" data-subject="{subject}" onsubmit="return setMaxTunnels(event)">
   <input type="number" name="max" min="1" value="{max_tunnels}" style="width:4rem">
-  <button type="submit" class="sec">Set quota</button>
+  <button type="submit" class="sec">Set tunnel quota</button>
+ </form>
+ <form class="inline" data-subject="{subject}" onsubmit="return setMaxChannels(event)">
+  <input type="number" name="max" min="1" value="{max_channels}" style="width:4rem">
+  <button type="submit" class="sec">Set channel quota</button>
  </form>
  <button class="danger" data-subject="{subject}" onclick="return deleteAccount(event)">Delete</button>
 </div></td>
@@ -2821,6 +2881,7 @@ fn admin_accounts_page_html(
             balance = r.balance,
             state_badge = state_badge,
             max_tunnels = r.max_tunnels,
+            max_channels = r.max_channels,
             blocked_flag = r.blocked,
             block_label = block_label,
         ));
@@ -2871,6 +2932,17 @@ function setMaxTunnels(ev){{
  var max = parseInt(form.max.value, 10);
  if(!max || max < 1) return false;
  adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/max-tunnels', {{max: max}})
+  .then(function(){{ location.reload(); }})
+  .catch(function(e){{ window.alert('quota update failed: ' + e.message); }});
+ return false;
+}}
+function setMaxChannels(ev){{
+ ev.preventDefault();
+ var form = ev.target;
+ var subject = form.getAttribute('data-subject');
+ var max = parseInt(form.max.value, 10);
+ if(!max || max < 1) return false;
+ adminApi('POST', '/admin-ui/accounts/' + encodeURIComponent(subject) + '/max-channels', {{max: max}})
   .then(function(){{ location.reload(); }})
   .catch(function(e){{ window.alert('quota update failed: ' + e.message); }});
  return false;
@@ -4475,6 +4547,11 @@ struct ClaimState {
     /// raw holder pubkey. `None` when no directory is wired (matches every other
     /// best-effort/optional integration on this portal -- the picker just doesn't render).
     agents: Option<Arc<crate::storage::SqliteAgentDirectory>>,
+    /// #113-ui-limits: `new_channel_submit`'s per-owner channel-count limit
+    /// (`SqliteLedger::max_channels`) -- same value the `/me/channels` JSON API's
+    /// own `channel_register` handler reads, so a limit set via the admin console
+    /// applies identically whichever path a user creates a channel through.
+    ledger: Arc<crate::storage::SqliteLedger>,
     /// Public portal origin -- same value/purpose as [`ApiState::portal_base`],
     /// duplicated here rather than merging the two states (see the struct doc).
     portal_base: Arc<str>,
@@ -4500,6 +4577,7 @@ pub fn channel_claim_router(
     session_key: &[u8],
     channels: Arc<crate::storage::SqliteChannelStore>,
     agents: Option<Arc<crate::storage::SqliteAgentDirectory>>,
+    ledger: Arc<crate::storage::SqliteLedger>,
     portal_base: &str,
     edge_cert_path: &str,
 ) -> Router {
@@ -4523,6 +4601,7 @@ pub fn channel_claim_router(
             session_key: Arc::from(session_key.to_vec()),
             channels,
             agents,
+            ledger,
             portal_base: Arc::from(portal_base),
             edge_cert_path: Arc::from(edge_cert_path),
         })
@@ -5026,14 +5105,31 @@ async fn new_channel_submit(State(st): State<ClaimState>, headers: HeaderMap, Fo
     // bytes are a valid channel id.
     let mut channel = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut channel);
-    match st.channels.register_channel(&ct_common::channel::ChannelId(channel), &operator, &claims.subject) {
-        Ok(true) => Redirect::to(&format!("/portal/channels/{}/manage?created=true", hex(&channel))).into_response(),
-        Ok(false) => {
+    // #113-ui-limits: same Standard-tier-with-a-per-account-raise shape as the
+    // `/me/channels` JSON API's own `channel_register` handler.
+    let account = match st.ledger.account_for_subject(&claims.subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("new_channel_submit/account_for_subject", e).into_response(),
+    };
+    let max = match st.ledger.max_channels(&account) {
+        Ok(m) => m,
+        Err(e) => return internal_error("new_channel_submit/max_channels", e).into_response(),
+    };
+    match st.channels.register_channel_if_under_owned_limit(&ct_common::channel::ChannelId(channel), &operator, &claims.subject, max) {
+        Ok(crate::storage::RegisterChannelOutcome::Registered) => {
+            Redirect::to(&format!("/portal/channels/{}/manage?created=true", hex(&channel))).into_response()
+        }
+        Ok(crate::storage::RegisterChannelOutcome::OwnedByAnother) => {
             // Vanishingly unlikely (a fresh random 32 bytes colliding with an existing
             // channel owned by someone else) -- handled rather than unwrapped so a
             // pathological RNG failure surfaces as a retryable error, not a panic.
             Html(new_channel_html(Some("channel id collision, please try again"), claims.email.as_deref())).into_response()
         }
+        Ok(crate::storage::RegisterChannelOutcome::OverLimit) => Html(new_channel_html(
+            Some("the Standard tier includes 100 channels per account -- ask the operator to raise your account's limit"),
+            claims.email.as_deref(),
+        ))
+        .into_response(),
         Err(e) => internal_error("new_channel_submit/register_channel", e).into_response(),
     }
 }
@@ -9281,7 +9377,7 @@ mod tests {
         let ch = ChannelId([0x6eu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let holder_sk = SigningKey::from_bytes(&[0xc5u8; 32]);
@@ -9421,7 +9517,7 @@ mod tests {
         let ch = ChannelId([0x5cu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let holder_sk = SigningKey::from_bytes(&[0xc3u8; 32]);
@@ -9553,7 +9649,7 @@ mod tests {
         use crate::storage::SqliteChannelStore;
 
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
-        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let (status, html) = get(&app, "/portal/channels/not-hex-and-also-not-64-chars/claim", Some("nat-subject")).await;
         assert_eq!(status, StatusCode::OK, "renders an error page, not a raw error status");
@@ -9574,7 +9670,7 @@ mod tests {
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
         let ch = ChannelId([0x6bu8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
-        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
 
@@ -9597,7 +9693,7 @@ mod tests {
         use crate::storage::SqliteChannelStore;
 
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
-        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let resp = app
             .clone()
@@ -9626,7 +9722,7 @@ mod tests {
         let ch = ChannelId([0x7au8; 32]);
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
 
@@ -9717,7 +9813,7 @@ mod tests {
         std::fs::write(&cert_path, der).unwrap();
         let cert_path_str = cert_path.to_string_lossy().into_owned();
 
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", &cert_path_str);
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", &cert_path_str);
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
         let holder_sk = SigningKey::from_bytes(&[0xc7u8; 32]);
@@ -9816,7 +9912,7 @@ mod tests {
         assert!(channels.register_channel(&ch, &[0x22u8; 32], "alice-owner").unwrap());
         assert!(channels.allowlist_add(&ch, "alice-owner", "nat@example.com", 1_000).unwrap());
 
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         let ch_hex = hex(&ch.0);
         let holder_sk = SigningKey::from_bytes(&[0xc9u8; 32]);
@@ -9876,7 +9972,7 @@ mod tests {
             .claim_via_allowlist(&ch_claimed, "nat@example.com", &[0xc3u8; 32], &[0xd4u8; 32], &[0u8; 64], 2_000, None)
             .unwrap().claimed());
 
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
         // Logged out -> bounced, not a raw 401/500.
@@ -9928,7 +10024,7 @@ mod tests {
     #[tokio::test]
     async fn new_channel_creates_it_and_lists_it_owner_scoped() {
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let operator_hex = "aa".repeat(32);
 
         // Logged out -> bounced.
@@ -9987,7 +10083,7 @@ mod tests {
     #[tokio::test]
     async fn new_channel_page_shows_the_signed_in_email_113() {
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
-        let app = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels, None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         let resp = app
             .clone()
@@ -10021,6 +10117,31 @@ mod tests {
         assert!(html.contains("Signed in as") && html.contains("alice@example.com"), "POST /new validation error: {html}");
     }
 
+    /// #113-ui-limits: channels had no cap at all before this. Proves the portal's
+    /// own creation path (not just the storage-layer method) actually enforces the
+    /// per-account limit end to end, and that a refused attempt creates nothing.
+    #[tokio::test]
+    async fn new_channel_submit_enforces_the_per_account_channel_limit() {
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ledger = Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap());
+        let account = ledger.account_for_subject("alice").unwrap();
+        ledger.set_max_channels(&account, 1).unwrap();
+        let app = channel_claim_router(KEY, channels.clone(), None, ledger, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let operator_hex = "aa".repeat(32);
+
+        // First channel: under the limit, succeeds.
+        let resp = post_form_response(&app, "/portal/channels/new", "alice", &format!("operator_pubkey={operator_hex}")).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "first channel is under the limit of 1");
+        assert_eq!(channels.channels_owned_by("alice").unwrap().len(), 1);
+
+        // Second channel: alice is already at her limit of 1 -- refused, not created.
+        let resp2 = post_form_response(&app, "/portal/channels/new", "alice", &format!("operator_pubkey={operator_hex}")).await;
+        assert_eq!(resp2.status(), StatusCode::OK, "over the limit re-renders the form, doesn't redirect as if it worked");
+        let body = String::from_utf8(to_bytes(resp2.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("100 channels per account"), "names the actual limit reason: {body}");
+        assert_eq!(channels.channels_owned_by("alice").unwrap().len(), 1, "still just the one channel -- the refused attempt created nothing");
+    }
+
     /// Adding a member from the manage page enforces the exact same #101 SEC101b
     /// attestation check the JSON API (`channel_add_member`) and the claim flow
     /// (`do_claim`) already do -- proven here rather than assumed, since this is a
@@ -10033,7 +10154,7 @@ mod tests {
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let ch = ChannelId([0x11; 32]);
         channels.register_channel(&ch, &[0x22; 32], "alice").unwrap();
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let ch_hex = hex(&ch.0);
 
         let holder_sk = SigningKey::from_bytes(&[0x33; 32]);
@@ -10107,7 +10228,7 @@ mod tests {
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let ch = ct_common::channel::ChannelId([0x55; 32]);
         channels.register_channel(&ch, &[0x66; 32], "alice").unwrap();
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let ch_hex = hex(&ch.0);
 
         // The button is present on the owner's manage page.
@@ -10149,7 +10270,7 @@ mod tests {
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let ch = ChannelId([0x55; 32]);
         channels.register_channel(&ch, &[0x66; 32], "alice").unwrap();
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let ch_hex = hex(&ch.0);
 
         assert_eq!(
@@ -10201,7 +10322,7 @@ mod tests {
         let holder = [0x99u8; 32];
         let holder_hex = hex(&holder);
         let ch_hex = hex(&ch.0);
-        let app = channel_claim_router(KEY, channels.clone(), None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app = channel_claim_router(KEY, channels.clone(), None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
 
         // Wrong length -> refused before ever reaching storage.
         let resp = post_form_response(
@@ -10270,6 +10391,7 @@ mod tests {
             KEY,
             channels.clone(),
             Some(agents.clone()),
+            Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()),
             "https://portal.example",
             "/nonexistent/ct-edge-ca.der",
         );
@@ -10297,7 +10419,7 @@ mod tests {
 
         // No directory wired at all -> empty JSON, not an error (matches the picker's
         // own "silently doesn't render" degrade path).
-        let app_no_dir = channel_claim_router(KEY, channels, None, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let app_no_dir = channel_claim_router(KEY, channels, None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
         let (status, body) = get(&app_no_dir, &format!("/portal/channels/{ch_hex}/manage/search-agents?q=physics"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "[]");
