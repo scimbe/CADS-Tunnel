@@ -67,7 +67,21 @@ CLIENT_REP="$(jq -n --arg cid "$CLIENT_ID" '{
   redirectUris: [],
   webOrigins: [],
   attributes: { "oauth2.device.authorization.grant.enabled": "true" },
-  defaultClientScopes: ["email", "profile"]
+  defaultClientScopes: ["email", "profile"],
+  protocolMappers: [{
+    name: "sub",
+    protocol: "openid-connect",
+    protocolMapper: "oidc-usermodel-property-mapper",
+    consentRequired: false,
+    config: {
+      "user.attribute": "id",
+      "claim.name": "sub",
+      "jsonType.label": "String",
+      "access.token.claim": "true",
+      "id.token.claim": "false",
+      "userinfo.token.claim": "false"
+    }
+  }]
 }')"
 
 log "Checking for an existing '$CLIENT_ID' client on realm '$REALM'"
