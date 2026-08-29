@@ -1096,6 +1096,20 @@ impl SqliteAgentDirectory {
         self.read()
             .query_row("SELECT COUNT(*) FROM agent_cards", [], |r| r.get(0))
     }
+
+    /// Remove a directory entry (#113-ui-delete). `agent_cards` has no owner/subject
+    /// column at all -- registration itself is gated by the shared admin token
+    /// (`POST /registry/agents`, #161), not a self-service per-account concept the
+    /// way channels/tunnels are -- so this is an admin-only operation, same gate as
+    /// registration. Returns whether a row was actually removed (`false` for an
+    /// unknown holder, so a caller can tell "already gone" from "deleted").
+    pub fn unregister(&self, holder_pubkey: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .writer
+            .lock_safe()
+            .execute("DELETE FROM agent_cards WHERE holder_pubkey = ?1", params![holder_pubkey])?;
+        Ok(n > 0)
+    }
 }
 
 /// SQLite-backed **pipeline registry** (#174 B): where a designer *publishes* a workflow
