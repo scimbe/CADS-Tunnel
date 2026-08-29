@@ -1938,6 +1938,17 @@ impl SqliteLedger {
             .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
     }
 
+    /// Whether ANY account is on a paid plan right now -- paid-tier alerting's
+    /// qualifier (`StatusResp::has_paid_accounts`). A cheap `EXISTS` rather than
+    /// `list_accounts()`, since `/status` reads this on every aggregation.
+    pub fn has_paid_accounts(&self) -> rusqlite::Result<bool> {
+        self.conn.lock_safe().query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE plan IS NOT NULL)",
+            [],
+            |r| r.get::<_, i64>(0),
+        ).map(|n| n != 0)
+    }
+
     /// Number of confirmed payments — for the status view (F4.1).
     pub fn confirmed_payment_count(&self) -> rusqlite::Result<i64> {
         self.conn
@@ -8812,6 +8823,21 @@ mod tests {
         assert_eq!(ledger.plan_for(&a2).unwrap(), None, "a sibling account is untouched");
         ledger.set_plan(&a1, None).unwrap();
         assert_eq!(ledger.plan_for(&a1).unwrap(), None, "clearing back to Free");
+    }
+
+    #[test]
+    fn has_paid_accounts_is_true_only_once_someone_actually_has_a_plan() {
+        // Paid-tier alerting's qualifier (StatusResp::has_paid_accounts).
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        assert!(!ledger.has_paid_accounts().unwrap(), "no accounts at all yet");
+        let free_account = ledger.account_for_subject("free-only").unwrap();
+        assert!(!ledger.has_paid_accounts().unwrap(), "a Free account alone doesn't count");
+        let paid_account = ledger.account_for_subject("paid-user").unwrap();
+        ledger.set_plan(&paid_account, Some("starter")).unwrap();
+        assert!(ledger.has_paid_accounts().unwrap(), "one paid account is enough");
+        ledger.set_plan(&paid_account, None).unwrap();
+        assert!(!ledger.has_paid_accounts().unwrap(), "clearing the only paid plan flips it back");
+        let _ = free_account;
     }
 
     #[test]

@@ -221,7 +221,10 @@ async fn paddle_webhook(State(st): State<PaddleState>, headers: HeaderMap, body:
     };
     let sig_header = headers.get("paddle-signature").and_then(|v| v.to_str().ok()).ok_or((StatusCode::BAD_REQUEST, "missing Paddle-Signature".to_string()))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    verify_paddle_signature(secret, sig_header, &body, now, 300).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    verify_paddle_signature(secret, sig_header, &body, now, 300).map_err(|e| {
+        crate::service::note_paddle_webhook_rejected(e); // paid-tier alerting
+        (StatusCode::UNAUTHORIZED, e.to_string())
+    })?;
 
     let event: serde_json::Value = serde_json::from_slice(&body).map_err(|_| (StatusCode::BAD_REQUEST, "malformed event body".to_string()))?;
     let event_type = event.get("event_type").and_then(|v| v.as_str()).unwrap_or("");

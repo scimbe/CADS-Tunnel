@@ -116,6 +116,15 @@ fn internal(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
+/// A backend-reachability/parse failure: notes the paid-tier "AI backend down"
+/// alert counter (`StatusResp::ai_backend_failures`) AND builds the error
+/// response, so every such failure is visible to a watcher, not just the one
+/// caller who happened to hit it.
+fn bad_gateway(why: String) -> (StatusCode, String) {
+    crate::service::note_ai_backend_failure(&why);
+    (StatusCode::BAD_GATEWAY, why)
+}
+
 fn ledger_err_status(e: &LedgerOpError) -> StatusCode {
     match e {
         LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. }) => StatusCode::PAYMENT_REQUIRED,
@@ -210,11 +219,11 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     if let Some(key) = &backend_key {
         rb = rb.header("authorization", format!("Bearer {key}"));
     }
-    let resp = rb.send().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("AI backend request failed: {e}")))?;
+    let resp = rb.send().await.map_err(|e| bad_gateway(format!("AI backend request failed: {e}")))?;
     if !resp.status().is_success() {
-        return Err((StatusCode::BAD_GATEWAY, format!("AI backend returned {}", resp.status())));
+        return Err(bad_gateway(format!("AI backend returned {}", resp.status())));
     }
-    let upstream: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("AI backend returned an unparseable response: {e}")))?;
+    let upstream: serde_json::Value = resp.json().await.map_err(|e| bad_gateway(format!("AI backend returned an unparseable response: {e}")))?;
 
     let total_tokens = upstream.get("usage").and_then(|u| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(bounded_max_tokens as u64);
     let credits_spent = (total_tokens * rate) / 1000;
@@ -266,11 +275,11 @@ async fn ai_transcribe(State(st): State<AiUsageState>, headers: HeaderMap, Json(
         .debit_ai_transcribe(&account, credits_cost, req.duration_seconds, pricing.free_ai_seconds_cap)
         .map_err(|e| (ledger_err_status(&e), e.to_string()))?;
 
-    let resp = rb.send().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("AI backend request failed: {e}")))?;
+    let resp = rb.send().await.map_err(|e| bad_gateway(format!("AI backend request failed: {e}")))?;
     if !resp.status().is_success() {
-        return Err((StatusCode::BAD_GATEWAY, format!("AI backend returned {}", resp.status())));
+        return Err(bad_gateway(format!("AI backend returned {}", resp.status())));
     }
-    let upstream: serde_json::Value = resp.json().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("AI backend returned an unparseable response: {e}")))?;
+    let upstream: serde_json::Value = resp.json().await.map_err(|e| bad_gateway(format!("AI backend returned an unparseable response: {e}")))?;
 
     Ok(Json(AiTranscribeResp { upstream, credits_spent: credits_cost }))
 }
