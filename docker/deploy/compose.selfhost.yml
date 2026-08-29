@@ -101,6 +101,15 @@ services:
       CT_CP_DNS_EDGE_IP: "${CT_CP_DNS_EDGE_IP:-57.131.133.91}"
     env_file:
       - .env
+      # Admin-only pricing preview (crates/control-plane/src/pricing.rs): optional,
+      # `required: false` so a deployment that hasn't created this file yet (every
+      # deployment before scimbe copies his own real numbers in -- see
+      # docker/deploy/.env.pricing.example) still starts normally, with the preview
+      # page rendering its "not configured" state. Never create this file with
+      # placeholder-only content just to satisfy compose -- absent is the correct,
+      # supported state, not a workaround.
+      - path: .env.pricing
+        required: false
     volumes:
       - cpdata:/data
       - shared:/shared:ro
