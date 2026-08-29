@@ -891,6 +891,10 @@ pub struct AuthedChannelState {
     /// caller (no raw bearer token, by BFF design) can drive these endpoints too --
     /// see [`subject_of_channel`]'s doc comment.
     session_key: Arc<[u8]>,
+    /// #113-ui-limits: `channel_register`'s per-owner channel-count limit
+    /// (`SqliteLedger::max_channels`, default 100, same Standard-tier shape as
+    /// tunnels' `max_tunnels`).
+    ledger: Arc<SqliteLedger>,
 }
 
 /// State for the #525 bearer-authed tunnel login-allow-list router: the tunnel store
@@ -933,6 +937,7 @@ pub fn authed_channel_router(
     channels: Arc<SqliteChannelStore>,
     verifier: OidcVerifierHandle,
     session_key: Arc<[u8]>,
+    ledger: Arc<SqliteLedger>,
 ) -> Router {
     Router::new()
         .route("/me/channels", post(channel_register).get(channel_list))
@@ -958,7 +963,7 @@ pub fn authed_channel_router(
             "/me/channels/:channel/allowlist/:email/remove",
             post(channel_allowlist_remove),
         )
-        .with_state(AuthedChannelState { channels, verifier, session_key })
+        .with_state(AuthedChannelState { channels, verifier, session_key, ledger })
 }
 
 /// Build the **service-account / bearer** tunnel login-allow-list router (#525): the
@@ -3197,16 +3202,26 @@ async fn channel_register(
         .ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?;
     let operator = hex_decode_32(&req.operator_pubkey)
         .ok_or((StatusCode::BAD_REQUEST, "malformed operator_pubkey".to_string()))?;
-    let ok = state
-        .channels
-        .register_channel(&ChannelId(channel), &operator, &owner)
+    // #113-ui-limits: same Standard-tier-with-a-per-account-raise shape as
+    // create_tunnel's own max_tunnels gate.
+    let account = state
+        .ledger
+        .account_for_subject(&owner)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // `register_channel` returns false only when the channel already belongs to a
-    // different subject — never let one owner re-key another's channel.
-    if ok {
-        Ok(StatusCode::OK)
-    } else {
-        Err((StatusCode::FORBIDDEN, "channel owned by another subject".to_string()))
+    let max = state
+        .ledger
+        .max_channels(&account)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match state.channels.register_channel_if_under_owned_limit(&ChannelId(channel), &operator, &owner, max) {
+        Ok(crate::storage::RegisterChannelOutcome::Registered) => Ok(StatusCode::OK),
+        Ok(crate::storage::RegisterChannelOutcome::OwnedByAnother) => {
+            Err((StatusCode::FORBIDDEN, "channel owned by another subject".to_string()))
+        }
+        Ok(crate::storage::RegisterChannelOutcome::OverLimit) => Err((
+            StatusCode::FORBIDDEN,
+            "the Standard tier includes 100 channels per account; ask the operator to raise your account's limit".to_string(),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
@@ -6081,6 +6096,7 @@ pub fn persistent_control_plane_router(
                 session_key,
                 channels.clone(),
                 Some(agent_directory.clone()),
+                ledger.clone(),
                 &portal_base_url,
                 &edge_cert_path,
             ))
@@ -6207,7 +6223,7 @@ pub fn persistent_control_plane_router(
             ))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
-            .merge(authed_channel_router(channels, oidc.clone(), Arc::from(session_key)))
+            .merge(authed_channel_router(channels, oidc.clone(), Arc::from(session_key), ledger.clone()))
             // #525: the bearer/service-account counterpart to the portal-session-only
             // tunnel login-allowlist form -- lets automation manage a tunnel's login
             // gate, owner-scoped, closing the channel/tunnel asymmetry.
@@ -10138,6 +10154,7 @@ mod tests {
             channels,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -10289,7 +10306,12 @@ mod tests {
         let session_key = b"test-session-key".as_slice();
         let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
-        let app = authed_channel_router(channels, OidcVerifierHandle::new(Some(verifier)), Arc::from(session_key));
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+        );
 
         let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
         let ch = "c3".repeat(32);
@@ -10356,6 +10378,7 @@ mod tests {
             channels,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -10551,6 +10574,7 @@ mod tests {
             channels,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -10660,6 +10684,7 @@ mod tests {
             channels,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -10756,6 +10781,7 @@ mod tests {
             channels,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();

@@ -623,7 +623,7 @@ mod tests {
     async fn client_registers_a_channel_against_the_authed_service() {
         use crate::oidc::{OidcVerifier, OidcVerifierHandle};
         use crate::service::authed_channel_router;
-        use crate::storage::SqliteChannelStore;
+        use crate::storage::{SqliteChannelStore, SqliteLedger};
         use ct_common::channel::ChannelId;
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -637,6 +637,7 @@ mod tests {
             channels,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
