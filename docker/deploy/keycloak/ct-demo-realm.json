@@ -125,6 +125,28 @@
       "serviceAccountsEnabled": true,
       "authorizationServicesEnabled": false,
       "fullScopeAllowed": true
+    },
+    {
+      "clientId": "ct-agent-cli",
+      "name": "ct-agent CLI (device code login)",
+      "description": "Public client for `ct-agent login` (RFC 8628 device code grant). No client secret -- a CLI on the operator's own machine can't keep one confidential. Details in docs/channel.md. Keycloak caps this column at 255 chars.",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "defaultClientScopes": [
+        "email",
+        "profile"
+      ]
     }
   ],
   "identityProviders": [
