@@ -67,9 +67,18 @@ pub const CT_EDGE_RELAY_ALPN: &str = "ct-edge-relay";
 /// nothing to flag.
 pub const CT_EDGE_CHANNEL_FALLBACK_SNI: &str = "edge-cdn.invalid";
 
-/// Return the raw `extensions` block of a buffered TLS ClientHello record, or
-/// `None` if `buf` is not a ClientHello. Fully bounds-checked — never panics.
-fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
+/// Return the ClientHello **handshake body** of a buffered TLS record (the bytes
+/// starting right after the 4-byte handshake header: `client_version(2) +
+/// random(32) + session_id + cipher_suites + compression_methods + extensions`),
+/// or `None` if `buf` is not a ClientHello. Fully bounds-checked — never panics.
+///
+/// Factored out of [`client_hello_extensions`] (which used to do this same
+/// record/handshake-header parse inline) so [`client_hello_ja4_fields`] — the JA4
+/// TLS fingerprinter's entry point (`crate::ja4`) — can reach `client_version`/
+/// `cipher_suites` too, from the SAME bounds-checked walk `client_hello_extensions`
+/// already relied on: one parse of the risky record/handshake-header prefix, not
+/// two independently-maintained copies of it.
+pub(crate) fn client_hello_body(buf: &[u8]) -> Option<&[u8]> {
     // TLS record header: content_type(1)=0x16 handshake, version(2), length(2).
     if buf.len() < 5 || buf[0] != 0x16 {
         return None;
@@ -80,7 +89,13 @@ fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
     if hs.len() < 4 || hs[0] != 0x01 {
         return None;
     }
-    let body = hs.get(4..)?;
+    hs.get(4..)
+}
+
+/// Return the raw `extensions` block of a buffered TLS ClientHello record, or
+/// `None` if `buf` is not a ClientHello. Fully bounds-checked — never panics.
+fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
+    let body = client_hello_body(buf)?;
     // client_version(2) + random(32).
     let mut p = 34usize;
     // session_id: len(1) + id.
@@ -98,13 +113,38 @@ fn client_hello_extensions(buf: &[u8]) -> Option<&[u8]> {
     body.get(p..p + ext_total)
 }
 
+/// Everything the JA4 fingerprinter (`crate::ja4`) needs from a buffered
+/// ClientHello in one bounds-checked pass — the legacy `client_version` field, the
+/// raw `cipher_suites` bytes (pairs of big-endian `u16`), and the `extensions`
+/// block ([`client_hello_extensions`]'s own return value, reached via the exact
+/// same offset walk so the two can never silently disagree on where the
+/// ClientHello's fields actually are). `None` under the same conditions
+/// [`client_hello_extensions`] returns `None` — not a ClientHello, or truncated.
+pub(crate) fn client_hello_ja4_fields(buf: &[u8]) -> Option<(u16, &[u8], &[u8])> {
+    let body = client_hello_body(buf)?;
+    let version = u16::from_be_bytes([*body.get(0)?, *body.get(1)?]);
+    let mut p = 34usize;
+    let sid = *body.get(p)? as usize;
+    p += 1 + sid;
+    let cs_len = u16::from_be_bytes([*body.get(p)?, *body.get(p + 1)?]) as usize;
+    p += 2;
+    let cipher_suites = body.get(p..p + cs_len)?;
+    p += cs_len;
+    let cm = *body.get(p)? as usize;
+    p += 1 + cm;
+    let ext_total = u16::from_be_bytes([*body.get(p)?, *body.get(p + 1)?]) as usize;
+    p += 2;
+    let extensions = body.get(p..p + ext_total)?;
+    Some((version, cipher_suites, extensions))
+}
+
 /// Find the first extension of type `want` in `exts` and map its data with `f`.
 // #339: `'a` is explicit (not an elided/higher-ranked lifetime) and shared between
 // `exts` and the closure's own parameter, so `T` is allowed to borrow from it --
 // e.g. `T = &'a str`, which `sni_from_extensions` below needs. A `for<'r> Fn(&'r
 // [u8]) -> Option<T>` bound (what eliding the lifetime here produces) can't
 // express that, since `T` is fixed before any particular `'r` is chosen.
-fn find_extension<'a, T>(exts: &'a [u8], want: u16, f: impl FnOnce(&'a [u8]) -> Option<T>) -> Option<T> {
+pub(crate) fn find_extension<'a, T>(exts: &'a [u8], want: u16, f: impl FnOnce(&'a [u8]) -> Option<T>) -> Option<T> {
     let mut q = 0usize;
     while q + 4 <= exts.len() {
         let etype = u16::from_be_bytes([exts[q], exts[q + 1]]);
@@ -118,13 +158,34 @@ fn find_extension<'a, T>(exts: &'a [u8], want: u16, f: impl FnOnce(&'a [u8]) -> 
     None
 }
 
+/// Visit every `(extension_type, extension_data)` pair in `exts`, in wire order --
+/// the JA4 fingerprinter's extension-count/extension-id-list source. Same
+/// bounds-checked walk as [`find_extension`] (which stops at the first match);
+/// this one calls `f` for every extension instead. Returns `None` the moment a
+/// length disagrees with the bytes actually present (a malformed extensions
+/// block), matching this module's fail-closed parsing posture -- whatever `f` was
+/// already called with for extensions BEFORE the corrupt one stays valid data, not
+/// fabricated past the real buffer. An empty `exts` (zero extensions) is not
+/// malformed; the loop simply calls `f` zero times and returns `Some(())`.
+pub(crate) fn each_extension(exts: &[u8], mut f: impl FnMut(u16, &[u8])) -> Option<()> {
+    let mut q = 0usize;
+    while q + 4 <= exts.len() {
+        let etype = u16::from_be_bytes([exts[q], exts[q + 1]]);
+        let elen = u16::from_be_bytes([exts[q + 2], exts[q + 3]]) as usize;
+        let edata = exts.get(q + 4..q + 4 + elen)?;
+        f(etype, edata);
+        q += 4 + elen;
+    }
+    Some(())
+}
+
 /// Zero-allocation core of [`peek_sni`]: the SNI hostname borrowed directly from
 /// `exts` (already-extracted extensions, see [`client_hello_extensions`]), in its
 /// **original case** — the caller lowercases only if/when it actually needs to
 /// (#339: `classify_front_door` compares case-insensitively and only allocates a
 /// lowercased copy for the one hostname it ends up returning, never for a
 /// rejected candidate).
-fn sni_from_extensions(exts: &[u8]) -> Option<&str> {
+pub(crate) fn sni_from_extensions(exts: &[u8]) -> Option<&str> {
     // server_name (0x0000): list len(2) + first entry type(1)=0 host_name,
     // name_len(2), name.
     find_extension(exts, 0x0000, |edata| {
@@ -214,6 +275,27 @@ pub fn peek_alpn(buf: &[u8]) -> Vec<String> {
         Some(out)
     })
     .unwrap_or_default()
+}
+
+/// The JA4 fingerprinter's ALPN field needs only the FIRST advertised protocol's
+/// raw bytes (unlike [`peek_alpn`]'s full list) -- zero-allocation, matching
+/// [`alpn_extension_has`]'s style. `None` if the extension is absent, its protocol
+/// list is empty, or the bytes are malformed (a length disagreeing with the data
+/// present) -- the caller ([`crate::ja4`]) treats that the same as "no ALPN
+/// offered", never fabricating a value past the real buffer.
+pub(crate) fn alpn_first_value(exts: &[u8]) -> Option<&[u8]> {
+    find_extension(exts, 0x0010, |edata| {
+        if edata.len() < 2 {
+            return None;
+        }
+        let list_len = u16::from_be_bytes([edata[0], edata[1]]) as usize;
+        let list = edata.get(2..2 + list_len)?;
+        if list.is_empty() {
+            return None;
+        }
+        let l = *list.first()? as usize;
+        list.get(1..1 + l)
+    })
 }
 
 /// Where the unified :443 front door should route a peeked ClientHello (#31 FD1).

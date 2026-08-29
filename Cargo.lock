@@ -649,6 +649,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "socket2 0.5.10",
  "time",
  "tokio",

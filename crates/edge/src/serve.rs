@@ -1493,6 +1493,20 @@ pub async fn serve_front_door(
     // (the TLS-TCP analog of QUIC's `conn.remote_address()`).
     let observed = inbound.peer_addr()?;
     let hello = read_client_hello_bytes_bounded(&mut inbound).await?;
+    // JA4 TLS-ClientHello fingerprinting: a PURE side observation, computed from
+    // the same buffered bytes the classifier below reads, borrowed (not
+    // consumed) so `hello` is untouched for `classify_front_door`/`Prepend`
+    // beneath it. Informational only -- see `crate::ja4`'s module doc and
+    // `state.rs`'s `Ja4Observations` for the bounded counter this feeds. NOT
+    // consulted by any admission/routing decision anywhere in this function; a
+    // `hello` `compute_ja4` can't parse (same malformed-body shapes
+    // `classify_front_door`'s own `client_hello_extensions` gate can reject)
+    // simply isn't counted here -- never rejected on that basis, and
+    // `classify_front_door` below runs exactly as it would if this block did
+    // not exist at all.
+    if let Some(fp) = crate::ja4::compute_ja4(&hello) {
+        state.note_ja4(&fp);
+    }
     // #339: no per-connection `Vec<String>`/`Vec<&str>` collection here anymore --
     // `classify_front_door` parses `hello` directly and this closure does a
     // case-insensitive scan of `proxies`' own (already-lowercased) keys, which

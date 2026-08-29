@@ -295,6 +295,51 @@ its own. `cross_family` is ordinary dual-stack.\n\
         tracked = penalty.tracked_ips(),
         tracked_max = penalty.max_tracked_ips(),
     ));
+    // JA4 TLS-ClientHello fingerprinting: informational only -- see `crate::ja4`'s
+    // module doc for what this is and is deliberately NOT (no reputation lookup, no
+    // admission/blocking decision anywhere reads these numbers). `total`/`evictions`
+    // make the bound's health legible even when the per-fingerprint breakdown below
+    // is incomplete, the same "both numbers, not just one" reasoning as the
+    // join-penalty block above.
+    {
+        let ja4 = state.ja4_observations();
+        out.push_str(&format!(
+            "# HELP ct_edge_ja4_observed_total ClientHellos JA4-fingerprinted at the :443 \
+front door since start. Informational only -- no admission or routing decision anywhere \
+in this codebase is EVER made from a JA4 value (see crate::ja4's module doc).\n\
+             # TYPE ct_edge_ja4_observed_total counter\n\
+             ct_edge_ja4_observed_total {total}\n\
+             # HELP ct_edge_ja4_tracked_fingerprints Distinct JA4 fingerprint strings \
+currently tracked. Read against ..._max: the table evicts oldest-first at the bound, so a \
+value AT the bound means the per-fingerprint breakdown below is incomplete, the same \
+reading as ct_edge_channel_join_penalty_tracked_ips.\n\
+             # TYPE ct_edge_ja4_tracked_fingerprints gauge\n\
+             ct_edge_ja4_tracked_fingerprints {tracked}\n\
+             # HELP ct_edge_ja4_tracked_fingerprints_max Capacity of that table, so a \
+scraper can read the ratio instead of a hard-coded bound.\n\
+             # TYPE ct_edge_ja4_tracked_fingerprints_max gauge\n\
+             ct_edge_ja4_tracked_fingerprints_max {max}\n\
+             # HELP ct_edge_ja4_evictions_total Distinct fingerprints evicted (FIFO) to \
+make room for a new one since start -- a rising rate means real distinct-fingerprint \
+traffic exceeds the tracked bound.\n\
+             # TYPE ct_edge_ja4_evictions_total counter\n\
+             ct_edge_ja4_evictions_total {evictions}\n\
+             # HELP ct_edge_ja4_fingerprint_total Connections observed per JA4 \
+fingerprint, for the currently-tracked subset only (see \
+ct_edge_ja4_tracked_fingerprints_max). Informational only.\n\
+             # TYPE ct_edge_ja4_fingerprint_total counter\n",
+            total = ja4.total(),
+            tracked = ja4.tracked_fingerprints(),
+            max = ja4.max_tracked_fingerprints(),
+            evictions = ja4.evictions(),
+        ));
+        for (fp, count) in ja4.snapshot() {
+            out.push_str(&format!(
+                "ct_edge_ja4_fingerprint_total{{ja4=\"{}\"}} {count}\n",
+                escape_prometheus_label(&fp)
+            ));
+        }
+    }
     if let Some(cap) = ws_channel_cap {
         out.push_str(&format!(
             "# HELP ct_edge_ws_channel_connections Browser WebSocket Agent-Fabric channel \
@@ -313,6 +358,23 @@ its own. `cross_family` is ordinary dual-stack.\n\
         ));
     }
     out
+}
+
+/// Escape a string for safe embedding inside a Prometheus text-exposition label
+/// value (`{label="..."}`): the exposition format requires backslash, double-quote,
+/// and newline to be backslash-escaped inside a label value. Every OTHER label
+/// value rendered by this file is an internal, trusted string (a static loop/
+/// listener name, a `kind`/`keepalive`/`result` enum-like tag) -- `ja4`
+/// (`ct_edge_ja4_fingerprint_total`) is the first one built from
+/// attacker-controlled bytes: JA4's ALPN field embeds up to two characters taken
+/// directly from the ClientHello's own ALPN value (see `ja4.rs`'s `alpn_code`), so
+/// a hostile client can choose an ALPN string whose first byte is `"` or `\`.
+/// Without this, that value could break out of the label's quotes in the
+/// rendered text and inject additional fake-looking metric lines into the
+/// scrape. Order matters: backslashes are escaped FIRST, so the backslashes just
+/// introduced by escaping a quote/newline are not themselves re-escaped.
+fn escape_prometheus_label(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 
 /// #498: how stale a broker-loop heartbeat may be before `/healthz` reports the loop as
@@ -990,5 +1052,99 @@ mod tests {
             body.contains("ct_edge_channel_join_penalty_tracked_ips 2"),
             "two distinct sources refused, so two are tracked: {body}"
         );
+    }
+
+    /// JA4 fingerprinting: the counter/gauge family renders, at zero before any
+    /// activity (so absent-vs-quiet isn't ambiguous to a scraper, same reasoning
+    /// every other bounded-map metric in this file gets) and reflecting real
+    /// per-fingerprint counts after some.
+    #[test]
+    fn ja4_metrics_render_zero_then_reflect_real_activity() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let body = render_edge_metrics(&state, None);
+        assert!(body.contains("ct_edge_ja4_observed_total 0"), "{body}");
+        assert!(body.contains("ct_edge_ja4_tracked_fingerprints 0"), "{body}");
+        assert!(body.contains("ct_edge_ja4_evictions_total 0"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "ct_edge_ja4_tracked_fingerprints_max {}",
+                state.ja4_observations().max_tracked_fingerprints()
+            )),
+            "the bound must be exported so the gauge can be read as a ratio: {body}"
+        );
+        assert!(
+            !body.contains("ct_edge_ja4_fingerprint_total{"),
+            "no fingerprint observed yet -> no per-fingerprint rows at all: {body}"
+        );
+
+        state.note_ja4("t13d1516h2_8daaf6152771_e5627efa2ab1");
+        state.note_ja4("t13d1516h2_8daaf6152771_e5627efa2ab1");
+        state.note_ja4("t12i0208d00_000000000000_000000000000");
+
+        let body = render_edge_metrics(&state, None);
+        assert!(body.contains("ct_edge_ja4_observed_total 3"), "{body}");
+        assert!(body.contains("ct_edge_ja4_tracked_fingerprints 2"), "two distinct fingerprints: {body}");
+        assert!(
+            body.contains("ct_edge_ja4_fingerprint_total{ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"} 2"),
+            "the repeated fingerprint's own count: {body}"
+        );
+        assert!(
+            body.contains("ct_edge_ja4_fingerprint_total{ja4=\"t12i0208d00_000000000000_000000000000\"} 1"),
+            "{body}"
+        );
+    }
+
+    /// #<ja4-issue>: `ja4` is the first label value in this file built from
+    /// attacker-controlled bytes (JA4's ALPN field embeds raw ClientHello ALPN
+    /// characters). A hostile fingerprint string containing a literal `"` must
+    /// render as a properly escaped label value, never break out of the
+    /// label's quotes and inject text that looks like a second metric line.
+    #[test]
+    fn ja4_fingerprint_label_is_escaped_against_injection() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let hostile = "t13d1516\"2_8daaf6152771_e5627efa2ab1\"} ct_edge_evil_metric 999 #";
+        state.note_ja4(hostile);
+        let body = render_edge_metrics(&state, None);
+        assert!(
+            body.contains("ct_edge_ja4_fingerprint_total{ja4=\"t13d1516\\\"2_8daaf6152771_e5627efa2ab1\\\"} ct_edge_evil_metric 999 #\"} 1"),
+            "the quote characters must be backslash-escaped in place, not dropped or left \
+             unescaped: {body:?}"
+        );
+        assert!(
+            !body.contains("ct_edge_evil_metric 999 #\"} 1\nct_edge"),
+            "must never produce a line that reads as an independent, unescaped metric \
+             series: {body:?}"
+        );
+    }
+
+    /// The sharper version of the same attack: a fingerprint containing a literal
+    /// newline (unreachable from a real `compute_ja4` output today, but this is a
+    /// defense-in-depth test of the renderer itself, not of `ja4.rs`'s current
+    /// output shape) must not be able to inject an ADDITIONAL, structurally
+    /// independent Prometheus line into the scrape.
+    #[test]
+    fn ja4_fingerprint_label_newline_cannot_forge_a_new_metric_line() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let hostile = "real\"}\nct_edge_forged_metric 1\n#";
+        state.note_ja4(hostile);
+        let body = render_edge_metrics(&state, None);
+        // The escaped `\n` keeps the whole hostile value on ONE physical line inside
+        // one label value -- no line in the output is the bare forged series.
+        assert!(
+            !body.lines().any(|l| l == "ct_edge_forged_metric 1"),
+            "the embedded newline must not split into a standalone forged metric line: {body:?}"
+        );
+        assert!(body.contains("real\\\"}\\nct_edge_forged_metric 1\\n#"), "escaped in place instead: {body:?}");
+    }
+
+    #[test]
+    fn escape_prometheus_label_escapes_backslash_before_quote_and_newline() {
+        // Order matters: escaping quotes/newlines FIRST would double-escape the
+        // backslashes that step introduces.
+        assert_eq!(escape_prometheus_label("a\\b"), "a\\\\b");
+        assert_eq!(escape_prometheus_label("a\"b"), "a\\\"b");
+        assert_eq!(escape_prometheus_label("a\nb"), "a\\nb");
+        assert_eq!(escape_prometheus_label("\\\"\n"), "\\\\\\\"\\n");
+        assert_eq!(escape_prometheus_label("plain"), "plain");
     }
 }
