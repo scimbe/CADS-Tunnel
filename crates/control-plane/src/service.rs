@@ -1339,6 +1339,7 @@ pub fn agent_directory_router(
 ) -> Router {
     Router::new()
         .route("/registry/agents", post(agent_register).get(agent_search))
+        .route("/registry/agents/:holder_pubkey", delete(agent_unregister))
         .with_state(AgentDirectoryState { directory, admin_token })
 }
 
@@ -1396,6 +1397,25 @@ async fn agent_search(
         .search(q.role.as_deref(), q.skill.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(entries))
+}
+
+/// `DELETE /registry/agents/:holder_pubkey` (#113-ui-delete): remove a directory entry.
+/// The directory has no owner/subject concept at all (see [`SqliteAgentDirectory::unregister`]'s
+/// doc) -- gated by the same shared admin token as registration itself, not a per-account
+/// self-service action. Before this there was no way to remove a stale/wrong entry at all,
+/// not even by the operator.
+async fn agent_unregister(
+    State(state): State<AgentDirectoryState>,
+    headers: HeaderMap,
+    Path(holder_pubkey): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_agent_registry_admin(&headers, &state.admin_token)?;
+    let removed = state.directory.unregister(&holder_pubkey).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if removed {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such agent-directory entry".to_string()))
+    }
 }
 
 /// State for the workflow-pipeline registry (#174 B): the store + the machine-writer admin token.
@@ -9496,6 +9516,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(injected.status(), StatusCode::BAD_REQUEST, "newline-injected facet token rejected");
+    }
+
+    /// #113-ui-delete: before this there was no way to remove an agent-directory
+    /// entry at all, not even by the operator -- e.g. a dead demo agent stays
+    /// discoverable in role/skill search forever. Same admin-token gate as
+    /// registration itself (the directory has no owner/subject column to scope a
+    /// self-service delete by).
+    #[tokio::test]
+    async fn agent_unregister_is_admin_gated_and_actually_removes_the_entry() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let admin = [0x5bu8; 32];
+        let dir = Arc::new(SqliteAgentDirectory::open_in_memory().unwrap());
+        dir.register("dd", "https://x/.well-known/agent-card.json", &["source".to_string()], &[], 0).unwrap();
+        let app = agent_directory_router(dir, Some(admin));
+
+        // No admin token -> 401, entry untouched.
+        let unauth = app
+            .clone()
+            .oneshot(Request::delete("/registry/agents/dd").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        let still_there = app
+            .clone()
+            .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(still_there.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Vec<AgentDirectoryEntry>>(&body).unwrap().len(), 1, "unauthorized delete didn't remove it");
+
+        // Unknown holder -> 404, not a silent 200.
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::delete("/registry/agents/ee")
+                    .header("x-ct-admin-token", hex_encode(&admin))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        // Correct admin token, known holder -> 200, and it's actually gone from search.
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::delete("/registry/agents/dd")
+                    .header("x-ct-admin-token", hex_encode(&admin))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let gone = app
+            .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(gone.into_body(), 1 << 16).await.unwrap();
+        assert!(serde_json::from_slice::<Vec<AgentDirectoryEntry>>(&body).unwrap().is_empty(), "actually removed, not just a 200 that changed nothing");
     }
 
     #[tokio::test]
