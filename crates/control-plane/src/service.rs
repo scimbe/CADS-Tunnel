@@ -4891,7 +4891,7 @@ const LANDING_HTML: &str = r#"<!doctype html>
    </div>
    <div class="demo-card reveal" style="transition-delay:120ms">
     <div class="demo-card-top"><span class="demo-name">webconference</span><span class="demo-badge live"><i></i>live</span></div>
-    <p>Browser-to-browser video conferencing — the channel does the signaling, the media flows peer-to-peer.</p>
+    <p>Real end-to-end-encrypted browser-to-browser video calls, plus a persistent encrypted messenger — the Agent-Fabric channel (Noise_IK, compiled to WASM) does the signaling, the media flows peer-to-peer.</p>
     <div class="demo-links"><a class="btn" href="https://webconference.bunsenbrenner.org" target="_blank" rel="noopener">Try it &rarr;</a><a class="plain" href="https://github.com/scimbe/CADS-webconference-demo" target="_blank" rel="noopener">Source</a></div>
    </div>
    <div class="demo-card reveal" style="transition-delay:180ms">
@@ -4994,9 +4994,10 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
  </div>
 
  <div class="features">
-  <div class="feature reveal" style="transition-delay:0ms"><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the operator cannot see your payload, only that a tunnel is active.</p></div>
+  <div class="feature reveal" style="transition-delay:0ms"><h3>Zero-knowledge</h3><p>Noise-encrypted end to end — the edge relays ciphertext only, so we structurally cannot see your payload, even under legal compulsion. Unlike Cloudflare Tunnel or ngrok, which terminate or can read traffic at their edge, there's no plaintext here to hand over.</p></div>
   <div class="feature reveal" style="transition-delay:60ms"><h3>Any hardware</h3><p>Laptop, Raspberry Pi, spare VM, container, or your own AI agent — nothing runs on our infrastructure.</p></div>
   <div class="feature reveal" style="transition-delay:120ms"><h3>Agent-native</h3><p>Built to be driven by Claude Code or any coding agent — /llms.txt is a machine-readable onboarding doc.</p></div>
+  <div class="feature reveal" style="transition-delay:180ms"><h3>Agent-to-agent, in the browser</h3><p>The same Noise-encrypted channel compiles to WebAssembly and runs directly in a browser tab — agent-to-agent connectivity no other tunneling tool (ngrok, Cloudflare Tunnel, Tailscale) offers at all.</p></div>
  </div>
 
  <div class="use-case reveal">
@@ -5077,6 +5078,25 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
    <div class="diagram-card">
     <div class="diagram-head"><span>CHANNEL · direct-first, relay fallback</span><span class="live"><i></i>encrypted</span></div>
     <canvas id="diagram-p2p" width="400" height="160" aria-label="Animated diagram of two agents connecting directly, with a relay fallback path shown for when direct connection is blocked"></canvas>
+   </div>
+  </div>
+
+  <div class="use-case reverse reveal" id="agent-fabric-browser">
+   <div class="diagram-card">
+    <div class="diagram-head"><span>BROWSER CHANNEL · WASM, browser &harr; browser</span><span class="live"><i></i>encrypted</span></div>
+    <canvas id="diagram-browser-a2a" width="400" height="160" aria-label="Animated diagram of two browser tabs each running the WASM channel client, exchanging a Noise-encrypted channel through the edge relay"></canvas>
+   </div>
+   <div>
+    <h3>Agent-to-agent, running in a browser tab</h3>
+    <p>The channel mechanism above isn't limited to the native <code>ct-agent</code> binary — the same
+     Noise_IK handshake and channel-join primitives compile to WebAssembly and run directly in a
+     browser. <a href="https://webconference.bunsenbrenner.org" target="_blank" rel="noopener">CADS-webconference-demo</a>
+     is the live proof: two browser tabs negotiate a genuine end-to-end-encrypted channel through the
+     edge, then a real-time video call and a persistent encrypted messenger ride on top — the edge
+     relays ciphertext for the channel exactly as it does for any tunnel, never a plaintext hub in the
+     middle. It's the same Agent-Fabric primitive as the channel-to-channel case above, just running
+     where a browser can reach it — connectivity ngrok, Cloudflare Tunnel, and Tailscale don't offer at
+     all.</p>
    </div>
   </div>
 
@@ -5303,6 +5323,18 @@ https://bunsenbrenner.org/portal -&gt; my tunnel -&gt; Install, then load it wit
   ],
   [ {from:0,to:1}, {from:0,to:2,dim:true,dashed:true}, {from:2,to:1,dim:true,dashed:true} ],
   [ {path:[0,1],speed:1,phase:0,color:'accent2'}, {path:[0,2,1],speed:.8,phase:.5} ]
+ );
+
+ // 2b. Agent-to-agent in the browser: the same channel primitives (Noise_IK,
+ // channel-join) compiled to WASM, running in two browser tabs instead of two
+ // native ct-agent processes -- the edge relays only ciphertext for the
+ // channel, same as any tunnel (ADR-0023, CADS-webconference-demo).
+ initMiniDiagram('diagram-browser-a2a',
+  [
+   {x:.12,y:.5,label:'Browser A'}, {x:.5,y:.5,label:'Edge',dim:true,r:7}, {x:.88,y:.5,label:'Browser B'},
+  ],
+  [ {from:0,to:1,dim:true}, {from:1,to:2,dim:true} ],
+  [ {path:[0,1,2],speed:1,phase:0,color:'accent2'} ]
  );
 
  // 3. Your own mesh, optimized: draw your agents into a graph in the topology
@@ -11623,6 +11655,36 @@ mod tests {
         assert!(
             html.contains(r#"href="/portal""#),
             "links to the customer portal (#64)"
+        );
+        // The zero-knowledge claim must be stated as a comparative, factual differentiator near
+        // the product description, not just implied -- explicitly names the competitors it's
+        // contrasted against (verified true: control-plane never holds Agent/CA private keys or
+        // payload, crates/control-plane/src/lib.rs; the edge only ever relays ciphertext,
+        // crates/edge/src/lib.rs).
+        assert!(
+            html.contains("Cloudflare Tunnel") && html.contains("ngrok"),
+            "names the competitors the zero-knowledge claim is contrasted against"
+        );
+        assert!(
+            html.contains("structurally cannot see your payload"),
+            "states the zero-knowledge claim as a structural fact, not a policy promise"
+        );
+        // The browser-side Agent-Fabric/a2a capability (Noise-encrypted channels compiled to WASM,
+        // powering CADS-webconference-demo's real browser-to-browser video calls + persistent
+        // encrypted messenger) must appear as its own named, findable feature -- not only implied
+        // by the demo carousel entry (verified real: scripts/build-ct-agent-wasm.sh,
+        // docs/adr/0023-video-conferencing-room-fanout.md).
+        assert!(
+            html.contains("Agent-to-agent, in the browser") || html.contains("running in a browser tab"),
+            "the browser-side Agent-Fabric channel capability has its own named feature"
+        );
+        assert!(
+            html.contains("persistent encrypted messenger"),
+            "surfaces the webconference demo's persistent encrypted messenger, not just video"
+        );
+        assert!(
+            html.contains(r#"id="diagram-browser-a2a""#),
+            "the browser agent-to-agent section has its own diagram, not folded into unrelated copy"
         );
         // CSP-safe means no external *asset* (script/style/image) sources -- an outbound <a href>
         // link (e.g. the support/membership page below) is plain navigation, not a CSP concern.
