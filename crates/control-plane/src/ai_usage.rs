@@ -140,6 +140,21 @@ fn ledger_err_status(e: &LedgerOpError) -> StatusCode {
     }
 }
 
+/// Maps a ledger-debit failure to a response, adding the cap-boundary upgrade
+/// hint (see the pre-flight check's own comment above) on `FreeAiCapExceeded`
+/// specifically -- this rare path (the pre-flight peek already caught the
+/// common case; only a genuine race lands here) should still be actionable,
+/// not a bare error string.
+fn debit_err(e: LedgerOpError) -> (StatusCode, String) {
+    let status = ledger_err_status(&e);
+    let msg = if matches!(e, LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded)) {
+        format!("{e} Upgrade to a paid plan (POST /me/checkout) for unlimited Standard-KI requests.")
+    } else {
+        e.to_string()
+    };
+    (status, msg)
+}
+
 #[derive(Deserialize)]
 struct AiChatReq {
     /// `"standard"` (self-hosted, every plan) or `"premium"` (Mistral proxy,
@@ -202,7 +217,14 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     if snapshot.plan.is_none() {
         if let Some(cap) = free_cap {
             if snapshot.free_requests_used >= cap {
-                return Err((StatusCode::FORBIDDEN, LedgerError::FreeAiCapExceeded.to_string()));
+                // The review's own "cap-boundary upgrade prompt" finding: this is
+                // the single highest-intent conversion moment available, and a
+                // bare error string turned it into a dead end. POST /me/checkout
+                // (crate::paddle, once launched) is the real next step.
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("{} Upgrade to a paid plan (POST /me/checkout) for unlimited Standard-KI requests.", LedgerError::FreeAiCapExceeded),
+                ));
             }
         }
     }
@@ -231,7 +253,7 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     // cost AND (for a Free-tier account) increments the free-request counter,
     // atomically, exactly once. The pre-flight peek above never mutates state,
     // so there is no double-count regardless of what the backend actually used.
-    st.ledger.debit_ai_chat(&account, credits_spent, free_cap).map_err(|e| (ledger_err_status(&e), e.to_string()))?;
+    st.ledger.debit_ai_chat(&account, credits_spent, free_cap).map_err(debit_err)?;
 
     Ok(Json(AiChatResp { upstream, credits_spent }))
 }
@@ -273,7 +295,7 @@ async fn ai_transcribe(State(st): State<AiUsageState>, headers: HeaderMap, Json(
     // so there is no "worst-case then true-up" split needed.
     st.ledger
         .debit_ai_transcribe(&account, credits_cost, req.duration_seconds, pricing.free_ai_seconds_cap)
-        .map_err(|e| (ledger_err_status(&e), e.to_string()))?;
+        .map_err(debit_err)?;
 
     let resp = rb.send().await.map_err(|e| bad_gateway(format!("AI backend request failed: {e}")))?;
     if !resp.status().is_success() {
