@@ -145,6 +145,35 @@ impl ControlPlaneClient {
         Ok(TenantId(body.tenant))
     }
 
+    /// `POST /me/signup` (anti-abuse repeat-signup mitigation) — `ct-agent signup`'s
+    /// own entry point: self-service tunnel creation via the Bearer-JWT `ct-agent
+    /// login`'s device-code flow already obtains, instead of a portal session
+    /// cookie. `device_fingerprint` is `sha256(machine_id || "\0" || os_username)`
+    /// (see `ct_agent::signup` for exactly what feeds it); `None` skips the
+    /// control-plane's repeat-account cap entirely (fail-open, matches every other
+    /// caller of the underlying account-creation path). Returns the routing token
+    /// so the caller can start serving immediately with no manual copy-paste.
+    pub async fn signup(
+        &self,
+        name: &str,
+        bearer_token: &str,
+        device_fingerprint: Option<&str>,
+    ) -> CpResult<SignupResult> {
+        let resp = self
+            .http
+            .post(format!("{}/me/signup", self.base))
+            .header("authorization", format!("Bearer {bearer_token}"))
+            .json(&serde_json::json!({
+                "name": name,
+                "device_fingerprint": device_fingerprint,
+            }))
+            .send()
+            .await?;
+        let resp = ok(resp)?;
+        let body: SignupResponseBody = resp.json().await?;
+        Ok(SignupResult { routing_token: body.routing_token, hostname: body.hostname })
+    }
+
     /// `GET /pki/ca` — fetch the edge CA root DER the control plane publishes
     /// (#11), so a cross-host Agent/Client can obtain the trust root over HTTP
     /// instead of copying it out of band. Public key material only.
@@ -404,6 +433,19 @@ struct AllowlistBody {
 #[derive(Deserialize)]
 struct TokenBody {
     token: String,
+}
+#[derive(Deserialize)]
+struct SignupResponseBody {
+    routing_token: String,
+    hostname: Option<String>,
+}
+/// [`ControlPlaneClient::signup`]'s success result: the new (or existing, on a
+/// re-run) tunnel's routing token and, when DNS is configured on this deployment,
+/// its auto-assigned hostname.
+#[derive(Debug, Clone)]
+pub struct SignupResult {
+    pub routing_token: String,
+    pub hostname: Option<String>,
 }
 #[derive(Deserialize)]
 struct TenantBody {
