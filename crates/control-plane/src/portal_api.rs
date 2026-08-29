@@ -874,6 +874,7 @@ const ICON_DOMAINS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="curre
 const ICON_ADMINS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/></svg>"#;
 const ICON_CERTS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>"#;
 const ICON_AUDIT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h9l5 5v13H6z"/><path d="M14 3v5h5M9 12h6M9 16h6"/></svg>"#;
+const ICON_PRICING: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.5 3.5H20v7.5L11 20 3.5 12.5z"/><circle cx="16" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg>"#;
 
 /// Shared page chrome for every `/admin-ui/*` HTML page -- deliberately its own
 /// shell, not [`page`] (Portal's own nav points at `/portal/*`, a different surface
@@ -905,6 +906,7 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
             "admins" => "/admin-ui/admins",
             "certs" => "/admin-ui/certs",
             "audit" => "/admin-ui/audit",
+            "pricing" => "/admin-ui/pricing-preview",
             _ => "",
         }
     }
@@ -916,6 +918,7 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
         rail_link("/admin-ui/admins", "Admins", ICON_ADMINS),
         rail_link("/admin-ui/certs", "Certs", ICON_CERTS),
         rail_link("/admin-ui/audit", "Audit log", ICON_AUDIT),
+        rail_link("/admin-ui/pricing-preview", "Pricing preview", ICON_PRICING),
     ]
     .concat();
     let initials: String = session
@@ -1210,6 +1213,7 @@ pub fn admin_ui_router(
         // HTML-only handlers.
         .route("/admin-ui/", get(admin_ui_dashboard))
         .route("/admin-ui/accounts", get(admin_ui_accounts_page))
+        .route("/admin-ui/pricing-preview", get(admin_ui_pricing_preview))
         .route("/admin-ui/audit", get(admin_ui_audit_page))
         .route("/admin-ui/logout", get(admin_ui_logout))
         .with_state(AdminUiState {
@@ -2810,6 +2814,7 @@ traffic/tunnel state (that's everywhere else in this console), just the box unde
  <a class="seccard" href="/admin-ui/admins"><div class="icon">{icon_admins}</div><h3>Admins</h3><p>Who can reach this console.</p></a>
  <a class="seccard" href="/admin-ui/certs"><div class="icon">{icon_certs}</div><h3>Certificates</h3><p>Front-door and per-domain cert expiry.</p></a>
  <a class="seccard" href="/admin-ui/audit"><div class="icon">{icon_audit}</div><h3>Audit log</h3><p>Every privileged action, who and when.</p></a>
+ <a class="seccard" href="/admin-ui/pricing-preview"><div class="icon">{icon_pricing}</div><h3>Pricing preview</h3><p>Plan comparison + booking-flow preview. Admin-only, not yet public.</p></a>
 </div>
 <script>
 fetch('/admin-ui/health').then(function(r){{return r.ok?r.json():Promise.reject(r.status);}})
@@ -2856,8 +2861,170 @@ fetch('/admin-ui/system').then(function(r){{return r.ok?r.json():Promise.reject(
         icon_admins = ICON_ADMINS,
         icon_certs = ICON_CERTS,
         icon_audit = ICON_AUDIT,
+        icon_pricing = ICON_PRICING,
     );
     admin_page("dashboard", session, &body)
+}
+
+/// `GET /admin-ui/pricing-preview` (admin-identity-gated): the confidential plan/
+/// pricing model's preview -- a plan comparison table plus a non-functional
+/// "booking flow" mockup, so scimbe can see how a future customer-facing plan
+/// page and checkout would look before deciding to launch it for real. The real
+/// €/Credit numbers are never committed to this repo (see `crate::pricing`'s doc
+/// comment) -- this handler only reads them at request time from the process
+/// environment (`docker/deploy/.env.pricing` on the live deployment, unset in
+/// every CI run and fresh clone).
+async fn admin_ui_pricing_preview(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    let session = match admin_ui_page_authed(&st, &headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    Html(admin_pricing_preview_page_html(&session, &crate::pricing::PricingConfig::from_env())).into_response()
+}
+
+fn admin_pricing_preview_page_html(session: &crate::admin_identity::AdminSession, cfg: &crate::pricing::PricingConfig) -> String {
+    if !cfg.is_configured() {
+        let body = r#"<h1>Pricing preview</h1>
+<p class="help">This deployment has no <code>docker/deploy/.env.pricing</code> configured, so
+there is nothing to preview yet. The pricing <em>mechanism</em> (this page, the plan-comparison
+rendering, the booking-flow mockup below) is ordinary committed code -- the actual €/Credit rates
+are deliberately kept out of the repository entirely and only ever exist in that one
+git-ignored file, created directly on the server from your own local copy of the model. See
+<code>docker/deploy/.env.pricing.example</code> for every variable name this page reads.</p>"#;
+        return admin_page("pricing", session, body);
+    }
+
+    let fmt_cents = |c: u32| format!("{}.{:02} €", c / 100, c % 100);
+    let cell = |v: Option<String>| v.unwrap_or_else(|| r#"<span class="help">-</span>"#.to_string());
+
+    let mut plans_js = String::from("[");
+    let mut cols = String::new();
+    // Free is always the first column -- it's not an Option<PaidTier>, it always exists.
+    cols.push_str(&format!(
+        r#"<th>Free</th>"#
+    ));
+    plans_js.push_str(&format!(
+        r#"{{"name":"Free","price":"0 €/month","credits":"-","tunnels":{tunnels},"relay":"{relay} GB/month"}},"#,
+        tunnels = cfg.free.tunnels.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()),
+        relay = cfg.free.relay_free_gb.map(|g| g.to_string()).unwrap_or_else(|| "-".to_string()),
+    ));
+    let tiers: [(&str, &Option<crate::pricing::PaidTier>); 4] =
+        [("Starter", &cfg.starter), ("Medium", &cfg.medium), ("Pro", &cfg.pro), ("Business", &cfg.business)];
+    for (name, tier) in tiers {
+        let Some(t) = tier else { continue };
+        cols.push_str(&format!("<th>{}</th>", escape(name)));
+        let price = match (t.price_cents, &t.note) {
+            (Some(c), _) => fmt_cents(c),
+            (None, Some(note)) => escape(note),
+            (None, None) => "-".to_string(),
+        };
+        plans_js.push_str(&format!(
+            r#"{{"name":"{name}","price":"{price}","credits":"{credits}","tunnels":"{tunnels}","relay":"{relay} GB/month"}},"#,
+            name = escape(name),
+            price = price.replace('"', "&quot;"),
+            credits = t.credits.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+            tunnels = t.tunnels.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string()),
+            relay = t.relay_free_gb.map(|g| g.to_string()).unwrap_or_else(|| "-".to_string()),
+        ));
+    }
+    plans_js.push(']');
+
+    let mut rows = String::new();
+    rows.push_str(&format!(
+        "<tr><td>Price</td><td>0 €</td>{}</tr>",
+        tiers
+            .iter()
+            .filter_map(|(_, t)| t.as_ref())
+            .map(|t| format!(
+                "<td>{}</td>",
+                match (t.price_cents, &t.note) {
+                    (Some(c), _) => fmt_cents(c),
+                    (None, Some(n)) => escape(n),
+                    (None, None) => "-".to_string(),
+                }
+            ))
+            .collect::<String>()
+    ));
+    rows.push_str(&format!(
+        "<tr><td>Monthly credits</td><td>-</td>{}</tr>",
+        tiers
+            .iter()
+            .filter_map(|(_, t)| t.as_ref())
+            .map(|t| format!("<td>{}</td>", cell(t.credits.map(|c| c.to_string()))))
+            .collect::<String>()
+    ));
+    rows.push_str(&format!(
+        "<tr><td>Tunnels</td><td>{}</td>{}</tr>",
+        cell(cfg.free.tunnels.map(|t| t.to_string())),
+        tiers
+            .iter()
+            .filter_map(|(_, t)| t.as_ref())
+            .map(|t| format!("<td>{}</td>", cell(t.tunnels.map(|n| n.to_string()))))
+            .collect::<String>()
+    ));
+    rows.push_str(&format!(
+        "<tr><td>Relay free quota</td><td>{}</td>{}</tr>",
+        cell(cfg.free.relay_free_gb.map(|g| format!("{g} GB/month"))),
+        tiers
+            .iter()
+            .filter_map(|(_, t)| t.as_ref())
+            .map(|t| format!("<td>{}</td>", cell(t.relay_free_gb.map(|g| format!("{g} GB/month")))))
+            .collect::<String>()
+    ));
+
+    let body = format!(
+        r#"<h1>Pricing preview</h1>
+<p class="help">Admin-only preview of the plan/pricing model -- not shown to real customers yet.
+The real numbers live only in this server's <code>docker/deploy/.env.pricing</code>, never
+committed. This page is the mechanism only; add <code>workflow-maintainer@gmail.com</code> as an
+admin (via the Admins page) to give them the same view.</p>
+<div class="tablewrap"><table class="data">
+<thead><tr><th></th>{cols}</tr></thead>
+<tbody>{rows}</tbody>
+</table></div>
+
+<h2>Booking flow preview</h2>
+<p class="help">A non-functional mockup of what a customer would see -- pick a plan below to
+preview the review screen. Nothing here is wired to real billing yet.</p>
+<div id="bookingPicker" class="cards"></div>
+<div id="bookingReview" style="display:none" class="card" style="max-width:28rem">
+ <h3 id="reviewPlanName"></h3>
+ <div class="kv"><div>Price</div><div id="reviewPrice"></div></div>
+ <div class="kv"><div>Monthly credits</div><div id="reviewCredits"></div></div>
+ <div class="kv"><div>Tunnels</div><div id="reviewTunnels"></div></div>
+ <div class="kv"><div>Relay free quota</div><div id="reviewRelay"></div></div>
+ <p class="help" style="margin-top:1rem"><strong>Preview only</strong> -- not wired to real billing yet.</p>
+ <button class="sec" disabled title="Preview only">Book now</button>
+ <button class="sec" onclick="document.getElementById('bookingReview').style.display='none'">Back</button>
+</div>
+<script>
+var PLANS = {plans_js};
+(function(){{
+ var picker = document.getElementById('bookingPicker');
+ PLANS.forEach(function(p, i){{
+  var a = document.createElement('a');
+  a.className = 'seccard';
+  a.href = '#';
+  a.innerHTML = '<h3>' + p.name + '</h3><p>' + p.price + '</p>';
+  a.onclick = function(ev){{
+   ev.preventDefault();
+   document.getElementById('reviewPlanName').textContent = p.name;
+   document.getElementById('reviewPrice').textContent = p.price;
+   document.getElementById('reviewCredits').textContent = p.credits;
+   document.getElementById('reviewTunnels').textContent = p.tunnels;
+   document.getElementById('reviewRelay').textContent = p.relay;
+   document.getElementById('bookingReview').style.display = 'block';
+   return false;
+  }};
+  picker.appendChild(a);
+ }});
+}})();
+</script>"#,
+        cols = cols,
+        rows = rows,
+        plans_js = plans_js,
+    );
+    admin_page("pricing", session, &body)
 }
 
 #[derive(Deserialize)]

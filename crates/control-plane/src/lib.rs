@@ -37,6 +37,7 @@ pub mod payment;
 pub mod portal;
 pub mod portal_api;
 pub mod payment_provider;
+pub mod pricing;
 pub mod registry;
 pub mod service;
 pub mod storage;
