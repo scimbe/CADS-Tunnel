@@ -4068,9 +4068,16 @@ async fn install_page(State(st): State<ApiState>, headers: HeaderMap, Path(id): 
     // tunnels list, and can never accidentally (or otherwise) end up with a
     // hostname it doesn't actually own in its own .env. Omitted entirely for
     // a Mesh-Plane-only tunnel (no DNS configured, so no hostname exists).
+    // #721: a tunnel with an assigned hostname exists to serve real public HTTPS
+    // traffic -- that only happens via the Browser Plane (`register_host`, edge/state.rs),
+    // which only ever runs when CT_AGENT_MODE=browser. Without this line, `ct-agent
+    // onboard` still succeeds (Mesh-Plane registration is real, DB shows Connected/Gelb)
+    // but the edge's SNI routing table never gets an entry for the host, so every real
+    // browser connection fails with "no tunnel registered for host" -- reproduced live
+    // for a self-service tunnel that used this page's env block as-is.
     let hostname_line = hostname
         .as_deref()
-        .map(|h| format!("\nCT_AGENT_HOSTNAME={h}   # this tunnel's own assigned hostname -- for CT_AGENT_MODE=browser and `ct-agent certificate`"))
+        .map(|h| format!("\nCT_AGENT_MODE=browser   # this tunnel has a public hostname -- serve it over the Browser Plane, not just Mesh-Plane channels\nCT_AGENT_HOSTNAME={h}   # this tunnel's own assigned hostname -- for CT_AGENT_MODE=browser and `ct-agent certificate`"))
         .unwrap_or_default();
     // #113-ui-issuer: also in the SAME .env this page already has the reader `source`
     // before running the agent -- so `ct-agent login` (Agent-Fabric channels) needs
@@ -9376,6 +9383,15 @@ mod tests {
             html.contains(&format!("CT_AGENT_HOSTNAME={expected_host}")),
             "carries this tunnel's own hostname, not left for the agent to copy by hand: {html}"
         );
+        // #721: a hostname means real public HTTPS traffic, which only ever routes
+        // via the Browser Plane (`register_host`) -- without this line the agent
+        // registers Mesh-Plane-only and the edge never learns the hostname, so every
+        // real browser connection fails with "no tunnel registered for host" even
+        // though onboarding itself reports success.
+        assert!(
+            html.contains("CT_AGENT_MODE=browser"),
+            "a tunnel with an assigned hostname must set CT_AGENT_MODE=browser or the edge never routes it: {html}"
+        );
 
         // A tunnel with no hostname (no DNS configured at all) must not show a
         // bogus/empty CT_AGENT_HOSTNAME line -- omitted entirely, not blank.
@@ -9401,6 +9417,13 @@ mod tests {
         let (_, bare_html) =
             get(&no_dns_app, &format!("/portal/tunnels/{}/install", bare_tunnel.id), Some("bob")).await;
         assert!(!bare_html.contains("CT_AGENT_HOSTNAME"), "omitted, not blank, when there's no hostname to carry");
+        // #721: a Mesh-Plane-only tunnel (no hostname) must NOT get CT_AGENT_MODE=browser
+        // -- that would push it into raw-TLS-passthrough for a tunnel that was never
+        // meant to serve public HTTPS traffic at all.
+        assert!(
+            !bare_html.contains("CT_AGENT_MODE=browser"),
+            "a bare Mesh-Plane tunnel with no hostname must not be pushed into browser mode: {bare_html}"
+        );
     }
 
     #[tokio::test]
