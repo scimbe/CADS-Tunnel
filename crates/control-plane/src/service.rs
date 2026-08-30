@@ -6236,6 +6236,11 @@ pub fn persistent_control_plane_router(
                     edge_mesh.clone(),
                     admin_token,
                     Some(oidc.clone()),
+                    // Security-hardening pass: new-tunnel-enrollment audit
+                    // visibility. Same `admin_audit` instance `/admin-ui/*`
+                    // already writes to (opened once, above) -- one shared
+                    // log, not a second table.
+                    Some(admin_audit.clone()),
                 ),
             )
             // #248-follow: the session-authed channel-allowlist self-service claim —
