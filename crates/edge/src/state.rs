@@ -318,6 +318,127 @@ impl Default for JoinRefusalPenalty {
     }
 }
 
+/// Capacity bound on distinct JA4 fingerprint strings tracked by
+/// [`Ja4Observations`] at once (FIFO eviction at the bound, same pattern
+/// [`JoinRefusalPenalty`] uses via [`KeyedRateLimiter::with_max_tracked_keys`]).
+/// An unauthenticated peer can present an arbitrary JA4 string simply by
+/// varying its ClientHello's own cipher/extension offer, so this map -- purely
+/// informational, no admission decision ever reads it -- still needs the same
+/// "can't grow forever under attacker control" bound every other per-key table
+/// in this file has. Kept deliberately smaller than
+/// [`JOIN_REFUSAL_MAX_TRACKED_IPS`] (4096): that table backs a real security
+/// control that needs headroom against a spread-out storm, while this one only
+/// ever gets rendered wholesale into `/metrics` on every scrape -- the
+/// "keine Folgekosten" (no follow-on cost) constraint this feature shipped
+/// under argues for keeping that render small (256 rows is at most a few tens
+/// of KB) rather than matching the security-table's budget just because the
+/// eviction mechanism is the same.
+const JA4_MAX_TRACKED_FINGERPRINTS: usize = 256;
+
+/// Passive JA4 TLS-ClientHello fingerprint counter (`crate::ja4::compute_ja4`),
+/// Prometheus-exposed by `observe.rs`. Bounded per
+/// [`JA4_MAX_TRACKED_FINGERPRINTS`]'s doc: `counts` holds at most that many
+/// distinct fingerprint strings, `order` is the FIFO eviction queue for the
+/// oldest one once the bound is hit -- structurally the same two-piece shape
+/// [`JoinRefusalPenalty`] uses (a bounded map plus its own eviction order),
+/// specialized here to a plain cumulative counter instead of a rate-limited
+/// window, since this is a counter, not a rate limiter: nothing is ever denied
+/// on account of a JA4 value.
+struct Ja4Table {
+    counts: HashMap<String, u64>,
+    order: std::collections::VecDeque<String>,
+}
+
+pub struct Ja4Observations {
+    table: Mutex<Ja4Table>,
+    /// Total ClientHellos observed since start, INCLUDING ones whose
+    /// fingerprint didn't get a tracked slot (evicted or never inserted) --
+    /// the denominator that makes `tracked_fingerprints`'s bound legible: if
+    /// this keeps climbing while `tracked_fingerprints` sits at the cap, the
+    /// per-fingerprint breakdown below is churning, not complete.
+    total: Counter,
+    /// Distinct fingerprints evicted to make room for a new one since start.
+    /// Zero for the whole life of a quiet edge; a rising rate is the signal
+    /// that real distinct-fingerprint traffic exceeds
+    /// [`JA4_MAX_TRACKED_FINGERPRINTS`] and the per-fingerprint counts below
+    /// are no longer a complete picture (mirrors
+    /// [`JoinRefusalPenalty::tracked_ips`]'s own "the table can still fail"
+    /// reasoning).
+    evictions: Counter,
+}
+
+impl Ja4Table {
+    fn new() -> Self {
+        Self { counts: HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+}
+
+impl Ja4Observations {
+    pub fn new() -> Self {
+        Self { table: Mutex::new(Ja4Table::new()), total: Counter::default(), evictions: Counter::default() }
+    }
+
+    /// Record one observed ClientHello's fingerprint. Purely additive
+    /// bookkeeping -- never returns anything a caller could branch admission
+    /// on, by construction (there is nothing to return).
+    pub fn note(&self, fingerprint: &str) {
+        self.total.inc();
+        let mut t = self.table.lock_safe();
+        if let Some(c) = t.counts.get_mut(fingerprint) {
+            *c += 1;
+            return;
+        }
+        if t.counts.len() >= JA4_MAX_TRACKED_FINGERPRINTS {
+            while let Some(oldest) = t.order.pop_front() {
+                if t.counts.remove(&oldest).is_some() {
+                    self.evictions.inc();
+                    break;
+                }
+                // Already gone -- keep popping (mirrors JoinRefusalPenalty's
+                // own eviction loop, `state.rs`'s `JoinRefusalPenalty` note).
+            }
+        }
+        t.order.push_back(fingerprint.to_string());
+        t.counts.insert(fingerprint.to_string(), 1);
+    }
+
+    /// A snapshot of every currently-tracked `(fingerprint, count)` pair, for
+    /// `/metrics` rendering. Allocates (a `Vec` copy of the live table) --
+    /// acceptable at a `/metrics`-scrape cadence and a `JA4_MAX_TRACKED_
+    /// FINGERPRINTS`-bounded size, unlike the per-connection hot path this
+    /// counter is fed from.
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        self.table.lock_safe().counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// Total ClientHellos observed since start (see the field doc).
+    pub fn total(&self) -> u64 {
+        self.total.get()
+    }
+
+    /// Distinct fingerprints currently tracked, bounded by
+    /// [`Self::max_tracked_fingerprints`].
+    pub fn tracked_fingerprints(&self) -> usize {
+        self.table.lock_safe().counts.len()
+    }
+
+    /// The capacity [`Self::tracked_fingerprints`] is bounded by.
+    pub fn max_tracked_fingerprints(&self) -> usize {
+        JA4_MAX_TRACKED_FINGERPRINTS
+    }
+
+    /// Distinct fingerprints evicted since start (see the field doc).
+    pub fn evictions(&self) -> u64 {
+        self.evictions.get()
+    }
+}
+
+impl Default for Ja4Observations {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Thread-safe registry of live Agent tunnels keyed by Routing Token, plus each
 /// Agent's Edge-observed peer candidate (its reflexive address) for P2P
 /// rendezvous (M11.1).
@@ -458,6 +579,10 @@ pub struct EdgeState<H> {
     /// `Arc`-shared (see [`JoinRefusalPenalty`]) because the QUIC broker loop enforces
     /// the SAME budget without holding an `EdgeState`.
     join_refusal: std::sync::Arc<JoinRefusalPenalty>,
+    /// JA4 TLS-ClientHello fingerprint counter (see [`Ja4Observations`]) --
+    /// `Arc`-shared for the same reason `join_refusal` is, even though today only
+    /// `serve_front_door` (which already holds an `&EdgeState`) feeds it.
+    ja4: std::sync::Arc<Ja4Observations>,
     /// #497 slice 2: liveness heartbeats for the two QUIC broker accept loops (relay,
     /// rendezvous) -- `Arc`-shared into the loops the same way `join_refusal` is, read by
     /// `/metrics`. See [`BrokerHeartbeat`].
@@ -618,6 +743,7 @@ impl<H: Clone> EdgeState<H> {
             gelb_hosts: RwLock::new(HashSet::new()),
             rendezvous_limiter: Mutex::new(None),
             join_refusal: std::sync::Arc::new(JoinRefusalPenalty::new()),
+            ja4: std::sync::Arc::new(Ja4Observations::new()),
             relay_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             rendezvous_broker_heartbeat: std::sync::Arc::new(BrokerHeartbeat::new()),
             listener_heartbeats: RwLock::new(HashMap::new()),
@@ -823,6 +949,21 @@ impl<H: Clone> EdgeState<H> {
     /// budget per IP -- a storm that alternates transports can't double its allowance.
     pub fn join_refusal_penalty(&self) -> std::sync::Arc<JoinRefusalPenalty> {
         self.join_refusal.clone()
+    }
+
+    /// The shared JA4 fingerprint counter (see [`Ja4Observations`]): the `:443`
+    /// front door records through [`Self::note_ja4`]; `/metrics` reads it via
+    /// this accessor. Purely observational -- nothing else in this codebase
+    /// reads a JA4 value to make an admission/routing decision.
+    pub fn ja4_observations(&self) -> std::sync::Arc<Ja4Observations> {
+        self.ja4.clone()
+    }
+
+    /// Record one observed ClientHello's JA4 fingerprint (see
+    /// [`Ja4Observations::note`]). A thin pass-through so call sites don't need
+    /// to reach through [`Self::ja4_observations`] just to record one value.
+    pub fn note_ja4(&self, fingerprint: &str) {
+        self.ja4.note(fingerprint);
     }
 
     /// #497 slice 2: the relay broker loop's liveness heartbeat (see [`BrokerHeartbeat`]).

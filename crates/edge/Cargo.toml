@@ -49,6 +49,12 @@ serde = { version = "1", features = ["derive"] }
 # (crates/control-plane/Cargo.toml) for consistency, even though the two crates share
 # no DB file (separate processes, each opens its own).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# JA4 TLS ClientHello fingerprinting (ja4.rs): JA4_b/JA4_c are truncated SHA256
+# hashes per the FoxIO spec. Already resolved in the workspace lockfile as a
+# transitive dependency via ct-common (crates/common/Cargo.toml pins the same
+# "0.10"), so this adds no new crate to the dependency tree -- just a direct
+# edge, matching the version already in use.
+sha2 = "0.10"
 
 [dev-dependencies]
 # `test-util` (dev-only) enables tokio's paused clock for the #111 Slowloris timeout test
