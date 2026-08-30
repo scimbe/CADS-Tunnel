@@ -131,6 +131,13 @@ struct ApiState {
     /// know about this new path needs to change; [`portal_api_router_with_verifier`]
     /// is the one real callers should use to actually get `/me/signup` live.
     verifier: Option<crate::oidc::OidcVerifierHandle>,
+    /// Security-hardening pass: new-tunnel-enrollment visibility for admins
+    /// (steady-state-abuse-detection precursor -- this alone isn't detection,
+    /// just the signal a future anomaly pass would feed on). `None` when this
+    /// router was built via the original [`portal_api_router`] entry point
+    /// (every existing test), matching the `verifier` field's own "absent
+    /// unless configured" convention right above.
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -172,6 +179,7 @@ pub fn portal_api_router(
         edge_mesh,
         admin_token,
         None,
+        None,
     )
 }
 
@@ -195,6 +203,7 @@ pub fn portal_api_router_with_verifier(
     edge_mesh: EdgeMeshHandle,
     admin_token: Option<[u8; 32]>,
     verifier: Option<crate::oidc::OidcVerifierHandle>,
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -216,6 +225,7 @@ pub fn portal_api_router_with_verifier(
         edge_mesh,
         admin_token,
         verifier: verifier.clone(),
+        audit,
     };
     let mut router = Router::new()
         .route("/portal/account", get(account_page))
@@ -3784,6 +3794,13 @@ async fn create_tunnel(
         }
         Err(e) => return internal_error("create_tunnel/create", e).into_response(),
     };
+    // Security-hardening pass: new-tunnel-enrollment visibility for admins --
+    // best-effort, same posture as every other `audit.record` call site
+    // (never blocks the actual action). `None` only when this router was
+    // built via the audit-free `portal_api_router` entry point (tests).
+    if let Some(audit) = &st.audit {
+        let _ = audit.record(&subject, "tunnel_enrolled", tunnel.hostname.as_deref(), Some("via portal"));
+    }
     authorize_hostname(&st, &tunnel).await;
     Redirect::to("/portal/tunnels").into_response()
 }
@@ -3883,6 +3900,12 @@ async fn me_signup(
         }
         Err(e) => return Err(internal_error("me_signup/create_if_under_owned_limit", e)),
     };
+    // Security-hardening pass: same new-tunnel-enrollment visibility as
+    // create_tunnel's portal path, tagged so an admin reviewing the log can
+    // tell the two self-service entry points apart.
+    if let Some(audit) = &st.audit {
+        let _ = audit.record(&subject, "tunnel_enrolled", tunnel.hostname.as_deref(), Some("via ct-agent signup"));
+    }
     authorize_hostname(&st, &tunnel).await;
     Ok(Json(MeSignupResp { routing_token: tunnel.routing_token, hostname: tunnel.hostname }))
 }
@@ -7759,6 +7782,147 @@ mod tests {
             html_after.contains(r#"<form aria-disabled="true">"#),
             "back at the limit, the form is disabled again: {html_after}"
         );
+    }
+
+    /// Security-hardening pass: `create_tunnel` records a `tunnel_enrolled`
+    /// audit entry when the router was built WITH an audit log (real
+    /// production wiring, `portal_api_router_with_verifier`) -- fails against
+    /// the pre-fix code, which had no `st.audit` field to record through at
+    /// all. Also confirms the audit-free `portal_api_router` entry point
+    /// (every pre-existing test) is completely unaffected: tunnel creation
+    /// still succeeds with `audit: None`, it just logs nothing.
+    #[tokio::test]
+    async fn create_tunnel_records_a_tunnel_enrolled_audit_entry_when_audit_is_configured() {
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let app = portal_api_router_with_verifier(
+            KEY,
+            ledger,
+            tunnels,
+            enrollment,
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            None, // oidc_issuer (test)
+            test_edge_mesh(),
+            None,
+            None, // verifier -- create_tunnel doesn't need it, only me_signup does
+            Some(audit.clone()),
+        );
+
+        // The account already owns one auto-provisioned tunnel on first
+        // portal visit -- this creates a SECOND one via the real POST path.
+        assert_eq!(get(&app, "/portal/tunnels", Some("auditee")).await.0, StatusCode::OK);
+        let entries_before = audit.recent(10).unwrap();
+        assert!(entries_before.is_empty(), "no audit entry from the auto-provisioned first tunnel");
+
+        // Needs headroom past the default 1-tunnel Standard-tier limit --
+        // reuse the same admin max-tunnels bump the sibling end-to-end test
+        // above uses, via a fresh router built with an admin token this time.
+        let secret = [0x77u8; 32];
+        let ledger2 = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels2 = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let audit2 = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let app2 = portal_api_router_with_verifier(
+            KEY,
+            ledger2,
+            tunnels2,
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            Some(secret),
+            None,
+            Some(audit2.clone()),
+        );
+        assert_eq!(get(&app2, "/portal/tunnels", Some("auditee2")).await.0, StatusCode::OK);
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let req = Request::post("/admin/accounts/auditee2/max-tunnels")
+            .header("content-type", "application/json")
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from(r#"{"max":2}"#))
+            .unwrap();
+        assert_eq!(app2.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        assert_eq!(
+            post_form(&app2, "/portal/tunnels", "auditee2", "name=audited-tunnel").await,
+            StatusCode::SEE_OTHER
+        );
+
+        let entries = audit2.recent(10).unwrap();
+        let enrolled = entries.iter().find(|e| e.action == "tunnel_enrolled");
+        let enrolled = enrolled.expect("tunnel_enrolled entry recorded");
+        assert_eq!(enrolled.actor_email, "auditee2");
+        // No DNS autopilot is configured in this test router, so the tunnel
+        // has no auto-assigned hostname -- target is None, matching real
+        // behavior for the same reason (create_tunnel only computes a
+        // hostname when st.dns is Some).
+        assert_eq!(enrolled.target, None);
+        assert_eq!(enrolled.detail.as_deref(), Some("via portal"));
+    }
+
+    /// Security-hardening pass: `me_signup` (`ct-agent signup`'s entry point)
+    /// records the same `tunnel_enrolled` audit entry as `create_tunnel`,
+    /// tagged to tell the two self-service paths apart. Fails against the
+    /// pre-fix code (no `st.audit` field, nothing recorded at all).
+    #[tokio::test]
+    async fn me_signup_records_a_tunnel_enrolled_audit_entry_tagged_via_ct_agent_signup() {
+        use crate::oidc::{OidcVerifier, OidcVerifierHandle};
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret_bytes = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let oidc = Arc::new(OidcVerifier::from_hs_secret(secret_bytes, issuer));
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let app = portal_api_router_with_verifier(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            None,
+            test_edge_mesh(),
+            None,
+            Some(OidcVerifierHandle::from(Some(oidc))),
+            Some(audit.clone()),
+        );
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "cli-user", "iss": issuer, "exp": now + 3600 });
+        let jwt = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret_bytes)).unwrap();
+        let body = serde_json::json!({ "name": "cli-tunnel" }).to_string();
+        let resp = app
+            .oneshot(
+                Request::post("/me/signup")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "signup itself still succeeds");
+
+        let entries = audit.recent(10).unwrap();
+        let enrolled = entries.iter().find(|e| e.action == "tunnel_enrolled").expect("entry recorded");
+        assert_eq!(enrolled.actor_email, "cli-user");
+        assert_eq!(enrolled.detail.as_deref(), Some("via ct-agent signup"), "tagged distinctly from the portal path");
     }
 
     /// #439 follow-up: confirms the Revoke scenario the operator specifically
