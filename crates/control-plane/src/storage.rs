@@ -1784,6 +1784,20 @@ impl SqliteLedger {
         Ok(())
     }
 
+    /// This account's paid plan (`None` for Free), the same value [`Self::set_plan`]
+    /// writes. A dedicated getter rather than reusing [`Self::ai_usage_for`] here --
+    /// that one is named/shaped for the AI-usage view specifically; a caller that
+    /// only wants the plan (e.g. gating the portal Share button, Business-only) is a
+    /// different concern and shouldn't have to pull in `AiUsageSnapshot`'s other
+    /// fields just to read one of them.
+    pub fn plan(&self, account: &AccountId) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .lock_safe()
+            .query_row("SELECT plan FROM accounts WHERE account = ?1", params![&account.0[..]], |r| r.get(0))
+            .optional()
+            .map(|v| v.flatten())
+    }
+
     /// This account's AI-usage state, for the self-service "how much have I used"
     /// view (`GET /me/ai/usage`) -- see [`AiUsageSnapshot`].
     pub fn ai_usage_for(&self, account: &AccountId) -> rusqlite::Result<Option<AiUsageSnapshot>> {
@@ -2488,6 +2502,13 @@ impl SqliteTunnelStore {
         ensure_column(&conn, "subject_tunnels", "direct_advertised", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "subject_tunnels", "direct_failures", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&conn, "subject_tunnels", "direct_probed_at", "INTEGER")?;
+        // Topology link: the owner's own framing (agent channels build a topology,
+        // a tunnel gives Browser-Plane access into it) -- an OPTIONAL association
+        // to one of the owner's own `topologies` rows, set via `set_topology_link`
+        // and cross-checked there against topology ownership (this store has no
+        // visibility into `SqliteTopologyStore`). NULL for every existing tunnel
+        // on upgrade -- linking is always an explicit owner action.
+        ensure_column(&conn, "subject_tunnels", "topology_id", "TEXT")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -2868,6 +2889,57 @@ impl SqliteTunnelStore {
             )
             .optional()
             .map(|v| v.map(|n| n != 0))
+    }
+
+    /// Link (or, with `topology_id: None`, unlink) a tunnel the caller owns to one
+    /// of their own Agent-Fabric topologies -- the caller's own framing: channels
+    /// build the topology, this tunnel gives Browser-Plane access into it. `false`
+    /// if the tunnel id is unknown or owned by someone else. Ownership of the
+    /// TARGET topology is the caller's responsibility to verify before calling this
+    /// -- this store has no visibility into `SqliteTopologyStore` (see
+    /// `link_topology_route`, which checks it first).
+    pub fn set_topology_link(&self, subject: &str, tunnel_id: &str, topology_id: Option<&str>) -> rusqlite::Result<bool> {
+        let n = self.writer.lock_safe().execute(
+            "UPDATE subject_tunnels SET topology_id = ?1 WHERE id = ?2 AND subject = ?3",
+            params![topology_id, tunnel_id, subject],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The topology id a tunnel the caller owns is linked to, if any. `None` also
+    /// for an unknown/foreign tunnel id -- same "existence leaks nothing" posture
+    /// as `require_login`.
+    pub fn topology_link(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        self.read()
+            .query_row(
+                "SELECT topology_id FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+    }
+
+    /// Every tunnel the caller owns that is linked to `topology_id`, sorted by
+    /// name -- for the Topology Editor's own "linked tunnels" panel. Grant
+    /// management itself stays on each tunnel's existing `/portal/tunnels/:id/grants`
+    /// page; this only makes those tunnels discoverable from inside the editor.
+    pub fn tunnels_linked_to_topology(&self, subject: &str, topology_id: &str) -> rusqlite::Result<Vec<SubjectTunnel>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hostname, created_at, routing_token FROM subject_tunnels
+             WHERE subject = ?1 AND topology_id = ?2 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![subject, topology_id], |r| {
+            Ok(SubjectTunnel {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                hostname: r.get(2)?,
+                created_at: r.get(3)?,
+                routing_token: r.get(4)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Whether the login gate is enabled for `hostname` (#382-follow). Unscoped
@@ -3273,6 +3345,32 @@ impl SqliteTunnelStore {
         let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
         let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| {
             Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0)))
+        })?;
+        rows.collect()
+    }
+
+    /// Batched form of [`Self::topology_link`] for the tunnels-page render loop
+    /// (same shape/rationale as [`Self::require_login_batch`] above). Keyed by
+    /// tunnel id; a row with no entry, or a `NULL topology_id`, both mean "not
+    /// linked" -- narrowed to that at the call site same as the other batched
+    /// lookups here.
+    pub fn topology_link_batch(
+        &self,
+        subject: &str,
+        tunnel_ids: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        if tunnel_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read();
+        let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, topology_id FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders}) AND topology_id IS NOT NULL"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         rows.collect()
     }
@@ -8045,6 +8143,42 @@ mod tests {
         assert!(store.revoke("alice", &t.id, 1_000).unwrap().is_some());
         assert!(!store.is_authorized("bob", &t.id).unwrap(), "grant gone with the tunnel");
         assert!(!store.is_authorized("alice", &t.id).unwrap(), "owner gone with the tunnel");
+    }
+
+    #[test]
+    fn tunnel_topology_link_is_owner_scoped_and_reversible() {
+        // scimbe's own framing: Agent-Fabric channels build a topology, a tunnel gives
+        // Browser-Plane access into it -- set_topology_link/topology_link/
+        // tunnels_linked_to_topology are the store side of that association.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "web", None).unwrap().created().expect("hostname is free in this test");
+
+        assert!(!store.set_topology_link("alice", "no-such-tunnel", Some("topo-1")).unwrap());
+        assert!(
+            !store.set_topology_link("bob", &t.id, Some("topo-1")).unwrap(),
+            "non-owner cannot link someone else's tunnel"
+        );
+        assert_eq!(store.topology_link("alice", &t.id).unwrap(), None, "not linked yet");
+
+        assert!(store.set_topology_link("alice", &t.id, Some("topo-1")).unwrap());
+        assert_eq!(store.topology_link("alice", &t.id).unwrap(), Some("topo-1".to_string()));
+        assert_eq!(
+            store.topology_link("bob", &t.id).unwrap(),
+            None,
+            "owner-scoped: a non-owner's lookup of someone else's tunnel sees nothing"
+        );
+
+        let linked = store.tunnels_linked_to_topology("alice", "topo-1").unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, t.id);
+        assert!(
+            store.tunnels_linked_to_topology("bob", "topo-1").unwrap().is_empty(),
+            "owner-scoped: bob's own (empty) tunnel list, never alice's"
+        );
+
+        assert!(store.set_topology_link("alice", &t.id, None).unwrap(), "unlink");
+        assert_eq!(store.topology_link("alice", &t.id).unwrap(), None);
+        assert!(store.tunnels_linked_to_topology("alice", "topo-1").unwrap().is_empty());
     }
 
     #[test]

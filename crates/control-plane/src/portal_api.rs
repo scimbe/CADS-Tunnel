@@ -3538,13 +3538,19 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     // instead of always being hard-disabled -- so a revoke really does free up
     // a slot for self-service creation. Same account/limit lookup create_tunnel
     // itself already gates on.
-    let max_tunnels = match st.ledger.account_for_subject(&subject) {
-        Ok(account) => match st.ledger.max_tunnels(&account) {
-            Ok(m) => m,
-            Err(e) => return internal_error("tunnels_page/max_tunnels", e).into_response(),
-        },
+    let account = match st.ledger.account_for_subject(&subject) {
+        Ok(a) => a,
         Err(e) => return internal_error("tunnels_page/account_for_subject", e).into_response(),
     };
+    let max_tunnels = match st.ledger.max_tunnels(&account) {
+        Ok(m) => m,
+        Err(e) => return internal_error("tunnels_page/max_tunnels", e).into_response(),
+    };
+    // Share (`/portal/tunnels/:id/grants`) is a Business-plan feature -- see
+    // `tunnels_html`'s own doc comment on `share_action`. Best-effort like every
+    // other per-request lookup here: a transient DB error just falls back to
+    // "not Business", the safe (more restrictive) direction.
+    let is_business_plan = st.ledger.plan(&account).ok().flatten().as_deref() == Some("business");
     match st.tunnels.list_authorized_for_subject(&subject) {
         Ok(tunnels) => {
             // #233/#437: fetch each hostname's Rot/Gelb/Grün admission state, and
@@ -3561,6 +3567,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             let tunnel_ids: Vec<&str> = tunnels.iter().map(|(t, _)| t.id.as_str()).collect();
             let require_logins = st.tunnels.require_login_batch(&subject, &tunnel_ids).unwrap_or_default();
             let allow_and_pending = st.tunnels.allowlist_and_pending_batch(&subject, &tunnel_ids).unwrap_or_default();
+            let topology_links = st.tunnels.topology_link_batch(&subject, &tunnel_ids).unwrap_or_default();
             let statuses: Vec<_> =
                 futures::future::join_all(tunnels.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
             let mut rows = Vec::with_capacity(tunnels.len());
@@ -3573,9 +3580,20 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     require_logins.get(&t.id).copied().unwrap_or((false, false));
                 let (login_allowlist, pending_requests) =
                     allow_and_pending.get(&t.id).cloned().unwrap_or_default();
-                rows.push((t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests));
+                let topology_link = topology_links.get(&t.id).cloned();
+                rows.push((
+                    t,
+                    owned,
+                    admission,
+                    status,
+                    require_login,
+                    allow_any_login,
+                    login_allowlist,
+                    pending_requests,
+                    topology_link,
+                ));
             }
-            Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref())).into_response()
+            Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan)).into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
@@ -4484,9 +4502,10 @@ type TunnelRow = (
     bool, // #501: allow_any_login
     Vec<String>,
     Vec<(String, String, i64)>,
+    Option<String>, // the topology id this tunnel is linked to, if any
 );
 
-fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) -> String {
+fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is_business_plan: bool) -> String {
     // #439 follow-up: owned_count is derived from the SAME rows the page just
     // fetched live from the store (list_authorized_for_subject), not a cached
     // value -- so a revoke that already committed (delete_tunnel -> revoke())
@@ -4495,7 +4514,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
     let owned_count = tunnels.iter().filter(|(_, owned, ..)| *owned).count() as u32;
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests)| {
+        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -4503,9 +4522,13 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
                 .unwrap_or_default();
             let id = escape(&t.id);
             // Owner-only actions are hidden on shared tunnels; an authorized
-            // grantee can still install an agent for it. Sharing itself is a
-            // planned paid-tier feature — shown so owners know it exists, but
-            // disabled (Standard tier ships one tunnel, not shared access).
+            // grantee can still install an agent for it. Sharing is a
+            // Business-plan feature -- shown so every owner knows it exists,
+            // real (linking to the existing /grants page) only once the
+            // account's plan is actually "business" (`admin_ui_set_plan`),
+            // disabled with the same explanation otherwise. No separate
+            // "Enterprise" tier exists in this codebase -- Business is already
+            // the top one (see `ai_usage::PREMIUM_AI_PLANS`).
             //
             // Share used to be a bare <span class="btn sec disabled">: the
             // page's own CSS only ever styles `a.btn`/`button` (never a plain
@@ -4514,11 +4537,17 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
             // one button group instead looked visibly misaligned. A real
             // disabled <button> picks up the page's existing `button:disabled`
             // rule for free and needs no new CSS.
+            let share_action = if is_business_plan {
+                format!(r#"<a class="btn sec" href="/portal/tunnels/{id}/grants">Share</a>"#)
+            } else {
+                r#"<button type="button" class="btn sec" disabled title="Sharing tunnels is a Business-plan feature">Share</button>"#
+                    .to_string()
+            };
             let owner_actions = if *owned {
                 format!(
                     r#"<div class="actions">
  <a class="btn sec" href="/portal/tunnels/{id}/install">Install</a>
- <button type="button" class="btn sec" disabled title="Sharing tunnels is a planned paid-tier feature">Share</button>
+ {share_action}
  <form class="inline fade-out-submit confirm-revoke" method="post" action="/portal/tunnels/{id}/delete">
   <button class="btn danger" type="submit" title="Permanently deletes this tunnel. This cannot be undone via self-service today.">Revoke</button></form>
 </div>"#
@@ -4561,6 +4590,25 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
             } else {
                 String::new()
             };
+            // Topology link (owner's own framing: Agent-Fabric channels build a
+            // topology, this tunnel gives Browser-Plane access into it). Options are
+            // populated client-side from the SAME session-cookie-authed `/me/topologies`
+            // fetch `/portal/topologies` already uses (see `topology_portal_router`'s
+            // own doc comment) -- this file has no topology store of its own to query
+            // server-side, and doesn't need one for a plain owner-vs-owner list.
+            let topology_section = if *owned {
+                let current = topology_link.as_deref().unwrap_or("");
+                format!(
+                    r#"<div class="row"><span class="k">Topology:</span>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/link-topology">
+  <select name="topology_id" class="topology-select" data-current="{current}"><option value="">(not linked)</option></select>
+  <button type="submit" class="sec">Set</button>
+ </form></div>"#,
+                    current = escape(current),
+                )
+            } else {
+                String::new()
+            };
             // data-search: lowercased name+hostname, read by the search box's JS
             // filter below -- client-side (an account's own tunnel count is small,
             // no round trip needed) and independent of what's actually displayed
@@ -4581,7 +4629,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{tier}{login_gate}
+{owner_actions}{bytes_line}{tier}{login_gate}{topology_section}
 </details></div>"#,
                 name = escape(&t.name),
             )
@@ -4663,6 +4711,38 @@ this.textContent=willExpand?'Collapse all':'Expand all';
 ">Expand all</button>"#
             .to_string()
     };
+    // Populate every `.topology-select` (owned tunnels only, so nothing renders --
+    // and this fetch never fires -- for an account with no tunnel of its own) from
+    // the caller's own topologies, fetched exactly the way `/portal/topologies`
+    // itself already does: a plain client-side `fetch('/me/topologies')`, satisfied
+    // by the browser's ambient portal session cookie (dual-auth, see
+    // `topology_portal_router`'s doc comment) -- no bearer token this page could
+    // hold, and no new server-side topology-store dependency for this file.
+    let topology_select_script = if owned_count > 0 {
+        r#"<script>
+(function(){
+ function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+ var selects = document.querySelectorAll('.topology-select');
+ if(!selects.length) return;
+ fetch('/me/topologies').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+  .then(function(topologies){
+   selects.forEach(function(sel){
+    (topologies || []).forEach(function(t){
+     var o = document.createElement('option');
+     o.value = t.id; o.textContent = t.id;
+     sel.appendChild(o);
+    });
+    if(sel.dataset.current) sel.value = sel.dataset.current;
+   });
+  })
+  .catch(function(){ /* best-effort -- an owner with no topologies yet, or a transient
+                         fetch failure, just leaves every select at "(not linked)" */ });
+})();
+</script>"#
+            .to_string()
+    } else {
+        String::new()
+    };
     let body = format!(
         r#"<h1>Your tunnels</h1>
 {quota_bar}
@@ -4671,6 +4751,7 @@ this.textContent=willExpand?'Collapse all':'Expand all';
 <div class="tunnel-grid">
 {rows}
 </div>
+{topology_select_script}
 <p class="help">Included in every tier: <strong>one</strong> tunnel with an automatically
 assigned hostname (e.g. <code>site-a1b2c3d4.bunsenbrenner.org</code>) &mdash; already set up for
 you above, nothing to configure. Click <strong>Install</strong> to get its tokens.</p>
@@ -5337,6 +5418,73 @@ pub fn login_gate_portal_router(
             tunnels,
             kc_admin,
         })
+}
+
+/// State for linking a self-service tunnel to one of the owner's own Agent-Fabric
+/// topologies (the owner's own framing: channels build the topology, a tunnel
+/// gives Browser-Plane access into it). Separate from `ApiState` for the same
+/// reason as `LoginGateState`/`ClaimState`/`TopologyPortalState` above -- a small,
+/// independent concern that would otherwise widen a struct with many existing
+/// test call sites.
+#[derive(Clone)]
+struct TunnelTopologyLinkState {
+    session_key: Arc<[u8]>,
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+}
+
+/// Build the tunnel-to-topology link's owner-facing router: `POST
+/// /portal/tunnels/:id/link-topology` (empty `topology_id` = unlink). Mount
+/// alongside `portal_api_router` wherever both stores are already in scope.
+pub fn tunnel_topology_link_portal_router(
+    session_key: &[u8],
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
+    topologies: Arc<crate::storage::SqliteTopologyStore>,
+) -> Router {
+    Router::new()
+        .route("/portal/tunnels/:id/link-topology", post(link_topology_route))
+        .with_state(TunnelTopologyLinkState {
+            session_key: Arc::from(session_key.to_vec()),
+            tunnels,
+            topologies,
+        })
+}
+
+#[derive(Deserialize)]
+struct LinkTopologyForm {
+    /// Empty string = unlink (an HTML `<select>`'s "not linked" option posts "").
+    topology_id: String,
+}
+
+/// `POST /portal/tunnels/:id/link-topology`: owner links (or unlinks) a tunnel
+/// they own to one of their OWN topologies. The target topology's ownership is
+/// checked here, not in `SqliteTunnelStore` (which has no visibility into
+/// `SqliteTopologyStore`) -- never lets an owner link to someone else's topology,
+/// even one shared with them (sharing grants view/compose rights, not this).
+async fn link_topology_route(
+    State(st): State<TunnelTopologyLinkState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<LinkTopologyForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let topology_id = form.topology_id.trim();
+    let target = if topology_id.is_empty() {
+        None
+    } else {
+        match st.topologies.topology(topology_id) {
+            Ok(Some(t)) if t.owner == subject => Some(topology_id),
+            Ok(_) => return (StatusCode::BAD_REQUEST, "not your topology").into_response(),
+            Err(e) => return internal_error("link_topology_route/topology", e).into_response(),
+        }
+    };
+    match st.tunnels.set_topology_link(&subject, &id, target) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
+        Err(e) => internal_error("link_topology_route/set", e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -7699,7 +7847,11 @@ mod tests {
         assert!(html.contains("automatically\nassigned hostname") || html.contains("automatically assigned hostname"),
             "explains the auto-assigned hostname");
         assert!(html.contains("disabled") && html.contains(">Share<"), "Share is shown but disabled");
-        assert!(html.contains("paid tier") || html.contains("paid-tier"), "names Share's paid-tier gate");
+        // scimbe's own operator instruction (2026-08-31): Share unlocks at the real
+        // Business plan (`ai_usage::PREMIUM_AI_PLANS`'s top tier), not a not-yet-named
+        // "paid tier" -- this account (default Free plan, no `set_plan` call) must still
+        // see it named and gated, just with the now-accurate wording.
+        assert!(html.contains("Business-plan feature"), "names Share's Business-plan gate");
         assert!(
             html.to_lowercase().contains("hostname"),
             "gives hostname guidance"
@@ -7709,6 +7861,43 @@ mod tests {
             !html.contains("http://") && !html.contains("https://cdn"),
             "no external assets"
         );
+    }
+
+    #[tokio::test]
+    async fn share_becomes_a_real_link_once_the_account_is_on_the_business_plan() {
+        // scimbe's own operator instruction (2026-08-31): Share unlocks at the real
+        // Business plan, set via the existing admin_ui_set_plan lever
+        // (SqliteLedger::set_plan) -- no separate flag, reusing the same "plan"
+        // column ai_usage::PREMIUM_AI_PLANS already checks for Premium AI.
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let enrollment = Arc::new(SqliteEnrollment::open_in_memory().unwrap());
+        let bootstrap = Arc::new(SqliteBootstrap::open_in_memory().unwrap());
+        let app = portal_api_router(
+            KEY,
+            ledger.clone(),
+            tunnels,
+            enrollment,
+            bootstrap,
+            "https://portal.example",
+            None,
+            None,
+            None,
+            None, // oidc_issuer (test)
+            test_edge_mesh(),
+            None,
+        );
+
+        let (_status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(html.contains("<button type=\"button\" class=\"btn sec\" disabled") && html.contains(">Share<"), "Free plan: still disabled");
+        assert!(!html.contains("/grants\">Share<"), "Free plan: no working grants link yet");
+
+        let account = ledger.account_for_subject("alice").unwrap();
+        ledger.set_plan(&account, Some("business")).unwrap();
+
+        let (_status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(!html.contains("disabled") || !html.contains("Business-plan feature"), "Business plan: no longer shown as gated");
+        assert!(html.contains("/grants\">Share</a>"), "Business plan: Share is now a real link to the grants page");
     }
 
     #[tokio::test]
@@ -11443,5 +11632,47 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["emails"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn link_topology_route_links_unlinks_and_rejects_someone_elses_topology() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "site", None).unwrap().created().expect("no hostname collision in this test");
+        topologies.create_topology("alice", "alice-topo", "u-alice").unwrap();
+        topologies.create_topology("bob", "bob-topo", "u-bob").unwrap();
+
+        let app = tunnel_topology_link_portal_router(KEY, tunnels.clone(), topologies);
+
+        // Owner links their own tunnel to their own topology.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/link-topology", t.id), "alice", "topology_id=alice-topo").await,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(tunnels.topology_link("alice", &t.id).unwrap(), Some("alice-topo".to_string()));
+
+        // Cannot link to a topology owned by someone else, even a real one.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/link-topology", t.id), "alice", "topology_id=bob-topo").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            tunnels.topology_link("alice", &t.id).unwrap(),
+            Some("alice-topo".to_string()),
+            "the refused link must not have taken effect"
+        );
+
+        // A non-owner cannot link alice's tunnel at all (owner-scoped in the store).
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/link-topology", t.id), "bob", "topology_id=bob-topo").await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Empty topology_id unlinks.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/link-topology", t.id), "alice", "topology_id=").await,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(tunnels.topology_link("alice", &t.id).unwrap(), None);
     }
 }
