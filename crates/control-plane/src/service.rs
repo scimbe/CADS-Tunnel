@@ -1113,6 +1113,12 @@ pub struct AuthedTopologyState {
     /// the channel it's attaching — "account related channels or shared to account
     /// channels", never an arbitrary id with no relationship to the caller.
     channels: Arc<SqliteChannelStore>,
+    /// The owner's own framing: Agent-Fabric channels build a topology, a tunnel
+    /// gives Browser-Plane access into it. Only used by [`topology_editor`], to
+    /// show which of the owner's tunnels are linked to this topology -- the link
+    /// itself is set from `/portal/tunnels` (`crate::portal_api::link_topology_route`),
+    /// never here (this router has no tunnel-mutation route, read-only use only).
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
 }
 
 /// Build the **authenticated** Topology Editor router (#107-rest): compose an overlay by
@@ -1132,6 +1138,7 @@ pub fn authed_topology_router(
     verifier: OidcVerifierHandle,
     session_key: Arc<[u8]>,
     channels: Arc<SqliteChannelStore>,
+    tunnels: Arc<crate::storage::SqliteTunnelStore>,
 ) -> Router {
     Router::new()
         .route("/me/topologies", post(topology_create).get(topology_list))
@@ -1147,7 +1154,7 @@ pub fn authed_topology_router(
         .route("/me/topologies/:id/edges/channel", axum::routing::put(topology_edge_channel))
         .route("/me/topologies/:id/share", post(topology_share_add))
         .route("/me/topologies/:id/share/:email/remove", post(topology_share_remove))
-        .with_state(AuthedTopologyState { topologies, verifier, session_key, channels })
+        .with_state(AuthedTopologyState { topologies, verifier, session_key, channels, tunnels })
 }
 
 /// State for real self-service M2M credentials (2026-08-04): an account owner
@@ -1990,6 +1997,16 @@ async fn topology_editor(
         .operator(&t.id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .is_some();
+    // The owner's own framing (agent channels build a topology, a tunnel gives
+    // Browser-Plane access into it): which of the OWNER's tunnels are currently
+    // linked here, display-only -- linking/unlinking itself stays on
+    // `/portal/tunnels` (`crate::portal_api::link_topology_route`), never a write
+    // path on this router. Owner-scoped by the same `t.owner` shares_for already
+    // uses above, so a shared (non-owner) viewer sees an empty Vec regardless.
+    let linked_tunnels = state
+        .tunnels
+        .tunnels_linked_to_topology(&t.owner, &t.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(axum::response::Html(render_topology_editor(
         &t,
         &agents,
@@ -1998,6 +2015,7 @@ async fn topology_editor(
         is_owner,
         &shares,
         operator_bound,
+        &linked_tunnels,
     )))
 }
 
@@ -2963,6 +2981,7 @@ fn render_topology_editor(
     is_owner: bool,
     shares: &[String],
     operator_bound: bool,
+    linked_tunnels: &[crate::storage::SubjectTunnel],
 ) -> String {
     use std::f64::consts::PI;
     let esc = crate::portal::escape;
@@ -3160,6 +3179,40 @@ fn render_topology_editor(
         String::new()
     };
 
+    // The owner's own framing (2026-08-31 live ask): Agent-Fabric channels build
+    // this topology, a tunnel gives Browser-Plane access into it -- display-only
+    // here (linking/unlinking a tunnel stays on `/portal/tunnels`, never a write
+    // path on this editor), so scimbe can see at a glance which of his tunnels
+    // already point at this topology while composing it. Owner-only like Shared
+    // with/Bind an operator key above -- `linked_tunnels` is already owner-scoped
+    // by the caller (`topology_editor`), this is just the render-time gate that
+    // matches the other two panels.
+    let linked_tunnels_section = if is_owner {
+        if linked_tunnels.is_empty() {
+            String::new()
+        } else {
+            let rows: String = linked_tunnels
+                .iter()
+                .map(|t| {
+                    let host = t
+                        .hostname
+                        .as_deref()
+                        .map(|h| format!(" &middot; <code>{}</code>", esc(h)))
+                        .unwrap_or_default();
+                    format!("<span class=\"sharee\">{name}{host}</span>", name = esc(&t.name))
+                })
+                .collect();
+            format!(
+                "<div class=\"panel\"><h2>Tunnels linked here</h2>\
+                 <p class=\"help\">These tunnels give Browser-Plane access into this topology \
+                 (linked from <a href=\"/portal/tunnels\">Your tunnels</a>, not here).</p>\
+                 <div id=\"linkedtunnels\">{rows}</div></div>"
+            )
+        }
+    } else {
+        String::new()
+    };
+
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -3186,7 +3239,7 @@ fn render_topology_editor(
          <div class=\"guide\" id=\"guide\" role=\"button\" tabindex=\"0\" aria-label=\"current step -- click for details\"></div>\
          <div class=\"stage\"><svg id=\"cv\" class=\"canvas\" viewBox=\"0 0 {VW:.0} {VH:.0}\" \
          preserveAspectRatio=\"xMidYMid meet\" role=\"application\" aria-label=\"topology node graph\">\
-         {content}</svg></div>{share_section}{operator_section}\
+         {content}</svg></div>{share_section}{operator_section}{linked_tunnels_section}\
          <div class=\"drawer-backdrop\" id=\"drawerbackdrop\"></div>\
          <aside class=\"drawer\" id=\"drawer\" aria-label=\"details\">\
          <div class=\"drawer-head\"><h2></h2><button type=\"button\" class=\"drawer-close\" id=\"drawerclose\" aria-label=\"close\">&times;</button></div>\
@@ -6266,6 +6319,15 @@ pub fn persistent_control_plane_router(
                 tunnels.clone(),
                 crate::keycloak_admin::KeycloakAdminConfig::from_env(),
             ))
+            // 2026-08-31 live ask: the owner's own framing (Agent-Fabric channels
+            // build a topology, a tunnel gives Browser-Plane access into it) --
+            // owner-facing link/unlink, surfaced read-only in the Topology Editor
+            // itself (authed_topology_router above, via AuthedTopologyState.tunnels).
+            .merge(crate::portal_api::tunnel_topology_link_portal_router(
+                session_key,
+                tunnels.clone(),
+                topologies.clone(),
+            ))
         })
         .merge(pki)
         // /install.sh + /install.ps1 now just redirect to ct-agent's own setup
@@ -6380,7 +6442,7 @@ pub fn persistent_control_plane_router(
                 },
             ))
             .merge(authed_network_router(networks, oidc.clone()))
-            .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone()))
+            .merge(authed_topology_router(topologies.clone(), oidc.clone(), Arc::from(session_key), channels.clone(), tunnels.clone()))
             // Real self-service M2M credentials -- an account owner's own
             // Keycloak service-account clients, /me/service-accounts*. `None`
             // kc_admin (no KEYCLOAK_PUBLIC_URL/KC_ADMIN_*) means every handler
@@ -8416,11 +8478,13 @@ mod tests {
         let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
         let app = authed_topology_router(
             topologies,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             channels,
+            tunnels,
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -8665,11 +8729,13 @@ mod tests {
         let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
         let app = authed_topology_router(
             topologies,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(session_key),
             channels,
+            tunnels,
         );
 
         let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
@@ -8737,6 +8803,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn topology_editor_shows_linked_tunnels_owner_only() {
+        // 2026-08-31 live ask (scimbe's own framing): Agent-Fabric channels build a
+        // topology, a tunnel gives Browser-Plane access into it -- the editor shows
+        // which of the owner's tunnels are linked, display-only, owner-only (same
+        // visibility rule as "Shared with"/operator-binding above it).
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
+        let app = authed_topology_router(
+            topologies.clone(),
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            channels,
+            tunnels.clone(),
+        );
+
+        let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
+        let get = |path: String, cookie: String| {
+            app.clone()
+                .oneshot(Request::builder().method("GET").uri(&path).header("cookie", cookie).body(Body::empty()).unwrap())
+        };
+
+        let created = app
+            .clone()
+            .oneshot(Request::post("/me/topologies").header("cookie", alice_cookie.clone()).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = to_bytes(created.into_body(), 1 << 16).await.unwrap();
+        let tid = serde_json::from_slice::<TopologyCreatedResp>(&body).unwrap().id;
+
+        // No tunnel linked yet -- panel absent.
+        let editor = get(format!("/me/topologies/{tid}/editor"), alice_cookie.clone()).await.unwrap();
+        let html = String::from_utf8_lossy(&to_bytes(editor.into_body(), 1 << 16).await.unwrap()).to_string();
+        assert!(!html.contains("Tunnels linked here"), "no tunnel linked yet -- panel absent");
+
+        let t = tunnels.create("alice", "web", Some("web.alice.example")).unwrap().created().expect("hostname is free in this test");
+        assert!(tunnels.set_topology_link("alice", &t.id, Some(&tid)).unwrap());
+
+        let editor = get(format!("/me/topologies/{tid}/editor"), alice_cookie.clone()).await.unwrap();
+        let html = String::from_utf8_lossy(&to_bytes(editor.into_body(), 1 << 16).await.unwrap()).to_string();
+        assert!(html.contains("Tunnels linked here"), "owner sees the linked-tunnels panel");
+        assert!(html.contains("web") && html.contains("web.alice.example"), "shows the linked tunnel's name and hostname");
+
+        // A shared (non-owner) viewer never sees it, even though they can view the topology.
+        topologies.share_add("alice", &tid, "mallory@example.test", 1_000).unwrap();
+        let mallory_cookie = format!(
+            "ct_portal_session={}",
+            crate::portal::sign_session_with_email_for_test(session_key, "mallory", "mallory@example.test")
+        );
+        let editor = get(format!("/me/topologies/{tid}/editor"), mallory_cookie).await.unwrap();
+        let html = String::from_utf8_lossy(&to_bytes(editor.into_body(), 1 << 16).await.unwrap()).to_string();
+        assert!(!html.contains("Tunnels linked here"), "a shared (non-owner) viewer never sees the owner's linked tunnels");
+    }
+
+    #[tokio::test]
     async fn topology_sharing_lets_a_collaborator_view_and_wire_their_own_agents_but_not_govern_107_complex() {
         // #107-complex: a topology defaults to owner-only (no share rows at all). Sharing is
         // strictly additive: the shared subject can VIEW and wire in THEIR OWN agents/edges
@@ -8751,11 +8878,13 @@ mod tests {
         let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
         let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
         let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
         let app = authed_topology_router(
             topologies,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(session_key),
             channels,
+            tunnels,
         );
         let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_with_email_for_test(session_key, "alice", "alice@example.test"));
         let bob_cookie = format!("ct_portal_session={}", crate::portal::sign_session_with_email_for_test(session_key, "bob", "bob@example.test"));
@@ -8915,11 +9044,13 @@ mod tests {
         let unrelated = ChannelId([0xc3u8; 32]);
         assert!(channels.register_channel(&unrelated, &[0x44u8; 32], "carol").unwrap());
 
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
         let app = authed_topology_router(
             topologies,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(session_key),
             channels,
+            tunnels,
         );
         let alice_cookie = format!(
             "ct_portal_session={}",
@@ -9021,11 +9152,13 @@ mod tests {
         assert!(channels.add_member(&owned, "alice", &real_holder, &[0u8; 32], &[0u8; 64]).unwrap());
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
 
+        let tunnels = Arc::new(crate::storage::SqliteTunnelStore::open_in_memory().unwrap());
         let app = authed_topology_router(
             topologies,
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(session_key),
             channels,
+            tunnels,
         );
         let alice_cookie = format!(
             "ct_portal_session={}",
@@ -9219,7 +9352,7 @@ mod tests {
             ("agent-2".to_string(), "agent-3".to_string(), None),
             ("agent-1".to_string(), "agent-3".to_string(), None),
         ];
-        let html = render_topology_editor(&t, &agents, &edges, "smart-route", true, &[], false);
+        let html = render_topology_editor(&t, &agents, &edges, "smart-route", true, &[], false, &[]);
 
         // A complete, self-contained HTML document.
         assert!(html.starts_with("<!doctype html>") && html.contains("</html>"), "full HTML doc");
@@ -9253,17 +9386,17 @@ mod tests {
         assert!(html.contains("id=\"budgetwrap\" style=\"display:none\""), "budget input hidden when mode != shortcut");
         // ...and server-rendered visible when the topology's current mode already is "shortcut"
         // (not just toggled client-side after a JS mode change).
-        let shortcut_html = render_topology_editor(&t, &agents, &edges, "shortcut", true, &[], false);
+        let shortcut_html = render_topology_editor(&t, &agents, &edges, "shortcut", true, &[], false, &[]);
         assert!(shortcut_html.contains("id=\"budgetwrap\" style=\"display:\">"), "budget input visible when mode == shortcut");
 
         // Agent ids are HTML-escaped (XSS-safe): a hostile id never emits raw markup.
         let evil = vec![("<script>alert(1)</script>".to_string(), "peer".to_string(), None, false)];
-        let evil_html = render_topology_editor(&t, &evil, &[], "baseline", true, &[], false);
+        let evil_html = render_topology_editor(&t, &evil, &[], "baseline", true, &[], false, &[]);
         assert!(!evil_html.contains("<script>alert(1)"), "hostile agent id is escaped");
         assert!(evil_html.contains("&lt;script&gt;alert(1)"), "escaped form is present");
 
         // An empty topology still yields a valid page with an empty-state hint (no panic).
-        let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[], false);
+        let empty = render_topology_editor(&t, &[], &[], "baseline", true, &[], false, &[]);
         assert!(empty.starts_with("<!doctype html>") && empty.contains("no agents yet"), "empty-state");
     }
 
@@ -9281,7 +9414,7 @@ mod tests {
             // dashed-outline modifier class, the "?" badge, and a tooltip.
             ("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2".to_string(), "peer".to_string(), None, false),
         ];
-        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false, &[]);
 
         // The aliased node: alias as the primary text, truncated key as a sub-label --
         // BOTH visible (finding 6 asked for a human label, not for hiding the id).
@@ -9305,7 +9438,7 @@ mod tests {
         let t = crate::topology::Topology { id: "t1".into(), owner: "alice".into(), net_uuid: "uuid-xyz".into() };
         let one_agent = vec![("agent-1".to_string(), "peer".to_string(), None, false)];
         let one_edge = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
-        let singular = render_topology_editor(&t, &one_agent, &one_edge, "baseline", true, &[], false);
+        let singular = render_topology_editor(&t, &one_agent, &one_edge, "baseline", true, &[], false, &[]);
         assert!(singular.contains("id=\"agentcount\">1 agent<"), "singular agent count has no trailing s");
         assert!(singular.contains("id=\"edgecount\">1 link<"), "singular edge count has no trailing s");
 
@@ -9314,7 +9447,7 @@ mod tests {
             ("agent-2".to_string(), "peer".to_string(), None, false),
             ("agent-3".to_string(), "peer".to_string(), None, false),
         ];
-        let plural = render_topology_editor(&t, &three_agents, &[], "baseline", true, &[], false);
+        let plural = render_topology_editor(&t, &three_agents, &[], "baseline", true, &[], false, &[]);
         assert!(plural.contains("id=\"agentcount\">3 agents<"), "plural agent count keeps the s");
         assert!(plural.contains("id=\"edgecount\">0 links<"), "zero edges is plural, not singular");
 
@@ -9354,7 +9487,7 @@ mod tests {
 
         // Owner, unbound: status chip says so, the bind panel with both input fields is
         // present, and the topology id is embedded so the copy-paste command is complete.
-        let unbound = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false);
+        let unbound = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false, &[]);
         assert!(unbound.contains("data-operator-bound=\"false\""), "unbound state flagged on body");
         assert!(unbound.contains("id=\"opstatus\">operator: not bound<"), "status chip reads not bound");
         assert!(unbound.contains("id=\"opbind\""), "bind panel present while unbound");
@@ -9363,14 +9496,14 @@ mod tests {
         assert!(unbound.contains("ct-agent channel bind-topology"), "points at the real producer command, not a dead end");
 
         // Owner, bound: status flips, the panel is gone (no more nagging once done).
-        let bound = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], true);
+        let bound = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], true, &[]);
         assert!(bound.contains("data-operator-bound=\"true\""), "bound state flagged on body");
         assert!(bound.contains("id=\"opstatus\">operator: bound<"), "status chip reads bound");
         assert!(!bound.contains("id=\"opbind\""), "bind panel is gone once bound -- it doesn't keep nagging");
 
         // Non-owner, unbound: the bind panel is owner-gated like share management --
         // a collaborator can SEE the status but can't attempt the (owner-only) bind.
-        let viewer = render_topology_editor(&t, &agents, &edges, "baseline", false, &[], false);
+        let viewer = render_topology_editor(&t, &agents, &edges, "baseline", false, &[], false, &[]);
         assert!(viewer.contains("id=\"opstatus\">operator: not bound<"), "a viewer still sees the status");
         assert!(!viewer.contains("id=\"opbind\""), "a non-owner never gets the bind form -- binding is owner-only");
 
@@ -9410,7 +9543,7 @@ mod tests {
             ("agent-2".to_string(), "super-peer".to_string(), None, false),
         ];
         let edges = vec![("agent-1".to_string(), "agent-2".to_string(), None)];
-        let html = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false);
+        let html = render_topology_editor(&t, &agents, &edges, "baseline", true, &[], false, &[]);
 
         assert!(html.contains("id=\"modeeasy\"") && html.contains("id=\"modeflex\""), "easy/flexible toggle present");
         assert!(html.contains("class=\"flex-only\""), "advanced-only controls (overlay mode, suggest) are marked for the easy-mode CSS to hide");
@@ -9450,7 +9583,7 @@ mod tests {
             ("agent-1".to_string(), "peer".to_string(), None, false),
             ("agent-2".to_string(), "peer".to_string(), None, false),
         ];
-        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false, &[]);
 
         // The Connect tool is present and starts un-armed (a11y state exposed).
         assert!(html.contains("id=\"link\"") && html.contains("aria-pressed=\"false\""), "Connect tool present, un-armed");
@@ -9491,7 +9624,7 @@ mod tests {
             ("agent-1".to_string(), "peer".to_string(), None, false),
             ("agent-2".to_string(), "peer".to_string(), None, false),
         ];
-        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false);
+        let html = render_topology_editor(&t, &agents, &[], "baseline", true, &[], false, &[]);
 
         // The action itself: a button wired to a real sync routine, not a stub.
         assert!(html.contains("id=\"syncchan\""), "Sync my channels button present");
