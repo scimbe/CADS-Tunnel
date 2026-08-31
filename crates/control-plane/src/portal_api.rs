@@ -5746,6 +5746,14 @@ async fn manage_channel_page(
         Ok(None) => return (StatusCode::FORBIDDEN, "not the channel owner").into_response(),
         Err(e) => return internal_error("manage_channel_page/members_of", e).into_response(),
     };
+    let member_subjects = match st.channels.member_subjects_of(&channel, &claims.subject) {
+        Ok(Some(s)) => s,
+        // Same owner-check as `members_of` just passed above, so `None` here can't
+        // actually happen on this path -- fail open to an empty map (just no
+        // identity column) rather than a second, redundant 403 branch.
+        Ok(None) => std::collections::HashMap::new(),
+        Err(e) => return internal_error("manage_channel_page/member_subjects_of", e).into_response(),
+    };
     let operator = match st.channels.operator_pubkey(&channel) {
         Ok(Some(o)) => o,
         Ok(None) => return (StatusCode::NOT_FOUND, "unknown channel").into_response(),
@@ -5760,6 +5768,7 @@ async fn manage_channel_page(
         &channel_hex,
         &hex(&operator),
         &members,
+        &member_subjects,
         &allowlist,
         q.created,
         q.error.as_deref(),
@@ -5773,6 +5782,7 @@ fn manage_channel_html(
     channel_hex: &str,
     operator_hex: &str,
     members: &[([u8; 32], Option<[u8; 32]>)],
+    member_subjects: &std::collections::HashMap<[u8; 32], String>,
     allowlist: &[String],
     created: bool,
     error: Option<&str>,
@@ -5800,8 +5810,17 @@ fn manage_channel_html(
                     Some(n) => format!(r#" <span class="help">noise: <code>{}…</code></span>"#, escape(&hex(n)[..16])),
                     None => String::new(),
                 };
+                // #514-follow: who claimed this holder, if anyone did (a holder the
+                // owner added directly, never through the self-service claim link,
+                // has no `channel_member_subjects` row and stays unclaimed -- shown
+                // as such rather than silently omitted, so an owner can tell the
+                // two cases apart instead of reading "no identity shown" as a bug).
+                let claimed_by = match member_subjects.get(holder) {
+                    Some(subject) => format!(r#" <span class="help">claimed by: {}</span>"#, escape(subject)),
+                    None => r#" <span class="help">unclaimed (added directly)</span>"#.to_string(),
+                };
                 format!(
-                    r#"<div class="row"><span class="v"><code>{holder_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{holder_hex}')">Copy</button>{noise_note}</span>
+                    r#"<div class="row"><span class="v"><code>{holder_hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{holder_hex}')">Copy</button>{noise_note}{claimed_by}</span>
  <span><form class="inline" method="post" action="/portal/channels/{channel_hex}/manage/remove-member/{holder_hex}">
  <button class="danger" type="submit">Remove</button></form></span></div>"#
                 )
@@ -10966,6 +10985,12 @@ mod tests {
             manage_html.contains(&format!("/portal/channels/{ch_hex}/manage/remove-member/{holder_hex}")),
             "a remove form is offered for it"
         );
+        // #514-follow: added directly by the owner (never claimed via the self-service
+        // link), so no identity is on file for it -- shown as such, not silently blank.
+        assert!(
+            manage_html.contains("unclaimed (added directly)"),
+            "a directly-added member is labeled unclaimed, not misattributed"
+        );
 
         // Remove round-trips cleanly.
         assert_eq!(
@@ -10973,6 +10998,42 @@ mod tests {
             StatusCode::SEE_OTHER
         );
         assert!(channels.members_of(&ch, "alice").unwrap().unwrap().is_empty(), "removed");
+    }
+
+    /// #514-follow: scimbe's own feedback on the manage dialog -- members were
+    /// listed with a working Remove button already, but a CLAIMED member's row
+    /// showed only the opaque holder pubkey, never who (which portal identity)
+    /// claimed it. `channel_member_subjects` already recorded this at claim time;
+    /// this proves the manage page now surfaces it.
+    #[tokio::test]
+    async fn manage_page_shows_who_claimed_a_member() {
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
+        let ch = ct_common::channel::ChannelId([0x66; 32]);
+        channels.register_channel(&ch, &[0x77; 32], "alice").unwrap();
+        channels.allowlist_add(&ch, "alice", "bob@example.com", 500).unwrap();
+
+        let holder = [0x88u8; 32];
+        // The store method itself doesn't verify the attestation cryptographically
+        // (that's `do_claim`'s job before it calls this, per the method's own doc) --
+        // a test exercising only the storage+rendering layer can use zero bytes.
+        let outcome = channels
+            .claim_via_allowlist(&ch, "bob@example.com", &holder, &[0x99u8; 32], &[0u8; 64], 1_000, Some("oidc-subject-bob"))
+            .unwrap();
+        assert!(matches!(outcome, crate::storage::ClaimOutcome::Claimed), "{outcome:?}");
+
+        let app = channel_claim_router(KEY, channels, None, Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap()), "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let ch_hex = hex(&ch.0);
+        let holder_hex = hex(&holder);
+        let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
+        assert!(manage_html.contains(&holder_hex), "claimed member listed");
+        assert!(
+            manage_html.contains("claimed by: oidc-subject-bob"),
+            "the claiming identity is shown, not just the opaque holder key: {manage_html}"
+        );
+        assert!(
+            !manage_html.contains("unclaimed (added directly)"),
+            "a claimed member must not also be labeled unclaimed"
+        );
     }
 
     /// #113-ui-delete: the manage page's every other row had a Remove action, but the
