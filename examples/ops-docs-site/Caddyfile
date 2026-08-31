@@ -1,0 +1,42 @@
+# Origin for the ops-docs.bunsenbrenner.org site (private CADS-ops-docs repo's
+# built Jekyll output). Same posture as examples/help-site/Caddyfile: TLS
+# terminates HERE, at the origin -- the tunnel/edge stays payload-blind. No
+# inbound :80/:443 of its own; only reachable through the tunnel.
+#
+# Access control IS this Caddyfile's job (basic_auth below) -- two other
+# mechanisms were tried first and both turned out not to apply here:
+#   1. GitHub Pages: private-repo Pages visibility restriction requires
+#      GitHub Enterprise Cloud + an organization, not available on a personal
+#      Pro account (confirmed live, 2026-08-31 -- the built site was briefly
+#      publicly reachable via Pages before this was caught and disabled).
+#   2. ct-agent's local-auth credential gate (#126): Mesh-Plane only by
+#      design -- Browser-Plane (what a real browser hostname needs) forwards
+#      opaque TLS the gate architecturally can't inspect.
+#   3. The portal's require-login/allowlist gate: scoped to tunnels created
+#      via the self-service `/portal/tunnels` flow -- this hostname was
+#      authorized via scripts/authorize-pipeline.sh (admin/edge-level host
+#      authorization), which has no corresponding portal tunnel row at all.
+# Caddy is the one layer here that genuinely terminates TLS and sees the real
+# request, so it's the one layer that actually can check a password.
+
+ops-docs.bunsenbrenner.org {
+	# HTTP Basic Auth -- the real access control for this site (see the header
+	# comment above: neither the local-auth credential gate nor the portal's
+	# require-login/allowlist mechanism apply to a pipeline-authorized
+	# hostname). Caddy terminates TLS itself, so it genuinely sees the request
+	# and CAN check a password -- this is the one layer that actually can.
+	# Hash generated with `caddy hash-password`; the plaintext password was
+	# handed to the operator out of band, never committed here.
+	basic_auth {
+		scimbe $2a$14$wujfN0BnMNZo4d1GMlF8.ORam4FAc3dO3Ubmi8IPcQxcPLx6EnRKS
+	}
+	root * /srv
+	file_server
+	encode gzip
+	tls /certs/fullchain.pem /certs/privkey.pem
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Robots-Tag "noindex, nofollow"
+	}
+}

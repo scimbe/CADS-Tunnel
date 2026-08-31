@@ -1,0 +1,85 @@
+# Serve https://ops-docs.bunsenbrenner.org (the private CADS-ops-docs runbook,
+# built as a static Jekyll site) through the Browser Plane, with a real Let's
+# Encrypt certificate obtained at the origin via deSEC DNS-01. Same shape as
+# examples/help-site/compose.help-site.yml.
+#
+# Runs ALONGSIDE an already-running plane (ct-edge with CT_EDGE_BROWSER_LISTEN=:443
+# and a ct-control-plane the agent onboards against). Env comes from
+# docker/deploy/.env (see docs/dns01-desec.md).
+#
+# The site's actual content lives in the SEPARATE, private CADS-ops-docs repo
+# (checked out as a sibling of CADS-Tunnel) -- rebuild it there
+# (`docker run --rm -v "$PWD":/srv/jekyll ... jekyll build`), then this
+# compose's ops-origin container serves the resulting _site/ directly off
+# disk. No container rebuild needed for a content-only change, just re-run
+# the Jekyll build and the running Caddy picks it up on the next request.
+#
+#   docker compose -f examples/ops-docs-site/compose.ops-docs-site.yml \
+#     --env-file docker/deploy/.env up --build -d
+services:
+  ops-origin:
+    build:
+      context: .
+      dockerfile: Caddy.Dockerfile
+    volumes:
+      # Sibling checkout, read-only -- see the header comment above. Override
+      # OPS_DOCS_SITE_DIR if CADS-ops-docs isn't checked out at the default
+      # `../../../CADS-ops-docs` relative path.
+      - ${OPS_DOCS_SITE_DIR:-../../../CADS-ops-docs/_site}:/srv:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${OPS_DOCS_CERT_DIR:?set OPS_DOCS_CERT_DIR=<dir with fullchain.pem+privkey.pem>}:/certs:ro
+      - ops_docs_caddy_data:/data
+    expose:
+      - "443"   # reachable only via the tunnel/agent, not published to the host
+    restart: unless-stopped
+    # Same #312/#600 rationale as every other origin on this shared host --
+    # sized generously above a static Caddy origin's real footprint.
+    mem_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
+
+  ops-agent:
+    build:
+      context: .
+      dockerfile: Agent.Dockerfile
+      args:
+        - CT_AGENT_REF=${OPS_DOCS_AGENT_REF:-v0.7.13}
+    environment:
+      - CT_AGENT_MODE=browser
+      - CT_AGENT_FRAMED_FALLBACK=1
+      - CT_AGENT_HOSTNAME=ops-docs.bunsenbrenner.org
+      - CT_AGENT_TOKEN=${OPS_DOCS_AGENT_TOKEN:-}
+      - CT_AGENT_ORIGIN=ops-origin:443
+      - CT_AGENT_ORIGIN_PROTO=tcp
+      - CT_AGENT_CAPABILITY_OUT=/tmp/capability.bin
+      - CT_AGENT_EDGE=${OPS_DOCS_AGENT_EDGE:?edge host:port, e.g. edge:4433}
+      - CT_AGENT_CP_URL=${OPS_DOCS_AGENT_CP_URL:?control-plane URL for onboarding}
+      - CT_AGENT_JOIN_TOKEN=${OPS_DOCS_JOIN_TOKEN:?single-use join token}
+      - CT_AGENT_ID=ops-docs-site
+      - CT_AGENT_EDGE_CERT_URL=${OPS_DOCS_AGENT_EDGE_CERT_URL:-}
+      # Persist onboarding outcome so a container restart RESTORES it instead
+      # of re-redeeming the single-use join token (help-site#141's fix, same
+      # reasoning applies here).
+      - CT_AGENT_STATE_DIR=/var/lib/ct-agent
+      - CT_AGENT_RECONNECT_MAX_ATTEMPTS=0
+    command: ["ct-agent", "onboard"]
+    depends_on:
+      - ops-origin
+    restart: unless-stopped
+    mem_limit: 128m
+    mem_reservation: 32m
+    cpus: 0.5
+    volumes:
+      - ops_docs_agent_state:/var/lib/ct-agent
+
+volumes:
+  ops_docs_caddy_data:
+  ops_docs_agent_state:
+
+# Join the running self-host plane's network so ops-agent/ops-origin can reach
+# `edge`/`control-plane` and the OPS_DOCS_AGENT_EDGE/OPS_DOCS_AGENT_CP_URL
+# hostnames resolve. Bring the base stack up first.
+networks:
+  default:
+    name: ct-selfhost_default
+    external: true
