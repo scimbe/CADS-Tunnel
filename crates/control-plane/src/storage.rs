@@ -4351,6 +4351,56 @@ impl SqliteChannelStore {
         ))
     }
 
+    /// Every claimed member's portal subject for `channel`, owner-scoped the same
+    /// way as [`Self::members_of`] (an unknown channel or non-owner caller gets
+    /// `None`, never a distinguishable empty map). `holder -> subject`, sourced
+    /// from `channel_member_subjects` (written at self-service claim time, see
+    /// that table's own doc comment). A holder the owner added directly (never
+    /// went through the claim flow) simply has no entry here -- callers should
+    /// treat a missing key as "not yet claimed / added directly", not an error.
+    /// Deliberately a SEPARATE query from `members_of` rather than folding the
+    /// join into it: `members_of`'s tuple shape is also the wire format of the
+    /// public `GET /me/channels/:channel/members` JSON API (`ChannelMemberView`
+    /// in `service.rs`), which this must not change. Added for the manage-channel
+    /// portal dialog, which wants to show *who* (which claimed identity) a member
+    /// row belongs to instead of only the opaque holder pubkey.
+    pub fn member_subjects_of(
+        &self,
+        channel: &ChannelId,
+        owner: &str,
+    ) -> rusqlite::Result<Option<std::collections::HashMap<[u8; 32], String>>> {
+        let conn = self.read();
+        let is_owner: bool = conn
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1 AND owner = ?2",
+                params![&channel.0[..], owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_owner {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT holder, subject FROM channel_member_subjects WHERE channel = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![&channel.0[..]], |r| {
+                let holder: Vec<u8> = r.get(0)?;
+                let subject: String = r.get(1)?;
+                Ok((holder, subject))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(
+            rows.into_iter()
+                .filter_map(|(h, s)| {
+                    let holder = <[u8; 32]>::try_from(h.as_slice()).ok()?;
+                    Some((holder, s))
+                })
+                .collect(),
+        ))
+    }
+
     /// Record a cross-user invitation redemption as **consumed** (#72 AF3 / #108),
     /// keyed by the invitation's 64-byte operator signature (unique per invitation — a
     /// replay carries the identical bytes). Returns `true` the **first** time an
