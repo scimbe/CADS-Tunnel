@@ -4563,11 +4563,20 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
             let search_key = escape(
                 &format!("{} {}", t.name, t.hostname.as_deref().unwrap_or_default()).to_lowercase(),
             );
+            // Collapsible per-card (2026-08-31 live ask): a card's install/revoke
+            // actions, byte counters, cert tier, and login-gate block are real
+            // detail, not identity -- native <details> gives per-card
+            // collapse/expand with zero JS and starts CLOSED with no `open`
+            // attribute needed, matching "start all collapsed" for free. The
+            // outer .tunnel-card <div> and its data-search attribute are left
+            // exactly where they were (search/removal-animation JS both still
+            // target `.tunnel-card` unchanged) -- only what used to be its flat
+            // children now nests one level deeper, inside <details>.
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
-<div class="row"><span class="v">{name}{host}{status_badge}</span></div>
+<details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
 {owner_actions}{bytes_line}{tier}{login_gate}
-</div>"#,
+</details></div>"#,
                 name = escape(&t.name),
             )
         })
@@ -4630,10 +4639,29 @@ may become available for your account &mdash; contact the operator if you need a
     } else {
         ""
     };
+    // Expand/collapse-all toggle (2026-08-31 live ask, same firing as the
+    // per-card <details> above): a plain two-state button, tracked in its own
+    // `data-expanded` attribute rather than inferred by inspecting every card
+    // each click -- cheaper and unambiguous even if a user has hand-toggled a
+    // few cards individually before clicking it (this always sets every card to
+    // the SAME state, it doesn't try to guess "mostly open vs. mostly closed").
+    let toggle_all = if tunnels.is_empty() {
+        String::new()
+    } else {
+        r#"<button type="button" id="toggleAllTunnels" class="btn sec" data-expanded="false"
+ style="margin-bottom:1rem" onclick="
+var willExpand=this.dataset.expanded!=='true';
+document.querySelectorAll('.tunnel-details').forEach(function(d){d.open=willExpand;});
+this.dataset.expanded=willExpand?'true':'false';
+this.textContent=willExpand?'Collapse all':'Expand all';
+">Expand all</button>"#
+            .to_string()
+    };
     let body = format!(
         r#"<h1>Your tunnels</h1>
 {quota_bar}
 {search_box}
+{toggle_all}
 <div class="tunnel-grid">
 {rows}
 </div>
@@ -4787,6 +4815,19 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  a.btn.danger,button.danger{{background:#3d1418;border:1px solid #6e2530;color:#ff9a9a}}
  a.btn.danger:hover,button.danger:hover{{background:#5a1c22}}
  .deleted-check{{animation:checkIn .45s ease-out}}
+ /* 2026-08-31: per-card collapse, a native disclosure widget -- starts closed
+    with no `open` attribute, toggled per-card by the browser for free and
+    all-at-once by #toggleAllTunnels above. The summary element keeps the .row
+    flex layout it already had as a plain div; only the pointer cursor is new
+    (some UA stylesheets don't set one on it by default). */
+ .tunnel-details>summary{{cursor:pointer;list-style:none}}
+ .tunnel-details>summary::-webkit-details-marker{{display:none}}
+ /* The caret lives inside .v (an existing flex item), not as a sibling of it --
+    .row's own justify-content:space-between would otherwise shove a sibling
+    pseudo-element off to the far edge instead of sitting next to the text. */
+ .tunnel-details>summary .v::before{{content:"▸";display:inline-block;width:1em;color:var(--muted);
+      transition:transform .15s ease}}
+ .tunnel-details[open]>summary .v::before{{transform:rotate(90deg)}}
  /* The connection-status indicator (was a raw 🟢/⚪ emoji before this pass) --
     same pulsing-dot motif the landing page uses for its own "live" markers. A
     dead/idle tunnel doesn't pulse (no activity to signal); a live one does. */
@@ -8009,6 +8050,36 @@ mod tests {
             "the freed slot really accepts a new tunnel"
         );
         assert_eq!(tunnels.list_for_subject("alice").unwrap().len(), 2, "back to 2 real owned tunnel rows");
+    }
+
+    /// scimbe's live feedback (2026-08-31): each tunnel card's detail should be
+    /// collapsible, starting collapsed, plus one toggle to expand/collapse all at
+    /// once. Native `<details>` gives per-card collapse with zero JS; this checks
+    /// the page actually renders that (not a flat `<div class="row">` any more)
+    /// and starts with no `open` attribute -- and that the all-toggle button and
+    /// its script are present and reference the right class.
+    #[tokio::test]
+    async fn tunnel_cards_are_collapsible_and_start_collapsed_with_an_expand_all_toggle() {
+        let app = test_app();
+        assert_eq!(get(&app, "/portal/tunnels", Some("alice")).await.0, StatusCode::OK); // auto-provision #1
+        let (_, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+
+        assert!(html.contains(r#"<details class="tunnel-details">"#), "card body is a <details>: {html}");
+        // "starts collapsed" == no `open` attribute anywhere on a tunnel-details
+        // element -- <details> is closed by default without one, so ABSENCE is
+        // the assertion, not a literal "closed" marker.
+        assert!(
+            !html.contains(r#"<details class="tunnel-details" open>"#) && !html.contains(r#"open class="tunnel-details""#),
+            "no card should render pre-opened: {html}"
+        );
+        assert!(html.contains(r#"<summary class="row">"#), "the always-visible header is the <summary>: {html}");
+
+        assert!(html.contains(r#"id="toggleAllTunnels""#), "an expand/collapse-all control exists: {html}");
+        assert!(html.contains("Expand all"), "starts labeled for its next action (expand, since all start closed)");
+        assert!(
+            html.matches(".tunnel-details").count() >= 2,
+            "the toggle's own script must target the same .tunnel-details class the cards use, not a stale/different selector: {html}"
+        );
     }
 
     #[tokio::test]
