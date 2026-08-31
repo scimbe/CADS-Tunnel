@@ -4540,9 +4540,15 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>) ->
                 Some(_) => r#" <span class="tier"><i class="status-dot off"></i>Not connected</span>"#.to_string(),
                 None => String::new(),
             };
+            // #517/ADR-0025 Decision 3 wording, reused verbatim from the admin Traffic
+            // monitor page (admin_traffic_page_html): the edge structurally can only see
+            // bytes that pass through the relay, never a direct P2P leg's traffic -- so
+            // this counter is labeled "via relay", not a bare "sent"/"received" that would
+            // read as total traffic and go silently wrong the moment a tunnel offloads to
+            // a direct path.
             let bytes_line = match status {
                 Some(s) if s.bytes_received > 0 || s.bytes_sent > 0 => format!(
-                    r#"<div class="row"><span class="k">↓ {} received · ↑ {} sent</span></div>"#,
+                    r#"<div class="row"><span class="k" title="Edge-measured relay-plane bytes only -- a direct P2P leg's traffic isn't counted here.">↓ {} received via relay · ↑ {} sent via relay</span></div>"#,
                     human_bytes(s.bytes_received),
                     human_bytes(s.bytes_sent),
                 ),
