@@ -231,6 +231,7 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/account", get(account_page))
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
+        .route("/portal/tunnels/:id/rename", post(rename_tunnel))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
         .route("/portal/tunnels/:id/install", get(install_page))
@@ -4002,6 +4003,35 @@ async fn delete_tunnel(
     Redirect::to("/portal/tunnels").into_response()
 }
 
+#[derive(Deserialize)]
+struct RenameTunnelForm {
+    name: String,
+}
+
+/// `POST /portal/tunnels/:id/rename` (2026-09-01, operator ask): a tunnel's
+/// display `name` was previously settable only at creation, with no way to
+/// relabel an existing one -- as the owned-tunnel list grows, an unchangeable
+/// name makes tunnels hard to tell apart. Owner-scoped via
+/// `SqliteTunnelStore::rename` itself (unknown id or someone else's tunnel
+/// both come back `Ok(false)`, same "existence leaks nothing" posture every
+/// other owner-scoped tunnel action here already follows); a blank-after-trim
+/// or over-60-char name is rejected rather than silently truncated/ignored.
+async fn rename_tunnel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<RenameTunnelForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.rename(&subject, &id, &form.name) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
+        Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+    }
+}
+
 /// `POST /portal/tunnels/:id/reclaim-cert-slot` (#233): the customer's
 /// explicit re-request after a lapsed claim window — the only way a lapsed
 /// hostname re-enters the Gelb queue (never automatic, per the admission
@@ -4609,6 +4639,21 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             } else {
                 String::new()
             };
+            // Rename (2026-09-01, operator ask): `name` was previously settable
+            // only at creation time -- owner-only, mirrors the topology-link
+            // form's own inline-form-in-a-card shape immediately above.
+            let rename_section = if *owned {
+                format!(
+                    r#"<div class="row"><span class="k">Name:</span>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/rename">
+  <input type="text" name="name" value="{name}" required maxlength="60" size="24">
+  <button type="submit" class="sec">Rename</button>
+ </form></div>"#,
+                    name = escape(&t.name),
+                )
+            } else {
+                String::new()
+            };
             // data-search: lowercased name+hostname, read by the search box's JS
             // filter below -- client-side (an account's own tunnel count is small,
             // no round trip needed) and independent of what's actually displayed
@@ -4629,7 +4674,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{tier}{login_gate}{topology_section}
+{owner_actions}{bytes_line}{tier}{login_gate}{topology_section}{rename_section}
 </details></div>"#,
                 name = escape(&t.name),
             )
@@ -5732,6 +5777,20 @@ async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Resp
         Ok(v) => v,
         Err(e) => return internal_error("channels_page/channels_owned_by", e).into_response(),
     };
+    // Quota display, mirroring `tunnels_html`'s own "using X of Y" line -- same
+    // `max_channels` (default 100, admin-raisable via `POST
+    // /admin/accounts/:subject/max-channels`) `new_channel_submit` already
+    // enforces, just not previously surfaced anywhere on this page. Fetched
+    // before the e-mail fork below since it's about OWNED channels (keyed on
+    // subject, not e-mail) and applies in both branches.
+    let account = match st.ledger.account_for_subject(&claims.subject) {
+        Ok(a) => a,
+        Err(e) => return internal_error("channels_page/account_for_subject", e).into_response(),
+    };
+    let max_channels = match st.ledger.max_channels(&account) {
+        Ok(m) => m,
+        Err(e) => return internal_error("channels_page/max_channels", e).into_response(),
+    };
     let Some(email) = claims.email else {
         let body = format!(
             r#"<h1>Your channels</h1>
@@ -5739,7 +5798,7 @@ async fn channels_page(State(st): State<ClaimState>, headers: HeaderMap) -> Resp
 <h2>Channels you're invited to</h2>
 <p class="help">Your session has no verified e-mail, so channel invitations (which are matched by
 e-mail) can't be shown here. Log in again with an identity provider that verifies e-mail.</p>"#,
-            owned_section = owned_channels_html(&owned),
+            owned_section = owned_channels_html(&owned, max_channels),
         );
         return Html(page("your channels", &body, None)).into_response();
     };
@@ -5747,7 +5806,7 @@ e-mail) can't be shown here. Log in again with an identity provider that verifie
         Ok(v) => v,
         Err(e) => return internal_error("channels_page/channels_for_email", e).into_response(),
     };
-    Html(channels_html(&owned, &entries, Some(&email))).into_response()
+    Html(channels_html(&owned, &entries, Some(&email), max_channels)).into_response()
 }
 
 /// The "channels you own" half of `channels_page`: a create-channel entry point plus a
@@ -5755,7 +5814,7 @@ e-mail) can't be shown here. Log in again with an identity provider that verifie
 /// [`channels_html`]'s invitee list never covered (#666-follow-up, self-service channel
 /// setup: creating a channel and adding its first member was API/CLI-only before this,
 /// confirmed live to have no portal path at all).
-fn owned_channels_html(owned: &[ct_common::channel::ChannelId]) -> String {
+fn owned_channels_html(owned: &[ct_common::channel::ChannelId], max_channels: u32) -> String {
     let rows = if owned.is_empty() {
         r#"<p class="help">You don't own any channels yet.</p>"#.to_string()
     } else {
@@ -5770,9 +5829,14 @@ fn owned_channels_html(owned: &[ct_common::channel::ChannelId]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // Quota line, same shape as `tunnels_html`'s "You're using X of Y tunnels
+    // included in your plan." -- surfaces `max_channels` (previously enforced
+    // by `new_channel_submit` but never shown anywhere on this page).
+    let owned_count = owned.len() as u32;
     format!(
         r#"<h2>Channels you own</h2>
-<p class="help">Create a channel, then add yourself (or anyone else) as a member -- no
+<p class="help">You're using {owned_count} of {max_channels} channels included in your plan.
+Create a channel, then add yourself (or anyone else) as a member -- no
 <code>ct-agent</code> CLI or raw API calls needed for this part.</p>
 {rows}
 <a class="btn sec" href="/portal/channels/new">Create a channel</a>"#
@@ -5786,6 +5850,7 @@ fn channels_html(
     owned: &[ct_common::channel::ChannelId],
     entries: &[(ct_common::channel::ChannelId, Option<u64>)],
     email: Option<&str>,
+    max_channels: u32,
 ) -> String {
     let rows = if entries.is_empty() {
         r#"<p class="help">No channel invitations yet. A channel owner adds your e-mail to their
@@ -5813,7 +5878,7 @@ portal), and it appears here automatically -- nothing to request.</p>"#
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let owned_section = owned_channels_html(owned);
+    let owned_section = owned_channels_html(owned, max_channels);
     let body = format!(
         r#"<h1>Your channels</h1>
 {owned_section}
@@ -11058,6 +11123,39 @@ mod tests {
         assert!(body.contains("No channel invitations yet"));
     }
 
+    #[tokio::test]
+    async fn channels_page_shows_the_account_s_channel_quota_like_tunnels_page_does() {
+        // 2026-09-01 operator ask: `/portal/tunnels` has always shown "using X of Y
+        // included in your plan" -- `/portal/channels` never did, even though the
+        // same per-account `max_channels` limit (`new_channel_submit`) already
+        // governs it. This is the parity fix.
+        use crate::portal::sign_session_with_email_for_test;
+        use crate::storage::SqliteChannelStore;
+        use ct_common::channel::ChannelId;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let ledger = Arc::new(crate::storage::SqliteLedger::open_in_memory().unwrap());
+        let op = [0x22u8; 32];
+        assert!(channels.register_channel(&ChannelId([0x01u8; 32]), &op, "alice-subject").unwrap());
+        assert!(channels.register_channel(&ChannelId([0x02u8; 32]), &op, "alice-subject").unwrap());
+        let account = ledger.account_for_subject("alice-subject").unwrap();
+        ledger.set_max_channels(&account, 5).unwrap();
+
+        let app = channel_claim_router(KEY, channels, None, ledger, "https://portal.example", "/nonexistent/ct-edge-ca.der");
+        let cookie =
+            format!("ct_portal_session={}", sign_session_with_email_for_test(KEY, "alice-subject", "alice@example.com"));
+        let resp = app
+            .oneshot(Request::get("/portal/channels").header("cookie", cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(
+            body.contains("You're using 2 of 5 channels included in your plan."),
+            "quota line missing or wrong -- body: {body}"
+        );
+    }
+
     /// The owner-side console added alongside the "search by name" picker: create a
     /// channel entirely from the browser, see it in "Channels you own", and confirm a
     /// non-owner is refused the manage page -- the exact gap #666-follow-up found live
@@ -11674,5 +11772,64 @@ mod tests {
             StatusCode::SEE_OTHER
         );
         assert_eq!(tunnels.topology_link("alice", &t.id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rename_tunnel_route_renames_rejects_blank_and_is_owner_scoped() {
+        let (app, tunnels) = test_app_with_tunnels();
+        let t = tunnels.create("alice", "old-name", None).unwrap().created().expect("no hostname collision in this test");
+
+        // Owner can rename their own tunnel.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/rename", t.id), "alice", "name=new-name").await,
+            StatusCode::SEE_OTHER
+        );
+        let (row, _) = tunnels.list_authorized_for_subject("alice").unwrap().into_iter().find(|(r, _)| r.id == t.id).unwrap();
+        assert_eq!(row.name, "new-name");
+
+        // A blank name is rejected, not silently applied.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/rename", t.id), "alice", "name=%20%20").await,
+            StatusCode::BAD_REQUEST
+        );
+        let (row, _) = tunnels.list_authorized_for_subject("alice").unwrap().into_iter().find(|(r, _)| r.id == t.id).unwrap();
+        assert_eq!(row.name, "new-name", "the rejected rename must not have taken effect");
+
+        // A non-owner cannot rename alice's tunnel (owner-scoped in the store).
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/rename", t.id), "bob", "name=stolen").await,
+            StatusCode::NOT_FOUND
+        );
+        let (row, _) = tunnels.list_authorized_for_subject("alice").unwrap().into_iter().find(|(r, _)| r.id == t.id).unwrap();
+        assert_eq!(row.name, "new-name", "a non-owner's rename attempt must not have taken effect");
+
+        // Unknown tunnel id.
+        assert_eq!(
+            post_form(&app, "/portal/tunnels/no-such-id/rename", "alice", "name=whatever").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_renders_a_rename_form_for_an_owned_tunnel_only() {
+        let (app, tunnels) = test_app_with_tunnels();
+        let _mine = tunnels.create("alice", "mine", None).unwrap().created().expect("no hostname collision in this test");
+        let shared = tunnels.create("bob", "bobs-tunnel", None).unwrap().created().expect("no hostname collision in this test");
+        tunnels.grant("bob", &shared.id, "alice").unwrap();
+
+        let resp = app
+            .oneshot(Request::get("/portal/tunnels").header("cookie", session_header("alice")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(
+            html.contains(&format!(r#"action="/portal/tunnels/{}/rename""#, _mine.id)),
+            "owned tunnel gets a rename form"
+        );
+        assert!(
+            !html.contains(&format!(r#"action="/portal/tunnels/{}/rename""#, shared.id)),
+            "a tunnel merely shared with alice must not offer a rename form -- rename is owner-only"
+        );
     }
 }
