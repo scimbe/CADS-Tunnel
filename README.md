@@ -98,7 +98,7 @@ installing `ct-agent`, managing tunnels, Agent-Fabric channels, the Topology Edi
 workflow pipelines, and everything else the live deployment does. Start here if you
 just want to *use* the thing rather than read source.
 
-Five more entry points into this repo itself, depending on what you need:
+Four more entry points into this repo itself, depending on what you need:
 
 **1. The source base** — how the code is organized
 [**→ Codebase overview**](docs/architecture.md): the crates, the data path,
@@ -131,10 +131,6 @@ the [specification](docs/SPEC.md), and the security set:
 [payment integration](docs/payment/integration.md) ·
 [product positioning](docs/product/positioning.md) ·
 [comparison to the tunneling landscape](docs/product/comparison.md).
-
-**5. The bachelor thesis (draft)** — the academic write-up
-[**→ thesis PDF**](docs/thesis/thesis.pdf) (German, HAW template); LaTeX sources
-under [`docs/thesis/`](docs/thesis/).
 
 ## Quick install
 
