@@ -2920,6 +2920,34 @@ impl SqliteTunnelStore {
             .map(|v| v.flatten())
     }
 
+    /// Owner-scoped rename of a tunnel's display name (2026-09-01, operator ask:
+    /// `name` was previously settable only at creation, with no way to relabel
+    /// an existing tunnel to keep a growing list distinguishable/filterable).
+    /// `Ok(false)` for an unknown tunnel id or one owned by someone else --
+    /// same "existence leaks nothing" posture as `set_topology_link`. Trimmed
+    /// and capped at 60 chars (same order of magnitude as `set_agent_label`'s
+    /// 40-char topology-agent label cap); empty-after-trim is rejected rather
+    /// than silently clearing, since `name` is `NOT NULL` in the schema and a
+    /// blank tunnel title would be worse than the rename failing outright.
+    pub fn rename(&self, subject: &str, tunnel_id: &str, name: &str) -> Result<bool, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("name must not be empty".to_string());
+        }
+        if trimmed.chars().count() > 60 {
+            return Err("name must be 60 characters or fewer".to_string());
+        }
+        let n = self
+            .writer
+            .lock_safe()
+            .execute(
+                "UPDATE subject_tunnels SET name = ?1 WHERE id = ?2 AND subject = ?3",
+                params![trimmed, tunnel_id, subject],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
     /// Every tunnel the caller owns that is linked to `topology_id`, sorted by
     /// name -- for the Topology Editor's own "linked tunnels" panel. Grant
     /// management itself stays on each tunnel's existing `/portal/tunnels/:id/grants`
@@ -8179,6 +8207,42 @@ mod tests {
         assert!(store.set_topology_link("alice", &t.id, None).unwrap(), "unlink");
         assert_eq!(store.topology_link("alice", &t.id).unwrap(), None);
         assert!(store.tunnels_linked_to_topology("alice", "topo-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn rename_is_owner_scoped_trims_and_rejects_blank_or_overlong() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "old-name", None).unwrap().created().expect("hostname is free in this test");
+
+        assert!(
+            !store.rename("alice", "no-such-tunnel", "new-name").unwrap(),
+            "unknown tunnel id"
+        );
+        assert!(
+            !store.rename("bob", &t.id, "stolen-name").unwrap(),
+            "non-owner cannot rename someone else's tunnel"
+        );
+
+        assert!(store.rename("alice", &t.id, "  padded-name  ").unwrap(), "owner can rename, trims whitespace");
+        let (row, _) = store
+            .list_authorized_for_subject("alice")
+            .unwrap()
+            .into_iter()
+            .find(|(row, _)| row.id == t.id)
+            .expect("tunnel still present");
+        assert_eq!(row.name, "padded-name", "whitespace trimmed, non-owner's rename attempt above had no effect");
+
+        assert!(store.rename("alice", &t.id, "   ").is_err(), "whitespace-only name is rejected, not silently cleared");
+        let too_long = "x".repeat(61);
+        assert!(store.rename("alice", &t.id, &too_long).is_err(), "over the 60-char cap");
+        // Neither rejected attempt above changed the stored name.
+        let (row, _) = store
+            .list_authorized_for_subject("alice")
+            .unwrap()
+            .into_iter()
+            .find(|(row, _)| row.id == t.id)
+            .expect("tunnel still present");
+        assert_eq!(row.name, "padded-name", "rejected renames leave the prior name intact");
     }
 
     #[test]
