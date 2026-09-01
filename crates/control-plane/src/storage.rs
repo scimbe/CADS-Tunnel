@@ -2509,17 +2509,31 @@ impl SqliteTunnelStore {
         // visibility into `SqliteTopologyStore`). NULL for every existing tunnel
         // on upgrade -- linking is always an explicit owner action.
         ensure_column(&conn, "subject_tunnels", "topology_id", "TEXT")?;
-        // ct-agent REST-bridge discovery (2026-09-01, llm2 proposal Phase 4): whether
-        // this tunnel's Origin is a `ct-agent channel rest-server` (see the ct-agent
-        // repo's rest_server module), and if so whether the discovery listing should
-        // treat it as a durable directory entry ("permanent" -- listed even while the
-        // tunnel is disconnected) or a purely session-scoped one ("ephemeral" -- listed
-        // only while [`Self::rest_bridge_mode`]'s caller can also observe the tunnel as
-        // currently connected; that liveness check lives in portal_api, this store has
-        // no notion of live connection state). `'off'` for every existing tunnel on
-        // upgrade -- enabling it is always an explicit owner action, same posture as
-        // `require_login`/`allow_any_login` above.
+        // Agent bridges (2026-09-01, llm2 proposal Phase 4; redesigned same night after
+        // the original `ct-agent channel rest-server` mechanism this column's name still
+        // references was removed for a real crash bug -- see the Agent-bridges-v2 plan):
+        // whether this tunnel's owner has opted the tunnel's agent into portal-mediated
+        // remote control, and if so whether the discovery listing should treat it as a
+        // durable directory entry ("permanent" -- listed even while the tunnel is
+        // disconnected) or a purely session-scoped one ("ephemeral" -- listed only while
+        // [`Self::rest_bridge_mode`]'s caller can also observe the tunnel as currently
+        // connected; that liveness check lives in portal_api, this store has no notion of
+        // live connection state). `'off'` for every existing tunnel on upgrade -- enabling
+        // it is always an explicit owner action, same posture as
+        // `require_login`/`allow_any_login` above. Column name kept as-is (not worth a
+        // migration for a naming-only concern) even though the mechanism it now enables is
+        // `channel/grant` + the bridge tool tranche, not the removed local REST listener.
         ensure_column(&conn, "subject_tunnels", "rest_bridge_mode", "TEXT NOT NULL DEFAULT 'off'")?;
+        // The SignedChannelGrant (hex-encoded) admitting the deployment's one shared
+        // bridge Noise identity into THIS tunnel's channel -- minted by calling the
+        // tunnel's own agent's `channel/grant` tool when the owner enables the bridge
+        // (Agent-bridges-v2 plan, Decisions §2: one shared bridge identity, not
+        // per-account/per-tunnel -- only the grant admitting it varies per tunnel). NULL
+        // until enabled, and cleared back to NULL whenever `rest_bridge_mode` returns to
+        // `'off'` or the stored grant expires -- a stale grant left behind after disabling
+        // would otherwise silently keep the shared bridge identity admitted to a channel
+        // the owner believes they revoked access to.
+        ensure_column(&conn, "subject_tunnels", "bridge_grant", "TEXT")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -2962,6 +2976,17 @@ impl SqliteTunnelStore {
             )
             .map_err(|e| e.to_string())?;
         }
+        // Turning the bridge OFF also clears any stored `bridge_grant` -- a stale grant
+        // left behind would otherwise silently keep the shared bridge identity admitted
+        // to this channel even after the owner believes they revoked access (see
+        // `bridge_grant`'s own ensure_column doc comment).
+        if n > 0 && mode == "off" {
+            tx.execute(
+                "UPDATE subject_tunnels SET bridge_grant = NULL WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(n > 0)
     }
@@ -2977,6 +3002,41 @@ impl SqliteTunnelStore {
                 |r| r.get::<_, String>(0),
             )
             .optional()
+    }
+
+    /// Store the `SignedChannelGrant` (hex-encoded) admitting the deployment's shared
+    /// bridge Noise identity into this tunnel's channel -- called once the "enable
+    /// bridge" flow has actually minted the grant via the tunnel's own agent's
+    /// `channel/grant` tool (Agent-bridges-v2 plan; the mint-and-store call itself is
+    /// not built yet, this is the storage half). Owner-scoped, `Ok(false)` for an
+    /// unknown/foreign tunnel id, same posture as `set_rest_bridge_mode`. Does NOT
+    /// validate the grant's signature/expiry itself -- that happens at actual call time,
+    /// same "store what was given, verify at use" posture the edge's own broker follows.
+    pub fn set_bridge_grant(&self, subject: &str, tunnel_id: &str, grant_hex: &str) -> Result<bool, String> {
+        let n = self
+            .writer
+            .lock_safe()
+            .execute(
+                "UPDATE subject_tunnels SET bridge_grant = ?1 WHERE id = ?2 AND subject = ?3",
+                params![grant_hex, tunnel_id, subject],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
+    /// The stored bridge grant for a tunnel the caller owns, or `None` if none is stored
+    /// (bridge never enabled, or turned off since -- `set_rest_bridge_mode` clears it on
+    /// `"off"`) or the tunnel id is unknown/foreign -- same "existence leaks nothing"
+    /// posture as `rest_bridge_mode`.
+    pub fn bridge_grant(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        self.read()
+            .query_row(
+                "SELECT bridge_grant FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
     }
 
     /// Every tunnel the caller owns with the REST bridge turned on (`mode != "off"`),
@@ -8396,6 +8456,36 @@ mod tests {
             store.require_login("alice", &t.id).unwrap(),
             Some(true),
             "turning the bridge off does NOT silently revert require_login -- that's a separate owner choice"
+        );
+    }
+
+    #[test]
+    fn bridge_grant_is_owner_scoped_and_cleared_when_the_bridge_is_turned_off() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "agent-1", None).unwrap().created().expect("hostname is free in this test");
+
+        assert_eq!(store.bridge_grant("alice", &t.id).unwrap(), None, "nothing stored yet");
+        assert!(
+            !store.set_bridge_grant("bob", &t.id, "deadbeef").unwrap(),
+            "non-owner cannot set someone else's tunnel's grant"
+        );
+        assert!(!store.set_bridge_grant("alice", "no-such-tunnel", "deadbeef").unwrap(), "unknown tunnel id");
+
+        assert!(store.set_rest_bridge_mode("alice", &t.id, "permanent").unwrap());
+        assert!(store.set_bridge_grant("alice", &t.id, "deadbeef").unwrap());
+        assert_eq!(store.bridge_grant("alice", &t.id).unwrap(), Some("deadbeef".to_string()));
+        assert_eq!(
+            store.bridge_grant("bob", &t.id).unwrap(),
+            None,
+            "owner-scoped: a non-owner's lookup sees nothing"
+        );
+
+        assert!(store.set_rest_bridge_mode("alice", &t.id, "off").unwrap());
+        assert_eq!(
+            store.bridge_grant("alice", &t.id).unwrap(),
+            None,
+            "turning the bridge off clears the stored grant -- a stale grant left behind \
+             would otherwise silently keep the bridge identity admitted"
         );
     }
 
