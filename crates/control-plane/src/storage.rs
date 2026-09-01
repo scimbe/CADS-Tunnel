@@ -2509,6 +2509,17 @@ impl SqliteTunnelStore {
         // visibility into `SqliteTopologyStore`). NULL for every existing tunnel
         // on upgrade -- linking is always an explicit owner action.
         ensure_column(&conn, "subject_tunnels", "topology_id", "TEXT")?;
+        // ct-agent REST-bridge discovery (2026-09-01, llm2 proposal Phase 4): whether
+        // this tunnel's Origin is a `ct-agent channel rest-server` (see the ct-agent
+        // repo's rest_server module), and if so whether the discovery listing should
+        // treat it as a durable directory entry ("permanent" -- listed even while the
+        // tunnel is disconnected) or a purely session-scoped one ("ephemeral" -- listed
+        // only while [`Self::rest_bridge_mode`]'s caller can also observe the tunnel as
+        // currently connected; that liveness check lives in portal_api, this store has
+        // no notion of live connection state). `'off'` for every existing tunnel on
+        // upgrade -- enabling it is always an explicit owner action, same posture as
+        // `require_login`/`allow_any_login` above.
+        ensure_column(&conn, "subject_tunnels", "rest_bridge_mode", "TEXT NOT NULL DEFAULT 'off'")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_subject_tunnels_status_queued
                  ON subject_tunnels (status, queued_at);
@@ -2918,6 +2929,81 @@ impl SqliteTunnelStore {
             )
             .optional()
             .map(|v| v.flatten())
+    }
+
+    /// Set (or clear) a tunnel's REST-bridge discovery mode (2026-09-01, llm2 proposal
+    /// Phase 4). `mode` must be `"off"`, `"ephemeral"`, or `"permanent"` -- anything
+    /// else is rejected rather than silently stored as garbage the discovery page
+    /// would then have to guess how to render. Turning the bridge ON (`mode != "off"`)
+    /// ALSO force-enables [`Self::set_require_login`] in the SAME update, atomically --
+    /// a REST endpoint that can mint channel grants must never be reachable without an
+    /// authenticated session, and this must not depend on the owner remembering to
+    /// tick a separate checkbox. Turning it back OFF deliberately does NOT revert
+    /// `require_login` -- the owner may have wanted the login gate for unrelated
+    /// reasons, and silently removing it on disable would be a surprising, unrelated
+    /// side effect. `Ok(false)` for an unknown tunnel id or one owned by someone else
+    /// -- same "existence leaks nothing" posture as `rename`/`set_topology_link`.
+    pub fn set_rest_bridge_mode(&self, subject: &str, tunnel_id: &str, mode: &str) -> Result<bool, String> {
+        if !matches!(mode, "off" | "ephemeral" | "permanent") {
+            return Err(format!("mode must be \"off\", \"ephemeral\", or \"permanent\", got {mode:?}"));
+        }
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction().map_err(|e| e.to_string())?;
+        let n = tx
+            .execute(
+                "UPDATE subject_tunnels SET rest_bridge_mode = ?1 WHERE id = ?2 AND subject = ?3",
+                params![mode, tunnel_id, subject],
+            )
+            .map_err(|e| e.to_string())?;
+        if n > 0 && mode != "off" {
+            tx.execute(
+                "UPDATE subject_tunnels SET require_login = 1 WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
+    /// The REST-bridge discovery mode of a tunnel the caller owns (`"off"` for every
+    /// tunnel that never opted in), or `None` for an unknown/foreign tunnel id --
+    /// same "existence leaks nothing" posture as `topology_link`.
+    pub fn rest_bridge_mode(&self, subject: &str, tunnel_id: &str) -> rusqlite::Result<Option<String>> {
+        self.read()
+            .query_row(
+                "SELECT rest_bridge_mode FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                params![tunnel_id, subject],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+    }
+
+    /// Every tunnel the caller owns with the REST bridge turned on (`mode != "off"`),
+    /// paired with that mode -- the portal discovery page's (`/portal/rest-bridges`)
+    /// source list. Whether an "ephemeral" entry is actually SHOWN (only while its
+    /// tunnel is observed as currently connected) is the caller's job, same division
+    /// of responsibility as `set_rest_bridge_mode`'s doc comment: this store holds no
+    /// live connection state.
+    pub fn rest_bridges_for_subject(&self, subject: &str) -> rusqlite::Result<Vec<(SubjectTunnel, String)>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, hostname, created_at, routing_token, rest_bridge_mode FROM subject_tunnels
+             WHERE subject = ?1 AND rest_bridge_mode != 'off' ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![subject], |r| {
+            Ok((
+                SubjectTunnel {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    hostname: r.get(2)?,
+                    created_at: r.get(3)?,
+                    routing_token: r.get(4)?,
+                },
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.collect()
     }
 
     /// Owner-scoped rename of a tunnel's display name (2026-09-01, operator ask:
@@ -3394,6 +3480,32 @@ impl SqliteTunnelStore {
         let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "SELECT id, topology_id FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders}) AND topology_id IS NOT NULL"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_iter), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.collect()
+    }
+
+    /// Batch [`Self::rest_bridge_mode`] for the tunnels page's card list -- one query
+    /// instead of one per row, same shape and reason as [`Self::topology_link_batch`].
+    /// Unlike that one, this INCLUDES `"off"` rows (every tunnel has SOME mode, never
+    /// `NULL`) so the caller can tell "no row returned" apart from "explicitly off"
+    /// with a plain `.get(id).cloned().unwrap_or_else(|| "off".to_string())` default.
+    pub fn rest_bridge_mode_batch(
+        &self,
+        subject: &str,
+        tunnel_ids: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        if tunnel_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read();
+        let placeholders = std::iter::repeat("?").take(tunnel_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, rest_bridge_mode FROM subject_tunnels WHERE subject = ?1 AND id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
         let params_iter = std::iter::once(subject).chain(tunnel_ids.iter().copied());
@@ -8243,6 +8355,71 @@ mod tests {
             .find(|(row, _)| row.id == t.id)
             .expect("tunnel still present");
         assert_eq!(row.name, "padded-name", "rejected renames leave the prior name intact");
+    }
+
+    #[test]
+    fn set_rest_bridge_mode_is_owner_scoped_validates_and_force_enables_require_login() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "agent-1", None).unwrap().created().expect("hostname is free in this test");
+
+        assert!(
+            !store.set_rest_bridge_mode("alice", "no-such-tunnel", "permanent").unwrap(),
+            "unknown tunnel id"
+        );
+        assert!(
+            !store.set_rest_bridge_mode("bob", &t.id, "permanent").unwrap(),
+            "non-owner cannot flip someone else's tunnel"
+        );
+        assert!(
+            store.set_rest_bridge_mode("alice", &t.id, "sideways").is_err(),
+            "garbage mode is rejected, not silently stored"
+        );
+        assert_eq!(store.rest_bridge_mode("alice", &t.id).unwrap(), Some("off".to_string()), "default is off");
+        assert_eq!(store.require_login("alice", &t.id).unwrap(), Some(false), "require_login starts off too");
+
+        assert!(store.set_rest_bridge_mode("alice", &t.id, "permanent").unwrap());
+        assert_eq!(store.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()));
+        assert_eq!(
+            store.require_login("alice", &t.id).unwrap(),
+            Some(true),
+            "enabling the bridge force-enables the login gate atomically"
+        );
+        assert_eq!(
+            store.rest_bridge_mode("bob", &t.id).unwrap(),
+            None,
+            "owner-scoped: a non-owner's lookup sees nothing, not even \"off\""
+        );
+
+        assert!(store.set_rest_bridge_mode("alice", &t.id, "off").unwrap(), "owner can turn it back off");
+        assert_eq!(store.rest_bridge_mode("alice", &t.id).unwrap(), Some("off".to_string()));
+        assert_eq!(
+            store.require_login("alice", &t.id).unwrap(),
+            Some(true),
+            "turning the bridge off does NOT silently revert require_login -- that's a separate owner choice"
+        );
+    }
+
+    #[test]
+    fn rest_bridges_for_subject_lists_only_the_owners_own_non_off_tunnels_with_their_mode() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let permanent = store.create("alice", "always-on", None).unwrap().created().expect("hostname free");
+        let ephemeral = store.create("alice", "session-only", None).unwrap().created().expect("hostname free");
+        let untouched = store.create("alice", "plain-tunnel", None).unwrap().created().expect("hostname free");
+        let bobs = store.create("bob", "bobs-agent", None).unwrap().created().expect("hostname free");
+
+        store.set_rest_bridge_mode("alice", &permanent.id, "permanent").unwrap();
+        store.set_rest_bridge_mode("alice", &ephemeral.id, "ephemeral").unwrap();
+        store.set_rest_bridge_mode("bob", &bobs.id, "permanent").unwrap();
+        let _ = &untouched; // stays "off", must not appear below
+
+        let alices = store.rest_bridges_for_subject("alice").unwrap();
+        let ids: std::collections::HashMap<String, String> =
+            alices.into_iter().map(|(t, mode)| (t.id, mode)).collect();
+        assert_eq!(ids.len(), 2, "only alice's two enabled bridges, not her plain tunnel or bob's");
+        assert_eq!(ids.get(&permanent.id), Some(&"permanent".to_string()));
+        assert_eq!(ids.get(&ephemeral.id), Some(&"ephemeral".to_string()));
+        assert!(!ids.contains_key(&untouched.id));
+        assert!(!ids.contains_key(&bobs.id), "owner-scoped: bob's bridge never appears in alice's list");
     }
 
     #[test]
