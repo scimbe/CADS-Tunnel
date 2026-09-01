@@ -92,7 +92,13 @@ DNS-01 responder for the front door's certs:
 
 ## Documentation
 
-Five entry points, depending on what you need:
+**[→ docs.bunsenbrenner.org](https://docs.bunsenbrenner.org)** — the full documentation
+site (tutorials, how-to guides, explanations, reference — with real screenshots):
+installing `ct-agent`, managing tunnels, Agent-Fabric channels, the Topology Editor,
+workflow pipelines, and everything else the live deployment does. Start here if you
+just want to *use* the thing rather than read source.
+
+Five more entry points into this repo itself, depending on what you need:
 
 **1. The source base** — how the code is organized
 [**→ Codebase overview**](docs/architecture.md): the crates, the data path,
