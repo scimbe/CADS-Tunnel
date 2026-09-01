@@ -3648,24 +3648,25 @@ fn rest_bridges_html(rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>)],
                 let connected = status.as_ref().map(|s| s.connected).unwrap_or(false);
                 let dot_class = if connected { "live" } else { "off" };
                 let status_label = if connected { "Online" } else { "Offline" };
-                let hostname_block = match &t.hostname {
-                    Some(h) => format!(
-                        r#"<code>https://{host}/v1/channel/grants</code>
-<div class="code-block"><div class="code-block-head"><span>curl</span>
-<button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button></div>
-<pre><code>curl -u agent:&lt;rest-server credential&gt; \
-  -X POST https://{host}/v1/channel/grants \
-  -H 'Content-Type: application/json' \
-  -d '{{"channel":"...","holder":"...","direction":"accept","expires_in":"30d"}}'</code></pre></div>"#,
-                        host = escape(h)
-                    ),
-                    None => "<p class=\"help\">This tunnel has no public hostname yet -- assign one before this bridge is reachable.</p>".to_string(),
-                };
+                // 2026-09-01: the previous "point your Origin at `ct-agent channel rest-server`,
+                // call this public https:// URL" instructions described a mechanism that no
+                // longer exists -- that local listener was removed (ct-agent PR#140, a real
+                // crash bug plus scimbe's own architectural pushback: "wieso muessen wir einen
+                // port oeffnen"). Its replacement (`channel/grant` + the broader Agent-bridges
+                // tool tranche, ct-agent v0.7.19) is reachable only over an already-admitted
+                // Noise channel session, not a public URL a browser page can curl -- so this
+                // page cannot show a working "call it like this" recipe until the control-plane
+                // gains its own bridge dialer (in progress, see the Agent-bridges-v2 plan). Say
+                // that honestly instead of a dead command a copy-paste would 404 on.
+                let hostname_block = r#"<p class="help">Remote control isn't wired up on this page yet -- the
+underlying mechanism changed (see <a href="https://docs.bunsenbrenner.org/how-to/install-an-agent-manifest/">the docs</a>
+for what <code>ct-agent</code> can already do from its own CLI today). This toggle just remembers
+that you've opted this tunnel in for when it is.</p>"#
+                    .to_string();
                 format!(
                     r#"<div class="card" style="margin-bottom:1rem">
 <h3><span class="status-dot {dot_class}"></span>{name} <span class="badge">{mode_label}</span></h3>
-<p class="help">{status_label} -- point this tunnel's Origin at your `ct-agent channel rest-server`
-(default 127.0.0.1:8765) to serve it here.</p>
+<p class="help">{status_label}</p>
 {hostname_block}
 </div>"#,
                     dot_class = dot_class,
