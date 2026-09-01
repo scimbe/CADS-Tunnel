@@ -5992,14 +5992,23 @@ fn owned_channels_html(owned: &[ct_common::channel::ChannelId], max_channels: u3
             .collect::<Vec<_>>()
             .join("\n")
     };
-    // Quota line, same shape as `tunnels_html`'s "You're using X of Y tunnels
-    // included in your plan." -- surfaces `max_channels` (previously enforced
-    // by `new_channel_submit` but never shown anywhere on this page).
+    // Quota bar, same `.quota-bar`/`.quota-track`/`.quota-fill` widget
+    // `tunnels_html`'s ADR-0025 layout pass introduced (2026-08-26 live
+    // feedback) -- this page previously only had the plain-text "You're using
+    // X of Y" sentence `tunnels_html` itself moved away from, so the two
+    // per-plan quotas read inconsistently. Same CSS classes, already global
+    // in `page()`'s stylesheet, so no new styling needed here.
     let owned_count = owned.len() as u32;
+    let plural = if max_channels == 1 { "" } else { "s" };
+    let quota_pct = owned_count.checked_mul(100).and_then(|n| n.checked_div(max_channels)).map(|p| p.min(100)).unwrap_or(100);
+    let quota_bar = format!(
+        r#"<div class="quota-bar"><span class="q-l">Using <strong>{owned_count}</strong> of <strong>{max_channels}</strong> channel{plural} included in your plan</span>
+<div class="quota-track"><div class="quota-fill" style="width:{quota_pct}%"></div></div></div>"#
+    );
     format!(
         r#"<h2>Channels you own</h2>
-<p class="help">You're using {owned_count} of {max_channels} channels included in your plan.
-Create a channel, then add yourself (or anyone else) as a member -- no
+{quota_bar}
+<p class="help">Create a channel, then add yourself (or anyone else) as a member -- no
 <code>ct-agent</code> CLI or raw API calls needed for this part.</p>
 {rows}
 <a class="btn sec" href="/portal/channels/new">Create a channel</a>"#
@@ -11314,9 +11323,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert!(
-            body.contains("You're using 2 of 5 channels included in your plan."),
-            "quota line missing or wrong -- body: {body}"
+            body.contains(r#"Using <strong>2</strong> of <strong>5</strong> channels included in your plan"#),
+            "quota bar missing or wrong -- body: {body}"
         );
+        assert!(body.contains(r#"class="quota-bar""#), "quota-bar widget missing -- body: {body}");
     }
 
     /// The owner-side console added alongside the "search by name" picker: create a
