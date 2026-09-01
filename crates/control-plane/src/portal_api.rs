@@ -232,6 +232,8 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/rename", post(rename_tunnel))
+        .route("/portal/tunnels/:id/rest-bridge", post(set_tunnel_rest_bridge))
+        .route("/portal/rest-bridges", get(rest_bridges_page))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
         .route("/portal/tunnels/:id/install", get(install_page))
@@ -3569,6 +3571,7 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
             let require_logins = st.tunnels.require_login_batch(&subject, &tunnel_ids).unwrap_or_default();
             let allow_and_pending = st.tunnels.allowlist_and_pending_batch(&subject, &tunnel_ids).unwrap_or_default();
             let topology_links = st.tunnels.topology_link_batch(&subject, &tunnel_ids).unwrap_or_default();
+            let rest_bridge_modes = st.tunnels.rest_bridge_mode_batch(&subject, &tunnel_ids).unwrap_or_default();
             let statuses: Vec<_> =
                 futures::future::join_all(tunnels.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
             let mut rows = Vec::with_capacity(tunnels.len());
@@ -3582,6 +3585,8 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                 let (login_allowlist, pending_requests) =
                     allow_and_pending.get(&t.id).cloned().unwrap_or_default();
                 let topology_link = topology_links.get(&t.id).cloned();
+                let rest_bridge_mode =
+                    rest_bridge_modes.get(&t.id).cloned().unwrap_or_else(|| "off".to_string());
                 rows.push((
                     t,
                     owned,
@@ -3592,12 +3597,102 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
                     login_allowlist,
                     pending_requests,
                     topology_link,
+                    rest_bridge_mode,
                 ));
             }
             Html(tunnels_html(&rows, max_tunnels, claims.email.as_deref(), is_business_plan)).into_response()
         }
         Err(e) => internal_error("tunnels_page/list", e).into_response(),
     }
+}
+
+/// `GET /portal/rest-bridges` (2026-09-01, llm2 proposal Phase 4): the discovery
+/// listing for the owner's own `ct-agent channel rest-server`-backed tunnels
+/// (toggled per tunnel via `/portal/tunnels/:id/rest-bridge`, see
+/// `set_tunnel_rest_bridge`). "Permanent" entries are always shown (with an
+/// online/offline badge, same live status source `tunnels_page` already uses);
+/// "ephemeral" entries are shown ONLY while their tunnel is currently connected --
+/// this store has no notion of live connection state (see
+/// `SqliteTunnelStore::rest_bridges_for_subject`'s doc), so the liveness filter
+/// lives here, at the one place that already awaits the edge status call anyway.
+async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Response {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let subject = claims.subject;
+    let bridges = match st.tunnels.rest_bridges_for_subject(&subject) {
+        Ok(b) => b,
+        Err(e) => return internal_error("rest_bridges_page/list", e).into_response(),
+    };
+    let statuses: Vec<_> =
+        futures::future::join_all(bridges.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
+    let rows: Vec<(SubjectTunnel, String, Option<EdgeTunnelStatus>)> = bridges
+        .into_iter()
+        .zip(statuses)
+        .filter(|((_, mode), status)| {
+            mode != "ephemeral" || status.as_ref().map(|s| s.connected).unwrap_or(false)
+        })
+        .map(|((t, mode), status)| (t, mode, status))
+        .collect();
+    Html(rest_bridges_html(&rows, claims.email.as_deref())).into_response()
+}
+
+fn rest_bridges_html(rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>)], email: Option<&str>) -> String {
+    let list = if rows.is_empty() {
+        r#"<p class="help">No REST bridge is enabled yet. Open a tunnel on the
+<a href="/portal/tunnels">Tunnels</a> page and turn on "REST bridge" (ephemeral or
+permanent) to make it appear here.</p>"#
+            .to_string()
+    } else {
+        rows.iter()
+            .map(|(t, mode, status)| {
+                let connected = status.as_ref().map(|s| s.connected).unwrap_or(false);
+                let dot_class = if connected { "live" } else { "off" };
+                let status_label = if connected { "Online" } else { "Offline" };
+                let hostname_block = match &t.hostname {
+                    Some(h) => format!(
+                        r#"<code>https://{host}/v1/channel/grants</code>
+<div class="code-block"><div class="code-block-head"><span>curl</span>
+<button type="button" class="copy-btn" onclick="copyCode(this)">Copy</button></div>
+<pre><code>curl -u agent:&lt;rest-server credential&gt; \
+  -X POST https://{host}/v1/channel/grants \
+  -H 'Content-Type: application/json' \
+  -d '{{"channel":"...","holder":"...","direction":"accept","expires_in":"30d"}}'</code></pre></div>"#,
+                        host = escape(h)
+                    ),
+                    None => "<p class=\"help\">This tunnel has no public hostname yet -- assign one before this bridge is reachable.</p>".to_string(),
+                };
+                format!(
+                    r#"<div class="card" style="margin-bottom:1rem">
+<h3><span class="status-dot {dot_class}"></span>{name} <span class="badge">{mode_label}</span></h3>
+<p class="help">{status_label} -- point this tunnel's Origin at your `ct-agent channel rest-server`
+(default 127.0.0.1:8765) to serve it here.</p>
+{hostname_block}
+</div>"#,
+                    dot_class = dot_class,
+                    name = escape(&t.name),
+                    mode_label = if mode == "permanent" { "Permanent" } else { "Ephemeral" },
+                    status_label = status_label,
+                    hostname_block = hostname_block,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    page(
+        "REST bridges",
+        &format!(
+            r#"<h1>REST bridges</h1>
+<p class="help">ct-agent instances of yours that expose channel-grant issuance over HTTP
+(llm2 proposal, Phase 2's <code>ct-agent channel rest-server</code>), reachable through this
+tunnel's existing hostname -- no new open port on your host. "Permanent" bridges stay listed
+even while offline; "ephemeral" ones only appear while actively connected.</p>
+{list}
+<p><a class="btn sec" href="/portal/tunnels">Back to tunnels</a></p>"#,
+            list = list
+        ),
+        email,
+    )
 }
 
 /// Create `name`'s tunnel for `subject` (auto-assigning its hostname when DNS
@@ -4026,6 +4121,32 @@ async fn rename_tunnel(
         return Redirect::to("/portal").into_response();
     };
     match st.tunnels.rename(&subject, &id, &form.name) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
+        Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RestBridgeForm {
+    mode: String,
+}
+
+/// `POST /portal/tunnels/:id/rest-bridge` (2026-09-01, llm2 proposal Phase 4): the
+/// owner-facing toggle for `SqliteTunnelStore::set_rest_bridge_mode` -- three-way
+/// (off/ephemeral/permanent), same owner-scoped "existence leaks nothing" posture as
+/// `rename_tunnel` above, and the same store call already force-enables the login
+/// gate atomically when turning the bridge on (see that function's own doc).
+async fn set_tunnel_rest_bridge(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<RestBridgeForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.set_rest_bridge_mode(&subject, &id, form.mode.trim()) {
         Ok(true) => Redirect::to("/portal/tunnels").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
         Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
@@ -4533,6 +4654,7 @@ type TunnelRow = (
     Vec<String>,
     Vec<(String, String, i64)>,
     Option<String>, // the topology id this tunnel is linked to, if any
+    String,         // rest_bridge_mode: "off" | "ephemeral" | "permanent"
 );
 
 fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is_business_plan: bool) -> String {
@@ -4544,7 +4666,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
     let owned_count = tunnels.iter().filter(|(_, owned, ..)| *owned).count() as u32;
     let rows = tunnels
         .iter()
-        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link)| {
+        .map(|(t, owned, admission, status, require_login, allow_any_login, login_allowlist, pending_requests, topology_link, rest_bridge_mode)| {
             let host = t
                 .hostname
                 .as_deref()
@@ -4654,6 +4776,31 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             } else {
                 String::new()
             };
+            // REST bridge (2026-09-01, llm2 proposal Phase 4): owner-only three-way
+            // toggle, mirrors rename_section's inline-form shape immediately above.
+            // Turning it on force-enables the login gate atomically (see
+            // `set_rest_bridge_mode`'s doc) -- deliberately no client-side warning
+            // about that here, since the server-side guarantee must hold regardless
+            // of what a form happens to say.
+            let rest_bridge_section = if *owned {
+                let opt = |value: &str, label: &str| {
+                    let selected = if rest_bridge_mode == value { " selected" } else { "" };
+                    format!(r#"<option value="{value}"{selected}>{label}</option>"#)
+                };
+                format!(
+                    r#"<div class="row"><span class="k">REST bridge:</span>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/rest-bridge">
+  <select name="mode">{off_opt}{eph_opt}{perm_opt}</select>
+  <button type="submit" class="sec">Update</button>
+ </form>
+ <span class="help">Enables force login. See <a href="/portal/rest-bridges">REST bridges</a>.</span></div>"#,
+                    off_opt = opt("off", "Off"),
+                    eph_opt = opt("ephemeral", "Ephemeral"),
+                    perm_opt = opt("permanent", "Permanent"),
+                )
+            } else {
+                String::new()
+            };
             // data-search: lowercased name+hostname, read by the search box's JS
             // filter below -- client-side (an account's own tunnel count is small,
             // no round trip needed) and independent of what's actually displayed
@@ -4674,7 +4821,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             format!(
                 r#"<div class="tunnel-card" data-search="{search_key}">
 <details class="tunnel-details"><summary class="row"><span class="v">{name}{host}{status_badge}</span></summary>
-{owner_actions}{bytes_line}{tier}{login_gate}{topology_section}{rename_section}
+{owner_actions}{bytes_line}{tier}{login_gate}{topology_section}{rename_section}{rest_bridge_section}
 </details></div>"#,
                 name = escape(&t.name),
             )
@@ -5053,7 +5200,7 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a>{signed_in_as}<a href="/portal/logout">Sign out</a></nav>
+<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/rest-bridges">REST bridges</a>{signed_in_as}<a href="/portal/logout">Sign out</a></nav>
 {body}
 </div>
 <script>
@@ -11831,5 +11978,125 @@ mod tests {
             !html.contains(&format!(r#"action="/portal/tunnels/{}/rename""#, shared.id)),
             "a tunnel merely shared with alice must not offer a rename form -- rename is owner-only"
         );
+    }
+
+    #[tokio::test]
+    async fn set_tunnel_rest_bridge_route_toggles_force_enables_login_and_is_owner_scoped() {
+        let (app, tunnels) = test_app_with_tunnels();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        assert_eq!(tunnels.require_login("alice", &t.id).unwrap(), Some(false));
+
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/rest-bridge", t.id), "alice", "mode=permanent").await,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()));
+        assert_eq!(
+            tunnels.require_login("alice", &t.id).unwrap(),
+            Some(true),
+            "enabling the bridge via the route must force-enable the login gate, same as the store call"
+        );
+
+        // A garbage mode is rejected, not silently stored.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/rest-bridge", t.id), "alice", "mode=sideways").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()), "unchanged");
+
+        // A non-owner cannot toggle alice's tunnel.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/rest-bridge", t.id), "bob", "mode=off").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()), "unchanged");
+    }
+
+    #[tokio::test]
+    async fn tunnels_page_renders_a_rest_bridge_form_for_an_owned_tunnel_only() {
+        let (app, tunnels) = test_app_with_tunnels();
+        let mine = tunnels.create("alice", "mine", None).unwrap().created().expect("no hostname collision in this test");
+        let shared = tunnels.create("bob", "bobs-tunnel", None).unwrap().created().expect("no hostname collision in this test");
+        tunnels.grant("bob", &shared.id, "alice").unwrap();
+
+        let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(&format!(r#"action="/portal/tunnels/{}/rest-bridge""#, mine.id)),
+            "owned tunnel gets a REST-bridge form"
+        );
+        assert!(
+            !html.contains(&format!(r#"action="/portal/tunnels/{}/rest-bridge""#, shared.id)),
+            "a tunnel merely shared with alice must not offer a REST-bridge form -- owner-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_lists_permanent_always_and_ephemeral_only_while_connected() {
+        // Phase 4 discovery UX (2026-09-01): "permanent" bridges stay listed even
+        // while offline; "ephemeral" ones disappear the moment their tunnel isn't
+        // observed as connected. Reuses the same mock-edge harness shape as
+        // tunnels_page_shows_live_connection_status_from_the_edge_248.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let connected = Arc::new(AtomicBool::new(true));
+        let conn = connected.clone();
+        let mock = Router::new()
+            .route("/admin/authorize-host/:host", post(|| async { StatusCode::OK }))
+            .route(
+                "/admin/tunnel-status/:token",
+                axum::routing::get(
+                    move |axum::extract::State(_): axum::extract::State<()>,
+                          axum::extract::Path(_token): axum::extract::Path<String>| {
+                        let conn = conn.clone();
+                        async move {
+                            Json(serde_json::json!({
+                                "connected": conn.load(Ordering::SeqCst),
+                                "registrations": 0,
+                                "bytes_received": 0,
+                                "bytes_sent": 0,
+                            }))
+                        }
+                    },
+                ),
+            )
+            .with_state(());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let permanent = tunnels.create("alice", "always-on", None).unwrap().created().expect("hostname free");
+        let ephemeral = tunnels.create("alice", "session-only", None).unwrap().created().expect("hostname free");
+        tunnels.set_rest_bridge_mode("alice", &permanent.id, "permanent").unwrap();
+        tunnels.set_rest_bridge_mode("alice", &ephemeral.id, "ephemeral").unwrap();
+
+        let app = portal_api_router(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels.clone(),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+            None,
+            None,
+            None,
+            EdgeMeshHandle::new(Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap()), Arc::from("primary")),
+            None,
+        );
+
+        // Both connected: both show up.
+        let (status, html) = get(&app, "/portal/rest-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("always-on"), "permanent bridge shown while connected");
+        assert!(html.contains("session-only"), "ephemeral bridge shown while connected");
+
+        // Now disconnected: permanent stays, ephemeral drops out.
+        connected.store(false, Ordering::SeqCst);
+        let (status, html) = get(&app, "/portal/rest-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("always-on"), "permanent bridge stays listed while offline");
+        assert!(!html.contains("session-only"), "ephemeral bridge disappears once disconnected");
     }
 }
