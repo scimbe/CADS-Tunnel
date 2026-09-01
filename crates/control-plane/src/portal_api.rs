@@ -232,8 +232,8 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/account/credits", post(buy_credits))
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/rename", post(rename_tunnel))
-        .route("/portal/tunnels/:id/rest-bridge", post(set_tunnel_rest_bridge))
-        .route("/portal/rest-bridges", get(rest_bridges_page))
+        .route("/portal/tunnels/:id/agent-bridge", post(set_tunnel_rest_bridge))
+        .route("/portal/agent-bridges", get(rest_bridges_page))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
         .route("/portal/tunnels/:id/install", get(install_page))
@@ -3606,9 +3606,10 @@ async fn tunnels_page(State(st): State<ApiState>, headers: HeaderMap) -> Respons
     }
 }
 
-/// `GET /portal/rest-bridges` (2026-09-01, llm2 proposal Phase 4): the discovery
-/// listing for the owner's own `ct-agent channel rest-server`-backed tunnels
-/// (toggled per tunnel via `/portal/tunnels/:id/rest-bridge`, see
+/// `GET /portal/agent-bridges` (2026-09-01, llm2 proposal Phase 4; user-facing name
+/// "Agent bridges" -- the underlying mechanism is still ct-agent's REST server):
+/// the discovery listing for the owner's own `ct-agent channel rest-server`-backed
+/// tunnels (toggled per tunnel via `/portal/tunnels/:id/agent-bridge`, see
 /// `set_tunnel_rest_bridge`). "Permanent" entries are always shown (with an
 /// online/offline badge, same live status source `tunnels_page` already uses);
 /// "ephemeral" entries are shown ONLY while their tunnel is currently connected --
@@ -3639,9 +3640,7 @@ async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Re
 
 fn rest_bridges_html(rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>)], email: Option<&str>) -> String {
     let list = if rows.is_empty() {
-        r#"<p class="help">No REST bridge is enabled yet. Open a tunnel on the
-<a href="/portal/tunnels">Tunnels</a> page and turn on "REST bridge" (ephemeral or
-permanent) to make it appear here.</p>"#
+        r#"<p class="help">No agent bridges yet -- enable one from <a href="/portal/tunnels">Tunnels</a>.</p>"#
             .to_string()
     } else {
         rows.iter()
@@ -3680,13 +3679,9 @@ permanent) to make it appear here.</p>"#
             .join("\n")
     };
     page(
-        "REST bridges",
+        "Agent bridges",
         &format!(
-            r#"<h1>REST bridges</h1>
-<p class="help">ct-agent instances of yours that expose channel-grant issuance over HTTP
-(llm2 proposal, Phase 2's <code>ct-agent channel rest-server</code>), reachable through this
-tunnel's existing hostname -- no new open port on your host. "Permanent" bridges stay listed
-even while offline; "ephemeral" ones only appear while actively connected.</p>
+            r#"<h1>Agent bridges</h1>
 {list}
 <p><a class="btn sec" href="/portal/tunnels">Back to tunnels</a></p>"#,
             list = list
@@ -4132,7 +4127,7 @@ struct RestBridgeForm {
     mode: String,
 }
 
-/// `POST /portal/tunnels/:id/rest-bridge` (2026-09-01, llm2 proposal Phase 4): the
+/// `POST /portal/tunnels/:id/agent-bridge` (2026-09-01, llm2 proposal Phase 4): the
 /// owner-facing toggle for `SqliteTunnelStore::set_rest_bridge_mode` -- three-way
 /// (off/ephemeral/permanent), same owner-scoped "existence leaks nothing" posture as
 /// `rename_tunnel` above, and the same store call already force-enables the login
@@ -4776,7 +4771,7 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
             } else {
                 String::new()
             };
-            // REST bridge (2026-09-01, llm2 proposal Phase 4): owner-only three-way
+            // Agent bridge (2026-09-01, llm2 proposal Phase 4): owner-only three-way
             // toggle, mirrors rename_section's inline-form shape immediately above.
             // Turning it on force-enables the login gate atomically (see
             // `set_rest_bridge_mode`'s doc) -- deliberately no client-side warning
@@ -4788,12 +4783,12 @@ fn tunnels_html(tunnels: &[TunnelRow], max_tunnels: u32, email: Option<&str>, is
                     format!(r#"<option value="{value}"{selected}>{label}</option>"#)
                 };
                 format!(
-                    r#"<div class="row"><span class="k">REST bridge:</span>
- <form class="inline" method="post" action="/portal/tunnels/{id}/rest-bridge">
+                    r#"<div class="row"><span class="k">Agent bridge:</span>
+ <form class="inline" method="post" action="/portal/tunnels/{id}/agent-bridge">
   <select name="mode">{off_opt}{eph_opt}{perm_opt}</select>
   <button type="submit" class="sec">Update</button>
  </form>
- <span class="help">Enables force login. See <a href="/portal/rest-bridges">REST bridges</a>.</span></div>"#,
+ <span class="help">Enables force login. See <a href="/portal/agent-bridges">Agent bridges</a>.</span></div>"#,
                     off_opt = opt("off", "Off"),
                     eph_opt = opt("ephemeral", "Ephemeral"),
                     perm_opt = opt("permanent", "Permanent"),
@@ -5072,10 +5067,31 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
     label, all packed into one .v span) mid-word once the card had less spare
     width than the old page ever gave it. Live-reported 2026-08-26. */
  .v code{{word-break:break-all}}
- nav a{{color:var(--accent2);text-decoration:none;margin-right:1rem;font-size:.9rem;transition:color .15s ease}}
- nav a:hover{{color:var(--accent2-hover)}} nav{{margin-bottom:1.2rem}}
- nav .signed-in-as{{color:var(--muted);margin-right:1rem;font-size:.9rem}}
+ /* Nav redesign (2026-09-01, operator ask: the old flat run-on of inline links +
+    the account-email line + the logout link had no grouping, so adding one more
+    section link (Agent bridges) started wrapping mid-phrase -- the logout link's
+    two words landing on separate lines. Two flex groups (primary sections vs. the
+    account cluster) wrap as whole units instead, and each stays on one line via
+    white-space:nowrap
+    on its own links -- a crowded viewport now drops the account cluster to its
+    own row rather than fracturing a single link's words across two. */
+ nav{{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
+     gap:.4rem 1.2rem;margin-bottom:1.6rem;padding-bottom:.9rem;border-bottom:1px solid var(--border)}}
+ .nav-links{{display:flex;flex-wrap:wrap;gap:.15rem}}
+ nav a{{color:var(--muted);text-decoration:none;font-size:.84rem;font-weight:600;white-space:nowrap;
+       padding:.4rem .65rem;border-radius:7px;transition:background .15s ease,color .15s ease}}
+ .nav-links a{{color:var(--accent2)}}
+ .nav-links a:hover{{background:#1c222b;color:var(--accent2-hover)}}
+ .nav-account{{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}}
+ nav .signed-in-as{{display:inline-flex;align-items:center;gap:.35rem;color:var(--muted);
+      font-size:.78rem;white-space:nowrap;background:#1c222b;border:1px solid var(--border);
+      border-radius:99px;padding:.32rem .8rem .32rem .65rem}}
  nav .signed-in-as strong{{color:var(--text);font-weight:600}}
+ /* Sign out reads as a distinct, less-frequent action -- an outline pill instead
+    of the same weight as a primary section tab, so the eye doesn't scan it as
+    "one more section" among Tunnels/Channels/etc. */
+ .nav-signout{{color:var(--muted)!important;border:1px solid var(--border)}}
+ .nav-signout:hover{{background:#1c222b;color:var(--text)!important;border-color:#3d444d}}
  a.btn,button{{background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;padding:.5rem 1rem;
       font:inherit;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block;position:relative;overflow:hidden;
       transition:background .15s ease,transform .08s ease,opacity .15s ease,box-shadow .2s ease}}
@@ -5200,7 +5216,7 @@ pub(crate) fn page(title: &str, body: &str, email: Option<&str>) -> String {
  details[open] summary{{margin-bottom:.4rem}}
 </style></head><body>
 <div class="card">
-<nav><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/rest-bridges">REST bridges</a>{signed_in_as}<a href="/portal/logout">Sign out</a></nav>
+<nav><div class="nav-links"><a href="/portal/account">Account</a><a href="/portal/tunnels">Tunnels</a><a href="/portal/channels">Channels</a><a href="/portal/topologies">Topologies</a><a href="/portal/agent-bridges">Agent bridges</a></div><div class="nav-account">{signed_in_as}<a class="nav-signout" href="/portal/logout">Sign out</a></div></nav>
 {body}
 </div>
 <script>
@@ -11987,7 +12003,7 @@ mod tests {
         assert_eq!(tunnels.require_login("alice", &t.id).unwrap(), Some(false));
 
         assert_eq!(
-            post_form(&app, &format!("/portal/tunnels/{}/rest-bridge", t.id), "alice", "mode=permanent").await,
+            post_form(&app, &format!("/portal/tunnels/{}/agent-bridge", t.id), "alice", "mode=permanent").await,
             StatusCode::SEE_OTHER
         );
         assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()));
@@ -11999,14 +12015,14 @@ mod tests {
 
         // A garbage mode is rejected, not silently stored.
         assert_eq!(
-            post_form(&app, &format!("/portal/tunnels/{}/rest-bridge", t.id), "alice", "mode=sideways").await,
+            post_form(&app, &format!("/portal/tunnels/{}/agent-bridge", t.id), "alice", "mode=sideways").await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()), "unchanged");
 
         // A non-owner cannot toggle alice's tunnel.
         assert_eq!(
-            post_form(&app, &format!("/portal/tunnels/{}/rest-bridge", t.id), "bob", "mode=off").await,
+            post_form(&app, &format!("/portal/tunnels/{}/agent-bridge", t.id), "bob", "mode=off").await,
             StatusCode::NOT_FOUND
         );
         assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()), "unchanged");
@@ -12022,12 +12038,12 @@ mod tests {
         let (status, html) = get(&app, "/portal/tunnels", Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            html.contains(&format!(r#"action="/portal/tunnels/{}/rest-bridge""#, mine.id)),
-            "owned tunnel gets a REST-bridge form"
+            html.contains(&format!(r#"action="/portal/tunnels/{}/agent-bridge""#, mine.id)),
+            "owned tunnel gets an Agent-bridge form"
         );
         assert!(
-            !html.contains(&format!(r#"action="/portal/tunnels/{}/rest-bridge""#, shared.id)),
-            "a tunnel merely shared with alice must not offer a REST-bridge form -- owner-only"
+            !html.contains(&format!(r#"action="/portal/tunnels/{}/agent-bridge""#, shared.id)),
+            "a tunnel merely shared with alice must not offer an Agent-bridge form -- owner-only"
         );
     }
 
@@ -12087,14 +12103,14 @@ mod tests {
         );
 
         // Both connected: both show up.
-        let (status, html) = get(&app, "/portal/rest-bridges", Some("alice")).await;
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("always-on"), "permanent bridge shown while connected");
         assert!(html.contains("session-only"), "ephemeral bridge shown while connected");
 
         // Now disconnected: permanent stays, ephemeral drops out.
         connected.store(false, Ordering::SeqCst);
-        let (status, html) = get(&app, "/portal/rest-bridges", Some("alice")).await;
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("always-on"), "permanent bridge stays listed while offline");
         assert!(!html.contains("session-only"), "ephemeral bridge disappears once disconnected");
