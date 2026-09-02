@@ -29,6 +29,17 @@ tokio = { version = "1", features = ["io-util", "sync", "macros", "time"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
+# channel_dial.rs (Agent-bridges-v2, native-only server-side channel dialer): QUIC/TLS,
+# unavailable and unneeded on the wasm32 build (the browser channel-claim page never
+# dials anything itself). Versions pinned to match ct-agent's own transport.rs exactly
+# (github.com/scimbe/ct-agent, native/Cargo.toml) -- both crates build QUIC connections
+# against the same broker wire protocol, so a version drift here would be a real risk,
+# not just a style nit.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio = { version = "1", features = ["net"] }
+
 [dev-dependencies]
 # `test-util` enables tokio's paused clock for the #269 idle-timeout tests
 # (`#[tokio::test(start_paused = true)]`), same purpose as ct-edge's #111 Slowloris

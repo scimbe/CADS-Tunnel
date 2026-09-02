@@ -578,7 +578,9 @@ version = "0.0.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
+ "quinn",
  "rand 0.8.7",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
