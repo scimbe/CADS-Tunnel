@@ -309,6 +309,9 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/tunnels/:id/agent-bridge", post(set_tunnel_rest_bridge))
         .route("/portal/tunnels/:id/agent-bridge/grant", post(set_tunnel_bridge_grant))
         .route("/portal/tunnels/:id/agent-bridge/call", post(call_tunnel_bridge_tool))
+        .route("/portal/tunnels/:id/agent-bridge/allowlist/add", post(add_bridge_allowlist))
+        .route("/portal/tunnels/:id/agent-bridge/allowlist/remove", post(remove_bridge_allowlist))
+        .route("/portal/tunnels/:id/agent-bridge/manifest/install", post(install_bridge_manifest))
         .route("/portal/agent-bridges", get(rest_bridges_page))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
@@ -3729,10 +3732,12 @@ async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Re
     Html(rest_bridges_html(&rows, holder_hex.as_deref(), noise_hex.as_deref(), claims.email.as_deref())).into_response()
 }
 
-/// Agent-bridges-v2's read-only bridge tools this page offers a one-click call for
-/// (already shipped in `ct-agent`) -- `bridge/allowlist-add`, `-remove`, and
-/// `bridge/manifest-install` are deliberately NOT here yet: they take arguments
-/// this pass doesn't build an input form for (see the plan's own scoping note).
+/// Agent-bridges-v2's read-only bridge tools this page offers a one-click "refresh"
+/// button for -- no arguments, just a labeled call. The three tools that take real
+/// input (`bridge/allowlist-add`, `-remove`, `bridge/manifest-install`) get their
+/// own structured forms with real fields instead (2026-09-02: replaced the original
+/// single generic tool-dropdown + raw-JSON-arguments form these five tools used to
+/// share too -- real inputs per action, not one shared JSON box for everything).
 const BRIDGE_CALL_TOOLS: &[(&str, &str)] = &[
     ("bridge/status", "Status"),
     ("bridge/config", "Config"),
@@ -3783,22 +3788,60 @@ unavailable here until an operator sets them.</p>"#
                     String::new()
                 } else if let Some(grant_hex) = grant {
                     let short = if grant_hex.len() > 16 { &grant_hex[..16] } else { grant_hex.as_str() };
-                    let tool_options = BRIDGE_CALL_TOOLS
+                    let refresh_buttons = BRIDGE_CALL_TOOLS
                         .iter()
-                        .map(|(name, label)| format!(r#"<option value="{name}">{label}</option>"#))
+                        .map(|(name, label)| {
+                            format!(
+                                r#"<form class="inline" method="post" action="/portal/tunnels/{id}/agent-bridge/call">
+ <input type="hidden" name="tool" value="{name}">
+ <input type="hidden" name="arguments" value="{{}}">
+ <button type="submit" class="btn sec">{label}</button>
+</form>"#
+                            )
+                        })
                         .collect::<Vec<_>>()
-                        .join("");
+                        .join(" ");
                     format!(
-                        r#"<p class="help">Bridge grant stored (<code>{short}…</code>). Call a read-only tool:</p>
+                        r#"<p class="help">Bridge grant stored (<code>{short}…</code>).</p>
+<h2 class="muted">Check status</h2>
+<div class="actions">{refresh_buttons}</div>
+<h2 class="muted">Allow-list</h2>
+<form method="post" action="/portal/tunnels/{id}/agent-bridge/allowlist/add">
+ <label>Email
+  <input type="email" name="email" required placeholder="teammate@example.com">
+ </label>
+ <button type="submit">Add</button>
+</form>
+<form method="post" action="/portal/tunnels/{id}/agent-bridge/allowlist/remove">
+ <label>Email
+  <input type="email" name="email" required placeholder="teammate@example.com">
+ </label>
+ <button type="submit" class="btn sec">Remove</button>
+</form>
+<p class="help">Use "Allow-list" above to see who's currently listed before removing anyone.</p>
+<h2 class="muted">Install a manifest</h2>
+<form method="post" action="/portal/tunnels/{id}/agent-bridge/manifest/install">
+ <label>Manifest location <span class="opt">(a URL or id from "Installed manifests" above)</span>
+  <input type="text" name="manifest_location" required placeholder="https://registry.example/manifests/...">
+ </label>
+ <label>Project name <span class="opt">(a new, unused name to isolate this install as)</span>
+  <input type="text" name="project_name" required placeholder="my-agent-tool">
+ </label>
+ <button type="submit">Install</button>
+</form>
+<p class="help">Refused entirely if the agent itself has set
+<code>CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL</code>, regardless of this form.</p>
+<details><summary>Advanced: call any tool directly</summary>
 <form method="post" action="/portal/tunnels/{id}/agent-bridge/call">
- <label>Tool
-  <select name="tool">{tool_options}</select>
+ <label>Tool <span class="opt">(e.g. bridge/status)</span>
+  <input type="text" name="tool" required>
  </label>
  <label>Arguments <span class="opt">(JSON, optional)</span>
   <input type="text" name="arguments" placeholder="{{}}">
  </label>
- <button type="submit">Call</button>
+ <button type="submit" class="btn sec">Call</button>
 </form>
+</details>
 <details><summary>Replace the stored grant</summary>{grant_form}</details>"#,
                         grant_form = bridge_grant_form_html(&id),
                     )
@@ -4460,6 +4503,30 @@ async fn call_tunnel_bridge_tool(
     Path(id): Path<String>,
     Form(form): Form<BridgeCallForm>,
 ) -> Response {
+    let arguments: serde_json::Value = match form.arguments.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("arguments must be valid JSON: {e}")).into_response(),
+        },
+        None => serde_json::json!({}),
+    };
+    dial_bridge_tool(st, headers, id, form.tool.trim().to_string(), arguments).await
+}
+
+/// Shared by every route that invokes a `bridge/*` tool -- the generic
+/// `/agent-bridge/call` form (raw tool name + JSON arguments) and the structured,
+/// real-input-field routes below (allow-list add/remove, manifest install). Owner-
+/// scoped exactly like every other tunnel action here -- "existence leaks nothing":
+/// an unknown/foreign tunnel id 404s. A tunnel with no stored grant yet also 404s
+/// (nothing to dial with); no configured bridge identity on this deployment is a
+/// 503, never a panic.
+async fn dial_bridge_tool(
+    st: ApiState,
+    headers: HeaderMap,
+    id: String,
+    tool: String,
+    arguments: serde_json::Value,
+) -> Response {
     let Some(claims) = session_claims_for(&st.session_key, &headers) else {
         return Redirect::to("/portal").into_response();
     };
@@ -4480,23 +4547,15 @@ async fn call_tunnel_bridge_tool(
             )
                 .into_response()
         }
-        Err(e) => return internal_error("call_tunnel_bridge_tool/bridge_grant", e).into_response(),
+        Err(e) => return internal_error("dial_bridge_tool/bridge_grant", e).into_response(),
     };
     let grant_bytes = match hex_decode(grant_hex.trim()) {
         Some(b) => b,
-        None => return internal_error("call_tunnel_bridge_tool/decode", "stored bridge grant is not valid hex").into_response(),
+        None => return internal_error("dial_bridge_tool/decode", "stored bridge grant is not valid hex").into_response(),
     };
     let grant = match ct_common::channel::SignedChannelGrant::decode(&grant_bytes) {
         Ok(g) => g,
-        Err(e) => return internal_error("call_tunnel_bridge_tool/grant_decode", e).into_response(),
-    };
-    let tool = form.tool.trim().to_string();
-    let arguments: serde_json::Value = match form.arguments.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(raw) => match serde_json::from_str(raw) {
-            Ok(v) => v,
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("arguments must be valid JSON: {e}")).into_response(),
-        },
-        None => serde_json::json!({}),
+        Err(e) => return internal_error("dial_bridge_tool/grant_decode", e).into_response(),
     };
     let claims_email = claims.email;
     match ct_common::channel_dial::dial_and_call(
@@ -4512,6 +4571,74 @@ async fn call_tunnel_bridge_tool(
         Ok(result) => Html(bridge_call_result_html(&id, &tool, Ok(&result), claims_email.as_deref())).into_response(),
         Err(e) => Html(bridge_call_result_html(&id, &tool, Err(&e.to_string()), claims_email.as_deref())).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct BridgeAllowlistForm {
+    email: String,
+}
+
+/// `POST /portal/tunnels/:id/agent-bridge/allowlist/add` -- a real email input
+/// field instead of the generic call form's raw JSON, dispatching to the same
+/// `bridge/allowlist-add` tool underneath. See [`dial_bridge_tool`].
+async fn add_bridge_allowlist(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<BridgeAllowlistForm>,
+) -> Response {
+    let email = form.email.trim().to_string();
+    if email.is_empty() {
+        return (StatusCode::BAD_REQUEST, "email is required").into_response();
+    }
+    dial_bridge_tool(st, headers, id, "bridge/allowlist-add".to_string(), serde_json::json!({ "email": email })).await
+}
+
+/// `POST /portal/tunnels/:id/agent-bridge/allowlist/remove` -- the counterpart to
+/// [`add_bridge_allowlist`], dispatching to `bridge/allowlist-remove`.
+async fn remove_bridge_allowlist(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<BridgeAllowlistForm>,
+) -> Response {
+    let email = form.email.trim().to_string();
+    if email.is_empty() {
+        return (StatusCode::BAD_REQUEST, "email is required").into_response();
+    }
+    dial_bridge_tool(st, headers, id, "bridge/allowlist-remove".to_string(), serde_json::json!({ "email": email })).await
+}
+
+#[derive(Deserialize)]
+struct BridgeManifestInstallForm {
+    manifest_location: String,
+    project_name: String,
+}
+
+/// `POST /portal/tunnels/:id/agent-bridge/manifest/install` -- a real
+/// manifest-picker + project-name input pair instead of the generic call form's
+/// raw JSON, dispatching to `bridge/manifest-install`. The agent's own
+/// `CT_CHANNEL_BRIDGE_DISABLE_MANIFEST_INSTALL` opt-out (if set) still refuses this
+/// at the agent, regardless of what this route allows through.
+async fn install_bridge_manifest(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<BridgeManifestInstallForm>,
+) -> Response {
+    let manifest_location = form.manifest_location.trim().to_string();
+    let project_name = form.project_name.trim().to_string();
+    if manifest_location.is_empty() || project_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "manifest_location and project_name are both required").into_response();
+    }
+    dial_bridge_tool(
+        st,
+        headers,
+        id,
+        "bridge/manifest-install".to_string(),
+        serde_json::json!({ "manifest_location": manifest_location, "project_name": project_name }),
+    )
+    .await
 }
 
 /// Render one bridge-tool call's outcome as a small standalone portal page --
@@ -12692,6 +12819,69 @@ mod tests {
             post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/call", t.id), "alice", "tool=bridge/status").await,
             StatusCode::NOT_FOUND,
             "no bridge_grant row yet -- nothing to dial with"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_bridge_allowlist_routes_reject_a_blank_email_before_dialing_anything() {
+        // 2026-09-02: these two routes replaced the old generic tool-dropdown +
+        // raw-JSON-arguments form with real email input fields -- this proves the
+        // field is actually validated server-side, not just left to the browser's
+        // own `required` attribute (which a raw POST bypasses entirely).
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+
+        for path in ["allowlist/add", "allowlist/remove"] {
+            assert_eq!(
+                post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/{path}", t.id), "alice", "email=").await,
+                StatusCode::BAD_REQUEST,
+                "{path}: a blank email must be rejected before ever reaching the dialer"
+            );
+            assert_eq!(
+                post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/{path}", t.id), "alice", "email=%20").await,
+                StatusCode::BAD_REQUEST,
+                "{path}: whitespace-only counts as blank too"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_bridge_allowlist_routes_404_when_no_grant_is_stored_yet() {
+        // Same "nothing to dial with" posture as the generic call route -- a
+        // well-formed email still can't reach an agent with no grant on file.
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+
+        for path in ["allowlist/add", "allowlist/remove"] {
+            assert_eq!(
+                post_form(
+                    &app,
+                    &format!("/portal/tunnels/{}/agent-bridge/{path}", t.id),
+                    "alice",
+                    "email=teammate%40example.com",
+                )
+                .await,
+                StatusCode::NOT_FOUND,
+                "{path}: no bridge_grant row yet"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_bridge_manifest_route_rejects_missing_fields_before_dialing_anything() {
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        let path = format!("/portal/tunnels/{}/agent-bridge/manifest/install", t.id);
+
+        assert_eq!(
+            post_form(&app, &path, "alice", "manifest_location=https%3A%2F%2Fexample.invalid%2Fm.json&project_name=").await,
+            StatusCode::BAD_REQUEST,
+            "blank project_name must be rejected"
+        );
+        assert_eq!(
+            post_form(&app, &path, "alice", "manifest_location=&project_name=proof").await,
+            StatusCode::BAD_REQUEST,
+            "blank manifest_location must be rejected"
         );
     }
 
