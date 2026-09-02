@@ -620,6 +620,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tower",
+ "x25519-dalek",
  "x509-parser",
 ]
 
