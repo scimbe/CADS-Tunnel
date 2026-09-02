@@ -12,7 +12,13 @@ RUN apt-get update \
 # match the repo-root `CT_AGENT_RELEASE` file (#512, the one pin source; a portal
 # test asserts this file agrees with it), so a release bump updates both together.
 ARG CT_AGENT_REF=v0.7.22
-RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
+# 2026-09-02: -c http.version=HTTP/1.1 works around a real, reproduced failure --
+# older git (Debian bookworm's 2.39.5) against github.com's current HTTP/2 responses
+# fails "could not read Username for 'https://github.com': No such device or address" /
+# "fatal: expected flush after ref listing" on a bare `git clone`, even though the URL
+# and tag are fine (confirmed: a newer git, e.g. Alpine's 2.54.0, clones the identical
+# URL successfully). Forcing HTTP/1.1 avoids the mishandled response entirely.
+RUN git -c http.version=HTTP/1.1 clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \

@@ -57,7 +57,13 @@ RUN apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/list
 RUN rustup target add wasm32-unknown-unknown
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo install wasm-bindgen-cli --version 0.2.126
-RUN git clone https://github.com/scimbe/ct-agent /agent-src \
+# 2026-09-02: -c http.version=HTTP/1.1 works around a real, reproduced failure --
+# older git (Debian bookworm's 2.39.5) against github.com's current HTTP/2 responses
+# fails "could not read Username for 'https://github.com': No such device or address" /
+# "fatal: expected flush after ref listing" on a bare `git clone`, even though the URL
+# and tag are fine (confirmed: a newer git, e.g. Alpine's 2.54.0, clones the identical
+# URL successfully). Forcing HTTP/1.1 avoids the mishandled response entirely.
+RUN git -c http.version=HTTP/1.1 clone https://github.com/scimbe/ct-agent /agent-src \
     && git -C /agent-src checkout "$CT_AGENT_REF"
 WORKDIR /agent-src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
