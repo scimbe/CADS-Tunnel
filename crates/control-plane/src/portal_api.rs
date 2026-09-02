@@ -3776,7 +3776,7 @@ unavailable here until an operator sets them.</p>"#
                     )
                 };
                 format!(
-                    r#"<div class="card" style="margin-bottom:1rem">
+                    r#"<div class="tunnel-card">
 <h3><span class="status-dot {dot_class}"></span>{name} <span class="badge">{mode_label}</span></h3>
 <p class="help">{status_label}</p>
 {action_block}
@@ -12635,5 +12635,28 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("always-on"), "permanent bridge stays listed while offline");
         assert!(!html.contains("session-only"), "ephemeral bridge disappears once disconnected");
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_uses_tunnel_card_not_the_page_wrapper_card_class() {
+        // Live-reported (scimbe, screenshot): each tunnel's box on this page was rendered
+        // with `class="card"` -- the SAME class page()'s own outer wrapper uses
+        // (`width:100%;max-width:860px;padding:2rem`, no `box-sizing:border-box` reset
+        // anywhere in this page's <style>). Nested inside the outer .card, that width/
+        // padding math overflows the parent by the padding+border amount -- the exact
+        // "sticks out past the edge" bug shown in the screenshot. Every other per-item
+        // box on this page (and on /portal/tunnels) uses `.tunnel-card` instead, which has
+        // no explicit width and so never overflows. Must never regress back to `.card`.
+        let (app, tunnels) = test_app_with_tunnels();
+        let t = tunnels.create("alice", "web", None).unwrap().created().expect("hostname free");
+        tunnels.set_rest_bridge_mode("alice", &t.id, "permanent").unwrap();
+
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(r#"<div class="tunnel-card">"#), "the per-tunnel box must use .tunnel-card, not .card");
+        assert!(
+            !html.contains(r#"<div class="card" style="margin-bottom:1rem">"#),
+            "must not regress to the page-wrapper's own .card class, which overflows when nested"
+        );
     }
 }
