@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 
+[features]
+# Test-only helpers (scripted brokers, grant/operator fixtures) that a DEPENDENT crate's
+# tests need -- ct-agent's, once the channel join protocol is consolidated here (Phase 2
+# of the CADS-Tunnel/ct-agent consolidation). Same pattern as ct-control-plane's
+# `test-support`, consumed by ct-client. Empty until the first shared helper lands; a
+# dependent enables it on its dev-dependency, never in a production build.
+test-support = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

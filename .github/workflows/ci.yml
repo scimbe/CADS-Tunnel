@@ -80,6 +80,27 @@ jobs:
           cargo install cargo-audit --locked || true
           cargo audit
 
+  # ct-common is deliberately wasm32-portable: it is compiled for the browser
+  # channel-claim page (ct-agent-wasm) and the WASM video-conferencing spike. Until now
+  # nothing in THIS repo's CI ever built it for wasm32 -- the native `gate` job above
+  # only sees the host target -- so a dependency added outside the
+  # `[target.'cfg(not(target_arch = "wasm32"))']` block, or a `cfg` typo on a
+  # native-only module (channel_dial.rs), would only surface downstream, at ct-agent's
+  # next pin bump, days later and in the wrong repo. Phase 2 of the channel-protocol
+  # consolidation moves more native-only code into ct-common, so this gate has to exist
+  # BEFORE that lands. Same `-D warnings`/`--locked` posture as the native gate.
+  wasm32:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Build ct-common for wasm32-unknown-unknown (-D warnings)
+        run: cargo build -p ct-common --target wasm32-unknown-unknown --locked
+
   # Der Realm-Import laeuft bei JEDEM Keycloak-Start; eine schema-ungueltige Datei
   # verhindert ihn (2026-08-16: hinzugefuegte `_comment`-Felder nahmen die
   # Auth-Ebene fuer ~6 Minuten offline). Syntaxpruefung reicht nicht -- die Datei
