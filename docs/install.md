@@ -74,6 +74,16 @@ validate the flow without risking the production rate limit; `--skip-cert`
 reuses certs already on disk. `./scripts/deploy-selfhost.sh --help` for every
 flag/env var (including `AUTH_PUBLIC_HOST`, `AUTH_CERT_DIR`, `KC_ADMIN_USER`).
 
+> **One manual step the script does NOT do for you.** `CT_ADMIN_SUPER_EMAIL`
+> (ADR-0025 — the one Google account allowed into the admin console) is
+> **required and fail-closed**: the control plane refuses to boot at all
+> without it, and `deploy-selfhost.sh` neither generates nor prompts for it
+> the way it does `CT_EDGE_ADMIN_TOKEN`. Add it to `docker/deploy/.env`
+> yourself before the first run: `CT_ADMIN_SUPER_EMAIL=you@example.com`. See
+> the [runbook's Configuration table](ops/runbook.md#configuration) for this
+> and every other env var, including which ones (like the optional
+> Agent-bridges-v2 identity) degrade gracefully instead.
+
 Deep-dive references for what each piece does under the hood: the front door
 and its `.env` keys are in the [runbook](ops/runbook.md#deploy); SSO's realm/
 client setup is in [keycloak-sso.md](deploy/keycloak-sso.md); the DNS-01
