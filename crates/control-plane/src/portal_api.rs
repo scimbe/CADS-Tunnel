@@ -309,8 +309,6 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/tunnels/:id/agent-bridge", post(set_tunnel_rest_bridge))
         .route("/portal/tunnels/:id/agent-bridge/grant", post(set_tunnel_bridge_grant))
         .route("/portal/tunnels/:id/agent-bridge/call", post(call_tunnel_bridge_tool))
-        .route("/portal/tunnels/:id/agent-bridge/allowlist/add", post(add_bridge_allowlist))
-        .route("/portal/tunnels/:id/agent-bridge/allowlist/remove", post(remove_bridge_allowlist))
         .route("/portal/tunnels/:id/agent-bridge/manifest/install", post(install_bridge_manifest))
         .route("/portal/agent-bridges", get(rest_bridges_page))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
@@ -3805,20 +3803,9 @@ unavailable here until an operator sets them.</p>"#
                         r#"<p class="help">Bridge grant stored (<code>{short}…</code>).</p>
 <h2 class="muted">Check status</h2>
 <div class="actions">{refresh_buttons}</div>
-<h2 class="muted">Allow-list</h2>
-<form method="post" action="/portal/tunnels/{id}/agent-bridge/allowlist/add">
- <label>Email
-  <input type="email" name="email" required placeholder="teammate@example.com">
- </label>
- <button type="submit">Add</button>
-</form>
-<form method="post" action="/portal/tunnels/{id}/agent-bridge/allowlist/remove">
- <label>Email
-  <input type="email" name="email" required placeholder="teammate@example.com">
- </label>
- <button type="submit" class="btn sec">Remove</button>
-</form>
-<p class="help">Use "Allow-list" above to see who's currently listed before removing anyone.</p>
+<p class="help">Managing the allow-list itself? Use the <a href="/portal/channels">Channels</a>
+tab's own allow-list form directly -- it's the same underlying list, reached without depending
+on this tunnel's agent being dialable at all.</p>
 <h2 class="muted">Install a manifest</h2>
 <form method="post" action="/portal/tunnels/{id}/agent-bridge/manifest/install">
  <label>Manifest location <span class="opt">(a URL or id from "Installed manifests" above)</span>
@@ -4571,42 +4558,6 @@ async fn dial_bridge_tool(
         Ok(result) => Html(bridge_call_result_html(&id, &tool, Ok(&result), claims_email.as_deref())).into_response(),
         Err(e) => Html(bridge_call_result_html(&id, &tool, Err(&e.to_string()), claims_email.as_deref())).into_response(),
     }
-}
-
-#[derive(Deserialize)]
-struct BridgeAllowlistForm {
-    email: String,
-}
-
-/// `POST /portal/tunnels/:id/agent-bridge/allowlist/add` -- a real email input
-/// field instead of the generic call form's raw JSON, dispatching to the same
-/// `bridge/allowlist-add` tool underneath. See [`dial_bridge_tool`].
-async fn add_bridge_allowlist(
-    State(st): State<ApiState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(form): Form<BridgeAllowlistForm>,
-) -> Response {
-    let email = form.email.trim().to_string();
-    if email.is_empty() {
-        return (StatusCode::BAD_REQUEST, "email is required").into_response();
-    }
-    dial_bridge_tool(st, headers, id, "bridge/allowlist-add".to_string(), serde_json::json!({ "email": email })).await
-}
-
-/// `POST /portal/tunnels/:id/agent-bridge/allowlist/remove` -- the counterpart to
-/// [`add_bridge_allowlist`], dispatching to `bridge/allowlist-remove`.
-async fn remove_bridge_allowlist(
-    State(st): State<ApiState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Form(form): Form<BridgeAllowlistForm>,
-) -> Response {
-    let email = form.email.trim().to_string();
-    if email.is_empty() {
-        return (StatusCode::BAD_REQUEST, "email is required").into_response();
-    }
-    dial_bridge_tool(st, headers, id, "bridge/allowlist-remove".to_string(), serde_json::json!({ "email": email })).await
 }
 
 #[derive(Deserialize)]
@@ -12820,51 +12771,6 @@ mod tests {
             StatusCode::NOT_FOUND,
             "no bridge_grant row yet -- nothing to dial with"
         );
-    }
-
-    #[tokio::test]
-    async fn add_and_remove_bridge_allowlist_routes_reject_a_blank_email_before_dialing_anything() {
-        // 2026-09-02: these two routes replaced the old generic tool-dropdown +
-        // raw-JSON-arguments form with real email input fields -- this proves the
-        // field is actually validated server-side, not just left to the browser's
-        // own `required` attribute (which a raw POST bypasses entirely).
-        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
-        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
-
-        for path in ["allowlist/add", "allowlist/remove"] {
-            assert_eq!(
-                post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/{path}", t.id), "alice", "email=").await,
-                StatusCode::BAD_REQUEST,
-                "{path}: a blank email must be rejected before ever reaching the dialer"
-            );
-            assert_eq!(
-                post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/{path}", t.id), "alice", "email=%20").await,
-                StatusCode::BAD_REQUEST,
-                "{path}: whitespace-only counts as blank too"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn add_and_remove_bridge_allowlist_routes_404_when_no_grant_is_stored_yet() {
-        // Same "nothing to dial with" posture as the generic call route -- a
-        // well-formed email still can't reach an agent with no grant on file.
-        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
-        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
-
-        for path in ["allowlist/add", "allowlist/remove"] {
-            assert_eq!(
-                post_form(
-                    &app,
-                    &format!("/portal/tunnels/{}/agent-bridge/{path}", t.id),
-                    "alice",
-                    "email=teammate%40example.com",
-                )
-                .await,
-                StatusCode::NOT_FOUND,
-                "{path}: no bridge_grant row yet"
-            );
-        }
     }
 
     #[tokio::test]
