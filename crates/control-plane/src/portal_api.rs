@@ -34,6 +34,31 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, Stri
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
+/// Agent-bridges-v2: minimal local hex codec -- this crate's existing per-file
+/// convention (e.g. `client.rs::hex_encode`/`hex_decode_32`, `edge_mesh.rs`'s
+/// own pair) rather than an external `hex` crate dependency, reused here for
+/// the bridge holder pubkey display and the owner-pasted channel id / grant hex
+/// on the new agent-bridge routes below.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// #606-safe (see `client.rs::hex_decode_32`'s doc for the exact hazard: `s.len()`
+/// is BYTE length, so a naive length check can pass a multi-byte UTF-8 char
+/// while a raw `&s[i..i+2]` slice lands mid-character and panics) -- the
+/// ASCII-hexdigit check below makes the subsequent byte-chunked slicing safe
+/// regardless of the input's length.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
 /// Shared HTTP client for the edge admin API calls (#112): a hung edge admin
 /// endpoint must not block the portal's authenticated request path (create /
 /// delete tunnel). Mirrors the timeout guard already on the OIDC client
@@ -81,6 +106,22 @@ struct DnsAutopilot {
 struct EdgeAdmin {
     url: Arc<str>,
     token: Arc<str>,
+}
+
+/// Agent-bridges-v2: this deployment's own shared identity for dialing the
+/// platform's own channel broker on a tunnel owner's behalf
+/// (`ct_common::channel_dial::dial_and_call`). Absent unless BOTH
+/// `CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY` are set and well-formed --
+/// `main.rs` degrades to `None` gracefully otherwise (this feature is optional,
+/// unlike e.g. `CT_ADMIN_SUPER_EMAIL`), same "absent unless configured"
+/// convention as [`EdgeAdmin`]/`DnsAutopilot`. `None` is therefore a normal
+/// production case, not just a test convenience: every route that reads
+/// `st.bridge` must handle it (503), never assume it's present.
+#[derive(Clone)]
+struct BridgeDialer {
+    holder: Arc<ed25519_dalek::SigningKey>,
+    noise_private: [u8; 32],
+    broker_addr: std::net::SocketAddr,
 }
 
 /// Shared state for the authed portal API.
@@ -138,6 +179,10 @@ struct ApiState {
     /// (every existing test), matching the `verifier` field's own "absent
     /// unless configured" convention right above.
     audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
+    /// Agent-bridges-v2's dialer identity -- see [`BridgeDialer`]'s own doc.
+    /// `None` disables `POST .../agent-bridge/call` (503, matching this crate's
+    /// "absent unless configured" convention), same posture as `edge_admin`/`dns`.
+    bridge: Option<BridgeDialer>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -180,6 +225,7 @@ pub fn portal_api_router(
         admin_token,
         None,
         None,
+        None,
     )
 }
 
@@ -204,6 +250,10 @@ pub fn portal_api_router_with_verifier(
     admin_token: Option<[u8; 32]>,
     verifier: Option<crate::oidc::OidcVerifierHandle>,
     audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
+    // Agent-bridges-v2: `(holder_signing_key, noise_private_key, broker_addr)`,
+    // `Some` only once `main.rs` finds both `CT_BRIDGE_HOLDER_KEY`/
+    // `CT_BRIDGE_NOISE_KEY` set and well-formed -- see [`BridgeDialer`]'s own doc.
+    bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr)>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -226,6 +276,11 @@ pub fn portal_api_router_with_verifier(
         admin_token,
         verifier: verifier.clone(),
         audit,
+        bridge: bridge_identity.map(|(holder, noise_private, broker_addr)| BridgeDialer {
+            holder: Arc::new(holder),
+            noise_private,
+            broker_addr,
+        }),
     };
     let mut router = Router::new()
         .route("/portal/account", get(account_page))
@@ -233,6 +288,8 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/tunnels", get(tunnels_page).post(create_tunnel))
         .route("/portal/tunnels/:id/rename", post(rename_tunnel))
         .route("/portal/tunnels/:id/agent-bridge", post(set_tunnel_rest_bridge))
+        .route("/portal/tunnels/:id/agent-bridge/grant", post(set_tunnel_bridge_grant))
+        .route("/portal/tunnels/:id/agent-bridge/call", post(call_tunnel_bridge_tool))
         .route("/portal/agent-bridges", get(rest_bridges_page))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
@@ -3627,53 +3684,108 @@ async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Re
     };
     let statuses: Vec<_> =
         futures::future::join_all(bridges.iter().map(|(t, _)| edge_tunnel_status(&st, &t.routing_token))).await;
-    let rows: Vec<(SubjectTunnel, String, Option<EdgeTunnelStatus>)> = bridges
-        .into_iter()
-        .zip(statuses)
-        .filter(|((_, mode), status)| {
-            mode != "ephemeral" || status.as_ref().map(|s| s.connected).unwrap_or(false)
-        })
-        .map(|((t, mode), status)| (t, mode, status))
-        .collect();
-    Html(rest_bridges_html(&rows, claims.email.as_deref())).into_response()
+    let mut rows: Vec<(SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>)> = Vec::new();
+    for ((t, mode), status) in bridges.into_iter().zip(statuses) {
+        if mode == "ephemeral" && !status.as_ref().map(|s| s.connected).unwrap_or(false) {
+            continue;
+        }
+        // Agent-bridges-v2: each row's own stored grant (`None` until the owner
+        // pastes one via the new grant form below) -- one lookup per row rather
+        // than a batch, matching `bridge_grant`'s own single-tunnel shape; this
+        // page's row count is bounded by an account's tunnel quota, never large
+        // enough for N+1 to matter the way it would on a shared listing.
+        let grant = st.tunnels.bridge_grant(&subject, &t.id).unwrap_or(None);
+        rows.push((t, mode, status, grant));
+    }
+    let holder_hex = st.bridge.as_ref().map(|b| hex_encode(&b.holder.verifying_key().to_bytes()));
+    Html(rest_bridges_html(&rows, holder_hex.as_deref(), claims.email.as_deref())).into_response()
 }
 
-fn rest_bridges_html(rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>)], email: Option<&str>) -> String {
+/// Agent-bridges-v2's read-only bridge tools this page offers a one-click call for
+/// (already shipped in `ct-agent`) -- `bridge/allowlist-add`, `-remove`, and
+/// `bridge/manifest-install` are deliberately NOT here yet: they take arguments
+/// this pass doesn't build an input form for (see the plan's own scoping note).
+const BRIDGE_CALL_TOOLS: &[(&str, &str)] = &[
+    ("bridge/status", "Status"),
+    ("bridge/config", "Config"),
+    ("bridge/channel-members", "Channel members"),
+    ("bridge/allowlist-list", "Allow-list"),
+    ("bridge/manifest-list", "Installed manifests"),
+];
+
+fn rest_bridges_html(
+    rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>)],
+    holder_hex: Option<&str>,
+    email: Option<&str>,
+) -> String {
+    let holder_block = match holder_hex {
+        Some(hex) => format!(
+            r#"<div class="row"><span class="k">This deployment's bridge holder pubkey</span>
+<span class="v"><code>{hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{hex}')">Copy</button></span></div>
+<p class="help">Grant this pubkey access to a tunnel's channel from that tunnel's own agent
+(<code>ct-agent</code>'s <code>channel/grant</code> tool), then paste the resulting channel id and
+<code>CT_CHANNEL_GRANT</code> hex into that tunnel's card below.</p>"#
+        ),
+        None => r#"<p class="help">This deployment hasn't configured an Agent-bridges dialer identity yet
+(<code>CT_BRIDGE_HOLDER_KEY</code>/<code>CT_BRIDGE_NOISE_KEY</code>) -- granting and calling are both
+unavailable here until an operator sets them.</p>"#
+            .to_string(),
+    };
     let list = if rows.is_empty() {
         r#"<p class="help">No agent bridges yet -- enable one from <a href="/portal/tunnels">Tunnels</a>.</p>"#
             .to_string()
     } else {
         rows.iter()
-            .map(|(t, mode, status)| {
+            .map(|(t, mode, status, grant)| {
                 let connected = status.as_ref().map(|s| s.connected).unwrap_or(false);
                 let dot_class = if connected { "live" } else { "off" };
                 let status_label = if connected { "Online" } else { "Offline" };
-                // 2026-09-01: the previous "point your Origin at `ct-agent channel rest-server`,
-                // call this public https:// URL" instructions described a mechanism that no
-                // longer exists -- that local listener was removed (ct-agent PR#140, a real
-                // crash bug plus scimbe's own architectural pushback: "wieso muessen wir einen
-                // port oeffnen"). Its replacement (`channel/grant` + the broader Agent-bridges
-                // tool tranche, ct-agent v0.7.19) is reachable only over an already-admitted
-                // Noise channel session, not a public URL a browser page can curl -- so this
-                // page cannot show a working "call it like this" recipe until the control-plane
-                // gains its own bridge dialer (in progress, see the Agent-bridges-v2 plan). Say
-                // that honestly instead of a dead command a copy-paste would 404 on.
-                let hostname_block = r#"<p class="help">Remote control isn't wired up on this page yet -- the
-underlying mechanism changed (see <a href="https://docs.bunsenbrenner.org/how-to/install-an-agent-manifest/">the docs</a>
-for what <code>ct-agent</code> can already do from its own CLI today). This toggle just remembers
-that you've opted this tunnel in for when it is.</p>"#
-                    .to_string();
+                let id = escape(&t.id);
+                // Agent-bridges-v2 (2026-09-02): the control plane now has its own
+                // bridge dialer (`ct_common::channel_dial`), so this card offers a
+                // real grant-and-call flow instead of the placeholder text the
+                // 2026-09-01 pass above shipped while that dialer didn't exist yet.
+                let action_block = if holder_hex.is_none() {
+                    String::new()
+                } else if let Some(grant_hex) = grant {
+                    let short = if grant_hex.len() > 16 { &grant_hex[..16] } else { grant_hex.as_str() };
+                    let tool_options = BRIDGE_CALL_TOOLS
+                        .iter()
+                        .map(|(name, label)| format!(r#"<option value="{name}">{label}</option>"#))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    format!(
+                        r#"<p class="help">Bridge grant stored (<code>{short}…</code>). Call a read-only tool:</p>
+<form method="post" action="/portal/tunnels/{id}/agent-bridge/call">
+ <label>Tool
+  <select name="tool">{tool_options}</select>
+ </label>
+ <label>Arguments <span class="opt">(JSON, optional)</span>
+  <input type="text" name="arguments" placeholder="{{}}">
+ </label>
+ <button type="submit">Call</button>
+</form>
+<details><summary>Replace the stored grant</summary>{grant_form}</details>"#,
+                        grant_form = bridge_grant_form_html(&id),
+                    )
+                } else {
+                    format!(
+                        r#"<p class="help">No bridge grant stored for this tunnel yet -- paste one to enable calling it from here.</p>
+{grant_form}"#,
+                        grant_form = bridge_grant_form_html(&id),
+                    )
+                };
                 format!(
                     r#"<div class="card" style="margin-bottom:1rem">
 <h3><span class="status-dot {dot_class}"></span>{name} <span class="badge">{mode_label}</span></h3>
 <p class="help">{status_label}</p>
-{hostname_block}
+{action_block}
 </div>"#,
                     dot_class = dot_class,
                     name = escape(&t.name),
                     mode_label = if mode == "permanent" { "Permanent" } else { "Ephemeral" },
                     status_label = status_label,
-                    hostname_block = hostname_block,
+                    action_block = action_block,
                 )
             })
             .collect::<Vec<_>>()
@@ -3683,11 +3795,29 @@ that you've opted this tunnel in for when it is.</p>"#
         "Agent bridges",
         &format!(
             r#"<h1>Agent bridges</h1>
+{holder_block}
 {list}
 <p><a class="btn sec" href="/portal/tunnels">Back to tunnels</a></p>"#,
+            holder_block = holder_block,
             list = list
         ),
         email,
+    )
+}
+
+/// The `channel id` + `CT_CHANNEL_GRANT` paste form shared by both a tunnel's
+/// first grant and its "replace the stored grant" path above.
+fn bridge_grant_form_html(id: &str) -> String {
+    format!(
+        r#"<form method="post" action="/portal/tunnels/{id}/agent-bridge/grant">
+ <label>Channel id <span class="opt">(64 hex chars)</span>
+  <input type="text" name="channel_id" required pattern="[0-9a-fA-F]{{64}}" maxlength="64">
+ </label>
+ <label>CT_CHANNEL_GRANT <span class="opt">(hex, from your agent's <code>channel/grant</code> tool)</span>
+  <input type="text" name="grant_hex" required>
+ </label>
+ <button type="submit">Save grant</button>
+</form>"#
     )
 }
 
@@ -4147,6 +4277,181 @@ async fn set_tunnel_rest_bridge(
         Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
         Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct BridgeGrantForm {
+    channel_id: String,
+    grant_hex: String,
+}
+
+/// `POST /portal/tunnels/:id/agent-bridge/grant` (Agent-bridges-v2): the owner
+/// pastes the channel id + `CT_CHANNEL_GRANT` hex they minted locally (via
+/// their own agent's `channel/grant` tool) admitting THIS deployment's shared
+/// bridge identity into the tunnel's channel -- this route never mints a grant
+/// itself, only stores what's pasted (`SqliteTunnelStore::set_bridge_grant`'s
+/// own doc). Rejected (400) unless the hex actually decodes, its own encoded
+/// channel matches the separately-pasted `channel_id` (catches "right grant,
+/// wrong tunnel's form" before it's stored), AND its `holder` matches the
+/// CONFIGURED bridge identity's own public key -- storing a grant for a
+/// different holder than what this deployment will actually dial with would
+/// silently never work, and worse, would look successfully saved. Owner-scoped
+/// exactly like `set_tunnel_rest_bridge` above -- "existence leaks nothing": an
+/// unknown/foreign tunnel id 404s, never a 403.
+async fn set_tunnel_bridge_grant(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<BridgeGrantForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let Some(bridge) = &st.bridge else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent bridge dialer not configured on this deployment",
+        )
+            .into_response();
+    };
+    let channel_id = match hex_decode(form.channel_id.trim()).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, "channel id must be 64 hex characters").into_response(),
+    };
+    let grant_hex = form.grant_hex.trim().to_string();
+    let grant_bytes = match hex_decode(&grant_hex) {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, "grant must be valid hex").into_response(),
+    };
+    let grant = match ct_common::channel::SignedChannelGrant::decode(&grant_bytes) {
+        Ok(g) => g,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("could not decode grant: {e}")).into_response(),
+    };
+    if grant.grant.channel.0 != channel_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            "channel id doesn't match the channel encoded in the grant",
+        )
+            .into_response();
+    }
+    if grant.grant.holder != bridge.holder.verifying_key().to_bytes() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "grant's holder doesn't match this deployment's published bridge holder pubkey -- \
+             mint the grant against the pubkey shown on this page",
+        )
+            .into_response();
+    }
+    match st.tunnels.set_bridge_grant(&subject, &id, &grant_hex) {
+        Ok(true) => Redirect::to("/portal/agent-bridges").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
+        Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct BridgeCallForm {
+    tool: String,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// `POST /portal/tunnels/:id/agent-bridge/call` (Agent-bridges-v2): dial this
+/// tunnel's own agent over the platform's own channel broker (via the grant
+/// stored by [`set_tunnel_bridge_grant`]) and invoke one bridge tool, showing
+/// the raw JSON-RPC result -- or the dial's own error text -- back to the
+/// owner. Owner-scoped exactly like every other tunnel action here -- "existence
+/// leaks nothing": an unknown/foreign tunnel id 404s. A tunnel with no stored
+/// grant yet also 404s (nothing to dial with); no configured bridge identity on
+/// this deployment is a 503, never a panic.
+async fn call_tunnel_bridge_tool(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<BridgeCallForm>,
+) -> Response {
+    let Some(claims) = session_claims_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    let subject = claims.subject.clone();
+    let Some(bridge) = st.bridge.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent bridge dialer not configured on this deployment",
+        )
+            .into_response();
+    };
+    let grant_hex = match st.tunnels.bridge_grant(&subject, &id) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "no bridge grant stored for this tunnel yet -- paste one on the Agent bridges page first",
+            )
+                .into_response()
+        }
+        Err(e) => return internal_error("call_tunnel_bridge_tool/bridge_grant", e).into_response(),
+    };
+    let grant_bytes = match hex_decode(grant_hex.trim()) {
+        Some(b) => b,
+        None => return internal_error("call_tunnel_bridge_tool/decode", "stored bridge grant is not valid hex").into_response(),
+    };
+    let grant = match ct_common::channel::SignedChannelGrant::decode(&grant_bytes) {
+        Ok(g) => g,
+        Err(e) => return internal_error("call_tunnel_bridge_tool/grant_decode", e).into_response(),
+    };
+    let tool = form.tool.trim().to_string();
+    let arguments: serde_json::Value = match form.arguments.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("arguments must be valid JSON: {e}")).into_response(),
+        },
+        None => serde_json::json!({}),
+    };
+    let claims_email = claims.email;
+    match ct_common::channel_dial::dial_and_call(
+        bridge.broker_addr,
+        grant,
+        bridge.holder.as_ref(),
+        &bridge.noise_private,
+        &tool,
+        arguments,
+    )
+    .await
+    {
+        Ok(result) => Html(bridge_call_result_html(&id, &tool, Ok(&result), claims_email.as_deref())).into_response(),
+        Err(e) => Html(bridge_call_result_html(&id, &tool, Err(&e.to_string()), claims_email.as_deref())).into_response(),
+    }
+}
+
+/// Render one bridge-tool call's outcome as a small standalone portal page --
+/// plain JSON (success) or the [`ct_common::channel_dial::DialError`]'s own
+/// `Display` text (failure), no further interpretation of either.
+fn bridge_call_result_html(id: &str, tool: &str, result: Result<&serde_json::Value, &str>, email: Option<&str>) -> String {
+    let (heading, body) = match result {
+        Ok(v) => (
+            "Result",
+            format!(
+                "<pre><code>{}</code></pre>",
+                escape(&serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+            ),
+        ),
+        Err(e) => ("Call failed", format!("<p class=\"help\">{}</p>", escape(e))),
+    };
+    page(
+        "Agent bridges",
+        &format!(
+            r#"<h1>{heading}: <code>{tool}</code></h1>
+<p class="help">Tunnel <code>{id}</code></p>
+{body}
+<p><a class="btn sec" href="/portal/agent-bridges">Back to Agent bridges</a></p>"#,
+            heading = heading,
+            id = escape(id),
+            tool = escape(tool),
+            body = body,
+        ),
+        email,
+    )
 }
 
 /// `POST /portal/tunnels/:id/reclaim-cert-slot` (#233): the customer's
@@ -8305,6 +8610,7 @@ mod tests {
             None,
             None, // verifier -- create_tunnel doesn't need it, only me_signup does
             Some(audit.clone()),
+            None, // bridge_identity (test)
         );
 
         // The account already owns one auto-provisioned tunnel on first
@@ -8335,6 +8641,7 @@ mod tests {
             Some(secret),
             None,
             Some(audit2.clone()),
+            None, // bridge_identity (test)
         );
         assert_eq!(get(&app2, "/portal/tunnels", Some("auditee2")).await.0, StatusCode::OK);
         let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -8394,6 +8701,7 @@ mod tests {
             None,
             Some(OidcVerifierHandle::from(Some(oidc))),
             Some(audit.clone()),
+            None, // bridge_identity (test)
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -12037,6 +12345,208 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(tunnels.rest_bridge_mode("alice", &t.id).unwrap(), Some("permanent".to_string()), "unchanged");
+    }
+
+    /// Agent-bridges-v2 test harness: like [`test_app_with_tunnels`] but wires a
+    /// configured bridge dialer identity (`Some`, matching what `main.rs` builds
+    /// from `CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY` in production), so the
+    /// `/agent-bridge/grant` and `/agent-bridge/call` routes are actually live
+    /// instead of 503ing. Returns the app, the tunnel store, and the bridge
+    /// holder's own signing key -- a test needs the key to mint a grant whose
+    /// `holder` matches what `set_tunnel_bridge_grant` checks against.
+    ///
+    /// `broker_addr` is a real (but never-dialed-successfully) loopback address:
+    /// none of the tests built on this harness reach an actual QUIC dial --
+    /// they exercise the grant-validation path and the `call` route's two
+    /// short-circuits (no stored grant, no configured identity), both of which
+    /// return before `ct_common::channel_dial::dial_and_call` ever touches a
+    /// socket.
+    fn test_app_with_bridge() -> (Router, Arc<SqliteTunnelStore>, ed25519_dalek::SigningKey) {
+        let holder = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let noise_private = [0x22u8; 32];
+        let broker_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = portal_api_router_with_verifier(
+            KEY,
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            tunnels.clone(),
+            Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+            Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+            "https://portal.example",
+            None,
+            None,
+            None,
+            None, // oidc_issuer (test)
+            test_edge_mesh(),
+            None,
+            None, // verifier (test)
+            None, // audit (test)
+            Some((holder.clone(), noise_private, broker_addr)),
+        );
+        (app, tunnels, holder)
+    }
+
+    /// Builds a `(channel_id_hex, grant_hex)` pair for the `/agent-bridge/grant`
+    /// form: a well-formed, WIRE_LEN-encoded [`ct_common::channel::SignedChannelGrant`]
+    /// for `channel`, bound to `holder_pub`. The signature bytes are junk
+    /// (`[0u8; 64]`) deliberately -- `set_tunnel_bridge_grant` never checks the
+    /// operator signature itself (`SqliteTunnelStore::set_bridge_grant`'s own doc:
+    /// "does NOT validate the grant's signature/expiry itself -- that happens at
+    /// actual call time"), so a test proving THIS route's own checks (decodability,
+    /// channel/id agreement, holder match) must not accidentally also depend on
+    /// signature validity that isn't this route's job.
+    fn bridge_grant_hex(channel: [u8; 32], holder_pub: [u8; 32]) -> (String, String) {
+        let grant = ct_common::channel::SignedChannelGrant {
+            grant: ct_common::channel::ChannelGrant {
+                channel: ct_common::channel::ChannelId(channel),
+                holder: holder_pub,
+                direction: ct_common::channel::Direction::Initiate,
+                rights: ct_common::channel::Rights::ReadWrite,
+                delegable: false,
+                expires_at: u64::MAX,
+            },
+            signature: [0u8; 64],
+        };
+        (hex_encode(&channel), hex_encode(&grant.encode()))
+    }
+
+    #[tokio::test]
+    async fn set_tunnel_bridge_grant_route_is_owner_scoped_404_not_403() {
+        // "Existence leaks nothing": copies the exact assertion style of
+        // `rename_tunnel_route_renames_rejects_blank_and_is_owner_scoped` and
+        // `set_tunnel_rest_bridge_route_toggles_force_enables_login_and_is_owner_scoped`
+        // above -- a non-owner's request, and a request against an unknown id,
+        // both come back 404, never 403 (a 403 would confirm the tunnel exists).
+        let (app, tunnels, holder) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        let (channel_hex, grant_hex) = bridge_grant_hex([1u8; 32], holder.verifying_key().to_bytes());
+        let form = format!("channel_id={channel_hex}&grant_hex={grant_hex}");
+
+        // A non-owner (bob) cannot plant a grant on alice's tunnel -- 404, not 403,
+        // and nothing gets stored.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/grant", t.id), "bob", &form).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(tunnels.bridge_grant("alice", &t.id).unwrap(), None, "a stranger's request must not have stored anything");
+
+        // An unknown tunnel id, same posture.
+        assert_eq!(
+            post_form(&app, "/portal/tunnels/no-such-id/agent-bridge/grant", "bob", &form).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // The real owner's identical request succeeds, proving the 404s above are
+        // really about ownership and not some other rejection this well-formed
+        // grant would also have hit.
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/grant", t.id), "alice", &form).await,
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(tunnels.bridge_grant("alice", &t.id).unwrap(), Some(grant_hex));
+    }
+
+    #[tokio::test]
+    async fn set_tunnel_bridge_grant_route_rejects_malformed_grant_hex_with_400_not_a_panic() {
+        let (app, tunnels, holder) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        let (channel_hex, _) = bridge_grant_hex([1u8; 32], holder.verifying_key().to_bytes());
+
+        // Not hex at all.
+        assert_eq!(
+            post_form(
+                &app,
+                &format!("/portal/tunnels/{}/agent-bridge/grant", t.id),
+                "alice",
+                &format!("channel_id={channel_hex}&grant_hex=not-hex-zz"),
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Valid hex, but far too short to be a WIRE_LEN (139-byte) SignedChannelGrant --
+        // decodes as hex fine, then `SignedChannelGrant::decode` must reject it as
+        // `Malformed` rather than panicking on an out-of-bounds slice.
+        assert_eq!(
+            post_form(
+                &app,
+                &format!("/portal/tunnels/{}/agent-bridge/grant", t.id),
+                "alice",
+                &format!("channel_id={channel_hex}&grant_hex=deadbeef"),
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Neither malformed attempt stored anything.
+        assert_eq!(tunnels.bridge_grant("alice", &t.id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn set_tunnel_bridge_grant_route_rejects_a_grant_minted_for_a_different_holder() {
+        // The most security-relevant check in the new code: a grant that decodes
+        // fine and names the right channel, but was minted for some OTHER key than
+        // this deployment's own configured bridge holder, must be rejected -- not
+        // silently stored (which would look successfully saved while being
+        // permanently useless, since this deployment can never dial with that
+        // other key).
+        let (app, tunnels, _holder) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        let someone_elses_key = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
+        let (channel_hex, grant_hex) = bridge_grant_hex([1u8; 32], someone_elses_key.verifying_key().to_bytes());
+
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/tunnels/{}/agent-bridge/grant", t.id),
+            "alice",
+            &format!("channel_id={channel_hex}&grant_hex={grant_hex}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(
+            body.contains("holder"),
+            "the rejection reason should say the holder mismatched, not some opaque error: {body}"
+        );
+        assert_eq!(
+            tunnels.bridge_grant("alice", &t.id).unwrap(),
+            None,
+            "a grant for the wrong holder must never be stored, even rejected-but-stored would be a real \
+             foot-gun here (it would look successfully saved while never actually working)"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tunnel_bridge_tool_route_404s_when_no_grant_is_stored_yet() {
+        let (app, tunnels, _holder) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+
+        assert_eq!(
+            post_form(&app, &format!("/portal/tunnels/{}/agent-bridge/call", t.id), "alice", "tool=bridge/status").await,
+            StatusCode::NOT_FOUND,
+            "no bridge_grant row yet -- nothing to dial with"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tunnel_bridge_tool_route_503s_clearly_when_no_bridge_identity_is_configured() {
+        // The `Option::None` case (`CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY` unset
+        // on this deployment) -- must fail closed with a real, immediate error, not
+        // panic and not hang trying to dial anything. `test_app_with_tunnels` (used
+        // by every other test in this file) builds its router via `portal_api_router`,
+        // which always passes `bridge_identity: None` -- exactly this case, no fake
+        // network setup required since the route must return before ever reaching
+        // `ct_common::channel_dial::dial_and_call`.
+        let (app, tunnels) = test_app_with_tunnels();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+
+        let resp = post_form_response(&app, &format!("/portal/tunnels/{}/agent-bridge/call", t.id), "alice", "tool=bridge/status").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(
+            body.contains("not configured"),
+            "the error must say the deployment isn't configured, not an opaque 503: {body}"
+        );
     }
 
     #[tokio::test]

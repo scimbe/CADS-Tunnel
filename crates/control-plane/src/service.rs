@@ -5919,6 +5919,14 @@ pub fn persistent_control_plane_router(
     // itself, not this `rusqlite::Result`-returning function whose error type can't
     // carry `admin_identity::super_admin_email_from_env`'s `String` error cleanly.
     admin: Arc<crate::admin_identity::AdminIdentity>,
+    // Agent-bridges-v2: the shared bridge dialer identity, if configured. Unlike
+    // `admin` above, this is deliberately GRACEFUL, not fail-closed (see the
+    // `CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY` doc in `main.rs`): a real
+    // production boot passes `Some` once both keys are set and `None` otherwise
+    // (missing/malformed keys just disable the feature), so `None` is a normal,
+    // expected production case here, not only a test convenience -- the two
+    // Agent-bridges portal routes handle it by responding 503, never by panicking.
+    bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr)>,
 ) -> rusqlite::Result<Router> {
     // #328: `/me/*` used to be conditionally *mounted* based on whether `oidc` was
     // `Some` at this exact call -- a boot-time-only decision. It's now always a
@@ -6294,6 +6302,10 @@ pub fn persistent_control_plane_router(
                     // already writes to (opened once, above) -- one shared
                     // log, not a second table.
                     Some(admin_audit.clone()),
+                    // Agent-bridges-v2: the shared bridge dialer identity, already
+                    // fail-closed-checked by `main.rs` -- see this function's own
+                    // `bridge_identity` param doc.
+                    bridge_identity.clone(),
                 ),
             )
             // #248-follow: the session-authed channel-allowlist self-service claim —
@@ -8035,7 +8047,7 @@ mod tests {
         // (open_account/buy_token, issue_join_token) to prove they persist across a restart,
         // so mount the OPEN (ungated) writers here against the SAME db — test-only, and no
         // route conflict since the production router mounts neither without a token.
-        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity())
+        let app = persistent_control_plane_router(db_path, TEST_WEBHOOK_SECRET, b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None)
             .unwrap()
             .merge(billing_writers_gated(std::sync::Arc::new(SqliteLedger::open(db_path).unwrap()), None))
             .merge(enroll_issue_writers_gated(std::sync::Arc::new(SqliteEnrollment::open(db_path).unwrap()), None));
@@ -8085,7 +8097,7 @@ mod tests {
         let db = temp_db_path();
         let oidc = Some(Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct")));
         let app =
-            persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::from(oidc), test_admin_identity()).unwrap();
+            persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::from(oidc), test_admin_identity(), None).unwrap();
         let resp = app
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
@@ -8096,7 +8108,7 @@ mod tests {
 
         // Without an OIDC verifier the public search is STILL mounted (#161): it is a public,
         // machine-facing surface, not part of the authed `/me/*` set that OIDC gates.
-        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let no_oidc = persistent_control_plane_router(&db, b"webhook-secret", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let still = no_oidc
             .oneshot(Request::get("/registry/agents?role=source").body(Body::empty()).unwrap())
             .await
@@ -11598,7 +11610,7 @@ mod tests {
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
         let app =
-            persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity()).unwrap();
+            persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity(), None).unwrap();
 
         // Without a bearer token the mounted endpoint rejects with 401 (not 404).
         let resp = app
@@ -11645,7 +11657,7 @@ mod tests {
         let secret = b"realm-secret";
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity(), None).unwrap();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -11692,7 +11704,7 @@ mod tests {
         let secret = b"realm-secret";
         let issuer = "https://kc/realms/ct";
         let oidc = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::from(Some(oidc)), test_admin_identity(), None).unwrap();
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let jwt_for = |sub: &str| {
             let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
@@ -11755,7 +11767,7 @@ mod tests {
         use tower::ServiceExt;
 
         let handle = OidcVerifierHandle::empty();
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", handle.clone(), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", handle.clone(), test_admin_identity(), None).unwrap();
         let resp = app
             .clone()
             .oneshot(Request::get("/me/account").body(Body::empty()).unwrap())
@@ -11791,7 +11803,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"the-webhook-secret", b"the-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"the-webhook-secret", b"the-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
 
         // A cookie forged with the webhook secret (what an attacker who only
         // learned THAT secret could produce) is rejected -> bounced to /portal.
@@ -11831,7 +11843,7 @@ mod tests {
         // The unified production router must not expose the M18 stub endpoint —
         // credits come only from the signed webhook (proven crediting-side by
         // unified_control_plane_survives_restart).
-        let app = persistent_control_plane_router(":memory:", b"whsec_prod", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_prod", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp = app
             .oneshot(
                 Request::post("/payment/confirm")
@@ -11855,7 +11867,7 @@ mod tests {
         use tower::ServiceExt;
 
         // The full production router serves the landing page at `/`.
-        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp = app
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
@@ -11931,7 +11943,7 @@ mod tests {
         // #194: fail closed — with no CT_CP_EDGE_ADMIN_TOKEN set (unset in the test env → admin_token
         // = None), the unauthenticated client-supplied-account billing writer must NOT be served;
         // /billing/issue is absent (404), not an open account-debit endpoint.
-        let app_b = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app_b = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp_b = app_b
             .oneshot(
                 Request::post("/billing/issue")
@@ -11971,7 +11983,7 @@ mod tests {
             "links to the project's Buy Me a Coffee page"
         );
         // /publish still redirects (old links / bookmarks keep working) to the merged section.
-        let app_pub = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app_pub = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp_pub = app_pub.oneshot(Request::get("/publish").body(Body::empty()).unwrap()).await.unwrap();
         assert!(resp_pub.status().is_redirection(), "/publish redirects, got {}", resp_pub.status());
         assert_eq!(
@@ -11980,7 +11992,7 @@ mod tests {
             "/publish redirects into the merged landing-page section"
         );
         // The starter template is a real, downloadable zip (not a 404, not HTML).
-        let app_zip = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app_zip = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp_zip = app_zip
             .oneshot(Request::get("/downloads/hello-world-pipeline.zip").body(Body::empty()).unwrap())
             .await
@@ -12002,7 +12014,7 @@ mod tests {
         let zip_bytes = to_bytes(resp_zip.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&zip_bytes[..2], b"PK", "serves a real zip archive (PK magic bytes)");
         // The read-it-yourself template guide actually serves (not a dead link).
-        let app_guide = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app_guide = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp_guide = app_guide
             .oneshot(Request::get("/template-guide").body(Body::empty()).unwrap())
             .await
@@ -12014,7 +12026,7 @@ mod tests {
             guide_html.contains("pipeline-spec.json") && guide_html.contains(".env"),
             "the template guide explains the file structure and the .env identity file"
         );
-        let app2 = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app2 = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
         let resp2 = app2.oneshot(Request::get("/llms.txt").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
         let ct2 = resp2.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -12074,7 +12086,7 @@ mod tests {
                 ],
             ),
         ] {
-            let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+            let app = persistent_control_plane_router(":memory:", b"whsec", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
             let resp = app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{path} should serve");
             let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -12537,7 +12549,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
 
-        let app = persistent_control_plane_router(":memory:", b"whsec_health", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity()).unwrap();
+        let app = persistent_control_plane_router(":memory:", b"whsec_health", b"test-session-key", OidcVerifierHandle::empty(), test_admin_identity(), None).unwrap();
 
         let health = app
             .clone()

@@ -18,7 +18,17 @@
 //! `CT_ADMIN_SUPER_EMAIL` (ADR-0025 — the one Google account allowed to reach
 //! the admin console and manage other admins; **required**, no default: this
 //! process refuses to start without it, same fail-closed posture as
-//! `CT_EDGE_ADMIN_TOKEN`).
+//! `CT_EDGE_ADMIN_TOKEN`), and `CT_BRIDGE_HOLDER_KEY` + `CT_BRIDGE_NOISE_KEY`
+//! (Agent-bridges-v2 — the shared identity this deployment dials the
+//! platform's own channel broker with, on a tunnel owner's behalf, from the
+//! portal's "Agent bridges" page; 64 hex chars each, **optional** -- unlike
+//! `CT_ADMIN_SUPER_EMAIL`/`CT_EDGE_ADMIN_TOKEN`, this degrades gracefully
+//! (same posture as `edge_admin`/`CT_CP_EDGE_ADMIN_URL`): if unset or
+//! malformed, the dialer is simply disabled and the two Agent-bridges portal
+//! routes 503 clearly, rather than the whole process refusing to boot for a
+//! brand-new, non-essential feature) plus the optional `CT_CHANNEL_BROKER`
+//! (host:port of that broker; defaults to this deployment's own production
+//! broker address if unset -- not a secret either).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -273,7 +283,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let app = persistent_control_plane_router(&db, &webhook_secret, &session_key, oidc_handle, admin_identity)?;
+    // Agent-bridges-v2: the shared bridge identity this deployment dials the
+    // platform's own channel broker with, on a tunnel owner's behalf, from the
+    // portal's "Agent bridges" page (`ct_common::channel_dial::dial_and_call`).
+    // Graceful, NOT fail-closed -- same posture as `edge_admin` (`service.rs`'s
+    // `CT_CP_EDGE_ADMIN_URL`/`CT_CP_EDGE_ADMIN_TOKEN`), not `CT_ADMIN_SUPER_EMAIL`'s.
+    // The distinction that matters: `CT_ADMIN_SUPER_EMAIL` gates a privileged surface
+    // whose *absence of a hard invariant* is itself the security concern (an admin
+    // console with no asserted super-admin). Agent-bridges is a brand-new, optional,
+    // non-essential feature -- crashing tunnels/channels/billing/every other route on
+    // every future restart just because this one feature's keys haven't been
+    // generated yet would be a disproportionate availability risk (see this
+    // workspace's own standing "service stability first" priority) and would also be
+    // internally inconsistent with `ApiState.bridge`'s own `Option<...>` type, which
+    // already implies graceful absence. So: missing or malformed keys log a loud
+    // warning and leave the bridge dialer disabled (`None`) -- the two new portal
+    // routes already 503 clearly in that case -- rather than aborting boot.
+    let bridge_identity = match resolve_bridge_keys(std::env::var("CT_BRIDGE_HOLDER_KEY").ok(), std::env::var("CT_BRIDGE_NOISE_KEY").ok()) {
+        Some((bridge_holder_key, noise_bytes)) => {
+            // Not a secret (a rendezvous address, same value ct-agent operators
+            // already set as their own CT_CHANNEL_BROKER) -- degrades to a
+            // sensible default instead of failing closed when unset.
+            let bridge_broker_host = std::env::var("CT_CHANNEL_BROKER")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_CHANNEL_BROKER.to_string());
+            match resolve_broker_addr(&bridge_broker_host).await {
+                Ok(bridge_broker_addr) => {
+                    eprintln!(
+                        "ct-control-plane: Agent bridges dialer enabled (holder={}, broker={bridge_broker_host})",
+                        hex_encode_32(&bridge_holder_key.verifying_key().to_bytes())
+                    );
+                    Some((bridge_holder_key, noise_bytes, bridge_broker_addr))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "ct-control-plane: WARNING -- CT_CHANNEL_BROKER={bridge_broker_host} \
+                         did not resolve ({e}) -- Agent bridges dialer disabled"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let app = persistent_control_plane_router(
+        &db,
+        &webhook_secret,
+        &session_key,
+        oidc_handle,
+        admin_identity,
+        bridge_identity,
+    )?;
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("ct-control-plane: listening on {listen}, db={db}");
@@ -401,6 +463,92 @@ where
                 grace.as_secs()
             );
             Ok(())
+        }
+    }
+}
+
+/// Agent-bridges-v2's own default `CT_CHANNEL_BROKER` when the operator hasn't set
+/// one -- this deployment's own production platform domain, on the standard
+/// Agent-Fabric channel-broker port (`CT_EDGE_CHANNEL_LISTEN`'s default, 4435; see
+/// `service.rs::NetworkInfoResp`'s doc for the port-naming convention). Not a
+/// secret, so it degrades to a sane default when unset, same as
+/// `CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY` above degrade to a disabled dialer
+/// rather than failing closed.
+const DEFAULT_CHANNEL_BROKER: &str = "bunsenbrenner.org:4435";
+
+/// Parse a 64-hex-char environment variable's value into 32 raw bytes.
+///
+/// #606-safe (same hazard class as this crate's other hex parsers, e.g.
+/// `client.rs::hex_decode_32`, `edge_mesh.rs::hex_decode_32`): `s.len()` is BYTE
+/// length, so a malformed value containing a multi-byte UTF-8 character could pass
+/// a naive length guard while a raw `&s[i*2..i*2+2]` slice lands mid-character and
+/// panics. Chunks the ASCII bytes instead of slicing the `str`.
+fn parse_hex_32_env(name: &str, s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{name} must be exactly 64 hex characters (32 raw bytes), got {} chars",
+            s.chars().count()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).expect("ascii-checked above"), 16)
+            .map_err(|_| format!("{name} contains invalid hex"))?;
+    }
+    Ok(out)
+}
+
+fn hex_encode_32(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
+/// Resolve `CT_CHANNEL_BROKER`'s `host:port` (a DNS name, not necessarily a literal
+/// IP -- e.g. the default above, or the "bunsenbrenner.org:4435" example in this
+/// deployment's own operator docs) into a concrete [`SocketAddr`] once at startup,
+/// the way `ct_common::channel_dial::dial_and_call` needs it. A plain
+/// `SocketAddr::from_str` can't do this (it only accepts a literal IP:port, not a
+/// hostname); `tokio::net::lookup_host` does the DNS lookup and this picks its
+/// first answer, same "first result wins" posture as a typical resolver client.
+async fn resolve_broker_addr(host_port: &str) -> Result<SocketAddr, String> {
+    tokio::net::lookup_host(host_port)
+        .await
+        .map_err(|e| format!("CT_CHANNEL_BROKER {host_port:?} could not be resolved: {e}"))?
+        .next()
+        .ok_or_else(|| format!("CT_CHANNEL_BROKER {host_port:?} resolved to no addresses"))
+}
+
+/// The graceful (not fail-closed) half of `CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY`
+/// resolution -- pulled out of `main()`'s async body so it's directly unit-testable
+/// without a Tokio runtime. `None` from either var, an empty value, or a malformed
+/// hex value all take the same path: log a warning and disable the dialer, never
+/// abort boot. See this crate's `main()` doc comment (top of file) for why this
+/// posture was deliberately chosen over `CT_ADMIN_SUPER_EMAIL`'s fail-closed one.
+fn resolve_bridge_keys(holder_hex: Option<String>, noise_hex: Option<String>) -> Option<(ed25519_dalek::SigningKey, [u8; 32])> {
+    let (holder_hex, noise_hex) = match (holder_hex, noise_hex) {
+        (Some(h), Some(n)) if !h.is_empty() && !n.is_empty() => (h, n),
+        _ => {
+            eprintln!(
+                "ct-control-plane: CT_BRIDGE_HOLDER_KEY/CT_BRIDGE_NOISE_KEY unset -- Agent bridges \
+                 dialer disabled (the portal's Agent bridges page will 503 on any call until both \
+                 are configured)"
+            );
+            return None;
+        }
+    };
+    match (parse_hex_32_env("CT_BRIDGE_HOLDER_KEY", &holder_hex), parse_hex_32_env("CT_BRIDGE_NOISE_KEY", &noise_hex)) {
+        (Ok(holder_bytes), Ok(noise_bytes)) => Some((ed25519_dalek::SigningKey::from_bytes(&holder_bytes), noise_bytes)),
+        (holder_res, noise_res) => {
+            eprintln!(
+                "ct-control-plane: WARNING -- CT_BRIDGE_HOLDER_KEY/CT_BRIDGE_NOISE_KEY set but \
+                 malformed ({:?}) -- Agent bridges dialer disabled",
+                holder_res.err().or(noise_res.err())
+            );
+            None
         }
     }
 }
@@ -574,5 +722,31 @@ mod tests {
             "must not wait anywhere near the stuck request's own duration: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn resolve_bridge_keys_disables_gracefully_rather_than_erroring_when_unset_or_malformed() {
+        // Neither var set.
+        assert!(super::resolve_bridge_keys(None, None).is_none());
+        // Only one set.
+        assert!(super::resolve_bridge_keys(Some("a".repeat(64)), None).is_none());
+        assert!(super::resolve_bridge_keys(None, Some("a".repeat(64))).is_none());
+        // Both set but empty (the shape an env var explicitly set to "" takes).
+        assert!(super::resolve_bridge_keys(Some(String::new()), Some(String::new())).is_none());
+        // Both set but not valid 64-hex-char values.
+        assert!(super::resolve_bridge_keys(Some("not-hex".to_string()), Some("a".repeat(64))).is_none());
+        assert!(super::resolve_bridge_keys(Some("a".repeat(63)), Some("a".repeat(64))).is_none());
+        // A malformed multi-byte-UTF8 value must not panic (#606 hazard class) --
+        // it's simply rejected as not 64 ASCII hex chars.
+        assert!(super::resolve_bridge_keys(Some("ü".repeat(64)), Some("a".repeat(64))).is_none());
+    }
+
+    #[test]
+    fn resolve_bridge_keys_accepts_well_formed_hex_and_recovers_the_exact_bytes() {
+        let holder_hex = "11".repeat(32);
+        let noise_hex = "22".repeat(32);
+        let (holder_key, noise_bytes) = super::resolve_bridge_keys(Some(holder_hex), Some(noise_hex)).expect("both well-formed");
+        assert_eq!(holder_key.to_bytes(), [0x11u8; 32]);
+        assert_eq!(noise_bytes, [0x22u8; 32]);
     }
 }
