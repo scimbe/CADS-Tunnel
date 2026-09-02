@@ -17,6 +17,13 @@ ct-common = { path = "../common" }
 ct-dns = { path = "../dns" }
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Agent-bridges-v2: derive the bridge identity's own Noise PUBLIC key from
+# CT_BRIDGE_NOISE_KEY (a raw private scalar) to display alongside the holder
+# pubkey on /portal/agent-bridges -- a tunnel owner needs BOTH to actually use
+# the feature (holder for the grant, Noise for their own CT_CHANNEL_BRIDGE_PEER).
+# Already resolved in this workspace's Cargo.lock via ct-common's own dependency
+# (noise.rs); pinned to the identical version rather than risking drift.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

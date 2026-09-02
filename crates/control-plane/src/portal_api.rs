@@ -3698,7 +3698,16 @@ async fn rest_bridges_page(State(st): State<ApiState>, headers: HeaderMap) -> Re
         rows.push((t, mode, status, grant));
     }
     let holder_hex = st.bridge.as_ref().map(|b| hex_encode(&b.holder.verifying_key().to_bytes()));
-    Html(rest_bridges_html(&rows, holder_hex.as_deref(), claims.email.as_deref())).into_response()
+    // #43-follow: a tunnel owner needs BOTH this deployment's holder pubkey (to mint the
+    // channel grant) AND its Noise pubkey (for their own CT_CHANNEL_BRIDGE_PEER, so their
+    // `channel --serve` process registers the bridge/* tools at all) -- shown here for the
+    // first time; previously only the holder half was published, silently leaving every
+    // bridge/* call unreachable regardless of a valid grant (found live-testing this page).
+    let noise_hex = st
+        .bridge
+        .as_ref()
+        .map(|b| hex_encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(b.noise_private)).as_bytes()));
+    Html(rest_bridges_html(&rows, holder_hex.as_deref(), noise_hex.as_deref(), claims.email.as_deref())).into_response()
 }
 
 /// Agent-bridges-v2's read-only bridge tools this page offers a one-click call for
@@ -3716,17 +3725,23 @@ const BRIDGE_CALL_TOOLS: &[(&str, &str)] = &[
 fn rest_bridges_html(
     rows: &[(SubjectTunnel, String, Option<EdgeTunnelStatus>, Option<String>)],
     holder_hex: Option<&str>,
+    noise_hex: Option<&str>,
     email: Option<&str>,
 ) -> String {
-    let holder_block = match holder_hex {
-        Some(hex) => format!(
+    let holder_block = match (holder_hex, noise_hex) {
+        (Some(holder), Some(noise)) => format!(
             r#"<div class="row"><span class="k">This deployment's bridge holder pubkey</span>
-<span class="v"><code>{hex}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{hex}')">Copy</button></span></div>
-<p class="help">Grant this pubkey access to a tunnel's channel from that tunnel's own agent
+<span class="v"><code>{holder}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{holder}')">Copy</button></span></div>
+<div class="row"><span class="k">This deployment's bridge Noise pubkey</span>
+<span class="v"><code>{noise}</code> <button class="copy-btn" type="button" onclick="copyText(this,'{noise}')">Copy</button></span></div>
+<p class="help">Grant the holder pubkey access to a tunnel's channel from that tunnel's own agent
 (<code>ct-agent</code>'s <code>channel/grant</code> tool), then paste the resulting channel id and
-<code>CT_CHANNEL_GRANT</code> hex into that tunnel's card below.</p>"#
+<code>CT_CHANNEL_GRANT</code> hex into that tunnel's card below. Separately, start that same agent's
+<code>channel --serve</code> with <code>CT_CHANNEL_BRIDGE_PEER=</code>the Noise pubkey above -- without
+it, this deployment can join the channel but every bridge tool call still fails, since the agent never
+registers the bridge tools for an unrecognized peer.</p>"#
         ),
-        None => r#"<p class="help">This deployment hasn't configured an Agent-bridges dialer identity yet
+        _ => r#"<p class="help">This deployment hasn't configured an Agent-bridges dialer identity yet
 (<code>CT_BRIDGE_HOLDER_KEY</code>/<code>CT_BRIDGE_NOISE_KEY</code>) -- granting and calling are both
 unavailable here until an operator sets them.</p>"#
             .to_string(),
@@ -12658,5 +12673,25 @@ mod tests {
             !html.contains(r#"<div class="card" style="margin-bottom:1rem">"#),
             "must not regress to the page-wrapper's own .card class, which overflows when nested"
         );
+    }
+
+    #[tokio::test]
+    async fn rest_bridges_page_publishes_both_the_holder_and_noise_pubkeys() {
+        // #43-follow: a tunnel owner needs the deployment's Noise pubkey too, for their own
+        // CT_CHANNEL_BRIDGE_PEER -- without it their agent never registers the bridge/* tools
+        // at all, so every call fails even with a valid grant, regardless of what this page
+        // shows. Publishing only the holder pubkey (the original shape) silently left that
+        // unreachable. Compute the expected Noise pubkey the exact same way the handler does,
+        // rather than a hardcoded hex string, so this test tracks the real derivation.
+        let (app, _tunnels, holder) = test_app_with_bridge();
+        let expected_noise_hex =
+            hex_encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x22u8; 32])).as_bytes());
+
+        let (status, html) = get(&app, "/portal/agent-bridges", Some("alice")).await;
+        assert_eq!(status, StatusCode::OK);
+        let holder_hex = hex_encode(&holder.verifying_key().to_bytes());
+        assert!(html.contains(&holder_hex), "the holder pubkey must still be published");
+        assert!(html.contains(&expected_noise_hex), "the Noise pubkey must also be published");
+        assert!(html.contains("CT_CHANNEL_BRIDGE_PEER"), "the page must name the env var the owner needs to set");
     }
 }
