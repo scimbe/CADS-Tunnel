@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 pub mod a2a;
 pub mod acme_ca;
 pub mod channel;
+/// Native-only (see this module's own doc comment for why): needs `quinn`/`rustls`, which
+/// this crate does not pull in for the wasm32 build (the browser channel-claim page).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod channel_dial;
 pub mod credential;
 pub mod crew;
 pub mod fallback_framing;
