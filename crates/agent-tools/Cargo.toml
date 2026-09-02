@@ -38,7 +38,7 @@ nat-lab = ["ct-agent/nat-lab"]
 # ct-client's dev-dependency. natlab's nat_lab_relay/listen/dial live here and
 # nowhere else.
 git = "https://github.com/scimbe/ct-agent"
-tag = "v0.6.9"
+tag = "v0.7.22"
 optional = true
 
 [[bin]]

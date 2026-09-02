@@ -690,12 +690,17 @@ mod tests {
         assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
         let origin_priv = origin_kp.private;
         let metrics = Arc::new(TunnelMetrics::new());
+        // No LAN-local auth gating for this bench harness -- `from_env(None, ...)`
+        // is ct-agent's own convention for "no local credential configured"
+        // (same call every ct-agent::serve test uses).
+        let gate = Arc::new(ct_agent::local_auth::LocalAuthGate::from_env(None, |_| None).unwrap().0);
         let agent_task = tokio::spawn(async move {
             while let Ok((s, r)) = agent_conn.accept_bi().await {
                 let priv_ = origin_priv;
                 let m = Arc::clone(&metrics);
+                let g = Arc::clone(&gate);
                 tokio::spawn(async move {
-                    let _ = serve_noise_stream(s, r, origin_addr, &[priv_], m).await;
+                    let _ = serve_noise_stream(s, r, origin_addr, &[priv_], m, &g).await;
                 });
             }
         });
@@ -789,12 +794,17 @@ mod tests {
         assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
         let origin_priv = origin_kp.private;
         let metrics = Arc::new(TunnelMetrics::new());
+        // No LAN-local auth gating for this bench harness -- `from_env(None, ...)`
+        // is ct-agent's own convention for "no local credential configured"
+        // (same call every ct-agent::serve test uses).
+        let gate = Arc::new(ct_agent::local_auth::LocalAuthGate::from_env(None, |_| None).unwrap().0);
         let agent_task = tokio::spawn(async move {
             while let Ok((s, r)) = agent_conn.accept_bi().await {
                 let priv_ = origin_priv;
                 let m = Arc::clone(&metrics);
+                let g = Arc::clone(&gate);
                 tokio::spawn(async move {
-                    let _ = serve_noise_stream(s, r, origin_addr, &[priv_], m).await;
+                    let _ = serve_noise_stream(s, r, origin_addr, &[priv_], m, &g).await;
                 });
             }
         });

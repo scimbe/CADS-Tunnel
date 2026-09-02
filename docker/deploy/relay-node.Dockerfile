@@ -60,7 +60,13 @@ RUN apt-get update \
 # Bumping now avoids a second coordinated release once Slice 2 ships.
 # 2026-08-24: bumped to v0.6.9 -- fleet-wide ct-agent pin bump (7 fixes since
 # v0.5.8, see CT_AGENT_RELEASE), same reasoning as every other pin in this repo.
-ARG CT_AGENT_REF=v0.6.9
+# 2026-09-02: bumped to v0.7.22 -- fleet-wide pin had drifted 13 minor releases
+# behind (scimbe flagged it live: "warum ist da noch der alt ct-agent drin?").
+# Repo-wide `every_ct_agent_pin_matches_the_release` re-run clean against the
+# new CT_AGENT_RELEASE across all 9 pin sites (including one blind spot the
+# test's own scan missed, crates/agent-tools/Cargo.toml's `tag = "..."` on a
+# line by itself -- fixed alongside this bump, same value, same reasoning).
+ARG CT_AGENT_REF=v0.7.22
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
