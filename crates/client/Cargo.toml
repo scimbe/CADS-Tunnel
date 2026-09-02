@@ -22,7 +22,7 @@ ct-edge = { path = "../edge" }
 # (bench.rs, rendezvous.rs) still exercise it end-to-end, now via a pinned git dep.
 # Pinned by commit (no tagged release exists yet); switch to `tag = "vX.Y.Z"` once
 # one does, same rev as crates/agent-tools's ct-agent dependency.
-ct-agent = { git = "https://github.com/scimbe/ct-agent", tag = "v0.6.9" }  # #507: was a v0.3.0-era rev
+ct-agent = { git = "https://github.com/scimbe/ct-agent", tag = "v0.7.22" }  # #507: was a v0.3.0-era rev
 ct-control-plane = { path = "../control-plane", features = ["test-support"] }
 axum = "0.7"
 # `test-util` (dev-only) enables tokio's paused clock for the #367 racing

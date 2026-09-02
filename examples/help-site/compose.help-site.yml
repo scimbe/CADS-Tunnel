@@ -49,7 +49,7 @@ services:
       dockerfile: Agent.Dockerfile
       args:
         # #512: the fallback MUST match the repo-root CT_AGENT_RELEASE file (test-pinned).
-        - CT_AGENT_REF=${CT_AGENT_REF:-v0.6.9}
+        - CT_AGENT_REF=${CT_AGENT_REF:-v0.7.22}
     environment:
       - CT_AGENT_MODE=browser                       # SNI passthrough to the origin
       - CT_AGENT_FRAMED_FALLBACK=1                  # #528: framed TLS-TCP fallback (in-flight keepalive)

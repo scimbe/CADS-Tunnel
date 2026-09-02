@@ -52,7 +52,7 @@
 # BuildKit can build it in parallel and cache it independently of the much-larger native
 # workspace compile. Bump CT_AGENT_REF here AND in scripts/build-ct-agent-wasm.sh together.
 FROM rust:1-slim-bookworm AS wasm-builder
-ARG CT_AGENT_REF=v0.6.9
+ARG CT_AGENT_REF=v0.7.22
 RUN apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

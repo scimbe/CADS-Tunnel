@@ -10,7 +10,7 @@ RUN apt-get update \
 # (every_ct_agent_pin_matches_the_release) scans every Agent.Dockerfile, not just
 # help-site's, and fails the gate if any of them disagree. Bump this file only
 # together with CT_AGENT_RELEASE and every other pin, never on its own.
-ARG CT_AGENT_REF=v0.6.9
+ARG CT_AGENT_REF=v0.7.22
 RUN git clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
 WORKDIR /build
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
