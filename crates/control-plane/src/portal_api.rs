@@ -183,6 +183,12 @@ struct ApiState {
     /// `None` disables `POST .../agent-bridge/call` (503, matching this crate's
     /// "absent unless configured" convention), same posture as `edge_admin`/`dns`.
     bridge: Option<BridgeDialer>,
+    /// Agent-bridges-v2: needed by [`set_tunnel_bridge_grant`] to actually admit the
+    /// bridge as a channel member (`add_member`) when a grant is pasted -- see that
+    /// handler's own doc for why this was missing before and what it fixes. Always
+    /// present (unlike `bridge` itself): harmless/unused when `bridge` is `None`,
+    /// since that route 503s before ever touching it.
+    channels: Arc<crate::storage::SqliteChannelStore>,
 }
 
 /// Build the authenticated portal API router (#26 account, #27 tunnels, #28 install).
@@ -226,6 +232,15 @@ pub fn portal_api_router(
         None,
         None,
         None,
+        // No caller of this wrapper ever configures a real bridge identity (the
+        // `bridge_identity: None` above), so `set_tunnel_bridge_grant` 503s before
+        // this store is ever touched -- a throwaway in-memory one satisfies the
+        // type without threading a real channel store through every existing
+        // caller of this function.
+        Arc::new(
+            crate::storage::SqliteChannelStore::open_in_memory()
+                .expect("in-memory sqlite store never fails to open"),
+        ),
     )
 }
 
@@ -254,6 +269,9 @@ pub fn portal_api_router_with_verifier(
     // `Some` only once `main.rs` finds both `CT_BRIDGE_HOLDER_KEY`/
     // `CT_BRIDGE_NOISE_KEY` set and well-formed -- see [`BridgeDialer`]'s own doc.
     bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr)>,
+    // Agent-bridges-v2: so `set_tunnel_bridge_grant` can actually admit the bridge as
+    // a channel member -- see that handler's own doc and [`ApiState::channels`].
+    channels: Arc<crate::storage::SqliteChannelStore>,
 ) -> Router {
     let state = ApiState {
         session_key: Arc::from(session_key.to_vec()),
@@ -281,6 +299,7 @@ pub fn portal_api_router_with_verifier(
             noise_private,
             broker_addr,
         }),
+        channels,
     };
     let mut router = Router::new()
         .route("/portal/account", get(account_page))
@@ -4313,6 +4332,15 @@ struct BridgeGrantForm {
 /// silently never work, and worse, would look successfully saved. Owner-scoped
 /// exactly like `set_tunnel_rest_bridge` above -- "existence leaks nothing": an
 /// unknown/foreign tunnel id 404s, never a 403.
+///
+/// **Also self-admits the bridge as a channel member** (fixed 2026-09-02): the
+/// bridge signs its own Noise-key attestation with its already-in-process key and
+/// calls `add_member` for the pasted `channel_id`, BEFORE the grant is stored --
+/// a channel not yet registered under the caller's own account (400, tells them
+/// to `channel register` first) never gets a doomed grant saved. Before this fix,
+/// pasting a grant only ever stored the hex; the edge resolves admission from the
+/// channel's attested member roster, not from a floating grant, so the bridge was
+/// never actually admitted no matter how correctly everything else was set up.
 async fn set_tunnel_bridge_grant(
     State(st): State<ApiState>,
     headers: HeaderMap,
@@ -4329,6 +4357,16 @@ async fn set_tunnel_bridge_grant(
         )
             .into_response();
     };
+    // "Existence leaks nothing" (matches every other tunnel route in this file): a
+    // non-owner or unknown tunnel id must 404 before ANY other check runs -- in
+    // particular before the channel-membership check below, which would otherwise
+    // leak a different signal (400 "channel isn't yours") for a tunnel the caller
+    // doesn't even own.
+    match st.tunnels.owns(&subject, &id) {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
+        Err(e) => return internal_error("set_tunnel_bridge_grant/owns", e).into_response(),
+    }
     let channel_id = match hex_decode(form.channel_id.trim()).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
         Some(b) => b,
         None => return (StatusCode::BAD_REQUEST, "channel id must be 64 hex characters").into_response(),
@@ -4356,6 +4394,43 @@ async fn set_tunnel_bridge_grant(
              mint the grant against the pubkey shown on this page",
         )
             .into_response();
+    }
+    // 2026-09-02 fix: pasting a grant here used to only validate+store the hex --
+    // it never actually admitted the bridge as a member of the channel, so the edge
+    // (which resolves admission from the channel's attested member roster, not from
+    // a floating grant) refused it no matter how correctly everything else was
+    // configured. The bridge identity already lives in-process right here (`bridge`),
+    // so it can sign its own attestation and self-admit -- no separate step for the
+    // tunnel owner, no private key ever needs to leave this process.
+    use ed25519_dalek::Signer;
+    let bridge_noise_pubkey = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bridge.noise_private));
+    let bridge_holder_pubkey = bridge.holder.verifying_key().to_bytes();
+    let attestation = bridge
+        .holder
+        .sign(&ct_common::channel::member_noise_attest_bytes(
+            &ct_common::channel::ChannelId(channel_id),
+            &bridge_holder_pubkey,
+            bridge_noise_pubkey.as_bytes(),
+        ))
+        .to_bytes();
+    match st.channels.add_member(
+        &ct_common::channel::ChannelId(channel_id),
+        &subject,
+        &bridge_holder_pubkey,
+        bridge_noise_pubkey.as_bytes(),
+        &attestation,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this channel isn't registered under your account -- run `ct-agent channel register` for it \
+                 first, then paste the grant again"
+                    .to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => return internal_error("set_tunnel_bridge_grant/add_member", e).into_response(),
     }
     match st.tunnels.set_bridge_grant(&subject, &id, &grant_hex) {
         Ok(true) => Redirect::to("/portal/agent-bridges").into_response(),
@@ -8626,6 +8701,7 @@ mod tests {
             None, // verifier -- create_tunnel doesn't need it, only me_signup does
             Some(audit.clone()),
             None, // bridge_identity (test)
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
         );
 
         // The account already owns one auto-provisioned tunnel on first
@@ -8657,6 +8733,7 @@ mod tests {
             None,
             Some(audit2.clone()),
             None, // bridge_identity (test)
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
         );
         assert_eq!(get(&app2, "/portal/tunnels", Some("auditee2")).await.0, StatusCode::OK);
         let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -8717,6 +8794,7 @@ mod tests {
             Some(OidcVerifierHandle::from(Some(oidc))),
             Some(audit.clone()),
             None, // bridge_identity (test)
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -12376,11 +12454,12 @@ mod tests {
     /// short-circuits (no stored grant, no configured identity), both of which
     /// return before `ct_common::channel_dial::dial_and_call` ever touches a
     /// socket.
-    fn test_app_with_bridge() -> (Router, Arc<SqliteTunnelStore>, ed25519_dalek::SigningKey) {
+    fn test_app_with_bridge() -> (Router, Arc<SqliteTunnelStore>, ed25519_dalek::SigningKey, Arc<crate::storage::SqliteChannelStore>) {
         let holder = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
         let noise_private = [0x22u8; 32];
         let broker_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let app = portal_api_router_with_verifier(
             KEY,
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
@@ -12397,8 +12476,9 @@ mod tests {
             None, // verifier (test)
             None, // audit (test)
             Some((holder.clone(), noise_private, broker_addr)),
+            channels.clone(),
         );
-        (app, tunnels, holder)
+        (app, tunnels, holder, channels)
     }
 
     /// Builds a `(channel_id_hex, grant_hex)` pair for the `/agent-bridge/grant`
@@ -12432,8 +12512,14 @@ mod tests {
         // `set_tunnel_rest_bridge_route_toggles_force_enables_login_and_is_owner_scoped`
         // above -- a non-owner's request, and a request against an unknown id,
         // both come back 404, never 403 (a 403 would confirm the tunnel exists).
-        let (app, tunnels, holder) = test_app_with_bridge();
+        let (app, tunnels, holder, channels) = test_app_with_bridge();
         let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        // The channel must already be registered under the caller's own account for
+        // the grant-paste to succeed (2026-09-02 fix: it now self-admits the bridge
+        // as a member, which needs the channel to already exist with this owner).
+        channels
+            .register_channel_if_under_owned_limit(&ct_common::channel::ChannelId([1u8; 32]), &[0x55u8; 32], "alice", 100)
+            .unwrap();
         let (channel_hex, grant_hex) = bridge_grant_hex([1u8; 32], holder.verifying_key().to_bytes());
         let form = format!("channel_id={channel_hex}&grant_hex={grant_hex}");
 
@@ -12462,8 +12548,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_tunnel_bridge_grant_route_actually_admits_the_bridge_as_a_channel_member() {
+        // The real bug (found 2026-09-02): pasting a grant used to only store the hex --
+        // it never called `add_member`, so the edge (which resolves admission from the
+        // channel's attested member roster, not a floating grant) would refuse the bridge
+        // no matter how correctly everything else was configured. This proves the fix:
+        // after a successful paste, the bridge's own holder is a real, attested member.
+        let (app, tunnels, holder, channels) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        let channel = ct_common::channel::ChannelId([7u8; 32]);
+        channels.register_channel_if_under_owned_limit(&channel, &[0x55u8; 32], "alice", 100).unwrap();
+        let (channel_hex, grant_hex) = bridge_grant_hex(channel.0, holder.verifying_key().to_bytes());
+
+        assert_eq!(
+            post_form(
+                &app,
+                &format!("/portal/tunnels/{}/agent-bridge/grant", t.id),
+                "alice",
+                &format!("channel_id={channel_hex}&grant_hex={grant_hex}"),
+            )
+            .await,
+            StatusCode::SEE_OTHER
+        );
+
+        let members = channels.members_of(&channel, "alice").unwrap().expect("channel is registered");
+        let bridge_pub = holder.verifying_key().to_bytes();
+        assert!(
+            members.iter().any(|(h, _)| *h == bridge_pub),
+            "the bridge's own holder must now be a real channel member, not just have a grant on file"
+        );
+        let expected_noise = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x22u8; 32]));
+        assert!(
+            members.iter().any(|(h, n)| *h == bridge_pub && *n == Some(*expected_noise.as_bytes())),
+            "the recorded member's noise_pubkey must be the bridge's own derived Noise public key"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_tunnel_bridge_grant_route_rejects_a_channel_not_registered_under_the_caller() {
+        // A tunnel owner who pastes a grant for a channel_id that was never registered
+        // under their own account (typo, wrong channel, forgot `channel register`) must
+        // get a clear, actionable 400 -- never a silently-stored, permanently-doomed grant.
+        let (app, tunnels, holder, _channels) = test_app_with_bridge();
+        let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
+        let (channel_hex, grant_hex) = bridge_grant_hex([9u8; 32], holder.verifying_key().to_bytes());
+
+        let resp = post_form_response(
+            &app,
+            &format!("/portal/tunnels/{}/agent-bridge/grant", t.id),
+            "alice",
+            &format!("channel_id={channel_hex}&grant_hex={grant_hex}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(
+            body.contains("channel register"),
+            "the rejection should point the owner at the fix (`channel register`), not an opaque error: {body}"
+        );
+        assert_eq!(
+            tunnels.bridge_grant("alice", &t.id).unwrap(),
+            None,
+            "a grant for an unregistered channel must never be stored"
+        );
+    }
+
+    #[tokio::test]
     async fn set_tunnel_bridge_grant_route_rejects_malformed_grant_hex_with_400_not_a_panic() {
-        let (app, tunnels, holder) = test_app_with_bridge();
+        let (app, tunnels, holder, _channels) = test_app_with_bridge();
         let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
         let (channel_hex, _) = bridge_grant_hex([1u8; 32], holder.verifying_key().to_bytes());
 
@@ -12505,7 +12657,7 @@ mod tests {
         // silently stored (which would look successfully saved while being
         // permanently useless, since this deployment can never dial with that
         // other key).
-        let (app, tunnels, _holder) = test_app_with_bridge();
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
         let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
         let someone_elses_key = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
         let (channel_hex, grant_hex) = bridge_grant_hex([1u8; 32], someone_elses_key.verifying_key().to_bytes());
@@ -12533,7 +12685,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tunnel_bridge_tool_route_404s_when_no_grant_is_stored_yet() {
-        let (app, tunnels, _holder) = test_app_with_bridge();
+        let (app, tunnels, _holder, _channels) = test_app_with_bridge();
         let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
 
         assert_eq!(
@@ -12683,7 +12835,7 @@ mod tests {
         // shows. Publishing only the holder pubkey (the original shape) silently left that
         // unreachable. Compute the expected Noise pubkey the exact same way the handler does,
         // rather than a hardcoded hex string, so this test tracks the real derivation.
-        let (app, _tunnels, holder) = test_app_with_bridge();
+        let (app, _tunnels, holder, _channels) = test_app_with_bridge();
         let expected_noise_hex =
             hex_encode(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([0x22u8; 32])).as_bytes());
 

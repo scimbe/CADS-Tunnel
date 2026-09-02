@@ -6306,6 +6306,12 @@ pub fn persistent_control_plane_router(
                     // fail-closed-checked by `main.rs` -- see this function's own
                     // `bridge_identity` param doc.
                     bridge_identity.clone(),
+                    // Agent-bridges-v2: lets `set_tunnel_bridge_grant` admit the bridge
+                    // as a channel member when a grant is pasted (#gap found 2026-09-02
+                    // -- pasting a grant alone never did this before, so the bridge was
+                    // never actually admitted by the edge no matter how correctly
+                    // everything else was configured).
+                    channels.clone(),
                 ),
             )
             // #248-follow: the session-authed channel-allowlist self-service claim —
