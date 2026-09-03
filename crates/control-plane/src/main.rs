@@ -308,13 +308,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_CHANNEL_BROKER.to_string());
-            match resolve_broker_addr(&bridge_broker_host).await {
+            match resolve_channel_addr("CT_CHANNEL_BROKER", &bridge_broker_host).await {
                 Ok(bridge_broker_addr) => {
-                    eprintln!(
-                        "ct-control-plane: Agent bridges dialer enabled (holder={}, broker={bridge_broker_host})",
-                        hex_encode_32(&bridge_holder_key.verifying_key().to_bytes())
-                    );
-                    Some((bridge_holder_key, noise_bytes, bridge_broker_addr))
+                    // #745: the dial is TWO hops -- rendezvous on the broker, then the
+                    // session on the relay port. Operators already configure the relay
+                    // for ct-agent as `CT_CHANNEL_RELAY=host:port` (the CP installer
+                    // emits it), so honor the same variable here; when unset, derive it
+                    // the way the edge itself does (same host, `CT_CP_CHANNEL_RELAY_PORT`
+                    // or 4436 -- `NetworkInfoResp` is the CP's own model of that port).
+                    let bridge_relay_host = std::env::var("CT_CHANNEL_RELAY")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty());
+                    let relay = match &bridge_relay_host {
+                        Some(host) => resolve_channel_addr("CT_CHANNEL_RELAY", host).await,
+                        None => Ok(default_bridge_relay_addr(
+                            bridge_broker_addr,
+                            ct_control_plane::service::NetworkInfoResp::from_env().channel_relay_port,
+                        )),
+                    };
+                    match relay {
+                        Ok(bridge_relay_addr) => {
+                            eprintln!(
+                                "ct-control-plane: Agent bridges dialer enabled (holder={}, broker={bridge_broker_host}, relay={} ({}))",
+                                hex_encode_32(&bridge_holder_key.verifying_key().to_bytes()),
+                                bridge_relay_addr,
+                                bridge_relay_host.as_deref().unwrap_or("derived from the broker host")
+                            );
+                            Some((bridge_holder_key, noise_bytes, bridge_broker_addr, bridge_relay_addr))
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "ct-control-plane: WARNING -- CT_CHANNEL_RELAY={} did not resolve ({e}) \
+                                 -- Agent bridges dialer disabled",
+                                bridge_relay_host.as_deref().unwrap_or("")
+                            );
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!(
@@ -507,19 +537,30 @@ fn hex_encode_32(b: &[u8; 32]) -> String {
     s
 }
 
-/// Resolve `CT_CHANNEL_BROKER`'s `host:port` (a DNS name, not necessarily a literal
-/// IP -- e.g. the default above, or the "bunsenbrenner.org:4435" example in this
-/// deployment's own operator docs) into a concrete [`SocketAddr`] once at startup,
-/// the way `ct_common::channel_dial::dial_and_call` needs it. A plain
-/// `SocketAddr::from_str` can't do this (it only accepts a literal IP:port, not a
-/// hostname); `tokio::net::lookup_host` does the DNS lookup and this picks its
-/// first answer, same "first result wins" posture as a typical resolver client.
-async fn resolve_broker_addr(host_port: &str) -> Result<SocketAddr, String> {
+/// Resolve a channel-address variable's `host:port` (`CT_CHANNEL_BROKER` or, #745,
+/// `CT_CHANNEL_RELAY`; a DNS name, not necessarily a literal IP -- e.g. the default
+/// above, or the "bunsenbrenner.org:4435" example in this deployment's own operator
+/// docs) into a concrete [`SocketAddr`] once at startup, the way
+/// `ct_common::channel_dial::dial_and_call` needs it. A plain `SocketAddr::from_str`
+/// can't do this (it only accepts a literal IP:port, not a hostname);
+/// `tokio::net::lookup_host` does the DNS lookup and this picks its first answer, same
+/// "first result wins" posture as a typical resolver client. `var` is only used to name
+/// the variable in the error text.
+async fn resolve_channel_addr(var: &str, host_port: &str) -> Result<SocketAddr, String> {
     tokio::net::lookup_host(host_port)
         .await
-        .map_err(|e| format!("CT_CHANNEL_BROKER {host_port:?} could not be resolved: {e}"))?
+        .map_err(|e| format!("{var} {host_port:?} could not be resolved: {e}"))?
         .next()
-        .ok_or_else(|| format!("CT_CHANNEL_BROKER {host_port:?} resolved to no addresses"))
+        .ok_or_else(|| format!("{var} {host_port:?} resolved to no addresses"))
+}
+
+/// #745: the relay address when `CT_CHANNEL_RELAY` is unset -- the broker's own host on
+/// `relay_port` (`NetworkInfoResp::channel_relay_port`: `CT_CP_CHANNEL_RELAY_PORT` or
+/// 4436), mirroring the edge's own default of "relay = rendezvous port + 1 on the same
+/// listener host" (`ct_edge::serve::resolve_channel_relay_addr`). Pure, so it is
+/// unit-testable without touching the process environment.
+fn default_bridge_relay_addr(broker_addr: SocketAddr, relay_port: u16) -> SocketAddr {
+    SocketAddr::new(broker_addr.ip(), relay_port)
 }
 
 /// The graceful (not fail-closed) half of `CT_BRIDGE_HOLDER_KEY`/`CT_BRIDGE_NOISE_KEY`
@@ -748,5 +789,24 @@ mod tests {
         let (holder_key, noise_bytes) = super::resolve_bridge_keys(Some(holder_hex), Some(noise_hex)).expect("both well-formed");
         assert_eq!(holder_key.to_bytes(), [0x11u8; 32]);
         assert_eq!(noise_bytes, [0x22u8; 32]);
+    }
+
+    #[test]
+    fn default_bridge_relay_addr_is_the_broker_host_on_the_relay_port_745() {
+        // #745: with `CT_CHANNEL_RELAY` unset the relay hop must target the SAME host the
+        // broker resolved to, on the CP's own relay-port model (4436 by default) -- the
+        // edge's own "relay = rendezvous + 1 on the same host" default, so an operator
+        // who only ever set CT_CHANNEL_BROKER gets a working two-hop dial.
+        let broker: std::net::SocketAddr = "203.0.113.7:4435".parse().unwrap();
+        assert_eq!(
+            super::default_bridge_relay_addr(broker, 4436),
+            "203.0.113.7:4436".parse::<std::net::SocketAddr>().unwrap()
+        );
+        // The port is whatever the CP's model says, not hardcoded; IPv6 hosts survive.
+        let broker6: std::net::SocketAddr = "[2001:db8::1]:4435".parse().unwrap();
+        assert_eq!(
+            super::default_bridge_relay_addr(broker6, 5555),
+            "[2001:db8::1]:5555".parse::<std::net::SocketAddr>().unwrap()
+        );
     }
 }

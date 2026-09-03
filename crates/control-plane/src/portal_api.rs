@@ -121,7 +121,11 @@ struct EdgeAdmin {
 struct BridgeDialer {
     holder: Arc<ed25519_dalek::SigningKey>,
     noise_private: [u8; 32],
+    /// The rendezvous port (`CT_CHANNEL_BROKER`, `:4435`) -- hop 1 of the dial.
     broker_addr: std::net::SocketAddr,
+    /// The relay port (`CT_CHANNEL_RELAY`, or broker host + `:4436`) -- hop 2, where
+    /// the session actually runs (#745; see `ct_common::channel_dial`'s module doc).
+    relay_addr: std::net::SocketAddr,
 }
 
 /// Shared state for the authed portal API.
@@ -265,10 +269,10 @@ pub fn portal_api_router_with_verifier(
     admin_token: Option<[u8; 32]>,
     verifier: Option<crate::oidc::OidcVerifierHandle>,
     audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
-    // Agent-bridges-v2: `(holder_signing_key, noise_private_key, broker_addr)`,
+    // Agent-bridges-v2: `(holder_signing_key, noise_private_key, broker_addr, relay_addr)`,
     // `Some` only once `main.rs` finds both `CT_BRIDGE_HOLDER_KEY`/
     // `CT_BRIDGE_NOISE_KEY` set and well-formed -- see [`BridgeDialer`]'s own doc.
-    bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr)>,
+    bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr, std::net::SocketAddr)>,
     // Agent-bridges-v2: so `set_tunnel_bridge_grant` can actually admit the bridge as
     // a channel member -- see that handler's own doc and [`ApiState::channels`].
     channels: Arc<crate::storage::SqliteChannelStore>,
@@ -294,10 +298,11 @@ pub fn portal_api_router_with_verifier(
         admin_token,
         verifier: verifier.clone(),
         audit,
-        bridge: bridge_identity.map(|(holder, noise_private, broker_addr)| BridgeDialer {
+        bridge: bridge_identity.map(|(holder, noise_private, broker_addr, relay_addr)| BridgeDialer {
             holder: Arc::new(holder),
             noise_private,
             broker_addr,
+            relay_addr,
         }),
         channels,
     };
@@ -4547,6 +4552,7 @@ async fn dial_bridge_tool(
     let claims_email = claims.email;
     match ct_common::channel_dial::dial_and_call(
         bridge.broker_addr,
+        bridge.relay_addr,
         grant,
         bridge.holder.as_ref(),
         &bridge.noise_private,
@@ -12526,8 +12532,8 @@ mod tests {
     /// holder's own signing key -- a test needs the key to mint a grant whose
     /// `holder` matches what `set_tunnel_bridge_grant` checks against.
     ///
-    /// `broker_addr` is a real (but never-dialed-successfully) loopback address:
-    /// none of the tests built on this harness reach an actual QUIC dial --
+    /// `broker_addr`/`relay_addr` are real (but never-dialed-successfully) loopback
+    /// addresses: none of the tests built on this harness reach an actual QUIC dial --
     /// they exercise the grant-validation path and the `call` route's two
     /// short-circuits (no stored grant, no configured identity), both of which
     /// return before `ct_common::channel_dial::dial_and_call` ever touches a
@@ -12536,6 +12542,7 @@ mod tests {
         let holder = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
         let noise_private = [0x22u8; 32];
         let broker_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let relay_addr: std::net::SocketAddr = "127.0.0.1:2".parse().unwrap();
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let app = portal_api_router_with_verifier(
@@ -12553,7 +12560,7 @@ mod tests {
             None,
             None, // verifier (test)
             None, // audit (test)
-            Some((holder.clone(), noise_private, broker_addr)),
+            Some((holder.clone(), noise_private, broker_addr, relay_addr)),
             channels.clone(),
         );
         (app, tunnels, holder, channels)
