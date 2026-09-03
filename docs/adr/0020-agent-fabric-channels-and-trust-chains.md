@@ -1,7 +1,9 @@
 # ADR-0020 — Agent Fabric: direct agent-to-agent channels with trust chains
 
 ## Status
-Proposed (planning). First sub-packet of the agent-to-agent networking feature
+Accepted (implemented; amended 2026-09-03). *The status change is proposed by the
+2026-09-03 amendment at the end of this file and is for the operator to confirm — until then
+this line read "Proposed (planning)".* First sub-packet of the agent-to-agent networking feature
 (issue #72). Builds the transport on ADR-0015 (P2P mesh with rendezvous) and the
 payload-blind relay of ADR-0010; deliberately distinct from the existing
 tunnel-**sharing** grants (`/portal/tunnels/{id}/grants`). No code lands with this
@@ -208,3 +210,110 @@ capability. Provider-blindness is preserved end to end (operator sees opaque
 
 `fix-ready` only when the whole acceptance (real direct agent-to-agent data exchange
 with trust chains and a tested fallback) is met.
+
+## Amendment (2026-09-03): one normative implementation of the join wire protocol
+
+Records a decision taken by the operator on 2026-09-02 and implemented in CADS-Tunnel
+#748 / #751 / #752 / #755 / #756 (tag `v0.4.19`); the ct-agent half of the same plan
+(PR4/PR5, see below) is pending as of this date. Amends §4/§4a; nothing above is withdrawn.
+
+### Decision
+
+The **client half** of the channel join wire protocol — §4a's member-ack grammar, the
+possession handshake, both leg variants, the QUIC dial — has exactly **one normative
+implementation**, in `ct-common`:
+
+- `ct_common::channel_wire` — the pure byte layer: `ChannelJoinOutcome`,
+  `DroppedLegBeforeAck`, `parse_channel_ack`, refusal-category and hex decoders, park-expiry
+  classification, the phase-preamble constants. Un-gated, wasm32-portable, no I/O.
+- `ct_common::channel_wire::io` — the stream-generic admission exchange over any duplex
+  (`present_channel_join_on_stream`, `present_channel_relay_join_on_stream`,
+  `ADMISSION_EXCHANGE_TIMEOUT`, `KA_PARK_INACTIVITY_BOUND`). Native-only.
+- `ct_common::channel_quic` — the accept-any-cert `quinn` dialer, the QUIC join wrappers,
+  `open_channel_streams`. Native-only.
+
+All three are a **verbatim** port of ct-agent `native/src/channel.rs:55-778`,
+`transport.rs:52-140` and `channel_run/session.rs:152-178` @ v0.7.23 — same bodies, doc
+comments and error strings (ct-agent's `channel_run/errors.rs` classifies by string and by
+downcast, so the wording is contract); every block carries a `// ported verbatim from …`
+marker. ct-agent re-exports these names in place of its own bodies (ct-agent PR5, pending), so
+no call site there changes; what stays in ct-agent is policy and environment
+(`CT_CHANNEL_PHASE_MARKER`, `phase_marker_for`, `run_channel_session*`, all of `channel_run/`,
+the cert-pinned tunnel dialer). The control plane's `ct_common::channel_dial` (#756) is a thin
+**policy layer** over the same modules — the two-hop sequence and its budgets, `DialError`,
+one adapter, the ct-agent#101 trust gate — and no longer implements the protocol.
+
+### Why
+
+The Agent-bridges dialer (#737) was written as a "faithful port" of ct-agent's exchange with
+one deliberate omission, the relay leg. That omission *was* #745: the dialer did the
+rendezvous hop on `:4435` (contract: ack, then close), `finish()`ed the admission stream and
+ran Noise on it → `closed stream`, while the relay-only acceptor parked on `:4436` reaped with
+"park expired with no partner (#21)" on every call. A second copy that agrees with itself
+drifts unnoticed — #756's diff shows it already had, in the reflexive `r=` handling and the
+post-possession refusal category. One implementation consumed by both binaries is the only
+arrangement in which the fix history below stays fixed.
+
+### Invariants carried over, and where they are guarded now
+
+- **In `ct-common`** (moved with the code, names and issue numbers unchanged: 20 ct-agent
+  tests + 1 smoke test, #751): ct-agent#21 (`EX`/park expiry is neither refusal nor transport
+  error), #23 (one ack contract on both legs: cap, empty-after-possession, NULs), #28
+  (grammar-true `OK` parse, never by field count), #36 (panic-free hex), #129 (malformed
+  pre-challenge response is a distinct error), #140 (bounded exchange), #148 (typed
+  `DroppedLegBeforeAck`); CADS-Tunnel#494 (`\n` completes the ack on a held-open `:443`
+  stream), #495 (phase preamble), #500 (leading NUL keepalives), #506 (tick-bounded KA park
+  wait), #524 (length-framed refusal category, 0x0A collision), #557 (park-expiry strings
+  derived from `crate::channel`, never copied).
+- **Against the real edge** — seven `_p2` contract tests in `crates/edge/src/channel_broker.rs`
+  (#752; the cycle-free home, since `ct-common` cannot dev-depend on `ct-edge`): possession +
+  framed refusal, rendezvous endpoint exchange with exact `r=` and marker toleration, attested
+  Noise triple verified under the peer holder (#101/#122), QUIC relay via
+  `open_channel_streams` (#139), the `:443` same-stream relay contract (#106/#148),
+  post-possession `pairing` refusal (#524/#23), QUIC park-expiry close → `ParkExpired`.
+- **Build-time gates:** CI compiles `ct-common` for `wasm32-unknown-unknown` (#748), so the
+  un-gated parser is actually built for the browser member. ct-agent PR4 adds a lockfile guard
+  ("exactly one `ct-common` in `Cargo.lock`") and a **parity test** — old body vs re-export
+  over the same scripted broker: byte-identical client writes, identical outcome or identical
+  `Err` `Display` + downcast. That test can only exist between PR4 and PR5, which is why the
+  pin bump and the deletion are separate PRs.
+
+### Two protocol facts the consolidation surfaced
+
+1. **The QUIC relay leg (`:4436`) is not the `:443` relay leg.** On `:443`/WS the relay join is
+   `present_channel_relay_join_on_stream`: the send half stays open, the ack is read only up to
+   `\n`, and the session runs on the **same** stream (§4a's `SameStream`). On `:4436` a member
+   does what it does on `:4435` — a **throwaway** admission bi-stream (`[0xFF, 0x02]` preamble,
+   `finish()` after the signature, EOF-terminated ack) — and then opens the session on the
+   **next** `open_bi()`; the edge splices the initiator's next bi-stream to the acceptor
+   (`relay::relay_initiator_to_acceptor`, `RELAY_SETUP_TIMEOUT` per side). #745's first fix
+   sketch assumed the `:443` shape; #749, `channel_dial` and the `_p2` tests pin the correct one.
+2. **A QUIC post-admission refusal must be held until delivered (#753, fixed #755).**
+   `finish_quic_pair_inner`'s Err arm wrote the framed `pairing` refusal (#524), `finish()`ed
+   and returned — dropping the last `quinn::Connection` handles; quinn sends nothing after an
+   implicit close, so the member saw a zero-byte close and, correctly per #23/#148, treated a
+   definitive refusal as a retryable dropped leg. The edge now holds both connections
+   (`conn.closed()`, bounded 2 s) as the admission-refusal path already did (#129-follow); the
+   `_p2` test committed `#[ignore]` in #752 is un-ignored as the regression guard.
+
+### Versioning
+
+CADS-Tunnel tags are the API contract for ct-agent. ct-agent pins **five** crates —
+`ct-common`, `ct-control-plane`, `ct-dns`, `ct-edge`, `ct-client` — at one tag and bumps them
+**together**: a mixed set resolves two `ct-common` packages (types stop unifying in the
+`ct_edge`-driven tests, loud; two copies in the production binary via `ct-control-plane`,
+silent). `v0.4.19` (annotated, `ce2979c`, 2026-09-03) is the first tag carrying the shared
+modules; it also contains #745 (#749), #747 (#750), #753 (#755) and #756. Tagging is manual —
+there is no release workflow.
+
+### Consequences and open items
+
+- **#754** — the `:443`/WS stream-pairing refusal (`finish_stream_pair_inner` Err arm) may be
+  lost to the TLS `close_notify` RST race that #511's `graceful_close` guards on the Ok path.
+  Not reproduced; contract test first, then decide.
+- **ct-agent PR4** (pins → `v0.4.19`, lockfile guard, parity test) and **PR5** (re-exports,
+  deletion of the moved bodies and duplex tests) are pending. Until PR5 merges the bodies exist
+  twice again, deliberately, with the parity test as the bridge; ct-agent PR7 then points
+  `channel.rs`'s header at `ct-common` as normative.
+- Any future change to the exchange lands in `ct-common` first, with its guard test, and
+  reaches ct-agent through a tag bump — never as a patch on top of a re-export.
