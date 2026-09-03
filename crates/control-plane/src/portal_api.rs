@@ -6606,11 +6606,22 @@ async fn new_channel_submit(State(st): State<ClaimState>, headers: HeaderMap, Fo
         Ok(m) => m,
         Err(e) => return internal_error("new_channel_submit/max_channels", e).into_response(),
     };
-    match st.channels.register_channel_if_under_owned_limit(&ct_common::channel::ChannelId(channel), &operator, &claims.subject, max) {
+    // #747: `allow_rekey = false` -- the id is fresh random bytes, so this can never
+    // legitimately hit a channel the caller already owns; a re-key here is impossible.
+    match st.channels.register_channel_if_under_owned_limit(
+        &ct_common::channel::ChannelId(channel),
+        &operator,
+        &claims.subject,
+        max,
+        false,
+    ) {
         Ok(crate::storage::RegisterChannelOutcome::Registered) => {
             Redirect::to(&format!("/portal/channels/{}/manage?created=true", hex(&channel))).into_response()
         }
-        Ok(crate::storage::RegisterChannelOutcome::OwnedByAnother) => {
+        Ok(crate::storage::RegisterChannelOutcome::OwnedByAnother)
+        | Ok(crate::storage::RegisterChannelOutcome::Unchanged)
+        | Ok(crate::storage::RegisterChannelOutcome::OperatorMismatch)
+        | Ok(crate::storage::RegisterChannelOutcome::Rekeyed { .. }) => {
             // Vanishingly unlikely (a fresh random 32 bytes colliding with an existing
             // channel owned by someone else) -- handled rather than unwrapped so a
             // pathological RNG failure surfaces as a retryable error, not a panic.
@@ -12603,7 +12614,7 @@ mod tests {
         // the grant-paste to succeed (2026-09-02 fix: it now self-admits the bridge
         // as a member, which needs the channel to already exist with this owner).
         channels
-            .register_channel_if_under_owned_limit(&ct_common::channel::ChannelId([1u8; 32]), &[0x55u8; 32], "alice", 100)
+            .register_channel_if_under_owned_limit(&ct_common::channel::ChannelId([1u8; 32]), &[0x55u8; 32], "alice", 100, false)
             .unwrap();
         let (channel_hex, grant_hex) = bridge_grant_hex([1u8; 32], holder.verifying_key().to_bytes());
         let form = format!("channel_id={channel_hex}&grant_hex={grant_hex}");
@@ -12642,7 +12653,7 @@ mod tests {
         let (app, tunnels, holder, channels) = test_app_with_bridge();
         let t = tunnels.create("alice", "agent-1", None).unwrap().created().expect("no hostname collision in this test");
         let channel = ct_common::channel::ChannelId([7u8; 32]);
-        channels.register_channel_if_under_owned_limit(&channel, &[0x55u8; 32], "alice", 100).unwrap();
+        channels.register_channel_if_under_owned_limit(&channel, &[0x55u8; 32], "alice", 100, false).unwrap();
         let (channel_hex, grant_hex) = bridge_grant_hex(channel.0, holder.verifying_key().to_bytes());
 
         assert_eq!(
