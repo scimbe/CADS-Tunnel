@@ -5052,6 +5052,12 @@ mod tests {
     /// Two assertions, both about things that actually drift: the runbook is where the
     /// operator reads the floor, so it must state the constant; and the dead version must
     /// be gone from the repo entirely, since a stale copy elsewhere is what produced this.
+    ///
+    /// Narrowed 2026-09-03: CADS-Tunnel itself cut a real tag of that same name
+    /// (`v0.4.19`, the channel-protocol consolidation, ADR-0020 amendment), so the bare
+    /// string is no longer dead in this repo -- only a **ct-agent** version floor naming it
+    /// is. The scan therefore flags the version only where `ct-agent` immediately
+    /// precedes it (`ct-agent ≥ v…`, `ct-agent v…`), which is exactly the #575 shape.
     #[test]
     fn the_runbook_states_the_same_ka_fleet_floor_as_the_code_575() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5115,9 +5121,18 @@ mod tests {
                     if line.contains("never cut") {
                         continue;
                     }
+                    // Only a ct-agent floor is dead: the version must follow `ct-agent`
+                    // within a few characters (`ct-agent ≥ v…`, `ct-agent >= v…`,
+                    // `ct-agent v…`). A CADS-Tunnel tag reference to the same string is
+                    // legitimate (see the doc comment).
+                    let names_agent_floor = line.match_indices(DEAD).any(|(at, _)| {
+                        let window_start = at.saturating_sub(16);
+                        let window = &line[line.floor_char_boundary(window_start)..at];
+                        window.contains("ct-agent")
+                    });
                     assert!(
-                        !line.contains(DEAD),
-                        "{}:{} still names {DEAD}, a ct-agent release that was never cut: \
+                        !names_agent_floor,
+                        "{}:{} still names ct-agent {DEAD}, a ct-agent release that was never cut: \
                          {line}",
                         p.display(),
                         i + 1
