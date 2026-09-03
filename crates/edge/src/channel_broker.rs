@@ -1851,6 +1851,24 @@ async fn finish_quic_pair_inner(
             let _ = b.send.write_all(&refusal).await;
             let _ = a.send.finish();
             let _ = b.send.finish();
+            // #753: do NOT return -- and thereby drop both `AdmittedMember`s -- yet. Dropping
+            // the last handle of a `quinn::Connection` closes it implicitly, and a close sends
+            // NO further data: the refusal `write_all`ed above is still sitting in quinn's send
+            // buffer at this point (a stream write only enqueues; the endpoint driver transmits
+            // asynchronously), so returning here discarded it. Both members then saw their
+            // connection close with zero ack bytes and, per the ack contract (#23/#148),
+            // classified a DEFINITIVE pairing refusal as a retryable dropped leg -- #524's
+            // `pairing` category never reached a QUIC member (found by the shared-client
+            // contract test `shared_client_surfaces_the_edges_framed_pairing_refusal_after_
+            // possession_p2`, deterministic). Same remedy as the admission-refusal path's
+            // #129-follow hold (`accept_and_read_join`): keep both connections alive until the
+            // peer has read the refusal and closed, bounded so a peer that never closes cannot
+            // pin this completer. Waited concurrently, so the bound is 2 s total, not 4 s.
+            let hold = std::time::Duration::from_secs(2);
+            let _ = tokio::join!(
+                tokio::time::timeout(hold, a.conn.closed()),
+                tokio::time::timeout(hold, b.conn.closed()),
+            );
             Err(format!("{refusal_label}: {e}").into())
         }
     }
@@ -8067,21 +8085,23 @@ mod tests {
             }
         }
 
+        /// CADS-Tunnel#753 REGRESSION GUARD. This test found the defect it now guards (PR3,
+        /// 2026-09-03, deterministic): `finish_quic_pair_inner`'s refusal arm buffered the
+        /// framed `pairing` refusal on both members' streams and then returned `Err`, which
+        /// dropped both `quinn::Connection`s -- and a quinn close sends no further data, so
+        /// the refusal never left the edge. Both members saw an empty-ack close and (correctly,
+        /// per #23/#148) reported the retryable `DroppedLegBeforeAck` for a DEFINITIVE
+        /// refusal; #524's post-admission `pairing` category was unreachable on QUIC. The arm
+        /// now holds both connections until the peer has read and closed (2 s bound, the
+        /// #129-follow pattern). Red without that hold, green with it.
         #[tokio::test]
-        #[ignore = "FOUND BY THIS TEST (2026-09-03, deterministic in 5/5 runs): on the QUIC pairing-refusal \
-                    path `finish_quic_pair_inner` writes the framed `pairing` refusal to both members, returns \
-                    Err, and thereby drops both `AdmittedMember` connections at once -- quinn's implicit close \
-                    on drop sends NO further data, so the still-buffered refusal never leaves the edge and the \
-                    shared client (correctly) reports `DroppedLegBeforeAck` (retryable) instead of the definitive \
-                    `Refused { Some(\"pairing\") }`. The admission-refusal path holds the connection for 2 s for \
-                    exactly this reason (#129-follow, `accept_and_read_join`); the pairing arm lacks that hold. \
-                    Production fix is edge-side and out of this test-only PR's scope; un-ignore with it."]
         async fn shared_client_surfaces_the_edges_framed_pairing_refusal_after_possession_p2() {
-            // CADS-Tunnel#524 (post-admission category) + ct-agent#23: two INITIATORS of the
-            // same channel each pass admission (grant + possession) but cannot be paired; the
-            // edge writes the framed `pairing` refusal after the possession exchange. The
-            // shared client classifies that at the byte level as `Refused { Some("pairing") }`
-            // — not a dropped leg, not an error, and not the generic category-less refusal.
+            // CADS-Tunnel#524 (post-admission category) + ct-agent#23 + CADS-Tunnel#753: two
+            // INITIATORS of the same channel each pass admission (grant + possession) but cannot
+            // be paired; the edge writes the framed `pairing` refusal after the possession
+            // exchange and must keep the connections alive until it is delivered. The shared
+            // client classifies it at the byte level as `Refused { Some("pairing") }` — not a
+            // dropped leg, not an error, and not the generic category-less refusal.
             let channel = [0xF0u8; 32];
             let holder_a = holder_sk(0x51);
             let holder_b = holder_sk(0x52);
