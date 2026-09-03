@@ -7678,4 +7678,470 @@ mod tests {
         }
     }
 
+
+    /// Phase-2 PR3 (CADS-Tunnel/ct-agent consolidation): **real edge vs SHARED client**
+    /// contract tests. ct-agent's own `channel.rs` tests drove its client half against a
+    /// pinned `ct_edge` dev-dependency (`present_channel_join_completes_the_possession_
+    /// handshake`, `two_agent_clients_learn_each_others_endpoint`, `rendezvous_relays_each_
+    /// peers_attested_noise_key`, `member_learns_its_edge_observed_reflexive_over_quic`,
+    /// ct-agent `native/src/channel.rs:1603-1917` @ v0.7.23) — a cross-repo, tag-lagged
+    /// gate. Now that the client half lives in `ct_common::channel_wire` / `channel_quic`
+    /// (PR2, verbatim port), the same intents run HERE, in the dependency direction that
+    /// already exists (`ct-edge → ct-common`), against this module's own admission and
+    /// pairing entry points: every edge-side change to the ack line, the refusal frame, the
+    /// possession exchange or the QUIC close reasons is checked against the real shared
+    /// client in this workspace's CI, before any tag reaches ct-agent. Hermetic (loopback
+    /// and in-memory duplexes only); every await is bounded by [`BOUND`].
+    mod wire_contract_p2 {
+        use super::*;
+        use ct_common::channel::{member_noise_attest_bytes, verify_member_noise_attestation};
+        use ct_common::channel_quic::{open_channel_streams, present_channel_join_quic};
+        use ct_common::channel_wire::io::{
+            present_channel_join_on_stream, present_channel_relay_join_on_stream, ADMISSION_EXCHANGE_TIMEOUT,
+        };
+        use ct_common::channel_wire::test_support::{operator, signed_grant};
+        use ct_common::channel_wire::{ChannelJoinOutcome, PHASE_MARKER_RELAY, PHASE_MARKER_RENDEZVOUS};
+        use rustls::pki_types::CertificateDer;
+        use std::net::SocketAddr;
+
+        /// Every await in these tests is bounded by this — a hung contract fails, never wedges CI.
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+        async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+            tokio::time::timeout(BOUND, f)
+                .await
+                .unwrap_or_else(|_| panic!("{what}: exceeded the {BOUND:?} test bound"))
+        }
+
+        /// The fixture operator's public key: ct-common's `test_support::signed_grant` signs
+        /// under it, so the edge-side `authorize` resolves to exactly this key.
+        fn op_pub() -> [u8; 32] {
+            operator().verifying_key().to_bytes()
+        }
+
+        fn request(channel: [u8; 32], holder: &SigningKey, dir: Direction, endpoint: &str) -> ChannelJoinRequest {
+            ChannelJoinRequest { grant: signed_grant(channel, holder, dir), endpoint: endpoint.to_string() }
+        }
+
+        /// Dial the edge over QUIC from a fresh loopback client endpoint and run the SHARED
+        /// QUIC join (`channel_quic::present_channel_join_quic`) on it. Returns the outcome,
+        /// the client's own bound source address (what the edge must report as `r=`), and
+        /// the still-open connection for tests that continue on it.
+        async fn join_quic(
+            cert: CertificateDer<'static>,
+            addr: SocketAddr,
+            req: &ChannelJoinRequest,
+            holder: &SigningKey,
+            marker: Option<u8>,
+        ) -> (ChannelJoinOutcome, SocketAddr, quinn::Connection) {
+            let client = build_client_endpoint(cert).expect("client endpoint");
+            let source = client.local_addr().expect("client local addr");
+            let conn = within("connect", client.connect(addr, "localhost").expect("cfg")).await.expect("conn");
+            let outcome = within("join", present_channel_join_quic(&conn, req, holder, marker))
+                .await
+                .expect("the shared QUIC join drives to an outcome");
+            (outcome, source, conn)
+        }
+
+        #[tokio::test]
+        async fn shared_client_proves_possession_to_the_real_edge_admission_over_a_duplex_p2() {
+            // ct-agent#72 AF4 + CADS-Tunnel#524 (from ct-agent's `present_channel_join_completes_
+            // the_possession_handshake`): the shared client's framed request, possession
+            // signature and ack reader against `admit_channel_join_on_duplex`, the `:443`
+            // front door's admission core. A genuine holder is admitted (the edge decodes the
+            // very request the client framed); a holder signing with the wrong key is refused
+            // with the edge's OWN framed `possession` category — the real-edge proof that the
+            // token the client parses is the one this module writes (ct-agent#129: an explicit
+            // refusal is `Refused`, never an error).
+            let channel = [0xA0u8; 32];
+            let holder = holder_sk(0x11);
+            let req = request(channel, &holder, Direction::Initiate, "203.0.113.7:9000");
+            let pk = op_pub();
+            let authorize = move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+            let observed: SocketAddr = "198.51.100.7:4477".parse().unwrap();
+
+            // (1) Genuine holder → Admitted; a lone admission acks a bare `OK` and closes
+            // (the `resolve_channel_join` shape).
+            let (client_end, edge_end) = tokio::io::duplex(4096);
+            let edge = tokio::spawn(async move {
+                let (mut stream, seen_req, op, noise, attest, seen) =
+                    admit_channel_join_on_duplex(edge_end, observed, 500, BOUND, &authorize)
+                        .await
+                        .expect("the real edge admits the shared client's join");
+                stream.write_all(b"OK").await.expect("ack");
+                stream.shutdown().await.expect("close");
+                (seen_req, op, noise, attest, seen)
+            });
+            let (cr, cw) = tokio::io::split(client_end);
+            let outcome = within(
+                "join",
+                present_channel_join_on_stream(cw, cr, &req, &holder, ADMISSION_EXCHANGE_TIMEOUT, false, None, false),
+            )
+            .await
+            .expect("join drives");
+            let (seen_req, op, noise, attest, seen) = within("edge", edge).await.expect("edge task");
+            assert_eq!(
+                outcome,
+                ChannelJoinOutcome::Admitted {
+                    peer_endpoint: String::new(),
+                    peer_noise_pubkey: None,
+                    peer_holder: None,
+                    peer_attestation: None,
+                    observed_reflexive: None,
+                },
+                "the genuine holder proves possession and is admitted"
+            );
+            assert_eq!(seen_req, req, "the edge decoded exactly the request the shared client framed");
+            assert_eq!((op, noise, attest, seen), (pk, None, None, observed));
+
+            // (2) Wrong possession key → the edge's framed `possession` refusal, classified
+            // as definitive on the edge and as `Refused { Some("possession") }` by the client.
+            let thief = holder_sk(0x99);
+            let (client_end, edge_end) = tokio::io::duplex(4096);
+            let edge = tokio::spawn(async move {
+                admit_channel_join_on_duplex(edge_end, observed, 500, BOUND, &authorize).await.map(|_| ())
+            });
+            let (cr, cw) = tokio::io::split(client_end);
+            let outcome = within(
+                "refused join",
+                present_channel_join_on_stream(cw, cr, &req, &thief, ADMISSION_EXCHANGE_TIMEOUT, false, None, false),
+            )
+            .await
+            .expect("an explicit refusal is a clean outcome, not an error (#129)");
+            let err = within("edge", edge).await.expect("edge task").expect_err("the edge refuses the thief");
+            assert!(is_definitive_join_refusal(&err), "a failed possession proof is definitive on the edge: {err}");
+            assert_eq!(
+                outcome,
+                ChannelJoinOutcome::Refused { category: Some("possession".to_string()) },
+                "the client surfaces the edge's own category token (#524)"
+            );
+        }
+
+        #[tokio::test]
+        async fn shared_client_learns_peer_endpoint_and_own_reflexive_from_the_edge_rendezvous_p2() {
+            // ct-agent#72 AF4 + #121 B1 + CADS-Tunnel#495 U2 (from ct-agent's `two_agent_clients_
+            // learn_each_others_endpoint` / `member_learns_its_edge_observed_reflexive_over_quic`):
+            // two shared QUIC clients join the same channel; `broker_channel_rendezvous` pairs
+            // them and each parses the PEER's advertised endpoint and its OWN edge-observed
+            // reflexive (`r=`, exactly the loopback source it dialed from) out of the ack. B
+            // sends the `[0xFF, 0x01]` rendezvous preamble and A none: the edge's marker
+            // toleration (#495 U2 b') and the unmarked legacy wire are both proven against
+            // the real admission.
+            let channel = [0xB0u8; 32];
+            let holder_a = holder_sk(0x21);
+            let holder_b = holder_sk(0x22);
+            let req_a = request(channel, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(channel, &holder_b, Direction::Accept, "203.0.113.2:7002");
+            let pk = op_pub();
+
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let srv = tokio::spawn(async move {
+                broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) })
+                    .await
+                    .map(|_| ())
+            });
+            let cert_b = cert.clone();
+            let a = tokio::spawn(async move {
+                let (out, source, conn) = join_quic(cert, addr, &req_a, &holder_a, None).await;
+                conn.close(0u32.into(), b"done");
+                (out, source)
+            });
+            let b = tokio::spawn(async move {
+                let (out, source, conn) = join_quic(cert_b, addr, &req_b, &holder_b, Some(PHASE_MARKER_RENDEZVOUS)).await;
+                conn.close(0u32.into(), b"done");
+                (out, source)
+            });
+            let (out_a, src_a) = within("a", a).await.expect("a");
+            let (out_b, src_b) = within("b", b).await.expect("b");
+            within("broker", srv).await.expect("broker task").expect("the edge paired the two members");
+
+            for (out, src, peer_ep, who) in [(out_a, src_a, "203.0.113.2:7002", "A"), (out_b, src_b, "203.0.113.1:7001", "B")] {
+                match out {
+                    ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive } => {
+                        assert_eq!(peer_endpoint, peer_ep, "{who} learns the peer's advertised endpoint");
+                        assert_eq!((peer_noise_pubkey, peer_holder, peer_attestation), (None, None, None), "no registry keys -> no triple, not a parse artifact");
+                        assert_eq!(observed_reflexive, Some(src), "{who} learns exactly the reflexive the edge observed (#121 B1)");
+                    }
+                    other => panic!("{who}: expected Admitted, got {other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn shared_client_receives_and_verifies_the_peers_attested_noise_key_from_the_edge_p2() {
+            // ct-agent#101/#100 + CADS-Tunnel#122 + ct-agent#28 (from ct-agent's `rendezvous_relays_
+            // each_peers_attested_noise_key`): when the registry holds each member's Noise key +
+            // holder-signed attestation, the edge's ack carries the PEER's `<noise> <holder>
+            // <attest>` triple followed by the `r=`/`sp=` tags. The shared client's grammar-true
+            // parser (#28) recovers the triple intact next to the tags, and the attestation
+            // verifies under the peer's grant-authenticated holder — the exact pre-pin check a
+            // ct-agent initiator performs before trusting the key.
+            let channel = [0xC0u8; 32];
+            let holder_a = holder_sk(0x31);
+            let holder_b = holder_sk(0x32);
+            let hkey_a = holder_a.verifying_key().to_bytes();
+            let hkey_b = holder_b.verifying_key().to_bytes();
+            let noise_a = [0xAAu8; 32];
+            let noise_b = [0xBBu8; 32];
+            let attest_a = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &hkey_a, &noise_a)).to_bytes();
+            let attest_b = holder_b.sign(&member_noise_attest_bytes(&ChannelId(channel), &hkey_b, &noise_b)).to_bytes();
+            let req_a = request(channel, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(channel, &holder_b, Direction::Accept, "203.0.113.2:7002");
+            let pk = op_pub();
+
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let srv = tokio::spawn(async move {
+                broker_channel_rendezvous(&server, 500, move |c, h| async move {
+                    let (noise, attest) = if h == hkey_a { (noise_a, attest_a) } else { (noise_b, attest_b) };
+                    (c.0 == channel).then_some((pk, Some(noise), Some(attest)))
+                })
+                .await
+                .map(|_| ())
+            });
+            let cert_b = cert.clone();
+            let a = tokio::spawn(async move {
+                let (out, _, conn) = join_quic(cert, addr, &req_a, &holder_a, None).await;
+                conn.close(0u32.into(), b"done");
+                out
+            });
+            let b = tokio::spawn(async move {
+                let (out, _, conn) = join_quic(cert_b, addr, &req_b, &holder_b, None).await;
+                conn.close(0u32.into(), b"done");
+                out
+            });
+            let out_a = within("a", a).await.expect("a");
+            let out_b = within("b", b).await.expect("b");
+            within("broker", srv).await.expect("broker task").expect("paired");
+
+            for (out, peer_ep, pn, ph, pa, who) in [
+                (out_a, "203.0.113.2:7002", noise_b, hkey_b, attest_b, "A"),
+                (out_b, "203.0.113.1:7001", noise_a, hkey_a, attest_a, "B"),
+            ] {
+                match out {
+                    ChannelJoinOutcome::Admitted { peer_endpoint, peer_noise_pubkey, peer_holder, peer_attestation, observed_reflexive } => {
+                        assert_eq!(peer_endpoint, peer_ep, "{who}: positional endpoint unaffected by the tags (#28)");
+                        assert_eq!((peer_noise_pubkey, peer_holder, peer_attestation), (Some(pn), Some(ph), Some(pa)), "{who} learns the peer's attested triple (#101/#122)");
+                        assert!(
+                            verify_member_noise_attestation(&ChannelId(channel), &ph, &pn, &pa),
+                            "{who}: the relayed attestation verifies under the peer's grant holder (#101)"
+                        );
+                        assert!(observed_reflexive.is_some_and(|r| r.ip().is_loopback()), "{who}: `r=` still parsed next to the triple");
+                    }
+                    other => panic!("{who}: expected Admitted, got {other:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn shared_client_joins_the_edge_relay_and_carries_bytes_over_open_channel_streams_p2() {
+            // ct-agent#72 AF4-relay + ct-agent#139 + CADS-Tunnel#495 U2 (a') (the shared-client
+            // form of this module's `broker_channel_relay_splices_two_members_tunnels`): both
+            // members join the RELAY endpoint with the relay phase preamble via the shared QUIC
+            // join, each learns the other's endpoint from the ack, then the shared bounded
+            // stream setup (`open_channel_streams`: initiator opens, acceptor accepts the
+            // edge-opened stream) carries bytes both ways THROUGH the edge splice.
+            let channel = [0xE0u8; 32];
+            let holder_a = holder_sk(0xa1);
+            let holder_b = holder_sk(0xb2);
+            let req_a = request(channel, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(channel, &holder_b, Direction::Accept, "203.0.113.2:7002");
+            let pk = op_pub();
+
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let relay = tokio::spawn(async move {
+                broker_channel_relay(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) })
+                    .await
+                    .map(|_| ())
+            });
+            let cert_b = cert.clone();
+            let a = tokio::spawn(async move {
+                let (out, _, conn) = join_quic(cert, addr, &req_a, &holder_a, Some(PHASE_MARKER_RELAY)).await;
+                assert!(matches!(&out, ChannelJoinOutcome::Admitted { peer_endpoint, .. } if peer_endpoint == "203.0.113.2:7002"), "A admitted with B's endpoint, got {out:?}");
+                let (mut s, mut r) = within("a streams", open_channel_streams(&conn, true, BOUND)).await.expect("initiator opens");
+                s.write_all(b"tunnel A->B via edge").await.expect("a write");
+                let mut got = vec![0u8; 20];
+                within("a read", r.read_exact(&mut got)).await.expect("a read");
+                conn.close(0u32.into(), b"done");
+                got
+            });
+            let b = tokio::spawn(async move {
+                let (out, _, conn) = join_quic(cert_b, addr, &req_b, &holder_b, Some(PHASE_MARKER_RELAY)).await;
+                assert!(matches!(&out, ChannelJoinOutcome::Admitted { peer_endpoint, .. } if peer_endpoint == "203.0.113.1:7001"), "B admitted with A's endpoint, got {out:?}");
+                let (mut s, mut r) = within("b streams", open_channel_streams(&conn, false, BOUND)).await.expect("acceptor accepts");
+                let mut got = vec![0u8; 20];
+                within("b read", r.read_exact(&mut got)).await.expect("b read");
+                s.write_all(b"tunnel B->A via edge").await.expect("b write");
+                let _ = s.finish();
+                within("b closed", conn.closed()).await;
+                got
+            });
+            let got_a = within("a", a).await.expect("a");
+            let got_b = within("b", b).await.expect("b");
+            let _ = within("relay", relay).await;
+            assert_eq!(&got_a, b"tunnel B->A via edge", "A receives B's bytes through the edge relay");
+            assert_eq!(&got_b, b"tunnel A->B via edge", "B receives A's bytes through the edge relay");
+        }
+
+        #[tokio::test]
+        async fn shared_relay_leg_client_reads_the_rich_ack_then_the_session_on_the_same_stream_p2() {
+            // CADS-Tunnel#106/#122 + ct-agent#148 + #495-U1: the `:443` SAME-stream contract.
+            // Two members are admitted over duplexes by `admit_channel_join_on_duplex` and
+            // relay-spliced by `finish_relay_pair_over_streams`, which acks each the RICH
+            // `OK <peer> <noise> <holder> <attest> r=<own> sp=<0|1>\n` line and then splices.
+            // The shared relay-leg client (`present_channel_relay_join_on_stream`) must read
+            // the ack up to its `\n` and not one byte further: the very next bytes on the same
+            // stream are the peer's session, and both directions must arrive intact.
+            let channel = [0xD0u8; 32];
+            let holder_a = holder_sk(0x41);
+            let holder_b = holder_sk(0x42);
+            let hkey_a = holder_a.verifying_key().to_bytes();
+            let hkey_b = holder_b.verifying_key().to_bytes();
+            let noise_a = [0xA1u8; 32];
+            let noise_b = [0xB1u8; 32];
+            let attest_a = holder_a.sign(&member_noise_attest_bytes(&ChannelId(channel), &hkey_a, &noise_a)).to_bytes();
+            let attest_b = holder_b.sign(&member_noise_attest_bytes(&ChannelId(channel), &hkey_b, &noise_b)).to_bytes();
+            let req_a = request(channel, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(channel, &holder_b, Direction::Accept, "203.0.113.2:7002");
+            let pk = op_pub();
+            let authorize = move |c: ChannelId, h: [u8; 32]| async move {
+                let (noise, attest) = if h == hkey_a { (noise_a, attest_a) } else { (noise_b, attest_b) };
+                (c.0 == channel).then_some((pk, Some(noise), Some(attest)))
+            };
+            // Distinct observed IPs: `sp=0`, and each side must get ITS OWN back as `r=`.
+            let obs_a: SocketAddr = "198.51.100.1:8001".parse().unwrap();
+            let obs_b: SocketAddr = "198.51.100.2:8002".parse().unwrap();
+
+            let (client_a, edge_a) = tokio::io::duplex(4096);
+            let (client_b, edge_b) = tokio::io::duplex(4096);
+            let edge = tokio::spawn(async move {
+                let mut members = Vec::new();
+                for (stream, observed) in [(edge_a, obs_a), (edge_b, obs_b)] {
+                    let (stream, req, operator, noise, attest, observed) =
+                        admit_channel_join_on_duplex(stream, observed, 500, BOUND, &authorize)
+                            .await
+                            .expect("the real edge admits the shared relay-leg client");
+                    members.push(AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: None });
+                }
+                let b = members.pop().unwrap();
+                let a = members.pop().unwrap();
+                finish_relay_pair_over_streams(a, b, 500).await.map(|_| ())
+            });
+
+            let client = |stream: tokio::io::DuplexStream, req: ChannelJoinRequest, holder: SigningKey, send: &'static [u8], want: &'static [u8]| async move {
+                let (mut cr, mut cw) = tokio::io::split(stream);
+                let out = within("relay join", present_channel_relay_join_on_stream(&mut cw, &mut cr, &req, &holder, None))
+                    .await
+                    .expect("relay-leg join drives");
+                // The session follows on the SAME halves the join used.
+                cw.write_all(send).await.expect("session write");
+                cw.flush().await.expect("flush");
+                let mut got = vec![0u8; want.len()];
+                within("session read", cr.read_exact(&mut got)).await.expect("session read");
+                assert_eq!(got, want, "the peer's first session bytes arrive intact right after the ack");
+                out
+            };
+            let a = tokio::spawn(client(client_a, req_a, holder_a, b"session A->B", b"session B->A"));
+            let b = tokio::spawn(client(client_b, req_b, holder_b, b"session B->A", b"session A->B"));
+            let out_a = within("a", a).await.expect("a");
+            let out_b = within("b", b).await.expect("b");
+            let _ = within("edge", edge).await.expect("edge task"); // the splice ends when the clients drop
+
+            for (out, peer_ep, pn, ph, pa, own, who) in [
+                (out_a, "203.0.113.2:7002", noise_b, hkey_b, attest_b, obs_a, "A"),
+                (out_b, "203.0.113.1:7001", noise_a, hkey_a, attest_a, obs_b, "B"),
+            ] {
+                assert_eq!(
+                    out,
+                    ChannelJoinOutcome::Admitted {
+                        peer_endpoint: peer_ep.to_string(),
+                        peer_noise_pubkey: Some(pn),
+                        peer_holder: Some(ph),
+                        peer_attestation: Some(pa),
+                        observed_reflexive: Some(own),
+                    },
+                    "{who}: the rich relay ack parses whole — peer triple (#122) and its OWN reflexive (#495-U1)"
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "FOUND BY THIS TEST (2026-09-03, deterministic in 5/5 runs): on the QUIC pairing-refusal \
+                    path `finish_quic_pair_inner` writes the framed `pairing` refusal to both members, returns \
+                    Err, and thereby drops both `AdmittedMember` connections at once -- quinn's implicit close \
+                    on drop sends NO further data, so the still-buffered refusal never leaves the edge and the \
+                    shared client (correctly) reports `DroppedLegBeforeAck` (retryable) instead of the definitive \
+                    `Refused { Some(\"pairing\") }`. The admission-refusal path holds the connection for 2 s for \
+                    exactly this reason (#129-follow, `accept_and_read_join`); the pairing arm lacks that hold. \
+                    Production fix is edge-side and out of this test-only PR's scope; un-ignore with it."]
+        async fn shared_client_surfaces_the_edges_framed_pairing_refusal_after_possession_p2() {
+            // CADS-Tunnel#524 (post-admission category) + ct-agent#23: two INITIATORS of the
+            // same channel each pass admission (grant + possession) but cannot be paired; the
+            // edge writes the framed `pairing` refusal after the possession exchange. The
+            // shared client classifies that at the byte level as `Refused { Some("pairing") }`
+            // — not a dropped leg, not an error, and not the generic category-less refusal.
+            let channel = [0xF0u8; 32];
+            let holder_a = holder_sk(0x51);
+            let holder_b = holder_sk(0x52);
+            let req_a = request(channel, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(channel, &holder_b, Direction::Initiate, "203.0.113.2:7002");
+            let pk = op_pub();
+
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let srv = tokio::spawn(async move {
+                let r = broker_channel_rendezvous(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) })
+                    .await
+                    .map(|_| ());
+                // The live edge's endpoint outlives one refused pairing; only the members'
+                // connections are dropped by the completer. Mirror that here.
+                within("drain", server.wait_idle()).await;
+                r
+            });
+            let cert_b = cert.clone();
+            let a = tokio::spawn(async move { join_quic(cert, addr, &req_a, &holder_a, None).await.0 });
+            let b = tokio::spawn(async move { join_quic(cert_b, addr, &req_b, &holder_b, None).await.0 });
+            let out_a = within("a", a).await.expect("a");
+            let out_b = within("b", b).await.expect("b");
+            within("broker", srv).await.expect("broker task").expect_err("two initiators are not pairable");
+            for (out, who) in [(out_a, "A"), (out_b, "B")] {
+                assert_eq!(out, ChannelJoinOutcome::Refused { category: Some("pairing".to_string()) }, "{who}");
+            }
+        }
+
+        #[tokio::test]
+        async fn shared_client_classifies_the_edges_quic_park_expiry_close_as_park_expired_p2() {
+            // ct-agent#21 (QUIC half) + CADS-Tunnel#557: a reaped QUIC park writes no ack at all —
+            // the edge closes the CONNECTION with the named `park-expired: …` reason
+            // (`quic_park_expired_reason`, built from the shared `PARK_EXPIRED_REASON_PREFIX`).
+            // The shared client must read that wire-carried reason out of quinn's error chain
+            // and return `ParkExpired` — neither `Refused` (the #21 phantom rung failures) nor
+            // a transport error. Both sides now derive the token from ct_common, and this is
+            // where a reword on either side fails.
+            let channel = [0x21u8; 32];
+            let holder = holder_sk(0x61);
+            let req = request(channel, &holder, Direction::Accept, "203.0.113.8:7008");
+            let pk = op_pub();
+
+            let (server, cert) = build_server_endpoint_with_cert().expect("server");
+            let addr = server.local_addr().expect("addr");
+            let edge = tokio::spawn(async move {
+                let conn = within("accept", server.accept()).await.expect("incoming");
+                let conn = within("handshake", std::future::IntoFuture::into_future(conn)).await.expect("conn");
+                let (_send, _req, _op, _noise, _attest, _observed) =
+                    read_join_on_connection(&conn, 500, BOUND, &move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) })
+                        .await
+                        .expect("admitted, then parked with no partner");
+                // The park TTL reap: close the whole connection, naming why.
+                conn.close(0u32.into(), quic_park_expired_reason("no partner within the park TTL").as_bytes());
+                within("drain", server.wait_idle()).await;
+            });
+            let (outcome, _, conn) = join_quic(cert, addr, &req, &holder, None).await;
+            conn.close(0u32.into(), b"done");
+            within("edge", edge).await.expect("edge task");
+            assert_eq!(outcome, ChannelJoinOutcome::ParkExpired, "the named close reason classifies as ParkExpired (#21), not a refusal");
+        }
+    }
 }
