@@ -318,6 +318,7 @@ pub fn portal_api_router_with_verifier(
         .route("/portal/agent-bridges", get(rest_bridges_page))
         .route("/portal/tunnels/:id/delete", post(delete_tunnel))
         .route("/portal/tunnels/:id/reclaim-cert-slot", post(reclaim_cert_slot))
+        .route("/portal/tunnels/:id/cert-claim-opt-out", post(set_cert_claim_opt_out))
         .route("/portal/tunnels/:id/install", get(install_page))
         .route("/portal/tunnels/:id/grants", get(grants_page).post(add_grant))
         .route("/portal/tunnels/:id/grants/:grantee/delete", post(delete_grant))
@@ -4652,6 +4653,35 @@ async fn reclaim_cert_slot(State(st): State<ApiState>, headers: HeaderMap, Path(
     Redirect::to("/portal/tunnels").into_response()
 }
 
+#[derive(Deserialize)]
+struct CertClaimOptOutForm {
+    /// Present (any value) when the portal checkbox was checked; absent when
+    /// unchecked -- standard HTML checkbox-form semantics, not a boolean field.
+    enabled: Option<String>,
+}
+
+/// `POST /portal/tunnels/:id/cert-claim-opt-out` (CADS-Tunnel#758): the owner's
+/// own opt-out from the Gelb claim/lapse cycle -- "stop offering me a 48h window
+/// I was never going to claim." Available to every plan (no gate, unlike
+/// tunnel-sharing) -- this reduces load on the operator's own queue, not a paid
+/// feature. Owner-scoped, same "existence leaks nothing" 404 posture as every
+/// other tunnel toggle in this file.
+async fn set_cert_claim_opt_out(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<CertClaimOptOutForm>,
+) -> Response {
+    let Some(subject) = session_subject_for(&st.session_key, &headers) else {
+        return Redirect::to("/portal").into_response();
+    };
+    match st.tunnels.set_cert_claim_opt_out(&subject, &id, form.enabled.is_some()) {
+        Ok(true) => Redirect::to("/portal/tunnels").into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "unknown tunnel".to_string()).into_response(),
+        Err(e) => internal_error("set_cert_claim_opt_out", e).into_response(),
+    }
+}
+
 /// `GET /portal/tunnels/:id/install` (#28): render the tokens (and how to use
 /// them) to bring an agent up for one of the caller's own tunnels. A fresh,
 /// single-use join token is minted per request and embedded via an env var.
@@ -4995,20 +5025,43 @@ fn cert_tier_html(id: &str, admission: &crate::storage::CertAdmission) -> String
                 "lapsed" => format!(
                     r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; die Frist ist abgelaufen.</div>{disclosure}
 <form class="inline" method="post" action="/portal/tunnels/{id}/reclaim-cert-slot">
- <button class="sec" type="submit">Erneut anfragen</button></form>"#
+ <button class="sec" type="submit">Erneut anfragen</button></form>{opt_out_form}"#,
+                    opt_out_form = cert_claim_opt_out_form_html(id, admission.cert_claim_opt_out),
                 ),
+                _ if admission.cert_claim_opt_out => {
+                    format!(
+                        r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; bleibt dauerhaft (Opt-out).</div>{disclosure}{opt_out_form}"#,
+                        opt_out_form = cert_claim_opt_out_form_html(id, true),
+                    )
+                }
                 _ => {
                     let position_note = match admission.queue_position {
                         Some(p) => format!(" &mdash; Warteschlangenposition {}", p + 1),
                         None => String::new(),
                     };
                     format!(
-                        r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; bereits erreichbar{position_note}.</div>{disclosure}"#
+                        r#"<div class="tier tier-gelb"><i class="tier-dot pulse"></i>Gelb &mdash; bereits erreichbar{position_note}.</div>{disclosure}{opt_out_form}"#,
+                        opt_out_form = cert_claim_opt_out_form_html(id, false),
                     )
                 }
             }
         }
     }
+}
+
+/// CADS-Tunnel#758: the owner-facing opt-out checkbox for the Gelb claim/lapse cycle,
+/// shared by every non-`offered` Gelb branch above (an open 48h offer is left alone --
+/// opting out mid-window doesn't retroactively cancel it, same "no surprise mid-flight
+/// state change" posture [`crate::storage::SqliteTunnelStore::set_cert_claim_opt_out`]
+/// documents).
+fn cert_claim_opt_out_form_html(id: &str, checked: bool) -> String {
+    format!(
+        r#"<form class="inline" method="post" action="/portal/tunnels/{id}/cert-claim-opt-out">
+ <label><input type="checkbox" name="enabled" value="1"{checked_attr}> Bleib dauerhaft auf dem gemeinsamen Zertifikat (kein eigenes Grün)</label>
+ <button class="sec" type="submit">Update</button>
+</form>"#,
+        checked_attr = if checked { " checked" } else { "" },
+    )
 }
 
 /// Render a byte count the way a tunnel owner reads it -- `0 B`/`512 B`/`3.4 KB`/
@@ -9069,10 +9122,11 @@ mod tests {
 
     #[tokio::test]
     async fn reclaim_cert_slot_only_reenters_the_queue_from_lapsed_and_only_for_the_owner() {
-        // #233: re-request after a lapse must (a) require ownership, (b) be a
-        // no-op unless the hostname is actually `lapsed`, and (c) land the
-        // hostname back at the queue's back (fresh queued_at), never restoring
-        // its old position.
+        // #233/#758: re-request must (a) require ownership, (b) be a no-op unless
+        // the hostname is actually `lapsed` (a state nothing produces anymore since
+        // #758's auto-requeue, but a pre-existing/legacy row could still carry --
+        // simulated directly here), and (c) land the hostname back at the queue's
+        // back (fresh queued_at), never restoring its old position.
         let (app, tunnels) = test_app_with_tunnels();
         let alice_hostname = "alice-site.example.com".to_string();
         let alice_id = tunnels.create("alice", "site", Some(&alice_hostname)).unwrap().created().expect("hostname is free in this test").id;
@@ -9082,11 +9136,29 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER, "redirects back regardless");
         assert_eq!(tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().status, "rot");
 
-        // Queue it, offer it, then let it lapse.
+        // Queue it, offer it, let it lapse -- #758: this now auto-requeues, so
+        // reclaim-cert-slot on it is correctly a no-op (nothing to reclaim).
         tunnels.enter_gelb_queue(&alice_hostname, 100).unwrap();
         tunnels.offer_claim(&alice_hostname, "letsencrypt", 100, 200).unwrap();
         tunnels.lapse_expired_claims(300).unwrap();
-        assert_eq!(tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().claim_state, "lapsed");
+        assert_eq!(
+            tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().claim_state,
+            "none",
+            "auto-requeued by the sweep, not left dead-ended at 'lapsed'"
+        );
+        post_form(&app, &format!("/portal/tunnels/{alice_id}/reclaim-cert-slot"), "alice", "").await;
+        assert_eq!(
+            tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().claim_state,
+            "none",
+            "reclaiming an already-requeued tunnel is a harmless no-op"
+        );
+
+        // Simulate a legacy 'lapsed' row (nothing produces this state anymore, but an
+        // older database or a row from before this migration could still carry one) --
+        // owner-scoping and the queue-position-reset behavior must still both hold.
+        tunnels
+            .set_lapsed_for_test(&alice_hostname)
+            .expect("test-only direct SQL to simulate a legacy lapsed row");
 
         // A stranger cannot reclaim alice's tunnel.
         let _ = get(&app, "/portal/tunnels", Some("bob")).await; // provisions bob's own tunnel
@@ -9102,6 +9174,40 @@ mod tests {
         let a = tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap();
         assert_eq!(a.claim_state, "none");
         assert_eq!(a.status, "gelb");
+    }
+
+    #[tokio::test]
+    async fn cert_claim_opt_out_route_is_owner_scoped_and_removes_the_tunnel_from_the_gelb_queue() {
+        // #758: available to every plan (no gate, unlike tunnel-sharing) -- toggling
+        // it must (a) require ownership, (b) actually take the hostname out of the
+        // FIFO the acme_broker sweep pulls from, and (c) be reflected back in
+        // cert_admission_for_hostname so the portal page renders the right state.
+        let (app, tunnels) = test_app_with_tunnels();
+        let alice_hostname = "alice-site.example.com".to_string();
+        let alice_id = tunnels.create("alice", "site", Some(&alice_hostname)).unwrap().created().expect("hostname is free in this test").id;
+        tunnels.enter_gelb_queue(&alice_hostname, 100).unwrap();
+        assert!(tunnels.gelb_queue_fifo().unwrap().contains(&alice_hostname));
+
+        // A stranger cannot opt bob's version of alice's tunnel out.
+        let _ = get(&app, "/portal/tunnels", Some("bob")).await; // provisions bob's own tunnel
+        post_form(&app, &format!("/portal/tunnels/{alice_id}/cert-claim-opt-out"), "bob", "enabled=1").await;
+        assert!(
+            !tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().cert_claim_opt_out,
+            "bob cannot opt alice's tunnel out"
+        );
+
+        // Alice opts her own tunnel out -> excluded from the queue, no queue_position.
+        let status = post_form(&app, &format!("/portal/tunnels/{alice_id}/cert-claim-opt-out"), "alice", "enabled=1").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let a = tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap();
+        assert!(a.cert_claim_opt_out);
+        assert_eq!(a.queue_position, None, "opted-out tunnels never show a queue position");
+        assert!(!tunnels.gelb_queue_fifo().unwrap().contains(&alice_hostname), "excluded from the FIFO");
+
+        // Unchecking the box (no `enabled` field at all) turns it back off.
+        post_form(&app, &format!("/portal/tunnels/{alice_id}/cert-claim-opt-out"), "alice", "").await;
+        assert!(!tunnels.cert_admission_for_hostname(&alice_hostname).unwrap().unwrap().cert_claim_opt_out);
+        assert!(tunnels.gelb_queue_fifo().unwrap().contains(&alice_hostname), "back in the FIFO");
     }
 
     #[tokio::test]

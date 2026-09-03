@@ -2288,6 +2288,11 @@ pub struct CertAdmission {
     /// Position in the Gelb queue (0 = next), or `None` once a claim has been
     /// offered or the hostname is already `gruen`.
     pub queue_position: Option<i64>,
+    /// CADS-Tunnel#758: the owner has opted out of ever being offered a claim
+    /// window -- excluded from [`SqliteTunnelStore::gelb_queue_fifo`], and
+    /// [`SqliteTunnelStore::lapse_expired_claims`] parks it (no fresh
+    /// `queued_at`) instead of auto-requeueing it, on every expiry.
+    pub cert_claim_opt_out: bool,
 }
 
 impl CertAdmission {
@@ -2500,6 +2505,13 @@ impl SqliteTunnelStore {
         // the allow-list is ignored while this is on. Off by default for every existing
         // tunnel on upgrade, same explicit-owner-action-only posture as require_login.
         ensure_column(&conn, "subject_tunnels", "allow_any_login", "INTEGER NOT NULL DEFAULT 0")?;
+        // CADS-Tunnel#758: an owner-opt-out from the Gelb claim/lapse cycle -- "I'm
+        // intentionally staying on the shared wildcard cert, stop offering me a 48h
+        // window I was never going to claim." Off by default for every existing tunnel
+        // on upgrade, same explicit-owner-action-only posture as require_login above.
+        // Available to every plan (not gated the way tunnel-sharing is) -- this is a
+        // load-reduction knob for the operator's own queue, not a paid feature.
+        ensure_column(&conn, "subject_tunnels", "cert_claim_opt_out", "INTEGER NOT NULL DEFAULT 0")?;
         // #517 V3 (traffic offload, slice 2): direct-serving state per tunnel.
         // `direct_endpoint` is the agent-advertised "ip:port" a reachable Green-tier
         // agent serves browsers on directly; `direct_enabled` is the OWNER's opt-in
@@ -2909,6 +2921,19 @@ impl SqliteTunnelStore {
     pub fn set_require_login(&self, subject: &str, tunnel_id: &str, enabled: bool) -> rusqlite::Result<bool> {
         let n = self.writer.lock_safe().execute(
             "UPDATE subject_tunnels SET require_login = ?1 WHERE id = ?2 AND subject = ?3",
+            params![enabled as i64, tunnel_id, subject],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// CADS-Tunnel#758: owner-scoped toggle for [`CertAdmission::cert_claim_opt_out`].
+    /// Turning it ON doesn't retroactively clear an already-open `offered` window --
+    /// it only takes effect the next time [`Self::lapse_expired_claims`] or
+    /// [`Self::gelb_queue_fifo`] looks at this hostname, same "no surprise mid-flight
+    /// state change" posture as `set_require_login` above.
+    pub fn set_cert_claim_opt_out(&self, subject: &str, tunnel_id: &str, enabled: bool) -> rusqlite::Result<bool> {
+        let n = self.writer.lock_safe().execute(
+            "UPDATE subject_tunnels SET cert_claim_opt_out = ?1 WHERE id = ?2 AND subject = ?3",
             params![enabled as i64, tunnel_id, subject],
         )?;
         Ok(n > 0)
@@ -3802,22 +3827,22 @@ impl SqliteTunnelStore {
     /// the moment a hostname leaves the "waiting" sub-state.
     pub fn cert_admission_for_hostname(&self, hostname: &str) -> rusqlite::Result<Option<CertAdmission>> {
         let conn = self.read();
-        let row: Option<(String, Option<String>, String, Option<i64>, Option<i64>)> = conn
+        let row: Option<(String, Option<String>, String, Option<i64>, Option<i64>, bool)> = conn
             .query_row(
-                "SELECT status, assigned_ca, claim_state, claim_deadline, queued_at
+                "SELECT status, assigned_ca, claim_state, claim_deadline, queued_at, cert_claim_opt_out
                  FROM subject_tunnels WHERE hostname = ?1",
                 params![hostname],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
-        let Some((status, assigned_ca, claim_state, claim_deadline, queued_at)) = row else {
+        let Some((status, assigned_ca, claim_state, claim_deadline, queued_at, cert_claim_opt_out)) = row else {
             return Ok(None);
         };
-        let queue_position = if status == "gelb" && claim_state == "none" {
+        let queue_position = if status == "gelb" && claim_state == "none" && !cert_claim_opt_out {
             match queued_at {
                 Some(qa) => Some(conn.query_row(
                     "SELECT COUNT(*) FROM subject_tunnels
-                     WHERE status = 'gelb' AND claim_state = 'none' AND queued_at < ?1",
+                     WHERE status = 'gelb' AND claim_state = 'none' AND queued_at < ?1 AND cert_claim_opt_out = 0",
                     params![qa],
                     |r| r.get(0),
                 )?),
@@ -3826,7 +3851,7 @@ impl SqliteTunnelStore {
         } else {
             None
         };
-        Ok(Some(CertAdmission { status, assigned_ca, claim_state, claim_deadline, queue_position }))
+        Ok(Some(CertAdmission { status, assigned_ca, claim_state, claim_deadline, queue_position, cert_claim_opt_out }))
     }
 
     /// Batched form of [`Self::cert_admission_for_hostname`] (#351): a page rendering N
@@ -3848,35 +3873,35 @@ impl SqliteTunnelStore {
         let conn = self.read();
         let placeholders = std::iter::repeat("?").take(hostnames.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT hostname, status, assigned_ca, claim_state, claim_deadline, queued_at
+            "SELECT hostname, status, assigned_ca, claim_state, claim_deadline, queued_at, cert_claim_opt_out
              FROM subject_tunnels WHERE hostname IN ({placeholders})"
         );
-        let rows: Vec<(String, String, Option<String>, String, Option<i64>, Option<i64>)> = conn
+        let rows: Vec<(String, String, Option<String>, String, Option<i64>, Option<i64>, bool)> = conn
             .prepare(&sql)?
             .query_map(rusqlite::params_from_iter(hostnames.iter()), |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut queued_ats: Vec<i64> = conn
             .prepare(
                 "SELECT queued_at FROM subject_tunnels
-                 WHERE status = 'gelb' AND claim_state = 'none' AND queued_at IS NOT NULL",
+                 WHERE status = 'gelb' AND claim_state = 'none' AND queued_at IS NOT NULL AND cert_claim_opt_out = 0",
             )?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<i64>>>()?;
         queued_ats.sort_unstable();
 
         let mut out = std::collections::HashMap::with_capacity(rows.len());
-        for (hostname, status, assigned_ca, claim_state, claim_deadline, queued_at) in rows {
-            let queue_position = if status == "gelb" && claim_state == "none" {
+        for (hostname, status, assigned_ca, claim_state, claim_deadline, queued_at, cert_claim_opt_out) in rows {
+            let queue_position = if status == "gelb" && claim_state == "none" && !cert_claim_opt_out {
                 queued_at.map(|qa| queued_ats.partition_point(|&x| x < qa) as i64)
             } else {
                 None
             };
             out.insert(
                 hostname,
-                CertAdmission { status, assigned_ca, claim_state, claim_deadline, queue_position },
+                CertAdmission { status, assigned_ca, claim_state, claim_deadline, queue_position, cert_claim_opt_out },
             );
         }
         Ok(out)
@@ -3928,9 +3953,13 @@ impl SqliteTunnelStore {
     /// the admission sweep's candidate list, oldest `queued_at` first.
     pub fn gelb_queue_fifo(&self) -> rusqlite::Result<Vec<String>> {
         let conn = self.read();
+        // CADS-Tunnel#758: `cert_claim_opt_out` rows never surface here -- they stay
+        // parked at claim_state='none' forever, by design (the owner said not to
+        // bother offering).
         let mut stmt = conn.prepare(
             "SELECT hostname FROM subject_tunnels
              WHERE status = 'gelb' AND claim_state = 'none' AND assigned_ca IS NULL
+               AND cert_claim_opt_out = 0
              ORDER BY queued_at ASC",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -3959,9 +3988,20 @@ impl SqliteTunnelStore {
     /// `lapsed`, awaiting an explicit customer re-request. Returns the number
     /// of rows lapsed this sweep.
     pub fn lapse_expired_claims(&self, now: i64) -> rusqlite::Result<usize> {
+        // CADS-Tunnel#758: an expired-and-unclaimed offer used to dead-end at
+        // `claim_state='lapsed'`, silently sitting there forever until the owner
+        // noticed and clicked "reclaim" -- found live affecting 12/17 tunnels on one
+        // account at once, including a hostname that had a real multi-hour outage
+        // earlier from the same underlying pattern. Now auto-requeues (fresh
+        // `queued_at`, same "back of the FIFO queue" semantics `reclaim_cert_slot`
+        // already had) instead of dead-ending -- UNLESS the owner has explicitly
+        // opted out (`cert_claim_opt_out`), in which case it parks at `claim_state
+        // = 'none'` with `queued_at = NULL` and is never reconsidered
+        // ([`Self::gelb_queue_fifo`] excludes opted-out rows entirely).
         self.writer.lock_safe().execute(
             "UPDATE subject_tunnels
-             SET claim_state = 'lapsed', assigned_ca = NULL, claim_offered_at = NULL, claim_deadline = NULL
+             SET claim_state = 'none', assigned_ca = NULL, claim_offered_at = NULL, claim_deadline = NULL,
+                 queued_at = CASE WHEN cert_claim_opt_out = 0 THEN ?1 ELSE NULL END
              WHERE claim_state = 'offered' AND claim_deadline < ?1",
             params![now],
         )
@@ -3981,6 +4021,23 @@ impl SqliteTunnelStore {
             params![hostname, subject, now],
         )?;
         Ok(affected > 0)
+    }
+
+    /// Test-only: simulate a legacy `claim_state='lapsed'` row -- nothing in this
+    /// crate's own code produces that state anymore after #758's auto-requeue, but
+    /// [`Self::reclaim_cert_slot`] must still recover one correctly (a pre-existing
+    /// row from before this migration, or a database that hasn't run a fresh sweep
+    /// tick yet). Exposed beyond `storage::tests` (`pub`, not just `#[cfg(test)]` on a
+    /// private fn) so `portal_api::tests` can drive the same scenario through the
+    /// real HTTP route instead of only unit-testing the store method directly.
+    #[cfg(test)]
+    pub fn set_lapsed_for_test(&self, hostname: &str) -> rusqlite::Result<()> {
+        self.writer.lock_safe().execute(
+            "UPDATE subject_tunnels SET claim_state = 'lapsed', assigned_ca = NULL, queued_at = NULL \
+             WHERE hostname = ?1",
+            params![hostname],
+        )?;
+        Ok(())
     }
 
     /// Record a completed issuance (#233): flips the hostname to `gruen`
@@ -8051,7 +8108,11 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_unclaimed_offer_lapses_and_frees_its_ca_assignment() {
+    fn an_expired_unclaimed_offer_auto_requeues_and_frees_its_ca_assignment_758() {
+        // CADS-Tunnel#758: an expired offer used to dead-end at claim_state='lapsed'
+        // until the owner manually reclaimed it -- found live affecting 12/17 tunnels
+        // on one account, silently, at once. Now it auto-requeues (back into the FIFO,
+        // same as a manual reclaim would do) instead of needing that manual step.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
         store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
@@ -8062,27 +8123,67 @@ mod tests {
 
         let a = store.cert_admission_for_hostname("a.example").unwrap().unwrap();
         assert_eq!(a.status, "gelb", "still gelb -- a lapse is not a demotion to rot");
-        assert_eq!(a.claim_state, "lapsed");
+        assert_eq!(a.claim_state, "none", "auto-requeued, not left dead-ended at 'lapsed'");
         assert_eq!(a.assigned_ca, None, "an unclaimed offer never consumed real CA capacity");
+        assert_eq!(a.queue_position, Some(0), "back in the FIFO immediately, ready to be re-offered");
     }
 
     #[test]
-    fn reclaiming_a_lapsed_slot_goes_to_the_back_of_the_queue_not_its_old_position() {
+    fn an_opted_out_hostnames_expired_offer_parks_instead_of_auto_requeueing_758() {
+        // The other half of #758: an owner who explicitly opted out must never be
+        // silently re-offered a window they already said not to bother with.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        store.enter_gelb_queue("a.example", 100).unwrap();
+        store.offer_claim("a.example", "letsencrypt", 500, 1000).unwrap();
+        assert!(store.set_cert_claim_opt_out("alice", &t.id, true).unwrap());
+
+        assert_eq!(store.lapse_expired_claims(1001).unwrap(), 1);
+
+        let a = store.cert_admission_for_hostname("a.example").unwrap().unwrap();
+        assert_eq!(a.claim_state, "none");
+        assert_eq!(a.queue_position, None, "parked -- never re-enters the FIFO while opted out");
+        assert!(!store.gelb_queue_fifo().unwrap().contains(&"a.example".to_string()));
+    }
+
+    #[test]
+    fn auto_requeueing_a_lapsed_slot_goes_to_the_back_of_the_queue_not_its_old_position_758() {
+        // #758: this used to go through a manual reclaim_cert_slot step (see the
+        // sibling test below for that path, kept for a pre-existing 'lapsed' row's
+        // sake) -- now lapse_expired_claims itself does the requeue, automatically,
+        // with the exact same "back of the queue, not the old position" property.
         let store = SqliteTunnelStore::open_in_memory().unwrap();
         store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
         store.create("alice", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
         store.enter_gelb_queue("a.example", 100).unwrap();
         store.enter_gelb_queue("b.example", 200).unwrap();
         store.offer_claim("a.example", "letsencrypt", 300, 400).unwrap();
-        store.lapse_expired_claims(500).unwrap();
+        store.lapse_expired_claims(600).unwrap();
+
+        // b was already queued (queued_at=200) and never lapsed; a re-enters
+        // fresh at queued_at=600 -- so b is now ahead, not a.
+        assert_eq!(store.gelb_queue_fifo().unwrap(), vec!["b.example", "a.example"]);
+    }
+
+    #[test]
+    fn reclaim_cert_slot_still_recovers_a_legacy_lapsed_row() {
+        // Nothing SETS claim_state='lapsed' anymore after #758 (lapse_expired_claims
+        // auto-requeues instead), but a row already in that state from before the
+        // migration -- or a legacy/older database that hasn't run a fresh sweep tick
+        // yet -- must still be recoverable via this manual path. Simulated directly
+        // (no code path produces 'lapsed' anymore to drive it through naturally).
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        store.create("alice", "a", Some("a.example")).unwrap().created().expect("hostname is free in this test");
+        store.create("alice", "b", Some("b.example")).unwrap().created().expect("hostname is free in this test");
+        store.enter_gelb_queue("a.example", 100).unwrap();
+        store.enter_gelb_queue("b.example", 200).unwrap();
+        store.set_lapsed_for_test("a.example").unwrap();
 
         // Wrong subject / not actually lapsed -> no-op.
         assert!(!store.reclaim_cert_slot("bob", "a.example", 600).unwrap());
         assert!(!store.reclaim_cert_slot("alice", "b.example", 600).unwrap(), "b never lapsed");
 
         assert!(store.reclaim_cert_slot("alice", "a.example", 600).unwrap());
-        // b was already queued (queued_at=200) and never lapsed; a re-enters
-        // fresh at queued_at=600 -- so b is now ahead, not a.
         assert_eq!(store.gelb_queue_fifo().unwrap(), vec!["b.example", "a.example"]);
     }
 
@@ -8197,10 +8298,10 @@ mod tests {
 
     #[test]
     fn may_issue_now_is_true_only_within_an_open_offer_or_once_permanently_gruen() {
-        let rot = CertAdmission { status: "rot".into(), assigned_ca: None, claim_state: "none".into(), claim_deadline: None, queue_position: None };
+        let rot = CertAdmission { status: "rot".into(), assigned_ca: None, claim_state: "none".into(), claim_deadline: None, queue_position: None, cert_claim_opt_out: false };
         assert!(!rot.may_issue_now(1000));
 
-        let gelb_queued = CertAdmission { status: "gelb".into(), assigned_ca: None, claim_state: "none".into(), claim_deadline: None, queue_position: Some(3) };
+        let gelb_queued = CertAdmission { status: "gelb".into(), assigned_ca: None, claim_state: "none".into(), claim_deadline: None, queue_position: Some(3), cert_claim_opt_out: false };
         assert!(!gelb_queued.may_issue_now(1000));
 
         let offered = CertAdmission {
@@ -8209,12 +8310,13 @@ mod tests {
             claim_state: "offered".into(),
             claim_deadline: Some(2000),
             queue_position: None,
+            cert_claim_opt_out: false,
         };
         assert!(offered.may_issue_now(1000), "within the open window");
         assert!(!offered.may_issue_now(2000), "deadline itself is not still open");
         assert!(!offered.may_issue_now(2001), "past the deadline");
 
-        let lapsed = CertAdmission { status: "gelb".into(), assigned_ca: None, claim_state: "lapsed".into(), claim_deadline: None, queue_position: None };
+        let lapsed = CertAdmission { status: "gelb".into(), assigned_ca: None, claim_state: "lapsed".into(), claim_deadline: None, queue_position: None, cert_claim_opt_out: false };
         assert!(!lapsed.may_issue_now(1000));
 
         let gruen = CertAdmission {
@@ -8223,6 +8325,7 @@ mod tests {
             claim_state: "none".into(),
             claim_deadline: None,
             queue_position: None,
+            cert_claim_opt_out: false,
         };
         assert!(gruen.may_issue_now(1000), "gruen always may-issue -- renewals must never block");
         assert!(gruen.may_issue_now(i64::MAX), "forever, regardless of how much later");
