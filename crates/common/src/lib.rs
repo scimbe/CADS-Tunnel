@@ -13,6 +13,24 @@ pub mod channel;
 /// this crate does not pull in for the wasm32 build (the browser channel-claim page).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod channel_dial;
+/// The channel join/dial wire protocol's **normative home** (Phase 2 of the
+/// CADS-Tunnel/ct-agent consolidation): a verbatim port of ct-agent's `channel.rs` client
+/// half — outcome type, ack parser, refusal-category decoder, park-expiry classifier (this
+/// un-gated, wasm32-portable layer) and, native-only under `channel_wire::io`, the
+/// stream-generic admission exchange for the broker and relay legs. ct-agent re-exports
+/// these names in place of its own bodies (consolidation PR5). The fix history the code
+/// carries — ct-agent#21 #23 #28 #36 #129 #140 #148, CADS-Tunnel#494 #495 #500 #506 #524
+/// #557 — is listed in the module doc; the guard tests moved with it. `channel_dial.rs`
+/// above still holds its own older copy of the same exchange; it becomes a thin caller of
+/// this module once #745 has merged (consolidation PR6).
+pub mod channel_wire;
+/// Native-only (needs `quinn`/`rustls`, not pulled in for the wasm32 build): the QUIC half
+/// of the consolidated channel protocol — the accept-any-cert channel dialer (ct-agent
+/// `transport.rs`, #114/#139), the QUIC join wrappers over `channel_wire::io` (#140), and
+/// the bounded post-admission stream setup (ct-agent `session.rs`, #139). Same provenance
+/// and re-export plan as `channel_wire`.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod channel_quic;
 pub mod credential;
 pub mod crew;
 pub mod fallback_framing;
