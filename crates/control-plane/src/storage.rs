@@ -2209,7 +2209,19 @@ pub enum CreateTunnelOutcome {
 /// How [`SqliteChannelStore::register_channel_if_under_owned_limit`] resolved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisterChannelOutcome {
+    /// A genuinely NEW channel row was inserted.
     Registered,
+    /// #747: the channel already exists under this owner with the SAME operator --
+    /// an idempotent re-run; nothing was written.
+    Unchanged,
+    /// #747: the channel already existed under this owner with a DIFFERENT operator
+    /// and the caller explicitly opted in (`allow_rekey`) -- the operator was rotated.
+    /// `previous` is the key it replaced (for the audit row); every grant signed by
+    /// it stops verifying from now on.
+    Rekeyed { previous: [u8; 32] },
+    /// #747: the channel already exists under this owner with a DIFFERENT operator
+    /// and the caller did NOT opt in -- refused; nothing was written.
+    OperatorMismatch,
     OwnedByAnother,
     OverLimit,
 }
@@ -4412,74 +4424,92 @@ impl SqliteChannelStore {
     }
 
     /// Register `channel` operated by `owner`, storing its operator **public** key.
-    /// Idempotent for the same owner (re-key allowed); returns `false` without any
-    /// change when the channel already exists under a *different* owner.
+    /// Idempotent for the same owner and the same operator; returns `false` without
+    /// any change when the channel already exists under a *different* owner **or**
+    /// (#747) under the same owner with a *different* operator -- this method never
+    /// re-keys. Rotating an owned channel's operator is only possible through
+    /// [`Self::register_channel_if_under_owned_limit`] with `allow_rekey = true`.
+    /// Kept (uncapped, `bool`-shaped) for its 45+ test-fixture call sites; it is a
+    /// thin wrapper over the outcome-typed method so there is exactly ONE write path.
     pub fn register_channel(
         &self,
         channel: &ChannelId,
         operator_pubkey: &[u8; 32],
         owner: &str,
     ) -> rusqlite::Result<bool> {
-        let conn = self.writer.lock_safe();
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT owner FROM channels WHERE channel = ?1",
-                params![&channel.0[..]],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if matches!(existing, Some(ref o) if o != owner) {
-            return Ok(false);
-        }
-        conn.execute(
-            "INSERT OR REPLACE INTO channels (channel, operator, owner) VALUES (?1, ?2, ?3)",
-            params![&channel.0[..], &operator_pubkey[..], owner],
-        )?;
-        Ok(true)
+        Ok(matches!(
+            self.register_channel_if_under_owned_limit(channel, operator_pubkey, owner, u32::MAX, false)?,
+            RegisterChannelOutcome::Registered | RegisterChannelOutcome::Unchanged
+        ))
     }
 
-    /// Like [`Self::register_channel`], but additionally enforces a per-owner
+    /// The single channel-registration write path. Enforces a per-owner
     /// channel-count limit (#113-ui-limits -- channels had NO cap at all before
-    /// this, unlike tunnels' `max_tunnels`/`create_if_under_owned_limit`). Deliberately
-    /// a separate method rather than widening `register_channel`'s own signature:
-    /// that function has 45+ existing call sites (mostly test fixtures seeding an
-    /// owned channel, which don't want or need limit enforcement); only the two
-    /// real user-facing creation paths (`POST /me/channels`, the portal's New
-    /// Channel form) should ever call this one. The count check runs under the
-    /// SAME writer lock as the insert (race-free, same reasoning as #432's tunnel
-    /// fix), and — matching `register_channel`'s own idempotent-re-key behavior —
-    /// re-registering a channel already owned by `owner` is never blocked by the
-    /// limit, only genuinely NEW channels are.
+    /// this, unlike tunnels' `max_tunnels`/`create_if_under_owned_limit`) and
+    /// (#747) refuses to silently replace an owned channel's operator key. The
+    /// checks and the write run under the SAME writer lock (race-free, same
+    /// reasoning as #432's tunnel fix). Resolution order:
+    ///
+    /// 1. exists under another owner → [`RegisterChannelOutcome::OwnedByAnother`]
+    ///    (checked FIRST, so a stranger learns nothing about the operator key);
+    /// 2. exists under `owner` with the same operator → `Unchanged` (no write);
+    /// 3. exists under `owner` with a different operator → `OperatorMismatch`
+    ///    (no write) unless `allow_rekey`, in which case a guarded
+    ///    `UPDATE ... WHERE channel AND owner` rotates it → `Rekeyed { previous }`.
+    ///    A re-key is NOT a new channel, so the limit never applies to it;
+    /// 4. new channel → `OverLimit` once `owner` already owns `max`, else a plain
+    ///    `INSERT` (no `OR REPLACE` anywhere any more) → `Registered`.
+    ///
+    /// Callers that expose `allow_rekey` (`POST /me/channels` with
+    /// `confirm_rekey: true`) must record an audit entry on `Rekeyed`.
     pub fn register_channel_if_under_owned_limit(
         &self,
         channel: &ChannelId,
         operator_pubkey: &[u8; 32],
         owner: &str,
         max: u32,
+        allow_rekey: bool,
     ) -> rusqlite::Result<RegisterChannelOutcome> {
         let conn = self.writer.lock_safe();
-        let existing: Option<String> = conn
+        let existing: Option<(String, Vec<u8>)> = conn
             .query_row(
-                "SELECT owner FROM channels WHERE channel = ?1",
+                "SELECT owner, operator FROM channels WHERE channel = ?1",
                 params![&channel.0[..]],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if matches!(existing, Some(ref o) if o != owner) {
-            return Ok(RegisterChannelOutcome::OwnedByAnother);
-        }
-        if existing.is_none() {
-            let owned_count: u32 =
-                conn.query_row("SELECT COUNT(*) FROM channels WHERE owner = ?1", params![owner], |r| r.get(0))?;
-            if owned_count >= max {
-                return Ok(RegisterChannelOutcome::OverLimit);
+        match existing {
+            Some((ref o, _)) if o != owner => Ok(RegisterChannelOutcome::OwnedByAnother),
+            Some((_, ref current)) if current.as_slice() == &operator_pubkey[..] => {
+                Ok(RegisterChannelOutcome::Unchanged)
+            }
+            Some((_, current)) => {
+                if !allow_rekey {
+                    return Ok(RegisterChannelOutcome::OperatorMismatch);
+                }
+                // Same lenient decode as `operator_pubkey()`: the column is always
+                // 32 bytes as written by this method, so the fallback never fires
+                // in practice but keeps a corrupt row from panicking the handler.
+                let previous = <[u8; 32]>::try_from(current.as_slice()).unwrap_or([0u8; 32]);
+                conn.execute(
+                    "UPDATE channels SET operator = ?2 WHERE channel = ?1 AND owner = ?3",
+                    params![&channel.0[..], &operator_pubkey[..], owner],
+                )?;
+                Ok(RegisterChannelOutcome::Rekeyed { previous })
+            }
+            None => {
+                let owned_count: u32 =
+                    conn.query_row("SELECT COUNT(*) FROM channels WHERE owner = ?1", params![owner], |r| r.get(0))?;
+                if owned_count >= max {
+                    return Ok(RegisterChannelOutcome::OverLimit);
+                }
+                conn.execute(
+                    "INSERT INTO channels (channel, operator, owner) VALUES (?1, ?2, ?3)",
+                    params![&channel.0[..], &operator_pubkey[..], owner],
+                )?;
+                Ok(RegisterChannelOutcome::Registered)
             }
         }
-        conn.execute(
-            "INSERT OR REPLACE INTO channels (channel, operator, owner) VALUES (?1, ?2, ?3)",
-            params![&channel.0[..], &operator_pubkey[..], owner],
-        )?;
-        Ok(RegisterChannelOutcome::Registered)
     }
 
     /// The operator public key for `channel`, if registered (the edge's lookup).
@@ -9438,19 +9468,24 @@ mod tests {
         assert!(s.remove_member(&ch, "alice", &member).unwrap(), "remove is idempotent");
         assert!(!s.is_member(&ch, &member).unwrap());
 
-        // Owner may re-key their own channel (agent rotates its operator key).
-        assert!(s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
-        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some([0x44u8; 32]));
+        // #747: the owner can NOT silently re-key their own channel through this
+        // path any more (it used to INSERT OR REPLACE) -- refused, key unchanged.
+        // Rotation needs register_channel_if_under_owned_limit(.., allow_rekey=true).
+        assert!(!s.register_channel(&ch, &[0x44u8; 32], "alice").unwrap());
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op), "operator key unchanged (#747)");
+        // The same-key re-run stays idempotent.
+        assert!(s.register_channel(&ch, &op, "alice").unwrap());
     }
 
     #[test]
     fn register_channel_if_under_owned_limit_enforces_the_cap_atomically_and_never_blocks_a_re_key() {
         // #113-ui-limits: channels had no cap at all before this. Three things this
         // must get right: (1) the Nth-plus-1 NEW channel is refused once `owner`
-        // already owns `max`, (2) re-registering (re-keying) a channel the SAME
-        // owner already owns is NEVER blocked by the limit -- only genuinely new
-        // channels count against it, matching register_channel's own idempotent-
-        // re-key behavior, (3) a different owner's count is untouched.
+        // already owns `max`, (2) re-registering a channel the SAME owner already
+        // owns is NEVER blocked by the limit -- only genuinely new channels count
+        // against it (#747: a re-key now needs the explicit `allow_rekey` flag, but
+        // the flagged re-key is still not a new channel), (3) a different owner's
+        // count is untouched.
         let s = SqliteChannelStore::open_in_memory().unwrap();
         let op = [0x77u8; 32];
 
@@ -9458,45 +9493,146 @@ mod tests {
         let ch1 = ChannelId([0x01; 32]);
         let ch2 = ChannelId([0x02; 32]);
         assert_eq!(
-            s.register_channel_if_under_owned_limit(&ch1, &op, "alice", 2).unwrap(),
+            s.register_channel_if_under_owned_limit(&ch1, &op, "alice", 2, false).unwrap(),
             RegisterChannelOutcome::Registered
         );
         assert_eq!(
-            s.register_channel_if_under_owned_limit(&ch2, &op, "alice", 2).unwrap(),
+            s.register_channel_if_under_owned_limit(&ch2, &op, "alice", 2, false).unwrap(),
             RegisterChannelOutcome::Registered
         );
 
         // A third NEW channel is refused -- alice already owns 2, the limit.
         let ch3 = ChannelId([0x03; 32]);
         assert_eq!(
-            s.register_channel_if_under_owned_limit(&ch3, &op, "alice", 2).unwrap(),
+            s.register_channel_if_under_owned_limit(&ch3, &op, "alice", 2, false).unwrap(),
             RegisterChannelOutcome::OverLimit
         );
         assert_eq!(s.operator_pubkey(&ch3).unwrap(), None, "refused, never created");
 
-        // Re-registering (re-keying) an ALREADY-OWNED channel is never blocked by
-        // the limit, even though alice is already at the cap.
+        // #747: re-registering an ALREADY-OWNED channel with a DIFFERENT operator is
+        // refused without the flag (it used to silently INSERT OR REPLACE), and the
+        // refusal is about the mismatch, not the cap -- nothing is written.
         let new_op = [0x88u8; 32];
         assert_eq!(
-            s.register_channel_if_under_owned_limit(&ch1, &new_op, "alice", 2).unwrap(),
-            RegisterChannelOutcome::Registered,
-            "re-keying an owned channel is not a NEW channel, so the limit doesn't apply"
+            s.register_channel_if_under_owned_limit(&ch1, &new_op, "alice", 2, false).unwrap(),
+            RegisterChannelOutcome::OperatorMismatch,
+            "a different operator without allow_rekey is refused (#747)"
+        );
+        assert_eq!(s.operator_pubkey(&ch1).unwrap(), Some(op), "operator key unchanged (#747)");
+        // With the flag the rotation goes through even though alice is at the cap:
+        // a re-key is not a NEW channel, so the limit doesn't apply.
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch1, &new_op, "alice", 2, true).unwrap(),
+            RegisterChannelOutcome::Rekeyed { previous: op },
+            "an explicit re-key of an owned channel is never blocked by the limit"
         );
         assert_eq!(s.operator_pubkey(&ch1).unwrap(), Some(new_op));
 
         // Owned-by-another still refused the same way as plain register_channel,
         // regardless of the (irrelevant, since it's refused first) limit.
         assert_eq!(
-            s.register_channel_if_under_owned_limit(&ch1, &op, "mallory", 100).unwrap(),
+            s.register_channel_if_under_owned_limit(&ch1, &op, "mallory", 100, false).unwrap(),
             RegisterChannelOutcome::OwnedByAnother
         );
 
         // A different owner's own count is untouched by alice's limit/usage.
         let ch4 = ChannelId([0x04; 32]);
         assert_eq!(
-            s.register_channel_if_under_owned_limit(&ch4, &op, "carol", 1).unwrap(),
+            s.register_channel_if_under_owned_limit(&ch4, &op, "carol", 1, false).unwrap(),
             RegisterChannelOutcome::Registered
         );
+    }
+
+    #[test]
+    fn register_channel_if_under_owned_limit_refuses_a_different_operator_without_the_rekey_flag_747() {
+        // #747: the channel-hijack / grant-outage vector -- re-registering an owned
+        // channel with another operator_pubkey used to INSERT OR REPLACE it with no
+        // refusal and no trail. Now: OperatorMismatch, and the row is untouched.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        let op = [0x22u8; 32];
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &op, "alice", 100, false).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &[0x33u8; 32], "alice", 100, false).unwrap(),
+            RegisterChannelOutcome::OperatorMismatch
+        );
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op), "no write on mismatch");
+        assert_eq!(s.channel_owner(&ch).unwrap(), Some("alice".to_string()), "owner untouched");
+    }
+
+    #[test]
+    fn register_channel_if_under_owned_limit_rotates_the_operator_only_with_the_rekey_flag_even_at_the_cap_747() {
+        // #747: with the explicit opt-in the operator IS rotated -- via a guarded
+        // UPDATE, reporting the key it replaced -- and the owner's channel cap does
+        // not get in the way (a re-key is not a new channel).
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        let old = [0x22u8; 32];
+        let new = [0x33u8; 32];
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &old, "alice", 1, false).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
+        // alice is now AT the cap of 1.
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ChannelId([0x12; 32]), &old, "alice", 1, true).unwrap(),
+            RegisterChannelOutcome::OverLimit,
+            "the flag never lets a NEW channel past the cap"
+        );
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &new, "alice", 1, true).unwrap(),
+            RegisterChannelOutcome::Rekeyed { previous: old }
+        );
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(new));
+        assert_eq!(s.channel_owner(&ch).unwrap(), Some("alice".to_string()));
+        // The flag does NOT let a stranger in: owner check comes first.
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &[0x44u8; 32], "mallory", 100, true).unwrap(),
+            RegisterChannelOutcome::OwnedByAnother
+        );
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(new));
+    }
+
+    #[test]
+    fn register_channel_if_under_owned_limit_same_operator_rerun_is_idempotent_747() {
+        // #747: `ct-agent channel register` re-run with the SAME key (the documented
+        // broker-mediated-channel flow) stays a harmless no-op -- Unchanged, with or
+        // without the flag, and even when the owner is at the cap.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        let op = [0x22u8; 32];
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &op, "alice", 1, false).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &op, "alice", 1, false).unwrap(),
+            RegisterChannelOutcome::Unchanged
+        );
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &op, "alice", 1, true).unwrap(),
+            RegisterChannelOutcome::Unchanged,
+            "the flag on a same-key re-run is not a re-key"
+        );
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op));
+    }
+
+    #[test]
+    fn register_channel_no_longer_silently_replaces_an_owned_channels_operator_747() {
+        // #747: the SECOND silent re-key path -- plain `register_channel` (room_create's
+        // former write path, and every test fixture's) -- must refuse a different
+        // operator for the same owner too, so no production path can re-key silently.
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        let op = [0x22u8; 32];
+        assert!(s.register_channel(&ch, &op, "alice").unwrap());
+        assert!(s.register_channel(&ch, &op, "alice").unwrap(), "same key re-run is idempotent");
+        assert!(!s.register_channel(&ch, &[0x33u8; 32], "alice").unwrap(), "different key is refused");
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op), "nothing written");
+        assert!(!s.register_channel(&ch, &op, "mallory").unwrap(), "another owner still refused");
     }
 
     #[test]
@@ -9831,8 +9967,15 @@ mod tests {
         assert_eq!(s.authorize_holder(&ch, &member).unwrap(), None, "revoked member refused");
 
         // Re-key tracks through: a re-added member resolves the NEW operator key.
+        // #747: plain register_channel no longer re-keys (refused, key unchanged);
+        // the rotation has to be the explicit `allow_rekey` path.
         assert!(s.add_member(&ch, "alice", &member, &[0xd4u8; 32], &[0u8; 64]).unwrap());
-        assert!(s.register_channel(&ch, &[0x55u8; 32], "alice").unwrap());
+        assert!(!s.register_channel(&ch, &[0x55u8; 32], "alice").unwrap(), "silent re-key refused (#747)");
+        assert_eq!(s.authorize_holder(&ch, &member).unwrap(), Some(op), "gate still hands out the OLD key");
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ch, &[0x55u8; 32], "alice", u32::MAX, true).unwrap(),
+            RegisterChannelOutcome::Rekeyed { previous: op }
+        );
         assert_eq!(s.authorize_holder(&ch, &member).unwrap(), Some([0x55u8; 32]));
     }
 

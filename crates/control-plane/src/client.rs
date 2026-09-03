@@ -34,8 +34,24 @@ pub enum CpError {
     Http(reqwest::Error),
     /// The service answered with a non-success status.
     Status(reqwest::StatusCode),
+    /// #747: a non-success status whose plain-text body is worth showing the user
+    /// verbatim (today only [`ControlPlaneClient::register_channel`]'s `409`, whose
+    /// body tells the operator how to opt in to a re-key). A separate variant rather
+    /// than widening [`CpError::Status`] so every existing `Status(_)` match keeps
+    /// working; use [`CpError::status`] to inspect either uniformly.
+    StatusWithBody(reqwest::StatusCode, String),
     /// A field could not be decoded (e.g. a token that is not 32 hex bytes).
     Malformed,
+}
+
+impl CpError {
+    /// The HTTP status behind a [`CpError::Status`] or [`CpError::StatusWithBody`].
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            CpError::Status(s) | CpError::StatusWithBody(s, _) => Some(*s),
+            CpError::Http(_) | CpError::Malformed => None,
+        }
+    }
 }
 
 impl std::fmt::Display for CpError {
@@ -43,6 +59,10 @@ impl std::fmt::Display for CpError {
         match self {
             CpError::Http(e) => write!(f, "control-plane request failed: {e}"),
             CpError::Status(s) => write!(f, "control-plane returned status {s}"),
+            CpError::StatusWithBody(s, body) if body.trim().is_empty() => {
+                write!(f, "control-plane returned status {s}")
+            }
+            CpError::StatusWithBody(s, body) => write!(f, "control-plane returned status {s}: {}", body.trim()),
             CpError::Malformed => write!(f, "control-plane returned a malformed field"),
         }
     }
@@ -303,25 +323,36 @@ impl ControlPlaneClient {
     /// subject), so the edge accepts the member grants that operator later signs — the
     /// last control-plane round-trip for an end-to-end self-service Agent-Fabric channel.
     /// Presents the OIDC token as `Authorization: Bearer`; the channel router is
-    /// owner-scoped, so a [`CpError::Status`] (403) means the channel already belongs to a
-    /// different subject, and (401) means the token was missing/invalid.
+    /// owner-scoped. Non-success answers come back as [`CpError::StatusWithBody`]
+    /// carrying the service's plain-text reason: (403) the channel already belongs
+    /// to a different subject, (401) the token was missing/invalid, and (#747) (409)
+    /// the channel is already registered by this subject with a DIFFERENT operator
+    /// key -- re-registering the same key is an idempotent 200, but a rotation must
+    /// be opted into with `confirm_rekey = true` (which only adds the field to the
+    /// wire request when set, so older control planes see the old shape). The 409
+    /// body says exactly that, so callers should print it verbatim.
     pub async fn register_channel(
         &self,
         channel_hex: &str,
         operator_pubkey_hex: &str,
         bearer_token: &str,
+        confirm_rekey: bool,
     ) -> CpResult<()> {
+        let mut body = serde_json::json!({
+            "channel": channel_hex,
+            "operator_pubkey": operator_pubkey_hex,
+        });
+        if confirm_rekey {
+            body["confirm_rekey"] = serde_json::Value::Bool(true);
+        }
         let resp = self
             .http
             .post(format!("{}/me/channels", self.base))
             .header("authorization", format!("Bearer {bearer_token}"))
-            .json(&serde_json::json!({
-                "channel": channel_hex,
-                "operator_pubkey": operator_pubkey_hex,
-            }))
+            .json(&body)
             .send()
             .await?;
-        ok(resp)?;
+        ok_with_body(resp).await?;
         Ok(())
     }
 
@@ -406,6 +437,20 @@ fn ok(resp: reqwest::Response) -> CpResult<reqwest::Response> {
         Ok(resp)
     } else {
         Err(CpError::Status(status))
+    }
+}
+
+/// #747: like [`ok`], but a non-success status carries the response text as
+/// [`CpError::StatusWithBody`] so an actionable plain-text reason (the channel
+/// router's `409` re-key hint) reaches the user instead of a bare status line.
+/// An unreadable body degrades to an empty string, never to a transport error.
+async fn ok_with_body(resp: reqwest::Response) -> CpResult<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        Ok(resp)
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(CpError::StatusWithBody(status, body))
     }
 }
 
@@ -680,6 +725,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -698,7 +744,7 @@ mod tests {
 
         // Alice registers her channel authority via the client → 200, and the store
         // resolves the operator key she bound (drives the edge's grant verification).
-        cp.register_channel(&channel_hex, &operator_hex, &jwt_for("alice"))
+        cp.register_channel(&channel_hex, &operator_hex, &jwt_for("alice"), false)
             .await
             .unwrap();
         assert_eq!(
@@ -709,18 +755,97 @@ mod tests {
 
         // A different subject cannot re-key alice's channel → the client surfaces 403.
         let mallory = cp
-            .register_channel(&channel_hex, &"ff".repeat(32), &jwt_for("mallory"))
+            .register_channel(&channel_hex, &"ff".repeat(32), &jwt_for("mallory"), false)
             .await;
-        assert!(matches!(mallory, Err(CpError::Status(_))), "non-owner re-key is a Status error (403)");
+        assert_eq!(
+            mallory.as_ref().err().and_then(CpError::status),
+            Some(reqwest::StatusCode::FORBIDDEN),
+            "non-owner re-key is a 403 status error"
+        );
         assert_eq!(
             probe.operator_pubkey(&chan).unwrap(),
             Some(hex_decode_32(&operator_hex).unwrap()),
             "the refused re-key left the operator key unchanged"
         );
 
-        // A missing/invalid bearer token → the client surfaces a Status error (401).
-        let no_auth = cp.register_channel(&channel_hex, &operator_hex, "").await;
-        assert!(matches!(no_auth, Err(CpError::Status(_))), "a missing token is a Status error (401)");
+        // A missing/invalid bearer token → the client surfaces a 401 status error.
+        let no_auth = cp.register_channel(&channel_hex, &operator_hex, "", false).await;
+        assert_eq!(
+            no_auth.as_ref().err().and_then(CpError::status),
+            Some(reqwest::StatusCode::UNAUTHORIZED),
+            "a missing token is a 401 status error"
+        );
+    }
+
+    /// #747: re-registering a channel the caller already owns with a DIFFERENT
+    /// operator key is refused with 409, and the client hands the caller the
+    /// service's plain-text reason (the `confirm_rekey` hint) rather than a bare
+    /// status -- `ct-agent channel register` prints `Display` via `?`, so that is
+    /// the only way the operator ever learns how to opt in. With `confirm_rekey`
+    /// the same call rotates the key; a same-key re-run stays an idempotent Ok.
+    #[tokio::test]
+    async fn client_surfaces_the_409_body_for_an_operator_mismatch_747() {
+        use crate::oidc::{OidcVerifier, OidcVerifierHandle};
+        use crate::service::authed_channel_router;
+        use crate::storage::{SqliteChannelStore, SqliteLedger};
+        use ct_common::channel::ChannelId;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let probe = channels.clone();
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let cp = ControlPlaneClient::new(format!("http://{addr}"));
+        let channel_hex = "a1".repeat(32);
+        let op1 = "b2".repeat(32);
+        let op2 = "c3".repeat(32);
+        let chan = ChannelId(hex_decode_32(&channel_hex).unwrap());
+
+        cp.register_channel(&channel_hex, &op1, &alice, false).await.unwrap();
+        cp.register_channel(&channel_hex, &op1, &alice, false)
+            .await
+            .expect("a same-key re-run is idempotent");
+
+        let refused = cp.register_channel(&channel_hex, &op2, &alice, false).await;
+        let err = refused.expect_err("a different operator without confirm_rekey is refused");
+        assert_eq!(err.status(), Some(reqwest::StatusCode::CONFLICT));
+        match &err {
+            CpError::StatusWithBody(_, body) => {
+                assert!(body.contains("different operator_pubkey"), "body explains the mismatch: {body}");
+                assert!(body.contains("\"confirm_rekey\": true"), "body tells the caller how to opt in: {body}");
+            }
+            other => panic!("expected StatusWithBody, got {other:?}"),
+        }
+        let shown = err.to_string();
+        assert!(shown.contains("409"), "Display carries the status: {shown}");
+        assert!(shown.contains("confirm_rekey"), "Display carries the hint verbatim: {shown}");
+        assert_eq!(
+            probe.operator_pubkey(&chan).unwrap(),
+            Some(hex_decode_32(&op1).unwrap()),
+            "the refused re-key wrote nothing"
+        );
+
+        cp.register_channel(&channel_hex, &op2, &alice, true)
+            .await
+            .expect("confirm_rekey rotates the operator");
+        assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(hex_decode_32(&op2).unwrap()));
     }
 
     /// #214 follow-up (automatic agent-directory registration): `ControlPlaneClient::register_agent`

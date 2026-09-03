@@ -917,6 +917,11 @@ pub struct AuthedChannelState {
     /// (`SqliteLedger::max_channels`, default 100, same Standard-tier shape as
     /// tunnels' `max_tunnels`).
     ledger: Arc<SqliteLedger>,
+    /// #747: the admin audit log, so an explicit operator re-key (`confirm_rekey`)
+    /// leaves a `channel_operator_rekeyed` row. `None` in tests / when no audit
+    /// store is wired -- the re-key itself is never blocked by a missing log
+    /// (same best-effort posture as `ClaimState.audit` / `tunnel_enrolled`).
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 }
 
 /// State for the #525 bearer-authed tunnel login-allow-list router: the tunnel store
@@ -937,8 +942,13 @@ pub struct AuthedTunnelState {
 /// DB-writing surface (cf. #87). It provides the operator-key + membership records that
 /// the edge channel broker's `authorize` lookup (SEC81c-a `authorize_holder`) reads.
 ///
-/// * `POST /me/channels` `{channel, operator_pubkey}` → register (owner = subject); `403` if
-///   the channel is already owned by another subject
+/// * `POST /me/channels` `{channel, operator_pubkey, confirm_rekey?}` → register (owner =
+///   subject); `403` if the channel is already owned by another subject. Re-sending
+///   the same `operator_pubkey` is an idempotent `200`; a DIFFERENT one for a channel
+///   the caller already owns is `409` (#747 -- no silent re-key) unless
+///   `"confirm_rekey": true`, which rotates the operator and records a
+///   `channel_operator_rekeyed` audit row (every grant signed by the previous
+///   operator stops verifying)
 /// * `GET /me/channels` → list the caller's own registered channels (video-conferencing
 ///   feature follow-up -- registration was write-only before this)
 /// * `DELETE /me/channels/:channel` → fully deregister a channel (its registration,
@@ -954,12 +964,15 @@ pub struct AuthedTunnelState {
 /// * `POST /me/channels/:channel/allowlist/:email/remove` → de-list an email (owner-scoped)
 /// * `POST /me/rooms` `{operator_pubkey, holders}` → register every pairwise channel
 ///   a full-mesh room of `holders` needs in one call (multicast/room fan-out
-///   follow-up, owner-scoped, idempotent/additive)
+///   follow-up, owner-scoped, idempotent/additive for the same operator; `409` if an
+///   existing pair channel already carries a different operator -- #747, never a
+///   silent re-key)
 pub fn authed_channel_router(
     channels: Arc<SqliteChannelStore>,
     verifier: OidcVerifierHandle,
     session_key: Arc<[u8]>,
     ledger: Arc<SqliteLedger>,
+    audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
 ) -> Router {
     Router::new()
         .route("/me/channels", post(channel_register).get(channel_list))
@@ -985,7 +998,7 @@ pub fn authed_channel_router(
             "/me/channels/:channel/allowlist/:email/remove",
             post(channel_allowlist_remove),
         )
-        .with_state(AuthedChannelState { channels, verifier, session_key, ledger })
+        .with_state(AuthedChannelState { channels, verifier, session_key, ledger, audit })
 }
 
 /// Build the **service-account / bearer** tunnel login-allow-list router (#525): the
@@ -3285,7 +3298,18 @@ async fn topology_status_page(
 struct ChannelRegisterReq {
     channel: String,
     operator_pubkey: String,
+    /// #747: explicit opt-in to rotate the operator of a channel the caller already
+    /// owns. Absent (older agents) → a mismatched key is refused with `409`, which is
+    /// the fail-safe direction.
+    #[serde(default)]
+    confirm_rekey: bool,
 }
+
+/// #747: the `409` text for an operator mismatch without `confirm_rekey` -- actionable
+/// on purpose, since `ct-agent channel register` prints the body verbatim.
+const CHANNEL_REKEY_CONFLICT: &str = "channel is already registered with a different operator_pubkey; \
+     re-send with \"confirm_rekey\": true to rotate it \
+     (every grant signed by the previous operator will stop verifying)";
 
 async fn channel_register(
     State(state): State<AuthedChannelState>,
@@ -3307,8 +3331,42 @@ async fn channel_register(
         .ledger
         .max_channels(&account)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    match state.channels.register_channel_if_under_owned_limit(&ChannelId(channel), &operator, &owner, max) {
-        Ok(crate::storage::RegisterChannelOutcome::Registered) => Ok(StatusCode::OK),
+    match state.channels.register_channel_if_under_owned_limit(
+        &ChannelId(channel),
+        &operator,
+        &owner,
+        max,
+        req.confirm_rekey,
+    ) {
+        Ok(crate::storage::RegisterChannelOutcome::Registered)
+        | Ok(crate::storage::RegisterChannelOutcome::Unchanged) => Ok(StatusCode::OK),
+        Ok(crate::storage::RegisterChannelOutcome::Rekeyed { previous }) => {
+            // #747: an explicit, opted-in operator rotation -- leave a trail (audit
+            // row + stderr), because every grant the previous operator signed just
+            // stopped verifying. Best-effort like every other audit record.
+            let old_hex = hex_encode(&previous);
+            let new_hex = hex_encode(&operator);
+            let channel_hex = hex_encode(&channel);
+            eprintln!(
+                "ct-cp: channel_operator_rekeyed channel={channel_hex} owner={owner} old={old_hex} new={new_hex}"
+            );
+            if let Some(audit) = &state.audit {
+                let _ = audit.record(
+                    &owner,
+                    "channel_operator_rekeyed",
+                    Some(&channel_hex),
+                    Some(&format!("old={old_hex} new={new_hex} via /me/channels confirm_rekey")),
+                );
+            }
+            Ok(StatusCode::OK)
+        }
+        Ok(crate::storage::RegisterChannelOutcome::OperatorMismatch) => {
+            eprintln!(
+                "ct-cp: channel_register REFUSED operator mismatch channel={} owner={owner}",
+                hex_encode(&channel)
+            );
+            Err((StatusCode::CONFLICT, CHANNEL_REKEY_CONFLICT.to_string()))
+        }
         Ok(crate::storage::RegisterChannelOutcome::OwnedByAnother) => {
             Err((StatusCode::FORBIDDEN, "channel owned by another subject".to_string()))
         }
@@ -3628,19 +3686,47 @@ async fn room_create(
     for i in 0..holders.len() {
         for j in (i + 1)..holders.len() {
             let channel = ct_common::channel::channel_id_for_link(&operator, &holders[i], &holders[j]);
-            let ok = state
+            // #747: rooms go through the single guarded write path with NO re-key
+            // opt-in (there is no `confirm_rekey` on this route on purpose -- a room
+            // re-POST must never rotate an existing pair channel's operator). The
+            // room route has never enforced the per-owner channel cap, so it stays
+            // uncapped here (`u32::MAX`) rather than changing that in a security fix.
+            use crate::storage::RegisterChannelOutcome as O;
+            match state
                 .channels
-                .register_channel(&channel, &operator, &owner)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            if !ok {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "the channel for pair {}/{} is already owned by another subject",
-                        hex_encode(&holders[i]),
-                        hex_encode(&holders[j])
-                    ),
-                ));
+                .register_channel_if_under_owned_limit(&channel, &operator, &owner, u32::MAX, false)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            {
+                O::Registered | O::Unchanged => {}
+                O::OperatorMismatch => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "the channel for pair {}/{} is already registered with a different operator_pubkey; \
+                             rooms never re-key an existing channel (re-key it via POST /me/channels with confirm_rekey)",
+                            hex_encode(&holders[i]),
+                            hex_encode(&holders[j])
+                        ),
+                    ));
+                }
+                O::OwnedByAnother => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "the channel for pair {}/{} is already owned by another subject",
+                            hex_encode(&holders[i]),
+                            hex_encode(&holders[j])
+                        ),
+                    ));
+                }
+                // Unreachable with `u32::MAX` / `allow_rekey = false`; surfaced rather
+                // than unwrapped so a future change to those arguments can't panic.
+                O::OverLimit | O::Rekeyed { .. } => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "unexpected channel registration outcome for a room".to_string(),
+                    ));
+                }
             }
             channels.push(RoomChannelView {
                 a: hex_encode(&holders[i]),
@@ -6473,7 +6559,14 @@ pub fn persistent_control_plane_router(
             ))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
-            .merge(authed_channel_router(channels, oidc.clone(), Arc::from(session_key), ledger.clone()))
+            .merge(authed_channel_router(
+                channels,
+                oidc.clone(),
+                Arc::from(session_key),
+                ledger.clone(),
+                // #747: so an opted-in operator re-key leaves an audit row.
+                Some(admin_audit.clone()),
+            ))
             // #525: the bearer/service-account counterpart to the portal-session-only
             // tunnel login-allowlist form -- lets automation manage a tunnel's login
             // gate, owner-scoped, closing the channel/tunnel asymmetry.
@@ -10540,6 +10633,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -10696,6 +10790,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(session_key),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
 
         let alice_cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, "alice"));
@@ -10764,6 +10859,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -10960,6 +11056,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -11070,6 +11167,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -11143,6 +11241,270 @@ mod tests {
         assert_eq!(del(format!("/me/channels/{ch}"), Some(alice)).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 
+    /// #747: `POST /me/channels` for a channel the caller already owns -- same
+    /// operator is an idempotent 200; a DIFFERENT operator without `confirm_rekey`
+    /// (absent OR explicitly false) is a 409 with the actionable text and NO write;
+    /// a stranger stays a 403 (owner check first, so the mismatch never leaks).
+    #[tokio::test]
+    async fn channel_register_returns_409_on_operator_mismatch_and_leaves_the_key_unchanged_747() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let probe = channels.clone();
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
+        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let jwt_for = |sub: &str| {
+            let claims = serde_json::json!({ "sub": sub, "iss": issuer, "exp": now + 3600 });
+            encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        let register = |bearer: String, body: String| {
+            let req = Request::post("/me/channels")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+        let ch = "a1".repeat(32);
+        let op1 = "b2".repeat(32);
+        let op2 = "c3".repeat(32);
+        let chan = ChannelId(hex_decode_32(&ch).unwrap());
+        let op1_bytes = hex_decode_32(&op1).unwrap();
+
+        let s = register(jwt_for("alice"), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op1}"}}"#)).await.unwrap().status();
+        assert_eq!(s, StatusCode::OK, "first registration");
+        let s = register(jwt_for("alice"), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op1}"}}"#)).await.unwrap().status();
+        assert_eq!(s, StatusCode::OK, "same-key re-run is idempotent");
+
+        let resp = register(jwt_for("alice"), format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}"}}"#)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "different operator without confirm_rekey -> 409 (#747)");
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert_eq!(body, CHANNEL_REKEY_CONFLICT, "the 409 body is the exact actionable text");
+        assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(op1_bytes), "no write on the refused re-key");
+
+        let s = register(
+            jwt_for("alice"),
+            format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}","confirm_rekey":false}}"#),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::CONFLICT, "an explicit confirm_rekey:false is the same refusal");
+        assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(op1_bytes));
+
+        // A stranger gets the 403 it always got, even with the flag -- the owner
+        // check runs before the operator comparison.
+        let s = register(
+            jwt_for("mallory"),
+            format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}","confirm_rekey":true}}"#),
+        )
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(s, StatusCode::FORBIDDEN, "non-owner stays 403, flag or not");
+        assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(op1_bytes));
+    }
+
+    /// #747: with `"confirm_rekey": true` the owner rotates the operator in place --
+    /// even at their `max_channels` cap (a re-key is not a new channel) -- and the
+    /// rotation leaves a `channel_operator_rekeyed` row in the admin audit log
+    /// (actor = owner subject, target = channel hex, detail = old/new key hex). A
+    /// flagged same-key re-run is still just `Unchanged`: no second audit row.
+    #[tokio::test]
+    async fn channel_register_with_confirm_rekey_rotates_and_records_a_channel_operator_rekeyed_audit_entry_747() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let probe = channels.clone();
+        // Put alice AT the cap: one channel is all she may own.
+        let acct = ledger.account_for_subject("alice").unwrap();
+        ledger.set_max_channels(&acct, 1).unwrap();
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            ledger,
+            Some(audit.clone()),
+        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let register = |body: String| {
+            let req = Request::post("/me/channels")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+        let ch = "a1".repeat(32);
+        let op1 = "b2".repeat(32);
+        let op2 = "c3".repeat(32);
+        let chan = ChannelId(hex_decode_32(&ch).unwrap());
+
+        let s = register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op1}"}}"#)).await.unwrap().status();
+        assert_eq!(s, StatusCode::OK);
+        // Proof the cap is live: a second NEW channel is refused.
+        let s = register(format!(r#"{{"channel":"{}","operator_pubkey":"{op1}"}}"#, "d4".repeat(32))).await.unwrap().status();
+        assert_eq!(s, StatusCode::FORBIDDEN, "alice is at max_channels = 1");
+        assert!(audit.recent(10).unwrap().is_empty(), "plain registration records no audit entry");
+
+        let s = register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}","confirm_rekey":true}}"#))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(s, StatusCode::OK, "confirm_rekey rotates the operator even at the cap");
+        assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(hex_decode_32(&op2).unwrap()));
+
+        let entries = audit.recent(10).unwrap();
+        assert_eq!(entries.len(), 1, "exactly one audit row for the rotation");
+        let e = &entries[0];
+        assert_eq!(e.action, "channel_operator_rekeyed");
+        assert_eq!(e.actor_email, "alice");
+        assert_eq!(e.target.as_deref(), Some(ch.as_str()));
+        assert_eq!(
+            e.detail.as_deref(),
+            Some(format!("old={op1} new={op2} via /me/channels confirm_rekey").as_str())
+        );
+
+        // Same key again, flag set: Unchanged -- no write, no second audit row.
+        let s = register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op2}","confirm_rekey":true}}"#))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(audit.recent(10).unwrap().len(), 1, "a flagged same-key re-run is not a re-key");
+    }
+
+    /// #747: the refused (no `confirm_rekey`) path writes nothing at all -- not the
+    /// channel row, and not an audit row either (a refusal is not a privileged
+    /// action; the stderr line is its only trace).
+    #[tokio::test]
+    async fn channel_register_without_confirm_rekey_records_no_audit_entry_747() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let probe = channels.clone();
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            Some(audit.clone()),
+        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let register = |body: String| {
+            let req = Request::post("/me/channels")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {alice}"))
+                .body(Body::from(body))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+        let ch = "a1".repeat(32);
+        let op1 = "b2".repeat(32);
+        let chan = ChannelId(hex_decode_32(&ch).unwrap());
+
+        assert_eq!(
+            register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{op1}"}}"#)).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            register(format!(r#"{{"channel":"{ch}","operator_pubkey":"{}"}}"#, "c3".repeat(32))).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(probe.operator_pubkey(&chan).unwrap(), Some(hex_decode_32(&op1).unwrap()), "no write");
+        assert!(audit.recent(10).unwrap().is_empty(), "a refused re-key records no audit entry");
+    }
+
+    /// #747: `POST /me/rooms` used to go through plain `register_channel`'s
+    /// INSERT OR REPLACE, so a room whose derived pair channel id already existed
+    /// under this owner with ANOTHER operator silently re-keyed it. Now it is a 409
+    /// naming the mismatch, nothing is written, and (there is deliberately no
+    /// `confirm_rekey` on this route) the only way to rotate is `POST /me/channels`.
+    #[tokio::test]
+    async fn room_create_refuses_to_silently_rekey_an_existing_pair_channel_747() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let secret = b"realm-secret";
+        let issuer = "https://kc/realms/ct";
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(secret, issuer));
+        let probe = channels.clone();
+        let app = authed_channel_router(
+            channels,
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(b"test-session-key".as_slice()),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
+        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let claims = serde_json::json!({ "sub": "alice", "iss": issuer, "exp": now + 3600 });
+        let alice = encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap();
+
+        let op = "42".repeat(32);
+        let op_bytes = hex_decode_32(&op).unwrap();
+        let h1 = "11".repeat(32);
+        let h2 = "22".repeat(32);
+        let pair = ct_common::channel::channel_id_for_link(&op_bytes, &hex_decode_32(&h1).unwrap(), &hex_decode_32(&h2).unwrap());
+        // The pair channel the room will derive already exists under alice, but
+        // bound to a DIFFERENT operator (registered by id via /me/channels earlier).
+        let other_op = [0x99u8; 32];
+        assert!(probe.register_channel(&pair, &other_op, "alice").unwrap());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/me/rooms")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {alice}"))
+                    .body(Body::from(format!(r#"{{"operator_pubkey":"{op}","holders":["{h1}","{h2}"]}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "a room never silently re-keys an existing pair channel (#747)");
+        let body = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(body.contains("different operator_pubkey"), "the 409 names the mismatch, not ownership: {body}");
+        assert_eq!(probe.operator_pubkey(&pair).unwrap(), Some(other_op), "the existing operator key is untouched");
+    }
+
     #[tokio::test]
     async fn room_create_registers_every_pairwise_channel_a_full_mesh_room_needs() {
         // Multicast/room fan-out follow-up (#276-video-call, ADR-0023): a room of N
@@ -11167,6 +11529,7 @@ mod tests {
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(b"test-session-key".as_slice()),
             Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
         );
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
