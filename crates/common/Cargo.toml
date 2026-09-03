@@ -45,3 +45,8 @@ tokio = { version = "1", features = ["net"] }
 # (`#[tokio::test(start_paused = true)]`), same purpose as ct-edge's #111 Slowloris
 # timeout test; dev-only, stays out of the production build.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "test-util"] }
+# #745: channel_dial's two-hop tests run a hermetic loopback quinn mock broker/relay,
+# which needs a self-signed server cert -- same dev-only dep, same version/features as
+# ct-edge's own transport tests (crates/edge/Cargo.toml). Never part of a wasm32 or
+# production build.
+rcgen = { version = "0.13", features = ["zeroize"] }

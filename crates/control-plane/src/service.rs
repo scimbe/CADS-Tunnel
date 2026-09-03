@@ -5926,7 +5926,8 @@ pub fn persistent_control_plane_router(
     // (missing/malformed keys just disable the feature), so `None` is a normal,
     // expected production case here, not only a test convenience -- the two
     // Agent-bridges portal routes handle it by responding 503, never by panicking.
-    bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr)>,
+    // The two addresses are the rendezvous broker and the relay (#745, two hops).
+    bridge_identity: Option<(ed25519_dalek::SigningKey, [u8; 32], std::net::SocketAddr, std::net::SocketAddr)>,
 ) -> rusqlite::Result<Router> {
     // #328: `/me/*` used to be conditionally *mounted* based on whether `oidc` was
     // `Some` at this exact call -- a boot-time-only decision. It's now always a

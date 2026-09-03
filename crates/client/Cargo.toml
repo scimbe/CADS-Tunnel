@@ -29,3 +29,9 @@ axum = "0.7"
 # tests (`#[tokio::test(start_paused = true)]`), same purpose/pattern as
 # ct-edge's #111 Slowloris test and ct-common's #269 idle-timeout tests.
 tokio = { version = "1", features = ["test-util"] }
+# #745: the two-hop bridge-dialer E2E test (tests/channel_dial_two_hop_745.rs) mints
+# operator-signed grants and Noise attestations for a real ct-edge rendezvous + relay
+# broker pair, and checks the JSON-RPC reply -- both already in the workspace lockfile
+# (ct-common / ct-edge deps), dev-only here.
+ed25519-dalek = "2"
+serde_json = "1"
