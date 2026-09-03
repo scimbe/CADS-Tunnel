@@ -57,6 +57,13 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
 
 [dev-dependencies]
+# Phase-2 PR3 (CADS-Tunnel/ct-agent consolidation): the channel-wire contract tests in
+# channel_broker.rs drive ct-common's SHARED client half (`channel_wire`, `channel_quic`
+# -- the verbatim port of ct-agent's join protocol) against this crate's own admission
+# entry points, using ct-common's test fixtures (`channel_wire::test_support`). Same
+# feature-on-dev-dependency pattern as ct-client's `ct-control-plane` dev-dep; the
+# feature is empty of production code and never enabled by a non-test build.
+ct-common = { path = "../common", features = ["test-support"] }
 # `test-util` (dev-only) enables tokio's paused clock for the #111 Slowloris timeout test
 # (`#[tokio::test(start_paused = true)]`); it stays out of the production build.
 tokio = { version = "1", features = ["test-util"] }
