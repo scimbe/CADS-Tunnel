@@ -215,7 +215,7 @@ with trust chains and a tested fallback) is met.
 
 Records a decision taken by the operator on 2026-09-02 and implemented in CADS-Tunnel
 #748 / #751 / #752 / #755 / #756 (tag `v0.4.19`); the ct-agent half of the same plan
-(PR4/PR5, see below) is pending as of this date. Amends §4/§4a; nothing above is withdrawn.
+(ct-agent #153/#154, see below) landed the same day. Amends §4/§4a; nothing above is withdrawn.
 
 ### Decision
 
@@ -236,7 +236,7 @@ All three are a **verbatim** port of ct-agent `native/src/channel.rs:55-778`,
 `transport.rs:52-140` and `channel_run/session.rs:152-178` @ v0.7.23 — same bodies, doc
 comments and error strings (ct-agent's `channel_run/errors.rs` classifies by string and by
 downcast, so the wording is contract); every block carries a `// ported verbatim from …`
-marker. ct-agent re-exports these names in place of its own bodies (ct-agent PR5, pending), so
+marker. ct-agent re-exports these names in place of its own bodies (ct-agent #154), so
 no call site there changes; what stays in ct-agent is policy and environment
 (`CT_CHANNEL_PHASE_MARKER`, `phase_marker_for`, `run_channel_session*`, all of `channel_run/`,
 the cert-pinned tunnel dialer). The control plane's `ct_common::channel_dial` (#756) is a thin
@@ -272,10 +272,10 @@ arrangement in which the fix history below stays fixed.
   `open_channel_streams` (#139), the `:443` same-stream relay contract (#106/#148),
   post-possession `pairing` refusal (#524/#23), QUIC park-expiry close → `ParkExpired`.
 - **Build-time gates:** CI compiles `ct-common` for `wasm32-unknown-unknown` (#748), so the
-  un-gated parser is actually built for the browser member. ct-agent PR4 adds a lockfile guard
+  un-gated parser is actually built for the browser member. ct-agent #153 added a lockfile guard
   ("exactly one `ct-common` in `Cargo.lock`") and a **parity test** — old body vs re-export
   over the same scripted broker: byte-identical client writes, identical outcome or identical
-  `Err` `Display` + downcast. That test can only exist between PR4 and PR5, which is why the
+  `Err` `Display` + downcast. That test could only exist between #153 and #154, which is why the
   pin bump and the deletion are separate PRs.
 
 ### Two protocol facts the consolidation surfaced
@@ -311,9 +311,9 @@ there is no release workflow.
 - **#754** — the `:443`/WS stream-pairing refusal (`finish_stream_pair_inner` Err arm) may be
   lost to the TLS `close_notify` RST race that #511's `graceful_close` guards on the Ok path.
   Not reproduced; contract test first, then decide.
-- **ct-agent PR4** (pins → `v0.4.19`, lockfile guard, parity test) and **PR5** (re-exports,
-  deletion of the moved bodies and duplex tests) are pending. Until PR5 merges the bodies exist
-  twice again, deliberately, with the parity test as the bridge; ct-agent PR7 then points
-  `channel.rs`'s header at `ct-common` as normative.
+- **ct-agent #153** (pins → `v0.4.19`, lockfile guard, parity test) and **#154** (re-exports,
+  deletion of the moved bodies and duplex tests, `channel.rs`'s header pointing at `ct-common`
+  as normative) landed on 2026-09-03 and ship as ct-agent 0.7.24. Between them the bodies
+  existed twice, deliberately, with the parity test as the bridge; it was retired with #154.
 - Any future change to the exchange lands in `ct-common` first, with its guard test, and
   reaches ct-agent through a tag bump — never as a patch on top of a re-export.
