@@ -6,14 +6,16 @@
 //! broker loops use (`finish_rendezvous_pair` / `finish_relay_pair`). The acceptor is a
 //! second in-process QUIC client that does what a relay-only `ct-agent channel --serve` does:
 //! rendezvous join, relay join, `accept_bi()` the edge-opened session stream, `a2a_respond`,
-//! answer one JSON-RPC `tools/call`.
+//! then `noise_pump` into a `serve_request_loop` duplex (the real serve shape) to answer one
+//! JSON-RPC `tools/call`.
 //!
 //! Hermetic: loopback UDP only, self-signed certs from `ct_edge::transport`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ct_common::a2a::{a2a_recv, a2a_respond, a2a_send};
+use ct_common::a2a::{a2a_respond, serve_request_loop};
+use ct_common::noise::noise_pump;
 use ct_common::channel::{
     member_noise_attest_bytes, ChannelGrant, ChannelId, ChannelJoinRequest, Direction, Rights, SignedChannelGrant,
     CHANNEL_ENDPOINT_RELAY_ONLY,
@@ -144,24 +146,37 @@ async fn dial_and_call_completes_one_tools_call_through_the_real_edge_rendezvous
             .await
             .expect("the edge opens the session stream toward the acceptor once msg1 arrives")
             .expect("accept_bi");
-        let mut session = tokio::time::timeout(STEP_TIMEOUT, a2a_respond(&mut send, &mut recv, &agent_noise.private))
+        let session = tokio::time::timeout(STEP_TIMEOUT, a2a_respond(&mut send, &mut recv, &agent_noise.private))
             .await
             .expect("handshake in time")
             .expect("Noise_IK responder");
-        let request = tokio::time::timeout(STEP_TIMEOUT, a2a_recv(&mut recv, &mut session))
+        // From here on the acceptor is the PRODUCTION shape (ct-agent `serve_local` +
+        // `noise_pump`): the pump writes each decrypted record into a duplex whose far end
+        // is ct-common's own `serve_request_loop`, which reads APP-LAYER u16 frames and
+        // answers through `write_message`. An acceptor that decrypted with `a2a_recv` and
+        // parsed the bytes directly accepted a bare, unframed request that the real one
+        // stalls on forever -- the post-#749 "pairs, then times out at exactly 20 s" bug.
+        let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+        let serve = tokio::spawn(async move {
+            let (mut sr, mut sw) = tokio::io::split(serve_side);
+            serve_request_loop(&mut sw, &mut sr, |request: Vec<u8>| async move {
+                let request: serde_json::Value = serde_json::from_slice(&request).expect("JSON-RPC request");
+                assert_eq!(request["method"], "tools/call");
+                assert_eq!(request["params"]["name"], "echo");
+                let reply = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"].clone(),
+                    "result": { "echo": request["params"]["arguments"].clone() },
+                });
+                serde_json::to_vec(&reply).unwrap()
+            })
             .await
-            .expect("request in time")
-            .expect("decrypt request");
-        let request: serde_json::Value = serde_json::from_slice(&request).expect("JSON-RPC request");
-        assert_eq!(request["method"], "tools/call");
-        assert_eq!(request["params"]["name"], "echo");
-        let reply = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request["id"].clone(),
-            "result": { "echo": request["params"]["arguments"].clone() },
         });
-        a2a_send(&mut send, &mut session, &serde_json::to_vec(&reply).unwrap()).await.expect("send reply");
-        let _ = send.finish();
+        tokio::time::timeout(STEP_TIMEOUT, noise_pump(session, tokio::io::join(recv, send), session_side))
+            .await
+            .expect("the one-call session ends in time")
+            .expect("noise_pump");
+        let _ = serve.await;
         // The bridge hangs up after its one reply; wait for that (bounded) so the splice
         // ends from the initiator side, as it does live.
         let _ = tokio::time::timeout(STEP_TIMEOUT, relay_conn.closed()).await;
