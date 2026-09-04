@@ -8131,6 +8131,79 @@ mod tests {
             }
         }
 
+        /// CADS-Tunnel#754 CONTRACT (the `:443` twin of the #753 guard above). Two
+        /// INITIATORS of the same channel arrive over REAL TLS-over-TCP front-door streams
+        /// (the exact `tokio_rustls` transport the live `:443` leg yields), pass admission,
+        /// and are handed to `finish_relay_pair_over_streams`, whose refusal arm writes the
+        /// framed `pairing` refusal, `shutdown()`s (close_notify + FIN) and returns. #754
+        /// asked whether that arm needs the Ok path's #511 `graceful_close` drain against
+        /// the close_notify RST race. It does not, and this test pins the delivered contract
+        /// so a change to that arm is judged against the real transport: at the moment the
+        /// edge shuts down, the member has sent nothing after its possession signature -- it
+        /// is blocked reading the ack -- so no unread close_notify sits in the edge's receive
+        /// buffer and the drop is FIN-only; the refusal record is on the wire ahead of the
+        /// FIN and the shared relay-leg client classifies it as the definitive
+        /// `Refused { Some("pairing") }`, never a retryable dropped leg.
+        #[tokio::test]
+        async fn shared_relay_leg_client_surfaces_the_frontdoor_pairing_refusal_over_real_tls_754() {
+            use crate::transport::{build_tcp_tls_listener_at, tcp_tls_connect};
+            use std::net::Ipv4Addr;
+
+            let channel = [0xF7u8; 32];
+            let holder_a = holder_sk(0x61);
+            let holder_b = holder_sk(0x62);
+            let req_a = request(channel, &holder_a, Direction::Initiate, "203.0.113.1:7001");
+            let req_b = request(channel, &holder_b, Direction::Initiate, "203.0.113.2:7002");
+            let pk = op_pub();
+
+            let (listener, acceptor, cert) = within("listen", build_tcp_tls_listener_at((Ipv4Addr::LOCALHOST, 0).into()))
+                .await
+                .expect("tls-tcp listener");
+            let addr: SocketAddr = listener.local_addr().expect("addr");
+
+            let edge = tokio::spawn(async move {
+                let authorize =
+                    move |c: ChannelId, _h: [u8; 32]| async move { (c.0 == channel).then_some((pk, None, None)) };
+                let mut members = Vec::new();
+                for _ in 0..2 {
+                    let (tcp, peer) = within("tcp accept", listener.accept()).await.expect("tcp accept");
+                    let tls = within("tls accept", acceptor.accept(tcp)).await.expect("tls accept");
+                    let (stream, req, operator, noise, attest, observed) =
+                        admit_channel_join_on_duplex(tls, peer, 500, BOUND, &authorize)
+                            .await
+                            .expect("the real edge admits the shared relay-leg client over TLS-TCP");
+                    members.push(AdmittedStreamMember { stream, req, operator, noise, attest, observed, session: SessionSource::SameStream, _permit: None });
+                }
+                let b = members.pop().unwrap();
+                let a = members.pop().unwrap();
+                finish_relay_pair_over_streams(a, b, 500).await.map(|_| ()).map_err(|e| e.to_string())
+            });
+
+            let client = |req: ChannelJoinRequest, holder: SigningKey, cert: CertificateDer<'static>| async move {
+                let stream = within("tls connect", tcp_tls_connect(addr, cert)).await.expect("tls-tcp connect");
+                let (mut cr, mut cw) = tokio::io::split(stream);
+                within("relay join", present_channel_relay_join_on_stream(&mut cw, &mut cr, &req, &holder, None))
+                    .await
+                    .expect("an explicit refusal is a clean outcome, not an error (ct-agent#129)")
+                // Dropping the halves here closes the member's connection the way ct-agent does
+                // once it has its outcome -- AFTER the edge's shutdown, never before.
+            };
+            let cert_b = cert.clone();
+            let a = tokio::spawn(client(req_a, holder_a, cert));
+            let b = tokio::spawn(client(req_b, holder_b, cert_b));
+            let out_a = within("a", a).await.expect("a");
+            let out_b = within("b", b).await.expect("b");
+            let err = within("edge", edge).await.expect("edge task").expect_err("two initiators are not pairable");
+            assert!(err.contains("channel relay pair refused"), "the edge reports the `:443` pair refusal: {err}");
+            for (out, who) in [(out_a, "A"), (out_b, "B")] {
+                assert_eq!(
+                    out,
+                    ChannelJoinOutcome::Refused { category: Some("pairing".to_string()) },
+                    "{who}: the framed refusal reaches the member over real TLS-TCP and is definitive"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn shared_client_classifies_the_edges_quic_park_expiry_close_as_park_expired_p2() {
             // ct-agent#21 (QUIC half) + CADS-Tunnel#557: a reaped QUIC park writes no ack at all —
