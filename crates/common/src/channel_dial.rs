@@ -61,6 +61,7 @@
 //! "wasm32"))'.dependencies]` block. A native build (ct-control-plane, ct-agent) sees this
 //! module; a wasm32 build does not, and nothing here can ever be reached from one.
 
+use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -68,7 +69,7 @@ use ed25519_dalek::SigningKey;
 use quinn::{Connection, Endpoint};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::a2a::{a2a_initiate, a2a_recv, a2a_send};
+use crate::a2a::{a2a_initiate, a2a_recv, a2a_send, write_message};
 use crate::channel::{ChannelId, ChannelJoinRequest, SignedChannelGrant, CHANNEL_ENDPOINT_RELAY_ONLY};
 use crate::channel_quic::build_channel_dialer;
 use crate::channel_wire::io::present_channel_join_on_stream;
@@ -76,6 +77,7 @@ use crate::channel_wire::{
     error_names_park_expiry, ChannelJoinOutcome, DroppedLegBeforeAck, PHASE_MARKER_RELAY, PHASE_MARKER_RENDEZVOUS,
 };
 use crate::mcp::encode_request;
+use crate::noise::take_frame;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -372,11 +374,28 @@ pub async fn dial_and_call(
 
     let call_deadline = tokio::time::Instant::now() + CALL_TIMEOUT;
     let req_bytes = encode_request(1, "tools/call", serde_json::json!({ "name": tool_name, "arguments": arguments }));
-    tokio::time::timeout_at(call_deadline, a2a_send(&mut send, &mut session, &req_bytes))
+    // The acceptor's side of this session is ct-agent's `serve_local` duplex: `noise_pump`
+    // decrypts each Noise record and writes its plaintext into that duplex VERBATIM, and
+    // the far end is this crate's own `serve_request_loop`, which reads APP-LAYER frames
+    // (`read_frame`: u16 big-endian length + body) and answers through `write_message`
+    // (the same framing). ct-agent's own callers (`mcp_call_over`, the crew service calls)
+    // therefore write `write_message` frames into their local duplex and the pump seals
+    // those. This dialer sealed the BARE JSON body instead -- the acceptor's loop took
+    // the first two bytes `{"` (0x7B22) as a 31 522-byte length and waited for the rest
+    // forever, with nothing to log on either side, until this caller's `CALL_TIMEOUT`
+    // fired to the millisecond: the "session pairs, `bridge/status` never completes"
+    // stall #745's live verification found once the two-hop fix (#749) had landed.
+    // `write_message` into a `Vec` gives the same size guard and `CT_DEBUG_A2A_TIMING`
+    // log as every other caller.
+    let mut framed_request = Vec::with_capacity(2 + req_bytes.len());
+    write_message(&mut framed_request, &req_bytes)
+        .await
+        .map_err(|e| DialError::Session(e.to_string()))?;
+    tokio::time::timeout_at(call_deadline, a2a_send(&mut send, &mut session, &framed_request))
         .await
         .map_err(|_| DialError::TimedOut)?
         .map_err(|e| DialError::Session(e.to_string()))?;
-    let reply_bytes = tokio::time::timeout_at(call_deadline, a2a_recv(&mut recv, &mut session))
+    let reply_bytes = tokio::time::timeout_at(call_deadline, recv_app_frame(&mut recv, &mut session))
         .await
         .map_err(|_| DialError::TimedOut)?
         .map_err(|e| DialError::Session(e.to_string()))?;
@@ -395,6 +414,26 @@ pub async fn dial_and_call(
         .ok_or_else(|| DialError::BadReply("reply had neither `result` nor `error`".into()))
 }
 
+/// Read ONE app-layer frame (`crate::noise::frame` shape -- what the acceptor's
+/// `serve_request_loop` emits through `write_message`) out of the decrypted record stream.
+/// The acceptor's `noise_pump` seals whatever each of its plaintext reads returns, so the
+/// frame is usually one record but may span several (a reply over the pump's 16 KiB read
+/// chunk, or a duplex write that got split); records are appended until the frame is whole.
+/// A source that closes before that surfaces as `a2a_recv`'s own EOF error.
+async fn recv_app_frame<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    session: &mut snow::TransportState,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    loop {
+        if let Some((body, _consumed)) = take_frame(&buf) {
+            return Ok(body.to_vec());
+        }
+        let record = a2a_recv(recv, session).await?;
+        buf.extend_from_slice(&record);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,6 +445,30 @@ mod tests {
 
     use crate::channel::{PARK_EXPIRED_REASON_PREFIX, PARK_EXPIRED_TOKEN};
     use crate::channel_wire::{decode_refusal_category, PHASE_PREAMBLE_MAGIC, POSSESSION_CHALLENGE_LEN};
+
+    /// The reply frame is reassembled even when the acceptor's pump sealed it as two records.
+    #[tokio::test]
+    async fn reply_frame_split_across_two_noise_records_is_reassembled_745() {
+        let initiator = crate::noise::generate_static_keypair();
+        let responder = crate::noise::generate_static_keypair();
+        let (mut a_w, mut a_r) = tokio::io::duplex(4096);
+        let (mut b_w, mut b_r) = tokio::io::duplex(4096);
+        let resp_priv = responder.private;
+        let body: &[u8] = br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        let responder_task = tokio::spawn(async move {
+            let mut sess = crate::a2a::a2a_respond(&mut b_w, &mut a_r, &resp_priv).await.expect("respond");
+            let framed = crate::noise::frame(body);
+            let (head, tail) = framed.split_at(5);
+            a2a_send(&mut b_w, &mut sess, head).await.expect("first record");
+            a2a_send(&mut b_w, &mut sess, tail).await.expect("second record");
+        });
+        let mut sess = a2a_initiate(&mut a_w, &mut b_r, &initiator.private, &responder.public)
+            .await
+            .expect("initiate");
+        let got = recv_app_frame(&mut b_r, &mut sess).await.expect("one whole app-layer frame");
+        assert_eq!(got, body, "the two records are joined and the u16 prefix is stripped");
+        responder_task.await.unwrap();
+    }
 
     // PR6 (channel_dial as a thin caller): the tests that unit-tested this module's former
     // private copies of the wire helpers are gone -- their guards now live with the shared
@@ -824,13 +887,33 @@ mod tests {
                         tokio::time::timeout(t, r2.read_exact(&mut first)).await??;
                         log.lock().unwrap().connections[idx].second_bi = Some((s2.id(), first.clone()));
                         let mut r2 = std::io::Cursor::new(first).chain(r2);
-                        let mut session =
+                        let session =
                             tokio::time::timeout(t, crate::a2a::a2a_respond(&mut s2, &mut r2, &noise_private)).await??;
-                        let req = tokio::time::timeout(t, a2a_recv(&mut r2, &mut session)).await??;
-                        let req: serde_json::Value = serde_json::from_slice(&req)?;
-                        let resp = serde_json::json!({ "jsonrpc": "2.0", "id": req["id"].clone(), "result": result });
-                        tokio::time::timeout(t, a2a_send(&mut s2, &mut session, &serde_json::to_vec(&resp)?)).await??;
-                        s2.finish()?;
+                        // PRODUCTION shape from here on (ct-agent `serve_local` + `noise_pump`):
+                        // the pump writes each decrypted record into a duplex whose far end is
+                        // this crate's `serve_request_loop`, reading APP-LAYER u16 frames and
+                        // answering with `write_message`. The earlier mock decrypted with
+                        // `a2a_recv` and parsed the bytes directly, so it happily accepted a
+                        // bare unframed request that the real acceptor stalls on forever --
+                        // which is exactly how #745's call-level bug got past this suite.
+                        let (session_side, serve_side) = tokio::io::duplex(1 << 16);
+                        let serve = tokio::spawn(async move {
+                            let (mut sr, mut sw) = tokio::io::split(serve_side);
+                            crate::a2a::serve_request_loop(&mut sw, &mut sr, move |req: Vec<u8>| {
+                                let result = result.clone();
+                                async move {
+                                    let req: serde_json::Value = serde_json::from_slice(&req)
+                                        .expect("the request loop hands the handler one whole JSON-RPC body");
+                                    let resp =
+                                        serde_json::json!({ "jsonrpc": "2.0", "id": req["id"].clone(), "result": result });
+                                    serde_json::to_vec(&resp).expect("serializable reply")
+                                }
+                            })
+                            .await
+                        });
+                        let cipher = tokio::io::join(r2, s2);
+                        tokio::time::timeout(t, crate::noise::noise_pump(session, cipher, session_side)).await??;
+                        let _ = serve.await;
                         conn.closed().await;
                     }
                 }
