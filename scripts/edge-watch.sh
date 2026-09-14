@@ -313,7 +313,7 @@ else
     # Pruefung liefe die Schleife unten in `EXP=0` = "nicht vorgesehen" und bliebe
     # still -- ein Waechterzweig, der nicht feuern KANN, sieht aus wie einer, der
     # nichts findet. Genau die Verwechslung, gegen die #539 gebaut wurde.
-    if ! printf '%s' "$MET" | grep -q "^ct_edge_channel_broker_loop_expected_since_seconds"; then
+    if ! grep -q "^ct_edge_channel_broker_loop_expected_since_seconds" <<< "$MET"; then
       ALARMS+=("Der laufende Edge kennt das Gauge 'expected_since' nicht (Stand vor #539). Der Waechter kann einen nie angelaufenen Broker-Loop deshalb NICHT erkennen -- das ist kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
     fi
     for LOOP in relay rendezvous; do
@@ -402,7 +402,7 @@ else
       [ -n "$l" ] || continue
       ALARMS+=("Lauscher '$l' wurde erwartet, ist aber nie angelaufen (fehlgeschlagener Bind). Er ist absichtlich NICHT gesundheitsentscheidend, also startet sich der Container deswegen NICHT neu -- diese Mail ist die einzige Meldung, die es dazu gibt.")
     done <<< "$ADVISORY"
-  elif ! printf '%s' "$MET" | grep -q "^ct_edge_listener_loop_health_gating"; then
+  elif ! grep -q "^ct_edge_listener_loop_health_gating" <<< "$MET"; then
     ALARMS+=("Der laufende Edge kennt 'ct_edge_listener_loop_health_gating' nicht. Nicht-gesundheitsentscheidende Lauscher (z.B. der :80-Redirect) koennen deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
   fi
 fi
