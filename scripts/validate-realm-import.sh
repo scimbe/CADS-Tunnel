@@ -24,7 +24,42 @@
 set -euo pipefail
 
 FILE="${1:-$(dirname "$0")/../docker/deploy/keycloak/ct-demo-realm.json}"
-IMAGE="${KC_IMAGE:-quay.io/keycloak/keycloak:25.0}"
+COMPOSE_FILE="${KC_COMPOSE_FILE:-$(dirname "$0")/../docker/deploy/compose.sso.yml}"
+
+# Einzige Quelle der Wahrheit für das Default-Image: der `keycloak`-Dienst in
+# compose.sso.yml (nicht der erste image-Eintrag der Datei -- postgres:16-alpine
+# steht davor). KC_IMAGE überschreibt weiterhin; ohne Override und ohne Fund
+# gibt es keinen stillen Rückfall auf eine feste Version.
+DEFAULT_IMAGE="$(python3 - "$COMPOSE_FILE" <<'PY'
+import re, sys
+path = sys.argv[1]
+try:
+    text = open(path).read()
+except OSError:
+    print("")
+    sys.exit(0)
+in_service = False
+image = ""
+for line in text.splitlines():
+    if re.match(r'^  keycloak:\s*(#.*)?$', line):
+        in_service = True
+        continue
+    if in_service:
+        if re.match(r'^  \S', line):
+            break
+        m = re.match(r'^\s{4,}image:\s*(\S+)\s*$', line)
+        if m:
+            image = m.group(1).strip('"\'')
+            break
+print(image)
+PY
+)"
+if [ -z "${KC_IMAGE:-}" ] && [ -z "$DEFAULT_IMAGE" ]; then
+  echo "FEHLER: kein image-Eintrag für den keycloak-Dienst in $COMPOSE_FILE gefunden."
+  echo "        (Ein stiller Rückfall auf eine feste Version ist kein Freispruch.)"
+  exit 1
+fi
+IMAGE="${KC_IMAGE:-$DEFAULT_IMAGE}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
 command -v docker >/dev/null || {
