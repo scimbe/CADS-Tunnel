@@ -151,6 +151,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_CONTROL_PLANE_LISTEN` | control plane | bind address (default `0.0.0.0:8090`) |
 | `CT_CONTROL_PLANE_DB` | control plane | SQLite path (put it on durable storage) |
 | `CT_CP_SHUTDOWN_GRACE_SECS` | control plane | on SIGTERM/Ctrl-C, how long (seconds) in-flight HTTP requests are given to finish before the process force-exits regardless; **default 30** (#400). Stops accepting new connections immediately; a stuck/slow request past this bound is cut off rather than hanging shutdown forever |
+| `CT_CP_ADMIN_AUDIT_RETENTION_DAYS` | control plane | opt-in retention window for `admin_audit_log`: the hourly retention sweep deletes entries older than this many days. **Unset/`0` = keep forever** (default). The same sweep always ages out `acme_issuance_log` (>30 d), consumed/expired claim invites (>30 d past), and runs a daily `wal_checkpoint(TRUNCATE)` + `PRAGMA optimize`; `token_issuances` (paid-token records) is never pruned (#775) |
 | `CT_OIDC_ISSUER` | control plane | Keycloak realm issuer URL; **alone** enables OIDC — the realm JWKS is fetched at startup to mount `/me/*` (#42) |
 | `CT_OIDC_PUBKEY_PATH` | control plane | PEM of the realm's RSA public key; an **offline override** of the JWKS fetch (takes precedence when set) |
 | `CT_OIDC_ACCESS_AUD` | control plane | **opt-in** access-token `aud` enforcement for `/me/*` (#82); set to your realm's field-checked access-token audience so a token whose `aud` omits it is rejected. Unset ⇒ audience not checked |
