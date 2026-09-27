@@ -36,17 +36,12 @@ data:
   # configured for); replace ct-portal.example.com with your real Portal
   # hostname before deploying, same posture as CT_OIDC_ISSUER above.
   CT_PORTAL_BASE_URL: "https://ct-portal.example.com"
-  # #309: OIDC/Keycloak SSO is DELIBERATELY OUT OF SCOPE for this pass. The
-  # self-host compose stack's SSO overlay (compose.sso.yml, #42/#48) runs a
-  # full Keycloak alongside the edge's Auth route (CT_EDGE_AUTH_HOST/_ADDR on
-  # the edge, CT_OIDC_CLIENT_ID/_SECRET/_REDIRECT_URI here) -- but there is no
-  # Keycloak k8s manifest anywhere in this directory yet. Wiring
-  # CT_OIDC_CLIENT_ID/_SECRET/_REDIRECT_URI here without a real Keycloak
-  # Service behind them would silently reference infrastructure that doesn't
-  # exist (portal.rs::PortalOidc::from_lookup would build a login URL nothing
-  # answers) -- worse than just leaving OIDC login off, which is the existing,
-  # already-safe default (CT_OIDC_ISSUER alone only enables JWKS-verified
-  # /me/* for bearer tokens minted elsewhere; it does NOT enable browser
-  # login, portal.rs L98-111). A follow-up issue should add a Keycloak k8s
-  # Deployment/Service/PVC (mirroring compose.sso.yml's Postgres-backed setup,
-  # #307) and the edge's Auth-route env before this is turned on here.
+  # ADR-0025: the one account allowed into the admin console. REQUIRED -- the
+  # control plane refuses to start without it (admin_identity.rs), so the base
+  # could not boot before this was set. REPLACE with the real address.
+  CT_ADMIN_SUPER_EMAIL: "admin@ct-portal.example.com"
+  # Browser login via Keycloak (CT_OIDC_CLIENT_ID/_SECRET/_REDIRECT_URI) is not
+  # enabled by the base: add the components/sso component (#397), which deploys
+  # Keycloak + Postgres, the edge's Auth route and this wiring. Without it,
+  # CT_OIDC_ISSUER above only enables JWKS-verified /me/* for bearer tokens
+  # minted elsewhere (portal.rs L98-111).

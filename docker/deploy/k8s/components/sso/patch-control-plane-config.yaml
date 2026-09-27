@@ -1,0 +1,16 @@
+# Turns on browser login (portal.rs PortalOidc::from_lookup needs issuer, client
+# id and redirect URI; the client secret comes from a Secret). REPLACE hosts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ct-control-plane-config
+  namespace: ct-system
+data:
+  CT_OIDC_ISSUER: "https://auth.ct-portal.example.com/realms/ct-demo"
+  CT_OIDC_CLIENT_ID: "ct-portal"
+  CT_OIDC_REDIRECT_URI: "https://ct-portal.example.com/portal/callback"
+  # #527: an email allow-list match must also carry `email_verified`; the realm
+  # allows self-registration. Same committed "1" as compose.sso.yml.
+  CT_GATE_REQUIRE_VERIFIED_EMAIL: "1"
+  # ADR-0025: the admin console's cert-expiry slot for the auth host.
+  CT_CP_CERT_AUTH_PATH: "/certs/auth/tls.crt"

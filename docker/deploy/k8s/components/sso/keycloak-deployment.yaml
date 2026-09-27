@@ -1,0 +1,141 @@
+# Keycloak (#397), the k8s counterpart of compose.sso.yml's `keycloak` service.
+# Reached only through the edge's :443 front door (auth host) and in-cluster as
+# ct-keycloak:8080; no public Service of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ct-keycloak
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-keycloak
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ct-keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ct-keycloak
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-keycloak
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  # One instance: no clustered cache is configured, matching compose.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ct-keycloak
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ct-keycloak
+        app.kubernetes.io/part-of: CADS-Tunnel
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # uid of the `keycloak` user in the official image.
+        runAsUser: 1000
+      containers:
+        - name: keycloak
+          # Same pinned release as compose.sso.yml; bump both together.
+          image: quay.io/keycloak/keycloak:26.7.3
+          # --import-realm is IGNORE_EXISTING: it seeds a fresh database and is a
+          # no-op once the realm exists (#307), so accounts survive restarts.
+          args: ["start", "--import-realm"]
+          envFrom:
+            - configMapRef:
+                name: ct-keycloak-config
+            - secretRef:
+                name: ct-keycloak-idp
+                optional: true
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ct-keycloak
+                  key: admin-password
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ct-keycloak
+                  key: db-password
+            - name: KC_PORTAL_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ct-oidc-portal-client
+                  key: secret
+            - name: KC_SMTP_HOST
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: host}}
+            - name: KC_SMTP_PORT
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: port}}
+            - name: KC_SMTP_FROM
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: from}}
+            - name: KC_SMTP_USER
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: user}}
+            - name: KC_SMTP_PASSWORD
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: password}}
+            - name: KC_SMTP_SSL
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: ssl}}
+            - name: KC_SMTP_STARTTLS
+              valueFrom: {secretKeyRef: {name: ct-keycloak-smtp, key: starttls}}
+          ports:
+            - name: http
+              containerPort: 8080
+            # Health endpoints live on the management port, not :8080.
+            - name: management
+              containerPort: 9000
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: management
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: management
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: management
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # compose.sso.yml: mem_reservation 512m, mem_limit 1536m, cpus 1.5.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1.5"
+              memory: 1536Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Writable root FS: `start` on the stock image re-augments Quarkus into
+            # /opt/keycloak/lib when build options (KC_DB) differ from the image's.
+            # A derived image built with `kc.sh build` plus `start --optimized`
+            # would allow a read-only root FS.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: realm
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
+      volumes:
+        - name: realm
+          configMap:
+            name: ct-keycloak-realm

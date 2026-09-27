@@ -1,0 +1,17 @@
+# TLS cert for the Keycloak hostname the front door terminates (CT_EDGE_AUTH_*),
+# issued like the base's edge-certificate.yaml. REPLACE the dnsName.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ct-edge-auth-tls
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  dnsNames:
+    - auth.ct-portal.example.com
+  secretName: ct-edge-auth-tls
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer

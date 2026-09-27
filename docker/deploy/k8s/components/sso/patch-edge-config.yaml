@@ -1,0 +1,12 @@
+# The edge's Auth route (#48): terminate TLS for the Keycloak hostname and
+# reverse-proxy to ct-keycloak:8080. REPLACE the hostname.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ct-edge-config
+  namespace: ct-system
+data:
+  CT_EDGE_AUTH_HOST: "auth.ct-portal.example.com"
+  CT_EDGE_AUTH_ADDR: "ct-keycloak:8080"
+  CT_EDGE_AUTH_CERT: "/certs/auth/tls.crt"
+  CT_EDGE_AUTH_KEY: "/certs/auth/tls.key"

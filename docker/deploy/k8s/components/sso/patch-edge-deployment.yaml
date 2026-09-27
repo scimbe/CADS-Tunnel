@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ct-edge
+  namespace: ct-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: edge
+          volumeMounts:
+            - name: auth-tls
+              mountPath: /certs/auth
+              readOnly: true
+      volumes:
+        - name: auth-tls
+          secret:
+            secretName: ct-edge-auth-tls
