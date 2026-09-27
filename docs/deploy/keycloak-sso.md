@@ -7,8 +7,10 @@ stack runs unchanged without it.
 
 ## What ships in-repo
 
-- `docker/deploy/compose.sso.yml` — the Keycloak service (`quay.io/keycloak/keycloak:25.0`,
-  `start-dev --import-realm`) plus the `CT_OIDC_*` env merged onto the control-plane.
+- `docker/deploy/compose.sso.yml` — the Keycloak service (image pinned in that file's
+  `keycloak` service, currently `quay.io/keycloak/keycloak:26.7.3`; `scripts/validate-realm-import.sh`
+  derives its default validation image from there so the two never drift apart, `start-dev
+  --import-realm`) plus the `CT_OIDC_*` env merged onto the control-plane.
 - `docker/deploy/keycloak/ct-demo-realm.json` — a declarative realm `ct-demo` with a
   confidential RS256 client `ct-portal` and self-registration enabled. Its secret is
   **pinned to `${KC_PORTAL_CLIENT_SECRET}`** (#65) — no literal is baked in, but
