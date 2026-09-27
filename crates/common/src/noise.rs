@@ -243,10 +243,17 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Vec<u8
 /// multiplexed pump frames `[tag] ‖ app bytes` — the framing is identical, only the plaintext differs
 /// (which is why the base wire carries no tag and the multiplexed wire's tag lives INSIDE the
 /// ciphertext). Byte-identical to the inline/closure code it replaces (`noise.rs` golden-vector pinned).
+/// Lock a session's transport state, failing only this session if the mutex is
+/// poisoned. Deliberately not `lock_safe`: a panic mid-`write_message` may have left
+/// the nonce counter torn, and reusing it risks nonce reuse, so this must fail closed
+/// (#775 item 6) instead of recovering the guard or cascading the panic.
+fn lock_session(ts: &Mutex<snow::TransportState>) -> io::Result<std::sync::MutexGuard<'_, snow::TransportState>> {
+    ts.lock()
+        .map_err(|_| io::Error::other("noise session state poisoned by an earlier panic; closing this session"))
+}
+
 fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8]) -> io::Result<usize> {
-    let len = ts
-        .lock()
-        .unwrap()
+    let len = lock_session(ts)?
         .write_message(plaintext, &mut ct[2..])
         .map_err(|e| io::Error::other(e.to_string()))?;
     ct[0..2].copy_from_slice(&(len as u16).to_be_bytes());
@@ -320,7 +327,7 @@ where
                     return Ok::<(), io::Error>(());
                 }
             };
-            let len = ts.lock().unwrap().read_message(&fr[..n], &mut pt).map_err(noise_err)?;
+            let len = lock_session(&ts)?.read_message(&fr[..n], &mut pt).map_err(noise_err)?;
             if debug_a2a_timing_enabled() {
                 eprintln!(
                     "ct-a2a-timing: noise_pump inbound plaintext decrypted len={len} head={:?}",
@@ -539,8 +546,8 @@ where
             };
             let len = {
                 let mut ts = match direct.as_ref() {
-                    Some((dts, _)) => dts.lock().unwrap(),
-                    None => relay_ts.lock().unwrap(),
+                    Some((dts, _)) => lock_session(dts)?,
+                    None => lock_session(&relay_ts)?,
                 };
                 ts.read_message(&fr[..n], &mut pt).map_err(noise_err)?
             };
@@ -736,6 +743,23 @@ mod tests {
         let after = unsafe { std::ptr::read(ptr) };
         assert_ne!(after, original, "the intermediate Zeroizing<StaticSecret>'s bytes must be wiped too, not just this crate's own copy");
         assert_eq!(after, [0u8; 32], "zeroize overwrites with zero bytes");
+    }
+
+    #[test]
+    fn poisoned_session_state_fails_the_session_instead_of_panicking_775() {
+        let (a, _b) = transport_pair();
+        let ats = std::sync::Arc::new(Mutex::new(a));
+        let poisoner = std::sync::Arc::clone(&ats);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("simulated panic while holding the transport state");
+        })
+        .join();
+        assert!(ats.is_poisoned());
+
+        let mut ct = vec![0u8; 512];
+        let err = seal_frame(&ats, b"hello", &mut ct).expect_err("poisoned state must not be reused");
+        assert!(err.to_string().contains("poisoned"), "{err}");
     }
 
     #[test]
