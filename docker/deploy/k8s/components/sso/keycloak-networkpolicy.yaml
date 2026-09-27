@@ -1,0 +1,49 @@
+# Holes in the base's default-deny ingress for the SSO component: the edge's
+# front door reaches Keycloak on :8080 (the auth host route); only Keycloak
+# reaches its Postgres. The control plane reaches Keycloak through the public
+# auth host (the edge), the same path the browser uses, so it needs no rule here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ct-keycloak
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-keycloak
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ct-keycloak
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ct-edge
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ct-keycloak-postgres
+  namespace: ct-system
+  labels:
+    app.kubernetes.io/name: ct-keycloak-postgres
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ct-keycloak-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ct-keycloak
+      ports:
+        - protocol: TCP
+          port: 5432

@@ -1,0 +1,61 @@
+# Optional SSO component (#397): Keycloak + its Postgres, the edge's Auth route
+# on the :443 front door, and the control plane's OIDC login wiring. The k8s
+# counterpart of compose.sso.yml. Off by default; opt in from an overlay:
+#
+#   # my-overlay/kustomization.yaml
+#   apiVersion: kustomize.config.k8s.io/v1beta1
+#   kind: Kustomization
+#   resources:  [../docker/deploy/k8s]
+#   components: [../docker/deploy/k8s/components/sso]
+#
+# Replace before deploying (same placeholder posture as the base):
+#   auth.ct-portal.example.com  -> your Keycloak hostname (keycloak-config.yaml,
+#                                  auth-certificate.yaml, patch-edge-config.yaml,
+#                                  patch-control-plane-config.yaml)
+#   ct-portal.example.com       -> your Portal hostname (must match the base)
+#
+# Create out-of-band in namespace ct-system (never committed):
+#   kubectl -n ct-system create secret generic ct-keycloak \
+#     --from-literal=admin-password="$(openssl rand -hex 24)" \
+#     --from-literal=db-password="$(openssl rand -hex 24)"
+#   # One value shared by Keycloak's ct-portal client and the control plane's
+#   # code->token exchange, so the two cannot drift (#65).
+#   kubectl -n ct-system create secret generic ct-oidc-portal-client \
+#     --from-literal=secret="$(openssl rand -hex 32)"
+#   kubectl -n ct-system create secret generic ct-portal-session-key \
+#     --from-literal=key="$(openssl rand -hex 32)"
+#   # SMTP is required: with trustEmail=false (#669) new social-login users must
+#   # confirm their address by mail.
+#   kubectl -n ct-system create secret generic ct-keycloak-smtp \
+#     --from-literal=host=... --from-literal=port=465 --from-literal=from=... \
+#     --from-literal=user=... --from-literal=password=... \
+#     --from-literal=ssl=true --from-literal=starttls=false
+#   # The declarative realm (kustomize's load restrictor forbids reading it from
+#   # outside this directory, so it is supplied like the secrets):
+#   kubectl -n ct-system create configmap ct-keycloak-realm \
+#     --from-file=docker/deploy/keycloak/ct-demo-realm.json
+#   # Optional: identity brokering / service-account client secrets the realm
+#   # substitutes (KC_GOOGLE_CLIENT_ID, KC_GITHUB_CLIENT_SECRET, ...). Every key
+#   # becomes an env var of the same name; missing keys stay empty.
+#   kubectl -n ct-system create secret generic ct-keycloak-idp --from-env-file=idp.env
+#
+# The realm's login theme (ct-bunsenbrenner) is not shipped here; without it
+# Keycloak renders its built-in theme. Bake docker/deploy/keycloak/themes into
+# a derived image under /opt/keycloak/themes for the branded pages.
+#
+# Certificates: auth-certificate.yaml asks cert-manager for ct-edge-auth-tls,
+# like the base's edge-certificate.yaml; without cert-manager create that TLS
+# Secret yourself and drop the file from `resources` in a local copy.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - keycloak-config.yaml
+  - keycloak-postgres.yaml
+  - keycloak-deployment.yaml
+  - keycloak-networkpolicy.yaml
+  - auth-certificate.yaml
+patches:
+  - path: patch-edge-config.yaml
+  - path: patch-edge-deployment.yaml
+  - path: patch-control-plane-config.yaml
+  - path: patch-control-plane-deployment.yaml

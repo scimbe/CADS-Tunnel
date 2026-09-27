@@ -28,8 +28,8 @@
 #
 # --- #309: also intentionally out of scope here (see edge-config.yaml and
 # control-plane-config.yaml's own comments for the full reasoning) ---------
-#   - Keycloak/OIDC login (CT_EDGE_AUTH_*, CT_OIDC_CLIENT_*): no Keycloak k8s
-#     manifest exists yet in this directory.
+#   - Keycloak/OIDC login (CT_EDGE_AUTH_*, CT_OIDC_CLIENT_*): opt-in via the
+#     components/sso component (#397); see its kustomization.yaml.
 #   - The Gelb-tier wildcard cert (CT_EDGE_WILDCARD_CERT/_KEY, #233): separate
 #     tenant-tier feature, optional/non-fatal by design even when absent.
 apiVersion: kustomize.config.k8s.io/v1beta1

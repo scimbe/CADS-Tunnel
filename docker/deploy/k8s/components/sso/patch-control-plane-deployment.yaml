@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ct-control-plane
+  namespace: ct-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          env:
+            # Same Secret/key Keycloak imports as the ct-portal client secret (#65).
+            - name: CT_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ct-oidc-portal-client
+                  key: secret
+            # Without it every restart logs all portal users out (#294).
+            - name: CT_PORTAL_SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ct-portal-session-key
+                  key: key
+          volumeMounts:
+            - name: auth-tls
+              mountPath: /certs/auth
+              readOnly: true
+      volumes:
+        - name: auth-tls
+          secret:
+            secretName: ct-edge-auth-tls
