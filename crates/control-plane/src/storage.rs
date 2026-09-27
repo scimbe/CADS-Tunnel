@@ -44,7 +44,7 @@ use ct_common::sync::MutexExt;
 /// customer-controlled agent could otherwise flood the shared per-domain budget bucket by
 /// re-POSTing "issuance complete" for its own already-gruen hostname). Real renewals are
 /// ~60 days apart, so a 24h floor costs nothing legitimate.
-const MIN_ISSUANCE_LOG_INTERVAL_SECS: i64 = 24 * 60 * 60;
+pub(crate) const MIN_ISSUANCE_LOG_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// Additive schema migration for in-place self-host upgrades (#44). SQLite's
 /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a column
@@ -4880,6 +4880,27 @@ impl SqliteTunnelStore {
         Ok(ca)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_acme_issuance_log_for_test(&self, ca: &str, domain: &str, hostname: &str, issued_at: i64) {
+        self.writer
+            .lock_safe()
+            .execute(
+                "INSERT INTO acme_issuance_log (ca, domain, hostname, issued_at) VALUES (?1, ?2, ?3, ?4)",
+                params![ca, domain, hostname, issued_at],
+            )
+            .unwrap();
+    }
+
+    /// #775 item 2: delete `acme_issuance_log` rows issued before `cutoff`. Only safe
+    /// while `cutoff` lies further back than both readers' windows -- the CA budget
+    /// window ([`Self::ca_budget_usage`]) and the per-hostname replay floor in
+    /// [`Self::record_issuance_complete`]; the retention loop enforces that.
+    pub fn prune_acme_issuance_log(&self, cutoff: i64) -> rusqlite::Result<usize> {
+        self.writer
+            .lock_safe()
+            .execute("DELETE FROM acme_issuance_log WHERE issued_at < ?1", params![cutoff])
+    }
+
     /// Every Gruen hostname whose `channel_tier=gelb=false` revert push to the edge
     /// hasn't been confirmed successful yet (#264): `issuance_complete`'s push is
     /// best-effort, and a failure (network blip, edge 5xx) used to just get logged
@@ -5660,8 +5681,8 @@ impl SqliteChannelStore {
         // opens the portal URL it yields and confirms the claim in THEIR OWN portal
         // session. The claim itself never runs under a bridge identity -- consent stays
         // with the human. Only the SHA-256 of the token is stored (a leaked DB row is not
-        // an open invitation); `consumed_at` makes it single-use; expired rows are inert
-        // and simply stay (no sweeper -- the expires_at index keeps the lookups cheap).
+        // an open invitation); `consumed_at` makes it single-use; expired and consumed rows
+        // are inert until `retention.rs` prunes them after a grace period (#775).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channel_claim_invites (
                  token_hash        TEXT PRIMARY KEY,
@@ -6500,6 +6521,39 @@ impl SqliteChannelStore {
             params![claim_invite_token_hash(token), now as i64],
         )?;
         Ok(changed > 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_claim_invite_for_test(&self, token: &str, expires_at: u64, consumed_at: Option<u64>) {
+        self.writer
+            .lock_safe()
+            .execute(
+                "INSERT INTO channel_claim_invites \
+                 (token_hash, channel, holder, noise_pubkey, noise_attestation, label, minted_by, created_at, expires_at, consumed_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'owner', 0, ?6, ?7)",
+                params![
+                    claim_invite_token_hash(token),
+                    &[1u8; 32][..],
+                    &[2u8; 32][..],
+                    &[3u8; 32][..],
+                    &[4u8; 64][..],
+                    expires_at as i64,
+                    consumed_at.map(|c| c as i64),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// #775 item 2: delete claim invites that were consumed or expired before `cutoff`.
+    /// A pruned token resolves to [`ClaimInviteLookup::Unknown`] instead of
+    /// `Consumed`/`Expired` -- still refused, only the message differs, which is why the
+    /// retention loop keeps a grace period rather than pruning at expiry.
+    pub fn prune_claim_invites(&self, cutoff: u64) -> rusqlite::Result<usize> {
+        self.writer.lock_safe().execute(
+            "DELETE FROM channel_claim_invites \
+             WHERE expires_at < ?1 OR (consumed_at IS NOT NULL AND consumed_at < ?1)",
+            params![cutoff as i64],
+        )
     }
 
     /// Self-service discoverability (2026-08-01): every channel `email`

@@ -112,6 +112,15 @@ impl SqliteAuditLog {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// #775 item 2: delete entries recorded before `cutoff`. Only called when the
+    /// operator opted into a retention window (`CT_CP_ADMIN_AUDIT_RETENTION_DAYS`);
+    /// by default the log is kept forever, matching the module's "immutable record" premise.
+    pub fn prune_older_than(&self, cutoff: i64) -> rusqlite::Result<usize> {
+        self.conn
+            .lock_safe()
+            .execute("DELETE FROM admin_audit_log WHERE at < ?1", params![cutoff])
+    }
 }
 
 fn now_secs() -> i64 {

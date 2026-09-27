@@ -60,7 +60,7 @@ const GELB_REAFFIRM_BATCH_SIZE: usize = 50;
 /// The rate-limit ledger's rolling window — matches Let's Encrypt's own
 /// "per 7 days" framing; every CA in the rotation is budgeted against the
 /// same window for simplicity, even where a CA's real limit isn't weekly.
-const BUDGET_WINDOW_SECS: i64 = 7 * 24 * 3600;
+pub(crate) const BUDGET_WINDOW_SECS: i64 = 7 * 24 * 3600;
 
 #[derive(Clone)]
 struct AcmeBrokerState {
