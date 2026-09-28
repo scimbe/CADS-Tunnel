@@ -6153,9 +6153,16 @@ fn is_same_origin_request(headers: &HeaderMap) -> bool {
     }
     match (header("origin"), header("host")) {
         (None, _) => true,
-        (Some(origin), Some(host)) => origin
-            .split_once("://")
-            .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host)),
+        (Some(origin), Some(host)) => origin.split_once("://").is_some_and(|(scheme, authority)| {
+            // A proxy may add or drop the scheme's default port on one side only.
+            let default_port = match scheme {
+                "https" => ":443",
+                "http" => ":80",
+                _ => "",
+            };
+            let strip = |a: &str| a.strip_suffix(default_port).filter(|_| !default_port.is_empty()).unwrap_or(a).to_ascii_lowercase();
+            strip(authority) == strip(host)
+        }),
         (Some(_), None) => false,
     }
 }
@@ -7167,6 +7174,16 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(send(Method::POST, "/portal/account/delete", &[]).await, StatusCode::OK);
+        assert_eq!(
+            send(Method::POST, "/portal/account/delete", &[("origin", "https://portal.example.org"), ("host", "portal.example.org:443")]).await,
+            StatusCode::OK,
+            "default port on one side only"
+        );
+        assert_eq!(
+            send(Method::POST, "/portal/account/delete", &[("origin", "https://portal.example.org:8443"), ("host", "portal.example.org")]).await,
+            StatusCode::FORBIDDEN,
+            "a non-default port is a different origin"
+        );
         // Safe methods and routes outside the cookie-authed prefixes are untouched.
         assert_eq!(send(Method::GET, "/portal", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
         assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
