@@ -434,7 +434,14 @@ pub async fn client_forward(
 ) -> Result<(), BoxError> {
     let shared_conn: Arc<tokio::sync::Mutex<Option<Connection>>> = Arc::new(tokio::sync::Mutex::new(None));
     loop {
-        let (sock, _peer) = listener.accept().await?;
+        let (sock, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("ct-client: accept failed: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let edge_cert = edge_cert.clone();
         let token = token.clone();
         let cap = cap.clone();
