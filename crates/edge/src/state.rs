@@ -158,6 +158,11 @@ const JOIN_REFUSAL_WINDOW_SECS: u64 = 60;
 /// definitively-refused sources per minute.
 const JOIN_REFUSAL_MAX_TRACKED_IPS: usize = 4096;
 
+/// Upper bound on advertised direct endpoints (role `'D'`), and on one advertised
+/// certificate (a self-signed Agent cert is well under 1 KiB). Worst case 32 MiB.
+const DIRECT_ENDPOINTS_MAX: usize = 4096;
+const DIRECT_CERT_MAX_LEN: usize = 8 * 1024;
+
 /// #497 slice 2: liveness heartbeat for a broker accept loop. The 2026-08-13 broker wedge
 /// (accept loop dead inside a live, healthcheck-green process, 22 minutes of fleet-wide
 /// channel outage) was invisible precisely because nothing observable distinguished "idle
@@ -1535,8 +1540,29 @@ impl<H: Clone> EdgeState<H> {
     /// one lock hold, not a separate check every caller has to remember.
     pub fn advertise_direct(&self, token: RoutingToken, addr: SocketAddr, cert: Vec<u8>) -> bool {
         let _guard = self.registration_lock.lock_safe();
-        if self.is_revoked(&token) {
+        if self.is_revoked(&token) || cert.len() > DIRECT_CERT_MAX_LEN {
             return false;
+        }
+        // 'D' is unauthenticated and the Agent sends it once, BEFORE registering, so a
+        // registration can't be required here. Bound the map instead: when full, make
+        // room by evicting an entry whose token has no live registration (every flooded
+        // entry qualifies), and refuse only if all entries belong to live tunnels.
+        let evict = {
+            let direct = self.direct.read_safe();
+            if direct.len() < DIRECT_ENDPOINTS_MAX || direct.contains_key(&token) {
+                None
+            } else {
+                Some(direct.keys().cloned().collect::<Vec<_>>())
+            }
+        };
+        if let Some(keys) = evict {
+            let Some(victim) = keys
+                .into_iter()
+                .find(|t| self.registration_count(t) == 0 && !self.has_tcp_agent(t))
+            else {
+                return false;
+            };
+            self.direct.write_safe().remove(&victim);
         }
         self.direct.write_safe().insert(token, (addr, cert));
         true
@@ -2983,6 +3009,48 @@ mod tests {
         let live = token(8);
         assert!(state.advertise_direct(live.clone(), addr, vec![4, 5, 6]), "an unrevoked token advertises normally");
         assert_eq!(state.direct_endpoint(&live), Some((addr, vec![4, 5, 6])));
+    }
+
+    fn many_token(i: usize) -> RoutingToken {
+        let mut t = [0u8; 32];
+        t[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        t[31] = 0xd1;
+        RoutingToken(t)
+    }
+
+    #[test]
+    fn advertise_direct_is_bounded_and_evicts_unregistered_entries_first() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        assert!(
+            !state.advertise_direct(token(1), addr, vec![0; DIRECT_CERT_MAX_LEN + 1]),
+            "oversized certificate refused"
+        );
+        assert_eq!(state.direct_endpoint(&token(1)), None);
+
+        // Flood: fill the map with tokens that never register.
+        for i in 0..DIRECT_ENDPOINTS_MAX {
+            assert!(state.advertise_direct(many_token(i), addr, vec![1]));
+        }
+        assert_eq!(state.direct.read_safe().len(), DIRECT_ENDPOINTS_MAX);
+        // A legitimate Agent still gets in, displacing a flooded entry; the map stays bounded.
+        assert!(state.advertise_direct(token(2), addr, vec![2]));
+        assert_eq!(state.direct_endpoint(&token(2)), Some((addr, vec![2])));
+        assert_eq!(state.direct.read_safe().len(), DIRECT_ENDPOINTS_MAX);
+        // Re-advertising an existing entry never needs room.
+        assert!(state.advertise_direct(token(2), addr, vec![3]));
+    }
+
+    #[test]
+    fn advertise_direct_never_evicts_a_live_tunnel() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        for i in 0..DIRECT_ENDPOINTS_MAX {
+            state.register(many_token(i), i as u32);
+            assert!(state.advertise_direct(many_token(i), addr, vec![1]));
+        }
+        assert!(!state.advertise_direct(token(3), addr, vec![1]), "full of live tunnels: refuse, don't evict");
+        assert!(state.direct_endpoint(&many_token(0)).is_some());
     }
 
     /// #665: belt-and-suspenders alongside `advertise_direct`'s own refusal --
