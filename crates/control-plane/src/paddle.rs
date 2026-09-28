@@ -239,23 +239,32 @@ async fn paddle_webhook(State(st): State<PaddleState>, headers: HeaderMap, body:
                 // reconcile against; ack so Paddle doesn't retry forever.
                 return Ok(StatusCode::OK);
             };
-            let payment = hex_decode_32(payment_id_hex).ok_or((StatusCode::BAD_REQUEST, "malformed payment id".to_string()))?;
-            match st.ledger.confirm_payment(&crate::payment::PaymentId(payment)) {
+            let payment = crate::payment::PaymentId(
+                hex_decode_32(payment_id_hex).ok_or((StatusCode::BAD_REQUEST, "malformed payment id".to_string()))?,
+            );
+            let (account, intent_credits) = st
+                .ledger
+                .payment_intent(&payment)
+                .map_err(|e| internal("paddle_webhook/payment_intent", e))?
+                .ok_or((StatusCode::NOT_FOUND, "unknown payment".to_string()))?;
+            let plan = custom_data.and_then(|c| c.get("plan")).and_then(|v| v.as_str()).unwrap_or("");
+            let plan = verify_paid_plan(&event, &PricingConfig::from_env(), plan, intent_credits).map_err(|why| {
+                crate::service::note_paddle_webhook_rejected(why);
+                (StatusCode::UNPROCESSABLE_ENTITY, why.to_string())
+            })?;
+            match st.ledger.confirm_payment(&payment) {
                 Ok(_) => {}
                 Err(crate::storage::PaymentOpError::Payment(crate::payment::PaymentError::AlreadyConfirmed)) => {}
                 Err(crate::storage::PaymentOpError::Payment(crate::payment::PaymentError::UnknownPayment)) => {
                     return Err((StatusCode::NOT_FOUND, "unknown payment".to_string()));
                 }
-                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+                Err(e) => return Err(internal("paddle_webhook/confirm_payment", e)),
             }
-            if let (Some(subject), Some(plan)) = (
-                custom_data.and_then(|c| c.get("subject")).and_then(|v| v.as_str()),
-                custom_data.and_then(|c| c.get("plan")).and_then(|v| v.as_str()),
-            ) {
-                if let Ok(account) = st.ledger.account_for_subject(subject) {
-                    let _ = st.ledger.set_plan(&account, Some(plan));
-                }
-            }
+            // A failure here must not be acked: Paddle retries non-2xx, and the retry
+            // is safe because an already-confirmed payment falls through to this step.
+            st.ledger
+                .set_plan(&account, Some(plan))
+                .map_err(|e| internal("paddle_webhook/set_plan", e))?;
         }
         // Cancellation/refund handling is real, separate follow-up scope --
         // acked here (so Paddle doesn't retry) but not yet acted on. Flagged
@@ -265,9 +274,73 @@ async fn paddle_webhook(State(st): State<PaddleState>, headers: HeaderMap, body:
     Ok(StatusCode::OK)
 }
 
+/// A completed transaction may only credit and upgrade what was actually paid for:
+/// `plan` must be a configured tier whose Paddle price is among the transaction's items,
+/// and the intent must carry exactly that tier's credits -- so a portal top-up intent
+/// (customer-chosen amount) or a cheaper price can never be confirmed as a plan purchase.
+fn verify_paid_plan<'a>(
+    event: &serde_json::Value,
+    pricing: &PricingConfig,
+    plan: &'a str,
+    intent_credits: u64,
+) -> Result<&'a str, &'static str> {
+    let tier = pricing.tier(plan).ok_or("transaction names no configured plan")?;
+    let price_id = tier.paddle_price_id.as_deref().ok_or("plan has no Paddle price configured")?;
+    let paid = event
+        .get("data")
+        .and_then(|d| d.get("items"))
+        .and_then(|i| i.as_array())
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|it| it.get("price").and_then(|p| p.get("id")).and_then(|v| v.as_str()) == Some(price_id))
+        });
+    if !paid {
+        return Err("transaction does not contain the plan's Paddle price");
+    }
+    if intent_credits != u64::from(tier.credits.unwrap_or(0)) {
+        return Err("payment intent does not match the plan's credit bundle");
+    }
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pricing_with_pro() -> PricingConfig {
+        PricingConfig {
+            pro: Some(crate::pricing::PaidTier {
+                name: "pro",
+                price_cents: Some(2000),
+                credits: Some(500),
+                tunnels: None,
+                relay_free_gb: None,
+                note: None,
+                paddle_price_id: Some("pri_pro".into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn event_with_prices(ids: &[&str]) -> serde_json::Value {
+        let items: Vec<_> = ids.iter().map(|id| serde_json::json!({ "price": { "id": id }, "quantity": 1 })).collect();
+        serde_json::json!({ "event_type": "transaction.completed", "data": { "items": items } })
+    }
+
+    #[test]
+    fn paid_plan_is_accepted_only_for_its_own_price_and_credit_bundle() {
+        let pricing = pricing_with_pro();
+        assert_eq!(verify_paid_plan(&event_with_prices(&["pri_pro"]), &pricing, "pro", 500), Ok("pro"));
+        // a cheaper price carrying plan=pro
+        assert!(verify_paid_plan(&event_with_prices(&["pri_cheap"]), &pricing, "pro", 500).is_err());
+        // a portal top-up intent (customer-chosen credits) confirmed through Paddle
+        assert!(verify_paid_plan(&event_with_prices(&["pri_pro"]), &pricing, "pro", 1_000_000).is_err());
+        // unknown / missing plan, missing items
+        assert!(verify_paid_plan(&event_with_prices(&["pri_pro"]), &pricing, "", 500).is_err());
+        assert!(verify_paid_plan(&event_with_prices(&["pri_pro"]), &pricing, "business", 500).is_err());
+        assert!(verify_paid_plan(&serde_json::json!({ "data": {} }), &pricing, "pro", 500).is_err());
+    }
 
     #[test]
     fn signature_round_trips_and_is_verifiable() {

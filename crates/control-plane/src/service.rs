@@ -483,9 +483,11 @@ async fn resolve_tunnel(
     }))
 }
 
-/// Build the persistent billing router (accounts / payment / credit-gated
-/// issuance) backed by a durable [`SqliteLedger`].
-pub fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
+/// Test-only: mounts `/payment/confirm` with no authentication at all, so it must
+/// never be reachable from a production router (the real confirmation path is the
+/// signature-verified provider webhook).
+#[cfg(test)]
+fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
     Router::new()
         .route("/accounts/open", post(open_account))
         .route("/payment/intent", post(create_payment_intent))
@@ -593,15 +595,18 @@ async fn create_payment_intent(
     }))
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ConfirmReq {
     payment: String,
 }
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct BalanceResp {
     balance: u64,
 }
 
+#[cfg(test)]
 async fn confirm_payment(
     State(store): State<Arc<SqliteLedger>>,
     Json(req): Json<ConfirmReq>,
