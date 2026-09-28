@@ -6117,6 +6117,44 @@ async fn ca_handler(State(cache): State<Arc<CaCache>>) -> axum::response::Respon
 /// connections — each owns its own tables, and each is opened with WAL +
 /// `busy_timeout` (#110) so concurrent writers queue instead of hitting
 /// `SQLITE_BUSY`. This is what a real deployment serves.
+/// Path prefixes whose state-changing routes authenticate by session cookie.
+const COOKIE_AUTHED_PREFIXES: [&str; 2] = ["/portal", "/admin-ui"];
+
+/// CSRF defence for the cookie-authenticated portal and admin console. `SameSite=Lax`
+/// alone is not enough here: customer tunnels are served on `*.<zone>`, i.e. same-site
+/// with the portal, so a page on any tunnel could auto-submit a form (e.g. account
+/// deletion) with the victim's cookie attached. A non-safe request is refused when the
+/// browser says it came from another origin (`Sec-Fetch-Site`, or `Origin` on browsers
+/// that predate it). Requests carrying neither header are not browser-initiated form
+/// posts and pass unchanged.
+async fn reject_cross_site_cookie_writes(req: Request, next: Next) -> Response {
+    if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
+        && COOKIE_AUTHED_PREFIXES.iter().any(|p| path_has_prefix(req.uri().path(), p))
+        && !is_same_origin_request(req.headers())
+    {
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    next.run(req).await
+}
+
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+fn is_same_origin_request(headers: &HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(site) = header("sec-fetch-site") {
+        return matches!(site, "same-origin" | "none");
+    }
+    match (header("origin"), header("host")) {
+        (None, _) => true,
+        (Some(origin), Some(host)) => origin
+            .split_once("://")
+            .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host)),
+        (Some(_), None) => false,
+    }
+}
+
 /// Fixed window (seconds) for the unauthenticated-writer rate limit (#87 SEC87b-rl).
 const UNAUTH_WRITE_WINDOW_SECS: u64 = 60;
 
@@ -6798,7 +6836,7 @@ pub fn persistent_control_plane_router(
             // the admin-gated `/registry/pipelines`.
             .merge(authed_pipeline_router(pipeline_registry, oidc));
     }
-    let app = app.merge(health_router(ledger));
+    let app = app.merge(health_router(ledger)).layer(axum::middleware::from_fn(reject_cross_site_cookie_writes));
     // #87 SEC87b-rl: optional per-IP flood cap on the unauthenticated DB-writers.
     // Off by default (no behavior change — the auth model + a default-on policy are
     // the maintainer decision this doesn't presume); set CT_CP_UNAUTH_WRITE_PER_MIN
@@ -7077,6 +7115,46 @@ pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cookie_authed_writes_refuse_cross_site_requests() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/portal/account/delete", post(|| async { StatusCode::OK }))
+            .route("/admin-ui/accounts/x/block", post(|| async { StatusCode::OK }))
+            .route("/portal", get(|| async { StatusCode::OK }))
+            .route("/me/issue", post(|| async { StatusCode::OK }))
+            .route("/portalx", post(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(reject_cross_site_cookie_writes));
+        let send = |method: Method, path: &str, headers: &[(&str, &str)]| {
+            let mut b = axum::http::Request::builder().method(method).uri(path);
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let app = app.clone();
+            let req = b.body(axum::body::Body::empty()).unwrap();
+            async move { app.oneshot(req).await.unwrap().status() }
+        };
+        // A form auto-submitted from a customer tunnel page (same-site, other origin).
+        assert_eq!(send(Method::POST, "/portal/account/delete", &[("sec-fetch-site", "same-site")]).await, StatusCode::FORBIDDEN);
+        assert_eq!(send(Method::POST, "/admin-ui/accounts/x/block", &[("sec-fetch-site", "cross-site")]).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            send(Method::POST, "/portal/account/delete", &[("origin", "https://evil.example.org"), ("host", "portal.example.org")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(send(Method::POST, "/portal/account/delete", &[("origin", "null"), ("host", "portal.example.org")]).await, StatusCode::FORBIDDEN);
+        // The portal's own forms, older browsers sending only Origin, and non-browser clients.
+        assert_eq!(send(Method::POST, "/portal/account/delete", &[("sec-fetch-site", "same-origin")]).await, StatusCode::OK);
+        assert_eq!(
+            send(Method::POST, "/portal/account/delete", &[("origin", "https://Portal.example.org"), ("host", "portal.example.org")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(send(Method::POST, "/portal/account/delete", &[]).await, StatusCode::OK);
+        // Safe methods and routes outside the cookie-authed prefixes are untouched.
+        assert_eq!(send(Method::GET, "/portal", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
+        assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
+        assert_eq!(send(Method::POST, "/portalx", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
+    }
     use crate::client::ControlPlaneClient;
 
     /// A fresh, in-memory `AdminIdentity` for the router-construction tests below
