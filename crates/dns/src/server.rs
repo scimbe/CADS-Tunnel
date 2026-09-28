@@ -57,6 +57,8 @@ pub async fn udp_loop(store: Arc<AcmeDnsStore>, sock: tokio::net::UdpSocket) -> 
             Ok(received) => received,
             Err(e) => {
                 eprintln!("ct-dns: udp recv failed: {e}");
+                // Same back-off as the accept loops: a persistent error must not spin.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };

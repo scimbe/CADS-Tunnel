@@ -6517,7 +6517,7 @@ pub fn persistent_control_plane_router(
     // portal mint / session-authed top-up / QUIC tunnel registration to the edge) don't
     // use these routes, so this is transparent to customers; `/registry/resolve` (read)
     // stays open. The operator selftest presents the token via ControlPlaneClient.
-    let admin_token = edge_admin_token_from_env().unwrap_or(None);
+    let admin_token = locked_on_malformed(edge_admin_token_from_env());
     // #194: the client-supplied-account billing WRITERS (/accounts/open, /payment/intent,
     // /billing/issue) debit/grow the ledger by an account named in the request body, with no
     // possession proof. Gated by the admin token when set — but mounting them OPEN when it's unset
@@ -6723,7 +6723,7 @@ pub fn persistent_control_plane_router(
     // #81 SEC81c-c (c-i): the live edge queries this to authorize channel-joins (the
     // broker's `authorize` closure). Gated by the shared edge↔CP admin token; mounted
     // only when CT_CP_EDGE_ADMIN_TOKEN is a valid 64-hex value.
-    if let Some(admin_tok) = edge_admin_token_from_env().unwrap_or(None) {
+    if let Some(admin_tok) = locked_on_malformed(edge_admin_token_from_env()) {
         app = app
             .merge(internal_channel_authorize_router(channels.clone(), topologies.clone(), admin_tok))
             // #327: the Edge's boot-time revoked-tokens fetch.
@@ -7087,6 +7087,18 @@ pub fn edge_admin_token_from_env() -> Result<Option<[u8; 32]>, String> {
     parse_edge_admin_token(std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().as_deref())
 }
 
+/// `main` refuses to start on a malformed token; any other entry point that builds the
+/// router must not fall open either. A malformed value becomes a random token nobody
+/// holds, so every route gated by it is mounted but unreachable.
+fn locked_on_malformed(token: Result<Option<[u8; 32]>, String>) -> Option<[u8; 32]> {
+    token.unwrap_or_else(|e| {
+        eprintln!("ct-control-plane: {e}; gated routes are locked");
+        let mut locked = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut locked);
+        Some(locked)
+    })
+}
+
 fn parse_edge_admin_token(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
@@ -7199,6 +7211,11 @@ mod tests {
         assert_eq!(parse_edge_admin_token(Some(&hex)), Ok(Some([0xab; 32])));
         assert!(parse_edge_admin_token(Some("c2VjcmV0LWluLWJhc2U2NA==")).is_err(), "base64 is not silently 'unset'");
         assert!(parse_edge_admin_token(Some(&"ab".repeat(31))).is_err(), "short hex");
+        assert_eq!(locked_on_malformed(Ok(None)), None, "unset stays unset");
+        assert_eq!(locked_on_malformed(Ok(Some([7; 32]))), Some([7; 32]));
+        let a = locked_on_malformed(Err("bad".into())).expect("malformed never means open");
+        let b = locked_on_malformed(Err("bad".into())).unwrap();
+        assert_ne!(a, b, "a random, unguessable lock");
     }
     use crate::client::ControlPlaneClient;
 
