@@ -372,11 +372,17 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
         // it), PLUS the link itself must still be unrevoked and unexpired: the
         // cookie is stateless, so this one primary-key lookup is what makes a
         // portal-side Revoke take effect on sessions already handed out.
-        let share_link_still_active = || match claims.email.strip_prefix(GATE_SHARE_SUBJECT_PREFIX) {
+        // A login session is re-checked against the hostname's CURRENT allow-list, so
+        // removing an email (or turning "any login" off, or the hostname changing hands)
+        // takes effect immediately instead of when the 8h cookie expires.
+        let still_authorized = || match claims.email.strip_prefix(GATE_SHARE_SUBJECT_PREFIX) {
             Some(link_id) => matches!(st.tunnels.share_link_active(link_id, &host, now), Ok(true)),
-            None => true,
+            None => {
+                matches!(st.tunnels.allow_any_login_for_hostname(&host), Ok(true))
+                    || matches!(st.tunnels.email_allowed_for_hostname(&host, &claims.email), Ok(true))
+            }
         };
-        if claims.host == host && share_link_still_active() {
+        if claims.host == host && still_authorized() {
             if let Ok(v) = HeaderValue::from_str(&claims.email) {
                 return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
             }
@@ -469,8 +475,8 @@ async fn gate_start(State(st): State<GateState>, Query(q): Query<StartQuery>) ->
         return gate_unconfigured();
     };
     let return_path = safe_return_path(q.return_path);
-    let state = random_state();
     let target = format!("{host}|{return_path}");
+    let state = bound_state(&st.session_key, &target);
     let authorize_url = cfg.authorize_redirect_to(&state, &redirect_uri);
     let mut resp = Redirect::to(&authorize_url).into_response();
     set_cookie(&mut resp, &gate_state_cookie(&state));
@@ -504,6 +510,14 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
     let Some(target) = cookie_value(&headers, GATE_TARGET_COOKIE) else {
         return (StatusCode::BAD_REQUEST, "missing gate target -- please retry from the original link").into_response();
     };
+    // The target cookie is not `__Host-`, so a sibling subdomain can plant one; only
+    // the target this login was started for (bound into the `__Host-` state) counts.
+    if !state_binds_target(&st.session_key, state, &target) {
+        let mut resp = (StatusCode::FORBIDDEN, "gate target does not match this login").into_response();
+        set_cookie(&mut resp, &cleared_gate_state_cookie());
+        set_cookie(&mut resp, &cleared_gate_target_cookie());
+        return resp;
+    }
     let Some((host, return_path)) = target.split_once('|') else {
         return (StatusCode::BAD_REQUEST, "malformed gate target").into_response();
     };
@@ -1029,6 +1043,31 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+const GATE_TARGET_CTX: &[u8] = b"ct-gate-target-v1";
+
+fn target_tag(key: &[u8], nonce: &str, target: &str) -> String {
+    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    m.update(GATE_TARGET_CTX);
+    m.update(nonce.as_bytes());
+    m.update(b"\0");
+    m.update(target.as_bytes());
+    hex(&m.finalize().into_bytes()[..16])
+}
+
+/// OIDC `state` for a gate login: a random nonce plus a MAC over the target it was
+/// started for, so the callback can tell the real target cookie from a planted one.
+fn bound_state(key: &[u8], target: &str) -> String {
+    let nonce = random_state();
+    let tag = target_tag(key, &nonce, target);
+    format!("{nonce}.{tag}")
+}
+
+fn state_binds_target(key: &[u8], state: &str, target: &str) -> bool {
+    state
+        .split_once('.')
+        .is_some_and(|(nonce, tag)| ct_eq(tag.as_bytes(), target_tag(key, nonce, target).as_bytes()))
+}
+
 fn sign_gate_session(key: &[u8], host: &str, email: &str, exp: u64) -> String {
     let payload = format!("{}:{}:{exp}", hex(host.as_bytes()), hex(email.as_bytes()));
     format!("{payload}.{}", hex(&gate_session_mac(key, payload.as_bytes())))
@@ -1075,6 +1114,21 @@ mod tests {
     use tower::ServiceExt;
 
     const TEST_KEY: &[u8] = b"test-session-key";
+
+    /// An OIDC `state` correctly bound to `target` (`host|return`), as
+    /// `/gate/start` mints it, but with a fixed nonce so a test can put the same
+    /// value in both the query and the cookie.
+    fn test_state(target: &str) -> String {
+        format!("testnonce.{}", super::target_tag(TEST_KEY, "testnonce", target))
+    }
+
+    fn callback_uri(target: &str) -> String {
+        format!("/gate/callback?code=abc&state={}", test_state(target))
+    }
+
+    fn callback_cookie(target: &str) -> String {
+        format!("{GATE_STATE_COOKIE}={}; {GATE_TARGET_COOKIE}={target}", test_state(target))
+    }
 
     fn cfg() -> PortalOidc {
         PortalOidc {
@@ -1167,6 +1221,7 @@ mod tests {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
         assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "alice@example.com", now_secs()).unwrap());
         let app =
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
 
@@ -1222,6 +1277,73 @@ mod tests {
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(ok.headers().get(GATE_EMAIL_HEADER).unwrap(), "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn gate_check_stops_admitting_a_session_once_its_email_leaves_the_allow_list() {
+        // A gate session is an 8h cookie; removing someone from the allow-list
+        // (or switching allow-any off) must take effect on the next request,
+        // not when that cookie happens to expire.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", now_secs()).unwrap());
+        let app = gate_router_with(
+            tunnels.clone(),
+            Some(cfg()),
+            TEST_KEY,
+            stub_exchanger("bob@example.com"),
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+        );
+        let token = sign_gate_session(TEST_KEY, "demo.bunsenbrenner.org", "bob@example.com", now_secs() + 3600);
+        let check = |app: Router| {
+            let token = token.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/gate/check")
+                        .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                        .header("cookie", format!("{GATE_SESSION_COOKIE}={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(check(app.clone()).await, StatusCode::OK, "allow-listed session passes");
+        assert!(tunnels.login_allowlist_remove("alice", &t.id, "bob@example.com").unwrap());
+        assert_eq!(check(app).await, StatusCode::FOUND, "the same, still-unexpired session is refused after removal");
+    }
+
+    #[tokio::test]
+    async fn gate_callback_refuses_a_target_cookie_the_state_was_not_minted_for() {
+        // A sibling tunnel on the shared cookie domain can plant
+        // `ct_gate_target`; the state MAC must catch a swapped target even
+        // when the state itself round-trips correctly.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "bob@example.com", now_secs()).unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let minted_for = "demo.bunsenbrenner.org|/room/1";
+        let state = test_state(minted_for);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/gate/callback?code=abc&state={state}"))
+                    .header(
+                        "cookie",
+                        format!("{GATE_STATE_COOKIE}={state}; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/evil"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get_all("set-cookie").iter().all(|c| !c.to_str().unwrap().starts_with(&format!("{GATE_SESSION_COOKIE}="))), "no session minted");
     }
 
     #[tokio::test]
@@ -1549,10 +1671,10 @@ mod tests {
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/room/1"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                        callback_cookie("demo.bunsenbrenner.org|/room/1"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1598,10 +1720,10 @@ mod tests {
                 None,
             );
             app.oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/join.html"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                        callback_cookie("demo.bunsenbrenner.org|/join.html"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1685,10 +1807,10 @@ mod tests {
         );
         let resp = app
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/join.html"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                        callback_cookie("demo.bunsenbrenner.org|/join.html"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1737,10 +1859,10 @@ mod tests {
         );
         let resp = app
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/join.html"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                        callback_cookie("demo.bunsenbrenner.org|/join.html"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1769,10 +1891,10 @@ mod tests {
         );
         let resp = app
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/join.html"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/join.html"),
+                        callback_cookie("demo.bunsenbrenner.org|/join.html"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1794,10 +1916,10 @@ mod tests {
         let resp = app
             .clone()
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/room/1"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                        callback_cookie("demo.bunsenbrenner.org|/room/1"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1839,10 +1961,10 @@ mod tests {
         let app = gate_router_with(tunnels, Some(cfg()), TEST_KEY, failing_exchanger(), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/room/1"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                        callback_cookie("demo.bunsenbrenner.org|/room/1"),
                     )
                     .body(Body::empty())
                     .unwrap(),
@@ -1957,10 +2079,10 @@ mod tests {
             gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
         let resp = app
             .oneshot(
-                Request::get("/gate/callback?code=abc&state=xyz")
+                Request::get(callback_uri("demo.bunsenbrenner.org|/room/1"))
                     .header(
                         "cookie",
-                        format!("{GATE_STATE_COOKIE}=xyz; {GATE_TARGET_COOKIE}=demo.bunsenbrenner.org|/room/1"),
+                        callback_cookie("demo.bunsenbrenner.org|/room/1"),
                     )
                     .body(Body::empty())
                     .unwrap(),
