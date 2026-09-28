@@ -56,7 +56,7 @@ ARG CT_AGENT_REF=v0.7.22
 RUN apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo install wasm-bindgen-cli --version 0.2.126
+    cargo install wasm-bindgen-cli --version 0.2.126 --locked
 # 2026-09-02: -c http.version=HTTP/1.1 works around a real, reproduced failure --
 # older git (Debian bookworm's 2.39.5) against github.com's current HTTP/2 responses
 # fails "could not read Username for 'https://github.com': No such device or address" /
@@ -68,9 +68,18 @@ RUN git -c http.version=HTTP/1.1 clone https://github.com/scimbe/ct-agent /agent
 WORKDIR /agent-src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/agent-src/target \
-    cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown \
+    cargo build -p ct-agent-wasm --release --target wasm32-unknown-unknown --locked \
     && mkdir -p /out \
     && wasm-bindgen --target web --out-dir /out target/wasm32-unknown-unknown/release/ct_agent_wasm.wasm
+# A git tag can be moved; Cargo.lock records the commit the tag pointed to when the
+# workspace was locked. Refuse to ship the browser bundle from any other commit.
+# (Copied after the build so a lockfile change doesn't invalidate the wasm build cache.)
+COPY Cargo.lock /pin/Cargo.lock
+RUN locked="$(grep -o "ct-agent?tag=${CT_AGENT_REF}#[0-9a-f]*" /pin/Cargo.lock | head -n1 | cut -d'#' -f2)" \
+    && actual="$(git -C /agent-src rev-parse HEAD)" \
+    && if [ -n "$locked" ] && [ "$actual" != "$locked" ]; then \
+         echo "ct-agent $CT_AGENT_REF is $actual, Cargo.lock pins $locked -- tag moved?" >&2; exit 1; \
+       fi
 
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
@@ -79,7 +88,7 @@ COPY --from=wasm-builder /out/ct_agent_wasm.js crates/control-plane/wasm-pkg/ct_
 COPY --from=wasm-builder /out/ct_agent_wasm_bg.wasm crates/control-plane/wasm-pkg/ct_agent_wasm_bg.wasm
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --workspace --bins \
+    cargo build --release --workspace --bins --locked \
     && mkdir -p /build/bin \
     && cp target/release/ct-edge target/release/ct-client \
           target/release/ct-control-plane target/release/cp_selftest \

@@ -20,3 +20,8 @@ agentdb.rvf.lock
 # Same reason: the hello-world-pipeline structure/how-to guide (served at /template-guide).
 !docs/landing/
 !docs/landing/*.html
+# Deploy secrets live next to the compose files; never send them into a build context
+# (they would persist in the builder cache even though no stage copies them out).
+.env
+**/.env
+**/.env.*

@@ -45,6 +45,15 @@ command -v gpg >/dev/null || die "gpg fehlt"
 
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 STAGE="$WORK/stage-$STAMP"
+TAR="$WORK/$STAMP.tar.gz"
+# $WORK holds plaintext secrets until encryption. A directory another local user
+# created in advance (e.g. under /var/tmp) must not be used.
+mkdir -p "$WORK"
+[ -O "$WORK" ] || die "$WORK gehört nicht $(id -un) -- abgebrochen"
+chmod 700 "$WORK"
+# Plaintext never outlives the run, also when a step fails.
+cleanup() { [ -f "$TAR" ] && { shred -u "$TAR" 2>/dev/null || rm -f "$TAR"; }; rm -rf "$STAGE"; }
+trap cleanup EXIT
 rm -rf "$STAGE"; mkdir -p "$STAGE/volumes"; chmod 700 "$STAGE"
 
 # --- Keycloak: logical dump, not a file copy. Copying a live Postgres data
@@ -114,7 +123,6 @@ tar czf "$STAGE/certs.tar.gz" -C "$(dirname "$CERT_DIRS")" "$(basename "$CERT_DI
 
 # --- One archive, one encryption step.
 log "verschlüsseln"
-TAR="$WORK/$STAMP.tar.gz"
 tar czf "$TAR" -C "$STAGE" .
 gpg --batch --yes --symmetric --cipher-algo AES256 --passphrase-file "$PASSFILE" \
     --output "$TAR.gpg" "$TAR" || die "gpg fehlgeschlagen"
