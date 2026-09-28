@@ -777,6 +777,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn stream_responder_refuses_a_non_global_offer_without_probing_it_480() {
+        for ep in ["127.0.0.1:6379", "192.168.1.1:80", "[fe80::1]:22"] {
+            let (mut a_w, mut a_r) = tokio::io::duplex(1024);
+            let (mut b_w, mut b_r) = tokio::io::duplex(1024);
+            crate::a2a::write_message(&mut a_w, &UpgradeMsg::Offer { direct_endpoint: ep.to_string() }.encode())
+                .await
+                .unwrap();
+            let mut coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+            let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let p = probed.clone();
+            let ok = responder_negotiate_upgrade(&mut coord, 5, &mut b_w, &mut a_r, |_| async move {
+                p.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+            .await
+            .unwrap();
+            assert!(!ok, "{ep} must not be accepted");
+            assert!(!probed.load(std::sync::atomic::Ordering::SeqCst), "{ep} must not even be probed");
+            assert!(!coord.is_direct());
+            let reply = crate::noise::read_frame(&mut b_r).await.unwrap();
+            assert!(matches!(UpgradeMsg::decode(&reply), Some(UpgradeMsg::Abort)), "{ep}: peer is told Abort");
+        }
+    }
+
+    #[tokio::test]
     async fn upgrade_handshake_promotes_both_sides_to_direct_over_the_control_stream() {
         // #104-handover H1 (frozen): the coordination handshake drives both UpgradeCoordinators
         // from Relay → Direct over the relay control stream — the initiator offers its

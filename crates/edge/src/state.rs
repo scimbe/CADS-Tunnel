@@ -162,6 +162,7 @@ const JOIN_REFUSAL_MAX_TRACKED_IPS: usize = 4096;
 /// certificate (a self-signed Agent cert is well under 1 KiB). Worst case 32 MiB.
 const DIRECT_ENDPOINTS_MAX: usize = 4096;
 const DIRECT_CERT_MAX_LEN: usize = 8 * 1024;
+const DIRECT_EVICTION_SAMPLE: usize = 64;
 
 /// #497 slice 2: liveness heartbeat for a broker accept loop. The 2026-08-13 broker wedge
 /// (accept loop dead inside a live, healthcheck-green process, 22 minutes of fleet-wide
@@ -1552,7 +1553,9 @@ impl<H: Clone> EdgeState<H> {
             if direct.len() < DIRECT_ENDPOINTS_MAX || direct.contains_key(&token) {
                 None
             } else {
-                Some(direct.keys().cloned().collect::<Vec<_>>())
+                // A bounded sample keeps each eviction O(1) in allocation; under a flood
+                // almost every sampled entry is evictable.
+                Some(direct.keys().take(DIRECT_EVICTION_SAMPLE).cloned().collect::<Vec<_>>())
             }
         };
         if let Some(keys) = evict {
