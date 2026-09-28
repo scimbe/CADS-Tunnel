@@ -642,6 +642,10 @@ struct AccountDeleteState {
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    /// Edge admin API (`CT_CP_EDGE_ADMIN_URL`/`_TOKEN`), so revoked tunnels are torn
+    /// down at the edge too -- see [`teardown_revoked_tunnel`].
+    edge_admin: Option<(String, String)>,
+    edge_mesh: Option<EdgeMeshHandle>,
 }
 
 /// Build the account-deletion router: `POST /portal/account/delete`, session-cookie
@@ -655,6 +659,8 @@ pub fn account_delete_router(
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    edge_admin: Option<(String, String)>,
+    edge_mesh: Option<EdgeMeshHandle>,
 ) -> Router {
     Router::new()
         .route("/portal/account/delete", post(delete_account))
@@ -665,6 +671,8 @@ pub fn account_delete_router(
             topologies,
             networks,
             pipelines,
+            edge_admin,
+            edge_mesh,
         })
 }
 
@@ -721,8 +729,12 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
     // failure must not abort the rest) makes it at least diagnosable.
     if let Ok(owned) = st.tunnels.list_for_subject(subject) {
         for t in owned {
-            if let Err(e) = st.tunnels.revoke(subject, &t.id, now) {
-                eprintln!("ct-cp: account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            match st.tunnels.revoke(subject, &t.id, now) {
+                Ok(Some(token)) => {
+                    teardown_revoked_tunnel(st.edge_admin.as_ref(), st.edge_mesh.as_ref(), &token, &t.id).await
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ct-cp: account deletion for {subject}: revoking tunnel {} failed: {e}", t.id),
             }
         }
     }
@@ -1579,8 +1591,13 @@ async fn cascade_delete_account(st: &AdminUiState, subject: &str) {
     // (2026-08-24 gap fix: log every step's failure, never `let _ =` it away).
     if let Ok(owned) = st.tunnels.list_for_subject(subject) {
         for t in owned {
-            if let Err(e) = st.tunnels.revoke(subject, &t.id, now) {
-                eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            match st.tunnels.revoke(subject, &t.id, now) {
+                Ok(Some(token)) => {
+                    let edge_admin = st.domain_admin.edge_admin.as_ref();
+                    teardown_revoked_tunnel(edge_admin, st.observability.edge_mesh.as_ref(), &token, &t.id).await
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id),
             }
         }
     }
@@ -4270,6 +4287,20 @@ fn bridge_grant_form_html(id: &str) -> String {
 /// identically. Errors are logged, not surfaced — a failed auto-provision
 /// just leaves the tunnel list empty and the next page view retries it.
 async fn provision_tunnel(st: &ApiState, subject: &str, name: &str) {
+    // ADR-0025: same admission rule as `create_tunnel` -- otherwise a blocked account
+    // deletes its tunnel, reloads /portal/tunnels and is handed a fresh one.
+    match st.ledger.account_for_subject(subject).map(|a| st.ledger.is_blocked(&a)) {
+        Ok(Ok(false)) => {}
+        Ok(Ok(true)) => return,
+        Ok(Err(e)) => {
+            eprintln!("ct-cp: auto-provisioning for {subject}: is_blocked failed: {e}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("ct-cp: auto-provisioning for {subject}: account lookup failed: {e}");
+            return;
+        }
+    }
     let hostname = st
         .dns
         .as_ref()
@@ -4613,6 +4644,31 @@ email you'd like unblocked, with a short explanation. This isn't automatic -- a 
 reviews each request.</p>
 </body></html>"#,
     )
+}
+
+/// The live side of a tunnel revoke, for the account-deletion cascades: the DB row is
+/// already gone, but until the edge hears about it the agent keeps serving (the edge
+/// reads `revoked_tokens` only at boot). Best-effort and logged, like
+/// [`delete_tunnel`]'s own edge call. DNS is left alone here: a stale A record only
+/// points at the edge, which now refuses the hostname.
+async fn teardown_revoked_tunnel(
+    edge_admin: Option<&(String, String)>,
+    edge_mesh: Option<&EdgeMeshHandle>,
+    routing_token: &str,
+    tunnel_id: &str,
+) {
+    if let Some(mesh) = edge_mesh {
+        mesh.forget(routing_token);
+    }
+    let Some((edge_url, edge_token)) = edge_admin else {
+        return;
+    };
+    let endpoint = format!("{}/admin/revoke/{}", edge_url.trim_end_matches('/'), routing_token);
+    match edge_admin_http_client().post(&endpoint).header("x-ct-admin-token", edge_token.as_str()).send().await {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => eprintln!("ct-cp: edge revoke for tunnel {tunnel_id} returned {}", r.status()),
+        Err(e) => eprintln!("ct-cp: edge revoke for tunnel {tunnel_id} failed: {}", redact_routing_tokens(&e.to_string())),
+    }
 }
 
 /// `POST /portal/tunnels/{id}/delete` (#27): revoke one of the caller's tunnels.
@@ -9643,13 +9699,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_account_tears_every_owned_tunnel_down_at_the_edge() {
+        // Without this the rows were gone but the agents kept serving until the
+        // next edge restart (the edge reads `revoked_tokens` only at boot).
+        use std::sync::Mutex;
+        let revoked: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let mock = Router::new()
+            .route(
+                "/admin/revoke/:token",
+                post(
+                    |axum::extract::State(rec): axum::extract::State<Arc<Mutex<Vec<(String, String)>>>>,
+                     headers: HeaderMap,
+                     Path(token): Path<String>| async move {
+                        let auth = headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                        rec.lock().unwrap().push((token, auth));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(revoked.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let a = tunnels.create("kc-alice", "a", None).unwrap().created().unwrap();
+        let b = tunnels.create("kc-alice", "b", None).unwrap().created().unwrap();
+        tunnels.create("kc-bob", "c", None).unwrap().created().unwrap();
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        mesh_store.record_ownership(&a.routing_token, None, "test-edge", 0).unwrap();
+        let edge_mesh = EdgeMeshHandle::new(mesh_store.clone(), Arc::from("test-edge"));
+        let app = account_delete_router(
+            KEY,
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+            Some(edge_mesh),
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("cookie", session_header("kc-alice"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut got = revoked.lock().unwrap().clone();
+        got.sort();
+        let mut want = vec![
+            (a.routing_token.clone(), "edge-secret".to_string()),
+            (b.routing_token.clone(), "edge-secret".to_string()),
+        ];
+        want.sort();
+        assert_eq!(got, want, "both of alice's tokens revoked at the edge, bob's untouched");
+        assert!(mesh_store.lookup_by_token(&a.routing_token).unwrap().is_none(), "mesh ownership forgotten");
+        assert_eq!(tunnels.list_for_subject("kc-bob").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn delete_account_requires_a_session_and_the_literal_confirm_text() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
         let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
         let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
-        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines);
+        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines, None, None);
 
         // No session -> bounced, nothing happens.
         let resp = app
@@ -9719,7 +9840,7 @@ mod tests {
         topologies.create_topology("kc-bob", "bob-topo", "u-bob").unwrap();
         topologies.share_add("kc-bob", "bob-topo", "alice@example.com", 1).unwrap();
 
-        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone());
+        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone(), None, None);
         let session = format!(
             "ct_portal_session={}",
             crate::portal::sign_session_with_email_for_test(KEY, "kc-alice", "alice@example.com")
@@ -11292,6 +11413,25 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(post_form(&app, "/portal/tunnels", "kc-blocked", "name=my-tunnel").await, StatusCode::SEE_OTHER);
         assert_eq!(tunnels.list_for_subject("kc-blocked").unwrap().len(), 1);
+    }
+
+    /// The other self-service path to a fresh tunnel: `/portal/tunnels` auto-provisions
+    /// one for an account that owns none. A blocked account deleting its tunnel and
+    /// reloading the page must not get a new one.
+    #[tokio::test]
+    async fn a_blocked_account_is_not_auto_provisioned_a_tunnel() {
+        let (app, ledger, tunnels, _admin) = test_admin_ui_app();
+        let account = ledger.account_for_subject("kc-blocked").unwrap();
+        ledger.set_blocked(&account, true).unwrap();
+        let get = |subject: &str| {
+            app.clone().oneshot(
+                Request::get("/portal/tunnels").header("cookie", session_header(subject)).body(Body::empty()).unwrap(),
+            )
+        };
+        get("kc-blocked").await.unwrap();
+        assert!(tunnels.list_for_subject("kc-blocked").unwrap().is_empty(), "blocked: nothing provisioned");
+        get("kc-fine").await.unwrap();
+        assert_eq!(tunnels.list_for_subject("kc-fine").unwrap().len(), 1, "control: an unblocked account still gets one");
     }
 
     #[tokio::test]
