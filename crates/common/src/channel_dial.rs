@@ -619,9 +619,7 @@ mod tests {
         broker.await.unwrap();
     }
 
-    fn hex_encode(b: &[u8]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect()
-    }
+    use crate::hex::encode as hex_encode;
 
     #[tokio::test]
     async fn present_join_recovers_the_category_of_a_post_possession_refusal() {

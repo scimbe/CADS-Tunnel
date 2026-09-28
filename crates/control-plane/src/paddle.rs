@@ -112,11 +112,7 @@ fn verify_paddle_signature(secret: &str, header: &str, body: &[u8], now: u64, to
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 || !s.is_ascii() {
-        return None;
-    }
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()).collect()
+    ct_common::hex::decode(s.trim())
 }
 
 #[derive(Clone)]
@@ -200,9 +196,7 @@ fn internal(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+use ct_common::hex::encode as hex_encode;
 
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     let bytes = hex_decode(s)?;

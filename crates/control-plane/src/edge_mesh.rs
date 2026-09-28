@@ -66,28 +66,9 @@ fn verify_heartbeat_proof(pubkey: &[u8; 32], sig: &[u8; 64], id: &str, peer_addr
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex_encode;
 
-fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    // #596: byte-length guard alone isn't a char-boundary guard -- a multi-byte UTF-8
-    // char can pass the length check and still land mid-char at a `s[i..j]` slice,
-    // panicking instead of returning `None` as this function's own contract promises.
-    // Same fix already applied once in this crate as service.rs::hex_decode_32 (#401).
-    if s.len() != 64 || !s.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+use ct_common::hex::decode_32 as hex_decode_32;
 
 fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
     // #596: same char-boundary hazard as hex_decode_32.
@@ -1197,9 +1178,7 @@ mod tests {
         (edge_mesh_router(store.clone(), admin_token), store)
     }
 
-    fn hex32(b: &[u8; 32]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect()
-    }
+    use ct_common::hex::encode as hex32;
 
     #[tokio::test]
     async fn heartbeat_endpoint_requires_the_admin_token_when_configured() {

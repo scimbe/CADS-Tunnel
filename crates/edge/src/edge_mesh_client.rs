@@ -72,28 +72,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 static SHARED_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| reqwest::Client::builder().timeout(DEFAULT_TIMEOUT).build().unwrap_or_else(|_| reqwest::Client::new()));
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex;
 
-/// #606: `s.len()` is BYTE length -- a multi-byte UTF-8 char in `s` can pass this guard
-/// while a raw `&s[2*i..2*i+2]` slice would land mid-character and panic. Chunk the bytes
-/// instead of slicing the `str` -- `s` here comes from a peer edge's JSON response body
-/// (ADR-0021 mesh), a genuinely peer-controlled trust boundary.
-fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
-}
+use ct_common::hex::decode_32 as hex_decode_32;
 
 #[derive(Deserialize)]
 struct RehydratePair {

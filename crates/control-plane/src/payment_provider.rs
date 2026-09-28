@@ -94,13 +94,7 @@ impl WebhookVerifier {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex_encode;
 
 /// #606: `s.len() % 2 == 0` is a BYTE-length check, not a char-boundary guard -- a
 /// string with a multi-byte UTF-8 char can still have even byte length while a
@@ -112,13 +106,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// to_str()` already rejects non-ASCII before this runs, same as #595/#606's other
 /// header-sourced sites), fixed anyway for consistency and defense-in-depth.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 || !s.is_ascii() {
-        return None;
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
-        .collect()
+    ct_common::hex::decode(s.trim())
 }
 
 #[cfg(test)]

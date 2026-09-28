@@ -347,28 +347,12 @@ pub fn parse_channel_ack(ack: &str) -> ChannelJoinOutcome {
 /// process DoS. `p2p.rs`'s `relay_node_key_seed` already has the safe shape for the same
 /// job: chunk the raw BYTES and `from_utf8` each chunk, so a boundary that splits a
 /// multi-byte char fails the chunk's own UTF-8 check instead of ever being sliced.
-pub fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
-}
+pub use crate::hex::decode_32 as decode_hex_32;
 
 /// Decode 128 lowercase-hex chars into the 64-byte attestation, or `None`. Same fix as
 /// [`decode_hex_32`], same reason (#36).
 pub fn decode_hex_64(s: &str) -> Option<[u8; 64]> {
-    if s.len() != 128 {
-        return None;
-    }
-    let mut out = [0u8; 64];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
+    crate::hex::decode_array(s)
 }
 
 /// Test-only helpers shared with DEPENDENT crates' tests (ct-agent's, via the
@@ -415,9 +399,7 @@ pub mod test_support {
     /// Lowercase hex, the encoding the edge's `OK` line uses for the attested-key triple
     /// (`<noise_hex64> <holder_hex64> <attest_hex128>`) — the inverse of
     /// [`super::decode_hex_32`] / [`super::decode_hex_64`], for building ack fixtures.
-    pub fn hex_encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
+    pub use crate::hex::encode as hex_encode;
 
     /// A scripted stand-in for the edge broker's admission side over ANY duplex (no
     /// `ct_edge`, so it can live below the edge in the dependency graph). It plays the
