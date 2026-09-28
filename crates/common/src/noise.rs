@@ -260,6 +260,12 @@ fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8])
     Ok(2 + len)
 }
 
+/// Largest Noise record (ciphertext) a peer may send, and so the smallest inbound
+/// plaintext buffer that can decrypt any of them: `snow` refuses to decrypt into a
+/// buffer shorter than the record's plaintext. Our own senders use 16 KiB chunks, but
+/// `a2a_send` peers (e.g. `channel_dial::dial_and_call`) may send up to this size.
+const NOISE_MAX_RECORD: usize = u16::MAX as usize;
+
 /// ct-agent#105: same opt-in switch as `a2a::write_message`'s request/response logging
 /// (`crates/common/src/a2a.rs`) -- kept as a separate check here (rather than importing
 /// across modules) because `noise_pump` is the transport-layer bracket around those
@@ -281,6 +287,7 @@ where
 {
     const CHUNK: usize = 16 * 1024; // well under Noise's 65519-byte plaintext cap
     let ts = Mutex::new(transport);
+    let debug_timing = debug_a2a_timing_enabled();
     let (mut c_read, mut c_write) = tokio::io::split(cipher);
     let (mut p_read, mut p_write) = tokio::io::split(plain);
 
@@ -300,7 +307,7 @@ where
                 let _ = c_write.shutdown().await;
                 return Ok::<(), io::Error>(());
             }
-            if debug_a2a_timing_enabled() {
+            if debug_timing {
                 eprintln!(
                     "ct-a2a-timing: noise_pump outbound plaintext read n={n} head={:?}",
                     String::from_utf8_lossy(&buf[..n.min(96)]),
@@ -315,7 +322,7 @@ where
 
     // ciphertext frames -> decrypt -> plaintext
     let inbound = async {
-        let mut pt = vec![0u8; CHUNK + 256];
+        let mut pt = vec![0u8; NOISE_MAX_RECORD];
         // One reusable ciphertext-frame buffer for the whole inbound loop, so no
         // per-frame `Vec` is allocated on the bulk path (#114 #2).
         let mut fr = Vec::with_capacity(CHUNK + 256);
@@ -328,7 +335,7 @@ where
                 }
             };
             let len = lock_session(&ts)?.read_message(&fr[..n], &mut pt).map_err(noise_err)?;
-            if debug_a2a_timing_enabled() {
+            if debug_timing {
                 eprintln!(
                     "ct-a2a-timing: noise_pump inbound plaintext decrypted len={len} head={:?}",
                     String::from_utf8_lossy(&pt[..len.min(96)]),
@@ -527,7 +534,7 @@ where
 
     // tagged frames -> plaintext / control; switch inbound to the direct read side on CUTOVER.
     let inbound = async {
-        let mut pt = vec![0u8; 1 + CHUNK + 256];
+        let mut pt = vec![0u8; NOISE_MAX_RECORD];
         let mut fr = Vec::with_capacity(CHUNK + 256);
         let mut dir_in_rx = Some(dir_in_rx); // moved into this loop; taken at cutover
         let mut direct: Option<(std::sync::Arc<Mutex<snow::TransportState>>, DR)> = None;
@@ -1119,6 +1126,28 @@ mod tests {
             origin_handshake_any(&[b.private, client.private], &msg1).is_none(),
             "rejects when the pinned origin key is absent"
         );
+    }
+
+    #[tokio::test]
+    async fn noise_pump_decrypts_a_max_size_peer_record() {
+        // A peer using `a2a_send` may seal one record up to Noise's plaintext cap, far
+        // above this pump's own 16 KiB chunks; the inbound buffer must still fit it.
+        let (mut sender, receiver) = transport_pair();
+        let (mut peer_cipher, pump_cipher) = tokio::io::duplex(1 << 17);
+        let (pump_plain, mut app) = tokio::io::duplex(1 << 17);
+        let pump = tokio::spawn(noise_pump(receiver, pump_cipher, pump_plain));
+
+        let payload: Vec<u8> = (0..crate::a2a::A2A_MAX_MESSAGE as u32).map(|i| (i % 251) as u8).collect();
+        let mut ct = vec![0u8; NOISE_MAX_RECORD];
+        let n = sender.write_message(&payload, &mut ct).unwrap();
+        peer_cipher.write_all(&frame(&ct[..n])).await.unwrap();
+
+        let mut got = vec![0u8; payload.len()];
+        app.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload);
+        drop(peer_cipher);
+        drop(app);
+        let _ = pump.await;
     }
 
     #[tokio::test]
