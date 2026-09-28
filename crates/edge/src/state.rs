@@ -467,6 +467,8 @@ pub struct EdgeState<H> {
     /// #362: `RwLock` -- read on every `direct_endpoint()` lookup, written
     /// only at advertise/teardown.
     direct: RwLock<HashMap<RoutingToken, (SocketAddr, Vec<u8>)>>,
+    /// Where the next bounded eviction sample of `direct` starts (see `advertise_direct`).
+    direct_eviction_cursor: AtomicU64,
     /// Parked TCP-fallback agents (issue #3 / P1.2c-3, pooled since #229): a
     /// `token` maps to a FIFO queue of senders, one per concurrently-parked
     /// registration -- the Agent-side pool (`run_agent_tcp_fallback`) holds
@@ -773,6 +775,7 @@ impl<H: Clone> EdgeState<H> {
             next_reg: AtomicU64::new(1),
             candidates: RwLock::new(HashMap::new()),
             direct: RwLock::new(HashMap::new()),
+            direct_eviction_cursor: AtomicU64::new(0),
             tcp_agents: Mutex::new(HashMap::new()),
             tcp_agent_parked: Notify::new(),
             hosts: RwLock::new(HashMap::new()),
@@ -1547,15 +1550,21 @@ impl<H: Clone> EdgeState<H> {
         // 'D' is unauthenticated and the Agent sends it once, BEFORE registering, so a
         // registration can't be required here. Bound the map instead: when full, make
         // room by evicting an entry whose token has no live registration (every flooded
-        // entry qualifies), and refuse only if all entries belong to live tunnels.
+        // entry qualifies), and refuse only if all *sampled* entries belong to live
+        // tunnels. The sample window rotates on every call, so repeated attempts cover
+        // the whole map instead of re-checking the same keys.
         let evict = {
             let direct = self.direct.read_safe();
             if direct.len() < DIRECT_ENDPOINTS_MAX || direct.contains_key(&token) {
                 None
             } else {
-                // A bounded sample keeps each eviction O(1) in allocation; under a flood
-                // almost every sampled entry is evictable.
-                Some(direct.keys().take(DIRECT_EVICTION_SAMPLE).cloned().collect::<Vec<_>>())
+                // A bounded sample keeps each eviction O(1) in allocation. HashMap order
+                // is stable for an unchanged map, so the window's start rotates.
+                let start = self
+                    .direct_eviction_cursor
+                    .fetch_add(DIRECT_EVICTION_SAMPLE as u64, Ordering::Relaxed) as usize
+                    % direct.len();
+                Some(direct.keys().cycle().skip(start).take(DIRECT_EVICTION_SAMPLE).cloned().collect::<Vec<_>>())
             }
         };
         if let Some(keys) = evict {
@@ -3042,6 +3051,24 @@ mod tests {
         assert_eq!(state.direct.read_safe().len(), DIRECT_ENDPOINTS_MAX);
         // Re-advertising an existing entry never needs room.
         assert!(state.advertise_direct(token(2), addr, vec![3]));
+    }
+
+    #[test]
+    fn advertise_direct_eventually_finds_an_evictable_entry_behind_live_ones() {
+        // All but one entry belong to live tunnels: the bounded sample must not keep
+        // looking at the same live keys forever.
+        let state: EdgeState<u32> = EdgeState::new();
+        let addr: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        for i in 0..DIRECT_ENDPOINTS_MAX - 1 {
+            state.register(many_token(i), i as u32);
+            assert!(state.advertise_direct(many_token(i), addr, vec![1]));
+        }
+        assert!(state.advertise_direct(token(4), addr, vec![1]), "the single unregistered entry");
+        let attempts = DIRECT_ENDPOINTS_MAX / DIRECT_EVICTION_SAMPLE + 1;
+        let admitted = (0..attempts).any(|_| state.advertise_direct(token(5), addr, vec![2]));
+        assert!(admitted, "rotation reaches the evictable entry within one full pass");
+        assert_eq!(state.direct_endpoint(&token(4)), None, "it was the one evicted");
+        assert!(state.direct_endpoint(&many_token(0)).is_some(), "live tunnels untouched");
     }
 
     #[test]
