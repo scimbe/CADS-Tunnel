@@ -130,21 +130,8 @@ pub struct Config {
     pub idle_timeout: Duration,
     /// The shared secret every caller must present (`x-ct-masque-token`) -- see the
     /// crate doc for why target-restriction alone isn't enough. `main.rs` requires
-    /// `CT_MASQUE_PROXY_TOKEN` to be set (fail-closed, no default); this `Default`
-    /// impl exists only for tests, which use a fixed, obviously-non-production value.
+    /// `CT_MASQUE_PROXY_TOKEN` to be set (fail-closed, no default).
     pub shared_token: [u8; 32],
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            listen: "127.0.0.1:4434".parse().unwrap(),
-            target: "127.0.0.1:4433".parse().unwrap(),
-            max_concurrent_tunnels: 256,
-            idle_timeout: Duration::from_secs(120),
-            shared_token: [0u8; 32],
-        }
-    }
 }
 
 /// Runs the proxy until `listener` errors or the process is torn down (there is no
@@ -164,7 +151,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
     let max_concurrent_tunnels = config.max_concurrent_tunnels;
 
     loop {
-        let (io, _peer) = listener.accept().await?;
+        let (io, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // Transient (EMFILE, ECONNABORTED): one failed accept must not stop the proxy.
+                eprintln!("ct-masque-proxy: accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let expected_path = expected_path.clone();
         let admission = admission.clone();
         tokio::spawn(async move {

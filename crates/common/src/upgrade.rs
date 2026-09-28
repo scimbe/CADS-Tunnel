@@ -307,6 +307,22 @@ where
     }
 }
 
+/// #480: an `Offer`'s endpoint is peer-supplied, and the responder usually runs inside a
+/// customer network. Only a global-unicast `ip:port` may ever be dialed -- checked before
+/// the reachability probe too, or the probe itself becomes an internal port-scan oracle.
+fn offered_endpoint_is_safe(endpoint: &str) -> bool {
+    let safe = endpoint
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(crate::channel::is_global_unicast);
+    if !safe {
+        eprintln!(
+            "ct-common: relay->direct upgrade refused a non-global-unicast offered \
+             endpoint {endpoint:?} (#480); staying on the relay leg"
+        );
+    }
+    safe
+}
+
 /// **#104-handover H1 — the coordination handshake (responder half).** Reads one control
 /// message; on an `Offer{endpoint}` it dials that endpoint via the injected `dial` — on
 /// success it replies `Ready` and `confirm_upgraded`s (`Ok(true)`), on failure it replies
@@ -333,7 +349,7 @@ where
         Some(UpgradeMsg::Offer { direct_endpoint }) => direct_endpoint,
         _ => return Ok(false),
     };
-    if dial(endpoint).await {
+    if offered_endpoint_is_safe(&endpoint) && dial(endpoint).await {
         // #481: guarded writer, matching the Offer side -- these two payloads are tiny fixed
         // encodings today, but routing every UpgradeMsg through the same guarded path means no
         // future variant can silently reintroduce the truncation hazard by accident.
@@ -426,7 +442,7 @@ where
         Some(UpgradeMsg::Offer { direct_endpoint }) => direct_endpoint,
         _ => return Ok(None),
     };
-    if dial(endpoint.clone()).await {
+    if offered_endpoint_is_safe(&endpoint) && dial(endpoint.clone()).await {
         let _ = ctl.send(crate::noise::PumpControl::Send(UpgradeMsg::Ready.encode()));
         coord.confirm_upgraded(now);
         Ok(Some(endpoint))
@@ -736,28 +752,12 @@ where
         if let Ok(Some(ep)) =
             drive_responder_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, dial_probe).await
         {
-            // #480: the offered direct endpoint is peer-supplied and unauthenticated at this
-            // point in the exchange (the relay leg's Noise handshake proves identity, not
-            // that the endpoint it's now offering is safe to dial) -- gate it through the
-            // same global-unicast check every other admission path in this codebase already
-            // uses (crates/edge/src/channel_broker.rs::safe_endpoint), rather than trusting
-            // each future caller's own dial_and_establish to remember. A private/loopback/
-            // link-local/CGNAT target is refused here, before it ever reaches the caller's
-            // dial -- the Agent side of this exchange typically runs inside the customer's
-            // own private network, where an unfiltered dial could reach an internal service.
-            let is_safe = ep.parse::<std::net::SocketAddr>().is_ok_and(crate::channel::is_global_unicast);
-            if is_safe {
-                if let Some(session) = dial_and_establish(ep).await {
-                    if let Some(tx) = dir_tx.take() {
-                        let _ = tx.send(session);
-                    }
-                    let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
+            // drive_responder_upgrade only returns an endpoint that passed #480's check.
+            if let Some(session) = dial_and_establish(ep).await {
+                if let Some(tx) = dir_tx.take() {
+                    let _ = tx.send(session);
                 }
-            } else {
-                eprintln!(
-                    "ct-common: relay->direct upgrade refused a non-global-unicast offered \
-                     endpoint {ep:?} (#480); staying on the relay leg"
-                );
+                let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
             }
         }
         drop(dir_tx.take());
@@ -850,6 +850,36 @@ mod tests {
                 if peer_inbound.send(bytes).await.is_err() {
                     break;
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responder_refuses_a_non_global_offer_without_probing_it_480() {
+        for ep in ["127.0.0.1:6379", "10.0.0.5:22", "169.254.169.254:80", "[::ffff:127.0.0.1]:80", "not-an-addr"] {
+            let (ctl_tx, mut ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (in_tx, mut in_rx) = tokio::sync::mpsc::channel(crate::noise::CONTROL_IN_CHANNEL_BOUND);
+            in_tx
+                .send(UpgradeMsg::Offer { direct_endpoint: ep.to_string() }.encode())
+                .await
+                .unwrap();
+            let mut coord = UpgradeCoordinator::with_backoff(Role::Responder, 0, 1, 100);
+            let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let p = probed.clone();
+            let out = drive_responder_upgrade(&mut coord, 5, &ctl_tx, &mut in_rx, |_| async move {
+                p.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            })
+            .await
+            .unwrap();
+            assert_eq!(out, None, "{ep} must not be accepted");
+            assert!(!probed.load(std::sync::atomic::Ordering::SeqCst), "{ep} must not even be probed");
+            assert!(!coord.is_direct());
+            match ctl_rx.try_recv() {
+                Ok(crate::noise::PumpControl::Send(b)) => {
+                    assert!(matches!(UpgradeMsg::decode(&b), Some(UpgradeMsg::Abort)), "{ep}: peer is told Abort")
+                }
+                _ => panic!("{ep}: expected an Abort control message"),
             }
         }
     }

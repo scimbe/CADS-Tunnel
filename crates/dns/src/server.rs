@@ -52,7 +52,14 @@ pub async fn udp_loop(store: Arc<AcmeDnsStore>, sock: tokio::net::UdpSocket) -> 
     // 512 is the classic DNS/UDP message ceiling; ACME TXT answers fit easily.
     let mut buf = vec![0u8; 512];
     loop {
-        let (n, peer) = sock.recv_from(&mut buf).await?;
+        // A failed receive is logged, not propagated: it would end the whole server.
+        let (n, peer) = match sock.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(e) => {
+                eprintln!("ct-dns: udp recv failed: {e}");
+                continue;
+            }
+        };
         if let Some(resp) = respond(&store, &buf[..n]) {
             let _ = sock.send_to(&resp, peer).await;
         }
@@ -71,7 +78,14 @@ pub async fn tcp_loop(store: Arc<AcmeDnsStore>, listener: tokio::net::TcpListene
     // #300: shared, not per-connection -- the budget is global across the listener.
     let conn_cap = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("ct-dns: tcp accept failed: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         // Shed over the cap by dropping the socket (closes it) rather than queuing --
         // an attacker holding MAX_TCP_CONNECTIONS stalled connections must not also be
         // able to queue unbounded pending accepts.

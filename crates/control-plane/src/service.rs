@@ -483,9 +483,11 @@ async fn resolve_tunnel(
     }))
 }
 
-/// Build the persistent billing router (accounts / payment / credit-gated
-/// issuance) backed by a durable [`SqliteLedger`].
-pub fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
+/// Test-only: mounts `/payment/confirm` with no authentication at all, so it must
+/// never be reachable from a production router (the real confirmation path is the
+/// signature-verified provider webhook).
+#[cfg(test)]
+fn billing_router_sqlite(store: Arc<SqliteLedger>) -> Router {
     Router::new()
         .route("/accounts/open", post(open_account))
         .route("/payment/intent", post(create_payment_intent))
@@ -593,15 +595,18 @@ async fn create_payment_intent(
     }))
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ConfirmReq {
     payment: String,
 }
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct BalanceResp {
     balance: u64,
 }
 
+#[cfg(test)]
 async fn confirm_payment(
     State(store): State<Arc<SqliteLedger>>,
     Json(req): Json<ConfirmReq>,
@@ -6505,10 +6510,7 @@ pub fn persistent_control_plane_router(
     // portal mint / session-authed top-up / QUIC tunnel registration to the edge) don't
     // use these routes, so this is transparent to customers; `/registry/resolve` (read)
     // stays open. The operator selftest presents the token via ControlPlaneClient.
-    let admin_token = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| hex_decode_32(&s));
+    let admin_token = edge_admin_token_from_env().unwrap_or(None);
     // #194: the client-supplied-account billing WRITERS (/accounts/open, /payment/intent,
     // /billing/issue) debit/grow the ledger by an account named in the request body, with no
     // possession proof. Gated by the admin token when set — but mounting them OPEN when it's unset
@@ -6714,11 +6716,7 @@ pub fn persistent_control_plane_router(
     // #81 SEC81c-c (c-i): the live edge queries this to authorize channel-joins (the
     // broker's `authorize` closure). Gated by the shared edge↔CP admin token; mounted
     // only when CT_CP_EDGE_ADMIN_TOKEN is a valid 64-hex value.
-    if let Some(admin_tok) = std::env::var("CT_CP_EDGE_ADMIN_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| hex_decode_32(&s))
-    {
+    if let Some(admin_tok) = edge_admin_token_from_env().unwrap_or(None) {
         app = app
             .merge(internal_channel_authorize_router(channels.clone(), topologies.clone(), admin_tok))
             // #327: the Edge's boot-time revoked-tokens fetch.
@@ -7074,6 +7072,25 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// `CT_CP_EDGE_ADMIN_TOKEN`: unset/empty is `Ok(None)` (machine-writer routes absent or
+/// open, as documented at their mount sites); set but not 64 hex chars is an error.
+/// Silently treating a malformed value as "unset" mounted the admin surfaces ungated
+/// while the operator believed them protected, so `main` refuses to start instead.
+pub fn edge_admin_token_from_env() -> Result<Option<[u8; 32]>, String> {
+    parse_edge_admin_token(std::env::var("CT_CP_EDGE_ADMIN_TOKEN").ok().as_deref())
+}
+
+fn parse_edge_admin_token(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => hex_decode_32(s).map(Some).ok_or_else(|| {
+            "CT_CP_EDGE_ADMIN_TOKEN is set but is not 64 hex characters -- refusing to start \
+             with the admin routes silently ungated"
+                .to_string()
+        }),
+    }
+}
+
 pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     // #401: byte-length guard alone isn't a char-boundary guard -- a multi-byte UTF-8
     // char can pass the length check and still land mid-char at a `s[i..j]` slice,
@@ -7154,6 +7171,17 @@ mod tests {
         assert_eq!(send(Method::GET, "/portal", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
         assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
         assert_eq!(send(Method::POST, "/portalx", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
+    }
+
+    #[test]
+    fn edge_admin_token_is_fail_closed_when_malformed() {
+        assert_eq!(parse_edge_admin_token(None), Ok(None));
+        assert_eq!(parse_edge_admin_token(Some("")), Ok(None));
+        assert_eq!(parse_edge_admin_token(Some("  ")), Ok(None));
+        let hex = "ab".repeat(32);
+        assert_eq!(parse_edge_admin_token(Some(&hex)), Ok(Some([0xab; 32])));
+        assert!(parse_edge_admin_token(Some("c2VjcmV0LWluLWJhc2U2NA==")).is_err(), "base64 is not silently 'unset'");
+        assert!(parse_edge_admin_token(Some(&"ab".repeat(31))).is_err(), "short hex");
     }
     use crate::client::ControlPlaneClient;
 

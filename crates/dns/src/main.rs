@@ -5,7 +5,7 @@
 //! client drives. Config:
 //! - `CT_DNS_LISTEN`     — DNS listener (default `0.0.0.0:53`; needs privilege).
 //! - `CT_DNS_API_LISTEN` — mutation API (default `127.0.0.1:8053`; keep loopback).
-//! - `CT_DNS_API_TOKEN`  — optional `x-ct-dns-token` shared secret.
+//! - `CT_DNS_API_TOKEN`  — `x-ct-dns-token` shared secret; required when the API listener is not loopback.
 //! - `CT_DNS_STORE_PATH` — optional path to persist published challenge records
 //!   (#302) so a restart mid-issuance doesn't lose a record Let's Encrypt's
 //!   multi-perspective validation hasn't seen yet. Unset -> in-memory only,
@@ -37,8 +37,12 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
     let token = std::env::var("CT_DNS_API_TOKEN").ok().filter(|s| !s.is_empty());
 
-    if !api_listen.ip().is_loopback() {
-        eprintln!("ct-dns: WARNING — API listener {api_listen} is not loopback; the mutation API should stay private");
+    if !api_listen.ip().is_loopback() && token.is_none() {
+        return Err(format!(
+            "CT_DNS_API_LISTEN={api_listen} is not loopback and CT_DNS_API_TOKEN is unset -- refusing to expose \
+             an unauthenticated DNS mutation API (set a token or bind to loopback)"
+        )
+        .into());
     }
     eprintln!(
         "ct-dns: authoritative DNS on {dns_listen} (udp+tcp), mutation API on {api_listen}{}",

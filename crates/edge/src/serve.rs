@@ -2884,7 +2884,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut role = [0u8; 1];
-    stream.read_exact(&mut role).await?;
+    // A peer that completes TLS and then sends nothing would otherwise hold a
+    // shared connection-cap slot until TCP keepalive gives up.
+    tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, stream.read_exact(&mut role))
+        .await
+        .map_err(|_| "timed out waiting for the TCP role byte")??;
     match role[0] {
         b'A' => {
             // #258: bound the admission exchange (not the park/relay that follows --
@@ -6105,6 +6109,22 @@ mod tests {
         // route_host_miss_reason is only ever consulted on the miss path.
         state.register_host("site.test", token.clone()).unwrap();
         assert_eq!(state.route_host("site.test"), Some(token));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_connection_that_never_sends_a_role_byte_is_dropped() {
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        let (edge_side, attacker_side) = tokio::io::duplex(64);
+        let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+        let server_task = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let res = serve_tcp_connection(edge_side, &state, &challenge, None, test_peer_ip()).await;
+            (res, start.elapsed())
+        });
+        let (res, elapsed) = server_task.await.unwrap();
+        assert!(res.is_err(), "a silent connection must be dropped");
+        assert!(elapsed >= TCP_FALLBACK_ADMISSION_TIMEOUT, "elapsed {elapsed:?}");
+        drop(attacker_side);
     }
 
     #[tokio::test(start_paused = true)]
