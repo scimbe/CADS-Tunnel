@@ -7668,7 +7668,7 @@ async fn manage_channel_page(
     Query(q): Query<ManageQuery>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
         return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
@@ -7795,11 +7795,28 @@ async function searchAgents() {{
   if (!resp.ok) {{ box.textContent = 'search failed'; return; }}
   const rows = await resp.json();
   if (rows.length === 0) {{ box.textContent = 'no matches'; return; }}
-  box.innerHTML = rows.map(r =>
-    '<div class="row"><span class="v">' + r.label + ' <code>' + r.holder_pubkey.slice(0, 16) + '…</code>' +
-    ' <button class="copy-btn" type="button" onclick="copyText(this,\'' + r.holder_pubkey + '\')">Copy</button></span>' +
-    '<span><button type="button" onclick="fillHolder(\'' + r.holder_pubkey + '\')">Use this key</button></span></div>'
-  ).join('');
+  // Built with DOM nodes + textContent: directory entries are third-party input.
+  box.replaceChildren(...rows.map(r => {{
+    const el = (tag, cls, text) => {{
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text !== undefined) n.textContent = text;
+      return n;
+    }};
+    const copy = el('button', 'copy-btn', 'Copy');
+    copy.type = 'button';
+    copy.addEventListener('click', () => copyText(copy, r.holder_pubkey));
+    const use = el('button', '', 'Use this key');
+    use.type = 'button';
+    use.addEventListener('click', () => fillHolder(r.holder_pubkey));
+    const v = el('span', 'v');
+    v.append(r.label + ' ', el('code', '', r.holder_pubkey.slice(0, 16) + '…'), ' ', copy);
+    const pick = el('span');
+    pick.append(use);
+    const row = el('div', 'row');
+    row.append(v, pick);
+    return row;
+  }}));
 }}
 </script>"#
         )
@@ -7894,7 +7911,7 @@ async fn manage_add_member(
     Form(req): Form<AddMemberFormReq>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let manage_url = format!("/portal/channels/{channel_hex}/manage");
     let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
@@ -7933,7 +7950,7 @@ async fn manage_remove_member(
     Path((channel_hex, holder_hex)): Path<(String, String)>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let manage_url = format!("/portal/channels/{channel_hex}/manage");
     let (Some(channel), Some(holder)) = (crate::service::hex_decode_32(&channel_hex), crate::service::hex_decode_32(&holder_hex)) else {
@@ -7953,7 +7970,7 @@ async fn manage_remove_member(
 /// operator ("ich kann keinen channel loeschen?").
 async fn manage_delete_channel(State(st): State<ClaimState>, headers: HeaderMap, Path(channel_hex): Path<String>) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
         return (StatusCode::BAD_REQUEST, "malformed channel").into_response();
@@ -7981,7 +7998,7 @@ async fn manage_allowlist_add(
     Form(req): Form<AllowlistFormReq>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let manage_url = format!("/portal/channels/{channel_hex}/manage");
     let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
@@ -8003,7 +8020,7 @@ async fn manage_allowlist_remove(
     Path((channel_hex, email)): Path<(String, String)>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let manage_url = format!("/portal/channels/{channel_hex}/manage");
     let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
@@ -8028,7 +8045,7 @@ async fn manage_deposit_grant(
     Form(req): Form<DepositGrantFormReq>,
 ) -> Response {
     let Some(claims) = crate::portal::session_claims_for(&st.session_key, &headers) else {
-        return Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response();
+        return manage_login_redirect(&channel_hex);
     };
     let manage_url = format!("/portal/channels/{channel_hex}/manage");
     let Some(channel) = crate::service::hex_decode_32(&channel_hex) else {
@@ -8067,6 +8084,17 @@ struct AgentSearchRow {
     label: String,
 }
 
+/// Login redirect back to a channel's manage page. `channel_hex` is the raw path
+/// parameter, checked only later by the handler; interpolating anything but hex into a
+/// `Location` header could make `Redirect::to` panic on an invalid header value.
+fn manage_login_redirect(channel_hex: &str) -> Response {
+    if !channel_hex.is_empty() && channel_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Redirect::to(&format!("/portal?next=/portal/channels/{channel_hex}/manage")).into_response()
+    } else {
+        Redirect::to("/portal").into_response()
+    }
+}
+
 /// `GET /portal/channels/:channel/manage/search-agents?q=<role or skill token>`: the
 /// "click, don't copy" picker on [`manage_channel_page`]'s add-member form. Backed by
 /// the SAME public agent directory `GET /registry/agents` already searches (exact-token
@@ -8097,7 +8125,7 @@ async fn manage_search_agents(State(st): State<ClaimState>, Query(q): Query<Sear
             let mut tags = e.role_tags;
             tags.extend(e.skill_ids);
             let label = if tags.is_empty() { "(no role/skill tags)".to_string() } else { tags.join(", ") };
-            AgentSearchRow { holder_pubkey: e.holder_pubkey, label: escape(&label) }
+            AgentSearchRow { holder_pubkey: e.holder_pubkey, label }
         })
         .take(20)
         .collect();
@@ -13897,8 +13925,9 @@ mod tests {
         // copy the raw identifier -- the manage page's search block wires up fillHolder
         // (click to select) and copyText (click to copy) together on every result row.
         let (_s, manage_html) = get(&app, &format!("/portal/channels/{ch_hex}/manage"), Some("alice")).await;
-        assert!(manage_html.contains("onclick=\"fillHolder("), "click-to-select is wired");
-        assert!(manage_html.contains("onclick=\"copyText(this,"), "click-to-copy is wired alongside it");
+        assert!(manage_html.contains("fillHolder(r.holder_pubkey)"), "click-to-select is wired");
+        assert!(manage_html.contains("copyText(copy, r.holder_pubkey)"), "click-to-copy is wired alongside it");
+        assert!(!manage_html.contains("box.innerHTML"), "directory rows are never parsed as HTML");
 
         // Matches by role.
         let (status, body) = get(&app, &format!("/portal/channels/{ch_hex}/manage/search-agents?q=physics"), None).await;

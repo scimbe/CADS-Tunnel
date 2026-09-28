@@ -468,7 +468,7 @@ async fn gate_start(State(st): State<GateState>, Query(q): Query<StartQuery>) ->
     let Some(redirect_uri) = gate_redirect_uri(&cfg.redirect_uri) else {
         return gate_unconfigured();
     };
-    let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
+    let return_path = safe_return_path(q.return_path);
     let state = random_state();
     let target = format!("{host}|{return_path}");
     let authorize_url = cfg.authorize_redirect_to(&state, &redirect_uri);
@@ -607,7 +607,7 @@ async fn gate_share(State(st): State<GateState>, Query(q): Query<ShareQuery>) ->
             }
             let exp = link.expires_at.max(now + 1);
             let session = sign_gate_session(&st.session_key, &host, &subject, exp);
-            let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
+            let return_path = safe_return_path(q.return_path);
             let mut resp = Redirect::to(&format!("https://{host}{return_path}")).into_response();
             set_cookie(&mut resp, &gate_session_cookie_with_max_age(&session, domain, exp - now));
             resp
@@ -721,7 +721,7 @@ async fn gate_logout(State(st): State<GateState>, Query(q): Query<LogoutQuery>) 
         .filter(|h| matches!(st.tunnels.routing_token_for_hostname(h), Ok(Some(_))));
     let target = match known_host {
         Some(host) => {
-            let return_path = q.return_path.filter(|p| p.starts_with('/')).unwrap_or_else(|| "/".to_string());
+            let return_path = safe_return_path(q.return_path);
             format!("https://{host}{return_path}")
         }
         // No specific (or no *known*) hostname given -- land on the control plane's own
@@ -924,6 +924,14 @@ fn request_recorded_html(host: &str) -> String {
     )
 }
 
+/// The in-host path to return to after login. It ends up in a `Set-Cookie` value and a
+/// `Location` header, so anything but a plain absolute path (no `;`/`,` that would add
+/// cookie attributes, no whitespace or control characters) falls back to `/`.
+fn safe_return_path(path: Option<String>) -> String {
+    path.filter(|p| p.starts_with('/') && p.bytes().all(|b| b.is_ascii_graphic() && b != b';' && b != b','))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 fn set_cookie(resp: &mut Response, cookie: &str) {
     if let Ok(v) = HeaderValue::from_str(cookie) {
         resp.headers_mut().append(SET_COOKIE, v);
@@ -1051,6 +1059,17 @@ fn verify_gate_session(key: &[u8], token: &str, now: u64) -> Option<GateSessionC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn return_path_cannot_inject_cookie_attributes_or_leave_the_host() {
+        assert_eq!(safe_return_path(Some("/app/page?x=1".into())), "/app/page?x=1");
+        assert_eq!(safe_return_path(None), "/");
+        assert_eq!(safe_return_path(Some("https://evil.example/".into())), "/");
+        assert_eq!(safe_return_path(Some("/;Domain=example.com;Path=/".into())), "/");
+        assert_eq!(safe_return_path(Some("/a,b".into())), "/");
+        assert_eq!(safe_return_path(Some("/a b".into())), "/");
+        assert_eq!(safe_return_path(Some("/a\r\nSet-Cookie: x=1".into())), "/");
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
