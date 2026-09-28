@@ -20,9 +20,8 @@
 //! persistence layer in this process. The SQLite shape (`open`/`open_in_memory`, a
 //! plain `Mutex<Connection>` for a write-heavy/rarely-read store) mirrors
 //! `crates/control-plane/src/storage.rs`'s established convention (e.g.
-//! `SqliteEdgeMesh`); `open_tuned`/the WAL+busy_timeout tuning is duplicated here
-//! rather than shared, since edge and control-plane are separate processes with no
-//! shared DB file today.
+//! `SqliteEdgeMesh`); the WAL/busy_timeout/file-mode setup lives in
+//! [`crate::sqlite_util::open_tuned`], shared with `tunnel_history`.
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
