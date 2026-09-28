@@ -211,7 +211,7 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     // before spending a real backend call on an account that's already broke or
     // capped. The single real debit (cap increment + balance decrement
     // together, exactly once) happens after the call, against the true cost.
-    let worst_case_cost = (bounded_max_tokens as u64 * rate) / 1000;
+    let worst_case_cost = (bounded_max_tokens as u64).saturating_mul(rate) / 1000;
     let free_cap = if is_premium { None } else { pricing.free_ai_request_cap };
     let snapshot = st.ledger.ai_usage_for(&account).map_err(|e| internal("ai_chat/ai_usage_for", e))?.ok_or((StatusCode::NOT_FOUND, "unknown account".to_string()))?;
     if snapshot.plan.is_none() {
@@ -248,7 +248,7 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     let upstream: serde_json::Value = resp.json().await.map_err(|e| bad_gateway(format!("AI backend returned an unparseable response: {e}")))?;
 
     let total_tokens = upstream.get("usage").and_then(|u| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(bounded_max_tokens as u64);
-    let credits_spent = (total_tokens * rate) / 1000;
+    let credits_spent = total_tokens.saturating_mul(rate) / 1000;
     // The one real debit for this request: decrements the balance by the true
     // cost AND (for a Free-tier account) increments the free-request counter,
     // atomically, exactly once. The pre-flight peek above never mutates state,
@@ -282,7 +282,7 @@ async fn ai_transcribe(State(st): State<AiUsageState>, headers: HeaderMap, Json(
 
     let pricing = PricingConfig::from_env();
     let rate_per_minute = pricing.standard_stt_credits_per_minute.unwrap_or(0) as u64;
-    let credits_cost = (req.duration_seconds as u64 * rate_per_minute) / 60;
+    let credits_cost = (req.duration_seconds as u64).saturating_mul(rate_per_minute) / 60;
 
     let client = ai_http_client();
     let body = serde_json::json!({ "audio_base64": req.audio_base64 });
@@ -405,6 +405,19 @@ mod tests {
         ledger.debit_ai_chat(&account, 5, Some(1)).unwrap();
         let err = ledger.debit_ai_chat(&account, 5, Some(1)).expect_err("cap already reached");
         assert!(matches!(err, LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded)));
+    }
+
+    #[test]
+    fn a_cost_above_i64_max_is_refused_not_wrapped_into_a_credit() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let account = ledger.account_for_subject("overflow-user").unwrap();
+        ledger.credit(&account, 1000).unwrap();
+        ledger.set_plan(&account, Some("pro")).unwrap();
+        for cost in [u64::MAX, i64::MAX as u64 + 1] {
+            let err = ledger.debit_ai_chat(&account, cost, None).expect_err("must be refused");
+            assert!(matches!(err, LedgerOpError::Ledger(LedgerError::InsufficientCredit { .. })));
+        }
+        assert_eq!(ledger.balance(&account).unwrap(), 1000, "balance untouched");
     }
 
     #[tokio::test]

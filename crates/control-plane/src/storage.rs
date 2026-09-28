@@ -1907,7 +1907,9 @@ impl SqliteLedger {
     }
 
     fn check_balance(balance: i64, credits_cost: u64) -> Result<(), LedgerOpError> {
-        if balance < credits_cost as i64 {
+        // A cost above i64::MAX must not wrap negative and pass (the caller then
+        // subtracts `credits_cost as i64`, i.e. would ADD to the balance).
+        if i64::try_from(credits_cost).map_or(true, |cost| balance < cost) {
             return Err(LedgerOpError::Ledger(LedgerError::InsufficientCredit { balance: balance.max(0) as u64, requested: credits_cost }));
         }
         Ok(())
@@ -2145,6 +2147,25 @@ impl SqliteLedger {
             params![&bytes[..], &account.0[..], credits as i64],
         )?;
         Ok(PaymentId(bytes))
+    }
+
+    /// The owning account and credit amount of a payment intent, `None` if unknown.
+    pub fn payment_intent(&self, payment: &PaymentId) -> rusqlite::Result<Option<(AccountId, u64)>> {
+        self.conn
+            .lock_safe()
+            .query_row(
+                "SELECT account, credits FROM payments WHERE payment = ?1",
+                params![&payment.0[..]],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(account, credits)| {
+                let account = <[u8; 32]>::try_from(account.as_slice()).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, "payments.account is not 32 bytes".into())
+                })?;
+                Ok((AccountId(account), credits.max(0) as u64))
+            })
+            .transpose()
     }
 
     /// Confirm a payment and credit the account, atomically. Idempotent: a
