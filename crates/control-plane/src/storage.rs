@@ -96,6 +96,22 @@ pub(crate) fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// The read-only connection pool every pooled store opens next to its writer (#344/#398).
+///
+/// `build_unchecked`: connections open lazily, so a transient failure can never fail
+/// store construction (the writer already proved `path` is openable). Each connection
+/// gets the writer's WAL/busy_timeout tuning. #444: r2d2's default checkout timeout is
+/// 30s, which would park a tokio worker that long before `read()` falls back to the
+/// writer; 50ms is "try briefly, then degrade".
+fn reader_pool(path: &str) -> r2d2::Pool<r2d2_sqlite::SqliteConnectionManager> {
+    let manager =
+        r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
+    r2d2::Pool::builder()
+        .max_size(8)
+        .connection_timeout(std::time::Duration::from_millis(50))
+        .build_unchecked(manager)
+}
+
 /// See [`open_tuned`]'s call site for why. `path`'s `-wal`/`-shm` sidecar files (WAL
 /// mode) can hold the same data as the main file (recent, not-yet-checkpointed rows),
 /// so all three need the same restriction, not just the main path.
@@ -973,9 +989,7 @@ impl SqliteAgentDirectory {
     /// `open_in_memory` (builds the pool too).
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let mut store = Self::from_connection(open_tuned(path)?)?;
-        let manager =
-            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
-        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        store.readers = Some(reader_pool(path));
         Ok(store)
     }
 
@@ -1138,9 +1152,7 @@ impl SqlitePipelineRegistry {
     /// connections (#398; see the struct doc).
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let mut store = Self::from_connection(open_tuned(path)?)?;
-        let manager =
-            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
-        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        store.readers = Some(reader_pool(path));
         Ok(store)
     }
 
@@ -2494,28 +2506,7 @@ impl SqliteTunnelStore {
     /// two are no longer simple twins of each other.
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let mut store = Self::from_connection(open_tuned(path)?)?;
-        // `build_unchecked`: connections are opened lazily on first checkout
-        // rather than eagerly here, so a transient issue opening extra reader
-        // connections can never fail store construction -- the eagerly-opened
-        // `writer` connection above already proved `path` itself is openable.
-        // Every pooled connection gets the identical WAL + busy_timeout tuning
-        // as `writer` via `with_init` (`tune_connection`, factored out of
-        // `open_tuned` so both share one source of truth for the tuning).
-        let manager =
-            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
-        // #444: r2d2's documented default connection_timeout is 30s -- `read()`'s own
-        // doc claims pool exhaustion "never a hard failure: a read simply degrades",
-        // but without this override a burst past max_size(8) parks the calling tokio
-        // worker thread for up to 30s BEFORE that degradation even begins, strictly
-        // worse than the pre-pool behavior this was meant to improve on. 50ms is
-        // "try briefly, then degrade" -- long enough to ride out a genuine transient
-        // burst, short enough that the promised fallback actually happens promptly.
-        store.readers = Some(
-            r2d2::Pool::builder()
-                .max_size(8)
-                .connection_timeout(std::time::Duration::from_millis(50))
-                .build_unchecked(manager),
-        );
+        store.readers = Some(reader_pool(path));
         Ok(store)
     }
 
@@ -5578,14 +5569,22 @@ impl ClaimOutcome {
     }
 }
 
+/// Every table keyed by `channel` that must not outlive its channel row. Constant
+/// names, so interpolating them into SQL carries no injection surface.
+const CHANNEL_DEPENDENT_TABLES: [&str; 5] = [
+    "channel_members",
+    "channel_allowlist",
+    "channel_member_subjects",
+    "channel_grant_deposits",
+    "channel_claim_invites",
+];
+
 impl SqliteChannelStore {
     /// Open (creating if needed) a durable store at `path`, plus a pool of extra read-only
     /// connections (#398; see the struct doc).
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let mut store = Self::from_connection(open_tuned(path)?)?;
-        let manager =
-            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
-        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        store.readers = Some(reader_pool(path));
         Ok(store)
     }
 
@@ -5871,15 +5870,21 @@ impl SqliteChannelStore {
     /// its allow-list — the account-deletion cascade's per-channel teardown. Returns
     /// `false` (no-op) if `owner` doesn't own `channel`.
     pub fn delete_channel(&self, owner: &str, channel: &ChannelId) -> rusqlite::Result<bool> {
-        let conn = self.writer.lock_safe();
-        let n = conn.execute(
+        // One transaction: channel ids are client-chosen and first-come, so leftover
+        // member rows would make a later re-registrant of the same id inherit them as
+        // authorized holders.
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let n = tx.execute(
             "DELETE FROM channels WHERE channel = ?1 AND owner = ?2",
             params![&channel.0[..], owner],
         )?;
         if n > 0 {
-            conn.execute("DELETE FROM channel_members WHERE channel = ?1", params![&channel.0[..]])?;
-            conn.execute("DELETE FROM channel_allowlist WHERE channel = ?1", params![&channel.0[..]])?;
+            for table in CHANNEL_DEPENDENT_TABLES {
+                tx.execute(&format!("DELETE FROM {table} WHERE channel = ?1"), params![&channel.0[..]])?;
+            }
         }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -6863,9 +6868,7 @@ impl SqliteTopologyStore {
     /// connections (#398; see the struct doc).
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let mut store = Self::from_connection(open_tuned(path)?)?;
-        let manager =
-            r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|c: &mut Connection| tune_connection(c));
-        store.readers = Some(r2d2::Pool::builder().max_size(8).build_unchecked(manager));
+        store.readers = Some(reader_pool(path));
         Ok(store)
     }
 
@@ -11520,7 +11523,23 @@ mod tests {
         assert_eq!(s.channels_owned_by("alice").unwrap(), vec![mine]);
 
         assert!(!s.delete_channel("mallory", &mine).unwrap(), "non-owner delete -> no-op");
+        s.insert_claim_invite_for_test("pending-invite", 1_000, None);
+        s.writer
+            .lock_safe()
+            .execute(
+                "UPDATE channel_claim_invites SET channel = ?1",
+                params![&mine.0[..]],
+            )
+            .unwrap();
         assert!(s.delete_channel("alice", &mine).unwrap());
+        for table in CHANNEL_DEPENDENT_TABLES {
+            let left: i64 = s
+                .writer
+                .lock_safe()
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE channel = ?1"), params![&mine.0[..]], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{table} rows outlived the deleted channel");
+        }
         assert_eq!(s.channel_owner(&mine).unwrap(), None, "channel gone");
         assert!(!s.is_member(&mine, &holder).unwrap(), "members gone with it");
         assert_eq!(s.allowlist_list(&mine, "alice").unwrap(), None, "channel unknown post-delete");

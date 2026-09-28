@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // satisfy). Every other admin-identity check in later phases traces back to
     // this one value.
     let super_admin_email = ct_control_plane::admin_identity::super_admin_email_from_env()?;
+    ct_control_plane::service::edge_admin_token_from_env()?;
     let admin_store = Arc::new(ct_control_plane::storage::SqliteAdminStore::open(&db)?);
     let admin_identity = Arc::new(ct_control_plane::admin_identity::AdminIdentity::new(
         admin_store,
