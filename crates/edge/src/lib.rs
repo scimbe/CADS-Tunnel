@@ -21,6 +21,7 @@ pub mod shutdown;
 pub mod sni;
 pub mod state;
 pub mod transport;
+mod sqlite_util;
 pub mod tunnel_history;
 pub mod ws_channel;
 
