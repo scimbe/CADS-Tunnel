@@ -1,19 +1,21 @@
 # cargo-audit configuration for the #78 CI dependency-audit gate.
 #
 # Each ignored advisory below is documented with WHY it is NOT a production exposure for this
-# workspace. In every case the flagged crate is NOT compiled into any release binary — verified
-# with `cargo tree -i <crate> -e normal` (which finds nothing for all three). These are gate-
+# workspace: either the flagged version is not compiled into any release binary (`cargo tree
+# -i <crate>@<version> -e normal` finds nothing), or the compiled version is outside the
+# advisory's affected range. These are gate-
 # hygiene ignores of non-exploitable, resolved-but-inactive dependencies, NOT acceptance of a
 # live risk. Flagged to central for security-review sign-off.
 
 [advisories]
 ignore = [
-    # hickory-proto: present ONLY as resolved-but-inactive optional deps of libp2p's `dns`/`mdns`
-    # features, which this workspace deliberately does NOT enable (libp2p features are
-    # tokio,noise,yamux,tcp,relay,dcutr,kad,macros — we dial raw multiaddrs, no DNS/mDNS). Our
-    # `ct-dns` crate is a hand-rolled codec that does not use hickory. Not in the compiled graph.
-    "RUSTSEC-2026-0118",  # hickory-proto NSEC3 unbounded loop — no upstream fix; not compiled here
-    "RUSTSEC-2026-0119",  # hickory-proto O(n^2) name compression — fix exists upstream; not compiled here
+    # hickory-proto: two copies are resolved. 0.26.1 IS compiled (ct-dns -> hickory-resolver
+    # 0.26.1 -> ct-control-plane, used by dns01_challenge's convergence check) and is NOT
+    # affected: 0118 lists >= 0.26.0-beta.1 as unaffected, 0119 is patched in >= 0.26.1.
+    # The advisories match only 0.25.2, an inactive optional dep of libp2p's `dns`/`mdns`
+    # features, which this workspace does not enable. Re-check if either version changes.
+    "RUSTSEC-2026-0118",  # hickory-proto NSEC3 unbounded loop -- compiled 0.26.1 unaffected
+    "RUSTSEC-2026-0119",  # hickory-proto O(n^2) name compression -- compiled 0.26.1 patched
 
     # rsa (Marvin Attack, timing side-channel key recovery — no upstream fix): pulled ONLY by the
     # TEST-side `jsonwebtoken::encode` that mints test JWTs (control-plane tests); it is not in any
