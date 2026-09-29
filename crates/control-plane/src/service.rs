@@ -7071,13 +7071,7 @@ async fn revoked_tokens(
     Ok(Json(RevokedTokensResp { tokens }))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex_encode;
 
 /// `CT_CP_EDGE_ADMIN_TOKEN`: unset/empty is `Ok(None)` (machine-writer routes absent or
 /// open, as documented at their mount sites); set but not 64 hex chars is an error.
@@ -7110,31 +7104,9 @@ fn parse_edge_admin_token(raw: Option<&str>) -> Result<Option<[u8; 32]>, String>
     }
 }
 
-pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    // #401: byte-length guard alone isn't a char-boundary guard -- a multi-byte UTF-8
-    // char can pass the length check and still land mid-char at a `s[i..j]` slice,
-    // panicking instead of returning `None` as this function's own contract promises.
-    if s.len() != 64 || !s.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+pub(crate) use ct_common::hex::decode_32 as hex_decode_32;
 
-/// Decode an arbitrary-length lowercase/upper hex string to bytes (even length).
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    // #401: same char-boundary hazard as hex_decode_32 -- `len() % 2` alone doesn't
-    // guarantee every 2-byte slice below lands on ASCII hex digits.
-    if s.len() % 2 != 0 || !s.is_ascii() {
-        return None;
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
-        .collect()
-}
+use ct_common::hex::decode as hex_decode;
 
 pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
     // #401: same char-boundary hazard as hex_decode_32.

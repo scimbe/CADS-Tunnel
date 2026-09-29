@@ -459,18 +459,11 @@ pub fn pubkey_from_hex(s: &str) -> Option<[u8; 32]> {
     hex_decode(s.trim()).and_then(|b| b.try_into().ok())
 }
 
-pub fn hex_encode(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
+pub use crate::hex::encode as hex_encode;
 
 /// Same hazard as `channel.rs::from_hex` (#417): check every byte is an ASCII hex digit
 /// before slicing, so a multi-byte char can never land a slice mid-character.
-pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
-}
+pub use crate::hex::decode as hex_decode;
 
 /// Fixtures for dependents' tests (`ct-agent-tools`'s `verify_receipts` bin): a small
 /// deterministic chain from a fixed seed. Enabled by the `test-support` feature on a

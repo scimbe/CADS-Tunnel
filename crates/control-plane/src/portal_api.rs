@@ -48,30 +48,9 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, Stri
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
-/// Agent-bridges-v2: minimal local hex codec -- this crate's existing per-file
-/// convention (e.g. `client.rs::hex_encode`/`hex_decode_32`, `edge_mesh.rs`'s
-/// own pair) rather than an external `hex` crate dependency, reused here for
-/// the bridge holder pubkey display and the owner-pasted channel id / grant hex
-/// on the new agent-bridge routes below.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex_encode;
 
-/// #606-safe (see `client.rs::hex_decode_32`'s doc for the exact hazard: `s.len()`
-/// is BYTE length, so a naive length check can pass a multi-byte UTF-8 char
-/// while a raw `&s[i..i+2]` slice lands mid-character and panics) -- the
-/// ASCII-hexdigit check below makes the subsequent byte-chunked slicing safe
-/// regardless of the input's length.
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
-}
+use ct_common::hex::decode as hex_decode;
 
 /// Shared HTTP client for the edge admin API calls (#112): a hung edge admin
 /// endpoint must not block the portal's authenticated request path (create /
@@ -6409,9 +6388,7 @@ you below, nothing to configure. Click <strong>Install</strong> to get its token
     page("your tunnels", &body, email)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+use ct_common::hex::encode as hex;
 
 /// Redact routing-token-shaped substrings (#90): a routing token is a 32-byte
 /// value rendered as 64 lowercase-hex chars, and it appears in the edge-revoke URL

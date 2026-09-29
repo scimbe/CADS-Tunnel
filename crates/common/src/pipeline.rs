@@ -90,19 +90,7 @@ impl PipelineSpec {
     }
 }
 
-/// #606: `s.len()` is BYTE length -- a multi-byte UTF-8 char in `s` can pass this guard
-/// while a raw `&s[i*2..i*2+2]` slice would land mid-character and panic. Chunk the bytes
-/// instead of slicing the `str`.
-fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(out)
-}
+use crate::hex::decode_32 as decode_hex_32;
 
 /// Why a pipeline could not convene.
 #[derive(Debug, Clone, PartialEq, Eq)]

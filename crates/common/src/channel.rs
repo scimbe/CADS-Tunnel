@@ -1448,29 +1448,8 @@ pub struct Skill {
 /// only a transport/display encoding, and [`AgentCard::is_valid`] re-checks the signature
 /// after any round-trip (#135 L1 — the JSON profile agent onboarding / #133 dogfood reads).
 mod card_hex {
-    fn to_hex(b: &[u8]) -> String {
-        use std::fmt::Write as _;
-        let mut s = String::with_capacity(b.len() * 2);
-        for byte in b {
-            let _ = write!(s, "{byte:02x}");
-        }
-        s
-    }
-    fn from_hex(s: &str) -> Option<Vec<u8>> {
-        // #417: the old `s.len() % 2 != 0` guard only bounded *byte* length, not char
-        // boundaries -- a multi-byte UTF-8 character (fully attacker-controlled, this is
-        // reached straight from untrusted JSON) can leave `&s[i..i+2]` slicing mid-character,
-        // which panics rather than returning an error. Requiring every byte to be an ASCII
-        // hex digit first guarantees the string is single-byte-per-char, so byte indexing
-        // can never land off a char boundary.
-        if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-            .collect()
-    }
+    use crate::hex::encode as to_hex;
+    use crate::hex::decode as from_hex;
     pub mod b32 {
         use serde::{Deserialize, Deserializer, Serializer};
         pub fn serialize<S: Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
@@ -2907,21 +2886,7 @@ pub fn redeem_invitation(
     })
 }
 
-/// Lowercase-hex a 32-byte value for the canonical signing bytes. Writes a static
-/// nibble table directly into the pre-sized `String` — **byte-identical** output to
-/// the old `format!("{:02x}")` loop (so the signature preimage is unchanged), but
-/// without the ~64 throwaway `format!` allocations per call. `signing_bytes` calls
-/// this twice on every grant/invitation verify, which is the per-connection A2A
-/// admission gate (#114 #5).
-fn hex32(b: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(64);
-    for &x in b {
-        s.push(HEX[(x >> 4) as usize] as char);
-        s.push(HEX[(x & 0x0f) as usize] as char);
-    }
-    s
-}
+use crate::hex::encode as hex32;
 
 #[cfg(test)]
 mod tests {

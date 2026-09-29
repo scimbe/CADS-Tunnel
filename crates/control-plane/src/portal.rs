@@ -952,27 +952,9 @@ pub(crate) fn cleared_session_cookie(domain: Option<&str>) -> String {
     }
 }
 
-/// #436: was `bytes.iter().map(|b| format!("{b:02x}")).collect()` -- one heap
-/// allocation per byte via `format!`, collected into a final `String`. Pushes
-/// directly into one pre-sized `String` instead.
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
+use ct_common::hex::encode as hex;
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
+use ct_common::hex::decode as unhex;
 
 /// HTML-escape untrusted text before embedding it in the page.
 ///

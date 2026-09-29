@@ -37,6 +37,7 @@ pub mod channel_quic;
 pub mod credential;
 pub mod crew;
 pub mod fallback_framing;
+pub mod hex;
 pub mod mcp;
 pub mod metrics;
 pub mod noise;

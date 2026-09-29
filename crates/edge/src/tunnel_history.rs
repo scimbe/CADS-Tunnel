@@ -635,7 +635,7 @@ pub fn uptime_percent(spans: &[(i64, Option<i64>)], now: i64, window: i64) -> f6
 /// Lowercase hex of a routing token -- the key `tunnel_sessions.routing_token` uses, the
 /// same encoding `admin.rs`'s routes and `serve::hex_of_bytes` produce.
 pub(crate) fn routing_token_hex(token: &RoutingToken) -> String {
-    token.0.iter().map(|b| format!("{b:02x}")).collect()
+    ct_common::hex::encode(&token.0)
 }
 
 fn clamp_i64(v: u64) -> i64 {
