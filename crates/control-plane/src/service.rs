@@ -6133,8 +6133,15 @@ const COOKIE_AUTHED_PREFIXES: [&str; 2] = ["/portal", "/admin-ui"];
 /// that predate it). Requests carrying neither header are not browser-initiated form
 /// posts and pass unchanged.
 async fn reject_cross_site_cookie_writes(req: Request, next: Next) -> Response {
+    // `/me/*` also accepts the portal cookie (the Topology Editor, channel and
+    // allow-list pages drive it from the browser), and several of its POSTs take no
+    // body, so they are CORS-simple. A request with an `Authorization` header cannot
+    // be forged cross-site without a preflight (no CORS is configured), so bearer
+    // callers are left alone.
+    let cookie_authed_me = path_has_prefix(req.uri().path(), "/me")
+        && !req.headers().contains_key(axum::http::header::AUTHORIZATION);
     if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
-        && COOKIE_AUTHED_PREFIXES.iter().any(|p| path_has_prefix(req.uri().path(), p))
+        && (cookie_authed_me || COOKIE_AUTHED_PREFIXES.iter().any(|p| path_has_prefix(req.uri().path(), p)))
         && !is_same_origin_request(req.headers())
     {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
@@ -6775,6 +6782,8 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                domain_admin_config.edge_admin.clone(),
+                Some(edge_mesh.clone()),
             ))
             // ADR-0025: the admin console's account/user operations, gated on a
             // verified admin session rather than the shared `x-ct-admin-token`.
@@ -7170,7 +7179,14 @@ mod tests {
         );
         // Safe methods and routes outside the cookie-authed prefixes are untouched.
         assert_eq!(send(Method::GET, "/portal", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
-        assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
+        // `/me/*`: a cross-site write without a bearer rides the portal cookie -> refused;
+        // a bearer caller cannot be forged cross-site and passes.
+        assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site"), ("authorization", "Bearer x")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(send(Method::POST, "/me/issue", &[]).await, StatusCode::OK, "non-browser client");
         assert_eq!(send(Method::POST, "/portalx", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
     }
 

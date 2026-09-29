@@ -1598,7 +1598,8 @@ impl SqliteLedger {
     /// deliberately does NOT do this (Keycloak still owns that caller's identity
     /// and a returning login would just re-create the account row); an admin
     /// deleting someone else's account has no such expectation, so this actually
-    /// removes the row. No-op if `subject` has no account yet.
+    /// removes the row. No-op if `subject` has no account yet, and for a blocked
+    /// account (kept as a tombstone so the block survives a re-login).
     pub fn delete_account_for_subject(&self, subject: &str) -> rusqlite::Result<()> {
         let mut guard = self.conn.lock_safe();
         let tx = guard.transaction()?;
@@ -1610,8 +1611,13 @@ impl SqliteLedger {
             )
             .optional()?;
         if let Some(bytes) = account {
-            tx.execute("DELETE FROM accounts WHERE account = ?1", params![&bytes[..]])?;
-            tx.execute("DELETE FROM account_subjects WHERE subject = ?1", params![subject])?;
+            // A blocked account keeps its row (and subject mapping) as a tombstone:
+            // deleting it would reset `blocked` (plus device fingerprint and free-tier
+            // counters), and the next login would get a clean, unblocked account.
+            let removed = tx.execute("DELETE FROM accounts WHERE account = ?1 AND blocked = 0", params![&bytes[..]])?;
+            if removed > 0 {
+                tx.execute("DELETE FROM account_subjects WHERE subject = ?1", params![subject])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -3035,18 +3041,34 @@ impl SqliteTunnelStore {
     pub fn revoke(&self, subject: &str, id: &str, now: u64) -> rusqlite::Result<Option<String>> {
         let mut guard = self.writer.lock_safe();
         let tx = guard.transaction()?;
-        let token: Option<String> = tx
+        let row: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT routing_token FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
+                "SELECT routing_token, hostname FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
                 params![id, subject],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+        let (token, hostname) = match row {
+            Some((tok, host)) => (Some(tok), host),
+            None => (None, None),
+        };
         if let Some(tok) = &token {
             tx.execute(
                 "DELETE FROM subject_tunnels WHERE id = ?1 AND subject = ?2",
                 params![id, subject],
             )?;
+            // Hostname-keyed gate state must not outlive the tunnel: the hostname is
+            // freed here and can be claimed by another account, whose gate would
+            // otherwise inherit this owner's allow-list (and see their visitors'
+            // pending requests).
+            if let Some(host) = &hostname {
+                tx.execute("DELETE FROM tunnel_login_allowlist WHERE hostname = ?1 COLLATE NOCASE", params![host])?;
+                tx.execute("DELETE FROM gate_access_requests WHERE hostname = ?1 COLLATE NOCASE", params![host])?;
+            }
+            tx.execute("DELETE FROM tunnel_access_policies WHERE tunnel_id = ?1", params![id])?;
+            // The alert webhook URL + signing secret are the owner's; no reason to keep them.
+            tx.execute("DELETE FROM tunnel_alerts WHERE tunnel_id = ?1", params![id])?;
+            tx.execute("DELETE FROM tunnel_alert_deliveries WHERE tunnel_id = ?1", params![id])?;
             tx.execute("DELETE FROM tunnel_grants WHERE tunnel_id = ?1", params![id])?;
             // #778: a public badge must not outlive its tunnel.
             tx.execute("DELETE FROM tunnel_badges WHERE tunnel_id = ?1", params![id])?;
@@ -4224,6 +4246,13 @@ impl SqliteTunnelStore {
     const MAX_PENDING_ACCESS_REQUESTS_PER_HOSTNAME: i64 = 500;
 
     pub fn record_access_request(&self, hostname: &str, email: &str, note: &str, now: u64) -> rusqlite::Result<bool> {
+        // Canonical form before storing: the gate check matches NOCASE, but the key and
+        // the per-hostname cap below are exact, so case variants of one host would each
+        // get their own 500-row budget.
+        let Some(hostname) = ct_common::normalize_hostname(hostname) else {
+            return Ok(false);
+        };
+        let hostname = hostname.as_str();
         if !self.require_login_for_hostname(hostname)? {
             return Ok(false);
         }
@@ -10832,6 +10861,58 @@ mod tests {
         assert!(ledger.debit(&acct, 1).is_err(), "blocked: refused");
         ledger.set_blocked(&acct, false).unwrap();
         assert_eq!(ledger.debit(&acct, 1).unwrap(), 9, "unblocked: same ledger, now succeeds");
+    }
+
+    #[test]
+    fn revoke_clears_hostname_keyed_gate_state_so_a_new_owner_inherits_nothing() {
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let host = "shop.example.org";
+        let t = tunnels.create("alice", "shop", Some(host)).unwrap().created().unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "friend@example.com", 1).unwrap());
+        assert!(tunnels.record_access_request(host, "visitor@example.com", "hi", 1).unwrap());
+        let policy = ct_common::access_window::AccessPolicy { expires_at: Some(99), schedule: None };
+        assert!(tunnels.set_access_policy("alice", &t.id, &policy, 1).unwrap());
+
+        assert!(tunnels.revoke("alice", &t.id, 2).unwrap().is_some());
+        assert!(tunnels.access_policy("alice", &t.id).unwrap().is_none());
+
+        // Another account claims the freed hostname and gates it.
+        let t2 = tunnels.create("mallory", "shop", Some(host)).unwrap().created().expect("hostname was freed");
+        assert!(tunnels.set_require_login("mallory", &t2.id, true).unwrap());
+        assert!(!tunnels.email_allowed_for_hostname(host, "friend@example.com").unwrap(), "old allow-list is gone");
+        assert_eq!(tunnels.login_allowlist_list("mallory", &t2.id).unwrap(), Some(vec![]));
+        assert_eq!(tunnels.pending_access_requests("mallory", &t2.id).unwrap().map(|v| v.len()), Some(0));
+    }
+
+    #[test]
+    fn access_requests_are_keyed_on_the_canonical_hostname() {
+        let tunnels = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = tunnels.create("alice", "shop", Some("shop.example.org")).unwrap().created().unwrap();
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        for variant in ["shop.example.org", "SHOP.example.org", "Shop.Example.Org."] {
+            assert!(tunnels.record_access_request(variant, "v@example.com", "", 1).unwrap());
+        }
+        assert_eq!(
+            tunnels.pending_access_requests("alice", &t.id).unwrap().map(|v| v.len()),
+            Some(1),
+            "case/trailing-dot variants collapse into one row (and one cap budget)"
+        );
+    }
+
+    #[test]
+    fn deleting_a_blocked_account_keeps_it_blocked() {
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let blocked = ledger.account_for_subject("bad").unwrap();
+        ledger.set_blocked(&blocked, true).unwrap();
+        ledger.delete_account_for_subject("bad").unwrap();
+        let again = ledger.account_for_subject("bad").unwrap();
+        assert_eq!(again, blocked, "same account row, not a fresh one");
+        assert!(ledger.is_blocked(&again).unwrap(), "the block survives deletion + re-login");
+
+        let fine = ledger.account_for_subject("ok").unwrap();
+        ledger.delete_account_for_subject("ok").unwrap();
+        assert_ne!(ledger.account_for_subject("ok").unwrap(), fine, "an unblocked account is really removed");
     }
 
     #[test]
