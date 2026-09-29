@@ -648,28 +648,9 @@ fn hex_suffix(t: &[u8; 32]) -> String {
     t[30..].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Parse a 64-hex string into 32 bytes.
-///
-/// Chunks the raw BYTES rather than string-slicing (`&s[i*2..i*2+2]`): `s.len()` is a
-/// byte length and says nothing about where UTF-8 char boundaries fall, so a 64-byte
-/// string containing a multi-byte char (e.g. one `U+FFFD`, 3 bytes, plus 61 ASCII bytes)
-/// passes the length guard and then panics on the first out-of-boundary slice (#595).
-/// Reachable via the `:token`/`:host` axum `Path` extractors, which percent-decode into
-/// a plain `String` with no ASCII restriction — confirmed NOT reachable via the
-/// `x-ct-admin-token` *header* path (`admin_authed`), since `HeaderValue::to_str()`
-/// rejects any non-ASCII byte before `parse_token_hex` ever sees it, so this needs a
-/// caller that already passes the shared-secret check, not an anonymous one. Same shape
-/// already fixed once in this codebase family — ct-agent#36's `decode_hex_32`.
+/// A 64-hex routing token from a path segment (surrounding whitespace ignored), or `None`.
 fn parse_token_hex(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim();
-    if s.len() != 64 {
-        return None;
-    }
-    let mut t = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-        t[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
-    }
-    Some(t)
+    ct_common::hex::decode_32(s.trim())
 }
 
 #[cfg(test)]

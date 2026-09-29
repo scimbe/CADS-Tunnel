@@ -7,7 +7,8 @@ lives in the linked documents.
 ## Summary
 
 - Payload is **end-to-end encrypted** (Noise) — the operator relays ciphertext
-  and cannot read your bytes.
+  and cannot read your bytes. **One time-bounded exception:** a browser-facing
+  hostname in the **Gelb** certificate state is TLS-terminated by the edge (see §1).
 - Transport is **TLS everywhere** — QUIC/TLS 1.3 to the edge, HTTPS to the
   control plane; nothing external is plaintext.
 - Access is **authenticated** with Keycloak/OIDC bearer tokens.
@@ -25,6 +26,18 @@ The client and your origin establish a Noise session
 edge and control plane. The operator can route and bill your traffic but cannot
 decrypt it — this is a cryptographic property, not a policy promise.
 _Detail: `crates/common/src/noise.rs`, [threat model](threat-model.md)._
+
+**Exception — Gelb certificate state (browser plane only).** A new public
+hostname moves Rot → Gelb → Grün while its own certificate is being issued
+(#233). While it is **Gelb**, the edge terminates the browser's TLS with a
+shared, operator-held wildcard certificate and relays the decrypted HTTP to your
+agent; your origin serves plain HTTP during that window. For that period the
+operator *can* read that hostname's browser traffic. Once the hostname is
+**Grün**, the edge reverts to raw TLS passthrough to your origin's own,
+agent-held certificate and the guarantee above applies again. Mesh-plane
+(client-software) traffic and Grün hostnames are never terminated.
+_Detail: [ADR-0002](../adr/0002-zero-knowledge-boundary.md),
+[agent onboarding](../agent-onboarding.md#certificate-status-rotgelbgrün)._
 
 ## 2. Transport security (TLS everywhere)
 

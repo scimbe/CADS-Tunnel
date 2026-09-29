@@ -48,30 +48,9 @@ fn internal_error(context: &str, e: impl std::fmt::Display) -> (StatusCode, Stri
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
 }
 
-/// Agent-bridges-v2: minimal local hex codec -- this crate's existing per-file
-/// convention (e.g. `client.rs::hex_encode`/`hex_decode_32`, `edge_mesh.rs`'s
-/// own pair) rather than an external `hex` crate dependency, reused here for
-/// the bridge holder pubkey display and the owner-pasted channel id / grant hex
-/// on the new agent-bridge routes below.
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex_encode;
 
-/// #606-safe (see `client.rs::hex_decode_32`'s doc for the exact hazard: `s.len()`
-/// is BYTE length, so a naive length check can pass a multi-byte UTF-8 char
-/// while a raw `&s[i..i+2]` slice lands mid-character and panics) -- the
-/// ASCII-hexdigit check below makes the subsequent byte-chunked slicing safe
-/// regardless of the input's length.
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
-}
+use ct_common::hex::decode as hex_decode;
 
 /// Shared HTTP client for the edge admin API calls (#112): a hung edge admin
 /// endpoint must not block the portal's authenticated request path (create /
@@ -642,6 +621,10 @@ struct AccountDeleteState {
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    /// Edge admin API (`CT_CP_EDGE_ADMIN_URL`/`_TOKEN`), so revoked tunnels are torn
+    /// down at the edge too -- see [`teardown_revoked_tunnel`].
+    edge_admin: Option<(String, String)>,
+    edge_mesh: Option<EdgeMeshHandle>,
 }
 
 /// Build the account-deletion router: `POST /portal/account/delete`, session-cookie
@@ -655,6 +638,8 @@ pub fn account_delete_router(
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    edge_admin: Option<(String, String)>,
+    edge_mesh: Option<EdgeMeshHandle>,
 ) -> Router {
     Router::new()
         .route("/portal/account/delete", post(delete_account))
@@ -665,6 +650,8 @@ pub fn account_delete_router(
             topologies,
             networks,
             pipelines,
+            edge_admin,
+            edge_mesh,
         })
 }
 
@@ -721,8 +708,12 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
     // failure must not abort the rest) makes it at least diagnosable.
     if let Ok(owned) = st.tunnels.list_for_subject(subject) {
         for t in owned {
-            if let Err(e) = st.tunnels.revoke(subject, &t.id, now) {
-                eprintln!("ct-cp: account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            match st.tunnels.revoke(subject, &t.id, now) {
+                Ok(Some(token)) => {
+                    teardown_revoked_tunnel(st.edge_admin.as_ref(), st.edge_mesh.as_ref(), &token, &t.id).await
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ct-cp: account deletion for {subject}: revoking tunnel {} failed: {e}", t.id),
             }
         }
     }
@@ -773,8 +764,10 @@ managed by Keycloak, not this page -- use <strong>Open Account Console</strong> 
 page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
 <a class="btn" href="/portal/logout">Sign out</a>"#;
     let mut resp = Html(page("account deleted", body, claims.email.as_deref())).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
-        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    for cookie in crate::portal::cleared_session_cookies(crate::portal::configured_cookie_domain().as_deref()) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
     }
     resp
 }
@@ -961,28 +954,18 @@ fn wants_html(headers: &HeaderMap) -> bool {
 /// every other login on this deployment already uses -- nothing new invented here);
 /// a verified-but-not-an-admin session becomes a real, rendered `403` page.
 ///
-/// **Known limitation (ADR-0025 Decision 5 addendum, deliberately left open by
-/// this integration pass):** `/portal/login` mints `ct_portal_session` host-only on
-/// Portal's own hostname; Decision 5 serves the admin console from a DIFFERENT
-/// hostname (`CT_EDGE_ADMIN_UI_HOST`). Per RFC 6265 a host-only cookie is never sent
-/// to a different host, so today this redirect reaches the correct login FLOW but
-/// does not yet leave behind a session `admin_session_from_headers` can read back on
-/// THIS host -- an admin who completes it lands back at the Portal, not the console.
-/// The addendum names two real fixes (widen `ct_portal_session` to a `Domain=`-scoped
-/// cookie shared across the zone, mirroring `gate.rs`'s `CT_GATE_COOKIE_DOMAIN`; or
-/// give admin-ui its own dedicated OIDC login + session, fully mirroring `gate.rs`'s
-/// shape) and explicitly asks that the choice be weighed, not defaulted -- this
-/// integration pass renders/wires what the previous four phases already built and
-/// does not invent either fix. Every route gated by this function is fully correct
-/// and independently testable regardless of which fix lands; only the end-to-end
-/// "click login, land back on admin.<zone> signed in" path is blocked until then.
+/// No session redirects to the portal login with `next=/admin-ui`. The login always
+/// completes on the portal host and sets a host-only session there, so the console is
+/// used at `<portal>/admin-ui`; a visit to `admin.<zone>` (`CT_EDGE_ADMIN_UI_HOST`)
+/// ends up there after the same round trip. The session is deliberately never shared
+/// with other hosts: customer tunnels live under the same zone.
 fn admin_ui_page_authed(
     st: &AdminUiState,
     headers: &HeaderMap,
 ) -> Result<crate::admin_identity::AdminSession, Response> {
     admin_ui_authed(st, headers).map_err(|resp| {
         if resp.status() == StatusCode::UNAUTHORIZED {
-            Redirect::to("/portal/login").into_response()
+            Redirect::to("/portal/login?next=/admin-ui").into_response()
         } else {
             admin_forbidden_page()
         }
@@ -1312,8 +1295,10 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
 /// is still an open question this pass doesn't resolve).
 async fn admin_ui_logout() -> Response {
     let mut resp = Redirect::to("/portal").into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
-        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    for cookie in crate::portal::cleared_session_cookies(crate::portal::configured_cookie_domain().as_deref()) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
     }
     resp
 }
@@ -1579,8 +1564,13 @@ async fn cascade_delete_account(st: &AdminUiState, subject: &str) {
     // (2026-08-24 gap fix: log every step's failure, never `let _ =` it away).
     if let Ok(owned) = st.tunnels.list_for_subject(subject) {
         for t in owned {
-            if let Err(e) = st.tunnels.revoke(subject, &t.id, now) {
-                eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id);
+            match st.tunnels.revoke(subject, &t.id, now) {
+                Ok(Some(token)) => {
+                    let edge_admin = st.domain_admin.edge_admin.as_ref();
+                    teardown_revoked_tunnel(edge_admin, st.observability.edge_mesh.as_ref(), &token, &t.id).await
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("ct-cp: admin account deletion for {subject}: revoking tunnel {} failed: {e}", t.id),
             }
         }
     }
@@ -4270,6 +4260,20 @@ fn bridge_grant_form_html(id: &str) -> String {
 /// identically. Errors are logged, not surfaced — a failed auto-provision
 /// just leaves the tunnel list empty and the next page view retries it.
 async fn provision_tunnel(st: &ApiState, subject: &str, name: &str) {
+    // ADR-0025: same admission rule as `create_tunnel` -- otherwise a blocked account
+    // deletes its tunnel, reloads /portal/tunnels and is handed a fresh one.
+    match st.ledger.account_for_subject(subject).map(|a| st.ledger.is_blocked(&a)) {
+        Ok(Ok(false)) => {}
+        Ok(Ok(true)) => return,
+        Ok(Err(e)) => {
+            eprintln!("ct-cp: auto-provisioning for {subject}: is_blocked failed: {e}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("ct-cp: auto-provisioning for {subject}: account lookup failed: {e}");
+            return;
+        }
+    }
     let hostname = st
         .dns
         .as_ref()
@@ -4613,6 +4617,31 @@ email you'd like unblocked, with a short explanation. This isn't automatic -- a 
 reviews each request.</p>
 </body></html>"#,
     )
+}
+
+/// The live side of a tunnel revoke, for the account-deletion cascades: the DB row is
+/// already gone, but until the edge hears about it the agent keeps serving (the edge
+/// reads `revoked_tokens` only at boot). Best-effort and logged, like
+/// [`delete_tunnel`]'s own edge call. DNS is left alone here: a stale A record only
+/// points at the edge, which now refuses the hostname.
+async fn teardown_revoked_tunnel(
+    edge_admin: Option<&(String, String)>,
+    edge_mesh: Option<&EdgeMeshHandle>,
+    routing_token: &str,
+    tunnel_id: &str,
+) {
+    if let Some(mesh) = edge_mesh {
+        mesh.forget(routing_token);
+    }
+    let Some((edge_url, edge_token)) = edge_admin else {
+        return;
+    };
+    let endpoint = format!("{}/admin/revoke/{}", edge_url.trim_end_matches('/'), routing_token);
+    match edge_admin_http_client().post(&endpoint).header("x-ct-admin-token", edge_token.as_str()).send().await {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => eprintln!("ct-cp: edge revoke for tunnel {tunnel_id} returned {}", r.status()),
+        Err(e) => eprintln!("ct-cp: edge revoke for tunnel {tunnel_id} failed: {}", redact_routing_tokens(&e.to_string())),
+    }
 }
 
 /// `POST /portal/tunnels/{id}/delete` (#27): revoke one of the caller's tunnels.
@@ -6409,9 +6438,7 @@ you below, nothing to configure. Click <strong>Install</strong> to get its token
     page("your tunnels", &body, email)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+use ct_common::hex::encode as hex;
 
 /// Redact routing-token-shaped substrings (#90): a routing token is a 32-byte
 /// value rendered as 64 lowercase-hex chars, and it appears in the edge-revoke URL
@@ -9643,13 +9670,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_account_tears_every_owned_tunnel_down_at_the_edge() {
+        // Without this the rows were gone but the agents kept serving until the
+        // next edge restart (the edge reads `revoked_tokens` only at boot).
+        use std::sync::Mutex;
+        let revoked: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let mock = Router::new()
+            .route(
+                "/admin/revoke/:token",
+                post(
+                    |axum::extract::State(rec): axum::extract::State<Arc<Mutex<Vec<(String, String)>>>>,
+                     headers: HeaderMap,
+                     Path(token): Path<String>| async move {
+                        let auth = headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                        rec.lock().unwrap().push((token, auth));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(revoked.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let a = tunnels.create("kc-alice", "a", None).unwrap().created().unwrap();
+        let b = tunnels.create("kc-alice", "b", None).unwrap().created().unwrap();
+        tunnels.create("kc-bob", "c", None).unwrap().created().unwrap();
+        let mesh_store = Arc::new(crate::edge_mesh::SqliteEdgeMesh::open_in_memory().unwrap());
+        mesh_store.record_ownership(&a.routing_token, None, "test-edge", 0).unwrap();
+        let edge_mesh = EdgeMeshHandle::new(mesh_store.clone(), Arc::from("test-edge"));
+        let app = account_delete_router(
+            KEY,
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Some((format!("http://{addr}"), "edge-secret".to_string())),
+            Some(edge_mesh),
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("cookie", session_header("kc-alice"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut got = revoked.lock().unwrap().clone();
+        got.sort();
+        let mut want = vec![
+            (a.routing_token.clone(), "edge-secret".to_string()),
+            (b.routing_token.clone(), "edge-secret".to_string()),
+        ];
+        want.sort();
+        assert_eq!(got, want, "both of alice's tokens revoked at the edge, bob's untouched");
+        assert!(mesh_store.lookup_by_token(&a.routing_token).unwrap().is_none(), "mesh ownership forgotten");
+        assert_eq!(tunnels.list_for_subject("kc-bob").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn delete_account_requires_a_session_and_the_literal_confirm_text() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
         let channels = Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap());
         let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
         let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
         let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
-        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines);
+        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines, None, None);
 
         // No session -> bounced, nothing happens.
         let resp = app
@@ -9719,7 +9811,7 @@ mod tests {
         topologies.create_topology("kc-bob", "bob-topo", "u-bob").unwrap();
         topologies.share_add("kc-bob", "bob-topo", "alice@example.com", 1).unwrap();
 
-        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone());
+        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone(), None, None);
         let session = format!(
             "ct_portal_session={}",
             crate::portal::sign_session_with_email_for_test(KEY, "kc-alice", "alice@example.com")
@@ -11294,6 +11386,25 @@ mod tests {
         assert_eq!(tunnels.list_for_subject("kc-blocked").unwrap().len(), 1);
     }
 
+    /// The other self-service path to a fresh tunnel: `/portal/tunnels` auto-provisions
+    /// one for an account that owns none. A blocked account deleting its tunnel and
+    /// reloading the page must not get a new one.
+    #[tokio::test]
+    async fn a_blocked_account_is_not_auto_provisioned_a_tunnel() {
+        let (app, ledger, tunnels, _admin) = test_admin_ui_app();
+        let account = ledger.account_for_subject("kc-blocked").unwrap();
+        ledger.set_blocked(&account, true).unwrap();
+        let get = |subject: &str| {
+            app.clone().oneshot(
+                Request::get("/portal/tunnels").header("cookie", session_header(subject)).body(Body::empty()).unwrap(),
+            )
+        };
+        get("kc-blocked").await.unwrap();
+        assert!(tunnels.list_for_subject("kc-blocked").unwrap().is_empty(), "blocked: nothing provisioned");
+        get("kc-fine").await.unwrap();
+        assert_eq!(tunnels.list_for_subject("kc-fine").unwrap().len(), 1, "control: an unblocked account still gets one");
+    }
+
     #[tokio::test]
     async fn admin_ui_delete_account_cascades_and_removes_the_ledger_row_for_any_subject() {
         let (app, ledger, tunnels, _admin) = test_admin_ui_app();
@@ -11786,7 +11897,10 @@ mod tests {
         let resp = admin_ui_html_get(&app, "/admin-ui/", None).await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER, "axum's Redirect defaults to 303");
         let loc = resp.headers().get("location").unwrap().to_str().unwrap();
-        assert_eq!(loc, "/portal/login", "the SAME login entry point every other Portal page uses");
+        assert_eq!(
+            loc, "/portal/login?next=/admin-ui",
+            "the same login entry point, returning to the console on the portal host"
+        );
     }
 
     /// A verified-but-not-an-admin session gets a real, rendered `403` page (a

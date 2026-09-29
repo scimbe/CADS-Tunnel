@@ -269,24 +269,9 @@ pub fn default_registry() -> ToolRegistry {
     r
 }
 
-fn to_hex(b: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        let _ = write!(s, "{x:02x}");
-    }
-    s
-}
+use crate::hex::encode as to_hex;
 
-fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
-}
+use crate::hex::decode as from_hex;
 
 /// Register #147-L4.3 settlement-chain **gossip** tools on a registry, over a shared `chain`, so the
 /// ledger propagates over the SAME authenticated #135 Agent-Fabric channel agents discover + cooperate

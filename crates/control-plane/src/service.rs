@@ -6133,8 +6133,15 @@ const COOKIE_AUTHED_PREFIXES: [&str; 2] = ["/portal", "/admin-ui"];
 /// that predate it). Requests carrying neither header are not browser-initiated form
 /// posts and pass unchanged.
 async fn reject_cross_site_cookie_writes(req: Request, next: Next) -> Response {
+    // `/me/*` also accepts the portal cookie (the Topology Editor, channel and
+    // allow-list pages drive it from the browser), and several of its POSTs take no
+    // body, so they are CORS-simple. A request with an `Authorization` header cannot
+    // be forged cross-site without a preflight (no CORS is configured), so bearer
+    // callers are left alone.
+    let cookie_authed_me = path_has_prefix(req.uri().path(), "/me")
+        && !req.headers().contains_key(axum::http::header::AUTHORIZATION);
     if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
-        && COOKIE_AUTHED_PREFIXES.iter().any(|p| path_has_prefix(req.uri().path(), p))
+        && (cookie_authed_me || COOKIE_AUTHED_PREFIXES.iter().any(|p| path_has_prefix(req.uri().path(), p)))
         && !is_same_origin_request(req.headers())
     {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
@@ -6775,6 +6782,8 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                domain_admin_config.edge_admin.clone(),
+                Some(edge_mesh.clone()),
             ))
             // ADR-0025: the admin console's account/user operations, gated on a
             // verified admin session rather than the shared `x-ct-admin-token`.
@@ -7071,13 +7080,7 @@ async fn revoked_tokens(
     Ok(Json(RevokedTokensResp { tokens }))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
+use ct_common::hex::encode as hex_encode;
 
 /// `CT_CP_EDGE_ADMIN_TOKEN`: unset/empty is `Ok(None)` (machine-writer routes absent or
 /// open, as documented at their mount sites); set but not 64 hex chars is an error.
@@ -7110,31 +7113,9 @@ fn parse_edge_admin_token(raw: Option<&str>) -> Result<Option<[u8; 32]>, String>
     }
 }
 
-pub(crate) fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
-    // #401: byte-length guard alone isn't a char-boundary guard -- a multi-byte UTF-8
-    // char can pass the length check and still land mid-char at a `s[i..j]` slice,
-    // panicking instead of returning `None` as this function's own contract promises.
-    if s.len() != 64 || !s.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+pub(crate) use ct_common::hex::decode_32 as hex_decode_32;
 
-/// Decode an arbitrary-length lowercase/upper hex string to bytes (even length).
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    // #401: same char-boundary hazard as hex_decode_32 -- `len() % 2` alone doesn't
-    // guarantee every 2-byte slice below lands on ASCII hex digits.
-    if s.len() % 2 != 0 || !s.is_ascii() {
-        return None;
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok())
-        .collect()
-}
+use ct_common::hex::decode as hex_decode;
 
 pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
     // #401: same char-boundary hazard as hex_decode_32.
@@ -7198,7 +7179,14 @@ mod tests {
         );
         // Safe methods and routes outside the cookie-authed prefixes are untouched.
         assert_eq!(send(Method::GET, "/portal", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
-        assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
+        // `/me/*`: a cross-site write without a bearer rides the portal cookie -> refused;
+        // a bearer caller cannot be forged cross-site and passes.
+        assert_eq!(send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site")]).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            send(Method::POST, "/me/issue", &[("sec-fetch-site", "cross-site"), ("authorization", "Bearer x")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(send(Method::POST, "/me/issue", &[]).await, StatusCode::OK, "non-browser client");
         assert_eq!(send(Method::POST, "/portalx", &[("sec-fetch-site", "cross-site")]).await, StatusCode::OK);
     }
 
