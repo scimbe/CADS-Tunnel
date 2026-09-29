@@ -59,12 +59,7 @@ const CLAIM_INVITE_GRACE_SECS: u64 = 30 * 24 * 3600;
 /// unparsable means keep forever.
 const ADMIN_AUDIT_RETENTION_ENV: &str = "CT_CP_ADMIN_AUDIT_RETENTION_DAYS";
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use ct_common::time::now_secs as unix_now;
 
 fn parse_admin_audit_retention(raw: Option<&str>) -> Option<u64> {
     let days: u64 = raw?.trim().parse().ok()?;

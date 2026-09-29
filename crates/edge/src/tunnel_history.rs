@@ -707,14 +707,7 @@ pub fn open_with_fallback(path: &str) -> Option<(SqliteTunnelHistory, bool)> {
     }
 }
 
-/// Current wall-clock time in Unix seconds, `0` on a clock error (the codebase's
-/// `SystemTime::now()` convention, e.g. `audit_log.rs::now_secs`).
-pub(crate) fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub(crate) use ct_common::time::now_secs_i64 as now_secs;
 
 /// #776: the periodic flush + eviction task, spawned from `serve::run_edge` next to the
 /// audit retention loop. Every 60 s it (a) writes each token's byte delta since the last

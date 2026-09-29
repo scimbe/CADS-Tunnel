@@ -857,13 +857,7 @@ fn verify_session_full(key: &[u8], token: &str, now: u64) -> Option<SessionClaim
     Some(SessionClaims { subject, email })
 }
 
-/// Constant-time byte-slice equality, so MAC verification leaks no timing.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+use ct_common::ct::eq as ct_eq;
 
 /// Resolve the subject of the request's session cookie, if valid and unexpired.
 fn session_subject(st: &PortalState, headers: &HeaderMap) -> Option<String> {

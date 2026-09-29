@@ -2051,9 +2051,7 @@ impl<H: Clone> EdgeState<H> {
     /// Always `false` when no admin token is configured (revocation disabled).
     pub fn admin_revoke_ok(&self, auth: &[u8; 32]) -> bool {
         match self.admin_token.lock_safe().as_ref() {
-            Some(expected) => {
-                auth.iter().zip(expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-            }
+            Some(expected) => ct_common::ct::eq(auth, expected),
             None => false,
         }
     }

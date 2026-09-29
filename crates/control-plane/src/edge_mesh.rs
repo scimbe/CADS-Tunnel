@@ -541,12 +541,7 @@ struct MeshState {
     tunnels: Option<Arc<crate::storage::SqliteTunnelStore>>,
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+use ct_common::time::now_secs_i64 as now_secs;
 
 async fn heartbeat(
     State(st): State<MeshState>,

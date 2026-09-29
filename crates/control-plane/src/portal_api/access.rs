@@ -44,12 +44,7 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/portal/tunnels/:id/access/clear", post(clear_access))
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+use ct_common::time::now_secs_i64 as now_secs;
 
 /// What the card's form posts. Every field optional: radio/checkbox inputs are simply
 /// absent when not selected, and the "Re-arm 24 h" button posts only `rearm`.
