@@ -47,6 +47,8 @@ use ct_common::receipt::{self, Receipt, ReceiptSigner};
 use ct_common::sync::MutexExt;
 use ct_common::RoutingToken;
 use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::sqlite_util::open_tuned;
 use serde::{Deserialize, Serialize};
 
 use crate::shutdown::ShutdownSignal;
@@ -641,31 +643,6 @@ pub(crate) fn routing_token_hex(token: &RoutingToken) -> String {
 fn clamp_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
-
-/// Same WAL + busy_timeout tuning and owner-only file mode as `audit_log.rs`'s
-/// `open_tuned` (#603/#608) -- see that function for the rationale. Duplicated rather
-/// than shared because the two stores are deliberately separate files with separate
-/// access postures (module doc), and neither module should depend on the other.
-fn open_tuned(path: &str) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    let _mode: String = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))?;
-    conn.busy_timeout(Duration::from_secs(5))?;
-    restrict_db_file_permissions(path);
-    Ok(conn)
-}
-
-#[cfg(unix)]
-fn restrict_db_file_permissions(path: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    for candidate in [path.to_string(), format!("{path}-wal"), format!("{path}-shm")] {
-        if std::path::Path::new(&candidate).exists() {
-            let _ = std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600));
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn restrict_db_file_permissions(_path: &str) {}
 
 /// Resolve where the history lives from `CT_EDGE_TUNNEL_HISTORY` (`off`/`0`/`false`
 /// disables -> `None`), `CT_EDGE_TUNNEL_HISTORY_PATH` (a non-empty value wins), and
