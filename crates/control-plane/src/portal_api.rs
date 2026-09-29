@@ -752,8 +752,10 @@ managed by Keycloak, not this page -- use <strong>Open Account Console</strong> 
 page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
 <a class="btn" href="/portal/logout">Sign out</a>"#;
     let mut resp = Html(page("account deleted", body, claims.email.as_deref())).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
-        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    for cookie in crate::portal::cleared_session_cookies(crate::portal::configured_cookie_domain().as_deref()) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
     }
     resp
 }
@@ -940,28 +942,18 @@ fn wants_html(headers: &HeaderMap) -> bool {
 /// every other login on this deployment already uses -- nothing new invented here);
 /// a verified-but-not-an-admin session becomes a real, rendered `403` page.
 ///
-/// **Known limitation (ADR-0025 Decision 5 addendum, deliberately left open by
-/// this integration pass):** `/portal/login` mints `ct_portal_session` host-only on
-/// Portal's own hostname; Decision 5 serves the admin console from a DIFFERENT
-/// hostname (`CT_EDGE_ADMIN_UI_HOST`). Per RFC 6265 a host-only cookie is never sent
-/// to a different host, so today this redirect reaches the correct login FLOW but
-/// does not yet leave behind a session `admin_session_from_headers` can read back on
-/// THIS host -- an admin who completes it lands back at the Portal, not the console.
-/// The addendum names two real fixes (widen `ct_portal_session` to a `Domain=`-scoped
-/// cookie shared across the zone, mirroring `gate.rs`'s `CT_GATE_COOKIE_DOMAIN`; or
-/// give admin-ui its own dedicated OIDC login + session, fully mirroring `gate.rs`'s
-/// shape) and explicitly asks that the choice be weighed, not defaulted -- this
-/// integration pass renders/wires what the previous four phases already built and
-/// does not invent either fix. Every route gated by this function is fully correct
-/// and independently testable regardless of which fix lands; only the end-to-end
-/// "click login, land back on admin.<zone> signed in" path is blocked until then.
+/// No session redirects to the portal login with `next=/admin-ui`. The login always
+/// completes on the portal host and sets a host-only session there, so the console is
+/// used at `<portal>/admin-ui`; a visit to `admin.<zone>` (`CT_EDGE_ADMIN_UI_HOST`)
+/// ends up there after the same round trip. The session is deliberately never shared
+/// with other hosts: customer tunnels live under the same zone.
 fn admin_ui_page_authed(
     st: &AdminUiState,
     headers: &HeaderMap,
 ) -> Result<crate::admin_identity::AdminSession, Response> {
     admin_ui_authed(st, headers).map_err(|resp| {
         if resp.status() == StatusCode::UNAUTHORIZED {
-            Redirect::to("/portal/login").into_response()
+            Redirect::to("/portal/login?next=/admin-ui").into_response()
         } else {
             admin_forbidden_page()
         }
@@ -1291,8 +1283,10 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
 /// is still an open question this pass doesn't resolve).
 async fn admin_ui_logout() -> Response {
     let mut resp = Redirect::to("/portal").into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&crate::portal::cleared_session_cookie(crate::portal::configured_cookie_domain().as_deref())) {
-        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    for cookie in crate::portal::cleared_session_cookies(crate::portal::configured_cookie_domain().as_deref()) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
     }
     resp
 }
@@ -11763,7 +11757,10 @@ mod tests {
         let resp = admin_ui_html_get(&app, "/admin-ui/", None).await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER, "axum's Redirect defaults to 303");
         let loc = resp.headers().get("location").unwrap().to_str().unwrap();
-        assert_eq!(loc, "/portal/login", "the SAME login entry point every other Portal page uses");
+        assert_eq!(
+            loc, "/portal/login?next=/admin-ui",
+            "the same login entry point, returning to the console on the portal host"
+        );
     }
 
     /// A verified-but-not-an-admin session gets a real, rendered `403` page (a
