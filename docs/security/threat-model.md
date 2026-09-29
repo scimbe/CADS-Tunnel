@@ -16,12 +16,15 @@ while the end-to-end Noise payload encryption is retained.
 
 | Party | Sees | Does **not** see |
 |-------|------|------------------|
-| Edge / control plane (operator) | Ciphertext, routing metadata, account id, billing | **Payload plaintext** (Noise E2E terminates at client↔origin) |
+| Edge / control plane (operator) | Ciphertext, routing metadata, account id, billing; **browser-plane plaintext of a hostname while it is Gelb** (edge terminates TLS with the shared wildcard cert, #233) | **Payload plaintext** (Noise E2E terminates at client↔origin; Grün hostnames are raw-TLS passthrough) |
 | Control plane | Keycloak subject, credit balance, tunnel registry | Origin private key, payload |
 | Client | Its own payload, the edge CA root | Other tenants' traffic |
 
 The operator can route and bill your traffic but cannot read it — the honest
-claim is "we can't read what you send", not anonymity.
+claim is "we can't read what you send", not anonymity. The one exception is the
+time-bounded Gelb admission window for browser-plane hostnames, during which the
+operator's edge holds the key that decrypts that hostname's traffic
+([ADR-0002](../adr/0002-zero-knowledge-boundary.md)).
 
 ## Adversaries & controls
 
@@ -38,6 +41,11 @@ claim is "we can't read what you send", not anonymity.
 | Poisoned local build (gate write-mount) | Server-side CI (`.github/workflows/ci.yml`) re-runs build+test+audit+secret-guard on `main`, independent of the local gate | accepted residual (#78 SEC78c; mitigated by SEC78b) |
 | Funded sybil / billing fraud | **unresolved** — PoW does not deter a paying adversary | open (SPEC §9.1) |
 | Capability holder registers as the Agent (#540) | **none today** — agent registration is `role='A' \| token(32)` and every TLS context is `with_no_client_auth()`, so the client capability already contains everything registration requires. Confidentiality/authenticity hold (Noise_IK to the pinned `OriginIdentity`); **availability does not** | open (#540, residual risk 7) |
+| Admin-blocked account keeps serving | Block refuses new tunnels, auto-provisioning, debits and signup; admin delete keeps the blocked row as a tombstone. **Existing tunnels, routing tokens, gate sessions and share links keep working** — revoking them on block is destructive and needs an unblock/re-provision path | open (operator decision) |
+| Tenant replays a realm token from another client app against `/me/*` | Bearer tokens are RS256 + issuer + expiry checked; **audience/`azp` is not** (`CT_OIDC_ACCESS_AUD` unset in the deploy) — any client in the realm can present a user's token here | open (needs a Keycloak audience mapper) |
+| Unlimited free accounts via self-service service accounts | Each service-account client has its own `sub` and so its own ledger account and free quota; the device-fingerprint cap is client-reported and optional | open (needs `sa_sub → owner` mapping) |
+| Ex-grantee keeps a tunnel's routing token | Revoking a grant deletes the row; the long-lived routing token the grantee already saw is not rotated | open (needs token rotation) |
+| One account drains the shared CA budget | Per-hostname issuance floor (#407); **no per-account limit** on `acme_issuance_log`, so create/claim/delete loops can exhaust the per-zone budget for every tenant | open |
 
 ## Secrets inventory & handling
 
