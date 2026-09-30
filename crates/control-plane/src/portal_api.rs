@@ -421,7 +421,7 @@ fn admin_authed(headers: &HeaderMap, admin_token: Option<[u8; 32]>) -> Result<()
             }
             Some(out)
         })
-        .is_some_and(|got| got.iter().zip(&expected).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0);
+        .is_some_and(|got| ct_common::ct::eq(&got, &expected));
     if authed {
         Ok(())
     } else {
@@ -8445,12 +8445,7 @@ struct ClaimInviteConfirmForm {
     invite: String,
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use ct_common::time::now_secs as unix_now;
 
 /// A refusal page for the invite flow -- `410` for a used/expired invitation, `404`
 /// for one that never existed, or whatever the claim itself answered. Never a claim.

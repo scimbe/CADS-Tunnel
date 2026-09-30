@@ -1007,12 +1007,7 @@ fn cleared_gate_session_cookie(domain: &str) -> String {
     format!("{GATE_SESSION_COOKIE}=; Domain={domain}; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use ct_common::time::now_secs;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -1032,9 +1027,7 @@ use ct_common::hex::encode as hex;
 
 use ct_common::hex::decode as unhex;
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+use ct_common::ct::eq as ct_eq;
 
 const GATE_TARGET_CTX: &[u8] = b"ct-gate-target-v1";
 

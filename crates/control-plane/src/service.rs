@@ -375,13 +375,7 @@ pub fn bootstrap_router(store: Arc<SqliteBootstrap>, admin_token: Option<[u8; 32
     redeem.merge(mint)
 }
 
-/// Seconds since the Unix epoch (wall clock), for the bootstrap-token TTL.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use ct_common::time::now_secs;
 
 #[derive(Deserialize)]
 struct BootstrapMintReq {
@@ -6884,7 +6878,7 @@ pub struct AdminChannelState {
 
 /// Constant-time 32-byte token comparison (avoid leaking the admin token via timing).
 fn ct_token_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    ct_common::ct::eq(a, b)
 }
 
 /// Build the **edge-facing** channel-authorize router (#81 SEC81c-c c-i): the live edge
