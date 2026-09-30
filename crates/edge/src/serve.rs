@@ -1221,6 +1221,30 @@ const TCP_PING_STOP: u8 = 0xFB;
 /// real TLS handshake is a handful of round trips, not a long-lived exchange.
 const FRONT_DOOR_TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a QUIC connection whose admission failed may linger (so the peer can read
+/// the reject reply) before the edge closes it and frees its `conn_cap` permit.
+const FAILED_ADMISSION_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
+/// Front-door `Proxy` leg (Portal / IdP upstreams): after the handshake, a connection with
+/// no bytes in either direction for this long is closed. The upstream (axum on hyper,
+/// served without a timer) has no header-read or keep-alive timeout of its own, so without
+/// this a peer could complete TLS once and then hold its [`crate::state::ConnectionCap`]
+/// permit indefinitely. Browsers reopen idle keep-alive connections transparently, and no
+/// Portal/IdP route streams (no SSE or WebSocket), so two minutes costs real users nothing.
+const FRONT_DOOR_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Bound on dialing a front-door `Proxy` upstream, same reasoning as the relay-gate's
+/// upstream connect (#616): an unreachable upstream must not pin cap permits for the OS's
+/// default TCP connect timeout.
+const FRONT_DOOR_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn front_door_upstream_connect(addr: std::net::SocketAddr) -> Result<tokio::net::TcpStream, BoxError> {
+    tokio::time::timeout(FRONT_DOOR_UPSTREAM_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
+        .await
+        .map_err(|_| -> BoxError { format!("front door: upstream {addr} did not accept within {FRONT_DOOR_UPSTREAM_CONNECT_TIMEOUT:?}").into() })?
+        .map_err(Into::into)
+}
+
 /// #549: the mesh-relay leg's counterparts to [`FRONT_DOOR_TLS_ACCEPT_TIMEOUT`] -- same
 /// class as #422, one leg over. [`relay_via_peer_edge`] dials a peer edge and waits for
 /// its 2-byte `OK`; both waits were unbounded, so a peer edge that accepts the TCP
@@ -1735,16 +1759,18 @@ pub async fn serve_front_door(
                     let mut tls = tokio::time::timeout(FRONT_DOOR_TLS_ACCEPT_TIMEOUT, pacc.accept(joined))
                         .await
                         .map_err(|_| -> BoxError { "front door: TLS handshake not completed within the timeout (#422)".into() })??;
-                    let mut upstream = tokio::net::TcpStream::connect(*addr).await?;
-                    tokio::io::copy_bidirectional(&mut tls, &mut upstream).await?;
+                    let mut upstream = front_door_upstream_connect(*addr).await?;
+                    crate::relay_gate::copy_bidirectional_with_idle_timeout(&mut tls, &mut upstream, FRONT_DOOR_PROXY_IDLE_TIMEOUT)
+                        .await?;
                     Ok(())
                 }
                 // Raw-proxy: only serves if the upstream itself terminates TLS (e.g.
                 // a fronting Caddy). Kept for that topology.
                 None => {
                     let mut joined = joined;
-                    let mut upstream = tokio::net::TcpStream::connect(*addr).await?;
-                    tokio::io::copy_bidirectional(&mut joined, &mut upstream).await?;
+                    let mut upstream = front_door_upstream_connect(*addr).await?;
+                    crate::relay_gate::copy_bidirectional_with_idle_timeout(&mut joined, &mut upstream, FRONT_DOOR_PROXY_IDLE_TIMEOUT)
+                        .await?;
                     Ok(())
                 }
             }
@@ -3247,6 +3273,15 @@ where
                     stream.flush().await?;
                     return Err(format!("mesh-relay: no local route for '{host}'").into());
                 };
+                // #779 applies here too: the ingress edge relays blind (it does not know
+                // this tunnel's policy), so the owning edge is the one place to enforce
+                // the access window for mesh-relayed browsers.
+                if !state.access_window_open(&token, unix_now() as i64) {
+                    state.note_access_window_refused();
+                    stream.write_all(b"NO").await?;
+                    stream.flush().await?;
+                    return Err(format!("mesh-relay: access window closed for '{host}'").into());
+                }
                 stream.write_all(b"OK").await?;
                 stream.flush().await?;
                 Ok::<_, BoxError>(token)
@@ -3322,6 +3357,9 @@ pub struct MeshRelayConfig {
 /// legitimate race between provisioning and first traffic) isn't stuck failing.
 const MESH_RELAY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Upper bound on [`MeshRelayConfig::negative_cache`] entries (its keys are attacker-chosen).
+const MESH_RELAY_NEGATIVE_CACHE_MAX: usize = 4096;
+
 /// #471: [`crate::edge_mesh_client::lookup_owner_by_host`], but skips the real CP
 /// round-trip entirely when `host`'s negative result is still fresh — see
 /// [`MeshRelayConfig::negative_cache`]'s own doc for the amplification this closes. A
@@ -3341,7 +3379,14 @@ async fn mesh_relay_lookup_cached(mesh: &MeshRelayConfig, host: &str) -> Option<
     let result = crate::edge_mesh_client::lookup_owner_by_host(&mesh.cp_url, &mesh.admin_token, host).await;
     if result.is_none() {
         if let Ok(mut c) = mesh.negative_cache.lock() {
-            c.insert(host.to_string(), tokio::time::Instant::now());
+            // Keys are attacker-chosen SNIs: sweep expired entries once the map is
+            // full, and stop caching new misses if it is still full after that.
+            if c.len() >= MESH_RELAY_NEGATIVE_CACHE_MAX {
+                c.retain(|_, at| at.elapsed() < MESH_RELAY_NEGATIVE_CACHE_TTL);
+            }
+            if c.len() < MESH_RELAY_NEGATIVE_CACHE_MAX {
+                c.insert(host.to_string(), tokio::time::Instant::now());
+            }
         }
     }
     result
@@ -4979,6 +5024,17 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                 rand::rngs::OsRng.fill_bytes(&mut nonce);
                 let challenge = Challenge { nonce, difficulty };
                 let registered = serve_agent_connection(&conn, &state, &challenge).await;
+                // A failed admission (no stream in time, bad role/PoW, revoked token, a
+                // relay that errored) must not leave the connection parked here: the
+                // edge's own keep-alives stop QUIC's idle timeout from ever firing, so
+                // an unclosed failure would hold this `conn_cap` permit indefinitely.
+                // A short grace first lets a reject reply already written to the stream
+                // (e.g. `NO`) reach the peer; `close` would discard unsent stream data.
+                if registered.is_err()
+                    && tokio::time::timeout(FAILED_ADMISSION_CLOSE_GRACE, conn.closed()).await.is_err()
+                {
+                    conn.close(0u32.into(), b"admission failed");
+                }
                 conn.closed().await;
                 // Evict exactly this dropped agent's registration so a later
                 // Client route() fails fast instead of hitting a dead handle (#2)
@@ -6293,6 +6349,60 @@ mod tests {
         let wrong_token = [0x99u8; 32]; // != the [0x42; 32] edge B is configured with
         let result = relay_via_peer_edge(edge_a_inbound, addr_b, host, cert_b, wrong_token).await;
         assert!(result.is_err(), "wrong admin token must be refused, not relayed");
+    }
+
+    #[tokio::test]
+    async fn mesh_relay_is_refused_outside_the_tunnels_access_window_779() {
+        // The owning edge enforces the access window for mesh-relayed traffic too;
+        // the ingress edge cannot, since it never sees the policy.
+        let (listener_b, acceptor_b, cert_b) =
+            crate::transport::build_tcp_tls_listener_at("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let state_b: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        state_b.set_admin_token([0x42u8; 32]);
+        let host = "app.example.test";
+        let token = RoutingToken([0x77; 32]);
+        let _ = state_b.register_host(host, token.clone());
+        state_b.set_access_policy(
+            token,
+            Some(ct_common::access_window::AccessPolicy { expires_at: Some(1), schedule: None }),
+        );
+        tokio::spawn(async move {
+            let (tcp, _) = listener_b.accept().await.unwrap();
+            if let Ok(tls) = acceptor_b.accept(tcp).await {
+                let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+                let _ = serve_tcp_connection(tls, &state_b, &challenge, None, test_peer_ip()).await;
+            }
+        });
+
+        let (_client_side, edge_a_inbound) = tokio::io::duplex(4096);
+        let result = relay_via_peer_edge(edge_a_inbound, addr_b, host, cert_b, [0x42u8; 32]).await;
+        let err = result.expect_err("an expired access window must refuse the mesh relay");
+        assert!(err.to_string().contains("refused"), "refused with NO, not a transport error: {err}");
+    }
+
+    #[test]
+    fn mesh_relay_negative_cache_stays_bounded_under_unique_hostnames() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // Unroutable CP URL: every lookup misses, so every host is a negative entry.
+            let mesh = MeshRelayConfig {
+                cp_url: "http://127.0.0.1:1".to_string(),
+                admin_token: [0u8; 32],
+                edge_cert: rustls::pki_types::CertificateDer::from(vec![0u8]),
+                negative_cache: Default::default(),
+            };
+            {
+                let mut c = mesh.negative_cache.lock().unwrap();
+                for i in 0..MESH_RELAY_NEGATIVE_CACHE_MAX {
+                    c.insert(format!("h{i}.example"), tokio::time::Instant::now());
+                }
+            }
+            assert!(mesh_relay_lookup_cached(&mesh, "one-more.example").await.is_none());
+            assert_eq!(mesh.negative_cache.lock().unwrap().len(), MESH_RELAY_NEGATIVE_CACHE_MAX, "full of fresh entries: no growth");
+        });
     }
 
     #[tokio::test]

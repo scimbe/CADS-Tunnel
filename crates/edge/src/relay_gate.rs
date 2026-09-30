@@ -74,10 +74,16 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Splice `a`↔`b` like [`tokio::io::copy_bidirectional`], but close the connection if
-/// NEITHER side produces a byte within [`RELAY_IDLE_TIMEOUT`] (#427) — `copy_bidirectional`
-/// itself has no such hook, so this drives two manual read/write loops via `select!`,
-/// resetting the shared idle deadline on any activity from either side.
-async fn copy_bidirectional_with_idle_timeout<A, B>(a: &mut A, b: &mut B) -> Result<(u64, u64), BoxError>
+/// NEITHER side produces a byte within `idle` (#427) — `copy_bidirectional` itself has
+/// no such hook, so this drives two manual read/write loops via `select!`, resetting the
+/// shared idle deadline on any activity from either side. EOF on one side half-closes
+/// the other (like `copy_bidirectional`), so a response still in flight after a
+/// client's FIN is delivered rather than dropped.
+pub(crate) async fn copy_bidirectional_with_idle_timeout<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle: Duration,
+) -> Result<(u64, u64), BoxError>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
@@ -85,25 +91,35 @@ where
     let mut buf_a = vec![0u8; 16 * 1024];
     let mut buf_b = vec![0u8; 16 * 1024];
     let (mut a_to_b, mut b_to_a) = (0u64, 0u64);
-    loop {
+    let (mut a_eof, mut b_eof) = (false, false);
+    while !(a_eof && b_eof) {
         tokio::select! {
-            r = a.read(&mut buf_a) => {
+            r = a.read(&mut buf_a), if !a_eof => {
                 let n = r?;
-                if n == 0 { return Ok((a_to_b, b_to_a)); }
-                b.write_all(&buf_a[..n]).await?;
-                a_to_b += n as u64;
+                if n == 0 {
+                    a_eof = true;
+                    let _ = b.shutdown().await;
+                } else {
+                    b.write_all(&buf_a[..n]).await?;
+                    a_to_b += n as u64;
+                }
             }
-            r = b.read(&mut buf_b) => {
+            r = b.read(&mut buf_b), if !b_eof => {
                 let n = r?;
-                if n == 0 { return Ok((a_to_b, b_to_a)); }
-                a.write_all(&buf_b[..n]).await?;
-                b_to_a += n as u64;
+                if n == 0 {
+                    b_eof = true;
+                    let _ = a.shutdown().await;
+                } else {
+                    a.write_all(&buf_b[..n]).await?;
+                    b_to_a += n as u64;
+                }
             }
-            _ = tokio::time::sleep(RELAY_IDLE_TIMEOUT) => {
-                return Err(format!("relay-gate: connection idle for {RELAY_IDLE_TIMEOUT:?}, closing (#427)").into());
+            _ = tokio::time::sleep(idle) => {
+                return Err(format!("connection idle for {idle:?}, closing (#427)").into());
             }
         }
     }
+    Ok((a_to_b, b_to_a))
 }
 
 /// The membership check a relay-gate pre-auth needs: is `holder` a current member of
@@ -262,7 +278,7 @@ where
         "relay-gate: relay-node connect not completed within the timeout (#616)".into()
     })?
     .map_err(|e| { eprintln!("ct-edge: relay-gate NO [upstream-connect]: {e}"); e })?;
-    copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream).await?;
+    copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream, RELAY_IDLE_TIMEOUT).await?;
     Ok(())
 }
 
@@ -422,7 +438,7 @@ mod tests {
         let (mut a, _a_peer) = tokio::io::duplex(64);
         let (mut b, _b_peer) = tokio::io::duplex(64);
         let start = tokio::time::Instant::now();
-        let res = copy_bidirectional_with_idle_timeout(&mut a, &mut b).await;
+        let res = copy_bidirectional_with_idle_timeout(&mut a, &mut b, RELAY_IDLE_TIMEOUT).await;
         assert!(res.is_err(), "a fully silent connection must be closed, not held open forever");
         assert!(
             start.elapsed() >= RELAY_IDLE_TIMEOUT,
@@ -438,7 +454,7 @@ mod tests {
         let (mut a, mut a_peer) = tokio::io::duplex(64);
         let (mut b, _b_peer) = tokio::io::duplex(64);
 
-        let relay_task = tokio::spawn(async move { copy_bidirectional_with_idle_timeout(&mut a, &mut b).await });
+        let relay_task = tokio::spawn(async move { copy_bidirectional_with_idle_timeout(&mut a, &mut b, RELAY_IDLE_TIMEOUT).await });
 
         // Send a byte every half-idle-window, well past the raw idle timeout in total
         // wall-clock, and confirm the relay is still alive throughout. The relay only
@@ -455,6 +471,31 @@ mod tests {
         relay_task.abort();
     }
 
+    #[tokio::test]
+    async fn copy_bidirectional_with_idle_timeout_delivers_the_reply_after_a_half_close() {
+        // A peer that FINs its write side right after the request must still get
+        // the response (half-close semantics, same as `copy_bidirectional`).
+        let (a, a_peer) = tokio::io::duplex(64);
+        let (b, b_peer) = tokio::io::duplex(64);
+        let relay_task = tokio::spawn(async move {
+            let (mut a, mut b) = (a, b);
+            copy_bidirectional_with_idle_timeout(&mut a, &mut b, RELAY_IDLE_TIMEOUT).await
+        });
+        let (mut a_r, mut a_w) = tokio::io::split(a_peer);
+        let (mut b_r, mut b_w) = tokio::io::split(b_peer);
+        a_w.write_all(b"GET").await.unwrap();
+        a_w.shutdown().await.unwrap();
+        let mut req = Vec::new();
+        b_r.read_to_end(&mut req).await.unwrap();
+        assert_eq!(req, b"GET", "request forwarded and the half-close propagated");
+        b_w.write_all(b"200 OK").await.unwrap();
+        b_w.shutdown().await.unwrap();
+        let mut resp = Vec::new();
+        a_r.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(resp, b"200 OK", "reply still delivered after the client's FIN");
+        assert_eq!(relay_task.await.unwrap().unwrap(), (3, 6));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn copy_bidirectional_with_idle_timeout_forwards_bytes_correctly_both_directions_427() {
         // #427: the idle-timeout wrapper must not change the actual relay behavior --
@@ -465,7 +506,7 @@ mod tests {
         let relay_task = tokio::spawn(async move {
             let mut a = a;
             let mut b = b;
-            copy_bidirectional_with_idle_timeout(&mut a, &mut b).await
+            copy_bidirectional_with_idle_timeout(&mut a, &mut b, RELAY_IDLE_TIMEOUT).await
         });
 
         a_peer.write_all(b"hello-from-a").await.unwrap();
