@@ -23,14 +23,7 @@ pub(super) fn routes() -> Router<ApiState> {
     Router::new().route("/portal/fleet", get(fleet_page))
 }
 
-/// Unix seconds now. Shared with `dial_bridge_tool`'s cache write so the stored
-/// `probed_at` and this page's "probed N ago" read the same clock.
-pub(super) fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub(super) use ct_common::time::now_secs_i64 as unix_now;
 
 /// Sessions asked from the edge per tunnel: the newest one alone supplies the transport
 /// column, and the uptime windows ride along regardless of the limit.

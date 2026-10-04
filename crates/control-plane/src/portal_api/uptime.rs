@@ -144,9 +144,7 @@ pub(super) fn routes() -> Router<ApiState> {
         .route("/portal/usage.csv", get(usage_csv))
 }
 
-fn now_secs() -> i64 {
-    i64::try_from(unix_now()).unwrap_or(0)
-}
+use ct_common::time::now_secs_i64 as now_secs;
 
 /// Best-effort audit row for a badge change, when the deployment has an audit log --
 /// same posture as `create_tunnel`'s `tunnel_enrolled` row (actor = the session's

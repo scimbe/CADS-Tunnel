@@ -35,6 +35,7 @@ pub mod channel_wire;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod channel_quic;
 pub mod credential;
+pub mod ct;
 pub mod crew;
 pub mod fallback_framing;
 pub mod hex;
@@ -53,6 +54,7 @@ pub mod receipt;
 pub mod replay;
 pub mod settlement;
 pub mod sync;
+pub mod time;
 pub mod upgrade;
 
 /// Stable crate identifier, used by downstream smoke tests.
