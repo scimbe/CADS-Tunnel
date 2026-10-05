@@ -338,7 +338,7 @@
         "userInfoUrl": "https://git.haw-hamburg.de/oauth/userinfo",
         "jwksUrl": "https://git.haw-hamburg.de/oauth/discovery/keys",
         "useJwksUrl": "true",
-        "defaultScope": "openid profile email",
+        "defaultScope": "openid profile email read_api read_repository",
         "hideOnLoginPage": "true",
         "syncMode": "FORCE"
       }
