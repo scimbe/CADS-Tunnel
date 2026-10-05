@@ -3559,6 +3559,9 @@ pub(crate) async fn run_channel_broker_loop<F, Fut, N, C, CFut>(
 }
 
 #[cfg(test)]
+mod park_pump_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::transport::{build_client_endpoint, build_server_endpoint_with_cert};
