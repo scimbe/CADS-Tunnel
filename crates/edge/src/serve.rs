@@ -10603,7 +10603,13 @@ mod tests {
         assert_eq!(audit_log_retention_secs_from(Some("86400")), 86_400);
     }
 
-    /// trace: REQ-0006 AUF-20261005-007
+    /// trace: REQ-0006 AUF-20261005-007 AUF-20261005-015
+    ///
+    /// AUF-20261005-015: the backpressure/sequencing below is detected directly
+    /// from the kernel (`try_write`/`writable()` on the upstream<->edge socket)
+    /// rather than guessed with fixed sleeps, and `body_len` no longer depends on
+    /// a live capacity probe -- both were a source of flakiness, not of the actual
+    /// bug coverage.
     ///
     /// AUF-20261005-007 (field report, ITS/labor-com, 2026-10-04/05): a browser
     /// reuses ONE HTTP/1.1 connection for the Keycloak login page's stylesheets
@@ -10643,70 +10649,20 @@ mod tests {
         crate::transport::install_crypto_provider();
 
         // Both ends of the browser socket are shrunk to this, so the pair's
-        // capacity is small AND known: untuned loopback otherwise swallows a whole
-        // 16 MiB response into kernel buffers before the client reads one byte
-        // (measured), i.e. nothing ever backs up and the bug stays invisible.
+        // capacity is small: untuned loopback otherwise swallows a whole 16 MiB
+        // response into kernel buffers before the client reads one byte (measured),
+        // i.e. nothing ever backs up and the bug stays invisible. The exact
+        // resulting capacity does not need to be known, let alone precisely hit --
+        // see `ready_rx` below, which detects the real backpressure directly from
+        // the kernel instead.
         const BROWSER_SOCKET_BUF: usize = 64 * 1024;
-        // How far the second response overshoots that capacity. The overshoot has
-        // to land in rustls's own outgoing-plaintext buffer, whose default limit is
-        // 64 KiB: beyond that `poll_write` returns `Pending` and the relay BLOCKS
-        // on this response instead of finishing it and going idle -- and a blocked
-        // relay resumes writing as soon as the browser reads, which hides the bug.
-        // 40 KiB leaves room for the capacity probe below being off by some KiB
-        // (TLS record overhead, skb accounting) in either direction.
+        // How far the second response overshoots a fresh pair's measured capacity
+        // (4x the configured buffer size on Linux, accounting for the kernel's own
+        // buffer doubling) -- generous enough that the write loop below reliably
+        // observes real backpressure (`WouldBlock`) partway through, however much
+        // this host's actual capacity differs from that estimate.
         const OVERSHOOT: usize = 32 * 1024;
-
-        /// Bytes a browser<->edge socket pair with these buffer sizes swallows
-        /// before writes block, measured on a throwaway pair of the same shape.
-        /// The second response is sized just past this, so the relay's LAST write
-        /// is the one that backs up -- the field condition (a long, congested hop
-        /// with the browser slow to read), reproduced without guessing at this
-        /// host's buffer autotuning.
-        async fn pipe_capacity(buf: usize) -> usize {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = l.local_addr().unwrap();
-            let probe = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )
-            .unwrap();
-            probe.set_recv_buffer_size(buf).unwrap();
-            probe.connect(&addr.into()).unwrap();
-            probe.set_nonblocking(true).unwrap();
-            // Held, never read from: this is the "browser that isn't reading".
-            let _reader = tokio::net::TcpStream::from_std(probe.into()).unwrap();
-            let (writer, _) = l.accept().await.unwrap();
-            socket2::SockRef::from(&writer)
-                .set_send_buffer_size(buf)
-                .unwrap();
-            let chunk = vec![b'c'; 16 * 1024];
-            let mut total = 0usize;
-            loop {
-                match writer.try_write(&chunk) {
-                    Ok(n) => total += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // One grace round: the kernel may still be moving the last
-                        // segments across loopback. Twice in a row means full.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        match writer.try_write(&chunk) {
-                            Ok(n) => total += n,
-                            _ => break total,
-                        }
-                    }
-                    Err(e) => panic!("capacity probe failed: {e}"),
-                }
-            }
-        }
-
-        // `pipe_capacity` tends to UNDER-read a fresh pair (its receive window has
-        // not grown yet), so take whichever is larger: the probe, or what Linux's
-        // buffer doubling makes the two 64 KiB requests worth (measured 262144 =
-        // 4 x 64 KiB actually swallowed, against a 193364-byte probe).
-        let body_len = pipe_capacity(BROWSER_SOCKET_BUF)
-            .await
-            .max(4 * BROWSER_SOCKET_BUF)
-            + OVERSHOOT;
+        let body_len = 4 * BROWSER_SOCKET_BUF + OVERSHOOT;
 
         fn chunked_head(body_len: usize) -> Vec<u8> {
             let mut v = Vec::with_capacity(body_len + 128);
@@ -10729,12 +10685,21 @@ mod tests {
         };
         let second_head = chunked_head(body_len);
 
-        let (tail_tx, tail_rx) = tokio::sync::oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_addr = up.local_addr().unwrap();
         let (up_first, up_second) = (first.clone(), second_head.clone());
         let up_task = tokio::spawn(async move {
             let (mut s, _) = up.accept().await.unwrap();
+            // Shrunk like the browser leg, so the upstream<->edge socket's own
+            // kernel buffer fills quickly too -- that is what makes the
+            // `WouldBlock` below a trustworthy signal that the EDGE (not just
+            // this socket in isolation) has stopped draining it, which per
+            // `copy_bidirectional_with_idle_timeout`'s `select!` loop only
+            // happens while it is itself stuck mid-write on the browser leg.
+            socket2::SockRef::from(&s)
+                .set_send_buffer_size(BROWSER_SOCKET_BUF)
+                .unwrap();
             let mut req = [0u8; 1024];
             let n = s.read(&mut req).await.unwrap();
             assert!(req[..n].starts_with(b"GET /one"), "first request proxied");
@@ -10744,9 +10709,48 @@ mod tests {
                 req[..n].starts_with(b"GET /two"),
                 "second request proxied over the same upstream connection"
             );
-            s.write_all(&up_second).await.unwrap();
-            let _ = tail_rx.await;
-            s.write_all(TERMINATOR).await.unwrap();
+
+            // Push the body with non-blocking writes until the KERNEL itself
+            // reports this socket full (`WouldBlock`) -- a direct, real-time
+            // signal that backpressure has actually occurred, in place of a
+            // guessed wall-clock delay. `ready_tx` fires the moment that
+            // happens, which is also, by construction, before the browser
+            // below has read a single byte of this response.
+            let mut sent = 0usize;
+            while sent < up_second.len() {
+                match s.try_write(&up_second[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("upstream write failed: {e}"),
+                }
+            }
+            assert!(
+                sent < up_second.len(),
+                "test setup: body_len must be large enough to actually back up the connection"
+            );
+            let _ = ready_tx.send(());
+
+            // Deliver the rest of the body, then the terminator, waiting on real
+            // socket writability (never a fixed sleep) whenever the kernel
+            // reports `WouldBlock`.
+            while sent < up_second.len() {
+                s.writable().await.unwrap();
+                match s.try_write(&up_second[sent..]) {
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(e) => panic!("upstream write failed: {e}"),
+                }
+            }
+            let mut term_sent = 0usize;
+            while term_sent < TERMINATOR.len() {
+                match s.try_write(&TERMINATOR[term_sent..]) {
+                    Ok(n) => term_sent += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        s.writable().await.unwrap();
+                    }
+                    Err(e) => panic!("terminator write failed: {e}"),
+                }
+            }
             // Deliberately NO shutdown: a real EOF here would take the relay's
             // half-close path, whose `shutdown()` flushes as a side effect and
             // would hide the missing flush under test.
@@ -10847,11 +10851,14 @@ mod tests {
         tls.write_all(b"GET /two HTTP/1.1\r\nHost: portal.test\r\n\r\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        // Release the terminator: it lands while the client is STILL not reading,
-        // making it the relay's final forwarded write on a full socket.
-        let _ = tail_tx.send(());
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for the upstream task's own kernel-reported backpressure signal
+        // (see `up_task` above) instead of guessing how long that takes -- by
+        // construction this fires only once the upstream<->edge socket has
+        // genuinely backed up, with nothing read here yet.
+        tokio::time::timeout(Duration::from_secs(10), ready_rx)
+            .await
+            .expect("upstream must observe real backpressure within a generous bound")
+            .unwrap();
 
         let mut got_second = vec![0u8; second_head.len() + TERMINATOR.len()];
         tokio::time::timeout(Duration::from_secs(1), tls.read_exact(&mut got_second))

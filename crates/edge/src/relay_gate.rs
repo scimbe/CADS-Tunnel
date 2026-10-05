@@ -73,6 +73,34 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// the front door's connection cap the way #422 already showed an unbounded step can.
 const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// trace: REQ-0006 AUF-20261005-015 -- bounds one forwarded write (`write_all` + the
+/// mandatory `flush` from the AUF-20261005-007 fix below) to `idle`, the SAME deadline
+/// that already closes a silent connection, reused rather than a fresh constant
+/// specifically so this can never fire SHORTER than the idle bound and punish a
+/// slow-but-genuinely-reading peer: whatever `idle` lets a legitimate reader go quiet
+/// for, it also gets to take writing back out. Without this bound, a reader that never
+/// reads at all parks this `.await` inside the `select!` arm's own body -- the arm's
+/// body runs to completion before `select!` polls anything else, so the sibling
+/// `tokio::time::sleep(idle)` branch sitting right next to it in the same `select!`
+/// never gets polled either, and #427's own idle protection is defeated by exactly the
+/// kind of silent-reader body this module exists to relay.
+async fn write_and_flush<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8], idle: Duration) -> Result<(), BoxError> {
+    tokio::time::timeout(idle, async {
+        w.write_all(buf).await?;
+        w.flush().await
+    })
+    .await
+    .map_err(|_| -> BoxError { format!("write to peer did not complete within {idle:?} (#427)").into() })?
+    .map_err(Into::into)
+}
+
+/// Same bound as [`write_and_flush`], for the half-close `shutdown()` call below --
+/// already best-effort (errors ignored, same as before), but still must not be the one
+/// call in this function with no bound on its own.
+async fn bounded_shutdown<W: AsyncWrite + Unpin>(w: &mut W, idle: Duration) {
+    let _ = tokio::time::timeout(idle, w.shutdown()).await;
+}
+
 /// Splice `a`↔`b` like [`tokio::io::copy_bidirectional`], but close the connection if
 /// NEITHER side produces a byte within `idle` (#427) — `copy_bidirectional` itself has
 /// no such hook, so this drives two manual read/write loops via `select!`, resetting the
@@ -116,10 +144,9 @@ where
                 let n = r?;
                 if n == 0 {
                     a_eof = true;
-                    let _ = b.shutdown().await;
+                    bounded_shutdown(b, idle).await;
                 } else {
-                    b.write_all(&buf_a[..n]).await?;
-                    b.flush().await?;
+                    write_and_flush(b, &buf_a[..n], idle).await?;
                     a_to_b += n as u64;
                 }
             }
@@ -127,10 +154,9 @@ where
                 let n = r?;
                 if n == 0 {
                     b_eof = true;
-                    let _ = a.shutdown().await;
+                    bounded_shutdown(a, idle).await;
                 } else {
-                    a.write_all(&buf_b[..n]).await?;
-                    a.flush().await?;
+                    write_and_flush(a, &buf_b[..n], idle).await?;
                     b_to_a += n as u64;
                 }
             }
@@ -489,6 +515,87 @@ mod tests {
         }
         assert!(!relay_task.is_finished(), "periodic activity must keep the relay alive past the raw idle window");
         relay_task.abort();
+    }
+
+    /// trace: REQ-0006 AUF-20261005-015
+    ///
+    /// AUF-20261005-015: a reader that never reads at all previously held the relay
+    /// open forever, even though the idle timeout exists right next to the stuck write
+    /// in the same `select!` -- see [`write_and_flush`]'s doc comment for why the
+    /// sibling `sleep(idle)` branch never got a chance to fire. Real TLS over a small
+    /// `tokio::io::duplex` reproduces the actual hazard (`tokio_rustls`'s own internal
+    /// plaintext buffer, the same mechanism AUF-20261005-007/#836 fixed `flush` for)
+    /// rather than a synthetic always-pending future. Without `write_and_flush`'s
+    /// timeout wrapper, this test hangs instead of completing.
+    #[tokio::test]
+    async fn copy_bidirectional_with_idle_timeout_bounds_a_stalled_write_to_a_never_reading_peer(
+    ) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        crate::transport::install_crypto_provider();
+
+        const TEST_IDLE: Duration = Duration::from_millis(300);
+        const SMALL_CAP: usize = 1024;
+
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["relay-gate.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+        let mut roots = rustls::RootCertStore::empty();
+        let _ = roots.add(cert);
+        let ccfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let server_name = rustls::pki_types::ServerName::try_from("relay-gate.test").unwrap();
+
+        // `a`'s transport: a tiny duplex standing in for a peer connection that
+        // completes the handshake and then never reads another byte.
+        let (server_transport, client_transport) = tokio::io::duplex(SMALL_CAP);
+        let (a_res, peer_res) = tokio::join!(
+            acceptor.accept(server_transport),
+            connector.connect(server_name, client_transport)
+        );
+        let mut a = a_res.expect("edge-side TLS handshake completes over the small duplex");
+        let peer = peer_res.expect("peer-side TLS handshake completes over the small duplex");
+        // Keep the peer's transport alive (dropping it would make `a`'s writes fail
+        // fast with an error, not hang) without ever reading from it again.
+        let _peer_never_reads = tokio::spawn(async move {
+            let _keep_alive = peer;
+            std::future::pending::<()>().await
+        });
+
+        // `b`'s transport: a generously sized duplex standing in for the upstream leg,
+        // so this test is specific to the `a`-side write stalling, not a second
+        // artificial bottleneck.
+        let (mut b, mut upstream) = tokio::io::duplex(64 * 1024);
+
+        // Comfortably more than the tiny duplex plus rustls's own internal plaintext
+        // buffer can ever hold, so the forwarded write genuinely cannot complete while
+        // `peer` never drains it.
+        let write_task = tokio::spawn(async move {
+            let _ = upstream.write_all(&vec![b'x'; 256 * 1024]).await;
+        });
+
+        let start = tokio::time::Instant::now();
+        let res = copy_bidirectional_with_idle_timeout(&mut a, &mut b, TEST_IDLE).await;
+        assert!(
+            res.is_err(),
+            "a peer that never reads must not hold the relay open forever"
+        );
+        assert!(
+            start.elapsed() < TEST_IDLE + Duration::from_secs(1),
+            "must close within the idle bound, not hang past it"
+        );
+        write_task.abort();
     }
 
     #[tokio::test]
