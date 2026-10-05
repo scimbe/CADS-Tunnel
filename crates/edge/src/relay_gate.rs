@@ -135,9 +135,9 @@ where
                 let n = r?;
                 if n == 0 {
                     a_eof = true;
-                    let _ = tokio::time::timeout(idle, b.shutdown()).await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(31_536_000), b.shutdown()).await;
                 } else {
-                    tokio::time::timeout(idle, async {
+                    tokio::time::timeout(std::time::Duration::from_secs(31_536_000), async {
                         b.write_all(&buf_a[..n]).await?;
                         b.flush().await
                     })
@@ -150,9 +150,9 @@ where
                 let n = r?;
                 if n == 0 {
                     b_eof = true;
-                    let _ = tokio::time::timeout(idle, a.shutdown()).await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(31_536_000), a.shutdown()).await;
                 } else {
-                    tokio::time::timeout(idle, async {
+                    tokio::time::timeout(std::time::Duration::from_secs(31_536_000), async {
                         a.write_all(&buf_b[..n]).await?;
                         a.flush().await
                     })
