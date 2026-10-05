@@ -4775,6 +4775,104 @@ mod tests {
         assert_eq!(&m1[..], b"m1");
     }
 
+    // trace: REQ-0006, AUF-20261005-019, AUF-20261005-023
+    #[ignore = "AUF-20261005-019: rot gegen main, Korrektur im Folge-Slice"]
+    #[tokio::test]
+    async fn park_pump_keeps_reading_a_leg_whose_write_side_is_stalled_auf019() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client_a, real_a) = tokio::io::duplex(4096);
+        let (client_b, real_b) = tokio::io::duplex(4096);
+        let (_la, dead_a) = ParkLiveness::monitored();
+        let (_lb, dead_b) = ParkLiveness::monitored();
+        let leg_a = spawn_park_keepalive_pump(Box::pin(real_a), false, dead_a);
+        let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), false, dead_b);
+        let _splice =
+            tokio::spawn(async move { crate::relay::relay_streams(leg_a, leg_b, "auf019").await });
+        let (_a_r, mut a_w) = tokio::io::split(client_a); // a liest NIE (_a_r bleibt am Leben)
+        let (mut b_r, mut b_w) = tokio::io::split(client_b);
+        // b -> a staut, weil a nicht liest; die Aufgabe wird nicht abgewartet.
+        let _stuck = tokio::spawn(async move {
+            let _ = b_w.write_all(&vec![0xb5u8; 1 << 20]).await;
+            b_w
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // Stau sicher aufgebaut
+        let _wr = tokio::spawn(async move {
+            let _ = a_w.write_all(&[0xa5u8; 64 * 1024]).await;
+            let _ = a_w.flush().await;
+            a_w
+        });
+        let mut got = vec![0u8; 64 * 1024];
+        tokio::time::timeout(std::time::Duration::from_secs(3), b_r.read_exact(&mut got))
+            .await
+            .expect("a->b muss weiterlaufen, auch wenn b->a staut")
+            .expect("read");
+        assert!(got.iter().all(|&x| x == 0xa5));
+    }
+
+    // trace: REQ-0006, AUF-20261005-019, AUF-20261005-023
+    #[tokio::test]
+    async fn park_pump_relays_32mib_each_way_with_concurrent_read_write_auf019() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const LEN: usize = 32 * 1024 * 1024;
+        let (client_a, real_a) = tokio::io::duplex(4096);
+        let (client_b, real_b) = tokio::io::duplex(4096);
+        let (_la, dead_a) = ParkLiveness::monitored();
+        let (_lb, dead_b) = ParkLiveness::monitored();
+        let leg_a = spawn_park_keepalive_pump(Box::pin(real_a), false, dead_a);
+        let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), false, dead_b);
+        let _splice =
+            tokio::spawn(
+                async move { crate::relay::relay_streams(leg_a, leg_b, "auf019_p1").await },
+            );
+        let (mut a_r, mut a_w) = tokio::io::split(client_a);
+        let (mut b_r, mut b_w) = tokio::io::split(client_b);
+
+        // Je Client: Schreib- und Lesehaelfte gemeinsam gejoint, nie erst schreiben und dann lesen.
+        let client_a_task = tokio::spawn(async move {
+            let write = async {
+                a_w.write_all(&vec![0xa5u8; LEN]).await.expect("a write");
+                a_w.flush().await.expect("a flush");
+            };
+            let read = async {
+                let mut got = vec![0u8; LEN];
+                a_r.read_exact(&mut got).await.expect("a read");
+                got
+            };
+            let (_, got) = tokio::join!(write, read);
+            got
+        });
+        let client_b_task = tokio::spawn(async move {
+            let write = async {
+                b_w.write_all(&vec![0xb5u8; LEN]).await.expect("b write");
+                b_w.flush().await.expect("b flush");
+            };
+            let read = async {
+                let mut got = vec![0u8; LEN];
+                b_r.read_exact(&mut got).await.expect("b read");
+                got
+            };
+            let (_, got) = tokio::join!(write, read);
+            got
+        });
+
+        let (got_a, got_b) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let got_a = client_a_task.await.expect("a task");
+            let got_b = client_b_task.await.expect("b task");
+            (got_a, got_b)
+        })
+        .await
+        .expect("beide Richtungen muessen binnen 20s ankommen");
+
+        assert!(
+            got_a.iter().all(|&x| x == 0xb5),
+            "a muss b's Muster empfangen"
+        );
+        assert!(
+            got_b.iter().all(|&x| x == 0xa5),
+            "b muss a's Muster empfangen"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn keepalive_park_delivers_nuls_then_ex_through_the_real_admission_path_500() {
         // #500 K2 end-to-end (minus TLS): a keepalive-negotiated member drives the REAL
