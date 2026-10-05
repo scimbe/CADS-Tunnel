@@ -10602,4 +10602,206 @@ mod tests {
         assert_eq!(audit_log_retention_secs_from(Some("not a number")), AUDIT_LOG_DEFAULT_RETENTION_SECS);
         assert_eq!(audit_log_retention_secs_from(Some("86400")), 86_400);
     }
+
+    /// trace: REQ-0006 AUF-20261005-007 AUF-20261005-015
+    ///
+    /// AUF-20261005-007 (field report, ITS/labor-com, 2026-10-04/05): a browser
+    /// reuses ONE HTTP/1.1 connection for the Keycloak login page's stylesheets and a
+    /// chunked response's body never arrives -- the `200` headers are there, the body
+    /// hangs to the 30s timeout, ~1 round in 3 (`curl --parallel --parallel-max 6`).
+    /// Not reproducible from `core`, whose hop is short enough that the edge's send
+    /// path never backs up.
+    ///
+    /// Cause: [`crate::relay_gate::copy_bidirectional_with_idle_timeout`] (called for
+    /// this arm at serve.rs:1763 and :1772) forwarded with `write_all` and never
+    /// flushed. On the `a` side -- a `tokio_rustls` TLS stream -- `write_all` only
+    /// means rustls ACCEPTED the plaintext: `poll_write` reports the whole write done
+    /// while the ciphertext for its tail is still queued inside rustls, whenever the
+    /// underlying TCP write went `Pending` mid-call. After the last chunk nothing
+    /// writes again (`poll_read` does not drain `wants_write`), the `select!` loop goes
+    /// back to waiting on reads, and the tail sits in rustls until the connection is
+    /// torn down -- hence the 7x/30 min "connection idle for 120s, closing" in the edge
+    /// log and a body that never arrives even late.
+    ///
+    /// trace: REQ-0006 AUF-20261005-015 -- what this test asserts, and what it no
+    /// longer tries to. It drives the real path (real TLS over real loopback TCP into
+    /// [`serve_front_door`]'s `Proxy` arm, two sequential requests on the SAME client
+    /// connection, the upstream answering both chunked over its own single connection)
+    /// and checks the property that must hold forever: both bodies arrive in full,
+    /// terminator included, promptly. It deliberately does NOT try to re-create the
+    /// stranded-tail timing. Doing that needed a client that reads nothing while the
+    /// relay works, a response sized just past what this host's socket pair swallows,
+    /// and fixed 2 s / 200 ms sleeps to sequence the two -- i.e. a measured kernel
+    /// buffer capacity (whose own comment claimed "40 KiB" for a 32 KiB constant) and
+    /// wall-clock guesses, both of which make the test flaky on a loaded or differently
+    /// tuned machine, and neither of which the assertion actually needs. The
+    /// bug-for-bug reproduction -- red without the flush, deterministic because its
+    /// transport is a bounded `tokio::io::duplex` rather than a kernel socket -- lives
+    /// next to the code it guards, in
+    /// `relay_gate::tests::copy_bidirectional_with_idle_timeout_flushes_a_chunked_second_response_through_a_small_tls_transport`;
+    /// the write-side timeout that same flush made necessary is covered there too, by
+    /// `..._bounds_a_write_to_a_peer_that_never_reads`. Here: no sleeps, no socket
+    /// buffer tuning, no capacity probe -- every step waits for the byte or the channel
+    /// message that tells it the previous step is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn front_door_proxy_delivers_the_second_chunked_response_on_a_reused_connection() {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::transport::install_crypto_provider();
+
+        /// A login.css-sized first response.
+        const FIRST_BODY: usize = 11 * 1024;
+        /// The second response, past rustls's 64 KiB outgoing-plaintext buffer and past
+        /// any plausible socket-pair capacity, so the transfer really does span many
+        /// forwarded 16 KiB chunks and many flushes instead of fitting in one. Nothing
+        /// about the assertion depends on the exact figure -- the client reads
+        /// concurrently throughout, so no buffer anywhere has to be a particular size.
+        const SECOND_BODY: usize = 1024 * 1024;
+        const TERMINATOR: &[u8] = b"\r\n0\r\n\r\n";
+
+        fn chunked(body_len: usize) -> Vec<u8> {
+            let mut v = Vec::with_capacity(body_len + 128);
+            v.extend_from_slice(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            v.extend_from_slice(format!("{body_len:x}\r\n").as_bytes());
+            v.extend(std::iter::repeat_n(b'w', body_len));
+            v.extend_from_slice(TERMINATOR);
+            v
+        }
+        /// Reads until the request head is complete, so this never depends on how the
+        /// relay happened to chunk the bytes it forwarded.
+        async fn read_request_head(s: &mut tokio::net::TcpStream) -> Vec<u8> {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = s.read(&mut byte).await.unwrap();
+                assert!(n == 1, "request head must arrive, not EOF");
+                head.push(byte[0]);
+            }
+            head
+        }
+
+        let first = chunked(FIRST_BODY);
+        let second = chunked(SECOND_BODY);
+
+        // Lets the upstream task hold its connection open (no EOF: a real one would
+        // take the relay's half-close path, whose `shutdown()` flushes as a side
+        // effect) until the test is done asserting, without sleeping on a timer.
+        let (keep_tx, keep_rx) = tokio::sync::oneshot::channel::<()>();
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        let (up_first, up_second) = (first.clone(), second.clone());
+        let up_task = tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            let head = read_request_head(&mut s).await;
+            assert!(head.starts_with(b"GET /one"), "first request proxied");
+            s.write_all(&up_first).await.unwrap();
+            let head = read_request_head(&mut s).await;
+            assert!(
+                head.starts_with(b"GET /two"),
+                "second request proxied over the same upstream connection"
+            );
+            s.write_all(&up_second).await.unwrap();
+            let _ = keep_rx.await;
+            s
+        });
+
+        // Portal/IdP cert for portal.test; it also stands in for the edge's own
+        // terminating acceptor, which this arm never touches.
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["portal.test".to_string()]).unwrap();
+        let portal_der = certified.cert.der().clone();
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![portal_der.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der())),
+            )
+            .unwrap();
+        let portal_tls = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(portal_der).unwrap();
+
+        let mut proxies: std::collections::HashMap<String, ProxyTarget> =
+            std::collections::HashMap::new();
+        proxies.insert("portal.test".into(), (up_addr, Some(portal_tls.clone())));
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let fd = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fd_addr = fd.local_addr().unwrap();
+        let fd_task = tokio::spawn(async move {
+            let (tcp, _) = fd.accept().await.unwrap();
+            let challenge = Challenge {
+                nonce: [0u8; 16],
+                difficulty: 0,
+            };
+            serve_front_door(
+                tcp,
+                &state,
+                &portal_tls,
+                &proxies,
+                Some("portal.test"),
+                &challenge,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+        let tcp = tokio::net::TcpStream::connect(fd_addr).await.unwrap();
+        let sni = rustls::pki_types::ServerName::try_from("portal.test").unwrap();
+        let mut tls = connector
+            .connect(sni, tcp)
+            .await
+            .expect("browser TLS terminates at the edge");
+
+        tls.write_all(b"GET /one HTTP/1.1\r\nHost: portal.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut got_first = vec![0u8; first.len()];
+        tokio::time::timeout(Duration::from_secs(30), tls.read_exact(&mut got_first))
+            .await
+            .expect("first chunked response arrives")
+            .unwrap();
+        assert!(
+            got_first == first,
+            "first chunked response delivered verbatim"
+        );
+
+        // Second request on the SAME client connection, answered on the SAME upstream
+        // connection. The generous timeout is a watchdog, not a race: it only has to
+        // outlast a slow machine, and a stuck tail fails it by never completing.
+        tls.write_all(b"GET /two HTTP/1.1\r\nHost: portal.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut got_second = vec![0u8; second.len()];
+        tokio::time::timeout(Duration::from_secs(30), tls.read_exact(&mut got_second))
+            .await
+            .expect("the second chunked body must arrive, terminator included")
+            .unwrap();
+        assert!(
+            got_second.ends_with(TERMINATOR),
+            "the second body's chunk terminator is delivered, not left stuck inside the edge"
+        );
+        assert!(
+            got_second == second,
+            "the second chunked response is delivered byte-for-byte"
+        );
+
+        let _ = keep_tx.send(());
+        drop(tls);
+        let _upstream = up_task.await.unwrap();
+        fd_task.abort();
+    }
 }

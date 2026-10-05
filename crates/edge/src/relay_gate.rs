@@ -73,12 +73,49 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// the front door's connection cap the way #422 already showed an unbounded step can.
 const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// trace: REQ-0006 AUF-20261005-015 -- the error [`copy_bidirectional_with_idle_timeout`]
+/// returns when a forwarded write cannot be handed over within the caller's idle window.
+/// Kept as one function so both directions report the identical condition.
+fn write_stall_error(idle: Duration) -> BoxError {
+    format!("write to the peer did not complete within {idle:?}, closing (#427)").into()
+}
+
 /// Splice `a`↔`b` like [`tokio::io::copy_bidirectional`], but close the connection if
 /// NEITHER side produces a byte within `idle` (#427) — `copy_bidirectional` itself has
 /// no such hook, so this drives two manual read/write loops via `select!`, resetting the
 /// shared idle deadline on any activity from either side. EOF on one side half-closes
 /// the other (like `copy_bidirectional`), so a response still in flight after a
 /// client's FIN is delivered rather than dropped.
+///
+/// trace: REQ-0006 AUF-20261005-007 -- `write_all` only guarantees the bytes were
+/// handed to the writer, not that they reached the peer: `tokio_rustls`'s `poll_write`
+/// (the `a` side on the front-door `Proxy` arm, `crate::serve::serve_front_door`) can
+/// return `Ready(Ok(n))` for the full `n` plaintext bytes while ciphertext for the tail
+/// of that write is still queued inside rustls, unflushed to the socket, if the
+/// underlying TCP write was itself backpressured mid-call (slower/congested path,
+/// concurrent load -- exactly what a longer network hop plus `curl --parallel` adds and
+/// a short same-host `core` hop does not). Nothing then forces that queued ciphertext
+/// out: the loop goes back to `select!` and blocks on the next read, so a response's
+/// last bytes (observed: a chunked body's final chunk) sit stuck until this connection
+/// is torn down and the buffered rustls state is simply dropped -- never actually
+/// delivered, not even late. `tokio::io::copy_bidirectional`'s own `CopyBuffer` hits this
+/// identical hazard and closes it by flushing the writer whenever the reader has no
+/// immediately-ready data ("avoid deadlock when the reader depends on buffered
+/// writer"); this mirrors that with an unconditional flush after every forwarded write,
+/// which is a no-op once the writer has nothing left queued (plain `TcpStream`'s
+/// `poll_flush` is a no-op already, so the `b` side pays nothing extra).
+///
+/// trace: REQ-0006 AUF-20261005-015 -- every write-side step of a branch body
+/// (`write_all`, `flush`, `shutdown`) runs under [`tokio::time::timeout`] with the
+/// caller's own `idle` as its bound, in BOTH directions. Awaiting inside a branch body
+/// means the `tokio::time::sleep(idle)` branch next to it is not polled, so a peer that
+/// stops reading parks the relay there forever and #427's idle close never fires -- the
+/// precise squat #427 exists to end. The flush above removes what used to soften that
+/// (rustls's ~64 KiB outgoing buffer absorbed a stalled peer's share before `poll_write`
+/// went `Pending`), so the bound has to be explicit. `idle` itself is the value, never
+/// anything shorter: a slow-but-reading peer drains at least some of each 16 KiB chunk
+/// well inside one idle window, so only a peer that moves no byte at all for a full
+/// window is dropped -- exactly the promise the read side of the same `select!` makes.
 pub(crate) async fn copy_bidirectional_with_idle_timeout<A, B>(
     a: &mut A,
     b: &mut B,
@@ -98,9 +135,14 @@ where
                 let n = r?;
                 if n == 0 {
                     a_eof = true;
-                    let _ = b.shutdown().await;
+                    let _ = tokio::time::timeout(idle, b.shutdown()).await;
                 } else {
-                    b.write_all(&buf_a[..n]).await?;
+                    tokio::time::timeout(idle, async {
+                        b.write_all(&buf_a[..n]).await?;
+                        b.flush().await
+                    })
+                    .await
+                    .map_err(|_| write_stall_error(idle))??;
                     a_to_b += n as u64;
                 }
             }
@@ -108,9 +150,14 @@ where
                 let n = r?;
                 if n == 0 {
                     b_eof = true;
-                    let _ = a.shutdown().await;
+                    let _ = tokio::time::timeout(idle, a.shutdown()).await;
                 } else {
-                    a.write_all(&buf_b[..n]).await?;
+                    tokio::time::timeout(idle, async {
+                        a.write_all(&buf_b[..n]).await?;
+                        a.flush().await
+                    })
+                    .await
+                    .map_err(|_| write_stall_error(idle))??;
                     b_to_a += n as u64;
                 }
             }
@@ -684,5 +731,260 @@ mod tests {
             start.elapsed() < RELAY_UPSTREAM_CONNECT_TIMEOUT,
             "a live, listening upstream must connect and relay well within the timeout, not near it"
         );
+    }
+
+    /// trace: REQ-0006 AUF-20261005-007
+    ///
+    /// Reproduces the field report behind AUF-20261005-007 for the front-door
+    /// `Proxy` arm (`crate::serve::serve_front_door`, calls at serve.rs:1763/1772):
+    /// a browser reuses one TLS connection for two sequential HTTP/1.1 requests;
+    /// the upstream answers both on the SAME persistent connection, the second
+    /// reply chunked. The `a` side here is a REAL `tokio_rustls` `TlsStream` (the
+    /// exact type the Proxy arm's `tls` is), its transport a bounded in-memory
+    /// `tokio::io::duplex` standing in for the client socket -- deterministic
+    /// backpressure with no OS/TCP buffer-tuning or MSS-vs-window artifacts to
+    /// fight (an earlier version of this test drove it over real loopback TCP
+    /// with shrunk `SO_SNDBUF`/`SO_RCVBUF`; that hit a zero-window stall
+    /// unrelated to this bug whenever the shrunk buffer was below the loopback
+    /// MTU, and needed no backpressure at all once large enough to clear it --
+    /// a duplex's buffer is a plain bounded queue, not subject to either one).
+    ///
+    /// Root cause: `tokio_rustls::TlsStream::poll_write` (see this module's
+    /// `copy_bidirectional_with_idle_timeout` doc comment above) hands plaintext
+    /// to rustls's own unbounded sender and reports success even when the
+    /// resulting ciphertext could not yet be written to the underlying
+    /// transport (here: the duplex is at capacity because the "browser" below
+    /// deliberately hasn't read anything yet). Each 16 KiB chunk this loop
+    /// forwards from `b` therefore reports done instantly regardless of
+    /// backpressure, so with `browser` not reading at all, EVERY chunk after
+    /// the first ~`SMALL_CAP` bytes queues up fully inside rustls, unflushed --
+    /// without the `a.flush().await?` fix, nothing ever drains it once the
+    /// relay's `select!` loop runs out of upstream bytes to forward and goes
+    /// back to idly waiting, so only the first few KiB ever reach `browser`
+    /// and the rest of the chunked body (including its terminator) never
+    /// arrives. With the fix, `flush()` properly awaits the duplex's
+    /// readiness, so the relay naturally paces itself to how fast `browser`
+    /// actually drains it and the full body arrives once it starts reading.
+    #[tokio::test]
+    async fn copy_bidirectional_with_idle_timeout_flushes_a_chunked_second_response_through_a_small_tls_transport(
+    ) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        crate::transport::install_crypto_provider();
+
+        // `SMALL_CAP` only needs to be smaller than one forwarded chunk (16 KiB,
+        // this module's `buf_a`/`buf_b` size) to force the relay's very first
+        // forward into backpressure; `BODY_LEN` just needs to be comfortably
+        // bigger than that so a stuck transfer is unmistakable, not a timing
+        // fluke.
+        const SMALL_CAP: usize = 4096;
+        const BODY_LEN: usize = 200_000;
+
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["browser.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+        let mut roots = rustls::RootCertStore::empty();
+        let _ = roots.add(cert);
+        let ccfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let server_name = rustls::pki_types::ServerName::try_from("browser.test").unwrap();
+
+        // `a`'s transport: a bounded duplex standing in for the browser<->edge
+        // TCP socket, deliberately tiny.
+        let (server_transport, client_transport) = tokio::io::duplex(SMALL_CAP);
+        let (a_res, browser_res) = tokio::join!(
+            acceptor.accept(server_transport),
+            connector.connect(server_name, client_transport)
+        );
+        let mut a = a_res.expect("edge-side TLS handshake completes over the small duplex");
+        let mut browser =
+            browser_res.expect("browser-side TLS handshake completes over the small duplex");
+
+        // `b`'s transport: a generously-sized duplex standing in for the
+        // edge<->upstream plaintext connection -- generous because the bug
+        // under test is specific to the TLS leg, not this one.
+        let (mut b, mut upstream) = tokio::io::duplex(64 * 1024);
+
+        let relay_task = tokio::spawn(async move {
+            copy_bidirectional_with_idle_timeout(&mut a, &mut b, Duration::from_secs(120)).await
+        });
+
+        // First request/response: small, must flow through trivially.
+        browser
+            .write_all(b"GET /one HTTP/1.1\r\nHost: browser.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut req = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), upstream.read(&mut req))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            req[..n].starts_with(b"GET /one"),
+            "first request reaches the upstream leg"
+        );
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+            .await
+            .unwrap();
+        let mut first = [0u8; "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst".len()];
+        tokio::time::timeout(Duration::from_secs(2), browser.read_exact(&mut first))
+            .await
+            .expect("first response arrives promptly")
+            .unwrap();
+
+        // Second request, REUSING the same TLS connection. The upstream leg
+        // (`b`/`upstream`) is never shut down here -- a real EOF would trigger
+        // this function's own half-close `shutdown()`, which flushes as a side
+        // effect and would mask the bug.
+        browser
+            .write_all(b"GET /two HTTP/1.1\r\nHost: browser.test\r\n\r\n")
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), upstream.read(&mut req))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            req[..n].starts_with(b"GET /two"),
+            "second request, same connection, reaches the upstream leg"
+        );
+        // Writing BODY_LEN into `b`'s own (generously-sized, but still finite)
+        // duplex can itself need the relay to drain some of it first, and the
+        // relay can't drain `b` while it's stuck flushing to the deliberately
+        // slow-draining `a` below -- so this has to run concurrently with the
+        // browser's delayed read, not block ahead of it sequentially.
+        let body_write_task = tokio::spawn(async move {
+            upstream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            upstream
+                .write_all(format!("{BODY_LEN:x}\r\n").as_bytes())
+                .await
+                .unwrap();
+            upstream.write_all(&vec![b'w'; BODY_LEN]).await.unwrap();
+            upstream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            upstream // handed back so the caller can keep the "connection" open
+        });
+
+        // The browser deliberately does NOT read at all for a beat, letting
+        // the relay race ahead of what the small duplex can actually hold.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let expected_len = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".len()
+            + format!("{BODY_LEN:x}\r\n").len()
+            + BODY_LEN
+            + "\r\n0\r\n\r\n".len();
+        let mut second = vec![0u8; expected_len];
+        tokio::time::timeout(Duration::from_secs(1), browser.read_exact(&mut second))
+            .await
+            .expect("the second, chunked response body must arrive promptly, not wait for the idle-close")
+            .unwrap();
+        assert!(
+            second.starts_with(b"HTTP/1.1 200 OK"),
+            "second response headers delivered"
+        );
+        assert!(
+            second.ends_with(b"\r\n0\r\n\r\n"),
+            "second response body delivered in full, including the chunk terminator"
+        );
+
+        let _upstream = body_write_task.await.unwrap();
+        relay_task.abort();
+    }
+
+    /// trace: REQ-0006 AUF-20261005-015
+    ///
+    /// The sibling of the flush test above, for the failure mode an unconditional
+    /// flush opens: a peer that never reads. `a` is a real `tokio_rustls` stream (the
+    /// front-door `Proxy` arm's own type) over a deliberately tiny `tokio::io::duplex`
+    /// whose remote end is held open but NEVER read from, while the upstream leg has a
+    /// response far larger than anything rustls plus that transport can hold. The
+    /// relay's `a.flush()` therefore cannot complete, and because it is awaited inside
+    /// a `select!` branch body, the `tokio::time::sleep(idle)` branch beside it is not
+    /// polled: without the `tokio::time::timeout` around the write branch this call
+    /// never returns and the test HANGS (no failure message, no idle close) -- which is
+    /// exactly the #427 protection a silent reader must not be able to switch off.
+    #[tokio::test]
+    async fn copy_bidirectional_with_idle_timeout_bounds_a_write_to_a_peer_that_never_reads() {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        crate::transport::install_crypto_provider();
+
+        // A short test-only idle window (the real callers pass RELAY_IDLE_TIMEOUT /
+        // FRONT_DOOR_PROXY_IDLE_TIMEOUT, which stay untouched): long enough that the
+        // real-clock TLS handshake below cannot trip it, short enough to keep the test
+        // quick.
+        const TEST_IDLE: Duration = Duration::from_secs(1);
+        // Smaller than one forwarded chunk (16 KiB, this module's `buf_b`), so the very
+        // first forward to `a` already has to wait on the silent reader.
+        const SMALL_CAP: usize = 4096;
+        // Past rustls's own ~64 KiB outgoing-plaintext buffer by a wide margin, so the
+        // relay is certainly still stuck mid-write when the bound has to fire.
+        const STUCK_BODY: usize = 512 * 1024;
+
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["silent.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+        let ccfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let server_name = rustls::pki_types::ServerName::try_from("silent.test").unwrap();
+
+        let (server_transport, client_transport) = tokio::io::duplex(SMALL_CAP);
+        let (a_res, peer_res) = tokio::join!(
+            acceptor.accept(server_transport),
+            connector.connect(server_name, client_transport)
+        );
+        let mut a = a_res.expect("edge-side TLS handshake completes over the small duplex");
+        // Held for the whole test so the transport stays OPEN (dropping it would end
+        // the write with a broken-pipe error and prove nothing), and never read from:
+        // this is the peer that stops reading.
+        let _silent_peer = peer_res.expect("peer-side TLS handshake completes");
+
+        // The upstream leg: roomy enough to take the whole response without a reader,
+        // so the only thing that can block the relay is the `a` side.
+        let (mut b, mut upstream) = tokio::io::duplex(STUCK_BODY + 16 * 1024);
+        upstream.write_all(&vec![b'w'; STUCK_BODY]).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            TEST_IDLE + Duration::from_secs(1),
+            copy_bidirectional_with_idle_timeout(&mut a, &mut b, TEST_IDLE),
+        )
+        .await
+        .expect("a peer that never reads must not hold the relay open past the idle window");
+        let err = res.expect_err("a write that cannot be handed over must end the relay");
+        assert!(
+            err.to_string().contains("did not complete within"),
+            "the write branch's own bound must be what closes it, not something else: {err}"
+        );
+        assert!(
+            start.elapsed() >= TEST_IDLE,
+            "the full idle window must be waited out, not cut short: {:?}",
+            start.elapsed()
+        );
+        drop(_silent_peer);
     }
 }
