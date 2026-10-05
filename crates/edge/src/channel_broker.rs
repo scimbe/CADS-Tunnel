@@ -2964,11 +2964,12 @@ pub(crate) const PARK_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Durat
 /// The parked phase ends at the FIRST edge->client chunk after this wrap (the ack or the
 /// `EX` token -- admission's challenge was written before the wrap): keepalive stops
 /// permanently then, so no NUL can ever interleave into the spliced session. A NUL racing
-/// the ack's first chunk lands BEFORE it (the select! serializes whole chunks), i.e. as
-/// one more leading NUL of exactly the kind a keepalive-negotiated client strips. Client
-/// EOF/error tears the pump down (the parked side then fails fast on its next write --
-/// the corpse surfaces at pairing instead of poisoning it silently); the arm side
-/// dropping/shutting down closes the real connection.
+/// the ack's first chunk lands BEFORE it (the select! serializes whole chunks -- NUL and
+/// data still share one arm, AUF-20261005-019 only decouples the two directions from each
+/// other), i.e. as one more leading NUL of exactly the kind a keepalive-negotiated client
+/// strips. Client EOF/error tears the pump down (the parked side then fails fast on its
+/// next write -- the corpse surfaces at pairing instead of poisoning it silently); the arm
+/// side dropping/shutting down closes the real connection.
 fn spawn_park_keepalive_pump(
     stream: BoxedChannelStream,
     keepalive: bool,
@@ -2985,7 +2986,9 @@ fn spawn_park_keepalive_pump(
             PARK_KEEPALIVE_INTERVAL,
         );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut parked = true;
+        // AUF-20261005-019: read by both directions below, written only by splice->client --
+        // an AtomicBool (not a Cell) keeps this task Send.
+        let parked = std::sync::atomic::AtomicBool::new(true);
         // #499 slice B, corrected after a live false-positive regression (2026-08-14): a clean
         // read EOF while parked is NOT a death signal on its own -- v0.4.11-and-older clients
         // legitimately HALF-CLOSE right after the possession signature, and flagging their EOF
@@ -2995,57 +2998,87 @@ fn spawn_park_keepalive_pump(
         // everyone else only a HARD read error (RST) is -- a clean EOF just closes the read
         // half and the pump keeps forwarding outbound (the ack/EX must still reach a
         // half-closed old client, which can still receive).
-        let mut read_open = true;
-        let mut from_client = vec![0u8; 16 * 1024];
-        let mut to_client = vec![0u8; 16 * 1024];
-        loop {
-            tokio::select! {
-                r = real_r.read(&mut from_client), if read_open => match r {
+        enum ClientToSplice {
+            Aborted,
+            HalfClosed,
+        }
+        // AUF-20261005-019 (auf): client -> splice, decoupled from (ab) below so a stalled
+        // splice->client write never blocks this leg's reads from the client.
+        let client_to_splice = async {
+            let mut from_client = vec![0u8; 16 * 1024];
+            loop {
+                match real_r.read(&mut from_client).await {
                     Err(_) => {
                         // Hard error (RST-class): unambiguous death on every client version.
-                        if parked {
+                        if parked.load(std::sync::atomic::Ordering::Relaxed) {
                             dead.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        break;
+                        return ClientToSplice::Aborted;
                     }
                     Ok(0) => {
                         if keepalive {
                             // KA contract: the parked leg stays fully open, so EOF = death.
-                            if parked {
+                            if parked.load(std::sync::atomic::Ordering::Relaxed) {
                                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
-                            break;
+                            return ClientToSplice::Aborted;
                         }
                         // Legacy half-close (or a v0.4.12 process death -- wire-ambiguous
-                        // by design until the client speaks the KA ALPN): tolerate, keep
-                        // the outbound direction alive.
-                        read_open = false;
+                        // by design until the client speaks the KA ALPN): tolerate, (ab)
+                        // keeps running alone to forward the outbound direction.
+                        return ClientToSplice::HalfClosed;
                     }
                     Ok(n) => {
                         if far_w.write_all(&from_client[..n]).await.is_err() {
-                            break;
+                            return ClientToSplice::Aborted;
                         }
                         let _ = far_w.flush().await;
                     }
-                },
-                r = far_r.read(&mut to_client) => match r {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        parked = false; // ack/EX started -- keepalive off for good
-                        if real_w.write_all(&to_client[..n]).await.is_err() {
+                }
+            }
+        };
+        // AUF-20261005-019 (ab): splice -> client, the sole owner of real_w, decoupled from
+        // (auf) above so a stalled real_w write never blocks reads from far_r.
+        let splice_to_client = async {
+            let mut to_client = vec![0u8; 16 * 1024];
+            loop {
+                tokio::select! {
+                    r = far_r.read(&mut to_client) => match r {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            parked.store(false, std::sync::atomic::Ordering::Relaxed); // ack/EX started -- keepalive off for good
+                            if real_w.write_all(&to_client[..n]).await.is_err() {
+                                break;
+                            }
+                            let _ = real_w.flush().await;
+                        }
+                    },
+                    _ = ticker.tick(), if parked.load(std::sync::atomic::Ordering::Relaxed) && keepalive => {
+                        if real_w.write_all(&[0u8]).await.is_err() {
+                            // The write path died while parked: same corpse semantics as a
+                            // read-side death (#499 slice B).
+                            dead.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                         let _ = real_w.flush().await;
                     }
-                },
-                _ = ticker.tick(), if parked && keepalive => {
-                    if real_w.write_all(&[0u8]).await.is_err() {
-                        // The write path died while parked: same corpse semantics as a
-                        // read-side death (#499 slice B).
-                        dead.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
+                }
+            }
+        };
+        {
+            tokio::pin!(client_to_splice);
+            tokio::pin!(splice_to_client);
+            let mut client_to_splice_done = false;
+            loop {
+                tokio::select! {
+                    res = &mut client_to_splice, if !client_to_splice_done => {
+                        client_to_splice_done = true;
+                        if matches!(res, ClientToSplice::Aborted) {
+                            break;
+                        }
+                        // HalfClosed: (ab) keeps running alone until its own end.
                     }
-                    let _ = real_w.flush().await;
+                    _ = &mut splice_to_client => break,
                 }
             }
         }
@@ -4776,7 +4809,6 @@ mod tests {
     }
 
     // trace: REQ-0006, AUF-20261005-019, AUF-20261005-023
-    #[ignore = "AUF-20261005-019: rot gegen main, Korrektur im Folge-Slice"]
     #[tokio::test]
     async fn park_pump_keeps_reading_a_leg_whose_write_side_is_stalled_auf019() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4788,6 +4820,40 @@ mod tests {
         let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), false, dead_b);
         let _splice =
             tokio::spawn(async move { crate::relay::relay_streams(leg_a, leg_b, "auf019").await });
+        let (_a_r, mut a_w) = tokio::io::split(client_a); // a liest NIE (_a_r bleibt am Leben)
+        let (mut b_r, mut b_w) = tokio::io::split(client_b);
+        // b -> a staut, weil a nicht liest; die Aufgabe wird nicht abgewartet.
+        let _stuck = tokio::spawn(async move {
+            let _ = b_w.write_all(&vec![0xb5u8; 1 << 20]).await;
+            b_w
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // Stau sicher aufgebaut
+        let _wr = tokio::spawn(async move {
+            let _ = a_w.write_all(&[0xa5u8; 64 * 1024]).await;
+            let _ = a_w.flush().await;
+            a_w
+        });
+        let mut got = vec![0u8; 64 * 1024];
+        tokio::time::timeout(std::time::Duration::from_secs(3), b_r.read_exact(&mut got))
+            .await
+            .expect("a->b muss weiterlaufen, auch wenn b->a staut")
+            .expect("read");
+        assert!(got.iter().all(|&x| x == 0xa5));
+    }
+
+    // trace: REQ-0006, AUF-20261005-019, AUF-20261005-023
+    // Kontrollarm zu (p2): derselbe Ablauf, aber ohne spawn_park_keepalive_pump dazwischen --
+    // belegt, dass (p2) die Kopplung in der Pumpe misst und nicht den Splice selbst.
+    #[tokio::test]
+    async fn relay_without_park_pumps_keeps_a_to_b_flowing_auf019() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client_a, real_a) = tokio::io::duplex(4096);
+        let (client_b, real_b) = tokio::io::duplex(4096);
+        let leg_a: BoxedChannelStream = Box::pin(real_a);
+        let leg_b: BoxedChannelStream = Box::pin(real_b);
+        let _splice = tokio::spawn(async move {
+            crate::relay::relay_streams(leg_a, leg_b, "auf019_control").await
+        });
         let (_a_r, mut a_w) = tokio::io::split(client_a); // a liest NIE (_a_r bleibt am Leben)
         let (mut b_r, mut b_w) = tokio::io::split(client_b);
         // b -> a staut, weil a nicht liest; die Aufgabe wird nicht abgewartet.
