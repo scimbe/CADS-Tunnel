@@ -119,7 +119,6 @@ where
                     let _ = b.shutdown().await;
                 } else {
                     b.write_all(&buf_a[..n]).await?;
-                    b.flush().await?;
                     a_to_b += n as u64;
                 }
             }
@@ -130,7 +129,6 @@ where
                     let _ = a.shutdown().await;
                 } else {
                     a.write_all(&buf_b[..n]).await?;
-                    a.flush().await?;
                     b_to_a += n as u64;
                 }
             }
