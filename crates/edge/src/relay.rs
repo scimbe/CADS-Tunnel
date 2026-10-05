@@ -12,9 +12,7 @@ use ct_common::fallback_framing::{
     POST_PEER_FIN_IDLE_BOUND,
 };
 use quinn::{RecvStream, SendStream};
-use tokio::io::{
-    copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Emit an Edge relay diagnostic when `CT_EDGE_TRACE` is set (issue #2, mode b).
 fn relay_trace(args: std::fmt::Arguments<'_>) {
@@ -99,7 +97,10 @@ fn with_cause_chain(e: &(dyn std::error::Error + 'static)) -> String {
 /// keeping the original `ErrorKind` so callers can still match on it.
 fn relay_io_error(e: std::io::Error, dir: &str, label: &str) -> std::io::Error {
     let kind = e.kind();
-    std::io::Error::new(kind, format!("relay {label} {dir}: {}", with_cause_chain(&e)))
+    std::io::Error::new(
+        kind,
+        format!("relay {label} {dir}: {}", with_cause_chain(&e)),
+    )
 }
 
 /// The exact text a relay leg's end is logged with: which relay (`label`),
@@ -181,15 +182,14 @@ where
         }
         total += n as u64;
         log_leg_end_on_err(w.write_all(&buf[..n]).await, dir, label)?;
-        n = match peek_next_read(&mut r, &mut buf).await {
-            NextRead::Data(res) => log_leg_end_on_err(res, dir, label)?,
-            NextRead::Idle => {
-                log_leg_end_on_err(w.flush().await, dir, label)?;
-                log_leg_end_on_err(r.read(&mut buf).await, dir, label)?
-            }
-        };
+        if n < buf.len() {
+            log_leg_end_on_err(w.flush().await, dir, label)?;
+        }
+        n = log_leg_end_on_err(r.read(&mut buf).await, dir, label)?;
     }
-    relay_trace(format_args!("relay {label} {dir}: {total} bytes total then EOF"));
+    relay_trace(format_args!(
+        "relay {label} {dir}: {total} bytes total then EOF"
+    ));
     Ok(total)
 }
 
@@ -255,12 +255,13 @@ async fn relay_two_connections_with_timeout(
     // Name the stage as well as the ConnectionError: "connection lost" during
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
-        move |e: quinn::ConnectionError| {
-            std::io::Error::other(format!("{label} {stage}: {e}"))
-        }
+        move |e: quinn::ConnectionError| std::io::Error::other(format!("{label} {stage}: {e}"))
     };
     let timed_out = |stage: &'static str| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{label} {stage}: relay setup timed out"))
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{label} {stage}: relay setup timed out"),
+        )
     };
     let (send_a, recv_a) = tokio::time::timeout(setup_timeout, conn_a.accept_bi())
         .await
@@ -285,7 +286,13 @@ pub async fn relay_initiator_to_acceptor(
     acceptor_conn: &quinn::Connection,
     label: &str,
 ) -> std::io::Result<(u64, u64)> {
-    relay_initiator_to_acceptor_with_timeout(initiator_conn, acceptor_conn, label, RELAY_SETUP_TIMEOUT).await
+    relay_initiator_to_acceptor_with_timeout(
+        initiator_conn,
+        acceptor_conn,
+        label,
+        RELAY_SETUP_TIMEOUT,
+    )
+    .await
 }
 
 /// [`relay_initiator_to_acceptor`] with an injectable setup timeout (#257) — split out
@@ -297,10 +304,12 @@ async fn relay_initiator_to_acceptor_with_timeout(
     setup_timeout: std::time::Duration,
 ) -> std::io::Result<(u64, u64)> {
     // Initiator opened its data stream (actualised by Noise msg1) — accept it.
-    let (send_i, recv_i) = next_session_bi_with_timeout(initiator_conn, true, label, setup_timeout).await?;
+    let (send_i, recv_i) =
+        next_session_bi_with_timeout(initiator_conn, true, label, setup_timeout).await?;
     // Open the data stream toward the acceptor; it becomes visible to the acceptor's
     // accept_bi as soon as relay_quic writes the first relayed bytes into it.
-    let (send_a, recv_a) = next_session_bi_with_timeout(acceptor_conn, false, label, setup_timeout).await?;
+    let (send_a, recv_a) =
+        next_session_bi_with_timeout(acceptor_conn, false, label, setup_timeout).await?;
     // a = initiator, b = acceptor: recv_i (msg1…) → send_a, recv_a (msg2…) → send_i.
     relay_quic(send_i, recv_i, send_a, recv_a, label).await
 }
@@ -331,12 +340,13 @@ async fn next_session_bi_with_timeout(
     // Name the stage as well as the ConnectionError: "connection lost" during
     // stream setup and during the pump are different failures (#214).
     let to_io = |stage: &'static str| {
-        move |e: quinn::ConnectionError| {
-            std::io::Error::other(format!("{label} {stage}: {e}"))
-        }
+        move |e: quinn::ConnectionError| std::io::Error::other(format!("{label} {stage}: {e}"))
     };
     let timed_out = |stage: &'static str| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{label} {stage}: relay setup timed out"))
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("{label} {stage}: relay setup timed out"),
+        )
     };
     if initiator {
         tokio::time::timeout(setup_timeout, conn.accept_bi())
@@ -494,7 +504,11 @@ where
         #[allow(clippy::redundant_locals)]
         let ev_tx = ev_tx;
         loop {
-            match reader.next().await.map_err(|e| relay_io_error(e, "agent->browser", "framed"))? {
+            match reader
+                .next()
+                .await
+                .map_err(|e| relay_io_error(e, "agent->browser", "framed"))?
+            {
                 None => {
                     // Clean EOF: the contract's IMPLICIT FIN when no explicit
                     // one preceded it -- converge on the exact same downstream
@@ -518,7 +532,10 @@ where
                         .await
                         .map_err(|e| relay_io_error(e, "agent->browser", "framed"))?;
                 }
-                Some(Frame::Keepalive { counter, should_ack }) => {
+                Some(Frame::Keepalive {
+                    counter,
+                    should_ack,
+                }) => {
                     // The reader evaluated the bounded-ACK rule already; a
                     // repeated/regressing counter earns nothing (flood bound).
                     // #528 review I4: `try_send`, never a blocking send -- a
@@ -577,36 +594,25 @@ where
             }
             let dead_deadline = tracker.oldest_outstanding_age_ms(now_ms(epoch)).map(|age| {
                 tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(FRAMED_KEEPALIVE_DEAD_AFTER_MS.saturating_sub(age))
+                    + std::time::Duration::from_millis(
+                        FRAMED_KEEPALIVE_DEAD_AFTER_MS.saturating_sub(age),
+                    )
             });
             tokio::select! {
                 read = browser_read.read(&mut buf), if !own_fin => {
-                    let mut n = read.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
-                    loop {
-                        if n == 0 {
-                            // In-band half-close: the agent's reply (and the
-                            // keepalives protecting it) can keep flowing.
-                            writer.fin().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
-                            own_fin = true;
-                            break;
-                        }
+                    let n = read.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                    if n == 0 {
+                        // In-band half-close: the agent's reply (and the
+                        // keepalives protecting it) can keep flowing.
+                        writer.fin().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        own_fin = true;
+                    } else {
                         fwd_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         writer.data(&buf[..n]).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
                         last_fwd_data = tokio::time::Instant::now();
-                        // AUF-20261005-018: the same idle-detection as
-                        // `pump_dir` (the #338 short-read heuristic's
-                        // successor) -- flush as soon as the NEXT browser
-                        // read isn't already ready, not merely because this
-                        // read happened to be short.
-                        match peek_next_read(&mut browser_read, &mut buf).await {
-                            NextRead::Data(res) => {
-                                n = res.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
-                                continue;
-                            }
-                            NextRead::Idle => {
-                                writer.flush().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
-                                break;
-                            }
+                        if n < buf.len() {
+                            // #338 short-read heuristic (control arm: the pre-fix rule).
+                            writer.flush().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
                         }
                     }
                     last_send = tokio::time::Instant::now();
@@ -768,7 +774,10 @@ where
         // close_notify), a write error, or the dead-peer verdict.
         f = &mut fwd_leg => f?,
     }
-    Ok((fwd_bytes.load(Ordering::Relaxed), rev_bytes.load(Ordering::Relaxed)))
+    Ok((
+        fwd_bytes.load(Ordering::Relaxed),
+        rev_bytes.load(Ordering::Relaxed),
+    ))
 }
 
 #[cfg(test)]
@@ -808,7 +817,8 @@ mod tests {
             mut self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
-            self.flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let drained: Vec<u8> = self.pending.drain(..).collect();
             self.sink.lock().unwrap().extend(drained);
             self.flushed.notify_one();
@@ -1003,8 +1013,14 @@ mod tests {
         }
 
         let rendered = with_cause_chain(&Outer(Inner));
-        assert!(rendered.contains("connection lost"), "keeps the top-level message: {rendered}");
-        assert!(rendered.contains("timed out"), "and reveals the real cause: {rendered}");
+        assert!(
+            rendered.contains("connection lost"),
+            "keeps the top-level message: {rendered}"
+        );
+        assert!(
+            rendered.contains("timed out"),
+            "and reveals the real cause: {rendered}"
+        );
     }
 
     #[test]
@@ -1014,7 +1030,11 @@ mod tests {
         // survive so existing callers can still match on it.
         let src = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "connection lost");
         let e = relay_io_error(src, "a->b", "chan-42");
-        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "kind is preserved for callers");
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "kind is preserved for callers"
+        );
         let text = e.to_string();
         assert!(text.contains("a->b"), "names the direction: {text}");
         assert!(text.contains("chan-42"), "names the channel: {text}");
@@ -1043,7 +1063,10 @@ mod tests {
         member_b.write_all(b"b->a").await.unwrap();
         let mut on_a = [0u8; 4];
         member_a.read_exact(&mut on_a).await.unwrap();
-        assert_eq!(&on_a, b"b->a", "B's reply reaches A with the forward leg still open");
+        assert_eq!(
+            &on_a, b"b->a",
+            "B's reply reaches A with the forward leg still open"
+        );
 
         // Both close -> the splice tears down and reports byte counts (no hang).
         member_a.shutdown().await.unwrap();
@@ -1090,7 +1113,9 @@ mod tests {
         };
 
         let relay_task =
-            tokio::spawn(async move { relay_pair(a_recv, a_send, b_recv, b_send, "test-bidir").await });
+            tokio::spawn(
+                async move { relay_pair(a_recv, a_send, b_recv, b_send, "test-bidir").await },
+            );
 
         for _ in 0..2 {
             a_poke.write_all(&chunk).await.unwrap();
@@ -1105,8 +1130,16 @@ mod tests {
             .await
             .expect("b->a: B's bulk data must be flushed to A promptly despite B pausing");
 
-        assert_eq!(sink_b.lock().unwrap().len(), 2 * 16 * 1024, "B received all of A's bytes");
-        assert_eq!(sink_a.lock().unwrap().len(), 2 * 16 * 1024, "A received all of B's bytes");
+        assert_eq!(
+            sink_b.lock().unwrap().len(),
+            2 * 16 * 1024,
+            "B received all of A's bytes"
+        );
+        assert_eq!(
+            sink_a.lock().unwrap().len(),
+            2 * 16 * 1024,
+            "A received all of B's bytes"
+        );
 
         drop(a_poke);
         drop(b_poke);
@@ -1147,7 +1180,9 @@ mod tests {
             Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 
@@ -1273,10 +1308,13 @@ mod tests {
         let _ = peer_a_tls.write_all(&stuck_chunk).await; // may itself not fully complete; that's fine
 
         let mut got = [0u8; "b-is-still-sending".len()];
-        tokio::time::timeout(std::time::Duration::from_secs(2), peer_a_tls.read_exact(&mut got))
-            .await
-            .expect("b->a must keep delivering even though a->b is permanently stuck")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_a_tls.read_exact(&mut got),
+        )
+        .await
+        .expect("b->a must keep delivering even though a->b is permanently stuck")
+        .unwrap();
         assert_eq!(&got, b"b-is-still-sending");
 
         relay_task.abort();
@@ -1299,19 +1337,32 @@ mod tests {
         });
 
         let ea = build_client_endpoint(cert.clone()).expect("ea");
-        let conn_a = ea.connect(addr, "localhost").expect("cfg").await.expect("conn a");
+        let conn_a = ea
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn a");
         let eb = build_client_endpoint(cert).expect("eb");
-        let conn_b = eb.connect(addr, "localhost").expect("cfg").await.expect("conn b");
+        let conn_b = eb
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn b");
 
         let (mut sa, mut ra) = conn_a.open_bi().await.expect("a bi");
         let (mut sb, mut rb) = conn_b.open_bi().await.expect("b bi");
         // Actualise both streams (open_bi is lazy) so the edge's two accept_bi resolve.
-        sa.write_all(b"a->b through the edge").await.expect("a write");
+        sa.write_all(b"a->b through the edge")
+            .await
+            .expect("a write");
         sb.write_all(b"b->a reply").await.expect("b write");
 
         let mut on_b = vec![0u8; 21];
         rb.read_exact(&mut on_b).await.expect("b reads a");
-        assert_eq!(&on_b, b"a->b through the edge", "A's bytes reach B through the edge");
+        assert_eq!(
+            &on_b, b"a->b through the edge",
+            "A's bytes reach B through the edge"
+        );
         let mut on_a = vec![0u8; 10];
         ra.read_exact(&mut on_a).await.expect("a reads b");
         assert_eq!(&on_a, b"b->a reply", "B's bytes reach A through the edge");
@@ -1319,7 +1370,10 @@ mod tests {
         // One side drops -> the relay must return, not hang.
         conn_a.close(0u32.into(), b"gone");
         let done = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
-        assert!(done.is_ok(), "relay tore down when a member dropped (no hang)");
+        assert!(
+            done.is_ok(),
+            "relay tore down when a member dropped (no hang)"
+        );
     }
 
     #[tokio::test]
@@ -1336,13 +1390,27 @@ mod tests {
         let relay_task = tokio::spawn(async move {
             let ca = server.accept().await.expect("inc a").await.expect("conn a");
             let cb = server.accept().await.expect("inc b").await.expect("conn b");
-            relay_two_connections_with_timeout(&ca, &cb, "test", std::time::Duration::from_millis(200)).await
+            relay_two_connections_with_timeout(
+                &ca,
+                &cb,
+                "test",
+                std::time::Duration::from_millis(200),
+            )
+            .await
         });
 
         let ea = build_client_endpoint(cert.clone()).expect("ea");
-        let conn_a = ea.connect(addr, "localhost").expect("cfg").await.expect("conn a");
+        let conn_a = ea
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn a");
         let eb = build_client_endpoint(cert).expect("eb");
-        let _conn_b = eb.connect(addr, "localhost").expect("cfg").await.expect("conn b");
+        let _conn_b = eb
+            .connect(addr, "localhost")
+            .expect("cfg")
+            .await
+            .expect("conn b");
         // conn_b intentionally never calls open_bi/accept_bi -- it just sits connected,
         // exactly the stall this issue describes (paired, alive, no data stream ever
         // actualized).
@@ -1353,8 +1421,15 @@ mod tests {
             .expect("the relay task itself must finish promptly")
             .expect("task join");
         let err = done.expect_err("a stalled peer must produce an error, not a byte count");
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "the error is a timeout, not some other failure: {err}");
-        assert!(err.to_string().contains("relay setup timed out"), "message names the real cause: {err}");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "the error is a timeout, not some other failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("relay setup timed out"),
+            "message names the real cause: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1412,7 +1487,10 @@ mod tests {
         agent.write_all(b"msg2").await.unwrap();
         let mut reply = [0u8; 4];
         client.read_exact(&mut reply).await.unwrap();
-        assert_eq!(&reply, b"msg2", "reply relayed back with the request side still open");
+        assert_eq!(
+            &reply, b"msg2",
+            "reply relayed back with the request side still open"
+        );
 
         // Close both ends so the relay finishes and reports byte counts.
         client.shutdown().await.unwrap();
@@ -1480,7 +1558,9 @@ mod tests {
         use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
         async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &[u8]) {
-            w.write_all(&(msg.len() as u16).to_be_bytes()).await.unwrap();
+            w.write_all(&(msg.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
             w.write_all(msg).await.unwrap();
             w.flush().await.unwrap();
         }
@@ -1605,7 +1685,8 @@ mod tests {
 
         let (mut browser_edge, mut browser_far) = tokio::io::duplex(1 << 16);
 
-        let relay_task = tokio::spawn(async move { framed_relay(&mut agent, &mut browser_edge).await });
+        let relay_task =
+            tokio::spawn(async move { framed_relay(&mut agent, &mut browser_edge).await });
 
         let chunk = vec![0x33u8; 16 * 1024];
         for _ in 0..2 {
@@ -1658,7 +1739,10 @@ mod tests {
         far_writer.flush().await.unwrap();
         let mut got = vec![0u8; b"reply from the agent".len()];
         browser_far.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"reply from the agent", "agent DATA payload reaches the browser unframed");
+        assert_eq!(
+            &got, b"reply from the agent",
+            "agent DATA payload reaches the browser unframed"
+        );
 
         // Browser EOF -> the edge sends the in-band FIN (not a TCP shutdown).
         browser_far.shutdown().await.unwrap();
@@ -1673,10 +1757,21 @@ mod tests {
         far_writer.fin().await.unwrap();
         let mut rest = Vec::new();
         browser_far.read_to_end(&mut rest).await.unwrap();
-        assert!(rest.is_empty(), "the agent's FIN surfaces as a clean browser EOF");
+        assert!(
+            rest.is_empty(),
+            "the agent's FIN surfaces as a clean browser EOF"
+        );
         let (fwd, rev) = relay.await.unwrap().unwrap();
-        assert_eq!(fwd, FROM_BROWSER.len() as u64, "browser->agent application bytes");
-        assert_eq!(rev, b"reply from the agent".len() as u64, "agent->browser application bytes");
+        assert_eq!(
+            fwd,
+            FROM_BROWSER.len() as u64,
+            "browser->agent application bytes"
+        );
+        assert_eq!(
+            rev,
+            b"reply from the agent".len() as u64,
+            "agent->browser application bytes"
+        );
     }
 
     #[tokio::test]
@@ -1753,7 +1848,9 @@ mod tests {
 
         // The next cadence yields the next counter.
         match far_reader.next().await.unwrap() {
-            Some(Frame::Keepalive { counter, .. }) => assert_eq!(counter, 1, "the counter advances"),
+            Some(Frame::Keepalive { counter, .. }) => {
+                assert_eq!(counter, 1, "the counter advances")
+            }
             other => panic!("expected the second injected keepalive, got {other:?}"),
         }
 
@@ -1771,11 +1868,14 @@ mod tests {
         // in the duplex buffer.
         let _hold_far_open = agent_far;
 
-        let err = relay
-            .await
-            .unwrap()
-            .expect_err("a never-acking peer must produce the dead verdict, not an infinite ping loop");
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "the verdict is a timeout: {err}");
+        let err = relay.await.unwrap().expect_err(
+            "a never-acking peer must produce the dead verdict, not an infinite ping loop",
+        );
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "the verdict is a timeout: {err}"
+        );
         assert!(
             err.to_string().contains("keepalive unacked"),
             "the error names the real cause: {err}"
@@ -1800,7 +1900,10 @@ mod tests {
         let mut far_reader = FrameReader::new(agent_far);
         let mut eof = Vec::new();
         browser_far.read_to_end(&mut eof).await.unwrap();
-        assert!(eof.is_empty(), "the agent's clean EOF closes the browser's read side");
+        assert!(
+            eof.is_empty(),
+            "the agent's clean EOF closes the browser's read side"
+        );
 
         // The browser can still send on the half-open connection...
         browser_far.write_all(b"late upload").await.unwrap();
@@ -1812,7 +1915,11 @@ mod tests {
 
         // ...and the browser's own EOF ends the relay (FIN both ways).
         browser_far.shutdown().await.unwrap();
-        assert_eq!(far_reader.next().await.unwrap(), Some(Frame::Fin), "own FIN still goes out");
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            Some(Frame::Fin),
+            "own FIN still goes out"
+        );
         let (fwd, _rev) = relay.await.unwrap().unwrap();
         assert_eq!(fwd, b"late upload".len() as u64);
     }
@@ -1824,7 +1931,9 @@ mod tests {
         // (they reset the TCP idle timer and keep earning transport ACKs, so no
         // kernel backstop ever fires). After POST_PEER_FIN_IDLE_BOUND without a
         // DATA write the relay FINs its own direction and terminates cleanly.
-        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter, POST_PEER_FIN_IDLE_BOUND};
+        use ct_common::fallback_framing::{
+            Frame, FrameReader, FrameWriter, POST_PEER_FIN_IDLE_BOUND,
+        };
         use tokio::io::AsyncReadExt;
 
         let (agent_far, mut browser_far, relay) = spawn_framed_relay();
@@ -1838,7 +1947,10 @@ mod tests {
         far_writer.fin().await.unwrap();
         let mut eof = Vec::new();
         browser_far.read_to_end(&mut eof).await.unwrap();
-        assert!(eof.is_empty(), "the peer's FIN surfaces as a clean browser EOF");
+        assert!(
+            eof.is_empty(),
+            "the peer's FIN surfaces as a clean browser EOF"
+        );
 
         // The relay keeps refreshing the middlebox for the whole idle window
         // (untracked keepalives), then ends it: own FIN, then close_notify.
@@ -1864,7 +1976,11 @@ mod tests {
             keepalives >= 20,
             "the idle window stays middlebox-protected until the bound (got {keepalives} keepalives)"
         );
-        assert_eq!(far_reader.next().await.unwrap(), None, "FIN is followed by a clean shutdown");
+        assert_eq!(
+            far_reader.next().await.unwrap(),
+            None,
+            "FIN is followed by a clean shutdown"
+        );
         let elapsed = start.elapsed();
         assert!(
             elapsed >= POST_PEER_FIN_IDLE_BOUND,
@@ -1875,7 +1991,11 @@ mod tests {
             "the relay must end promptly AT the bound (ended after {elapsed:?})"
         );
         let (fwd, rev) = relay.await.unwrap().unwrap();
-        assert_eq!((fwd, rev), (0, 0), "the N2 ending is a clean return, not an error");
+        assert_eq!(
+            (fwd, rev),
+            (0, 0),
+            "the N2 ending is a clean return, not an error"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1884,7 +2004,9 @@ mod tests {
         // time: an origin may HTTP-legally reply early and FIN while the client
         // is still uploading. Chunks spaced inside the bound but totalling far
         // beyond it must keep the relay alive; every DATA write resets the clock.
-        use ct_common::fallback_framing::{Frame, FrameReader, FrameWriter, POST_PEER_FIN_IDLE_BOUND};
+        use ct_common::fallback_framing::{
+            Frame, FrameReader, FrameWriter, POST_PEER_FIN_IDLE_BOUND,
+        };
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (agent_far, mut browser_far, relay) = spawn_framed_relay();
@@ -1952,7 +2074,10 @@ mod tests {
         let mut acked = 0u32;
         while acked < 40 {
             match far_reader.next().await.unwrap() {
-                Some(Frame::Keepalive { counter, should_ack }) => {
+                Some(Frame::Keepalive {
+                    counter,
+                    should_ack,
+                }) => {
                     assert!(should_ack, "injected counters are strictly increasing");
                     far_writer.keepalive_ack(counter).await.unwrap();
                     acked += 1;
@@ -1967,7 +2092,10 @@ mod tests {
         far_writer.fin().await.unwrap();
         let mut got = Vec::new();
         browser_far.read_to_end(&mut got).await.unwrap();
-        assert_eq!(got, b"late reply", "the late reply survives 320s of own-FIN-only silence");
+        assert_eq!(
+            got, b"late reply",
+            "the late reply survives 320s of own-FIN-only silence"
+        );
         let (fwd, rev) = relay.await.unwrap().unwrap();
         assert_eq!(fwd, 0);
         assert_eq!(rev, b"late reply".len() as u64);
