@@ -4786,25 +4786,37 @@ mod tests {
         }
 
         // The completer writes the ack through the parked end -> client sees it verbatim...
-        parked_end.write_all(b"OK 203.0.113.5:9999").await.expect("ack");
+        parked_end
+            .write_all(b"OK 203.0.113.5:9999")
+            .await
+            .expect("ack");
         parked_end.flush().await.expect("flush");
         let mut ack = [0u8; 19];
         client_r.read_exact(&mut ack).await.expect("ack relayed");
         assert_eq!(&ack[..], b"OK 203.0.113.5:9999");
 
         // ...and the keepalive is off for good: two more intervals, not one further byte.
-        let quiet = tokio::time::timeout(PARK_KEEPALIVE_INTERVAL * 2 + std::time::Duration::from_secs(1), async {
-            let mut b = [0u8; 1];
-            client_r.read_exact(&mut b).await.map(|_| b[0])
-        })
+        let quiet = tokio::time::timeout(
+            PARK_KEEPALIVE_INTERVAL * 2 + std::time::Duration::from_secs(1),
+            async {
+                let mut b = [0u8; 1];
+                client_r.read_exact(&mut b).await.map(|_| b[0])
+            },
+        )
         .await;
-        assert!(quiet.is_err(), "no byte after the ack -- keepalive stopped, got {quiet:?}");
+        assert!(
+            quiet.is_err(),
+            "no byte after the ack -- keepalive stopped, got {quiet:?}"
+        );
 
         // Client->edge payload still relays through the pump (the session phase).
         client_w.write_all(b"m1").await.expect("client payload");
         client_w.flush().await.expect("flush");
         let mut m1 = [0u8; 2];
-        parked_end.read_exact(&mut m1).await.expect("relayed to the parked side");
+        parked_end
+            .read_exact(&mut m1)
+            .await
+            .expect("relayed to the parked side");
         assert_eq!(&m1[..], b"m1");
     }
 
@@ -4836,12 +4848,18 @@ mod tests {
         for i in 0..3u32 {
             tokio::time::advance(PARK_KEEPALIVE_INTERVAL).await;
             client_r.read_exact(&mut nul).await.expect("keepalive byte");
-            assert_eq!(nul[0], 0, "keepalive tick {i} stays a lone NUL even while the client writes");
+            assert_eq!(
+                nul[0], 0,
+                "keepalive tick {i} stays a lone NUL even while the client writes"
+            );
         }
 
         // The client's writes still reach the parked side undisturbed.
         let mut got = [0u8; 3];
-        parked_end.read_exact(&mut got).await.expect("client payload still relays");
+        parked_end
+            .read_exact(&mut got)
+            .await
+            .expect("client payload still relays");
         assert_eq!(&got[..], b"xxx");
     }
 
@@ -4869,7 +4887,10 @@ mod tests {
         parked_end.write_all(ack).await.expect("ack");
         parked_end.flush().await.expect("flush");
         let mut got = vec![0u8; ack.len()];
-        client_r.read_exact(&mut got).await.expect("ack relayed whole");
+        client_r
+            .read_exact(&mut got)
+            .await
+            .expect("ack relayed whole");
         assert_eq!(&got[..], ack, "no NUL woven inside the chunk");
 
         // Nothing trails the chunk: no byte (NUL or otherwise) shows up afterwards.
@@ -4878,7 +4899,10 @@ mod tests {
             client_r.read_exact(&mut b).await.map(|_| b[0])
         })
         .await;
-        assert!(trailing.is_err(), "no byte trails the ack, got {trailing:?}");
+        assert!(
+            trailing.is_err(),
+            "no byte trails the ack, got {trailing:?}"
+        );
     }
 
     // trace: REQ-0006, AUF-20261005-019, AUF-20261005-027
@@ -4900,7 +4924,10 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            assert!(lv.is_dead(), "KA-negotiated EOF while parked must flag death");
+            assert!(
+                lv.is_dead(),
+                "KA-negotiated EOF while parked must flag death"
+            );
         }
 
         // (2) keepalive=false, parked, client EOF -> tolerated, not dead.
@@ -4913,7 +4940,10 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            assert!(!lv.is_dead(), "a legacy half-close on a plain leg must not flag death");
+            assert!(
+                !lv.is_dead(),
+                "a legacy half-close on a plain leg must not flag death"
+            );
         }
 
         // (3) keepalive=true, EOF AFTER the first ack chunk (no longer parked) -> not dead.
@@ -4927,11 +4957,17 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            client_end.shutdown().await.expect("client half-close after the ack");
+            client_end
+                .shutdown()
+                .await
+                .expect("client half-close after the ack");
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            assert!(!lv.is_dead(), "EOF after the first chunk must not flag death");
+            assert!(
+                !lv.is_dead(),
+                "EOF after the first chunk must not flag death"
+            );
         }
     }
 
