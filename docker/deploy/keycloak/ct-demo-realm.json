@@ -326,7 +326,8 @@
       "providerId": "oidc",
       "enabled": true,
       "trustEmail": true,
-      "storeToken": false,
+      "storeToken": true,
+      "addReadTokenRoleOnCreate": true,
       "linkOnly": false,
       "config": {
         "clientId": "${KC_HAW_GITLAB_CLIENT_ID:}",
