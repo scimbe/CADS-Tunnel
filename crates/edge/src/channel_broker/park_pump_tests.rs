@@ -278,3 +278,130 @@ async fn park_pump_relays_32mib_each_way_with_256k_client_duplex_auf027() {
         "b muss a's Muster empfangen"
     );
 }
+
+// trace: REQ-0006, AUF-20261005-023, AUF-20261005-027
+//
+// (f2) Arm 1, Abbau des Gegenbeins (INC-20261005-203): Client A wird GANZ fallengelassen
+// (beide Haelften); Client B muss binnen 3s EOF sehen (read liefert Ok(0)), statt das Bein
+// ESTABLISHED mit ungelesener rx_queue zu halten.
+#[tokio::test]
+async fn park_pump_far_leg_sees_eof_after_peer_close_auf027() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client_a, real_a) = tokio::io::duplex(4096);
+    let (mut client_b, real_b) = tokio::io::duplex(4096);
+    let (_la, dead_a) = ParkLiveness::monitored();
+    let (_lb, dead_b) = ParkLiveness::monitored();
+    let leg_a = spawn_park_keepalive_pump(Box::pin(real_a), true, dead_a);
+    let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), true, dead_b);
+    let _splice =
+        tokio::spawn(
+            async move { crate::relay::relay_streams(leg_a, leg_b, "auf027_f2_arm1").await },
+        );
+
+    // Beide Clients tauschen zuerst je einen kleinen Chunk aus (parked -> false auf beiden Seiten).
+    client_a.write_all(b"a2b1").await.expect("a write");
+    let mut buf = [0u8; 4];
+    client_b.read_exact(&mut buf).await.expect("b read");
+    client_b.write_all(b"b2a1").await.expect("b write");
+    client_a.read_exact(&mut buf).await.expect("a read");
+
+    drop(client_a);
+
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), client_b.read(&mut byte))
+        .await
+        .expect("b muss binnen 3s EOF sehen, statt das Bein offen zu halten")
+        .expect("read");
+    assert_eq!(n, 0, "b muss EOF (Ok(0)) sehen, nachdem a geschlossen hat");
+}
+
+// trace: REQ-0006, AUF-20261005-023, AUF-20261005-027
+//
+// (f2) Arm 2, Abbau des Gegenbeins: vor dem Schliessen staut B's Schreiben (ab)_A, weil A
+// nicht mehr liest (wie in (p2)); danach schliesst A ganz. B muss trotz des gestauten
+// Gegenzweigs binnen 3s EOF sehen -- die Kopplung aus (p2) darf den Abbau nicht blockieren.
+#[tokio::test]
+async fn park_pump_far_leg_sees_eof_after_peer_close_with_stalled_down_leg_auf027() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client_a, real_a) = tokio::io::duplex(4096);
+    let (client_b, real_b) = tokio::io::duplex(4096);
+    let (_la, dead_a) = ParkLiveness::monitored();
+    let (_lb, dead_b) = ParkLiveness::monitored();
+    let leg_a = spawn_park_keepalive_pump(Box::pin(real_a), true, dead_a);
+    let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), true, dead_b);
+    let _splice =
+        tokio::spawn(
+            async move { crate::relay::relay_streams(leg_a, leg_b, "auf027_f2_arm2").await },
+        );
+    let (mut b_r, mut b_w) = tokio::io::split(client_b);
+
+    // Beide Clients tauschen zuerst je einen kleinen Chunk aus (parked -> false auf beiden Seiten).
+    client_a.write_all(b"a2b1").await.expect("a write");
+    let mut buf = [0u8; 4];
+    b_r.read_exact(&mut buf).await.expect("b read");
+    b_w.write_all(b"b2a1").await.expect("b write");
+    client_a.read_exact(&mut buf).await.expect("a read");
+
+    // b -> a staut, weil a ab jetzt nicht mehr liest; die Aufgabe wird nicht abgewartet.
+    let _stuck = tokio::spawn(async move {
+        let _ = b_w.write_all(&vec![0xb5u8; 1 << 20]).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await; // Stau sicher aufgebaut
+
+    drop(client_a);
+
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), b_r.read(&mut byte))
+        .await
+        .expect("b muss trotz gestautem Gegenzweig binnen 3s EOF sehen")
+        .expect("read");
+    assert_eq!(n, 0, "b muss EOF (Ok(0)) sehen, nachdem a geschlossen hat");
+}
+
+// trace: REQ-0006, AUF-20261005-023, AUF-20261005-027
+//
+// (f2) Arm 3 (core's "Nein-Fall 1"): A schreibt so viel, dass (auf)_A im far_w.write_all
+// steht, weil B nichts abnimmt; dann schliesst A ganz. B muss danach, sobald es die
+// gestauten Bytes liest, binnen 3s nach dem letzten Byte EOF sehen.
+#[tokio::test]
+async fn park_pump_far_leg_sees_eof_when_up_leg_is_blocked_in_write_auf027() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client_a, real_a) = tokio::io::duplex(4096);
+    let (client_b, real_b) = tokio::io::duplex(4096);
+    let (_la, dead_a) = ParkLiveness::monitored();
+    let (_lb, dead_b) = ParkLiveness::monitored();
+    let leg_a = spawn_park_keepalive_pump(Box::pin(real_a), true, dead_a);
+    let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), true, dead_b);
+    let _splice =
+        tokio::spawn(
+            async move { crate::relay::relay_streams(leg_a, leg_b, "auf027_f2_arm3").await },
+        );
+    let (mut b_r, mut b_w) = tokio::io::split(client_b);
+
+    // Beide Clients tauschen zuerst je einen kleinen Chunk aus (parked -> false auf beiden Seiten).
+    client_a.write_all(b"a2b1").await.expect("a write");
+    let mut buf = [0u8; 4];
+    b_r.read_exact(&mut buf).await.expect("b read");
+    b_w.write_all(b"b2a1").await.expect("b write");
+    client_a.read_exact(&mut buf).await.expect("a read");
+
+    // a -> b staut, weil b ab jetzt nicht mehr liest, bis (auf)_A in far_w.write_all steht.
+    let writer = tokio::spawn(async move {
+        let _ = client_a.write_all(&vec![0xa5u8; 1 << 20]).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await; // Stau sicher aufgebaut
+
+    // A schliesst ganz, waehrend (auf)_A im Schreiben steht.
+    writer.abort();
+
+    // B liest die gestauten Bytes und muss binnen 3s nach dem letzten Byte EOF sehen.
+    let mut got = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), b_r.read_to_end(&mut got))
+        .await
+        .expect("b muss binnen 3s nach dem letzten Byte EOF sehen")
+        .expect("read to EOF");
+    assert!(
+        got.iter().all(|&x| x == 0xa5),
+        "die gestauten Bytes muessen a's Muster tragen"
+    );
+}
