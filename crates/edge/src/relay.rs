@@ -4,6 +4,8 @@
 //! ciphertext between them. The Edge is provider-blind: it copies bytes without
 //! inspecting them. P2.4a is the generic bidirectional relay primitive; P2.4b
 //! wires it onto paired QUIC streams (Client stream ↔ Agent tunnel).
+//
+// trace: REQ-0006, AUF-20261005-018
 
 use ct_common::fallback_framing::{
     Frame, FrameReader, FrameWriter, KeepaliveTracker, KEEPALIVE_DEAD_AFTER, KEEPALIVE_INTERVAL,
@@ -40,59 +42,34 @@ where
     copy_bidirectional(a, b).await
 }
 
-/// Pump one direction: read from `r`, write each chunk to `w`, flushing only
-/// on a **short** read, until `r` reaches EOF, then shut `w` down. The
-/// per-direction byte count + trace make a stalled direction visible in real
-/// time (issue #2, mode b: the agent's reply reached the edge but never made
-/// it back to the client).
+/// Pump one direction: read from `r`, write each chunk to `w`, flushing
+/// whenever `r`'s *next* read isn't already sitting ready, until `r` reaches
+/// EOF, then shut `w` down. The per-direction byte count + trace make a
+/// stalled direction visible in real time (issue #2, mode b: the agent's
+/// reply reached the edge but never made it back to the client).
 ///
-/// #338: flush only when the just-completed read was short (`n < buf.len()`),
-/// not on every chunk. A full-buffer read (`n == buf.len()`) means the source
-/// likely has more data immediately ready (a bulk transfer mid-flight, e.g. a
-/// large upload or video stream) — skipping the flush there lets the writer's
-/// own layer coalesce it with the next write instead of forcing a
-/// syscall/round-trip per 16KB chunk. A short read means the source just gave
-/// us everything it currently has: small/interactive traffic (the common case
-/// for this tunnel's Noise-encrypted application data) or the tail of a bulk
-/// transfer — flush immediately there, which is exactly what preserves the
-/// original per-chunk-flush's reason to exist: a small reply (e.g. a Noise
-/// handshake response) must reach the wire promptly, not wait behind more
-/// source data that may never come soon.
+/// AUF-20261005-018 / INC-20261005-203: the predecessor rule (#338) flushed
+/// only when the just-completed read was **short** (`n < buf.len()`). That
+/// conflated "short read" with "source has nothing more right now", which is
+/// wrong for a bulk sender whose reads happen to land on exact 16KiB
+/// boundaries and then pause without closing (a chunked upload, a paced
+/// video feed) — every read is full-buffer, so the old rule never flushed,
+/// and the sink stayed silent until the source eventually closed or sent a
+/// short tail. The actual signal for "the source has nothing more right now"
+/// is whether the *next* read is already ready, not the size of the read
+/// that just completed: [`peek_next_read`] races it against an
+/// always-ready marker and reports [`NextRead::Idle`] exactly when the
+/// source has gone quiet, which is when this function flushes. A run of
+/// back-to-back full reads (the #338 bulk case) still coalesces without an
+/// intermediate flush, since each one's "next read" is already ready.
 ///
-/// This is safe at EOF even when the last real chunk was a full-buffer read
-/// that skipped its own flush: `shutdown()` below is unconditional, and for
-/// every concrete writer this crate hands to `pump_dir` in production,
-/// `poll_shutdown` drains any writer-internal buffered output before the
-/// underlying transport closes (verified against this workspace's pinned
-/// crate versions, not assumed — see the #338 commit message for the full
-/// evidence trail):
-///   - `quinn::SendStream` (`relay_quic`, quinn 0.11.11): `poll_flush` is a
-///     hardcoded no-op (`Poll::Ready(Ok(()))`) — flushing this writer type has
-///     literally zero observable effect either way. All bytes handed to
-///     `poll_write` are already inside quinn's own connection-driver state;
-///     transmission is scheduled by quinn's background connection task, not
-///     by the application calling flush. `shutdown()` calls `finish()`, which
-///     only signals "no more data is coming" — previously written (already
-///     buffered-in-quinn) data is still transmitted normally.
-///   - `tokio_rustls::server::TlsStream`/`client::TlsStream` (the `:443`
-///     TLS-TCP channel-relay fallback, tokio-rustls 0.26.4 / rustls 0.23.43):
-///     `poll_write` itself already drains any produced TLS records to the
-///     underlying socket in an inner loop (`while session.wants_write() {
-///     write_io(cx) }`) before returning — rustls's `ConnectionCommon::write`
-///     encrypts application data into ready-to-send records immediately, it
-///     does not hold plaintext back awaiting a flush (that only happens
-///     mid-handshake). The only way bytes can still be sitting unsent after a
-///     `write_all` is if the socket briefly applied backpressure; even then,
-///     `poll_shutdown` explicitly loops `while session.wants_write() {
-///     write_io(cx) }` before closing the socket, so a skipped flush can never
-///     strand data at EOF.
-///   - `WsByteStream` (`ws_channel.rs`, the browser `/ws/channel` transport):
-///     `poll_write` already calls `poll_flush` on the WebSocket sink inline,
-///     before returning — there is never unflushed data left after a
-///     `write_all` completes, whether or not the caller flushes separately.
-/// A test double modeling a writer with *real* internal buffering (unlike
-/// `tokio::io::DuplexStream`, whose `poll_flush` is a no-op and so can't
-/// stress this) proves the EOF property directly below.
+/// `shutdown()` at EOF is unconditional and, for every concrete writer this
+/// crate hands to `pump_dir` in production, already drains any
+/// writer-internal buffered output before the underlying transport closes
+/// (`quinn::SendStream`'s `poll_flush` is a no-op so this is moot there;
+/// `tokio_rustls`'s `poll_shutdown` loops `while session.wants_write() {
+/// write_io(cx) }`; `WsByteStream`'s `poll_write` already flushes the
+/// WebSocket sink inline) — so EOF needs no separate flush call of its own.
 /// Render an error together with its full `source()` chain.
 ///
 /// Without this, a relay failure surfaces as the bare top-level message. For
@@ -125,6 +102,66 @@ fn relay_io_error(e: std::io::Error, dir: &str, label: &str) -> std::io::Error {
     std::io::Error::new(kind, format!("relay {label} {dir}: {}", with_cause_chain(&e)))
 }
 
+/// The exact text a relay leg's end is logged with: which relay (`label`),
+/// which side (`a->b` / `b->a`, or the framed relay's `browser->agent`) and
+/// why (`"EOF"`, or an I/O error's own rendering). Factored out as a pure
+/// function so a test can check the wording directly, without capturing
+/// process output (AUF-20261005-018 criterion 7).
+fn relay_leg_end_line(label: &str, dir: &str, reason: &str) -> String {
+    format!("relay {label} {dir}: leg ended ({reason})")
+}
+
+/// Emit the leg-end line. Always on (unlike [`relay_trace`]'s
+/// `CT_EDGE_TRACE` gate) — a relay leg ending, especially on error, is
+/// operational signal worth keeping visible by default, and it is one line
+/// per leg's end, not per chunk.
+fn log_relay_leg_end(label: &str, dir: &str, reason: &str) {
+    eprintln!("{}", relay_leg_end_line(label, dir, reason));
+}
+
+/// Map an I/O error through [`relay_io_error`] and log the leg's end before
+/// propagating it, so every error exit from a relay leg is covered by the
+/// same line [`log_relay_leg_end`] emits for a clean EOF.
+fn log_leg_end_on_err<T>(res: std::io::Result<T>, dir: &str, label: &str) -> std::io::Result<T> {
+    res.map_err(|e| {
+        let err = relay_io_error(e, dir, label);
+        log_relay_leg_end(label, dir, &err.to_string());
+        err
+    })
+}
+
+/// The outcome of racing the next read on `r` against an always-ready
+/// marker (see [`peek_next_read`]) — the shared idle-detection primitive
+/// behind the AUF-20261005-018 flush-timing fix, used by both `pump_dir` and
+/// `framed_relay`'s browser->agent leg.
+enum NextRead {
+    /// The read already completed — use its result directly. Dropping it
+    /// here would silently lose (a real read happened) or duplicate (a
+    /// second read would re-consume nothing but still cost a syscall) data
+    /// already pulled off the source.
+    Data(std::io::Result<usize>),
+    /// The read is not ready yet: the source has gone idle. The caller must
+    /// flush before it may actually wait for more data, so a paused-but-not-
+    /// closed sender's bytes are visible at the sink promptly.
+    Idle,
+}
+
+/// Race the next read on `r` against an immediately-ready marker. `biased`
+/// polls `r.read` FIRST: if that returns `Ready` on the very first poll
+/// (data — or EOF — already sitting there), [`NextRead::Data`] wins without
+/// ever touching the second branch; only if `r.read` is genuinely `Pending`
+/// does the always-ready marker resolve, yielding [`NextRead::Idle`].
+/// Dropping the unfinished `read` future in that case is safe: tokio's
+/// `AsyncReadExt::read` has not pulled any bytes off `r` while `Pending`, so
+/// nothing is lost by awaiting a fresh call to it later.
+async fn peek_next_read<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> NextRead {
+    tokio::select! {
+        biased;
+        res = r.read(buf) => NextRead::Data(res),
+        () = std::future::ready(()) => NextRead::Idle,
+    }
+}
+
 async fn pump_dir<R, W>(mut r: R, mut w: W, dir: &str, label: &str) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -132,20 +169,25 @@ where
 {
     let mut buf = [0u8; 16 * 1024];
     let mut total: u64 = 0;
+    let mut n = log_leg_end_on_err(r.read(&mut buf).await, dir, label)?;
     loop {
-        let n = r.read(&mut buf).await.map_err(|e| relay_io_error(e, dir, label))?;
         if n == 0 {
             let _ = w.shutdown().await;
+            log_relay_leg_end(label, dir, "EOF");
             break;
         }
         if total == 0 {
             relay_trace(format_args!("relay {label} {dir}: first {n} bytes"));
         }
         total += n as u64;
-        w.write_all(&buf[..n]).await.map_err(|e| relay_io_error(e, dir, label))?;
-        if n < buf.len() {
-            w.flush().await.map_err(|e| relay_io_error(e, dir, label))?;
-        }
+        log_leg_end_on_err(w.write_all(&buf[..n]).await, dir, label)?;
+        n = match peek_next_read(&mut r, &mut buf).await {
+            NextRead::Data(res) => log_leg_end_on_err(res, dir, label)?,
+            NextRead::Idle => {
+                log_leg_end_on_err(w.flush().await, dir, label)?;
+                log_leg_end_on_err(r.read(&mut buf).await, dir, label)?
+            }
+        };
     }
     relay_trace(format_args!("relay {label} {dir}: {total} bytes total then EOF"));
     Ok(total)
@@ -402,11 +444,14 @@ async fn maybe_deadline(d: Option<tokio::time::Instant>) {
 ///   an early-FINning origin is never cut. Peer keepalives are ACKed iff the reader's own `should_ack`
 ///   verdict says so and are never forwarded -- a keepalive must not corrupt
 ///   the raw browser stream.
-/// - **DATA flushing** applies the #338 short-read heuristic on both legs: the
-///   agent-bound writer flushes after a short browser read (a likely message
-///   boundary the far side waits on), full-buffer chunks coalesce; the codec
-///   flushes KA/ACK/FIN inline itself. The browser leg flushes per chunk, since
-///   each DATA frame is already a peer-chosen chunk.
+/// - **DATA flushing.** The agent-bound writer flushes once the *next*
+///   browser read isn't already ready (AUF-20261005-018, [`peek_next_read`])
+///   rather than merely because the read that just completed was short — a
+///   browser that pauses mid-upload after a run of full-buffer reads still
+///   needs its bytes visible to the agent promptly; back-to-back full reads
+///   still coalesce. The codec flushes KA/ACK/FIN inline itself. The browser
+///   leg flushes per chunk, since each DATA frame is already a peer-chosen
+///   chunk.
 ///
 /// The relay phase is single-use, exactly like the raw one: it ends only with
 /// the connection (no return to a park phase; the worker redials).
@@ -536,21 +581,32 @@ where
             });
             tokio::select! {
                 read = browser_read.read(&mut buf), if !own_fin => {
-                    let n = read.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
-                    if n == 0 {
-                        // In-band half-close: the agent's reply (and the
-                        // keepalives protecting it) can keep flowing.
-                        writer.fin().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
-                        own_fin = true;
-                    } else {
+                    let mut n = read.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                    loop {
+                        if n == 0 {
+                            // In-band half-close: the agent's reply (and the
+                            // keepalives protecting it) can keep flowing.
+                            writer.fin().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                            own_fin = true;
+                            break;
+                        }
                         fwd_bytes.fetch_add(n as u64, Ordering::Relaxed);
                         writer.data(&buf[..n]).await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
                         last_fwd_data = tokio::time::Instant::now();
-                        if n < buf.len() {
-                            // #338 short-read heuristic (the codec contract's
-                            // caller duty): a short read marks a likely message
-                            // boundary the far side is waiting on.
-                            writer.flush().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                        // AUF-20261005-018: the same idle-detection as
+                        // `pump_dir` (the #338 short-read heuristic's
+                        // successor) -- flush as soon as the NEXT browser
+                        // read isn't already ready, not merely because this
+                        // read happened to be short.
+                        match peek_next_read(&mut browser_read, &mut buf).await {
+                            NextRead::Data(res) => {
+                                n = res.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                                continue;
+                            }
+                            NextRead::Idle => {
+                                writer.flush().await.map_err(|e| relay_io_error(e, "browser->agent", "framed"))?;
+                                break;
+                            }
                         }
                     }
                     last_send = tokio::time::Instant::now();
@@ -853,6 +909,71 @@ mod tests {
         assert_eq!(total, "handshake-reply".len() as u64);
     }
 
+    /// trace: REQ-0006, AUF-20261005-018
+    ///
+    /// INC-20261005-203, slice 1 (control arm): over a REAL-buffering writer
+    /// (a `tokio::io::DuplexStream` can't exercise this -- its `poll_flush`
+    /// is a no-op, so a byte is "visible" the instant it's written whether
+    /// or not anyone ever flushes), a source that delivers exact full-16KiB
+    /// reads and then pauses WITHOUT closing must still have every byte
+    /// reach the sink promptly. Against main (a0267e8) this is RED: the old
+    /// rule only flushed on a short read, and every read here is exactly
+    /// `buf.len()`, so the writer never flushes and the sink stays silent
+    /// until the 2s timeout below fires.
+    #[tokio::test]
+    async fn pump_dir_flushes_when_the_source_pauses_after_full_buffer_reads_without_closing() {
+        use tokio::io::{duplex, AsyncWriteExt};
+
+        let chunk = vec![0xCDu8; 16 * 1024];
+        let (mut src_w, src_r) = duplex(4 * 16 * 1024);
+        for _ in 0..2 {
+            src_w.write_all(&chunk).await.unwrap();
+        }
+        // Deliberately NOT closed: the source pauses, mimicking a bulk
+        // transfer mid-flight with nothing more to send right now.
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let w = BufferingCounter {
+            pending: Vec::new(),
+            sink: sink.clone(),
+            flushes: flushes.clone(),
+            flushed: flushed.clone(),
+        };
+
+        let pump_task = tokio::spawn(pump_dir(src_r, w, "a->b", "pause-test"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed.notified())
+            .await
+            .expect(
+                "the two full-buffer chunks must be flushed promptly even though \
+                 the source paused without closing",
+            );
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            2 * 16 * 1024,
+            "every byte reached the sink despite the source pausing after full reads"
+        );
+
+        src_w.shutdown().await.unwrap();
+        let total = tokio::time::timeout(std::time::Duration::from_secs(2), pump_task)
+            .await
+            .expect("pump_dir finished after EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 2 * 16 * 1024);
+    }
+
+    /// trace: REQ-0006, AUF-20261005-018
+    #[test]
+    fn relay_leg_end_line_names_the_label_side_and_reason() {
+        let line = relay_leg_end_line("chan-1", "a->b", "EOF");
+        assert!(line.contains("chan-1"), "names the relay: {line}");
+        assert!(line.contains("a->b"), "names the side: {line}");
+        assert!(line.contains("EOF"), "names the reason: {line}");
+    }
+
     #[test]
     fn cause_chain_surfaces_the_underlying_reason_not_just_connection_lost() {
         // #214: quinn's WriteError/ReadError::ConnectionLost displays as the
@@ -929,6 +1050,236 @@ mod tests {
         member_b.shutdown().await.unwrap();
         let (a2b, b2a) = relay_task.await.unwrap().unwrap();
         assert_eq!((a2b, b2a), (4, 4), "one message each direction");
+    }
+
+    /// trace: REQ-0006, AUF-20261005-018
+    ///
+    /// INC-20261005-203, slice 1 (control arm), two-direction variant: both
+    /// legs of `relay_pair` send a multiple of 16KiB and then pause WITHOUT
+    /// closing -- the old short-read rule never fires in EITHER direction
+    /// (every read is exactly `buf.len()`), so a regression here stalls
+    /// both sides at once. Against main (a0267e8) this is RED on both
+    /// `flushed_*.notified()` waits below.
+    #[tokio::test]
+    async fn relay_pair_flushes_both_directions_when_each_side_pauses_after_full_buffer_reads() {
+        use tokio::io::{duplex, AsyncWriteExt};
+
+        let chunk = vec![0x11u8; 16 * 1024];
+
+        let (mut a_poke, a_recv) = duplex(4 * 16 * 1024);
+        let (mut b_poke, b_recv) = duplex(4 * 16 * 1024);
+
+        let sink_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushes_a = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushed_a = std::sync::Arc::new(tokio::sync::Notify::new());
+        let a_send = BufferingCounter {
+            pending: Vec::new(),
+            sink: sink_a.clone(),
+            flushes: flushes_a.clone(),
+            flushed: flushed_a.clone(),
+        };
+
+        let sink_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushes_b = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushed_b = std::sync::Arc::new(tokio::sync::Notify::new());
+        let b_send = BufferingCounter {
+            pending: Vec::new(),
+            sink: sink_b.clone(),
+            flushes: flushes_b.clone(),
+            flushed: flushed_b.clone(),
+        };
+
+        let relay_task =
+            tokio::spawn(async move { relay_pair(a_recv, a_send, b_recv, b_send, "test-bidir").await });
+
+        for _ in 0..2 {
+            a_poke.write_all(&chunk).await.unwrap();
+            b_poke.write_all(&chunk).await.unwrap();
+        }
+        // Both sides pause WITHOUT closing.
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed_b.notified())
+            .await
+            .expect("a->b: A's bulk data must be flushed to B promptly despite A pausing");
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed_a.notified())
+            .await
+            .expect("b->a: B's bulk data must be flushed to A promptly despite B pausing");
+
+        assert_eq!(sink_b.lock().unwrap().len(), 2 * 16 * 1024, "B received all of A's bytes");
+        assert_eq!(sink_a.lock().unwrap().len(), 2 * 16 * 1024, "A received all of B's bytes");
+
+        drop(a_poke);
+        drop(b_poke);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
+    }
+
+    /// A `ServerCertVerifier` that accepts anything -- these tests only need a real TLS
+    /// handshake to actually complete against a self-signed cert, not certificate trust
+    /// (same pattern as `relay_gate.rs`'s own `NoVerify`, duplicated here since it's
+    /// private to that module's tests).
+    #[derive(Debug)]
+    struct NoVerify;
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// Build a self-signed-cert `TlsAcceptor`/`TlsConnector` pair for `name`, and complete
+    /// one handshake over `transport_cap` bytes of in-memory duplex. Mirrors the
+    /// acceptor/connector setup `relay_gate.rs:581-590`/`667-707` uses for its own real-TLS
+    /// tests.
+    async fn real_tls_pair_over_duplex(
+        name: &str,
+        transport_cap: usize,
+    ) -> (
+        tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
+        tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+    ) {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        crate::transport::install_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+        let ccfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let server_name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+
+        let (server_transport, client_transport) = tokio::io::duplex(transport_cap);
+        let (server_res, client_res) = tokio::join!(
+            acceptor.accept(server_transport),
+            connector.connect(server_name, client_transport)
+        );
+        (
+            server_res.expect("edge-side TLS handshake completes"),
+            client_res.expect("peer-side TLS handshake completes"),
+        )
+    }
+
+    /// trace: REQ-0006, AUF-20261005-018
+    ///
+    /// INC-20261005-203, slice 1, test (d1): the SINK is a REAL `tokio_rustls` leg (the
+    /// exact type/pattern this relay hands to `pump_dir` in production -- see
+    /// `relay_gate.rs:581-590`) over a deliberately tiny transport, so it backpressures;
+    /// the SOURCE delivers two full-16KiB reads and then pauses WITHOUT closing. Once the
+    /// sink resumes reading, every byte must arrive -- including whatever is still
+    /// sitting in rustls's own internal send buffer from before the backpressure cleared.
+    #[tokio::test]
+    async fn pump_dir_delivers_all_bytes_over_a_real_tls_leg_after_the_sink_backpressures_then_drains(
+    ) {
+        use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+        const SMALL_CAP: usize = 4096;
+        let (edge_tls, mut peer_tls) = real_tls_pair_over_duplex("relay-d1.test", SMALL_CAP).await;
+
+        let (mut src_poke, src_r) = duplex(4 * 16 * 1024);
+        let chunk = vec![0x55u8; 16 * 1024];
+        src_poke.write_all(&chunk).await.unwrap();
+        src_poke.write_all(&chunk).await.unwrap();
+        // Source pauses WITHOUT closing.
+
+        let pump_task = tokio::spawn(pump_dir(src_r, edge_tls, "a->b", "d1"));
+
+        // The sink deliberately does not read at first -- it backpressures while
+        // pump_dir writes into the tiny transport.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut got = vec![0u8; 2 * 16 * 1024];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer_tls.read_exact(&mut got),
+        )
+        .await
+        .expect(
+            "every byte must arrive once the sink resumes reading, including whatever was \
+                 still queued in rustls's own buffer",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            [chunk.clone(), chunk].concat(),
+            "both chunks arrived intact"
+        );
+
+        src_poke.shutdown().await.unwrap();
+        let total = tokio::time::timeout(std::time::Duration::from_secs(2), pump_task)
+            .await
+            .expect("pump_dir finished after EOF")
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, 2 * 16 * 1024);
+    }
+
+    /// trace: REQ-0006, AUF-20261005-018
+    ///
+    /// INC-20261005-203, slice 1, test (d2) -- labor-com 16:22Z: one side's own peer never
+    /// reads what's relayed to it (a permanently backpressured direction), while the
+    /// OTHER side keeps sending; the opposite direction must keep delivering regardless.
+    /// Per the Rahmenbedingungen's conservative voice: if this is already green against
+    /// main, that is itself the finding for this spot, not a defect to correct here.
+    #[tokio::test]
+    async fn relay_streams_keeps_the_other_direction_moving_when_one_peer_never_reads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (edge_a_tls, mut peer_a_tls) =
+            real_tls_pair_over_duplex("relay-d2-a.test", 64 * 1024).await;
+        let (edge_b_tls, mut peer_b_tls) = real_tls_pair_over_duplex("relay-d2-b.test", 4096).await;
+
+        let relay_task =
+            tokio::spawn(async move { relay_streams(edge_a_tls, edge_b_tls, "d2-test").await });
+
+        // B sends its own data (exercises b->a) but will NEVER read what's relayed to it
+        // (a->b stays backpressured forever once A's burst below exceeds B's tiny transport).
+        peer_b_tls.write_all(b"b-is-still-sending").await.unwrap();
+
+        // A sends more than B's transport can ever hold, with B never draining it.
+        let stuck_chunk = vec![0x77u8; 3 * 16 * 1024];
+        let _ = peer_a_tls.write_all(&stuck_chunk).await; // may itself not fully complete; that's fine
+
+        let mut got = [0u8; "b-is-still-sending".len()];
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer_a_tls.read_exact(&mut got))
+            .await
+            .expect("b->a must keep delivering even though a->b is permanently stuck")
+            .unwrap();
+        assert_eq!(&got, b"b-is-still-sending");
+
+        relay_task.abort();
     }
 
     #[tokio::test]
@@ -1216,6 +1567,66 @@ mod tests {
             framed_relay(&mut agent_edge, &mut browser_edge).await
         });
         (agent_far, browser_far, relay)
+    }
+
+    /// trace: REQ-0006, AUF-20261005-018
+    ///
+    /// INC-20261005-203, slice 1 (control arm), `framed_relay`'s analogue of
+    /// (a)/(b) at the browser->agent leg (relay.rs:549): drives the
+    /// agent-bound writer through [`BufferingCounter`] (a stand-in for the
+    /// production tokio-rustls TLS leg -- a plain `tokio::io::duplex` can't
+    /// exercise this, its `poll_flush` is a no-op so a byte is already
+    /// "visible" on write regardless of any flush). `tokio::io::join` glues
+    /// that buffering writer to an otherwise-idle reader, since `framed_relay`
+    /// needs one combined `AsyncRead + AsyncWrite` for its `agent` parameter.
+    /// The browser delivers two full-16KiB reads then pauses WITHOUT
+    /// closing; against main (a0267e8) this is RED -- the old rule never
+    /// flushes a full-buffer read, so the agent-bound sink stays short of
+    /// both DATA frames until the 2s timeout below fires (well short of the
+    /// 8s keepalive interval, so this isn't "it would have arrived anyway").
+    #[tokio::test]
+    async fn framed_relay_flushes_browser_to_agent_when_the_browser_pauses_after_full_buffer_reads()
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let agent_writer = BufferingCounter {
+            pending: Vec::new(),
+            sink: sink.clone(),
+            flushes: flushes.clone(),
+            flushed: flushed.clone(),
+        };
+        // Held open and never written to: the agent->browser direction is
+        // not exercised by this test, only the writer under test.
+        let (agent_read_far, agent_read_near) = tokio::io::duplex(1024);
+        let mut agent = tokio::io::join(agent_read_near, agent_writer);
+
+        let (mut browser_edge, mut browser_far) = tokio::io::duplex(1 << 16);
+
+        let relay_task = tokio::spawn(async move { framed_relay(&mut agent, &mut browser_edge).await });
+
+        let chunk = vec![0x33u8; 16 * 1024];
+        for _ in 0..2 {
+            browser_far.write_all(&chunk).await.unwrap();
+        }
+        // Pauses WITHOUT closing.
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed.notified())
+            .await
+            .expect("the agent-bound writer must be flushed promptly once the browser pauses");
+
+        // Two DATA frames: 1-byte tag + 4-byte BE length header, then the payload, each.
+        let expected_len = 2 * (5 + 16 * 1024);
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            expected_len,
+            "both full DATA frames reached the agent-bound sink"
+        );
+
+        drop(agent_read_far);
+        relay_task.abort();
     }
 
     #[tokio::test]
