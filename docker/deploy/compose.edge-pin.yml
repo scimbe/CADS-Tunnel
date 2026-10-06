@@ -1,0 +1,13 @@
+# Optional overlay: keep the edge on fixed container addresses when it is re-created.
+# Why (INC-20261005-201, core 2026-10-04): a re-created edge got a new address on the default
+# network; agents older than ct-agent 0.7.37 resolve the edge once at start and silently lost it.
+# Use: docker compose ... -f compose.edge-pin.yml up -d --no-deps edge
+# Both variables are required; take the values from `docker inspect ct-selfhost-edge-1` before
+# the first use. The networks must already exist with a subnet that contains these addresses.
+services:
+  edge:
+    networks:
+      default:
+        ipv4_address: ${CT_EDGE_IPV4_DEFAULT:?set CT_EDGE_IPV4_DEFAULT to the edge address on the default network}
+      relay_internal:
+        ipv4_address: ${CT_EDGE_IPV4_RELAY:?set CT_EDGE_IPV4_RELAY to the edge address on relay_internal}
