@@ -663,3 +663,82 @@ async fn park_pump_far_leg_sees_eof_when_up_leg_is_blocked_in_write_256k_auf002(
         "die gestauten Bytes muessen a's Muster tragen"
     );
 }
+
+// Art: BEWEIS (haengt real auf a0267e8/da990b0 -- siehe PR-Text)
+// trace: REQ-0006, AUF-20261006-002
+//
+// (e) Nicht-KA-Bein, voller Client-Close (INC-20261005-203): beide Beine ohne Keepalive.
+// Auf dem Stand vor dieser Korrektur schliesst (auf) bei Ok(0)+keepalive==false nur sich
+// selbst (HalfClosed) ohne far_w zu schliessen; die aeussere Schleife wartet dann nur noch
+// auf splice_to_client (far_r-EOF), das nie kommt, obwohl der Client ganz (beide Haelften)
+// geschlossen hat -- b sieht nie EOF und die Pumpe lebt weiter.
+#[tokio::test]
+async fn park_pump_plain_leg_propagates_client_close_to_far_side_auf002() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client_a, real_a) = tokio::io::duplex(4096);
+    let (mut client_b, real_b) = tokio::io::duplex(4096);
+    let (_la, dead_a) = ParkLiveness::monitored();
+    let (_lb, dead_b) = ParkLiveness::monitored();
+    let leg_a = spawn_park_keepalive_pump(Box::pin(real_a), false, dead_a);
+    let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), false, dead_b);
+    let _splice = tokio::spawn(async move {
+        crate::relay::relay_streams(leg_a, leg_b, "auf002_plain_full_close").await
+    });
+
+    client_a.write_all(b"a2b1").await.expect("a write");
+    let mut buf = [0u8; 4];
+    client_b.read_exact(&mut buf).await.expect("b read");
+
+    drop(client_a);
+
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), client_b.read(&mut byte))
+        .await
+        .expect("b muss binnen 3s EOF sehen, statt dass die Pumpe weiterlebt")
+        .expect("read");
+    assert_eq!(n, 0, "b muss EOF (Ok(0)) sehen, nachdem a ganz geschlossen hat");
+}
+
+// Art: BEWEIS
+// trace: REQ-0006, AUF-20261006-002
+//
+// (e) Nicht-KA-Bein, Halbschluss: der Client schliesst nur die Schreibhaelfte (shutdown);
+// die Gegenseite (direkt am zurueckgegebenen Pumpen-Ende, wie in den p3/f1-ERHALT-Tests)
+// muss binnen 3s EOF sehen UND danach noch 64 KiB an den Client liefern koennen, die der
+// Client vollstaendig liest -- sichert, dass das Schliessen von far_w im (auf)-Zweig nur
+// die Client->Gegenseite-Richtung trifft und (ab) (der Ruecklauf) unveraendert weiterlaeuft.
+#[tokio::test]
+async fn park_pump_plain_leg_propagates_half_close_and_still_delivers_auf002() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_end, real) = tokio::io::duplex(128 * 1024);
+    let boxed: BoxedChannelStream = Box::pin(real);
+    let (_lv, dead) = ParkLiveness::monitored();
+    let mut parked_end = spawn_park_keepalive_pump(boxed, false, dead);
+    let (mut client_r, mut client_w) = tokio::io::split(client_end);
+
+    client_w
+        .shutdown()
+        .await
+        .expect("client half-closes its write side");
+
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), parked_end.read(&mut byte))
+        .await
+        .expect("Gegenseite muss binnen 3s EOF sehen, nachdem der Client die Schreibhaelfte geschlossen hat")
+        .expect("read");
+    assert_eq!(
+        n, 0,
+        "Gegenseite muss EOF (Ok(0)) sehen, nachdem der Client die Schreibhaelfte geschlossen hat"
+    );
+
+    let payload = vec![0xc3u8; 64 * 1024];
+    parked_end.write_all(&payload).await.expect("Gegenseite write");
+    parked_end.flush().await.expect("Gegenseite flush");
+
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(std::time::Duration::from_secs(3), client_r.read_exact(&mut got))
+        .await
+        .expect("Client muss binnen 3s die vollen 64 KiB empfangen")
+        .expect("read");
+    assert_eq!(got, payload, "Client muss die vollen 64 KiB unveraendert empfangen");
+}

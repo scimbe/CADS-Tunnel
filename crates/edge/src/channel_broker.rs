@@ -3026,6 +3026,8 @@ fn spawn_park_keepalive_pump(
                         // Legacy half-close (or a v0.4.12 process death -- wire-ambiguous
                         // by design until the client speaks the KA ALPN): tolerate, (ab)
                         // keeps running alone to forward the outbound direction.
+                        // trace: REQ-0006, AUF-20261006-002
+                        let _ = far_w.shutdown().await;
                         return ClientToSplice::HalfClosed;
                     }
                     Ok(n) => {
