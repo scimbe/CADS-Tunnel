@@ -11,6 +11,10 @@ pub mod a2a;
 /// the portal edits, the control plane stores and pushes, and the edge evaluates locally.
 pub mod access_window;
 pub mod acme_ca;
+/// trace: AUF-20261011-079, AUF-20261011-049; INC-20261011-305, INC-20261011-004.
+/// Signed agent-binding v1: ties a join/routing token to both a tunnel and an agent
+/// public key, closing the gap where `credential::Credential` binds only a tenant.
+pub mod agent_binding;
 pub mod channel;
 /// Native-only (see this module's own doc comment for why): needs `quinn`/`rustls`, which
 /// this crate does not pull in for the wasm32 build (the browser channel-claim page).
