@@ -3038,6 +3038,22 @@ where
 /// inside every plausible idle timer and costs ~one TLS record per tick.
 pub(crate) const PARK_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a pumped leg keeps its remaining direction open after the other direction has
+/// ended cleanly (a write half-close) without a single byte moving in it. A half-closed
+/// pair is a legitimate state, so the open direction may finish on its own and may run for
+/// as long as data flows: every chunk moved in either direction restarts this idle bound.
+/// It only makes sure a peer that goes silent without closing cannot hold both legs and
+/// their permits forever.
+pub(crate) const PARK_HALF_CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `shutdown()` on a leg's write half, bounded by [`PARK_HALF_CLOSE_LINGER`]: a client that
+/// stops reading can leave a TLS close-notify flush pending, and an unbounded wait here
+/// would keep the idle bound from ever being armed.
+async fn bounded_shutdown<W: tokio::io::AsyncWrite + Unpin>(w: &mut W) {
+    use tokio::io::AsyncWriteExt;
+    let _ = tokio::time::timeout(PARK_HALF_CLOSE_LINGER, w.shutdown()).await;
+}
+
 /// #500 K2: wrap an ADMITTED (post-challenge) keepalive-negotiated stream in a pump task
 /// that owns the real connection and injects one NUL byte of application payload every
 /// [`PARK_KEEPALIVE_INTERVAL`] while the leg is parked. The pairer parks the returned
@@ -3049,7 +3065,10 @@ pub(crate) const PARK_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Durat
 /// the ack's first chunk lands BEFORE it (the select! serializes whole chunks -- NUL and
 /// data still share one arm, AUF-20261005-019 only decouples the two directions from each
 /// other), i.e. as one more leading NUL of exactly the kind a keepalive-negotiated client
-/// strips. Client EOF/error tears the pump down (the parked side then fails fast on its
+/// strips. A client error, or a keepalive client's EOF while still parked, tears the pump
+/// down; any other client EOF is a write half-close, passed on to the arm side once the
+/// leg is no longer parked, while the opposite direction keeps flowing (see
+/// [`PARK_HALF_CLOSE_LINGER`]). When the pump goes down the parked side then fails fast on its
 /// next write -- the corpse surfaces at pairing instead of poisoning it silently); the arm
 /// side dropping/shutting down closes the real connection.
 fn spawn_park_keepalive_pump(
@@ -3071,6 +3090,20 @@ fn spawn_park_keepalive_pump(
         // AUF-20261005-019: read by both directions below, written only by splice->client --
         // an AtomicBool (not a Cell) keeps this task Send.
         let parked = std::sync::atomic::AtomicBool::new(true);
+        // Signalled when `parked` flips to false: a half-close seen while parked is only
+        // passed on from then on (the pairer never reads a parked member, so forwarding it
+        // earlier would surface as an EOF on the peer right after pairing).
+        let unparked = tokio::sync::Notify::new();
+        // Idle bookkeeping for the half-closed phase: milliseconds since the pump started
+        // at which a chunk last moved in either direction.
+        let started = tokio::time::Instant::now();
+        let last_active_ms = std::sync::atomic::AtomicU64::new(0);
+        let touch = || {
+            last_active_ms.store(
+                started.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+        };
         // #499 slice B, corrected after a live false-positive regression (2026-08-14): a clean
         // read EOF while parked is NOT a death signal on its own -- v0.4.11-and-older clients
         // legitimately HALF-CLOSE right after the possession signature, and flagging their EOF
@@ -3083,6 +3116,10 @@ fn spawn_park_keepalive_pump(
         enum ClientToSplice {
             Aborted,
             HalfClosed,
+        }
+        enum SpliceToClient {
+            Failed,
+            PeerClosed,
         }
         // AUF-20261005-019 (auf): client -> splice, decoupled from (ab) below so a stalled
         // splice->client write never blocks this leg's reads from the client.
@@ -3098,19 +3135,26 @@ fn spawn_park_keepalive_pump(
                         return ClientToSplice::Aborted;
                     }
                     Ok(0) => {
-                        if keepalive {
-                            // KA contract: the parked leg stays fully open, so EOF = death.
-                            if parked.load(std::sync::atomic::Ordering::Relaxed) {
-                                dead.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
+                        if keepalive && parked.load(std::sync::atomic::Ordering::Relaxed) {
+                            // KA contract: the parked leg stays fully open, so EOF while
+                            // parked = death.
+                            dead.store(true, std::sync::atomic::Ordering::Relaxed);
                             return ClientToSplice::Aborted;
                         }
-                        // Legacy half-close (or a v0.4.12 process death -- wire-ambiguous
-                        // by design until the client speaks the KA ALPN): tolerate, (ab)
-                        // keeps running alone to forward the outbound direction.
+                        // A half-close: a legacy client's (or a v0.4.12 process death --
+                        // wire-ambiguous by design until the client speaks the KA ALPN),
+                        // or any client's once the spliced session is running. Forward it
+                        // to the peer as a write half-close only -- but not while parked:
+                        // wait for the first chunk to the client (the ack/EX) -- and let
+                        // (ab) keep running to deliver the opposite direction.
+                        while parked.load(std::sync::atomic::Ordering::Relaxed) {
+                            unparked.notified().await;
+                        }
+                        bounded_shutdown(&mut far_w).await;
                         return ClientToSplice::HalfClosed;
                     }
                     Ok(n) => {
+                        touch();
                         if far_w.write_all(&from_client[..n]).await.is_err() {
                             return ClientToSplice::Aborted;
                         }
@@ -3126,11 +3170,26 @@ fn spawn_park_keepalive_pump(
             loop {
                 tokio::select! {
                     r = far_r.read(&mut to_client) => match r {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => {
+                            // The peer closed its write side. Once the session is running
+                            // that is a half-close: pass it on to the client and leave
+                            // (auf) alone. While still parked it means the park is over
+                            // (superseded, reaped, dropped), so the whole leg goes.
+                            if parked.load(std::sync::atomic::Ordering::Relaxed) {
+                                return SpliceToClient::Failed;
+                            }
+                            bounded_shutdown(&mut real_w).await;
+                            return SpliceToClient::PeerClosed;
+                        }
+                        Err(_) => return SpliceToClient::Failed,
                         Ok(n) => {
-                            parked.store(false, std::sync::atomic::Ordering::Relaxed); // ack/EX started -- keepalive off for good
+                            // ack/EX started -- keepalive off for good
+                            if parked.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                unparked.notify_one();
+                            }
+                            touch();
                             if real_w.write_all(&to_client[..n]).await.is_err() {
-                                break;
+                                return SpliceToClient::Failed;
                             }
                             let _ = real_w.flush().await;
                         }
@@ -3140,7 +3199,7 @@ fn spawn_park_keepalive_pump(
                             // The write path died while parked: same corpse semantics as a
                             // read-side death (#499 slice B).
                             dead.store(true, std::sync::atomic::Ordering::Relaxed);
-                            break;
+                            return SpliceToClient::Failed;
                         }
                         let _ = real_w.flush().await;
                     }
@@ -3151,20 +3210,54 @@ fn spawn_park_keepalive_pump(
             tokio::pin!(client_to_splice);
             tokio::pin!(splice_to_client);
             let mut client_to_splice_done = false;
+            let mut splice_to_client_done = false;
+            // Armed when the first direction ends cleanly: the other one may finish on
+            // its own, but only while it keeps moving data -- PARK_HALF_CLOSE_LINGER of
+            // silence tears the leg down.
+            let linger = tokio::time::sleep(PARK_HALF_CLOSE_LINGER);
+            tokio::pin!(linger);
+            let mut linger_armed = false;
             loop {
                 tokio::select! {
                     res = &mut client_to_splice, if !client_to_splice_done => {
                         client_to_splice_done = true;
-                        if matches!(res, ClientToSplice::Aborted) {
+                        if matches!(res, ClientToSplice::Aborted) || splice_to_client_done {
                             break;
                         }
                         // HalfClosed: (ab) keeps running alone until its own end.
+                        if !linger_armed {
+                            linger_armed = true;
+                            touch();
+                            linger.as_mut().reset(tokio::time::Instant::now() + PARK_HALF_CLOSE_LINGER);
+                        }
                     }
-                    _ = &mut splice_to_client => break,
+                    res = &mut splice_to_client, if !splice_to_client_done => {
+                        splice_to_client_done = true;
+                        if matches!(res, SpliceToClient::Failed) || client_to_splice_done {
+                            break;
+                        }
+                        // PeerClosed: (auf) keeps running alone until its own end.
+                        if !linger_armed {
+                            linger_armed = true;
+                            touch();
+                            linger.as_mut().reset(tokio::time::Instant::now() + PARK_HALF_CLOSE_LINGER);
+                        }
+                    }
+                    _ = &mut linger, if linger_armed => {
+                        let last = started
+                            + std::time::Duration::from_millis(
+                                last_active_ms.load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                        let deadline = last + PARK_HALF_CLOSE_LINGER;
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        linger.as_mut().reset(deadline);
+                    }
                 }
             }
         }
-        let _ = real_w.shutdown().await;
+        bounded_shutdown(&mut real_w).await;
     });
     near
 }
