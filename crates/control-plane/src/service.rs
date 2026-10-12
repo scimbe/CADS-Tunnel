@@ -3885,19 +3885,20 @@ fn holder_authorized(
 async fn channel_grant_status(
     State(state): State<GrantSignedState>,
     Json(req): Json<GrantStatusReq>,
-) -> Result<Json<GrantStatusResp>, StatusCode> {
-    let channel = ChannelId(hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST)?);
-    let asker = hex_decode_32(&req.asker).ok_or(StatusCode::BAD_REQUEST)?;
-    let peer = hex_decode_32(&req.peer).ok_or(StatusCode::BAD_REQUEST)?;
-    let digest = hex_decode_32(&req.grant_digest).ok_or(StatusCode::BAD_REQUEST)?;
-    let sig = hex_decode_64(&req.sig).ok_or(StatusCode::BAD_REQUEST)?;
+) -> Result<Json<GrantStatusResp>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let channel = ChannelId(hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST.into_response())?);
+    let asker = hex_decode_32(&req.asker).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let peer = hex_decode_32(&req.peer).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let digest = hex_decode_32(&req.grant_digest).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let sig = hex_decode_64(&req.sig).ok_or(StatusCode::BAD_REQUEST.into_response())?;
     let now = now_secs();
     if now.abs_diff(req.ts) > GRANT_STATUS_SKEW_SECS {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into_response());
     }
     let msg = ct_common::channel::grant_status_signing_bytes(&channel, &peer, &digest, req.ts);
     if !ct_common::channel::verify_holder_possession(&asker, &msg, &sig) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into_response());
     }
     let st = state.clone();
     let state_name = tokio::task::spawn_blocking(move || {
@@ -3916,11 +3917,14 @@ async fn channel_grant_status(
         Ok(Some("valid"))
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
     match state_name {
-        None => Err(StatusCode::NOT_FOUND),
-        Some("asker-not-member") => Err(StatusCode::FORBIDDEN),
+        // A body, so that an agent can tell "this control plane has the endpoint and no such
+        // channel" (the channel is gone: its sessions end) from the bare 404 of an older control
+        // plane that has no such endpoint at all (its sessions keep running, with a warning).
+        None => Err((StatusCode::NOT_FOUND, Json(GrantStatusResp { state: "unknown-channel".to_string(), checked_at: now })).into_response()),
+        Some("asker-not-member") => Err(StatusCode::FORBIDDEN.into_response()),
         Some(s) => Ok(Json(GrantStatusResp { state: s.to_string(), checked_at: now })),
     }
 }
@@ -12575,6 +12579,39 @@ mod tests {
         // An outsider (not a member) and a stale timestamp are refused.
         assert_eq!(status(&outsider_sk, digest, now).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert_eq!(status(&asker_sk, digest, now - 1_000).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // An unknown channel is a 404 WITH a body naming it, so an agent can tell it from the
+        // bare 404 an older control plane gives for a route it does not have.
+        {
+            let ghost = ChannelId([0xEEu8; 32]);
+            let msg = ct_common::channel::grant_status_signing_bytes(&ghost, &peer, &digest, now);
+            let body = format!(
+                r#"{{"channel":"{}","asker":"{}","peer":"{}","grant_digest":"{}","ts":{now},"sig":"{}"}}"#,
+                hex_encode(&ghost.0),
+                hex_encode(&asker),
+                hex_encode(&peer),
+                hex_encode(&digest),
+                hex_encode(&asker_sk.sign(&msg).to_bytes())
+            );
+            let r = signed
+                .clone()
+                .oneshot(
+                    Request::post("/channel/grant-status")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND);
+            assert_eq!(state_of(r).await, "unknown-channel");
+            let missing = signed
+                .clone()
+                .oneshot(Request::post("/channel/no-such-route").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            assert!(to_bytes(missing.into_body(), 1 << 16).await.unwrap().is_empty(), "a missing route has no body");
+        }
 
         // Operator-signed revoke: wrong key refused, right key accepted, replay idempotent.
         let revoke = |sk: &SigningKey, d: [u8; 32], exp: u64| {
