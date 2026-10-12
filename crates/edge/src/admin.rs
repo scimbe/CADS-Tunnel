@@ -285,7 +285,6 @@ async fn reload_agent_key(
     match state.reload_agent_key_policy_from_file() {
         Ok(removed) => {
             let closed = removed.len();
-            eprintln!("DEBUG handler closed={closed}");
             for conn in removed {
                 conn.close(0u32.into(), b"agent key policy reload");
             }
@@ -1891,6 +1890,12 @@ mod tests {
         state.set_admin_token(secret);
         let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
         let t = RoutingToken([0x11; 32]);
+        // A second, untouched tunnel: a lone proven admission and nothing
+        // else, so B2's readiness check (`agent_key_ready_for_enforce`) has a
+        // row to say yes to -- `t` itself never can, because it is deliberately
+        // given an `unproven_beside_proven` violation below, and that reason
+        // is documented to keep a tunnel out of `Enforce` for good.
+        let t_clean = RoutingToken([0x22; 32]);
         let path = agent_key_admin_049_temp_path();
 
         // N15/N8: the enforce-list path is stored now, but it is not yet
@@ -1971,6 +1976,23 @@ mod tests {
         );
         assert_eq!(parsed.enforce_tunnels, 1);
         assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+
+        // `t_clean` sees exactly one proven admission and nothing else, so it
+        // stays on `Log` (never named in the enforce file) while being ready.
+        let (_c3, _s3, proven_clean_conn) = agent_key_admin_049_connection().await;
+        state
+            .register_with_candidate_checked(
+                t_clean.clone(),
+                proven_clean_conn,
+                agent_key_admin_049_cand(3),
+                AgentKeyMode::Log,
+                Some(crate::state::ProvenKey {
+                    key: [9u8; 32],
+                    issued_at: 10,
+                }),
+                None,
+            )
+            .expect("proven registration on the untouched tunnel");
 
         let status = |auth: Option<String>| {
             let app = admin_router(state.clone());

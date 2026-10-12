@@ -601,9 +601,6 @@ fn agent_key_only_tolerated(entry: &AgentKeyTunnelCounts) -> bool {
         .all(|(reason, count)| *count == 0 || *reason == AgentKeyReason::SecondUnproven)
 }
 
-/// Conservative default for every tunnel in this slice: observe, never act.
-const AGENT_KEY_DEFAULT_MODE: AgentKeyMode = AgentKeyMode::Log;
-
 /// Upper bound on tracked tunnels, mirroring `WindowLogThrottle`'s
 /// `max_tracked`: a token flood must not grow the counter map without end.
 const AGENT_KEY_MAX_TRACKED: usize = 1024;
@@ -1742,13 +1739,14 @@ impl<H: Clone> EdgeState<H> {
     /// tracked tunnel, plus the Unix second the observation began.
     pub fn agent_key_snapshot(&self) -> (Vec<AgentKeySnapshotRow>, u64) {
         let counts = self.agent_key_counts.lock_safe();
+        let policy = self.agent_key_policy.lock_safe();
         let mut rows: Vec<AgentKeySnapshotRow> = counts
             .iter()
             .map(|(hash, entry)| {
                 let ready = entry.proofs_admitted > 0 && agent_key_only_tolerated(entry);
                 (
                     agent_key_hash_prefix(hash),
-                    AGENT_KEY_DEFAULT_MODE,
+                    policy.mode_for(hash),
                     entry.reasons.clone(),
                     entry.proofs_admitted,
                     ready,
@@ -2682,7 +2680,6 @@ impl<H: Clone> EdgeState<H> {
             }
         }
         let id = self.register_locked(token.clone(), handle);
-        eprintln!("DEBUG register_with_candidate_checked id={id} proves_pin={proves_pin}");
         self.candidates
             .write_safe()
             .insert(token.clone(), candidate);
@@ -2872,12 +2869,10 @@ impl<H: Clone> EdgeState<H> {
             issuers,
         };
         let newly = self.swap_agent_key_policy_locked(next);
-        eprintln!("DEBUG set_agent_key_policy newly={}", newly.len());
         let mut removed: Vec<H> = Vec::new();
         for token in &newly {
             removed.extend(self.enforce_tunnel_locked(token));
         }
-        eprintln!("DEBUG set_agent_key_policy removed.len()={}", removed.len());
         removed
     }
 
@@ -2919,7 +2914,6 @@ impl<H: Clone> EdgeState<H> {
             .lock_safe()
             .get(token)
             .map_or_else(HashSet::new, |pin| pin.proven_ids.clone());
-        eprintln!("DEBUG enforce_tunnel_locked proven={:?}", proven);
         let mut removed: Vec<H> = Vec::new();
         {
             let mut agents = self.agents.write_safe();
@@ -2933,7 +2927,6 @@ impl<H: Clone> EdgeState<H> {
                     }
                 }
                 let evicted = before - v.len();
-                eprintln!("DEBUG enforce_tunnel_locked before={before} evicted={evicted} removed_len={}", removed.len());
                 // #359: the gauges move with the real removal, exactly like
                 // `remove_registration`'s own correction.
                 self.total_registrations_gauge
