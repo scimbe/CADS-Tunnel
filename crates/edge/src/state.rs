@@ -445,6 +445,193 @@ impl Default for Ja4Observations {
     }
 }
 
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// AUF-20261011-049 / INC-20261011-305 (B3): how strictly the Edge treats an
+/// Agent registration whose key binding is not proven. Every later slice takes
+/// this mode as a parameter, so the decision stays with the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AgentKeyMode {
+    /// Observe and count only -- never refuse, never evict. The default for
+    /// every tunnel, and deliberately neutral: in `Log` a proven registration
+    /// does not outrank an unproven one.
+    Log,
+    /// May refuse or evict an unproven registration. Only ever reached by a
+    /// tunnel that has shown a proof over TCP, see
+    /// [`EdgeState::agent_key_ready_for_enforce`].
+    Enforce,
+}
+
+impl AgentKeyMode {
+    /// Stable snake_case wire name for the log line and the snapshot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// AUF-20261011-049 (N8): why an Agent registration counted as an agent-key
+/// observation. Complete here so every later slice names its case from this
+/// one list instead of inventing a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AgentKeyReason {
+    /// Unproven, and no live registration on this tunnel.
+    Unproven,
+    /// Unproven, next to a live *proven* registration (B2) -- the shape an
+    /// intercepted Routing Token takes when the rightful Agent is still up.
+    UnprovenBesideProven,
+    /// Unproven, next to only unproven registrations: the tolerated overlap of
+    /// a reconnecting Agent with its own predecessor (#8, state.rs:1598-1602).
+    SecondUnproven,
+    /// Unproven on the TCP fallback path.
+    UnprovenTcp,
+    /// The presented key is not the key this tunnel is bound to.
+    ForeignKey,
+    /// The binding is older than the tunnel's current pin.
+    StaleBinding,
+    /// The binding names a different Routing Token than the one presented.
+    BindingToken,
+    /// The binding did not parse or its signature did not verify.
+    BadBinding,
+    /// The proof-of-possession did not verify.
+    BadProof,
+    /// The binding or its proof was past its validity.
+    Expired,
+    /// The peer did not send its binding/proof in time.
+    Timeout,
+    /// The binding or proof exceeded the accepted size.
+    Oversize,
+    /// An unproven registration was evicted because the tunnel was on
+    /// `Enforce`.
+    EvictedOnEnforce,
+}
+
+impl AgentKeyReason {
+    /// Stable snake_case wire name for the log line and the snapshot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unproven => "unproven",
+            Self::UnprovenBesideProven => "unproven_beside_proven",
+            Self::SecondUnproven => "second_unproven",
+            Self::UnprovenTcp => "unproven_tcp",
+            Self::ForeignKey => "foreign_key",
+            Self::StaleBinding => "stale_binding",
+            Self::BindingToken => "binding_token",
+            Self::BadBinding => "bad_binding",
+            Self::BadProof => "bad_proof",
+            Self::Expired => "expired",
+            Self::Timeout => "timeout",
+            Self::Oversize => "oversize",
+            Self::EvictedOnEnforce => "evicted_on_enforce",
+        }
+    }
+}
+
+/// AUF-20261011-049: what the Edge did about the observation above. This slice
+/// only ever reports `Admitted` -- nothing refuses or evicts yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AgentKeyAction {
+    /// The registration was let in (always the case in `Log`).
+    Admitted,
+    /// The registration was refused.
+    Refused,
+    /// A live registration was torn down.
+    Evicted,
+    /// The tunnel's key pin was moved to the presented key.
+    Repinned,
+}
+
+impl AgentKeyAction {
+    /// Stable snake_case wire name for the log line and the snapshot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Refused => "refused",
+            Self::Evicted => "evicted",
+            Self::Repinned => "repinned",
+        }
+    }
+}
+
+/// Hash of a Routing Token: the key every agent-key counter is kept under, so
+/// the token itself never enters a counter map, a snapshot or a log line.
+pub fn agent_key_token_hash(token: &RoutingToken) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(token.0).into()
+}
+
+/// First 8 hex characters of a token hash -- the only tunnel identifier that
+/// may appear in a log line or a snapshot (N6).
+fn agent_key_hash_prefix(token_hash: &[u8; 32]) -> String {
+    token_hash[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The one agent-key log line (N6/N18). A free function so a test can assert
+/// its exact shape -- and that it carries only the first 8 hex of the token
+/// *hash*, never the Routing Token.
+fn agent_key_violation_line(
+    token_hash: &[u8; 32],
+    reason: AgentKeyReason,
+    action: AgentKeyAction,
+    mode: AgentKeyMode,
+    remote: Option<std::net::IpAddr>,
+) -> String {
+    let remote = remote.map_or_else(|| "-".to_string(), |ip| ip.to_string());
+    format!(
+        "ct-edge: agent_key_violation mode={} action={} reason={} tunnel={} remote={}",
+        mode.as_str(),
+        action.as_str(),
+        reason.as_str(),
+        agent_key_hash_prefix(token_hash),
+        remote,
+    )
+}
+
+/// B2: every reason but `second_unproven` is at zero on this tunnel.
+fn agent_key_only_tolerated(entry: &AgentKeyTunnelCounts) -> bool {
+    entry
+        .reasons
+        .iter()
+        .all(|(reason, count)| *count == 0 || *reason == AgentKeyReason::SecondUnproven)
+}
+
+/// Conservative default for every tunnel in this slice: observe, never act.
+const AGENT_KEY_DEFAULT_MODE: AgentKeyMode = AgentKeyMode::Log;
+
+/// Upper bound on tracked tunnels, mirroring `WindowLogThrottle`'s
+/// `max_tracked`: a token flood must not grow the counter map without end.
+const AGENT_KEY_MAX_TRACKED: usize = 1024;
+
+/// How long one `agent_key_violation` line speaks for a (tunnel, reason).
+const AGENT_KEY_LOG_WINDOW_SECS: u64 = 300;
+
+/// Loudest keys a window summary would name.
+const AGENT_KEY_LOG_TOP_N: usize = 5;
+
+/// Throttle keyed by (token hash, reason) -- aliased so the field below stays
+/// one readable line.
+type AgentKeyThrottle = crate::log_throttle::WindowLogThrottle<([u8; 32], AgentKeyReason)>;
+
+/// One row of [`EdgeState::agent_key_snapshot`]: tunnel hash prefix (8 hex),
+/// mode, counts per reason, proven admissions, enforce readiness.
+pub type AgentKeySnapshotRow = (
+    String,
+    AgentKeyMode,
+    HashMap<AgentKeyReason, u64>,
+    u64,
+    bool,
+);
+
+/// One tunnel's agent-key tally (B2).
+#[derive(Debug, Default)]
+struct AgentKeyTunnelCounts {
+    /// Violations per reason; a reason absent from the map stands for 0.
+    reasons: HashMap<AgentKeyReason, u64>,
+    /// Admitted registrations on this tunnel whose key binding was proven.
+    proofs_admitted: u64,
+}
+
 /// Thread-safe registry of live Agent tunnels keyed by Routing Token, plus each
 /// Agent's Edge-observed peer candidate (its reflexive address) for P2P
 /// rendezvous (M11.1).
@@ -766,6 +953,25 @@ pub struct EdgeState<H> {
     /// registration/teardown/host-bind are connection-setup-time operations,
     /// not the data-relay hot path, so global serialization here is cheap.
     registration_lock: Mutex<()>,
+    /// AUF-20261011-049 (B2/N8): agent-key observations per tunnel, keyed by
+    /// `sha256(RoutingToken)`. Its own small map under its own mutex, never
+    /// under `registration_lock`, so counting an observation can never
+    /// serialize against a registration or a teardown.
+    agent_key_counts: Mutex<HashMap<[u8; 32], AgentKeyTunnelCounts>>,
+    /// Unix second this process started observing (B2). The counters restart
+    /// at zero after an Edge restart, so a readiness verdict only ever speaks
+    /// about the time since this moment.
+    agent_key_observed_since: u64,
+    /// Throttles the `agent_key_violation` line per (tunnel, reason) (N6/N18):
+    /// one full line per window, while the counters above count every single
+    /// occurrence.
+    agent_key_log_throttle: Mutex<AgentKeyThrottle>,
+    /// Lines actually emitted -- lets a test see "one line per window"
+    /// without reading stderr.
+    agent_key_log_lines: Counter,
+    /// Observations dropped because the counter map was at
+    /// `AGENT_KEY_MAX_TRACKED` and the tunnel was new.
+    agent_key_untracked: Counter,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -813,6 +1019,15 @@ impl<H: Clone> EdgeState<H> {
             tunnel_history: RwLock::new(None),
             flushed_bytes: Mutex::new(HashMap::new()),
             registration_lock: Mutex::new(()),
+            agent_key_counts: Mutex::new(HashMap::new()),
+            agent_key_observed_since: Self::wall_now(),
+            agent_key_log_throttle: Mutex::new(AgentKeyThrottle::new(
+                AGENT_KEY_LOG_WINDOW_SECS,
+                AGENT_KEY_MAX_TRACKED,
+                AGENT_KEY_LOG_TOP_N,
+            )),
+            agent_key_log_lines: Counter::default(),
+            agent_key_untracked: Counter::default(),
             active_tunnels_gauge: AtomicU64::new(0),
             total_registrations_gauge: AtomicU64::new(0),
         }
@@ -1268,6 +1483,154 @@ impl<H: Clone> EdgeState<H> {
     /// Cumulative counter snapshots for the metrics endpoint (#10 O2).
     pub fn registrations_total(&self) -> u64 {
         self.registrations.get()
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 -- count
+    /// one agent-key observation and, at most once per window, say it
+    /// (N6/N18). The counter counts every occurrence, the line does not. This
+    /// slice changes no registration behaviour: `route`/`routes` are
+    /// untouched, nothing is refused, `mode` is only reported.
+    pub fn note_agent_key_violation(
+        &self,
+        token: &RoutingToken,
+        reason: AgentKeyReason,
+        action: AgentKeyAction,
+        mode: AgentKeyMode,
+        remote: Option<std::net::IpAddr>,
+    ) {
+        let hash = agent_key_token_hash(token);
+        {
+            let mut counts = self.agent_key_counts.lock_safe();
+            if counts.len() >= AGENT_KEY_MAX_TRACKED && !counts.contains_key(&hash) {
+                // Bounded like the throttle's `max_tracked`; such an
+                // observation is still spoken, just not kept per tunnel.
+                self.agent_key_untracked.inc();
+            } else {
+                let entry = counts.entry(hash).or_default();
+                let slot = entry.reasons.entry(reason).or_insert(0);
+                *slot = slot.saturating_add(1);
+            }
+        }
+        let now = Self::wall_now();
+        let decision = self
+            .agent_key_log_throttle
+            .lock_safe()
+            .note(now, (hash, reason));
+        if decision == crate::log_throttle::LogDecision::LogFull {
+            self.agent_key_log_lines.inc();
+            eprintln!(
+                "{}",
+                agent_key_violation_line(&hash, reason, action, mode, remote)
+            );
+        }
+    }
+
+    /// Count one admitted registration whose key binding was proven, per
+    /// tunnel (B2) -- the only thing that can ever make a tunnel ready for
+    /// `Enforce`.
+    pub fn note_agent_key_proven(&self, token: &RoutingToken) {
+        let hash = agent_key_token_hash(token);
+        let mut counts = self.agent_key_counts.lock_safe();
+        if counts.len() >= AGENT_KEY_MAX_TRACKED && !counts.contains_key(&hash) {
+            self.agent_key_untracked.inc();
+            return;
+        }
+        let entry = counts.entry(hash).or_default();
+        entry.proofs_admitted = entry.proofs_admitted.saturating_add(1);
+    }
+
+    /// Observations of one reason on one tunnel.
+    pub fn agent_key_violations_for(&self, token_hash: &[u8; 32], reason: AgentKeyReason) -> u64 {
+        self.agent_key_counts
+            .lock_safe()
+            .get(token_hash)
+            .and_then(|c| c.reasons.get(&reason).copied())
+            .unwrap_or(0)
+    }
+
+    /// Proven admissions on one tunnel (B2).
+    pub fn agent_key_proofs_admitted_for(&self, token_hash: &[u8; 32]) -> u64 {
+        self.agent_key_counts
+            .lock_safe()
+            .get(token_hash)
+            .map_or(0, |c| c.proofs_admitted)
+    }
+
+    /// Sum of one reason across every tracked tunnel (metrics).
+    pub fn agent_key_violations_by_reason(&self, reason: AgentKeyReason) -> u64 {
+        self.agent_key_counts
+            .lock_safe()
+            .values()
+            .map(|c| c.reasons.get(&reason).copied().unwrap_or(0))
+            .sum()
+    }
+
+    /// Sum of every agent-key observation across every tracked tunnel.
+    pub fn agent_key_violations_total(&self) -> u64 {
+        self.agent_key_counts
+            .lock_safe()
+            .values()
+            .map(|c| c.reasons.values().sum::<u64>())
+            .sum()
+    }
+
+    /// Proven admissions across every tracked tunnel.
+    pub fn agent_key_proofs_admitted_total(&self) -> u64 {
+        self.agent_key_counts
+            .lock_safe()
+            .values()
+            .map(|c| c.proofs_admitted)
+            .sum()
+    }
+
+    /// Lines the throttle let through; the suppressed repeats are only
+    /// counted (N18).
+    pub fn agent_key_log_lines_total(&self) -> u64 {
+        self.agent_key_log_lines.get()
+    }
+
+    /// Observations dropped at `AGENT_KEY_MAX_TRACKED`.
+    pub fn agent_key_untracked_total(&self) -> u64 {
+        self.agent_key_untracked.get()
+    }
+
+    /// Unix second this Edge process started observing agent keys (B2).
+    pub fn agent_key_observed_since(&self) -> u64 {
+        self.agent_key_observed_since
+    }
+
+    /// B2: a tunnel may only move to `Enforce` once it has shown at least one
+    /// proven admission and carries no observation of any other kind.
+    /// `second_unproven` is the one tolerated overlap (a reconnect racing its
+    /// own predecessor, #8); `unproven_beside_proven` and `unproven_tcp` do
+    /// count and keep the tunnel out of `Enforce`.
+    pub fn agent_key_ready_for_enforce(&self, token_hash: &[u8; 32]) -> bool {
+        let counts = self.agent_key_counts.lock_safe();
+        let Some(entry) = counts.get(token_hash) else {
+            return false;
+        };
+        entry.proofs_admitted > 0 && agent_key_only_tolerated(entry)
+    }
+
+    /// Momentary view for metrics / the admin console (B2): one row per
+    /// tracked tunnel, plus the Unix second the observation began.
+    pub fn agent_key_snapshot(&self) -> (Vec<AgentKeySnapshotRow>, u64) {
+        let counts = self.agent_key_counts.lock_safe();
+        let mut rows: Vec<AgentKeySnapshotRow> = counts
+            .iter()
+            .map(|(hash, entry)| {
+                let ready = entry.proofs_admitted > 0 && agent_key_only_tolerated(entry);
+                (
+                    agent_key_hash_prefix(hash),
+                    AGENT_KEY_DEFAULT_MODE,
+                    entry.reasons.clone(),
+                    entry.proofs_admitted,
+                    ready,
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        (rows, self.agent_key_observed_since)
     }
     pub fn relays_total(&self) -> u64 {
         self.relays.get()
@@ -2180,6 +2543,164 @@ mod tests {
 
     fn token(b: u8) -> RoutingToken {
         RoutingToken([b; 32])
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn note_violation(state: &EdgeState<u32>, t: &RoutingToken, reason: AgentKeyReason) {
+        state.note_agent_key_violation(
+            t,
+            reason,
+            AgentKeyAction::Admitted,
+            AgentKeyMode::Log,
+            None,
+        );
+    }
+
+    #[test]
+    fn agent_key_count_049_counts_and_proofs_are_per_tunnel() {
+        // B2: the tally is keyed by sha256(token), so tunnel A's observations
+        // never show up on tunnel B -- the whole point of binding a join
+        // token to one tunnel instead of to a tenant.
+        let state = EdgeState::<u32>::new();
+        let (t1, t2) = (token(1), token(2));
+        let (h1, h2) = (agent_key_token_hash(&t1), agent_key_token_hash(&t2));
+        note_violation(&state, &t1, AgentKeyReason::Unproven);
+        note_violation(&state, &t1, AgentKeyReason::Unproven);
+        note_violation(&state, &t2, AgentKeyReason::Unproven);
+        note_violation(&state, &t2, AgentKeyReason::ForeignKey);
+        state.note_agent_key_proven(&t1);
+        state.note_agent_key_proven(&t1);
+
+        assert_eq!(
+            state.agent_key_violations_for(&h1, AgentKeyReason::Unproven),
+            2
+        );
+        assert_eq!(
+            state.agent_key_violations_for(&h2, AgentKeyReason::Unproven),
+            1
+        );
+        assert_eq!(
+            state.agent_key_violations_for(&h1, AgentKeyReason::ForeignKey),
+            0
+        );
+        assert_eq!(
+            state.agent_key_violations_by_reason(AgentKeyReason::Unproven),
+            3
+        );
+        assert_eq!(state.agent_key_violations_total(), 4);
+        assert_eq!(state.agent_key_proofs_admitted_for(&h1), 2);
+        assert_eq!(state.agent_key_proofs_admitted_for(&h2), 0);
+        assert_eq!(state.agent_key_proofs_admitted_total(), 2);
+    }
+
+    #[test]
+    fn agent_key_count_049_ready_for_enforce_needs_a_proof_and_a_clean_tally() {
+        // B2 / conservative voice: no tunnel goes to Enforce without a proof,
+        // and `second_unproven` (a reconnect overlapping itself, #8) is the
+        // only observation that is tolerated.
+        let t = token(7);
+        let h = agent_key_token_hash(&t);
+
+        let state = EdgeState::<u32>::new();
+        assert!(!state.agent_key_ready_for_enforce(&h), "no proof yet");
+        note_violation(&state, &t, AgentKeyReason::SecondUnproven);
+        assert!(!state.agent_key_ready_for_enforce(&h), "still no proof");
+
+        let proven_only_tolerated = EdgeState::<u32>::new();
+        proven_only_tolerated.note_agent_key_proven(&t);
+        note_violation(&proven_only_tolerated, &t, AgentKeyReason::SecondUnproven);
+        assert!(proven_only_tolerated.agent_key_ready_for_enforce(&h));
+
+        let beside_proven = EdgeState::<u32>::new();
+        beside_proven.note_agent_key_proven(&t);
+        note_violation(&beside_proven, &t, AgentKeyReason::UnprovenBesideProven);
+        assert!(
+            !beside_proven.agent_key_ready_for_enforce(&h),
+            "unproven_beside_proven counts and blocks Enforce"
+        );
+
+        let over_tcp = EdgeState::<u32>::new();
+        over_tcp.note_agent_key_proven(&t);
+        note_violation(&over_tcp, &t, AgentKeyReason::UnprovenTcp);
+        assert!(
+            !over_tcp.agent_key_ready_for_enforce(&h),
+            "unproven_tcp counts and blocks Enforce"
+        );
+    }
+
+    #[test]
+    fn agent_key_count_049_thousand_repeats_count_fully_but_log_once_per_window() {
+        // N18: the counter is the complete record, the line is throttled per
+        // (tunnel, reason).
+        let state = EdgeState::<u32>::new();
+        let t = token(9);
+        let h = agent_key_token_hash(&t);
+        for _ in 0..1000 {
+            note_violation(&state, &t, AgentKeyReason::BadProof);
+        }
+        assert_eq!(
+            state.agent_key_violations_for(&h, AgentKeyReason::BadProof),
+            1000
+        );
+        assert_eq!(state.agent_key_log_lines_total(), 1, "one line per window");
+        // A different reason on the same tunnel is its own throttle key.
+        note_violation(&state, &t, AgentKeyReason::Timeout);
+        assert_eq!(state.agent_key_log_lines_total(), 2);
+    }
+
+    #[test]
+    fn agent_key_count_049_log_line_carries_no_token_hex() {
+        // N6: only 8 hex of the token *hash*, never the Routing Token.
+        let t = token(0xab);
+        let h = agent_key_token_hash(&t);
+        let raw_hex: String = t.0.iter().map(|b| format!("{b:02x}")).collect();
+        let line = agent_key_violation_line(
+            &h,
+            AgentKeyReason::UnprovenBesideProven,
+            AgentKeyAction::Admitted,
+            AgentKeyMode::Log,
+            Some(std::net::IpAddr::from([198, 51, 100, 7])),
+        );
+        let prefix = agent_key_hash_prefix(&h);
+        assert_eq!(prefix.len(), 8);
+        assert_eq!(
+            line,
+            format!(
+                "ct-edge: agent_key_violation mode=log action=admitted \
+                 reason=unproven_beside_proven tunnel={prefix} remote=198.51.100.7"
+            )
+        );
+        assert!(!line.contains(&raw_hex), "no raw token hex in the line");
+        assert!(!line.contains("abab"), "no raw token hex in the line");
+
+        let without_remote = agent_key_violation_line(
+            &h,
+            AgentKeyReason::Unproven,
+            AgentKeyAction::Refused,
+            AgentKeyMode::Enforce,
+            None,
+        );
+        assert!(without_remote.ends_with("remote=-"), "{without_remote}");
+    }
+
+    #[test]
+    fn agent_key_count_049_snapshot_and_observed_since() {
+        // B2: the snapshot names the tunnel only by hash prefix and reports
+        // when this process started observing.
+        let state = EdgeState::<u32>::new();
+        let t = token(3);
+        note_violation(&state, &t, AgentKeyReason::Unproven);
+        state.note_agent_key_proven(&t);
+        let (rows, observed_since) = state.agent_key_snapshot();
+        assert!(observed_since > 0, "observed_since is set at construction");
+        assert_eq!(observed_since, state.agent_key_observed_since());
+        assert_eq!(rows.len(), 1);
+        let (prefix, mode, reasons, proofs, ready) = &rows[0];
+        assert_eq!(*prefix, agent_key_hash_prefix(&agent_key_token_hash(&t)));
+        assert_eq!(*mode, AgentKeyMode::Log, "every tunnel defaults to log");
+        assert_eq!(reasons.get(&AgentKeyReason::Unproven).copied(), Some(1));
+        assert_eq!(*proofs, 1);
+        assert!(!ready, "an unproven observation blocks Enforce");
     }
 
     #[test]
