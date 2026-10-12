@@ -1431,4 +1431,127 @@ mod tests {
         assert_eq!(revoke.status(), StatusCode::OK);
         assert!(state.access_policy(&token).is_none(), "revoke must drop the policy with the token");
     }
+
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+
+    /// One live QUIC connection, built the same way `serve.rs`'s own wire
+    /// tests do (`transport::build_server_endpoint_with_cert` /
+    /// `build_client_endpoint`) -- a real handle to hand to
+    /// `register_with_candidate_checked`, not a mock. The two endpoints are
+    /// returned alongside it so they outlive the connection for the rest of
+    /// the test.
+    async fn agent_key_admin_049_connection() -> (quinn::Endpoint, quinn::Endpoint, Connection) {
+        let (server, cert) = crate::transport::build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let client = crate::transport::build_client_endpoint(cert).expect("client");
+        let server_for_accept = server.clone();
+        let accept = tokio::spawn(async move {
+            server_for_accept.accept().await.expect("incoming").await.expect("server conn")
+        });
+        let client_conn = client.connect(addr, "localhost").expect("connect cfg").await.expect("client conn");
+        accept.await.expect("accept task");
+        (client, server, client_conn)
+    }
+
+    fn agent_key_admin_049_temp_path() -> std::path::PathBuf {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        std::env::temp_dir().join(format!("ct_edge_admin_enforce_{}_{name}.list", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn agent_key_admin_049_reload_and_status() {
+        use crate::state::{agent_key_token_hash, AgentKeyMode};
+        use std::collections::HashSet;
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x77u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let t = RoutingToken([0x11; 32]);
+        let path = agent_key_admin_049_temp_path();
+
+        // N15/N8: the enforce-list path is stored now, but it is not yet
+        // readable -- the list stays empty/Log until a reload actually runs.
+        state.set_agent_key_policy(AgentKeyMode::Log, HashSet::new(), Some(path.clone()), Vec::new());
+
+        let (_c1, _s1, proven_conn) = agent_key_admin_049_connection().await;
+        let (_c2, _s2, unproven_conn) = agent_key_admin_049_connection().await;
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                proven_conn,
+                cand(1),
+                AgentKeyMode::Log,
+                Some(crate::state::ProvenKey { key: [9u8; 32], issued_at: 10 }),
+                None,
+            )
+            .expect("proven registration admitted on Log");
+        state
+            .register_with_candidate_checked(t.clone(), unproven_conn, cand(2), AgentKeyMode::Log, None, None)
+            .expect("unproven registration admitted on Log");
+
+        let reload = |auth: Option<String>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::post("/admin/agent-key/reload");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // Reload without the admin token is refused, exactly like every other
+        // admin route -- nothing is read, nothing changes.
+        assert_eq!(reload(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // H4: the stored path is not yet readable -> 5xx, the old (empty/Log)
+        // list stays in force, nothing is closed.
+        assert_eq!(
+            reload(Some(secret_hex.clone())).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Log, "unreadable reload changes nothing");
+
+        // Now the file names this tunnel -> reload puts it on Enforce and
+        // evicts exactly the one unproven registration.
+        std::fs::write(&path, ct_common::hex::encode(&agent_key_token_hash(&t))).unwrap();
+        let resp = reload(Some(secret_hex.clone())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: AgentKeyReloadResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.closed, 1, "exactly the unproven registration is closed");
+        assert_eq!(parsed.enforce_tunnels, 1);
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+
+        let status = |auth: Option<String>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get("/admin/agent-key/status");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        assert_eq!(status(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        let resp = status(Some(secret_hex)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: AgentKeyStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed.note.contains("enforce disables the TCP fallback"),
+            "the fixed TCP-fallback hint is always present"
+        );
+        assert!(parsed.note.contains("observed_since"), "the counters' since-when is spelled out too");
+        let row = parsed
+            .tunnels
+            .iter()
+            .find(|r| r.mode == "Enforce")
+            .expect("the enforced tunnel shows up in the status rows, by hash prefix only");
+        assert!(!row.hash_prefix.is_empty());
+        assert!(row.proofs_admitted >= 1, "the proven registration counted");
+        assert!(row.ready_for_enforce, "a proven admission makes it ready");
+    }
 }

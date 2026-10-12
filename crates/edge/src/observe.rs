@@ -1226,4 +1226,34 @@ mod tests {
         assert_eq!(escape_prometheus_label("\\\"\n"), "\\\\\\\"\\n");
         assert_eq!(escape_prometheus_label("plain"), "plain");
     }
+
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    /// ct_edge_agent_key_violations_total renders one line per reason, summed
+    /// across tunnels -- and never a per-tunnel hash prefix, unlike the
+    /// admin-only status endpoint.
+    #[test]
+    fn agent_key_admin_049_violations_metric_renders_summed_by_reason() {
+        use crate::state::{AgentKeyAction, AgentKeyMode, AgentKeyReason};
+        let state: EdgeState<u32> = EdgeState::new();
+        state.note_agent_key_violation(
+            &token(5),
+            AgentKeyReason::Unproven,
+            AgentKeyAction::Admitted,
+            AgentKeyMode::Log,
+            None,
+        );
+        state.note_agent_key_violation(
+            &token(6),
+            AgentKeyReason::Unproven,
+            AgentKeyAction::Admitted,
+            AgentKeyMode::Log,
+            None,
+        );
+        let body = render_edge_metrics(&state, None);
+        assert!(body.contains("ct_edge_agent_key_violations_total{reason=\"unproven\"} 2"), "{body}");
+        assert!(
+            !body.contains(&token(5).0.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            "no per-tunnel identifier leaks into the export"
+        );
+    }
 }
