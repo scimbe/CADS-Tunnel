@@ -35,8 +35,14 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // stays mounted, unchanged, for back-compat during a mixed CP/edge-version
         // rollout. Both forward to the same inner logic -- only how the token is
         // extracted differs.
-        .route("/admin/authorize-host/:host", post(authorize_host_via_header))
+        .route(
+            "/admin/authorize-host/:host",
+            post(authorize_host_via_header),
+        )
         .route("/admin/host-auth-dump", get(host_auth_dump))
+        // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+        .route("/admin/agent-key/reload", post(reload_agent_key))
+        .route("/admin/agent-key/status", get(agent_key_status))
         .route("/admin/tunnel-status/:token", get(tunnel_status))
         // Static route, same path prefix as the `:token` one above -- axum/matchit
         // prefers an exact literal match over a same-position dynamic segment, so
@@ -49,8 +55,14 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // comes first: the portal's stored bridge grant binds the portal's OWN holder,
         // so the serving sidecar's holder is not derivable from it and the card asks
         // "who ELSE was here?" instead (see `channel_broker::ChannelPresence::holders_of`).
-        .route("/internal/channel/presence/:channel_hex", get(channel_presence_list))
-        .route("/internal/channel/presence/:channel_hex/:holder_hex", get(channel_presence_one))
+        .route(
+            "/internal/channel/presence/:channel_hex",
+            get(channel_presence_list),
+        )
+        .route(
+            "/internal/channel/presence/:channel_hex/:holder_hex",
+            get(channel_presence_one),
+        )
         // #776: read-only per-tunnel session history for the portal's "Connection history"
         // card -- same listener, gate, and `/internal/...` naming as the #763 presence
         // routes above, for the same reason (the CP is its only caller).
@@ -85,7 +97,11 @@ fn admin_authed(state: &EdgeState<Connection>, headers: &HeaderMap) -> bool {
 const ROUTING_TOKEN_HEADER: &str = "x-ct-routing-token";
 
 fn routing_token_from_header(headers: &HeaderMap) -> Option<String> {
-    headers.get(ROUTING_TOKEN_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string).filter(|s| !s.is_empty())
+    headers
+        .get(ROUTING_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
 }
 
 /// Serve the admin API on `listen` until the process ends.
@@ -169,7 +185,12 @@ async fn authorize_host_via_header(
     authorize_host_inner(state, token, host, q).await
 }
 
-async fn authorize_host_inner(state: Arc<EdgeState<Connection>>, token: String, host: String, q: ChannelTierQuery) -> StatusCode {
+async fn authorize_host_inner(
+    state: Arc<EdgeState<Connection>>,
+    token: String,
+    host: String,
+    q: ChannelTierQuery,
+) -> StatusCode {
     let host = host.trim();
     match parse_token_hex(&token) {
         Some(t) if !host.is_empty() => {
@@ -220,6 +241,107 @@ async fn host_auth_dump(
         })
         .collect();
     Ok(Json(entries))
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+#[derive(Serialize, serde::Deserialize)]
+struct AgentKeyReloadResponse {
+    enforce_tunnels: usize,
+    closed: usize,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+#[derive(Serialize, serde::Deserialize)]
+struct AgentKeyStatusTunnel {
+    hash_prefix: String,
+    mode: String,
+    reasons: std::collections::HashMap<String, u64>,
+    proofs_admitted: u64,
+    ready_for_enforce: bool,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+#[derive(Serialize, serde::Deserialize)]
+struct AgentKeyStatusResponse {
+    observed_since: u64,
+    tunnels: Vec<AgentKeyStatusTunnel>,
+    note: String,
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+///
+/// `POST /admin/agent-key/reload` (N4/H4): re-read the enforce-list file and
+/// put it in force. On success every evicted (unproven-beside-the-switch)
+/// connection is closed here and counted; on an unreadable or malformed file
+/// (H4) the previous list stays in force, nothing is closed, and this answers
+/// with a 5xx -- never a partial list.
+async fn reload_agent_key(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+) -> Result<Json<AgentKeyReloadResponse>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match state.reload_agent_key_policy_from_file() {
+        Ok(removed) => {
+            let closed = removed.len();
+            for conn in removed {
+                conn.close(0u32.into(), b"agent key policy reload");
+            }
+            let enforce_tunnels = state
+                .agent_key_snapshot()
+                .0
+                .iter()
+                .filter(|row| row.1 == crate::state::AgentKeyMode::Enforce)
+                .count();
+            Ok(Json(AgentKeyReloadResponse {
+                enforce_tunnels,
+                closed,
+            }))
+        }
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+///
+/// `GET /admin/agent-key/status` (N5/B2/B4): one row per tracked tunnel (hash
+/// prefix only, never the Routing Token), its mode, its violation counts by
+/// reason, how many proven admissions it has seen, and whether it is ready to
+/// move to `Enforce`. The counters are cumulative since `observed_since`; the
+/// fixed note repeats that and the TCP-fallback tradeoff of `Enforce`.
+async fn agent_key_status(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+) -> Result<Json<AgentKeyStatusResponse>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let (rows, observed_since) = state.agent_key_snapshot();
+    let tunnels = rows
+        .into_iter()
+        .map(
+            |(hash_prefix, mode, reasons, proofs_admitted, ready_for_enforce)| {
+                AgentKeyStatusTunnel {
+                    hash_prefix,
+                    mode: format!("{mode:?}"),
+                    reasons: reasons
+                        .into_iter()
+                        .map(|(k, v)| (format!("{k:?}"), v))
+                        .collect(),
+                    proofs_admitted,
+                    ready_for_enforce,
+                }
+            },
+        )
+        .collect();
+    Ok(Json(AgentKeyStatusResponse {
+        observed_since,
+        tunnels,
+        note: "enforce disables the TCP fallback; with UDP blocked the tunnel is offline -- \
+               counters are cumulative since observed_since"
+            .to_string(),
+    }))
 }
 
 #[derive(Serialize, serde::Deserialize)]
@@ -370,11 +492,17 @@ async fn channel_presence_one(
     if !admin_authed(&state, &headers) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let (Some(channel), Some(holder)) = (parse_token_hex(&channel_hex), parse_token_hex(&holder_hex)) else {
+    let (Some(channel), Some(holder)) =
+        (parse_token_hex(&channel_hex), parse_token_hex(&holder_hex))
+    else {
         return Err(StatusCode::BAD_REQUEST);
     };
     let now = crate::channel_broker::presence_unix_now();
-    let ago = crate::channel_broker::channel_presence_last_seen(&ct_common::channel::ChannelId(channel), &holder, now);
+    let ago = crate::channel_broker::channel_presence_last_seen(
+        &ct_common::channel::ChannelId(channel),
+        &holder,
+        now,
+    );
     Ok(Json(ChannelPresenceResp::from_last_seen(ago)))
 }
 
@@ -395,14 +523,17 @@ async fn channel_presence_list(
         return Err(StatusCode::BAD_REQUEST);
     };
     let now = crate::channel_broker::presence_unix_now();
-    let holders = crate::channel_broker::channel_presence_holders(&ct_common::channel::ChannelId(channel), now)
-        .into_iter()
-        .map(|(holder, ago)| ChannelPresenceHolder {
-            holder: holder.iter().map(|b| format!("{b:02x}")).collect(),
-            parked_now: crate::channel_broker::presence_is_serving(ago),
-            last_seen_secs_ago: ago,
-        })
-        .collect();
+    let holders = crate::channel_broker::channel_presence_holders(
+        &ct_common::channel::ChannelId(channel),
+        now,
+    )
+    .into_iter()
+    .map(|(holder, ago)| ChannelPresenceHolder {
+        holder: holder.iter().map(|b| format!("{b:02x}")).collect(),
+        parked_now: crate::channel_broker::presence_is_serving(ago),
+        last_seen_secs_ago: ago,
+    })
+    .collect();
     Ok(Json(ChannelPresenceListResp { holders }))
 }
 
@@ -425,7 +556,11 @@ impl ChannelPresenceResp {
                 parked_now: Some(crate::channel_broker::presence_is_serving(ago)),
                 last_seen_secs_ago: Some(ago),
             },
-            None => Self { seen: false, parked_now: None, last_seen_secs_ago: None },
+            None => Self {
+                seen: false,
+                parked_now: None,
+                last_seen_secs_ago: None,
+            },
         }
     }
 }
@@ -494,7 +629,11 @@ async fn tunnel_history(
     let Some(history) = state.tunnel_history() else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let limit = q.limit.filter(|&l| l > 0).unwrap_or(HISTORY_DEFAULT_LIMIT).min(HISTORY_MAX_LIMIT);
+    let limit = q
+        .limit
+        .filter(|&l| l > 0)
+        .unwrap_or(HISTORY_DEFAULT_LIMIT)
+        .min(HISTORY_MAX_LIMIT);
     // Re-derive the lowercase hex from the parsed bytes: the store is keyed by the exact
     // string `EdgeState` writes, and the caller's segment may be upper-case.
     let hex = crate::tunnel_history::routing_token_hex(&RoutingToken(t));
@@ -506,7 +645,11 @@ async fn tunnel_history(
     let open = history.open_session_exists(&hex).map_err(store_error)?;
     let uptime = history.uptime_summary(&hex, now).map_err(store_error)?;
     let sessions = history.sessions_for(&hex, limit).map_err(store_error)?;
-    Ok(Json(TunnelHistoryResp { open, uptime, sessions }))
+    Ok(Json(TunnelHistoryResp {
+        open,
+        uptime,
+        sessions,
+    }))
 }
 
 /// #782: the body of [`receipts_pubkey`].
@@ -535,10 +678,15 @@ async fn receipts_pubkey(
     let Some(history) = state.tunnel_history() else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let (Some(pubkey), Some(edge_id)) = (history.receipts_pubkey_hex(), history.receipts_edge_id()) else {
+    let (Some(pubkey), Some(edge_id)) = (history.receipts_pubkey_hex(), history.receipts_edge_id())
+    else {
         return Err(StatusCode::NOT_FOUND);
     };
-    Ok(Json(ReceiptsPubkeyResp { alg: "ed25519".into(), pubkey, edge_id: edge_id.to_string() }))
+    Ok(Json(ReceiptsPubkeyResp {
+        alg: "ed25519".into(),
+        pubkey,
+        edge_id: edge_id.to_string(),
+    }))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -587,7 +735,8 @@ async fn tunnel_receipts(
     let Some(history) = state.tunnel_history() else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let (Some(pubkey), Some(edge_id)) = (history.receipts_pubkey_hex(), history.receipts_edge_id()) else {
+    let (Some(pubkey), Some(edge_id)) = (history.receipts_pubkey_hex(), history.receipts_edge_id())
+    else {
         return Err(StatusCode::NOT_FOUND);
     };
     let limit = q
@@ -596,11 +745,17 @@ async fn tunnel_receipts(
         .unwrap_or(RECEIPTS_DEFAULT_LIMIT)
         .min(crate::tunnel_history::RECEIPTS_MAX_LIMIT);
     let token_hash = ct_common::receipt::routing_token_hash(&t);
-    let receipts = history.receipts_for(&token_hash, q.since.unwrap_or(0), limit).map_err(|e| {
-        eprintln!("ct-edge: receipts read failed: {e} (#782)");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    Ok(Json(TunnelReceiptsResp { pubkey, edge_id: edge_id.to_string(), receipts }))
+    let receipts = history
+        .receipts_for(&token_hash, q.since.unwrap_or(0), limit)
+        .map_err(|e| {
+            eprintln!("ct-edge: receipts read failed: {e} (#782)");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(TunnelReceiptsResp {
+        pubkey,
+        edge_id: edge_id.to_string(),
+        receipts,
+    }))
 }
 
 /// `POST /internal/tunnel/access-policy` (#779): the control plane's push of one
@@ -618,7 +773,10 @@ async fn set_access_policy(
     if !admin_authed(&state, &headers) {
         return StatusCode::UNAUTHORIZED;
     }
-    let Some(t) = routing_token_from_header(&headers).as_deref().and_then(parse_token_hex) else {
+    let Some(t) = routing_token_from_header(&headers)
+        .as_deref()
+        .and_then(parse_token_hex)
+    else {
         return StatusCode::BAD_REQUEST;
     };
     if let Some(p) = &policy {
@@ -680,14 +838,26 @@ mod tests {
         };
 
         // No / wrong admin token -> 401, nothing revoked.
-        assert_eq!(post(None, &target).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post(None, &target).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         let wrong: String = [0x00u8; 32].iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(post(Some(wrong), &target).await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert!(!state.is_revoked(&target_token), "not revoked without valid auth");
+        assert_eq!(
+            post(Some(wrong), &target).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(
+            !state.is_revoked(&target_token),
+            "not revoked without valid auth"
+        );
 
         // Correct admin token -> 200 and the token is revoked.
         assert_eq!(
-            post(Some(secret_hex.clone()), &target).await.unwrap().status(),
+            post(Some(secret_hex.clone()), &target)
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         assert!(state.is_revoked(&target_token), "token revoked");
@@ -711,7 +881,9 @@ mod tests {
 
         let post = |auth: Option<String>| {
             let app = admin_router(state.clone());
-            let mut req = Request::post(format!("/admin/authorize-host/{tok}/help.bunsenbrenner.org"));
+            let mut req = Request::post(format!(
+                "/admin/authorize-host/{tok}/help.bunsenbrenner.org"
+            ));
             if let Some(a) = auth {
                 req = req.header("x-ct-admin-token", a);
             }
@@ -723,9 +895,15 @@ mod tests {
         assert!(!state.host_bind_allowed("help.bunsenbrenner.org", &tok_token));
 
         // Correct auth -> 200, the (host, token) pair is now bind-allowed.
-        assert_eq!(post(Some(secret_hex)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            post(Some(secret_hex)).await.unwrap().status(),
+            StatusCode::OK
+        );
         assert!(state.host_bind_allowed("help.bunsenbrenner.org", &tok_token));
-        assert!(!state.host_bind_allowed("evil.example", &tok_token), "only the authorized host");
+        assert!(
+            !state.host_bind_allowed("evil.example", &tok_token),
+            "only the authorized host"
+        );
     }
 
     /// #666: the routing token must be acceptable via the `x-ct-routing-token` header on
@@ -757,17 +935,26 @@ mod tests {
         };
 
         // No admin auth at all -> 401, regardless of routing-token header.
-        assert_eq!(post(None, Some(&tok)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post(None, Some(&tok)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         assert!(!state.host_bind_allowed("help2.bunsenbrenner.org", &tok_token));
 
         // Correct admin auth, but no routing-token header -> 400, not treated as
         // "no owner" and not silently ignored.
-        assert_eq!(post(Some(&secret_hex), None).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post(Some(&secret_hex), None).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
         assert!(!state.host_bind_allowed("help2.bunsenbrenner.org", &tok_token));
 
         // Correct admin auth + routing token via header -> 200, host now bind-allowed --
         // matches the path-form route's own outcome exactly.
-        assert_eq!(post(Some(&secret_hex), Some(&tok)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            post(Some(&secret_hex), Some(&tok)).await.unwrap().status(),
+            StatusCode::OK
+        );
         assert!(state.host_bind_allowed("help2.bunsenbrenner.org", &tok_token));
     }
 
@@ -794,20 +981,36 @@ mod tests {
             )
         };
 
-        assert!(!state.is_gelb("gelb.bunsenbrenner.org"), "never marked -> not gelb");
+        assert!(
+            !state.is_gelb("gelb.bunsenbrenner.org"),
+            "never marked -> not gelb"
+        );
 
         assert_eq!(
-            post(format!("/admin/authorize-host/{tok}/gelb.bunsenbrenner.org?channel_tier=gelb")).await.unwrap().status(),
+            post(format!(
+                "/admin/authorize-host/{tok}/gelb.bunsenbrenner.org?channel_tier=gelb"
+            ))
+            .await
+            .unwrap()
+            .status(),
             StatusCode::OK
         );
         assert!(state.is_gelb("gelb.bunsenbrenner.org"));
 
         // No `channel_tier` param at all -> today's exact shape, and clears a previous Gelb mark.
         assert_eq!(
-            post(format!("/admin/authorize-host/{tok}/gelb.bunsenbrenner.org")).await.unwrap().status(),
+            post(format!(
+                "/admin/authorize-host/{tok}/gelb.bunsenbrenner.org"
+            ))
+            .await
+            .unwrap()
+            .status(),
             StatusCode::OK
         );
-        assert!(!state.is_gelb("gelb.bunsenbrenner.org"), "re-authorized with no tier -> reverted to passthrough");
+        assert!(
+            !state.is_gelb("gelb.bunsenbrenner.org"),
+            "re-authorized with no tier -> reverted to passthrough"
+        );
     }
 
     #[tokio::test]
@@ -833,13 +1036,20 @@ mod tests {
             app.oneshot(req.body(Body::empty()).unwrap())
         };
 
-        assert_eq!(get(None).await.unwrap().status(), StatusCode::UNAUTHORIZED, "no admin token -> 401");
+        assert_eq!(
+            get(None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "no admin token -> 401"
+        );
 
         let resp = get(Some(secret_hex)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let entries: Vec<HostAuthEntry> = serde_json::from_slice(&body).unwrap();
-        let mut pairs: Vec<(String, String)> = entries.into_iter().map(|e| (e.hostname, e.token)).collect();
+        let mut pairs: Vec<(String, String)> =
+            entries.into_iter().map(|e| (e.hostname, e.token)).collect();
         pairs.sort();
         assert_eq!(
             pairs,
@@ -876,15 +1086,25 @@ mod tests {
         };
 
         assert_eq!(
-            get(None, format!("/admin/tunnel-status/{tok_hex}")).await.unwrap().status(),
+            get(None, format!("/admin/tunnel-status/{tok_hex}"))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::UNAUTHORIZED,
             "no admin token -> 401"
         );
 
         // Never registered -> connected=false, registrations=0.
-        let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
+        let resp = get(
+            Some(secret_hex.clone()),
+            format!("/admin/tunnel-status/{tok_hex}"),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
         assert!(!status.connected);
         assert_eq!(status.registrations, 0);
@@ -896,8 +1116,15 @@ mod tests {
         // alone -- `note_relay` never registers/deregisters an agent).
         let t = RoutingToken(parse_token_hex(&tok_hex).unwrap());
         state.note_relay(&t, 300, 120, RelayKind::DataPlane);
-        let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp = get(
+            Some(secret_hex.clone()),
+            format!("/admin/tunnel-status/{tok_hex}"),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.bytes_received, 300, "client->agent direction");
         assert_eq!(status.bytes_sent, 120, "agent->client direction");
@@ -910,11 +1137,21 @@ mod tests {
         // apart from a real outage. Observed live on 2026-08-17 with kali.bunsenbrenner.org,
         // which answered real HTTP while this endpoint said connected=false.
         let _park = state.park_tcp_agent(t.clone());
-        let resp = get(Some(secret_hex.clone()), format!("/admin/tunnel-status/{tok_hex}")).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp = get(
+            Some(secret_hex.clone()),
+            format!("/admin/tunnel-status/{tok_hex}"),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status: TunnelStatusResp = serde_json::from_slice(&body).unwrap();
         assert!(status.connected, "a fallback-served tunnel is connected");
-        assert_eq!(status.fallback_parked, 1, "and the transport is visible, not merged away");
+        assert_eq!(
+            status.fallback_parked, 1,
+            "and the transport is visible, not merged away"
+        );
         assert_eq!(
             status.registrations, 0,
             "`registrations` keeps its QUIC-only meaning -- the two transports are reported \
@@ -923,7 +1160,10 @@ mod tests {
 
         // Malformed token hex -> 400, not a panic.
         assert_eq!(
-            get(Some(secret_hex), "/admin/tunnel-status/not-hex".to_string()).await.unwrap().status(),
+            get(Some(secret_hex), "/admin/tunnel-status/not-hex".to_string())
+                .await
+                .unwrap()
+                .status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -961,16 +1201,30 @@ mod tests {
         let list = format!("/internal/channel/presence/{channel_hex}");
 
         // No admin token -> 401 on both forms, nothing disclosed.
-        assert_eq!(get(None, one.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(get(None, list.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            get(None, one.clone()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(None, list.clone()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
 
         // Never admitted -> seen:false, and the list form is empty.
         let resp = get(Some(secret_hex.clone()), one.clone()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), r#"{"seen":false}"#, "the unseen shape is exactly this");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"seen":false}"#,
+            "the unseen shape is exactly this"
+        );
         let resp = get(Some(secret_hex.clone()), list.clone()).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: ChannelPresenceListResp = serde_json::from_slice(&body).unwrap();
         assert!(parsed.holders.is_empty());
 
@@ -982,13 +1236,20 @@ mod tests {
         );
         let resp = get(Some(secret_hex.clone()), one.clone()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: ChannelPresenceResp = serde_json::from_slice(&body).unwrap();
         assert!(parsed.seen);
         assert_eq!(parsed.parked_now, Some(true));
-        assert!(parsed.last_seen_secs_ago.unwrap() <= 2, "just admitted -> fresh: {parsed:?}");
+        assert!(
+            parsed.last_seen_secs_ago.unwrap() <= 2,
+            "just admitted -> fresh: {parsed:?}"
+        );
         let resp = get(Some(secret_hex.clone()), list.clone()).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: ChannelPresenceListResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.holders.len(), 1);
         assert_eq!(parsed.holders[0].holder, holder_hex);
@@ -996,11 +1257,23 @@ mod tests {
 
         // Malformed hex -> 400, not a panic (either segment).
         assert_eq!(
-            get(Some(secret_hex.clone()), format!("/internal/channel/presence/not-hex/{holder_hex}")).await.unwrap().status(),
+            get(
+                Some(secret_hex.clone()),
+                format!("/internal/channel/presence/not-hex/{holder_hex}")
+            )
+            .await
+            .unwrap()
+            .status(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            get(Some(secret_hex), format!("/internal/channel/presence/{channel_hex}/not-hex")).await.unwrap().status(),
+            get(
+                Some(secret_hex),
+                format!("/internal/channel/presence/{channel_hex}/not-hex")
+            )
+            .await
+            .unwrap()
+            .status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -1034,70 +1307,148 @@ mod tests {
         let path = format!("/internal/tunnel/history/{tok_hex}");
 
         // No admin token -> 401 (before any "is the store even on" answer leaks).
-        assert_eq!(get(None, path.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            get(None, path.clone()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         // Store not configured -> 404, the CP's fail-open signal.
-        assert_eq!(get(Some(secret_hex.clone()), path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(Some(secret_hex.clone()), path.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
 
         let history = Arc::new(SqliteTunnelHistory::open_in_memory().unwrap());
         state.set_tunnel_history(history.clone());
         let now = crate::tunnel_history::now_secs();
         // One CLOSED 12 h session inside the last 24 h, written directly to the store...
         let hex = crate::tunnel_history::routing_token_hex(&tok);
-        history.open_session(&hex, TRANSPORT_QUIC, now - 18 * 3600).unwrap();
-        history.add_session_bytes(&hex, 500, 200, now - 12 * 3600).unwrap();
-        history.close_session(&hex, now - 6 * 3600, "removed").unwrap();
+        history
+            .open_session(&hex, TRANSPORT_QUIC, now - 18 * 3600)
+            .unwrap();
+        history
+            .add_session_bytes(&hex, 500, 200, now - 12 * 3600)
+            .unwrap();
+        history
+            .close_session(&hex, now - 6 * 3600, "removed")
+            .unwrap();
         // ...and one OPEN session via the real registration path (a fallback park needs
         // no quinn handle, unlike `register`).
         let _park = state.park_tcp_agent(tok.clone());
 
-        let resp = get(Some(secret_hex.clone()), format!("{path}?limit=10")).await.unwrap();
+        let resp = get(Some(secret_hex.clone()), format!("{path}?limit=10"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: TunnelHistoryResp = serde_json::from_slice(&body).unwrap();
         assert!(parsed.open, "the park opened a live session");
         assert_eq!(parsed.sessions.len(), 2);
-        assert_eq!(parsed.sessions[0].transport, "tcp-fallback", "newest (open) first");
+        assert_eq!(
+            parsed.sessions[0].transport, "tcp-fallback",
+            "newest (open) first"
+        );
         assert_eq!(parsed.sessions[0].disconnected_at, None);
         assert_eq!(parsed.sessions[0].reason, None);
         assert_eq!(parsed.sessions[1].transport, "quic");
         assert_eq!(parsed.sessions[1].disconnected_at, Some(now - 6 * 3600));
         assert_eq!(parsed.sessions[1].reason.as_deref(), Some("removed"));
-        assert_eq!((parsed.sessions[1].bytes_in, parsed.sessions[1].bytes_out), (500, 200));
+        assert_eq!(
+            (parsed.sessions[1].bytes_in, parsed.sessions[1].bytes_out),
+            (500, 200)
+        );
         // 12 h closed + a just-opened live session (a few seconds at most) over 24 h.
-        assert!(parsed.uptime.h24 >= 50.0 && parsed.uptime.h24 < 50.1, "{:?}", parsed.uptime);
+        assert!(
+            parsed.uptime.h24 >= 50.0 && parsed.uptime.h24 < 50.1,
+            "{:?}",
+            parsed.uptime
+        );
         assert!(parsed.uptime.d7 > 0.0 && parsed.uptime.d30 > 0.0);
 
         // The raw JSON carries exactly the documented keys.
         let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let mut keys: Vec<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = raw
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["open", "sessions", "uptime"]);
-        let mut ukeys: Vec<&str> = raw["uptime"].as_object().unwrap().keys().map(String::as_str).collect();
+        let mut ukeys: Vec<&str> = raw["uptime"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         ukeys.sort_unstable();
         assert_eq!(ukeys, ["d30", "d7", "h24"]);
-        let mut skeys: Vec<&str> = raw["sessions"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        let mut skeys: Vec<&str> = raw["sessions"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         skeys.sort_unstable();
-        assert_eq!(skeys, ["bytes_in", "bytes_out", "connected_at", "disconnected_at", "reason", "transport"]);
+        assert_eq!(
+            skeys,
+            [
+                "bytes_in",
+                "bytes_out",
+                "connected_at",
+                "disconnected_at",
+                "reason",
+                "transport"
+            ]
+        );
 
         // `limit` is honoured (and an upper-case token segment resolves the same rows).
-        let resp = get(Some(secret_hex.clone()), format!("/internal/tunnel/history/{}?limit=1", tok_hex.to_uppercase()))
+        let resp = get(
+            Some(secret_hex.clone()),
+            format!(
+                "/internal/tunnel/history/{}?limit=1",
+                tok_hex.to_uppercase()
+            ),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let parsed: TunnelHistoryResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.sessions.len(), 1);
 
         // An unknown token is an empty, zero-uptime answer, not an error.
-        let resp = get(Some(secret_hex.clone()), format!("/internal/tunnel/history/{}", "7b".repeat(32))).await.unwrap();
+        let resp = get(
+            Some(secret_hex.clone()),
+            format!("/internal/tunnel/history/{}", "7b".repeat(32)),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: TunnelHistoryResp = serde_json::from_slice(&body).unwrap();
         assert!(!parsed.open && parsed.sessions.is_empty());
-        assert_eq!((parsed.uptime.h24, parsed.uptime.d7, parsed.uptime.d30), (0.0, 0.0, 0.0));
+        assert_eq!(
+            (parsed.uptime.h24, parsed.uptime.d7, parsed.uptime.d30),
+            (0.0, 0.0, 0.0)
+        );
 
         // Malformed hex -> 400, not a panic.
         assert_eq!(
-            get(Some(secret_hex), "/internal/tunnel/history/not-hex".to_string()).await.unwrap().status(),
+            get(
+                Some(secret_hex),
+                "/internal/tunnel/history/not-hex".to_string()
+            )
+            .await
+            .unwrap()
+            .status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -1132,91 +1483,203 @@ mod tests {
         let path = format!("/internal/tunnel/receipts/{tok_hex}");
 
         // No admin token -> 401 on both.
-        assert_eq!(get(None, pubkey_path.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(get(None, path.clone()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            get(None, pubkey_path.clone()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get(None, path.clone()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
         // No history store at all -> 404 on both.
-        assert_eq!(get(Some(secret_hex.clone()), pubkey_path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
-        assert_eq!(get(Some(secret_hex.clone()), path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(Some(secret_hex.clone()), pubkey_path.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(Some(secret_hex.clone()), path.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
 
         // A history store WITHOUT a signer (CT_EDGE_RECEIPTS=off) -> still 404 on both,
         // while the history route itself keeps working.
         state.set_tunnel_history(Arc::new(SqliteTunnelHistory::open_in_memory().unwrap()));
-        assert_eq!(get(Some(secret_hex.clone()), pubkey_path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
-        assert_eq!(get(Some(secret_hex.clone()), path.clone()).await.unwrap().status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            get(Some(secret_hex.clone()), format!("/internal/tunnel/history/{tok_hex}")).await.unwrap().status(),
+            get(Some(secret_hex.clone()), pubkey_path.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(Some(secret_hex.clone()), path.clone())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(
+                Some(secret_hex.clone()),
+                format!("/internal/tunnel/history/{tok_hex}")
+            )
+            .await
+            .unwrap()
+            .status(),
             StatusCode::OK
         );
 
         // With a signer: the pubkey route publishes the key + edge id...
         let signer = ReceiptSigner::from_seed(&[0x82u8; 32], "edge-82");
         let expected_pubkey = signer.pubkey_hex();
-        let history = Arc::new(SqliteTunnelHistory::open_in_memory().unwrap().with_receipts(signer).unwrap());
+        let history = Arc::new(
+            SqliteTunnelHistory::open_in_memory()
+                .unwrap()
+                .with_receipts(signer)
+                .unwrap(),
+        );
         state.set_tunnel_history(history.clone());
-        let resp = get(Some(secret_hex.clone()), pubkey_path.clone()).await.unwrap();
+        let resp = get(Some(secret_hex.clone()), pubkey_path.clone())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: ReceiptsPubkeyResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             parsed,
-            ReceiptsPubkeyResp { alg: "ed25519".into(), pubkey: expected_pubkey.clone(), edge_id: "edge-82".into() }
+            ReceiptsPubkeyResp {
+                alg: "ed25519".into(),
+                pubkey: expected_pubkey.clone(),
+                edge_id: "edge-82".into()
+            }
         );
 
         // ...and the receipts route pages the token's chain. Three sessions via the
         // store (six receipts), then one live open via the registration path.
         let hex = crate::tunnel_history::routing_token_hex(&tok);
         for i in 0..3 {
-            history.open_session(&hex, TRANSPORT_QUIC, 1_000 + i * 100).unwrap();
-            history.close_session(&hex, 1_050 + i * 100, "removed").unwrap();
+            history
+                .open_session(&hex, TRANSPORT_QUIC, 1_000 + i * 100)
+                .unwrap();
+            history
+                .close_session(&hex, 1_050 + i * 100, "removed")
+                .unwrap();
         }
         let _park = state.park_tcp_agent(tok.clone());
 
         let resp = get(Some(secret_hex.clone()), path.clone()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.pubkey, expected_pubkey);
         assert_eq!(parsed.edge_id, "edge-82");
-        assert_eq!(parsed.receipts.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
-        assert_eq!(parsed.receipts[6].kind, receipt::KIND_SESSION_OPEN, "the live park's open receipt");
+        assert_eq!(
+            parsed.receipts.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            (1..=7).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parsed.receipts[6].kind,
+            receipt::KIND_SESSION_OPEN,
+            "the live park's open receipt"
+        );
         assert_eq!(parsed.receipts[6].payload["transport"], "tcp-fallback");
-        assert!(!body.windows(64).any(|w| w == tok_hex.as_bytes()), "the raw routing token never appears");
-        assert_eq!(parsed.receipts[0].routing_token_hash, receipt::routing_token_hash(&tok.0));
+        assert!(
+            !body.windows(64).any(|w| w == tok_hex.as_bytes()),
+            "the raw routing token never appears"
+        );
+        assert_eq!(
+            parsed.receipts[0].routing_token_hash,
+            receipt::routing_token_hash(&tok.0)
+        );
         let key = receipt::pubkey_from_hex(&parsed.pubkey).unwrap();
-        receipt::verify_chain(&parsed.receipts, &key).expect("the served page verifies under the served key");
+        receipt::verify_chain(&parsed.receipts, &key)
+            .expect("the served page verifies under the served key");
         // The raw JSON carries exactly the documented top-level keys and receipt keys.
         let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let mut keys: Vec<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = raw
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["edge_id", "pubkey", "receipts"]);
-        let mut rkeys: Vec<&str> = raw["receipts"][0].as_object().unwrap().keys().map(String::as_str).collect();
+        let mut rkeys: Vec<&str> = raw["receipts"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         rkeys.sort_unstable();
         assert_eq!(
             rkeys,
-            ["edge_id", "hash", "kind", "payload", "prev_hash", "routing_token_hash", "seq", "sig", "ts"]
+            [
+                "edge_id",
+                "hash",
+                "kind",
+                "payload",
+                "prev_hash",
+                "routing_token_hash",
+                "seq",
+                "sig",
+                "ts"
+            ]
         );
 
         // `since` is an exclusive cursor and `limit` a page size (upper-case hex resolves too).
-        let upper = format!("/internal/tunnel/receipts/{}?since=2&limit=3", tok_hex.to_uppercase());
+        let upper = format!(
+            "/internal/tunnel/receipts/{}?since=2&limit=3",
+            tok_hex.to_uppercase()
+        );
         let resp = get(Some(secret_hex.clone()), upper).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed.receipts.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
-        let resp = get(Some(secret_hex.clone()), format!("{path}?since=7")).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            parsed.receipts.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        let resp = get(Some(secret_hex.clone()), format!("{path}?since=7"))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
-        assert!(parsed.receipts.is_empty(), "past the head -> empty page, not an error");
+        assert!(
+            parsed.receipts.is_empty(),
+            "past the head -> empty page, not an error"
+        );
 
         // An unknown token is an empty page; malformed hex -> 400.
         let unknown = format!("/internal/tunnel/receipts/{}", "7d".repeat(32));
         let resp = get(Some(secret_hex.clone()), unknown).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: TunnelReceiptsResp = serde_json::from_slice(&body).unwrap();
         assert!(parsed.receipts.is_empty());
         assert_eq!(
-            get(Some(secret_hex), "/internal/tunnel/receipts/not-hex".to_string()).await.unwrap().status(),
+            get(
+                Some(secret_hex),
+                "/internal/tunnel/receipts/not-hex".to_string()
+            )
+            .await
+            .unwrap()
+            .status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -1230,7 +1693,11 @@ mod tests {
     #[test]
     fn parse_token_hex_rejects_rather_than_panics_on_a_multi_byte_char_at_a_bad_offset() {
         let s: String = "\u{FFFD}".to_string() + &"a".repeat(61);
-        assert_eq!(s.len(), 64, "byte-length guard alone would let this through");
+        assert_eq!(
+            s.len(),
+            64,
+            "byte-length guard alone would let this through"
+        );
         assert_eq!(parse_token_hex(&s), None);
     }
 
@@ -1255,7 +1722,10 @@ mod tests {
             .header("x-ct-admin-token", secret_hex)
             .body(Body::empty())
             .unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -1270,7 +1740,8 @@ mod tests {
 
         let post = |auth: Option<String>, tok: Option<String>, body: &'static str| {
             let app = admin_router(state.clone());
-            let mut req = Request::post("/internal/tunnel/access-policy").header("content-type", "application/json");
+            let mut req = Request::post("/internal/tunnel/access-policy")
+                .header("content-type", "application/json");
             if let Some(a) = auth {
                 req = req.header("x-ct-admin-token", a);
             }
@@ -1282,12 +1753,27 @@ mod tests {
         let expiring = r#"{"expires_at":100}"#;
 
         // Wrong/missing admin auth -> 401, nothing stored.
-        assert_eq!(post(None, Some(tok_hex.clone()), expiring).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post(None, Some(tok_hex.clone()), expiring)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         assert!(state.access_policy(&token).is_none());
         // Missing / malformed routing token -> 400.
-        assert_eq!(post(Some(secret_hex.clone()), None, expiring).await.unwrap().status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            post(Some(secret_hex.clone()), Some("zz".repeat(32)), expiring).await.unwrap().status(),
+            post(Some(secret_hex.clone()), None, expiring)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(Some(secret_hex.clone()), Some("zz".repeat(32)), expiring)
+                .await
+                .unwrap()
+                .status(),
             StatusCode::BAD_REQUEST
         );
         // A policy that fails validation (day 9) -> 400, nothing stored.
@@ -1305,20 +1791,32 @@ mod tests {
         assert!(state.access_policy(&token).is_none());
 
         // A valid push lands in the map and is evaluated locally from then on.
-        let ok = post(Some(secret_hex.clone()), Some(tok_hex.clone()), expiring).await.unwrap();
+        let ok = post(Some(secret_hex.clone()), Some(tok_hex.clone()), expiring)
+            .await
+            .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
-        assert_eq!(state.access_policy(&token), Some(AccessPolicy { expires_at: Some(100), schedule: None }));
+        assert_eq!(
+            state.access_policy(&token),
+            Some(AccessPolicy {
+                expires_at: Some(100),
+                schedule: None
+            })
+        );
         assert!(state.access_window_open(&token, 99));
         assert!(!state.access_window_open(&token, 100));
 
         // `null` clears it.
-        let cleared = post(Some(secret_hex.clone()), Some(tok_hex.clone()), "null").await.unwrap();
+        let cleared = post(Some(secret_hex.clone()), Some(tok_hex.clone()), "null")
+            .await
+            .unwrap();
         assert_eq!(cleared.status(), StatusCode::OK);
         assert!(state.access_policy(&token).is_none());
         assert!(state.access_window_open(&token, 100));
 
         // Revoke clears a pushed policy too (the same admin listener's revoke route).
-        let again = post(Some(secret_hex.clone()), Some(tok_hex.clone()), expiring).await.unwrap();
+        let again = post(Some(secret_hex.clone()), Some(tok_hex.clone()), expiring)
+            .await
+            .unwrap();
         assert_eq!(again.status(), StatusCode::OK);
         let revoke = admin_router(state.clone())
             .oneshot(
@@ -1330,6 +1828,220 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoke.status(), StatusCode::OK);
-        assert!(state.access_policy(&token).is_none(), "revoke must drop the policy with the token");
+        assert!(
+            state.access_policy(&token).is_none(),
+            "revoke must drop the policy with the token"
+        );
+    }
+
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+
+    /// One live QUIC connection, built the same way `serve.rs`'s own wire
+    /// tests do (`transport::build_server_endpoint_with_cert` /
+    /// `build_client_endpoint`) -- a real handle to hand to
+    /// `register_with_candidate_checked`, not a mock. The two endpoints are
+    /// returned alongside it so they outlive the connection for the rest of
+    /// the test.
+    async fn agent_key_admin_049_connection() -> (quinn::Endpoint, quinn::Endpoint, Connection) {
+        let (server, cert) = crate::transport::build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let client = crate::transport::build_client_endpoint(cert).expect("client");
+        let server_for_accept = server.clone();
+        let accept = tokio::spawn(async move {
+            server_for_accept
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("server conn")
+        });
+        let client_conn = client
+            .connect(addr, "localhost")
+            .expect("connect cfg")
+            .await
+            .expect("client conn");
+        accept.await.expect("accept task");
+        (client, server, client_conn)
+    }
+
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn agent_key_admin_049_cand(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn agent_key_admin_049_temp_path() -> std::path::PathBuf {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        std::env::temp_dir().join(format!(
+            "ct_edge_admin_enforce_{}_{name}.list",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn agent_key_admin_049_reload_and_status() {
+        use crate::state::{agent_key_token_hash, AgentKeyMode};
+        use std::collections::HashSet;
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x77u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let t = RoutingToken([0x11; 32]);
+        // A second, untouched tunnel: a lone proven admission and nothing
+        // else, so B2's readiness check (`agent_key_ready_for_enforce`) has a
+        // row to say yes to -- `t` itself never can, because it is deliberately
+        // given an `unproven_beside_proven` violation below, and that reason
+        // is documented to keep a tunnel out of `Enforce` for good.
+        let t_clean = RoutingToken([0x22; 32]);
+        let path = agent_key_admin_049_temp_path();
+
+        // N15/N8: the enforce-list path is stored now, but it is not yet
+        // readable -- the list stays empty/Log until a reload actually runs.
+        state.set_agent_key_policy(
+            AgentKeyMode::Log,
+            HashSet::new(),
+            Some(path.clone()),
+            Vec::new(),
+        );
+
+        let (_c1, _s1, proven_conn) = agent_key_admin_049_connection().await;
+        let (_c2, _s2, unproven_conn) = agent_key_admin_049_connection().await;
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                proven_conn,
+                agent_key_admin_049_cand(1),
+                AgentKeyMode::Log,
+                Some(crate::state::ProvenKey {
+                    key: [9u8; 32],
+                    issued_at: 10,
+                }),
+                None,
+            )
+            .expect("proven registration admitted on Log");
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                unproven_conn,
+                agent_key_admin_049_cand(2),
+                AgentKeyMode::Log,
+                None,
+                None,
+            )
+            .expect("unproven registration admitted on Log");
+
+        let reload = |auth: Option<String>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::post("/admin/agent-key/reload");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        // Reload without the admin token is refused, exactly like every other
+        // admin route -- nothing is read, nothing changes.
+        assert_eq!(
+            reload(None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // H4: the stored path is not yet readable -> 5xx, the old (empty/Log)
+        // list stays in force, nothing is closed.
+        assert_eq!(
+            reload(Some(secret_hex.clone())).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            state.agent_key_mode_for(&t),
+            AgentKeyMode::Log,
+            "unreadable reload changes nothing"
+        );
+
+        // Now the file names this tunnel -> reload puts it on Enforce and
+        // evicts exactly the one unproven registration.
+        std::fs::write(&path, ct_common::hex::encode(&agent_key_token_hash(&t))).unwrap();
+        let resp = reload(Some(secret_hex.clone())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: AgentKeyReloadResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed.closed, 1,
+            "exactly the unproven registration is closed"
+        );
+        assert_eq!(parsed.enforce_tunnels, 1);
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+
+        // `t_clean` sees exactly one proven admission and nothing else, so it
+        // stays on `Log` (never named in the enforce file) while being ready.
+        let (_c3, _s3, proven_clean_conn) = agent_key_admin_049_connection().await;
+        state
+            .register_with_candidate_checked(
+                t_clean.clone(),
+                proven_clean_conn,
+                agent_key_admin_049_cand(3),
+                AgentKeyMode::Log,
+                Some(crate::state::ProvenKey {
+                    key: [9u8; 32],
+                    issued_at: 10,
+                }),
+                None,
+            )
+            .expect("proven registration on the untouched tunnel");
+
+        let status = |auth: Option<String>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::get("/admin/agent-key/status");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        assert_eq!(
+            status(None).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let resp = status(Some(secret_hex)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: AgentKeyStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed.note.contains("enforce disables the TCP fallback"),
+            "the fixed TCP-fallback hint is always present"
+        );
+        assert!(
+            parsed.note.contains("observed_since"),
+            "the counters' since-when is spelled out too"
+        );
+        let row = parsed
+            .tunnels
+            .iter()
+            .find(|r| r.mode == "Enforce")
+            .expect("the enforced tunnel shows up in the status rows, by hash prefix only");
+        assert!(!row.hash_prefix.is_empty());
+        assert!(row.proofs_admitted >= 1, "the proven registration counted");
+        assert!(
+            !row.ready_for_enforce,
+            "`t` saw an unproven_beside_proven violation, which keeps it out of Enforce readiness for good"
+        );
+        let clean = parsed
+            .tunnels
+            .iter()
+            .find(|r| r.mode == "Log")
+            .expect("the untouched tunnel stays on Log");
+        assert!(clean.proofs_admitted >= 1, "its proven admission counted");
+        assert!(
+            clean.ready_for_enforce,
+            "a lone proven admission makes the untouched tunnel ready"
+        );
     }
 }
