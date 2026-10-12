@@ -957,6 +957,8 @@ pub struct AuthedTunnelState {
 /// * `GET /me/channels/:channel/members` → list a channel's members (owner-scoped;
 ///   same follow-up -- membership was write-only before this)
 /// * `POST /me/channels/:channel/members/:holder/remove` → remove a member (revocation)
+/// * `POST /me/channels/:channel/grants/revoke` `{grant_digest, expires_at}` → revoke ONE
+///   signed grant by its SHA-256 digest (owner-scoped; the holder stays a member)
 /// * `POST /me/channels/:channel/allowlist` `{email}` → allow-list an email for
 ///   self-service claiming (#248-follow, owner-scoped)
 /// * `GET /me/channels/:channel/allowlist` → list allow-listed emails (owner-scoped)
@@ -988,6 +990,10 @@ pub fn authed_channel_router(
         .route(
             "/me/channels/:channel/members/:holder/remove",
             post(channel_remove_member),
+        )
+        .route(
+            "/me/channels/:channel/grants/revoke",
+            post(channel_revoke_grant_owner),
         )
         .route(
             "/me/channels/:channel/grants/:holder",
@@ -3747,6 +3753,267 @@ async fn channel_remove_member(
     } else {
         Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()))
     }
+}
+
+#[derive(Deserialize)]
+struct GrantRevokeReq {
+    /// SHA-256 of the signed grant (hex), see `SignedChannelGrant::digest`.
+    grant_digest: String,
+    /// The grant's own expiry: the entry may be dropped after it.
+    expires_at: u64,
+    /// Operator signature over `grant_revoke_signing_bytes` (hex); only used by the
+    /// signature-authenticated route.
+    #[serde(default)]
+    operator_sig: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GrantRevokeResp {
+    revoked: bool,
+    already: bool,
+    /// Present (and `true`) only when the grant was already past its expiry: no entry was
+    /// kept because none is needed. Older clients ignore the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
+}
+
+/// `POST /me/channels/:channel/grants/revoke`: revoke one signed grant, owner-scoped.
+/// This only restricts access (the same effect class as `remove_member`), so it gives
+/// the owner no privilege beyond what they already hold.
+async fn channel_revoke_grant_owner(
+    State(state): State<AuthedChannelState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<GrantRevokeReq>,
+) -> Result<Json<GrantRevokeResp>, (StatusCode, String)> {
+    let owner = subject_of_channel(&state.session_key, &state.verifier, &headers)?;
+    let channel = ChannelId(
+        hex_decode_32(&channel_hex).ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?,
+    );
+    let digest =
+        hex_decode_32(&req.grant_digest).ok_or((StatusCode::BAD_REQUEST, "malformed grant_digest".to_string()))?;
+    let channels = state.channels.clone();
+    let owned = tokio::task::spawn_blocking(move || {
+        let is_owner = channels.channel_owner(&channel)?.as_deref() == Some(owner.as_str());
+        Ok::<_, rusqlite::Error>((is_owner, owner))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !owned.0 {
+        return Err((StatusCode::FORBIDDEN, "not the channel owner".to_string()));
+    }
+    let resp = record_grant_revocation(&state.channels, &channel, &digest, req.expires_at).await?;
+    if let Some(audit) = &state.audit {
+        let _ = audit.record(
+            &owned.1,
+            "channel_grant_revoked",
+            Some(&channel_hex),
+            Some(&format!("grant_digest={}", req.grant_digest)),
+        );
+    }
+    Ok(Json(resp))
+}
+
+async fn record_grant_revocation(
+    channels: &Arc<SqliteChannelStore>,
+    channel: &ChannelId,
+    digest: &[u8; 32],
+    expires_at: u64,
+) -> Result<GrantRevokeResp, (StatusCode, String)> {
+    let (channels, channel, digest) = (channels.clone(), *channel, *digest);
+    let now = now_secs();
+    let stored = tokio::task::spawn_blocking(move || channels.revoke_grant(&channel, &digest, expires_at, now))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match stored {
+        None => Err((StatusCode::NOT_FOUND, "unknown channel".to_string())),
+        // Already past its expiry: the store keeps no entry, so do not claim one
+        // (`already` stays false: this call is the one that settled it).
+        Some(_) if expires_at <= now => Ok(GrantRevokeResp { revoked: true, already: false, expired: true }),
+        Some(new) => Ok(GrantRevokeResp { revoked: true, already: !new, expired: false }),
+    }
+}
+
+/// State of the signature-authenticated grant routes (no session, no admin token: the
+/// signature IS the credential).
+#[derive(Clone)]
+struct GrantSignedState {
+    channels: Arc<SqliteChannelStore>,
+    topologies: Arc<SqliteTopologyStore>,
+}
+
+/// Allowed clock skew for `/channel/grant-status` timestamps, seconds.
+const GRANT_STATUS_SKEW_SECS: u64 = 120;
+
+fn grant_signed_router(channels: Arc<SqliteChannelStore>, topologies: Arc<SqliteTopologyStore>) -> Router {
+    Router::new()
+        .route("/channel/grant-status", post(channel_grant_status))
+        .route("/channel/:channel/grant-revoke", post(channel_grant_revoke_signed))
+        .with_state(GrantSignedState { channels, topologies })
+}
+
+#[derive(Deserialize)]
+struct GrantStatusReq {
+    channel: String,
+    /// The asking member's own holder key (hex).
+    asker: String,
+    /// The peer holder whose grant is checked (hex).
+    peer: String,
+    grant_digest: String,
+    ts: u64,
+    /// Holder signature over `grant_status_signing_bytes` (hex).
+    sig: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GrantStatusResp {
+    /// `valid`, `revoked` or `not-member`.
+    state: String,
+    checked_at: u64,
+}
+
+fn holder_authorized(
+    channels: &SqliteChannelStore,
+    topologies: &SqliteTopologyStore,
+    channel: &ChannelId,
+    holder: &[u8; 32],
+) -> rusqlite::Result<bool> {
+    if channels.authorize_holder(channel, holder)?.is_some() {
+        return Ok(true);
+    }
+    Ok(topologies.topology_authorizes(channel, holder)?.is_some())
+}
+
+/// `POST /channel/grant-status`: lets a running forward session's accept side ask
+/// whether the peer's grant is still good. Only a current member of the channel,
+/// proving possession of its holder key, may ask (no oracle for outsiders).
+async fn channel_grant_status(
+    State(state): State<GrantSignedState>,
+    Json(req): Json<GrantStatusReq>,
+) -> Result<Json<GrantStatusResp>, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    let channel = ChannelId(hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST.into_response())?);
+    let asker = hex_decode_32(&req.asker).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let peer = hex_decode_32(&req.peer).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let digest = hex_decode_32(&req.grant_digest).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let sig = hex_decode_64(&req.sig).ok_or(StatusCode::BAD_REQUEST.into_response())?;
+    let now = now_secs();
+    if now.abs_diff(req.ts) > GRANT_STATUS_SKEW_SECS {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    let msg = ct_common::channel::grant_status_signing_bytes(&channel, &peer, &digest, req.ts);
+    if !ct_common::channel::verify_holder_possession(&asker, &msg, &sig) {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    let st = state.clone();
+    let state_name = tokio::task::spawn_blocking(move || {
+        if st.channels.channel_owner(&channel)?.is_none() {
+            return Ok::<_, rusqlite::Error>(None);
+        }
+        if !holder_authorized(&st.channels, &st.topologies, &channel, &asker)? {
+            return Ok(Some("asker-not-member"));
+        }
+        if !holder_authorized(&st.channels, &st.topologies, &channel, &peer)? {
+            return Ok(Some("not-member"));
+        }
+        if st.channels.is_grant_revoked(&channel, &digest)? {
+            return Ok(Some("revoked"));
+        }
+        Ok(Some("valid"))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
+    match state_name {
+        // A body, so that an agent can tell "this control plane has the endpoint and no such
+        // channel" (the channel is gone: its sessions end) from the bare 404 of an older control
+        // plane that has no such endpoint at all (its sessions keep running, with a warning).
+        None => Err((StatusCode::NOT_FOUND, Json(GrantStatusResp { state: "unknown-channel".to_string(), checked_at: now })).into_response()),
+        // Also with a body, for the same reason: a proxy in front of the control plane can answer
+        // a bare 403, and an agent must only end its sessions at once on the control plane's own word.
+        Some("asker-not-member") => Err((StatusCode::FORBIDDEN, Json(GrantStatusResp { state: "asker-not-member".to_string(), checked_at: now })).into_response()),
+        Some(s) => Ok(Json(GrantStatusResp { state: s.to_string(), checked_at: now })),
+    }
+}
+
+/// `POST /channel/:channel/grant-revoke`: revoke one grant on the strength of the channel
+/// operator's signature alone (for an operator without a portal session). Restrictive
+/// only; replay is harmless because the entry is idempotent and the signature binds
+/// the expiry.
+async fn channel_grant_revoke_signed(
+    State(state): State<GrantSignedState>,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<GrantRevokeReq>,
+) -> Result<Json<GrantRevokeResp>, (StatusCode, String)> {
+    let channel = ChannelId(
+        hex_decode_32(&channel_hex).ok_or((StatusCode::BAD_REQUEST, "malformed channel".to_string()))?,
+    );
+    let digest =
+        hex_decode_32(&req.grant_digest).ok_or((StatusCode::BAD_REQUEST, "malformed grant_digest".to_string()))?;
+    let sig = req
+        .operator_sig
+        .as_deref()
+        .and_then(hex_decode_64)
+        .ok_or((StatusCode::BAD_REQUEST, "missing or malformed operator_sig".to_string()))?;
+    let channels = state.channels.clone();
+    let operator = tokio::task::spawn_blocking(move || channels.operator_pubkey(&channel))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown channel".to_string()))?;
+    let msg = ct_common::channel::grant_revoke_signing_bytes(&channel, &digest, req.expires_at);
+    if !ct_common::channel::verify_holder_possession(&operator, &msg, &sig) {
+        return Err((StatusCode::FORBIDDEN, "bad operator signature".to_string()));
+    }
+    Ok(Json(record_grant_revocation(&state.channels, &channel, &digest, req.expires_at).await?))
+}
+
+#[derive(Deserialize)]
+struct GrantRevokedQuery {
+    channel: String,
+    digests: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GrantRevokedResp {
+    revoked: Vec<String>,
+}
+
+/// `POST /internal/channel/grant-revoked` (edge, admin token): which of `digests` are on
+/// the revocation list of `channel`. Used by the edge at admission and by its splice sweep.
+async fn channel_grant_revoked(
+    State(state): State<AdminChannelState>,
+    headers: HeaderMap,
+    Json(req): Json<GrantRevokedQuery>,
+) -> Result<Json<GrantRevokedResp>, StatusCode> {
+    if !admin_token_ok(&headers, &state.admin_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if req.digests.len() > 1024 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let channel = ChannelId(hex_decode_32(&req.channel).ok_or(StatusCode::BAD_REQUEST)?);
+    let digests = req
+        .digests
+        .iter()
+        .map(|d| hex_decode_32(d).ok_or(StatusCode::BAD_REQUEST))
+        .collect::<Result<Vec<_>, _>>()?;
+    let channels = state.channels.clone();
+    let revoked = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for d in digests {
+            if channels.is_grant_revoked(&channel, &d)? {
+                out.push(hex_encode(&d));
+            }
+        }
+        Ok::<_, rusqlite::Error>(out)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(GrantRevokedResp { revoked }))
 }
 
 /// `DELETE /me/channels/:channel` (video-conferencing feature follow-up): fully
@@ -6730,6 +6997,9 @@ pub fn persistent_control_plane_router(
             // #327: the Edge's boot-time revoked-tokens fetch.
             .merge(internal_revoked_tokens_router(tunnels.clone(), admin_tok));
     }
+    // Signature-authenticated grant status / operator revoke. Always mounted: the
+    // signature is the credential, and these only read or restrict.
+    app = app.merge(grant_signed_router(channels.clone(), topologies.clone()));
     // Authenticated per-subject endpoints (`/me/*`) (M26.1). #328: always mounted
     // now, regardless of whether a verifier is installed yet -- each handler
     // checks `oidc`'s current readiness per-request via `subject_of`, returning
@@ -6899,6 +7169,7 @@ fn internal_channel_authorize_router(
 ) -> Router {
     Router::new()
         .route("/internal/channel/authorize", post(channel_authorize))
+        .route("/internal/channel/grant-revoked", post(channel_grant_revoked))
         .with_state(AdminChannelState {
             channels,
             topologies,
@@ -12258,6 +12529,183 @@ mod tests {
             StatusCode::CONFLICT,
             "a pair whose derived channel is already owned by someone else is rejected, not silently taken over"
         );
+    }
+
+    /// Per-grant revocation end to end over the HTTP surface: operator-signed revoke,
+    /// member-signed status, edge-facing digest lookup, owner-session revoke.
+    #[tokio::test]
+    async fn grant_revocation_endpoints_status_revoke_and_edge_lookup() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let op_sk = SigningKey::from_bytes(&[0x41u8; 32]);
+        let asker_sk = SigningKey::from_bytes(&[0x42u8; 32]);
+        let peer = [0x43u8; 32];
+        let outsider_sk = SigningKey::from_bytes(&[0x44u8; 32]);
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let ch = ChannelId([0xC6u8; 32]);
+        assert!(channels.register_channel(&ch, &op_sk.verifying_key().to_bytes(), "alice").unwrap());
+        let asker = asker_sk.verifying_key().to_bytes();
+        assert!(channels.add_member(&ch, "alice", &asker, &[0u8; 32], &[0u8; 64]).unwrap());
+        assert!(channels.add_member(&ch, "alice", &peer, &[0u8; 32], &[0u8; 64]).unwrap());
+
+        let signed = grant_signed_router(channels.clone(), topologies.clone());
+        let digest = [0x99u8; 32];
+        let other_digest = [0x98u8; 32];
+        let now = now_secs();
+        let ch_hex = hex_encode(&ch.0);
+
+        let status = |who: &SigningKey, d: [u8; 32], ts: u64| {
+            let who_pub = who.verifying_key().to_bytes();
+            let msg = ct_common::channel::grant_status_signing_bytes(&ch, &peer, &d, ts);
+            let sig = who.sign(&msg).to_bytes();
+            let body = format!(
+                r#"{{"channel":"{ch_hex}","asker":"{}","peer":"{}","grant_digest":"{}","ts":{ts},"sig":"{}"}}"#,
+                hex_encode(&who_pub),
+                hex_encode(&peer),
+                hex_encode(&d),
+                hex_encode(&sig)
+            );
+            signed.clone().oneshot(
+                Request::post("/channel/grant-status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let state_of = |r: axum::response::Response| async move {
+            let b = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+            serde_json::from_slice::<GrantStatusResp>(&b).unwrap().state
+        };
+
+        // Before any revocation: valid for a member asker.
+        let r = status(&asker_sk, digest, now).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(state_of(r).await, "valid");
+        // An outsider (not a member) and a stale timestamp are refused.
+        let r = status(&outsider_sk, digest, now).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state_of(r).await, "asker-not-member", "the refusal names itself, unlike a proxy's bare 403");
+        assert_eq!(status(&asker_sk, digest, now - 1_000).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // An unknown channel is a 404 WITH a body naming it, so an agent can tell it from the
+        // bare 404 an older control plane gives for a route it does not have.
+        {
+            let ghost = ChannelId([0xEEu8; 32]);
+            let msg = ct_common::channel::grant_status_signing_bytes(&ghost, &peer, &digest, now);
+            let body = format!(
+                r#"{{"channel":"{}","asker":"{}","peer":"{}","grant_digest":"{}","ts":{now},"sig":"{}"}}"#,
+                hex_encode(&ghost.0),
+                hex_encode(&asker),
+                hex_encode(&peer),
+                hex_encode(&digest),
+                hex_encode(&asker_sk.sign(&msg).to_bytes())
+            );
+            let r = signed
+                .clone()
+                .oneshot(
+                    Request::post("/channel/grant-status")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND);
+            assert_eq!(state_of(r).await, "unknown-channel");
+            let missing = signed
+                .clone()
+                .oneshot(Request::post("/channel/no-such-route").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            assert!(to_bytes(missing.into_body(), 1 << 16).await.unwrap().is_empty(), "a missing route has no body");
+        }
+
+        // Operator-signed revoke: wrong key refused, right key accepted, replay idempotent.
+        let revoke = |sk: &SigningKey, d: [u8; 32], exp: u64| {
+            let sig = sk.sign(&ct_common::channel::grant_revoke_signing_bytes(&ch, &d, exp)).to_bytes();
+            let body = format!(
+                r#"{{"grant_digest":"{}","expires_at":{exp},"operator_sig":"{}"}}"#,
+                hex_encode(&d),
+                hex_encode(&sig)
+            );
+            signed.clone().oneshot(
+                Request::post(format!("/channel/{ch_hex}/grant-revoke"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(revoke(&outsider_sk, digest, now + 3_600).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(revoke(&op_sk, digest, now + 3_600).await.unwrap().status(), StatusCode::OK);
+        let again = revoke(&op_sk, digest, now + 3_600).await.unwrap();
+        let b = to_bytes(again.into_body(), 1 << 16).await.unwrap();
+        assert!(serde_json::from_slice::<GrantRevokeResp>(&b).unwrap().already, "replay is idempotent");
+        // A grant that is already past its expiry is accepted, not kept, and says so.
+        let past = revoke(&op_sk, [0x77; 32], now - 10).await.unwrap();
+        assert_eq!(past.status(), StatusCode::OK);
+        let b = to_bytes(past.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!((v["revoked"].as_bool(), v["already"].as_bool(), v["expired"].as_bool()), (Some(true), Some(false), Some(true)));
+        assert!(!channels.is_grant_revoked(&ch, &[0x77; 32]).unwrap(), "no entry is kept for an expired grant");
+        let normal = revoke(&op_sk, digest, now + 3_600).await.unwrap();
+        let normal: serde_json::Value = serde_json::from_slice(&to_bytes(normal.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert!(normal.get("expired").is_none(), "the field is absent on a normal answer");
+
+        // Status now reports revoked for that digest only; the holder stays a member.
+        let r = status(&asker_sk, digest, now).await.unwrap();
+        assert_eq!(state_of(r).await, "revoked");
+        let r = status(&asker_sk, other_digest, now).await.unwrap();
+        assert_eq!(state_of(r).await, "valid", "a different grant of the same holder is unaffected");
+
+        // Removing the peer yields not-member (holder-level revocation, existing path).
+        assert!(channels.remove_member(&ch, "alice", &peer).unwrap());
+        let r = status(&asker_sk, other_digest, now).await.unwrap();
+        assert_eq!(state_of(r).await, "not-member");
+
+        // Edge-facing lookup needs the admin token and returns exactly the revoked digests.
+        let admin = [0x7au8; 32];
+        let internal = internal_channel_authorize_router(channels.clone(), topologies.clone(), admin);
+        let lookup = |tok: Option<String>| {
+            let mut req = Request::post("/internal/channel/grant-revoked").header("content-type", "application/json");
+            if let Some(t) = tok {
+                req = req.header("x-ct-admin-token", t);
+            }
+            let body = format!(r#"{{"channel":"{ch_hex}","digests":["{}","{}"]}}"#, hex_encode(&digest), hex_encode(&other_digest));
+            internal.clone().oneshot(req.body(Body::from(body)).unwrap())
+        };
+        assert_eq!(lookup(None).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let r = lookup(Some(hex_encode(&admin))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let b = to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<GrantRevokedResp>(&b).unwrap().revoked, vec![hex_encode(&digest)]);
+
+        // Owner-session route: only the owner may revoke.
+        let session_key = b"test-session-key".as_slice();
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(b"realm-secret", "https://kc/realms/ct"));
+        let app = authed_channel_router(
+            channels.clone(),
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(session_key),
+            Arc::new(SqliteLedger::open_in_memory().unwrap()),
+            None,
+        );
+        let owner_post = |who: &str, d: [u8; 32]| {
+            let cookie = format!("ct_portal_session={}", crate::portal::sign_session_for_test(session_key, who));
+            app.clone().oneshot(
+                Request::post(format!("/me/channels/{ch_hex}/grants/revoke"))
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie)
+                    .body(Body::from(format!(r#"{{"grant_digest":"{}","expires_at":{}}}"#, hex_encode(&d), now + 3_600)))
+                    .unwrap(),
+            )
+        };
+        assert_eq!(owner_post("mallory", other_digest).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(owner_post("alice", other_digest).await.unwrap().status(), StatusCode::OK);
+        assert!(channels.is_grant_revoked(&ch, &other_digest).unwrap());
     }
 
     #[tokio::test]

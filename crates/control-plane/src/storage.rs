@@ -5600,7 +5600,8 @@ impl ClaimOutcome {
 
 /// Every table keyed by `channel` that must not outlive its channel row. Constant
 /// names, so interpolating them into SQL carries no injection surface.
-const CHANNEL_DEPENDENT_TABLES: [&str; 5] = [
+const CHANNEL_DEPENDENT_TABLES: [&str; 6] = [
+    "channel_grant_revocations",
     "channel_members",
     "channel_allowlist",
     "channel_member_subjects",
@@ -5703,7 +5704,17 @@ impl SqliteChannelStore {
         // without the member's private holder key (#81 possession challenge), so this
         // adds no bearer surface.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS channel_grant_deposits (
+            // Per-grant revocation list, keyed by the SHA-256 digest of the signed grant.
+            // Additive: rows are only written by the revoke endpoint and may be deleted
+            // once `expires_at` has passed (the grant no longer verifies anyway).
+            "CREATE TABLE IF NOT EXISTS channel_grant_revocations (
+                 channel      BLOB NOT NULL,
+                 grant_digest BLOB NOT NULL,
+                 revoked_at   INTEGER NOT NULL,
+                 expires_at   INTEGER NOT NULL,
+                 PRIMARY KEY (channel, grant_digest)
+             );
+             CREATE TABLE IF NOT EXISTS channel_grant_deposits (
                  channel      BLOB NOT NULL,
                  holder       BLOB NOT NULL,
                  grant_hex    TEXT NOT NULL,
@@ -6220,6 +6231,67 @@ impl SqliteChannelStore {
             }
         }
         Ok(false)
+    }
+
+    /// Record the signed grant with SHA-256 digest `grant_digest` as revoked on `channel`.
+    /// Returns `None` for an unknown channel, `Some(true)` when the row is new and
+    /// `Some(false)` when it already existed (idempotent; the first `revoked_at` is kept).
+    /// Rows past their `expires_at` are purged on every write: such a grant no longer
+    /// verifies, so the entry carries no information any more. A grant that is already
+    /// past its expiry (`expires_at <= now`) is therefore not recorded at all and the
+    /// call still answers `Some(true)`: nothing is left to revoke. Both times are
+    /// stored saturated to `i64::MAX`, so a far-future expiry stays far in the future
+    /// instead of wrapping negative and being purged by the next write.
+    pub fn revoke_grant(
+        &self,
+        channel: &ChannelId,
+        grant_digest: &[u8; 32],
+        expires_at: u64,
+        now: u64,
+    ) -> rusqlite::Result<Option<bool>> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction()?;
+        let known: bool = tx
+            .query_row(
+                "SELECT 1 FROM channels WHERE channel = ?1",
+                params![&channel.0[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !known {
+            return Ok(None);
+        }
+        let now_db = i64::try_from(now).unwrap_or(i64::MAX);
+        let expires_db = i64::try_from(expires_at).unwrap_or(i64::MAX);
+        tx.execute(
+            "DELETE FROM channel_grant_revocations WHERE expires_at <= ?1",
+            params![now_db],
+        )?;
+        if expires_at <= now {
+            tx.commit()?;
+            return Ok(Some(true));
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO channel_grant_revocations \
+             (channel, grant_digest, revoked_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![&channel.0[..], &grant_digest[..], now_db, expires_db],
+        )?;
+        tx.commit()?;
+        Ok(Some(inserted > 0))
+    }
+
+    /// Whether the grant with `grant_digest` is on the revocation list of `channel`.
+    pub fn is_grant_revoked(&self, channel: &ChannelId, grant_digest: &[u8; 32]) -> rusqlite::Result<bool> {
+        Ok(self
+            .read()
+            .query_row(
+                "SELECT 1 FROM channel_grant_revocations WHERE channel = ?1 AND grant_digest = ?2",
+                params![&channel.0[..], &grant_digest[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Remove `holder` from `channel`. Owner-scoped, idempotent; `false` if not the
@@ -8005,6 +8077,54 @@ pub struct ManagedDomainHostnameRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_revocation_is_per_digest_idempotent_and_purged_after_expiry() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        let other = ChannelId([0x12; 32]);
+        assert!(s.register_channel(&ch, &[0x22; 32], "alice").unwrap());
+        let (d1, d2) = ([1u8; 32], [2u8; 32]);
+        assert!(!s.is_grant_revoked(&ch, &d1).unwrap());
+        assert_eq!(s.revoke_grant(&ch, &d1, 2_000, 1_000).unwrap(), Some(true));
+        assert_eq!(s.revoke_grant(&ch, &d1, 2_000, 1_500).unwrap(), Some(false), "idempotent");
+        assert!(s.is_grant_revoked(&ch, &d1).unwrap());
+        assert!(!s.is_grant_revoked(&ch, &d2).unwrap(), "another grant of the same holder is untouched");
+        assert!(!s.is_grant_revoked(&other, &d1).unwrap(), "scoped to the channel");
+        assert_eq!(s.revoke_grant(&other, &d1, 2_000, 1_000).unwrap(), None, "unknown channel");
+        // a later write after expiry purges the stale row
+        assert_eq!(s.revoke_grant(&ch, &d2, 9_000, 2_001).unwrap(), Some(true));
+        assert!(!s.is_grant_revoked(&ch, &d1).unwrap(), "expired entry is purged");
+        assert!(s.is_grant_revoked(&ch, &d2).unwrap());
+    }
+
+    #[test]
+    fn a_grant_with_a_very_distant_expiry_stays_revoked_across_later_writes() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        assert!(s.register_channel(&ch, &[0x22; 32], "alice").unwrap());
+        let (far, beyond, other) = ([3u8; 32], [5u8; 32], [4u8; 32]);
+        // u64::MAX does not fit a SQLite integer; it must not wrap negative and look expired.
+        assert_eq!(s.revoke_grant(&ch, &far, u64::MAX, 1_000).unwrap(), Some(true));
+        assert_eq!(s.revoke_grant(&ch, &other, 9_000_000_000_000, 2_000_000_000_000).unwrap(), Some(true));
+        assert!(s.is_grant_revoked(&ch, &far).unwrap(), "a later write must not purge it");
+        let just_over = u64::try_from(i64::MAX).unwrap() + 5;
+        assert_eq!(s.revoke_grant(&ch, &beyond, just_over, 2_000_000_000_001).unwrap(), Some(true));
+        assert_eq!(s.revoke_grant(&ch, &[6u8; 32], 9_000_000_000_000, 2_000_000_000_002).unwrap(), Some(true));
+        assert!(s.is_grant_revoked(&ch, &beyond).unwrap());
+        assert!(s.is_grant_revoked(&ch, &far).unwrap());
+    }
+
+    #[test]
+    fn a_grant_already_past_its_expiry_is_not_recorded() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x11; 32]);
+        assert!(s.register_channel(&ch, &[0x22; 32], "alice").unwrap());
+        assert_eq!(s.revoke_grant(&ch, &[8u8; 32], 500, 1_000).unwrap(), Some(true));
+        assert_eq!(s.revoke_grant(&ch, &[8u8; 32], 1_000, 1_000).unwrap(), Some(true), "expires_at == now counts as expired");
+        assert!(!s.is_grant_revoked(&ch, &[8u8; 32]).unwrap());
+        assert_eq!(s.revoke_grant(&ChannelId([0x12; 32]), &[8u8; 32], 500, 1_000).unwrap(), None, "unknown channel still reported");
+    }
 
     #[test]
     fn every_sqlite_store_constructs_via_the_shared_ctor_macro() {

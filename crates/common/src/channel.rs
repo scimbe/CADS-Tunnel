@@ -322,6 +322,14 @@ impl SignedChannelGrant {
         out
     }
 
+    /// SHA-256 over [`SignedChannelGrant::encode`] (signature included): the identity
+    /// of one concrete signed grant. Re-signing the same fields yields a different
+    /// digest, which is what lets a revocation list name exactly one grant.
+    pub fn digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.encode()).into()
+    }
+
     /// Decode from [`SignedChannelGrant::encode`]'s wire form.
     pub fn decode(bytes: &[u8]) -> Result<Self, GrantError> {
         fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], GrantError> {
@@ -2888,6 +2896,33 @@ pub fn redeem_invitation(
 
 use crate::hex::encode as hex32;
 
+/// Bytes the channel operator (or any signer the control plane accepts for it) signs to
+/// revoke the grant with `grant_digest` on `channel`. `expires_at` is bound so a replayed
+/// message cannot be re-submitted with an earlier expiry that would purge the entry.
+pub fn grant_revoke_signing_bytes(channel: &ChannelId, grant_digest: &[u8; 32], expires_at: u64) -> Vec<u8> {
+    let mut out = b"ct-grant-revoke:v1|".to_vec();
+    out.extend_from_slice(&channel.0);
+    out.push(b'|');
+    out.extend_from_slice(grant_digest);
+    out.push(b'|');
+    out.extend_from_slice(&expires_at.to_le_bytes());
+    out
+}
+
+/// Bytes a channel member signs with its holder key to ask whether `peer`'s grant
+/// (`grant_digest`) is still valid on `channel`. `ts` bounds replay.
+pub fn grant_status_signing_bytes(channel: &ChannelId, peer: &[u8; 32], grant_digest: &[u8; 32], ts: u64) -> Vec<u8> {
+    let mut out = b"ct-grant-status:v1|".to_vec();
+    out.extend_from_slice(&channel.0);
+    out.push(b'|');
+    out.extend_from_slice(peer);
+    out.push(b'|');
+    out.extend_from_slice(grant_digest);
+    out.push(b'|');
+    out.extend_from_slice(&ts.to_le_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3288,6 +3323,35 @@ mod tests {
             (ProposalDecision::Accept.tag(), ProposalDecision::Reject.tag(), ProposalDecision::Counter.tag()),
             (0, 1, 2), "decision tags are stable"
         );
+    }
+
+    /// The grant digest and the revoke signing bytes are a contract with ct-agent (own
+    /// repo, own release cadence), which recomputes both. Pins the bytes themselves.
+    #[test]
+    fn grant_digest_and_revoke_bytes_are_pinned_for_cross_repo_use() {
+        use sha2::{Digest, Sha256};
+        let signed = SignedChannelGrant {
+            grant: ChannelGrant {
+                channel: ChannelId([0x11; 32]),
+                holder: [0x22; 32],
+                direction: Direction::Both,
+                rights: Rights::Read,
+                delegable: false,
+                expires_at: 2000,
+            },
+            signature: [0xaa; 64],
+        };
+        assert_eq!(
+            crate::hex::encode(&signed.digest()),
+            "76e43324c486202745e98926f6362b6966ee3935f24aa72a784f77deb103d662"
+        );
+        let bytes = grant_revoke_signing_bytes(&ChannelId([0x11; 32]), &[1; 32], 2000);
+        assert_eq!(
+            crate::hex::encode(&Sha256::digest(&bytes)[..]),
+            "91c32e4a8bb5cf5b4b4558386703235bf9237894886927054867028a96d1fbf9"
+        );
+        assert!(bytes.starts_with(b"ct-grant-revoke:v1|"));
+        assert!(grant_status_signing_bytes(&ChannelId([0x11; 32]), &[2; 32], &[1; 32], 5).starts_with(b"ct-grant-status:v1|"));
     }
 
     #[test]
