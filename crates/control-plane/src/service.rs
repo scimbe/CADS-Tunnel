@@ -3924,7 +3924,9 @@ async fn channel_grant_status(
         // channel" (the channel is gone: its sessions end) from the bare 404 of an older control
         // plane that has no such endpoint at all (its sessions keep running, with a warning).
         None => Err((StatusCode::NOT_FOUND, Json(GrantStatusResp { state: "unknown-channel".to_string(), checked_at: now })).into_response()),
-        Some("asker-not-member") => Err(StatusCode::FORBIDDEN.into_response()),
+        // Also with a body, for the same reason: a proxy in front of the control plane can answer
+        // a bare 403, and an agent must only end its sessions at once on the control plane's own word.
+        Some("asker-not-member") => Err((StatusCode::FORBIDDEN, Json(GrantStatusResp { state: "asker-not-member".to_string(), checked_at: now })).into_response()),
         Some(s) => Ok(Json(GrantStatusResp { state: s.to_string(), checked_at: now })),
     }
 }
@@ -12577,7 +12579,9 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(state_of(r).await, "valid");
         // An outsider (not a member) and a stale timestamp are refused.
-        assert_eq!(status(&outsider_sk, digest, now).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let r = status(&outsider_sk, digest, now).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(state_of(r).await, "asker-not-member", "the refusal names itself, unlike a proxy's bare 403");
         assert_eq!(status(&asker_sk, digest, now - 1_000).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         // An unknown channel is a 404 WITH a body naming it, so an agent can tell it from the
         // bare 404 an older control plane gives for a route it does not have.
