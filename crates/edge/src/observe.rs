@@ -40,6 +40,41 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
         Some(secs) => format!("ct_edge_tcp_fallback_reaper_last_tick_seconds_ago {secs}\n"),
         None => String::new(),
     };
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    // One line per `AgentKeyReason`, summed across every tracked tunnel --
+    // never a per-tunnel identifier (the hash prefix stays admin-only).
+    let agent_key_violations = {
+        use crate::state::AgentKeyReason::*;
+        let reasons = [
+            Unproven,
+            UnprovenBesideProven,
+            SecondUnproven,
+            UnprovenTcp,
+            ForeignKey,
+            StaleBinding,
+            BindingToken,
+            BadBinding,
+            BadProof,
+            Expired,
+            Timeout,
+            Oversize,
+            EvictedOnEnforce,
+            Revoked,
+        ];
+        let mut s = String::from(
+            "# HELP ct_edge_agent_key_violations_total Agent-key policy observations since \
+             start, by reason, summed across every tracked tunnel.\n\
+             # TYPE ct_edge_agent_key_violations_total counter\n",
+        );
+        for reason in reasons {
+            s.push_str(&format!(
+                "ct_edge_agent_key_violations_total{{reason=\"{}\"}} {}\n",
+                reason.as_str(),
+                state.agent_key_violations_by_reason(reason)
+            ));
+        }
+        s
+    };
     let mut out = format!(
         "# HELP ct_edge_active_tunnels Distinct routing tokens with at least one live agent.\n\
          # TYPE ct_edge_active_tunnels gauge\n\
@@ -50,6 +85,7 @@ pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Optio
          # HELP ct_edge_registrations_total Agent registrations accepted since start.\n\
          # TYPE ct_edge_registrations_total counter\n\
          ct_edge_registrations_total {registrations}\n\
+         {agent_key_violations}\
          # HELP ct_edge_relays_total Client relays served since start.\n\
          # TYPE ct_edge_relays_total counter\n\
          ct_edge_relays_total {relays}\n\
@@ -136,6 +172,7 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         tunnels = state.active_tunnels(),
         agents = state.total_registrations(),
         registrations = state.registrations_total(),
+        agent_key_violations = agent_key_violations,
         relays = state.relays_total(),
         relay_bytes = state.relay_bytes_total(),
         relay_bytes_browser = state.relay_bytes_by_kind().0,

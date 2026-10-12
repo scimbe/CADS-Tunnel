@@ -37,6 +37,9 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // extracted differs.
         .route("/admin/authorize-host/:host", post(authorize_host_via_header))
         .route("/admin/host-auth-dump", get(host_auth_dump))
+        // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+        .route("/admin/agent-key/reload", post(reload_agent_key))
+        .route("/admin/agent-key/status", get(agent_key_status))
         .route("/admin/tunnel-status/:token", get(tunnel_status))
         // Static route, same path prefix as the `:token` one above -- axum/matchit
         // prefers an exact literal match over a same-position dynamic segment, so
@@ -220,6 +223,102 @@ async fn host_auth_dump(
         })
         .collect();
     Ok(Json(entries))
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+#[derive(Serialize, serde::Deserialize)]
+struct AgentKeyReloadResponse {
+    enforce_tunnels: usize,
+    closed: usize,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+#[derive(Serialize, serde::Deserialize)]
+struct AgentKeyStatusTunnel {
+    hash_prefix: String,
+    mode: String,
+    reasons: std::collections::HashMap<String, u64>,
+    proofs_admitted: u64,
+    ready_for_enforce: bool,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+#[derive(Serialize, serde::Deserialize)]
+struct AgentKeyStatusResponse {
+    observed_since: u64,
+    tunnels: Vec<AgentKeyStatusTunnel>,
+    note: String,
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+///
+/// `POST /admin/agent-key/reload` (N4/H4): re-read the enforce-list file and
+/// put it in force. On success every evicted (unproven-beside-the-switch)
+/// connection is closed here and counted; on an unreadable or malformed file
+/// (H4) the previous list stays in force, nothing is closed, and this answers
+/// with a 5xx -- never a partial list.
+async fn reload_agent_key(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+) -> Result<Json<AgentKeyReloadResponse>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match state.reload_agent_key_policy_from_file() {
+        Ok(removed) => {
+            let closed = removed.len();
+            for conn in removed {
+                conn.close(0u32.into(), b"agent key policy reload");
+            }
+            let enforce_tunnels = state
+                .agent_key_snapshot()
+                .0
+                .iter()
+                .filter(|row| row.1 == crate::state::AgentKeyMode::Enforce)
+                .count();
+            Ok(Json(AgentKeyReloadResponse {
+                enforce_tunnels,
+                closed,
+            }))
+        }
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+///
+/// `GET /admin/agent-key/status` (N5/B2/B4): one row per tracked tunnel (hash
+/// prefix only, never the Routing Token), its mode, its violation counts by
+/// reason, how many proven admissions it has seen, and whether it is ready to
+/// move to `Enforce`. The counters are cumulative since `observed_since`; the
+/// fixed note repeats that and the TCP-fallback tradeoff of `Enforce`.
+async fn agent_key_status(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+) -> Result<Json<AgentKeyStatusResponse>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let (rows, observed_since) = state.agent_key_snapshot();
+    let tunnels = rows
+        .into_iter()
+        .map(
+            |(hash_prefix, mode, reasons, proofs_admitted, ready_for_enforce)| AgentKeyStatusTunnel {
+                hash_prefix,
+                mode: format!("{mode:?}"),
+                reasons: reasons.into_iter().map(|(k, v)| (format!("{k:?}"), v)).collect(),
+                proofs_admitted,
+                ready_for_enforce,
+            },
+        )
+        .collect();
+    Ok(Json(AgentKeyStatusResponse {
+        observed_since,
+        tunnels,
+        note: "enforce disables the TCP fallback; with UDP blocked the tunnel is offline -- \
+               counters are cumulative since observed_since"
+            .to_string(),
+    }))
 }
 
 #[derive(Serialize, serde::Deserialize)]
