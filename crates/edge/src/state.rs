@@ -1883,9 +1883,7 @@ impl<H: Clone> EdgeState<H> {
         // receive it (a dropped receiver means that slot is gone either way).
         // Saturating (#510): a gauge can never owe parks, and a miscounted
         // increment elsewhere must show as 0, not wrap to u64::MAX in /metrics.
-        let _ = self
-            .tcp_parked_gauge
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |g| Some(g.saturating_sub(1)));
+        saturating_dec(&self.tcp_parked_gauge);
         let sent = tx.send(stream);
         if sent.is_ok() {
             self.tcp_deliveries.inc();
@@ -1945,9 +1943,7 @@ impl<H: Clone> EdgeState<H> {
         }
         drop(agents);
         for _ in 0..reaped {
-            let _ = self
-                .tcp_parked_gauge
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |g| Some(g.saturating_sub(1)));
+            saturating_dec(&self.tcp_parked_gauge);
         }
         reaped
     }
@@ -3033,6 +3029,24 @@ impl<H: Clone> EdgeState<H> {
 impl<H: Clone> Default for EdgeState<H> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Decrements a gauge without going below zero. A compare-exchange loop
+/// rather than `fetch_update`, which newer toolchains deprecate under a name
+/// the workspace's minimum Rust version does not have yet.
+fn saturating_dec(gauge: &AtomicU64) {
+    let mut current = gauge.load(Ordering::Relaxed);
+    while current != 0 {
+        match gauge.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(seen) => current = seen,
+        }
     }
 }
 
