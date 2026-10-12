@@ -2067,13 +2067,32 @@ pub async fn serve_connection(
             // concurrent revoke can't complete inside the gap between a
             // separate check and a separate register call — see that method's
             // doc for the exact race this closes.
-            let Some(reg) =
-                state.register_with_candidate_unless_revoked(token.clone(), conn.clone(), conn.remote_address())
-            else {
-                send.write_all(b"NO").await?;
-                send.finish()?;
-                return Ok(None);
+            // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (B3):
+            // the same checked admission Rolle 'V' below uses, with NO proof --
+            // so an unproven 'A' registration is counted on every tunnel and
+            // refused only where the policy says `Enforce`. In `Log` the answer
+            // bytes and the order of events are exactly what they were before.
+            let admitted = state.register_with_candidate_checked(
+                token.clone(),
+                conn.clone(),
+                conn.remote_address(),
+                state.agent_key_mode_for(&token),
+                None,
+                Some(conn.remote_address().ip()),
+            );
+            let (reg, removed) = match admitted {
+                Ok(pair) => pair,
+                Err(_reason) => {
+                    send.write_all(b"NO").await?;
+                    send.finish()?;
+                    return Ok(None);
+                }
             };
+            // Empty for 'A' (an unproven registration never repins), iterated
+            // anyway so the one close path is shared with Rolle 'V'.
+            for old in removed {
+                old.close(0u32.into(), b"agent key repinned");
+            }
             send.write_all(b"OK").await?;
             send.finish()?;
             // #583: this event was previously silent -- diagnosing whether an
@@ -2112,6 +2131,80 @@ pub async fn serve_connection(
             // keeping this path non-blocking preserves the "register then return"
             // contract the relay harnesses depend on (they serve 'A' then 'C' on
             // one task).
+            Ok(Some((token, reg)))
+        }
+        // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (B1):
+        // Rolle 'V' is Rolle 'A' plus a proof that the peer holds the key an
+        // issuer bound to THIS Routing Token -- `'V'` was the unassigned byte
+        // ('A' 'C' 'D' 'H' 'P' 'W' 'R' are taken). No Agent in the field (rc.2,
+        // 0.7.39) ever sends it, so adding it changes nothing for them; a failed
+        // handshake is refused in BOTH modes because only a brand-new client can
+        // reach this arm at all.
+        b'V' => {
+            let mut token = [0u8; 32];
+            tokio::time::timeout(ROLE_DISPATCH_TIMEOUT, recv.read_exact(&mut token))
+                .await
+                .map_err(|_| "serve_connection: 'V' token not received in time (#449)")??;
+            let token = RoutingToken(token);
+            let mode = state.agent_key_mode_for(&token);
+            let issuers = state.agent_key_issuers();
+            let remote = conn.remote_address();
+            // Nonce out, binding + proof-of-possession back -- verified locally,
+            // without any control-plane round trip (INC-20261011-004).
+            let proof = crate::agent_key::prove_agent_key(
+                &mut recv,
+                &mut send,
+                &token,
+                &issuers,
+                unix_now(),
+            )
+            .await;
+            let proven = match proof {
+                Ok(proven) => proven,
+                Err(reason) => {
+                    state.note_agent_key_violation(
+                        &token,
+                        reason,
+                        crate::state::AgentKeyAction::Refused,
+                        mode,
+                        Some(remote.ip()),
+                    );
+                    send.write_all(b"NO").await?;
+                    send.finish()?;
+                    return Ok(None);
+                }
+            };
+            let admitted = state.register_with_candidate_checked(
+                token.clone(),
+                conn.clone(),
+                remote,
+                mode,
+                Some(proven),
+                Some(remote.ip()),
+            );
+            let (reg, removed) = match admitted {
+                Ok(pair) => pair,
+                Err(_reason) => {
+                    send.write_all(b"NO").await?;
+                    send.finish()?;
+                    return Ok(None);
+                }
+            };
+            // A strictly newer binding for a different key repins the tunnel and
+            // hands back the registrations it displaced; this module never owns a
+            // connection beyond closing it.
+            for old in removed {
+                old.close(0u32.into(), b"agent key repinned");
+            }
+            send.write_all(b"OK").await?;
+            send.finish()?;
+            {
+                let mut th_buf = [0u8; 8];
+                let th = token_hex(&token, &mut th_buf);
+                eprintln!(
+                    "ct-edge: agent registered (proven key) token={th} reg={reg} remote={remote:?}"
+                );
+            }
             Ok(Some((token, reg)))
         }
         b'C' => {
@@ -2486,6 +2579,11 @@ async fn admit_tcp_agent_a<S>(
     state: &EdgeState<Connection>,
     tcp_agent_cap: Option<&ConnectionCap>,
     role_label: &'static str,
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3): the
+    // connecting socket's source IP, already at hand in `serve_tcp_connection`
+    // for #603's audit record, so the agent-key observation on the fallback can
+    // name where the park came from.
+    peer_ip: std::net::IpAddr,
 ) -> Result<
     Option<(
         RoutingToken,
@@ -2497,6 +2595,15 @@ async fn admit_tcp_agent_a<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3): the
+    // admission body below is left untouched ON PURPOSE -- its answer bytes and
+    // their order are what every Agent in the field (rc.2, 0.7.39) already sees
+    // on this path. What changes is where its park goes: through this shim, so
+    // `park_tcp_agent_unless_revoked` in there IS the checked park, with this
+    // tunnel's mode and the connecting source IP. In `Log` that parks and counts
+    // exactly as before; an `Enforce` tunnel gets `None` and answers `NO`, which
+    // the `else` branch below already writes.
+    let state = &TcpParkWithAgentKey { state, peer_ip };
     let (_token, parked, sub_permit) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
         let mut token_buf = [0u8; 32];
         stream.read_exact(&mut token_buf).await?;
@@ -2563,6 +2670,9 @@ async fn admit_tcp_agent_b<S>(
     state: &EdgeState<Connection>,
     tcp_agent_cap: Option<&ConnectionCap>,
     role_label: &'static str,
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3), as in
+    // [`admit_tcp_agent_a`].
+    peer_ip: std::net::IpAddr,
 ) -> Result<
     Option<(
         RoutingToken,
@@ -2590,6 +2700,21 @@ where
             stream.flush().await?;
             return Ok::<_, BoxError>(None);
         }
+        // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3):
+        // unlike the 'A'/'K' body, this one acks on `register_host` success --
+        // BEFORE the park. An `Enforce` tunnel therefore has to be refused here,
+        // ahead of the hostname and of the ack, and that refusal is the ONE
+        // `park_tcp_agent_checked` call this connection makes (the park site
+        // below is only ever reached in `Log`, so nothing is counted twice).
+            if tcp_agent_key_enforced(state, &token, peer_ip) {
+                edge_trace(format_args!(
+                    "admit '{role_label}' token={} -> NO (agent_key enforce, no proof over TCP)",
+                    token_hex(&token, &mut th_buf)
+                ));
+                stream.write_all(b"NO").await?;
+                stream.flush().await?;
+                return Ok::<_, BoxError>(None);
+            }
         let mut hl = [0u8; 2];
         stream.read_exact(&mut hl).await?;
         let hlen = u16::from_be_bytes(hl) as usize;
@@ -2642,7 +2767,7 @@ where
     // for 'B'/'L'/'F' too.
     // Returned UN-awaited: the caller decides whether to await it plainly ('B') or
     // to keep the idle connection alive with `park_and_ping` while waiting ('L').
-    let parked = state.park_tcp_agent_unless_revoked(token.clone());
+    let parked = park_tcp_agent_key_checked(state, &token, peer_ip);
     // #589 forensics (2026-08-26 sort recurrence, same reasoning as
     // admit_tcp_agent_a's own trace above): this is the step the existing
     // consumer-side `tcp_fallback_pool=N` figure can't see -- whether THIS
@@ -2665,6 +2790,61 @@ where
         ));
     }
     Ok(parked.map(|parked| (token, parked, sub_permit)))
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3) -- stands
+/// in for `&EdgeState` inside [`admit_tcp_agent_a`]'s admission body so that
+/// body needs no edit at all: its `park_tcp_agent_unless_revoked` call lands
+/// here and becomes [`park_tcp_agent_key_checked`], which knows the tunnel's
+/// mode and the source IP. Only the two methods that body actually uses.
+struct TcpParkWithAgentKey<'a> {
+    state: &'a EdgeState<Connection>,
+    peer_ip: std::net::IpAddr,
+}
+
+impl TcpParkWithAgentKey<'_> {
+    /// The checked park (see [`park_tcp_agent_key_checked`]); same signature and
+    /// same `Option` as `EdgeState`'s own method, revoke check included.
+    fn park_tcp_agent_unless_revoked(
+        &self,
+        token: RoutingToken,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::state::BoxedStream>> {
+        park_tcp_agent_key_checked(self.state, &token, self.peer_ip)
+    }
+
+    /// Delegated unchanged -- the admission body's `#589` trace line uses it.
+    fn tcp_parked_for(&self, token: &RoutingToken) -> usize {
+        self.state.tcp_parked_for(token)
+    }
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3) -- the TCP
+/// fallback carries no key proof at all, so every park is an `unproven_tcp`
+/// observation on this tunnel's own mode: parked and counted in `Log` (answer
+/// bytes and order unchanged), refused in `Enforce`.
+fn park_tcp_agent_key_checked(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+    peer_ip: std::net::IpAddr,
+) -> Option<tokio::sync::oneshot::Receiver<crate::state::BoxedStream>> {
+    let mode = state.agent_key_mode_for(token);
+    state.park_tcp_agent_checked(token.clone(), mode, Some(peer_ip))
+}
+
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3) -- does
+/// this tunnel refuse an unproven TCP park? Only asks (and only counts) on an
+/// `Enforce` tunnel, so a `Log` tunnel reaches
+/// [`park_tcp_agent_key_checked`] exactly as before and is counted once there.
+fn tcp_agent_key_enforced(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+    peer_ip: std::net::IpAddr,
+) -> bool {
+    let mode = state.agent_key_mode_for(token);
+    mode == crate::state::AgentKeyMode::Enforce
+        && state
+            .park_tcp_agent_checked(token.clone(), mode, Some(peer_ip))
+            .is_none()
 }
 
 async fn park_and_ping<S>(
@@ -2923,7 +3103,7 @@ where
             // #410's bound only means anything while the registration is still
             // parked, so the permit has to outlive admission.
             let Some((token, parked, _sub_permit)) =
-                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "A").await?
+                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "A", peer_ip).await?
             else {
                 let _ = stream.shutdown().await;
                 return Ok(());
@@ -2963,7 +3143,7 @@ where
             // Held for the whole parked-and-relaying life of this connection,
             // exactly as in the 'A' arm -- see `admit_tcp_agent_a`'s doc.
             let Some((token, parked, _sub_permit)) =
-                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "K").await?
+                admit_tcp_agent_a(&mut stream, state, tcp_agent_cap, "K", peer_ip).await?
             else {
                 let _ = stream.shutdown().await;
                 return Ok(());
@@ -3036,7 +3216,7 @@ where
             // poisoned the first PING round trip ("malformed PONG"), driving an
             // endless redial loop.
             let Some((token, parked, _sub_permit)) =
-                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "F").await?
+                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "F", peer_ip).await?
             else {
                 return Ok(());
             };
@@ -3086,7 +3266,7 @@ where
         }
         b'B' => {
             let Some((token, parked, _sub_permit)) =
-                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "B").await?
+                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "B", peer_ip).await?
             else {
                 return Ok(());
             };
@@ -3129,7 +3309,7 @@ where
             // so it can never reach this arm -- zero behavior change for any
             // already-deployed client.
             let Some((token, parked, _sub_permit)) =
-                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "L").await?
+                admit_tcp_agent_b(&mut stream, state, tcp_agent_cap, "L", peer_ip).await?
             else {
                 return Ok(());
             };
@@ -3694,6 +3874,31 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     save_cert(cert_out, &ca_root)?;
 
     let state = Arc::new(EdgeState::<Connection>::new());
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N4/N7): the
+    // agent-key policy goes in force before the first connection is served.
+    // `agent_key_config_from_env` fails closed ONLY where enforcement actually
+    // applies (mode `enforce`, or a non-empty enforce list) and the issuers or
+    // the enforce file are unusable -- the default, log for every tunnel, turns
+    // every configuration problem into a warning and never blocks the start.
+    {
+        let cfg =
+            crate::agent_key::agent_key_config_from_env().map_err(|e| -> BoxError { e.into() })?;
+        for w in &cfg.warnings {
+            eprintln!("ct-edge: WARNING -- {w}");
+        }
+        let mode = cfg.mode;
+        let enforce_tunnels = cfg.enforce_set.len();
+        let issuers = cfg.issuers.len();
+        let evicted =
+            state.set_agent_key_policy(mode, cfg.enforce_set, cfg.enforce_file, cfg.issuers);
+        for old in evicted {
+            old.close(0u32.into(), b"agent key policy");
+        }
+        eprintln!(
+            "ct-edge: agent_key mode={} enforce_tunnels={enforce_tunnels} issuers={issuers}",
+            mode.as_str()
+        );
+    }
     // #522: periodic reaper for DEAD TCP-fallback parks. Until this, dead parks
     // were only cleared lazily on a browser delivery, so a crash-loop / duplicate-
     // process flood accumulated corpses that eventually left a token with only dead
@@ -10803,5 +11008,346 @@ mod tests {
         drop(tls);
         let _upstream = up_task.await.unwrap();
         fd_task.abort();
+    }
+
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (AUF-20261011-082)
+    /// An Edge that serves `serve_connection` for every incoming connection --
+    /// the harness the Rolle 'V' / Rolle 'A' wire tests below drive by hand.
+    fn agent_key_wire_049_edge(
+        state: Arc<EdgeState<Connection>>,
+    ) -> (std::net::SocketAddr, Vec<u8>, tokio::task::JoinHandle<()>) {
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let task = tokio::spawn(async move {
+            while let Some(inc) = server.accept().await {
+                let state_c = state.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = inc.await else { return };
+                    let challenge = Challenge {
+                        nonce: [0u8; 16],
+                        difficulty: 0,
+                    };
+                    let _ = serve_connection(&conn, &state_c, &challenge).await;
+                    conn.closed().await;
+                });
+            }
+        });
+        (addr, cert.to_vec(), task)
+    }
+
+    /// trace: AUF-20261011-049 -- one client connection to that Edge. The
+    /// endpoint is handed back because it has to outlive the connection.
+    async fn agent_key_wire_049_client(
+        addr: std::net::SocketAddr,
+        cert: Vec<u8>,
+    ) -> (quinn::Endpoint, Connection) {
+        let client = build_client_endpoint(cert.into()).expect("client");
+        let conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.connect(addr, "localhost").expect("cfg"),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("conn");
+        (client, conn)
+    }
+
+    /// trace: AUF-20261011-049 -- the Rolle 'V' wire: `'V' | token(32)`, then
+    /// the Edge's nonce(32) back, then `u16 BE len | SignedAgentBinding::encode()
+    /// | sign_registration(nonce, token)`. `binding_token` is what the BINDING
+    /// names, so a test can bind tunnel A and present tunnel B.
+    async fn agent_key_wire_049_register_v(
+        conn: &Connection,
+        token: &RoutingToken,
+        binding_token: &RoutingToken,
+        issuer: &ed25519_dalek::SigningKey,
+        agent: &ed25519_dalek::SigningKey,
+        issued_at: u64,
+    ) -> Vec<u8> {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut msg = vec![b'V'];
+        msg.extend_from_slice(&token.0);
+        send.write_all(&msg).await.unwrap();
+        let mut nonce = [0u8; 32];
+        tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut nonce))
+            .await
+            .expect("nonce timed out")
+            .unwrap();
+        let binding = ct_common::agent_binding::AgentBinding {
+            tunnel_id: "tunnel-049".to_string(),
+            token_hash: crate::state::agent_key_token_hash(binding_token),
+            agent_pubkey: agent.verifying_key().to_bytes(),
+            issued_at,
+            expires_at: issued_at + 3600,
+        };
+        let signed = ct_common::agent_binding::SignedAgentBinding::mint(issuer, binding);
+        let encoded = signed.encode();
+        let sig = ct_common::agent_binding::sign_registration(agent, &nonce, &token.0);
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+        tail.extend_from_slice(&encoded);
+        tail.extend_from_slice(&sig);
+        send.write_all(&tail).await.unwrap();
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(8))
+            .await
+            .expect("ack timed out")
+            .unwrap()
+    }
+
+    /// trace: AUF-20261011-049 -- plain Rolle 'A' (no proof at all), the wire
+    /// every Agent in the field speaks.
+    async fn agent_key_wire_049_register_a(conn: &Connection, token: &RoutingToken) -> Vec<u8> {
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let mut msg = vec![b'A'];
+        msg.extend_from_slice(&token.0);
+        send.write_all(&msg).await.unwrap();
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(8))
+            .await
+            .expect("ack timed out")
+            .unwrap()
+    }
+
+    /// trace: AUF-20261011-049 -- a state whose policy is `mode` for every
+    /// tunnel, with `issuer` as the one accepted binding issuer.
+    fn agent_key_wire_049_state(
+        mode: crate::state::AgentKeyMode,
+        issuer: &ed25519_dalek::SigningKey,
+    ) -> Arc<EdgeState<Connection>> {
+        let state: Arc<EdgeState<Connection>> = Arc::new(EdgeState::new());
+        let removed = state.set_agent_key_policy(
+            mode,
+            std::collections::HashSet::new(),
+            None,
+            vec![issuer.verifying_key().to_bytes()],
+        );
+        assert!(removed.is_empty(), "a fresh state has nothing to evict");
+        state
+    }
+
+    fn agent_key_wire_049_issuer() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// (a)/(b): a second Rolle 'V' registration with a FOREIGN key on an
+    /// already-pinned tunnel -- refused under `Enforce`, admitted and counted
+    /// under `Log`, and in both cases the rightful first Agent keeps routing.
+    async fn agent_key_wire_049_foreign_key(
+        mode: crate::state::AgentKeyMode,
+    ) -> (Arc<EdgeState<Connection>>, RoutingToken, Vec<u8>) {
+        let token = RoutingToken([21u8; 32]);
+        let issuer = agent_key_wire_049_issuer();
+        let state = agent_key_wire_049_state(mode, &issuer);
+        let (addr, cert, _edge) = agent_key_wire_049_edge(state.clone());
+        let rightful = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let thief = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let issued_at = unix_now() - 10;
+        let (_ep1, conn1) = agent_key_wire_049_client(addr, cert.clone()).await;
+        let first =
+            agent_key_wire_049_register_v(&conn1, &token, &token, &issuer, &rightful, issued_at)
+                .await;
+        assert_eq!(first, b"OK", "the rightful agent proves its key and is in");
+        let (_ep2, conn2) = agent_key_wire_049_client(addr, cert).await;
+        let second =
+            agent_key_wire_049_register_v(&conn2, &token, &token, &issuer, &thief, issued_at).await;
+        (state, token, second)
+    }
+
+    #[tokio::test]
+    async fn agent_key_wire_049_v_foreign_key_enforce_refused() {
+        let (state, token, ack) =
+            agent_key_wire_049_foreign_key(crate::state::AgentKeyMode::Enforce).await;
+        assert_eq!(ack, b"NO", "a foreign key is refused on an enforced tunnel");
+        let hash = crate::state::agent_key_token_hash(&token);
+        assert_eq!(
+            state.agent_key_violations_for(&hash, crate::state::AgentKeyReason::ForeignKey),
+            1
+        );
+        assert!(state.is_known(&token), "the first agent still routes");
+    }
+
+    #[tokio::test]
+    async fn agent_key_wire_049_v_foreign_key_log_admitted() {
+        let (state, token, ack) =
+            agent_key_wire_049_foreign_key(crate::state::AgentKeyMode::Log).await;
+        assert_eq!(ack, b"OK", "log mode never refuses");
+        let hash = crate::state::agent_key_token_hash(&token);
+        assert_eq!(
+            state.agent_key_violations_for(&hash, crate::state::AgentKeyReason::ForeignKey),
+            1
+        );
+    }
+
+    /// (c)/(d): Rolle 'A' brings no proof -- refused under `Enforce`, and under
+    /// `Log` answered exactly as today while being counted as `unproven`.
+    async fn agent_key_wire_049_unproven_a(
+        mode: crate::state::AgentKeyMode,
+    ) -> (Arc<EdgeState<Connection>>, RoutingToken, Vec<u8>) {
+        let token = RoutingToken([22u8; 32]);
+        let issuer = agent_key_wire_049_issuer();
+        let state = agent_key_wire_049_state(mode, &issuer);
+        let (addr, cert, _edge) = agent_key_wire_049_edge(state.clone());
+        let (_ep, conn) = agent_key_wire_049_client(addr, cert).await;
+        let ack = agent_key_wire_049_register_a(&conn, &token).await;
+        (state, token, ack)
+    }
+
+    #[tokio::test]
+    async fn agent_key_wire_049_a_unproven_enforce_refused() {
+        let (state, token, ack) =
+            agent_key_wire_049_unproven_a(crate::state::AgentKeyMode::Enforce).await;
+        assert_eq!(ack, b"NO");
+        assert!(!state.is_known(&token), "nothing was registered");
+    }
+
+    #[tokio::test]
+    async fn agent_key_wire_049_a_unproven_log_admitted() {
+        let (state, token, ack) =
+            agent_key_wire_049_unproven_a(crate::state::AgentKeyMode::Log).await;
+        assert_eq!(
+            ack, b"OK",
+            "the field agent sees exactly what it sees today"
+        );
+        assert!(state.is_known(&token));
+        let hash = crate::state::agent_key_token_hash(&token);
+        assert_eq!(
+            state.agent_key_violations_for(&hash, crate::state::AgentKeyReason::Unproven),
+            1
+        );
+    }
+
+    /// (e): a binding that names tunnel A, presented on tunnel B. The proof
+    /// itself does not verify against the presented token, so this is refused
+    /// in BOTH modes -- Rolle 'V' is new wire no field Agent can reach.
+    #[tokio::test]
+    async fn agent_key_wire_049_v_binding_for_other_token_refused() {
+        for mode in [
+            crate::state::AgentKeyMode::Log,
+            crate::state::AgentKeyMode::Enforce,
+        ] {
+            let token_a = RoutingToken([23u8; 32]);
+            let token_b = RoutingToken([24u8; 32]);
+            let issuer = agent_key_wire_049_issuer();
+            let state = agent_key_wire_049_state(mode, &issuer);
+            let (addr, cert, _edge) = agent_key_wire_049_edge(state.clone());
+            let agent = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+            let (_ep, conn) = agent_key_wire_049_client(addr, cert).await;
+            let ack = agent_key_wire_049_register_v(
+                &conn,
+                &token_b,
+                &token_a,
+                &issuer,
+                &agent,
+                unix_now() - 10,
+            )
+            .await;
+            assert_eq!(
+                ack, b"NO",
+                "mode {mode:?}: the binding names another tunnel"
+            );
+            assert!(!state.is_known(&token_b), "mode {mode:?}");
+        }
+    }
+
+    /// (g): a strictly newer binding for a DIFFERENT key repins the tunnel, and
+    /// the displaced connection is closed by this module.
+    #[tokio::test]
+    async fn agent_key_wire_049_v_repin_closes_the_old_connection() {
+        let token = RoutingToken([25u8; 32]);
+        let issuer = agent_key_wire_049_issuer();
+        let state = agent_key_wire_049_state(crate::state::AgentKeyMode::Log, &issuer);
+        let (addr, cert, _edge) = agent_key_wire_049_edge(state.clone());
+        let old_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let new_key = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let now = unix_now();
+        let (_ep1, conn1) = agent_key_wire_049_client(addr, cert.clone()).await;
+        assert_eq!(
+            agent_key_wire_049_register_v(&conn1, &token, &token, &issuer, &old_key, now - 60)
+                .await,
+            b"OK"
+        );
+        let (_ep2, conn2) = agent_key_wire_049_client(addr, cert).await;
+        assert_eq!(
+            agent_key_wire_049_register_v(&conn2, &token, &token, &issuer, &new_key, now - 10)
+                .await,
+            b"OK",
+            "the newer binding repins"
+        );
+        tokio::time::timeout(Duration::from_secs(10), conn1.closed())
+            .await
+            .expect("the repinned-away connection is closed");
+    }
+
+    /// (f)/(h): the TCP fallback carries no proof at all. On an `Enforce`
+    /// tunnel role 'L' is refused BEFORE the hostname is even read and nothing
+    /// is parked; on a `Log` tunnel it parks exactly as today and is counted as
+    /// `unproven_tcp` with the source IP (the `remote=` rendering itself is
+    /// covered by `state.rs`'s own `agent_key_violation_line` test).
+    async fn agent_key_wire_049_tcp_l(
+        mode: crate::state::AgentKeyMode,
+        token: &RoutingToken,
+        host: &str,
+    ) -> (Arc<EdgeState<Connection>>, Vec<u8>) {
+        let issuer = agent_key_wire_049_issuer();
+        let state = agent_key_wire_049_state(mode, &issuer);
+        let state_srv = state.clone();
+        let (mut agent_side, edge_side) = tokio::io::duplex(16 * 1024);
+        let edge = tokio::spawn(async move {
+            let challenge = Challenge {
+                nonce: [0u8; 16],
+                difficulty: 0,
+            };
+            let _ =
+                serve_tcp_connection(edge_side, &state_srv, &challenge, None, test_peer_ip()).await;
+        });
+        let mut msg = vec![b'L'];
+        msg.extend_from_slice(&token.0);
+        msg.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        msg.extend_from_slice(host.as_bytes());
+        agent_side.write_all(&msg).await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(10), agent_side.read_exact(&mut ack))
+            .await
+            .expect("ack timed out")
+            .unwrap();
+        drop(agent_side);
+        let _ = tokio::time::timeout(Duration::from_secs(10), edge).await;
+        (state, ack.to_vec())
+    }
+
+    #[tokio::test]
+    async fn agent_key_wire_049_tcp_l_enforce_refused() {
+        let token = RoutingToken([26u8; 32]);
+        let (state, ack) =
+            agent_key_wire_049_tcp_l(crate::state::AgentKeyMode::Enforce, &token, "l49.example")
+                .await;
+        assert_eq!(ack, b"NO", "no proof is possible over the fallback");
+        assert!(!state.has_tcp_agent(&token), "nothing was parked");
+        let hash = crate::state::agent_key_token_hash(&token);
+        assert_eq!(
+            state.agent_key_violations_for(&hash, crate::state::AgentKeyReason::UnprovenTcp),
+            1,
+            "counted exactly once, at the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_key_wire_049_tcp_l_log_parks_and_counts_remote() {
+        let token = RoutingToken([27u8; 32]);
+        let (state, ack) =
+            agent_key_wire_049_tcp_l(crate::state::AgentKeyMode::Log, &token, "l49-log.example")
+                .await;
+        assert_eq!(ack, b"OK", "log mode answers exactly as today");
+        let hash = crate::state::agent_key_token_hash(&token);
+        assert_eq!(
+            state.agent_key_violations_for(&hash, crate::state::AgentKeyReason::UnprovenTcp),
+            1
+        );
+        assert_eq!(
+            state.agent_key_log_lines_total(),
+            1,
+            "one line, carrying remote=203.0.113.42 (test_peer_ip)"
+        );
     }
 }
