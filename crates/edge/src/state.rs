@@ -505,6 +505,10 @@ pub enum AgentKeyReason {
     /// An unproven registration was evicted because the tunnel was on
     /// `Enforce`.
     EvictedOnEnforce,
+    /// The Routing Token is revoked -- refused before the key is even looked
+    /// at, so [`EdgeState::register_with_candidate_checked`] keeps a single
+    /// `Result` return instead of a second error type.
+    Revoked,
 }
 
 impl AgentKeyReason {
@@ -524,6 +528,7 @@ impl AgentKeyReason {
             Self::Timeout => "timeout",
             Self::Oversize => "oversize",
             Self::EvictedOnEnforce => "evicted_on_enforce",
+            Self::Revoked => "revoked",
         }
     }
 }
@@ -630,6 +635,45 @@ struct AgentKeyTunnelCounts {
     reasons: HashMap<AgentKeyReason, u64>,
     /// Admitted registrations on this tunnel whose key binding was proven.
     proofs_admitted: u64,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// AUF-20261011-049 / INC-20261011-305 (B1): the public key a tunnel is bound
+/// to, together with the `issued_at` of the binding that pinned it. The Edge
+/// keeps this in its own map NEXT TO `agents`, so `agents`'s type is unchanged.
+/// `agent_key.rs` imports this type in a later slice;
+/// `ct_common::agent_binding::AgentBinding` supplies both values
+/// (`agent_pubkey`, `issued_at`) once the wire path carries them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenKey {
+    /// The Agent's public key as proven over this connection.
+    pub key: [u8; 32],
+    /// `UnixSeconds` (`ct_common::credential`) of the binding that proved it.
+    pub issued_at: u64,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// One tunnel's key pin plus the registration ids admitted WITH a proof for
+/// that pin. The proven ids are what tells an unproven registration apart from
+/// one that merely sits next to a proven Agent (`unproven_beside_proven`, B2);
+/// [`EdgeState::remove_registration`] keeps the set in lockstep with `agents`.
+#[derive(Debug, Default)]
+struct AgentKeyPin {
+    pin: Option<ProvenKey>,
+    proven_ids: HashSet<u64>,
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// What the pin map decided about a proven binding (N10).
+enum PinOutcome {
+    /// The pin was created, left as it was, or moved forward for the same key.
+    Accepted,
+    /// A strictly newer binding for a DIFFERENT key took the pin over, so
+    /// every registration admitted under the old pin has to go.
+    Repinned,
+    /// The binding does not match the pin: `foreign_key` (not newer) or
+    /// `stale_binding` (older than the pin). The pin stays as it is.
+    Rejected(AgentKeyReason),
 }
 
 /// Thread-safe registry of live Agent tunnels keyed by Routing Token, plus each
@@ -972,6 +1016,11 @@ pub struct EdgeState<H> {
     /// Observations dropped because the counter map was at
     /// `AGENT_KEY_MAX_TRACKED` and the tunnel was new.
     agent_key_untracked: Counter,
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (B1): key
+    /// pin and proven registration ids per tunnel, in their own Mutex next to
+    /// `agents`. Never taken while a guard on `agents` is held, anywhere --
+    /// one lock order, not two.
+    agent_pins: Mutex<HashMap<RoutingToken, AgentKeyPin>>,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -1028,6 +1077,7 @@ impl<H: Clone> EdgeState<H> {
             )),
             agent_key_log_lines: Counter::default(),
             agent_key_untracked: Counter::default(),
+            agent_pins: Mutex::new(HashMap::new()),
             active_tunnels_gauge: AtomicU64::new(0),
             total_registrations_gauge: AtomicU64::new(0),
         }
@@ -2264,8 +2314,19 @@ impl<H: Clone> EdgeState<H> {
     /// re-reading it added nothing once the lock spans both.
     pub fn remove_registration(&self, token: &RoutingToken, id: u64) {
         let _guard = self.registration_lock.lock_safe();
+        // AUF-20261011-049 (B1): the pin map's proven set is keyed by
+        // registration id, so a registration that is gone must not keep its
+        // tunnel looking proven. Done before `agents` is locked, so the pin
+        // map is never taken underneath that write guard. The pin itself
+        // survives one Agent's disconnect -- only the full teardown in
+        // `remove_locked` clears it.
+        if let Some(pin) = self.agent_pins.lock_safe().get_mut(token) {
+            pin.proven_ids.remove(&id);
+        }
         let mut agents = self.agents.write_safe();
-        let Some(v) = agents.get_mut(token) else { return };
+        let Some(v) = agents.get_mut(token) else {
+            return;
+        };
         let before = v.len();
         v.retain(|(rid, _)| *rid != id);
         let removed = before - v.len();
@@ -2336,6 +2397,9 @@ impl<H: Clone> EdgeState<H> {
         self.candidates.write_safe().remove(token);
         self.direct.write_safe().remove(token);
         self.tcp_agents.lock_safe().remove(token);
+        // AUF-20261011-049 (B1): a full teardown drops the key pin too -- the
+        // tunnel is gone, and the next Agent's binding pins it afresh.
+        self.agent_pins.lock_safe().remove(token);
         self.clear_hosts_for(token);
         // ADR-0025 Decision 6: unlike `remove_registration`, this always tears
         // down BOTH transports (the `tcp_agents.remove` above), so unlike that
@@ -2462,6 +2526,176 @@ impl<H: Clone> EdgeState<H> {
         Some(id)
     }
 
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (B1) --
+    /// [`register_with_candidate_unless_revoked`](Self::register_with_candidate_unless_revoked)
+    /// with the agent-key check in front of it. `proof` is the ALREADY verified
+    /// binding (`Some`) or nothing at all (`None`, every Agent in the field at
+    /// rc.2 / 0.7.39). Returns the registration id and the handles of the
+    /// registrations that a repin removed -- **the caller closes them**, this
+    /// function never touches a connection.
+    ///
+    /// Rules: revoke as before. Proven and no pin -> pin it. Proven, same key
+    /// -> admit and move `issued_at` forward. Proven, different key, strictly
+    /// newer -> repin, remove the entries of the old key and the unproven ones
+    /// and hand them back (N10). Proven, different key, not newer ->
+    /// `foreign_key` (`stale_binding` if older than the pin): refused on
+    /// `Enforce`, admitted and counted on `Log` with the pin unchanged.
+    /// Unproven -> refused on `Enforce`, admitted and counted on `Log`.
+    ///
+    /// LOG-NEUTRAL: in `Log` admission and the order inside `agents` are
+    /// exactly `register_with_candidate_unless_revoked`'s -- a proven
+    /// registration does NOT outrank an unproven one (H1 deliberately left
+    /// out, the console decides after M3). The single exception is the repin by
+    /// a strictly newer proven binding, which no Agent in the field can reach.
+    ///
+    /// BESTAND JE REGISTRIERUNG (N13): `registration_lock` is global per Edge,
+    /// and `register_locked` -> [`note_connected`](Self::note_connected) ->
+    /// `tunnel_history.open_session` runs SQLite per registration underneath
+    /// it. That is taken as-is until measurement M3 (slice 8). Everything this
+    /// slice adds under the lock is HashMap work; the cryptography runs before
+    /// the call. No new lock.
+    pub fn register_with_candidate_checked(
+        &self,
+        token: RoutingToken,
+        handle: H,
+        candidate: SocketAddr,
+        mode: AgentKeyMode,
+        proof: Option<ProvenKey>,
+        remote: Option<std::net::IpAddr>,
+    ) -> Result<(u64, Vec<H>), AgentKeyReason> {
+        // Taken exactly once, like `register_with_candidate_unless_revoked`.
+        let _guard = self.registration_lock.lock_safe();
+        if self.is_revoked(&token) {
+            return Err(AgentKeyReason::Revoked);
+        }
+        let refusing = mode == AgentKeyMode::Enforce;
+        let action = if refusing {
+            AgentKeyAction::Refused
+        } else {
+            AgentKeyAction::Admitted
+        };
+        let mut removed: Vec<H> = Vec::new();
+        let mut proves_pin = false;
+        match proof.as_ref() {
+            Some(p) => match self.pin_proven_locked(&token, p) {
+                PinOutcome::Accepted => proves_pin = true,
+                PinOutcome::Repinned => {
+                    proves_pin = true;
+                    removed = self.take_registrations_locked(&token);
+                    self.note_agent_key_violation(
+                        &token,
+                        AgentKeyReason::ForeignKey,
+                        AgentKeyAction::Repinned,
+                        mode,
+                        remote,
+                    );
+                }
+                PinOutcome::Rejected(reason) => {
+                    self.note_agent_key_violation(&token, reason, action, mode, remote);
+                    if refusing {
+                        return Err(reason);
+                    }
+                }
+            },
+            None => {
+                let reason = self.unproven_reason_locked(&token);
+                self.note_agent_key_violation(&token, reason, action, mode, remote);
+                if refusing {
+                    return Err(reason);
+                }
+            }
+        }
+        let id = self.register_locked(token.clone(), handle);
+        self.candidates
+            .write_safe()
+            .insert(token.clone(), candidate);
+        if proves_pin {
+            self.agent_pins
+                .lock_safe()
+                .entry(token.clone())
+                .or_default()
+                .proven_ids
+                .insert(id);
+            self.note_agent_key_proven(&token);
+        }
+        Ok((id, removed))
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N10) --
+    /// what a proven binding does to `token`'s pin. Only HashMap work;
+    /// `registration_lock` is assumed held by the caller.
+    fn pin_proven_locked(&self, token: &RoutingToken, proof: &ProvenKey) -> PinOutcome {
+        let mut pins = self.agent_pins.lock_safe();
+        let entry = pins.entry(token.clone()).or_default();
+        let Some(current) = entry.pin.clone() else {
+            entry.pin = Some(proof.clone());
+            return PinOutcome::Accepted;
+        };
+        if current.key == proof.key {
+            if proof.issued_at > current.issued_at {
+                entry.pin = Some(proof.clone());
+            }
+            return PinOutcome::Accepted;
+        }
+        if proof.issued_at > current.issued_at {
+            entry.pin = Some(proof.clone());
+            // Nothing is proven for the NEW pin yet -- the registration that
+            // carried it is admitted (and recorded) by the caller.
+            entry.proven_ids.clear();
+            return PinOutcome::Repinned;
+        }
+        if proof.issued_at < current.issued_at {
+            PinOutcome::Rejected(AgentKeyReason::StaleBinding)
+        } else {
+            PinOutcome::Rejected(AgentKeyReason::ForeignKey)
+        }
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (B2) --
+    /// which unproven shape `token` currently has: alone, next to a live
+    /// proven registration, or next to only unproven ones (the tolerated
+    /// reconnect overlap of #8).
+    fn unproven_reason_locked(&self, token: &RoutingToken) -> AgentKeyReason {
+        let live: Vec<u64> = self
+            .agents
+            .read_safe()
+            .get(token)
+            .map_or_else(Vec::new, |v| v.iter().map(|(id, _)| *id).collect());
+        if live.is_empty() {
+            return AgentKeyReason::Unproven;
+        }
+        let beside_proven = self
+            .agent_pins
+            .lock_safe()
+            .get(token)
+            .is_some_and(|pin| live.iter().any(|id| pin.proven_ids.contains(id)));
+        if beside_proven {
+            AgentKeyReason::UnprovenBesideProven
+        } else {
+            AgentKeyReason::SecondUnproven
+        }
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N10) --
+    /// drop every live registration of `token` and hand the handles back for
+    /// the caller to close. `registration_lock` is assumed held, so this must
+    /// never call [`remove_registration`](Self::remove_registration), which
+    /// takes that lock itself (it is NOT reentrant). Unlike that function this
+    /// leaves candidates, hostname routes and the TCP pool alone: the
+    /// repinning registration takes the tunnel over in the same breath.
+    fn take_registrations_locked(&self, token: &RoutingToken) -> Vec<H> {
+        let Some(v) = self.agents.write_safe().remove(token) else {
+            return Vec::new();
+        };
+        if v.is_empty() {
+            return Vec::new();
+        }
+        self.active_tunnels_gauge.fetch_sub(1, Ordering::Relaxed);
+        self.total_registrations_gauge
+            .fetch_sub(v.len() as u64, Ordering::Relaxed);
+        v.into_iter().map(|(_, handle)| handle).collect()
+    }
+
     /// [`park_tcp_agent`], but atomically refuses a revoked token (#411): the
     /// TCP-fallback registration path previously had no revocation check at
     /// all, so a revoked token could still be queued as a waiting agent
@@ -2479,6 +2713,46 @@ impl<H: Clone> EdgeState<H> {
         // path) counts `tcp_parks`/`tcp_parked_gauge` exactly like the plain
         // path -- it used to skip both while `deliver_to_tcp_agent` always
         // decremented, wrapping the gauge to u64::MAX on first delivery.
+        Some(self.park_tcp_agent(token))
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N3/N8) --
+    /// [`park_tcp_agent_unless_revoked`](Self::park_tcp_agent_unless_revoked)
+    /// for every park site, with the agent-key check in front. `None` means
+    /// revoked OR refused by `Enforce`, so the call sites in `serve.rs` keep
+    /// testing exactly one `Option`.
+    ///
+    /// The TCP fallback carries NO proof: on `Enforce` the park is refused as
+    /// `unproven_tcp` and nothing is queued; on `Log` it is parked as it is
+    /// today and counted. EVERY TCP park counts as `unproven_tcp`, including
+    /// one from an Agent that has already proven itself over QUIC on the same
+    /// tunnel (B4) -- which is why a tunnel that still uses the fallback never
+    /// reaches [`agent_key_ready_for_enforce`](Self::agent_key_ready_for_enforce).
+    pub fn park_tcp_agent_checked(
+        &self,
+        token: RoutingToken,
+        mode: AgentKeyMode,
+        remote: Option<std::net::IpAddr>,
+    ) -> Option<oneshot::Receiver<BoxedStream>> {
+        let _guard = self.registration_lock.lock_safe();
+        if self.is_revoked(&token) {
+            return None;
+        }
+        let refusing = mode == AgentKeyMode::Enforce;
+        self.note_agent_key_violation(
+            &token,
+            AgentKeyReason::UnprovenTcp,
+            if refusing {
+                AgentKeyAction::Refused
+            } else {
+                AgentKeyAction::Admitted
+            },
+            mode,
+            remote,
+        );
+        if refusing {
+            return None;
+        }
         Some(self.park_tcp_agent(token))
     }
 
@@ -3188,6 +3462,312 @@ mod tests {
         assert!(
             state.park_tcp_agent_unless_revoked(live).is_some(),
             "an unrevoked token parks normally"
+        );
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn proof(key: u8, issued_at: u64) -> ProvenKey {
+        ProvenKey {
+            key: [key; 32],
+            issued_at,
+        }
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn cand(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn count(state: &EdgeState<u32>, t: &RoutingToken, reason: AgentKeyReason) -> u64 {
+        state.agent_key_violations_for(&agent_key_token_hash(t), reason)
+    }
+
+    #[test]
+    fn enforce_refuses_a_foreign_proven_key_and_keeps_the_pin_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(41);
+        let (_id, removed) = state
+            .register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Enforce,
+                Some(proof(1, 100)),
+                None,
+            )
+            .expect("the first proven registration pins the tunnel");
+        assert!(removed.is_empty(), "a fresh pin removes nothing");
+        assert_eq!(
+            state.register_with_candidate_checked(
+                t.clone(),
+                11,
+                cand(2),
+                AgentKeyMode::Enforce,
+                Some(proof(2, 100)),
+                None,
+            ),
+            Err(AgentKeyReason::ForeignKey),
+            "a different proven key of the same age must not take the tunnel over"
+        );
+        assert_eq!(
+            state.route(&t),
+            Some(10),
+            "the pinned Agent keeps the route"
+        );
+    }
+
+    #[test]
+    fn log_admits_a_foreign_proven_key_and_only_counts_it_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(42);
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Log,
+                Some(proof(1, 100)),
+                None,
+            )
+            .expect("the first proven registration pins the tunnel");
+        let (_id, removed) = state
+            .register_with_candidate_checked(
+                t.clone(),
+                11,
+                cand(2),
+                AgentKeyMode::Log,
+                Some(proof(2, 100)),
+                None,
+            )
+            .expect("Log never refuses");
+        assert!(removed.is_empty(), "Log evicts nothing");
+        assert_eq!(count(&state, &t, AgentKeyReason::ForeignKey), 1);
+        assert_eq!(
+            state.route(&t),
+            Some(11),
+            "Log keeps register_with_candidate_unless_revoked's order: newest wins"
+        );
+        assert!(
+            state
+                .register_with_candidate_checked(
+                    t.clone(),
+                    12,
+                    cand(3),
+                    AgentKeyMode::Enforce,
+                    Some(proof(1, 100)),
+                    None,
+                )
+                .is_ok(),
+            "the pin is unchanged, so the pinned key still passes on Enforce"
+        );
+    }
+
+    #[test]
+    fn enforce_refuses_an_unproven_registration_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(43);
+        assert_eq!(
+            state.register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Enforce,
+                None,
+                None,
+            ),
+            Err(AgentKeyReason::Unproven)
+        );
+        assert!(!state.is_known(&t), "nothing was registered");
+    }
+
+    #[test]
+    fn log_names_the_unproven_shape_per_tunnel_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let alone = token(44);
+        for (handle, port) in [(10, 1), (11, 2)] {
+            state
+                .register_with_candidate_checked(
+                    alone.clone(),
+                    handle,
+                    cand(port),
+                    AgentKeyMode::Log,
+                    None,
+                    None,
+                )
+                .expect("Log admits an unproven registration");
+        }
+        assert_eq!(count(&state, &alone, AgentKeyReason::Unproven), 1);
+        assert_eq!(count(&state, &alone, AgentKeyReason::SecondUnproven), 1);
+
+        let beside = token(45);
+        state
+            .register_with_candidate_checked(
+                beside.clone(),
+                20,
+                cand(3),
+                AgentKeyMode::Log,
+                Some(proof(1, 100)),
+                None,
+            )
+            .expect("proven registrations are admitted");
+        state
+            .register_with_candidate_checked(
+                beside.clone(),
+                21,
+                cand(4),
+                AgentKeyMode::Log,
+                None,
+                None,
+            )
+            .expect("Log admits an unproven registration next to a proven one");
+        assert_eq!(
+            count(&state, &beside, AgentKeyReason::UnprovenBesideProven),
+            1
+        );
+        assert_eq!(count(&state, &beside, AgentKeyReason::Unproven), 0);
+    }
+
+    #[test]
+    fn a_newer_binding_repins_and_hands_back_the_old_handle_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(46);
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Enforce,
+                Some(proof(1, 100)),
+                None,
+            )
+            .expect("the first proven registration pins the tunnel");
+        let (_id, removed) = state
+            .register_with_candidate_checked(
+                t.clone(),
+                11,
+                cand(2),
+                AgentKeyMode::Enforce,
+                Some(proof(2, 200)),
+                None,
+            )
+            .expect("a strictly newer proven binding takes the tunnel over");
+        assert_eq!(
+            removed,
+            vec![10],
+            "exactly the old pin's handle comes back for the caller to close"
+        );
+        assert_eq!(state.route(&t), Some(11));
+        assert_eq!(
+            state.register_with_candidate_checked(
+                t.clone(),
+                12,
+                cand(3),
+                AgentKeyMode::Enforce,
+                Some(proof(3, 150)),
+                None,
+            ),
+            Err(AgentKeyReason::StaleBinding),
+            "a binding older than the pin is stale, not a repin"
+        );
+        assert_eq!(state.route(&t), Some(11));
+    }
+
+    #[test]
+    fn remove_registration_drops_the_proven_id_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(47);
+        let (proven_id, _) = state
+            .register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Log,
+                Some(proof(1, 100)),
+                None,
+            )
+            .expect("proven registrations are admitted");
+        state
+            .register_with_candidate_checked(t.clone(), 11, cand(2), AgentKeyMode::Log, None, None)
+            .expect("Log admits an unproven registration");
+        assert_eq!(count(&state, &t, AgentKeyReason::UnprovenBesideProven), 1);
+
+        state.remove_registration(&t, proven_id);
+        state
+            .register_with_candidate_checked(t.clone(), 12, cand(3), AgentKeyMode::Log, None, None)
+            .expect("Log admits an unproven registration");
+        assert_eq!(
+            count(&state, &t, AgentKeyReason::UnprovenBesideProven),
+            1,
+            "the proven registration is gone, so nothing sits beside it any more"
+        );
+        assert_eq!(count(&state, &t, AgentKeyReason::SecondUnproven), 1);
+    }
+
+    #[test]
+    fn a_revoked_token_is_refused_before_the_key_check_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(48);
+        state.revoke_token(&t);
+        assert_eq!(
+            state.register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Log,
+                Some(proof(1, 100)),
+                None,
+            ),
+            Err(AgentKeyReason::Revoked)
+        );
+        assert!(!state.is_known(&t));
+        assert!(state
+            .park_tcp_agent_checked(t.clone(), AgentKeyMode::Log, None)
+            .is_none());
+        assert!(!state.has_tcp_agent(&t));
+    }
+
+    #[test]
+    fn tcp_parks_count_as_unproven_and_enforce_refuses_them_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(49);
+        assert!(
+            state
+                .park_tcp_agent_checked(t.clone(), AgentKeyMode::Enforce, None)
+                .is_none(),
+            "the fallback carries no proof, so Enforce refuses it"
+        );
+        assert!(!state.has_tcp_agent(&t), "Enforce parks nothing");
+        assert_eq!(count(&state, &t, AgentKeyReason::UnprovenTcp), 1);
+
+        let parked = state.park_tcp_agent_checked(t.clone(), AgentKeyMode::Log, None);
+        assert!(parked.is_some(), "Log parks as it does today");
+        assert!(state.has_tcp_agent(&t));
+        assert_eq!(count(&state, &t, AgentKeyReason::UnprovenTcp), 2);
+
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Log,
+                Some(proof(1, 100)),
+                None,
+            )
+            .expect("proven registrations are admitted");
+        let after_proof = state.park_tcp_agent_checked(t.clone(), AgentKeyMode::Log, None);
+        assert!(
+            after_proof.is_some(),
+            "B4: a proven QUIC registration does not make the next TCP park proven"
+        );
+        assert_eq!(
+            count(&state, &t, AgentKeyReason::UnprovenTcp),
+            3,
+            "every TCP park counts, even from an Agent already proven over QUIC"
+        );
+        assert!(
+            !state.agent_key_ready_for_enforce(&agent_key_token_hash(&t)),
+            "a tunnel that still uses the fallback never reaches Enforce"
         );
     }
 
