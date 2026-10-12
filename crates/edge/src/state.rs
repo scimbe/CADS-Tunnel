@@ -676,6 +676,75 @@ enum PinOutcome {
     Rejected(AgentKeyReason),
 }
 
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// AUF-20261011-049 (H4): why a reload of the enforce list did not happen.
+/// `Invalid` names the 1-based line that did not parse, so an operator sees
+/// which line to fix; on either error the policy in force stays exactly as it
+/// was and nothing is evicted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadError {
+    /// The file could not be read (missing, no permission, no path stored).
+    Unreadable(String),
+    /// This 1-based line is not 64 hex digits.
+    Invalid(usize),
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// Parse an enforce list (H4/N15): one `sha256(RoutingToken)` as 64 hex digits
+/// per line, blank lines skipped, every other line an error. The hash -- never
+/// the Routing Token itself -- is what the file carries, so the list is not a
+/// credential store.
+pub fn parse_enforce_list(text: &str) -> Result<HashSet<[u8; 32]>, ReloadError> {
+    let mut out = HashSet::new();
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(hash) = ct_common::hex::decode_32(trimmed) else {
+            return Err(ReloadError::Invalid(idx + 1));
+        };
+        out.insert(hash);
+    }
+    Ok(out)
+}
+
+// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+/// AUF-20261011-049 (N15): the agent-key policy in force. A default mode for
+/// every tunnel plus the set of `sha256(RoutingToken)` that are on `Enforce`,
+/// the file that set is reloaded from (H4) and the binding issuers the Edge
+/// accepts. The conservative default is `Log` for all tunnels: without a
+/// setter nothing is ever refused or evicted.
+#[derive(Debug)]
+struct AgentKeyPolicy {
+    default: AgentKeyMode,
+    enforce_set: HashSet<[u8; 32]>,
+    enforce_file: Option<std::path::PathBuf>,
+    issuers: Vec<[u8; 32]>,
+}
+
+impl Default for AgentKeyPolicy {
+    fn default() -> Self {
+        Self {
+            default: AgentKeyMode::Log,
+            enforce_set: HashSet::new(),
+            enforce_file: None,
+            issuers: Vec::new(),
+        }
+    }
+}
+
+impl AgentKeyPolicy {
+    /// The mode one tunnel runs in: its own entry wins, otherwise the default.
+    fn mode_for(&self, token_hash: &[u8; 32]) -> AgentKeyMode {
+        if self.default == AgentKeyMode::Enforce || self.enforce_set.contains(token_hash) {
+            AgentKeyMode::Enforce
+        } else {
+            AgentKeyMode::Log
+        }
+    }
+}
+
 /// Thread-safe registry of live Agent tunnels keyed by Routing Token, plus each
 /// Agent's Edge-observed peer candidate (its reflexive address) for P2P
 /// rendezvous (M11.1).
@@ -1021,6 +1090,12 @@ pub struct EdgeState<H> {
     /// `agents`. Never taken while a guard on `agents` is held, anywhere --
     /// one lock order, not two.
     agent_pins: Mutex<HashMap<RoutingToken, AgentKeyPin>>,
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N15): the
+    /// agent-key policy -- default mode, the tunnels on `Enforce`, the file
+    /// that set is reloaded from and the accepted issuers. Its own mutex, so a
+    /// mode lookup never serializes against a registration; taken before
+    /// `agents` where both are needed, never after.
+    agent_key_policy: Mutex<AgentKeyPolicy>,
 }
 
 impl<H: Clone> EdgeState<H> {
@@ -1078,6 +1153,7 @@ impl<H: Clone> EdgeState<H> {
             agent_key_log_lines: Counter::default(),
             agent_key_untracked: Counter::default(),
             agent_pins: Mutex::new(HashMap::new()),
+            agent_key_policy: Mutex::new(AgentKeyPolicy::default()),
             active_tunnels_gauge: AtomicU64::new(0),
             total_registrations_gauge: AtomicU64::new(0),
         }
@@ -2754,6 +2830,157 @@ impl<H: Clone> EdgeState<H> {
             return None;
         }
         Some(self.park_tcp_agent(token))
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N15) --
+    /// the mode `token` runs in. `Log` for every tunnel until
+    /// [`set_agent_key_policy`](Self::set_agent_key_policy) says otherwise.
+    pub fn agent_key_mode_for(&self, token: &RoutingToken) -> AgentKeyMode {
+        let hash = agent_key_token_hash(token);
+        self.agent_key_policy.lock_safe().mode_for(&hash)
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N8) --
+    /// the binding issuers the Edge accepts, for the verifying call site.
+    pub fn agent_key_issuers(&self) -> Vec<[u8; 32]> {
+        self.agent_key_policy.lock_safe().issuers.clone()
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N4) --
+    /// put a new policy in force and clean up after it: every tunnel that goes
+    /// from `Log` to `Enforce` loses each registration that is not proven for
+    /// its pin, and its whole TCP-fallback pool. The removed QUIC handles come
+    /// back for the caller to close (this module never owns a connection), and
+    /// every removed registration counts one `evicted_on_enforce`.
+    ///
+    /// Held under `registration_lock` for the whole switch, so a registration
+    /// cannot slip in between the mode change and the eviction -- no new lock
+    /// (N13): the eviction is HashMap work, exactly like a teardown.
+    pub fn set_agent_key_policy(
+        &self,
+        default: AgentKeyMode,
+        enforce_set: HashSet<[u8; 32]>,
+        enforce_file: Option<std::path::PathBuf>,
+        issuers: Vec<[u8; 32]>,
+    ) -> Vec<H> {
+        let _guard = self.registration_lock.lock_safe();
+        let next = AgentKeyPolicy {
+            default,
+            enforce_set,
+            enforce_file,
+            issuers,
+        };
+        let newly = self.swap_agent_key_policy_locked(next);
+        let mut removed: Vec<H> = Vec::new();
+        for token in &newly {
+            removed.extend(self.enforce_tunnel_locked(token));
+        }
+        removed
+    }
+
+    /// Put `next` in force and report the tunnels that newly run on `Enforce`
+    /// -- live QUIC registrations and parked TCP-fallback slots both count.
+    /// `registration_lock` is assumed held.
+    fn swap_agent_key_policy_locked(&self, next: AgentKeyPolicy) -> Vec<RoutingToken> {
+        let mut policy = self.agent_key_policy.lock_safe();
+        let mut tokens: Vec<RoutingToken> = self.agents.read_safe().keys().cloned().collect();
+        for token in self.tcp_agents.lock_safe().keys() {
+            if !tokens.contains(token) {
+                tokens.push(token.clone());
+            }
+        }
+        let newly: Vec<RoutingToken> = tokens
+            .into_iter()
+            .filter(|token| {
+                let hash = agent_key_token_hash(token);
+                next.mode_for(&hash) == AgentKeyMode::Enforce
+                    && policy.mode_for(&hash) == AgentKeyMode::Log
+            })
+            .collect();
+        *policy = next;
+        newly
+    }
+
+    /// Drop everything unproven on `token` because it just went to `Enforce`:
+    /// every registration whose id is not in the tunnel's proven set, plus the
+    /// entire TCP-fallback pool (the fallback carries no proof at all, B4).
+    /// Dropping a parked `oneshot::Sender` ends the Agent's wait on the other
+    /// side (`serve.rs:2728-2735` reads that as `TryRecvError::Closed`).
+    /// `registration_lock` is assumed held, so this must never call back into
+    /// [`remove_registration`](Self::remove_registration), which takes it.
+    fn enforce_tunnel_locked(&self, token: &RoutingToken) -> Vec<H> {
+        // The pin map is read and released BEFORE `agents` is locked -- one
+        // lock order, see `agent_pins`'s doc.
+        let proven: HashSet<u64> = self
+            .agent_pins
+            .lock_safe()
+            .get(token)
+            .map_or_else(HashSet::new, |pin| pin.proven_ids.clone());
+        let mut removed: Vec<H> = Vec::new();
+        {
+            let mut agents = self.agents.write_safe();
+            if let Some(v) = agents.get_mut(token) {
+                let before = v.len();
+                for (id, handle) in std::mem::take(v) {
+                    if proven.contains(&id) {
+                        v.push((id, handle));
+                    } else {
+                        removed.push(handle);
+                    }
+                }
+                let evicted = before - v.len();
+                // #359: the gauges move with the real removal, exactly like
+                // `remove_registration`'s own correction.
+                self.total_registrations_gauge
+                    .fetch_sub(evicted as u64, Ordering::Relaxed);
+                if v.is_empty() {
+                    if evicted > 0 {
+                        self.active_tunnels_gauge.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    agents.remove(token);
+                }
+            }
+        }
+        self.tcp_agents.lock_safe().remove(token);
+        // Counted per removed registration, and only once every guard above is
+        // released: the counter map has its own mutex.
+        for _ in 0..removed.len() {
+            self.note_agent_key_violation(
+                token,
+                AgentKeyReason::EvictedOnEnforce,
+                AgentKeyAction::Evicted,
+                AgentKeyMode::Enforce,
+                None,
+            );
+        }
+        removed
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (H4) --
+    /// re-read the enforce list from the stored path and put it in force,
+    /// keeping the default mode and the issuers. An unreadable file or a
+    /// single unparsable line changes NOTHING: the list in force stays, no
+    /// registration is removed, and the error says which line to fix. The
+    /// reload route in `admin.rs` only ever gets `EdgeState`, which is why
+    /// both the path and the issuers live in this struct (N8).
+    pub fn reload_agent_key_policy_from_file(&self) -> Result<Vec<H>, ReloadError> {
+        let (default, path, issuers) = {
+            let policy = self.agent_key_policy.lock_safe();
+            (
+                policy.default,
+                policy.enforce_file.clone(),
+                policy.issuers.clone(),
+            )
+        };
+        let Some(path) = path else {
+            return Err(ReloadError::Unreadable("no enforce-list path set".into()));
+        };
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| ReloadError::Unreadable(format!("{}: {e}", path.display())))?;
+        // Parsed in full BEFORE anything is put in force, so a bad line can
+        // never leave half a list behind.
+        let enforce_set = parse_enforce_list(&text)?;
+        Ok(self.set_agent_key_policy(default, enforce_set, Some(path), issuers))
     }
 
     /// Whether `token` currently has at least one live Agent tunnel.
@@ -4997,5 +5224,224 @@ mod tests {
         assert_eq!(state.note_access_window_refused(), 1);
         assert_eq!(state.note_access_window_refused(), 2);
         assert_eq!(state.access_window_refused_total(), 2);
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 -- a unique
+    /// temp path for an enforce list, after `audit_log.rs`'s `temp_db_path`
+    /// (:180-186, an `OsRng` suffix) plus this process's id. No `tempfile`
+    /// dependency; every test below deletes its file again.
+    fn temp_enforce_list_path() -> std::path::PathBuf {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        std::env::temp_dir().join(format!(
+            "ct_edge_enforce_{}_{name}.list",
+            std::process::id()
+        ))
+    }
+
+    /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn proven_key(key: u8, issued_at: u64) -> ProvenKey {
+        ProvenKey {
+            key: [key; 32],
+            issued_at,
+        }
+    }
+
+    #[test]
+    fn agent_key_policy_049_switch_to_enforce_evicts_the_unproven_entries() {
+        // N4: the tunnel that newly runs on `Enforce` loses every unproven
+        // registration and its whole TCP pool; the proven one stays, and a
+        // tunnel that stays on `Log` is not touched at all.
+        let state = EdgeState::<u32>::new();
+        let (t, other) = (token(1), token(2));
+        state
+            .register_with_candidate_checked(
+                t.clone(),
+                100,
+                cand(1),
+                AgentKeyMode::Log,
+                Some(proven_key(9, 10)),
+                None,
+            )
+            .expect("a proven registration is admitted on Log");
+        state
+            .register_with_candidate_checked(t.clone(), 1, cand(2), AgentKeyMode::Log, None, None)
+            .expect("an unproven registration is admitted on Log");
+        state
+            .register_with_candidate_checked(t.clone(), 2, cand(3), AgentKeyMode::Log, None, None)
+            .expect("a second unproven registration is admitted on Log");
+        let mut parked = state
+            .park_tcp_agent_checked(t.clone(), AgentKeyMode::Log, None)
+            .expect("the TCP fallback parks on Log");
+        state
+            .register_with_candidate_checked(
+                other.clone(),
+                7,
+                cand(4),
+                AgentKeyMode::Log,
+                None,
+                None,
+            )
+            .expect("the other tunnel registers on Log");
+
+        let mut enforce_set = HashSet::new();
+        enforce_set.insert(agent_key_token_hash(&t));
+        let mut removed =
+            state.set_agent_key_policy(AgentKeyMode::Log, enforce_set, None, Vec::new());
+        removed.sort_unstable();
+
+        assert_eq!(
+            removed,
+            vec![1, 2],
+            "exactly the unproven handles come back to be closed"
+        );
+        assert_eq!(state.route(&t), Some(100), "the proven entry survives");
+        assert_eq!(state.registration_count(&t), 1);
+        assert!(
+            !state.has_tcp_agent(&t),
+            "the tunnel's whole TCP pool is dropped"
+        );
+        assert!(
+            matches!(
+                parked.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "dropping the parked sender ends the Agent's side"
+        );
+        assert_eq!(
+            state.agent_key_violations_for(
+                &agent_key_token_hash(&t),
+                AgentKeyReason::EvictedOnEnforce
+            ),
+            2,
+            "one evicted_on_enforce per removed registration"
+        );
+        assert_eq!(state.route(&other), Some(7), "the Log tunnel is untouched");
+        assert_eq!(state.registration_count(&other), 1);
+    }
+
+    #[test]
+    fn agent_key_policy_049_mode_is_per_tunnel() {
+        // N15: a default plus a set of token hashes, never a global switch.
+        let state = EdgeState::<u32>::new();
+        let (t, other) = (token(1), token(2));
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Log);
+        assert_eq!(state.agent_key_mode_for(&other), AgentKeyMode::Log);
+
+        let mut enforce_set = HashSet::new();
+        enforce_set.insert(agent_key_token_hash(&t));
+        state.set_agent_key_policy(AgentKeyMode::Log, enforce_set, None, vec![[4u8; 32]]);
+
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+        assert_eq!(state.agent_key_mode_for(&other), AgentKeyMode::Log);
+        assert_eq!(state.agent_key_issuers(), vec![[4u8; 32]]);
+    }
+
+    #[test]
+    fn agent_key_policy_049_reload_of_an_unreadable_file_changes_nothing() {
+        // H4: no path stored -> Err; a path that cannot be read -> Err, with
+        // the mode and the live registrations exactly as they were.
+        let state = EdgeState::<u32>::new();
+        let t = token(1);
+        state
+            .register_with_candidate_checked(t.clone(), 1, cand(1), AgentKeyMode::Log, None, None)
+            .expect("register on Log to have something to lose");
+        assert!(matches!(
+            state.reload_agent_key_policy_from_file(),
+            Err(ReloadError::Unreadable(_))
+        ));
+
+        let path = temp_enforce_list_path();
+        let mut enforce_set = HashSet::new();
+        enforce_set.insert(agent_key_token_hash(&t));
+        state.set_agent_key_policy(
+            AgentKeyMode::Log,
+            enforce_set,
+            Some(path.clone()),
+            Vec::new(),
+        );
+        // The switch above already evicted the unproven entry; re-register so
+        // the reload has something it could wrongly remove.
+        state
+            .register_with_candidate_checked(t.clone(), 2, cand(1), AgentKeyMode::Log, None, None)
+            .expect("Log admission is what makes this observable");
+        assert!(
+            matches!(
+                state.reload_agent_key_policy_from_file(),
+                Err(ReloadError::Unreadable(_))
+            ),
+            "the file was never written"
+        );
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+        assert_eq!(state.route(&t), Some(2), "nothing is removed on an error");
+
+        std::fs::write(&path, "not hex\n").unwrap();
+        assert_eq!(
+            state.reload_agent_key_policy_from_file(),
+            Err(ReloadError::Invalid(1)),
+            "an unparsable line names its own line number"
+        );
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+        assert_eq!(state.route(&t), Some(2));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn agent_key_policy_049_reload_of_a_valid_file_takes_effect() {
+        // H4: the list from the file is the list in force afterwards.
+        let state = EdgeState::<u32>::new();
+        let (t, other) = (token(1), token(2));
+        let path = temp_enforce_list_path();
+        state.set_agent_key_policy(
+            AgentKeyMode::Log,
+            HashSet::new(),
+            Some(path.clone()),
+            Vec::new(),
+        );
+        state
+            .register_with_candidate_checked(t.clone(), 1, cand(1), AgentKeyMode::Log, None, None)
+            .expect("register on Log");
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Log);
+
+        let text = format!(
+            "\n{}\n  \n",
+            ct_common::hex::encode(&agent_key_token_hash(&t))
+        );
+        std::fs::write(&path, text).unwrap();
+        let removed = state
+            .reload_agent_key_policy_from_file()
+            .expect("a valid list reloads");
+
+        assert_eq!(removed, vec![1], "the unproven entry is handed back");
+        assert_eq!(state.agent_key_mode_for(&t), AgentKeyMode::Enforce);
+        assert_eq!(state.agent_key_mode_for(&other), AgentKeyMode::Log);
+        assert_eq!(state.route(&t), None);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn agent_key_policy_049_dropping_the_parked_sender_closes_the_tcp_side() {
+        // The eviction's only way to end a parked TCP agent is to drop its
+        // `oneshot::Sender`; this is the test that says so out loud
+        // (serve.rs:2728-2735 maps `Closed` to "superseded/dropped").
+        let state = EdgeState::<u32>::new();
+        let t = token(3);
+        let mut parked = state
+            .park_tcp_agent_checked(t.clone(), AgentKeyMode::Log, None)
+            .expect("the park succeeds on Log");
+        assert!(state.has_tcp_agent(&t));
+
+        let mut enforce_set = HashSet::new();
+        enforce_set.insert(agent_key_token_hash(&t));
+        let removed = state.set_agent_key_policy(AgentKeyMode::Log, enforce_set, None, Vec::new());
+
+        assert!(removed.is_empty(), "no QUIC registration existed");
+        assert!(!state.has_tcp_agent(&t));
+        assert!(matches!(
+            parked.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 }
