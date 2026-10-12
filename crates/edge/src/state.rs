@@ -2635,6 +2635,7 @@ impl<H: Clone> EdgeState<H> {
     ) -> Result<(u64, Vec<H>), AgentKeyReason> {
         // Taken exactly once, like `register_with_candidate_unless_revoked`.
         let _guard = self.registration_lock.lock_safe();
+        let mode = self.agent_key_mode_locked(&token, mode);
         if self.is_revoked(&token) {
             return Err(AgentKeyReason::Revoked);
         }
@@ -2805,6 +2806,7 @@ impl<H: Clone> EdgeState<H> {
         remote: Option<std::net::IpAddr>,
     ) -> Option<oneshot::Receiver<BoxedStream>> {
         let _guard = self.registration_lock.lock_safe();
+        let mode = self.agent_key_mode_locked(&token, mode);
         if self.is_revoked(&token) {
             return None;
         }
@@ -2824,6 +2826,25 @@ impl<H: Clone> EdgeState<H> {
             return None;
         }
         Some(self.park_tcp_agent(token))
+    }
+
+    /// trace: AUF-20261011-049 -- the mode a registration is judged by, with
+    /// `registration_lock` held. The caller read its mode before taking the
+    /// lock (and, for a proving Agent, before a handshake that can take
+    /// seconds); a switch to `Enforce` in between has already evicted what was
+    /// there and must refuse what arrives late. So `Enforce` in force wins over
+    /// a stale `Log`. The other direction is left to the caller: one that read
+    /// `Enforce` is refused once and simply reconnects.
+    fn agent_key_mode_locked(
+        &self,
+        token: &RoutingToken,
+        read_by_caller: AgentKeyMode,
+    ) -> AgentKeyMode {
+        if self.agent_key_mode_for(token) == AgentKeyMode::Enforce {
+            AgentKeyMode::Enforce
+        } else {
+            read_by_caller
+        }
     }
 
     /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049 (N15) --
@@ -3818,6 +3839,47 @@ mod tests {
             Err(AgentKeyReason::Unproven)
         );
         assert!(!state.is_known(&t), "nothing was registered");
+    }
+
+    #[test]
+    fn enforce_set_after_the_caller_read_log_still_refuses_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(45);
+        let mut enforce_set = HashSet::new();
+        enforce_set.insert(agent_key_token_hash(&t));
+        state.set_agent_key_policy(AgentKeyMode::Log, enforce_set, None, Vec::new());
+        assert_eq!(
+            state.register_with_candidate_checked(
+                t.clone(),
+                10,
+                cand(1),
+                AgentKeyMode::Log,
+                None,
+                None,
+            ),
+            Err(AgentKeyReason::Unproven),
+            "a mode read before the switch must not admit into an enforced tunnel"
+        );
+        assert!(!state.is_known(&t), "nothing was registered");
+        assert!(
+            state
+                .park_tcp_agent_checked(t.clone(), AgentKeyMode::Log, None)
+                .is_none(),
+            "the TCP fallback is judged by the mode in force as well"
+        );
+        assert_eq!(state.tcp_parked_for(&t), 0, "nothing was parked");
+    }
+
+    #[test]
+    fn a_caller_that_read_enforce_is_not_downgraded_agent_key_049() {
+        let state = EdgeState::<u32>::new();
+        let t = token(46);
+        assert!(
+            state
+                .park_tcp_agent_checked(t.clone(), AgentKeyMode::Enforce, None)
+                .is_none(),
+            "Enforce read by the caller stands even if the policy says Log by now"
+        );
     }
 
     #[test]
@@ -5374,11 +5436,22 @@ mod tests {
             Some(path.clone()),
             Vec::new(),
         );
-        // The switch above already evicted the unproven entry; re-register so
-        // the reload has something it could wrongly remove.
+        // The switch above already evicted the unproven entry; re-register
+        // with a proof (the only way into an enforced tunnel) so the reload
+        // has something it could wrongly remove.
         state
-            .register_with_candidate_checked(t.clone(), 2, cand(1), AgentKeyMode::Log, None, None)
-            .expect("Log admission is what makes this observable");
+            .register_with_candidate_checked(
+                t.clone(),
+                2,
+                cand(1),
+                AgentKeyMode::Enforce,
+                Some(ProvenKey {
+                    key: [9u8; 32],
+                    issued_at: 10,
+                }),
+                None,
+            )
+            .expect("a proven registration is admitted on Enforce");
         assert!(
             matches!(
                 state.reload_agent_key_policy_from_file(),
