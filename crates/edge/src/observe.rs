@@ -28,7 +28,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// every gauge above, which reads from `EdgeState`, this reads directly from the
 /// `ConnectionCap` itself (ws_channel.rs has no `EdgeState` of its own; wiring one in
 /// just for this would be a much larger, unrelated change for one metric).
-pub fn render_edge_metrics<H: Clone>(state: &EdgeState<H>, ws_channel_cap: Option<&ConnectionCap>) -> String {
+pub fn render_edge_metrics<H: Clone>(
+    state: &EdgeState<H>,
+    ws_channel_cap: Option<&ConnectionCap>,
+) -> String {
     // #775: no sample at all before the reaper's first tick (a few seconds after
     // boot) -- same "absent renders nothing" convention as every other best-effort
     // gauge in this file, rather than a misleading placeholder value.
@@ -453,7 +456,9 @@ ct_edge_ja4_tracked_fingerprints_max). Informational only.\n\
 /// scrape. Order matters: backslashes are escaped FIRST, so the backslashes just
 /// introduced by escaping a quote/newline are not themselves re-escaped.
 fn escape_prometheus_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// #498: how stale a broker-loop heartbeat may be before `/healthz` reports the loop as
@@ -473,7 +478,11 @@ pub struct BrokerLoopStatus {
 
 impl BrokerLoopStatus {
     pub fn of(name: &'static str, hb: &crate::state::BrokerHeartbeat) -> Self {
-        Self { name, last_seen: hb.last_seen(), expected_since: hb.expected_since() }
+        Self {
+            name,
+            last_seen: hb.last_seen(),
+            expected_since: hb.expected_since(),
+        }
     }
 }
 
@@ -530,21 +539,28 @@ pub fn broker_loops_health(
 /// answers 200 only while the broker accept loops are provably iterating -- the container
 /// healthcheck's probe target, so "healthy" means "can admit channel joins", not merely "the
 /// metrics HTTP server responds".
-pub fn metrics_router(state: Arc<EdgeState<Connection>>, ws_channel_cap: Option<ConnectionCap>) -> Router {
+pub fn metrics_router(
+    state: Arc<EdgeState<Connection>>,
+    ws_channel_cap: Option<ConnectionCap>,
+) -> Router {
     Router::new()
         .route("/metrics", get(render))
         .route("/healthz", get(healthz))
         .with_state((state, ws_channel_cap))
 }
 
-async fn render(State((state, ws_channel_cap)): State<(Arc<EdgeState<Connection>>, Option<ConnectionCap>)>) -> impl IntoResponse {
+async fn render(
+    State((state, ws_channel_cap)): State<(Arc<EdgeState<Connection>>, Option<ConnectionCap>)>,
+) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
         render_edge_metrics(&*state, ws_channel_cap.as_ref()),
     )
 }
 
-async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<ConnectionCap>)>) -> impl IntoResponse {
+async fn healthz(
+    State((state, _)): State<(Arc<EdgeState<Connection>>, Option<ConnectionCap>)>,
+) -> impl IntoResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -559,7 +575,11 @@ async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<Co
         BrokerLoopStatus::of("relay", &state.relay_broker_heartbeat()),
         BrokerLoopStatus::of("rendezvous", &state.rendezvous_broker_heartbeat()),
     ];
-    loops.extend(listeners.iter().map(|(label, hb)| BrokerLoopStatus::of(label, hb)));
+    loops.extend(
+        listeners
+            .iter()
+            .map(|(label, hb)| BrokerLoopStatus::of(label, hb)),
+    );
     match broker_loops_health(&loops, now, BROKER_HEALTH_MAX_AGE_SECS) {
         // #573: the 200 names what it checked. The two brokers above are hardcoded, so this
         // endpoint can never pass on an empty set -- but the LISTENERS are whatever registered
@@ -578,7 +598,10 @@ async fn healthz(State((state, _)): State<(Arc<EdgeState<Connection>>, Option<Co
                 loops.iter().map(|l| l.name).collect::<Vec<_>>().join(", ")
             ),
         ),
-        Err(why) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
+        Err(why) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!("{why}\n"),
+        ),
     }
 }
 
@@ -637,9 +660,18 @@ mod tests {
         assert!(body.contains("ct_edge_relays_total 3"), "{body}");
         assert!(body.contains("ct_edge_relay_bytes_total 162"), "{body}");
         assert!(body.contains("ct_edge_failovers_total 1"), "{body}");
-        assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="browser"} 10"#), "{body}");
-        assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="dataplane"} 150"#), "{body}");
-        assert!(body.contains(r#"ct_edge_relay_bytes_kind_total{kind="tcp_fallback"} 2"#), "{body}");
+        assert!(
+            body.contains(r#"ct_edge_relay_bytes_kind_total{kind="browser"} 10"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"ct_edge_relay_bytes_kind_total{kind="dataplane"} 150"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"ct_edge_relay_bytes_kind_total{kind="tcp_fallback"} 2"#),
+            "{body}"
+        );
         assert!(body.contains("ct_edge_channel_relay_bytes_total"), "{body}");
         assert!(body.contains("ct_edge_channel_splices_total"), "{body}");
         // #530: the channel-pairer reap counter renders (value is a process-wide
@@ -648,9 +680,15 @@ mod tests {
         // ...and beside it the supersede counter, which is the whole point of the split:
         // if only one of the two renders, an operator reading /metrics cannot tell a
         // "nobody is coming" churn from a same-holder retry storm.
-        assert!(body.contains("ct_edge_channel_park_superseded_total"), "{body}");
+        assert!(
+            body.contains("ct_edge_channel_park_superseded_total"),
+            "{body}"
+        );
         // #533: same for the front-door benign client-abort counter.
-        assert!(body.contains("ct_edge_front_door_client_aborts_total"), "{body}");
+        assert!(
+            body.contains("ct_edge_front_door_client_aborts_total"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
@@ -658,7 +696,12 @@ mod tests {
         let state = Arc::new(EdgeState::<Connection>::new());
         let app = metrics_router(state, None);
         let resp = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -668,42 +711,94 @@ mod tests {
         );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("ct_edge_active_tunnels 0"), "empty edge → 0 tunnels: {text}");
+        assert!(
+            text.contains("ct_edge_active_tunnels 0"),
+            "empty edge → 0 tunnels: {text}"
+        );
         assert!(text.contains("ct_edge_active_agents 0"));
-        assert!(!text.contains("ct_edge_ws_channel_"), "no ws_channel_cap -> no ws-channel gauges at all: {text}");
+        assert!(
+            !text.contains("ct_edge_ws_channel_"),
+            "no ws_channel_cap -> no ws-channel gauges at all: {text}"
+        );
     }
 
     /// Test helper: a loop that is running and last beat at `last_seen`.
     fn beating(name: &'static str, last_seen: u64) -> BrokerLoopStatus {
-        BrokerLoopStatus { name, last_seen, expected_since: last_seen.saturating_sub(1) }
+        BrokerLoopStatus {
+            name,
+            last_seen,
+            expected_since: last_seen.saturating_sub(1),
+        }
     }
     /// Test helper: a loop the edge deliberately does not run (#103 guard).
     fn not_expected(name: &'static str) -> BrokerLoopStatus {
-        BrokerLoopStatus { name, last_seen: 0, expected_since: 0 }
+        BrokerLoopStatus {
+            name,
+            last_seen: 0,
+            expected_since: 0,
+        }
     }
     /// Test helper: a loop the edge meant to run that has never iterated (#539).
     fn expected_but_silent(name: &'static str, since: u64) -> BrokerLoopStatus {
-        BrokerLoopStatus { name, last_seen: 0, expected_since: since }
+        BrokerLoopStatus {
+            name,
+            last_seen: 0,
+            expected_since: since,
+        }
     }
 
     #[test]
     fn broker_loops_health_classifies_fresh_stale_and_never_started_498() {
         // Fresh beats within the window -> healthy.
-        assert!(broker_loops_health(&[beating("relay", 1_000), beating("rendezvous", 1_005)], 1_030, 60).is_ok());
+        assert!(broker_loops_health(
+            &[beating("relay", 1_000), beating("rendezvous", 1_005)],
+            1_030,
+            60
+        )
+        .is_ok());
         // Exactly at the boundary is still healthy; one past it is not.
-        assert!(broker_loops_health(&[beating("relay", 940), beating("rendezvous", 1_000)], 1_000, 60).is_ok());
-        let why = broker_loops_health(&[beating("relay", 939), beating("rendezvous", 1_000)], 1_000, 60)
-            .expect_err("61s old = wedged");
-        assert!(why.contains("relay") && why.contains("61s"), "names the stale loop and age: {why}");
-        assert!(!why.contains("rendezvous ("), "the fresh loop is not named: {why}");
+        assert!(broker_loops_health(
+            &[beating("relay", 940), beating("rendezvous", 1_000)],
+            1_000,
+            60
+        )
+        .is_ok());
+        let why = broker_loops_health(
+            &[beating("relay", 939), beating("rendezvous", 1_000)],
+            1_000,
+            60,
+        )
+        .expect_err("61s old = wedged");
+        assert!(
+            why.contains("relay") && why.contains("61s"),
+            "names the stale loop and age: {why}"
+        );
+        assert!(
+            !why.contains("rendezvous ("),
+            "the fresh loop is not named: {why}"
+        );
         // Both stale -> both named.
-        let why = broker_loops_health(&[beating("relay", 100), beating("rendezvous", 200)], 1_000, 60)
-            .expect_err("both wedged");
+        let why = broker_loops_health(
+            &[beating("relay", 100), beating("rendezvous", 200)],
+            1_000,
+            60,
+        )
+        .expect_err("both wedged");
         assert!(why.contains("relay") && why.contains("rendezvous"), "{why}");
         // A loop the edge never meant to run stays healthy -- the #103 address-collision
         // guard is a configuration decision, not a fault.
-        assert!(broker_loops_health(&[not_expected("relay"), beating("rendezvous", 1_000)], 1_030, 60).is_ok());
-        assert!(broker_loops_health(&[not_expected("relay"), not_expected("rendezvous")], 1_030, 60).is_ok());
+        assert!(broker_loops_health(
+            &[not_expected("relay"), beating("rendezvous", 1_000)],
+            1_030,
+            60
+        )
+        .is_ok());
+        assert!(broker_loops_health(
+            &[not_expected("relay"), not_expected("rendezvous")],
+            1_030,
+            60
+        )
+        .is_ok());
     }
 
     #[test]
@@ -713,12 +808,18 @@ mod tests {
         // loop never beat. Previously indistinguishable from "deliberately not run", so
         // /healthz answered 200 forever while both-NAT'd peers could not pair at all.
         let why = broker_loops_health(
-            &[expected_but_silent("relay", 1_000), beating("rendezvous", 1_100)],
+            &[
+                expected_but_silent("relay", 1_000),
+                beating("rendezvous", 1_100),
+            ],
             1_100,
             60,
         )
         .expect_err("expected for 100s without a single beat is not healthy");
-        assert!(why.contains("relay") && why.contains("never started"), "{why}");
+        assert!(
+            why.contains("relay") && why.contains("never started"),
+            "{why}"
+        );
         assert!(
             !why.contains("wedged"),
             "a loop that never came up is not a wedged loop -- the operator response differs \
@@ -758,20 +859,35 @@ mod tests {
         state.relay_broker_heartbeat().beat(now);
         state.rendezvous_broker_heartbeat().beat(now);
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        state.relay_broker_heartbeat().beat(now - BROKER_HEALTH_MAX_AGE_SECS - 120);
+        state
+            .relay_broker_heartbeat()
+            .beat(now - BROKER_HEALTH_MAX_AGE_SECS - 120);
         let resp = metrics_router(state, None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("relay") && text.contains("#498"), "names the wedged loop: {text}");
+        assert!(
+            text.contains("relay") && text.contains("#498"),
+            "names the wedged loop: {text}"
+        );
     }
 
     /// An advisory listener must be BOTH: reported in `/metrics`, and unable to fail
@@ -813,12 +929,20 @@ mod tests {
         state.expect_listener_advisory(":80 redirect", now - BROKER_HEALTH_MAX_AGE_SECS - 120);
 
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "everything gating is fresh");
         let body = String::from_utf8(
-            axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec(),
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
         )
         .unwrap();
 
@@ -855,7 +979,12 @@ mod tests {
         state.expect_listener_advisory(":80 redirect", dead_long_ago);
 
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -865,7 +994,12 @@ mod tests {
         );
 
         let body = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap()
             .into_body()
@@ -875,7 +1009,9 @@ mod tests {
             .to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
-            text.contains("ct_edge_listener_loop_expected_since_seconds{listener=\":80 redirect\"}"),
+            text.contains(
+                "ct_edge_listener_loop_expected_since_seconds{listener=\":80 redirect\"}"
+            ),
             "not fatal must not mean not reported: {text}"
         );
         assert!(
@@ -889,10 +1025,19 @@ mod tests {
         // never-started check had stopped working.
         state.expect_listener(":443 front door", dead_long_ago);
         let resp = metrics_router(state, None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a gating listener still fails");
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a gating listener still fails"
+        );
     }
 
     #[tokio::test]
@@ -908,10 +1053,19 @@ mod tests {
 
         // Relay untouched: never expected, never beat -- a deliberate no-relay edge is healthy.
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "a deliberately unstarted relay is not a fault");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a deliberately unstarted relay is not a fault"
+        );
 
         // Now the edge declares it MEANT to run the relay, long enough ago that a first beat
         // was due -- the bind-failure signature. Same state, opposite verdict.
@@ -919,13 +1073,21 @@ mod tests {
             .relay_broker_heartbeat()
             .expect_start(now - BROKER_HEALTH_MAX_AGE_SECS - 120);
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("relay") && text.contains("never started"), "{text}");
+        assert!(
+            text.contains("relay") && text.contains("never started"),
+            "{text}"
+        );
 
         // And the metrics side carries the same distinction, so monitoring is not left with
         // the ambiguous 0 that made this invisible in the first place.
@@ -956,7 +1118,10 @@ mod tests {
         cap.note_shed();
         let body = render_edge_metrics(&state, Some(&cap));
         assert!(body.contains("ct_edge_ws_channel_connections 2"), "{body}");
-        assert!(body.contains("ct_edge_ws_channel_connections_max 3"), "{body}");
+        assert!(
+            body.contains("ct_edge_ws_channel_connections_max 3"),
+            "{body}"
+        );
         assert!(body.contains("ct_edge_ws_channel_shed_total 1"), "{body}");
     }
 
@@ -979,16 +1144,30 @@ mod tests {
         let fd = state.expect_listener(":443 front door", now);
         fd.beat(now);
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "brokers and listener all fresh");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "brokers and listener all fresh"
+        );
 
         // Its task dies. The BROKERS ARE STILL FINE -- that is the whole point, and the
         // reason checking only them was not enough.
         fd.beat(now - BROKER_HEALTH_MAX_AGE_SECS - 120);
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -997,7 +1176,9 @@ mod tests {
             "a dead :443 accept loop must not be reported as healthy just because the \
              QUIC brokers are alive"
         );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(
             body.contains(":443 front door"),
@@ -1021,7 +1202,12 @@ mod tests {
         // a bind failure looks exactly like this.
         let _ = state.expect_listener("TCP fallback", now - BROKER_HEALTH_MAX_AGE_SECS - 120);
         let resp = metrics_router(state.clone(), None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1032,7 +1218,12 @@ mod tests {
         bare.relay_broker_heartbeat().beat(now);
         bare.rendezvous_broker_heartbeat().beat(now);
         let resp = metrics_router(bare, None)
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1054,7 +1245,9 @@ mod tests {
         let body = render_edge_metrics(&state, None);
         for flavour in ["yes", "no"] {
             assert!(
-                body.contains(&format!("ct_edge_channel_park_legs_total{{keepalive=\"{flavour}\"}}")),
+                body.contains(&format!(
+                    "ct_edge_channel_park_legs_total{{keepalive=\"{flavour}\"}}"
+                )),
                 "the {flavour} row must exist even before any leg parks: {body}"
             );
         }
@@ -1085,7 +1278,9 @@ mod tests {
 
         let body = render_edge_metrics(&state, None);
         assert!(
-            body.contains("ct_edge_listener_loop_last_seen_seconds{listener=\":443 front door\"} 1700000005"),
+            body.contains(
+                "ct_edge_listener_loop_last_seen_seconds{listener=\":443 front door\"} 1700000005"
+            ),
             "a beating listener must report its beat: {body}"
         );
         assert!(
@@ -1108,8 +1303,14 @@ mod tests {
         // Nothing has happened yet: both numbers present and zero. The zero matters -- an
         // absent metric and a quiet penalty must not look the same to a scraper.
         let body = render_edge_metrics(&state, None);
-        assert!(body.contains("ct_edge_channel_join_penalty_sheds_total 0"), "{body}");
-        assert!(body.contains("ct_edge_channel_join_penalty_tracked_ips 0"), "{body}");
+        assert!(
+            body.contains("ct_edge_channel_join_penalty_sheds_total 0"),
+            "{body}"
+        );
+        assert!(
+            body.contains("ct_edge_channel_join_penalty_tracked_ips 0"),
+            "{body}"
+        );
         assert!(
             body.contains(&format!(
                 "ct_edge_channel_join_penalty_tracked_ips_max {}",
@@ -1126,7 +1327,10 @@ mod tests {
         }
 
         let body = render_edge_metrics(&state, None);
-        assert!(body.contains("ct_edge_channel_join_penalty_sheds_total 3"), "{body}");
+        assert!(
+            body.contains("ct_edge_channel_join_penalty_sheds_total 3"),
+            "{body}"
+        );
         assert!(
             body.contains("ct_edge_channel_join_penalty_tracked_ips 2"),
             "two distinct sources refused, so two are tracked: {body}"
@@ -1142,7 +1346,10 @@ mod tests {
         let state: EdgeState<u32> = EdgeState::new();
         let body = render_edge_metrics(&state, None);
         assert!(body.contains("ct_edge_ja4_observed_total 0"), "{body}");
-        assert!(body.contains("ct_edge_ja4_tracked_fingerprints 0"), "{body}");
+        assert!(
+            body.contains("ct_edge_ja4_tracked_fingerprints 0"),
+            "{body}"
+        );
         assert!(body.contains("ct_edge_ja4_evictions_total 0"), "{body}");
         assert!(
             body.contains(&format!(
@@ -1162,13 +1369,20 @@ mod tests {
 
         let body = render_edge_metrics(&state, None);
         assert!(body.contains("ct_edge_ja4_observed_total 3"), "{body}");
-        assert!(body.contains("ct_edge_ja4_tracked_fingerprints 2"), "two distinct fingerprints: {body}");
         assert!(
-            body.contains("ct_edge_ja4_fingerprint_total{ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"} 2"),
+            body.contains("ct_edge_ja4_tracked_fingerprints 2"),
+            "two distinct fingerprints: {body}"
+        );
+        assert!(
+            body.contains(
+                "ct_edge_ja4_fingerprint_total{ja4=\"t13d1516h2_8daaf6152771_e5627efa2ab1\"} 2"
+            ),
             "the repeated fingerprint's own count: {body}"
         );
         assert!(
-            body.contains("ct_edge_ja4_fingerprint_total{ja4=\"t12i0208d00_000000000000_000000000000\"} 1"),
+            body.contains(
+                "ct_edge_ja4_fingerprint_total{ja4=\"t12i0208d00_000000000000_000000000000\"} 1"
+            ),
             "{body}"
         );
     }
@@ -1213,7 +1427,10 @@ mod tests {
             !body.lines().any(|l| l == "ct_edge_forged_metric 1"),
             "the embedded newline must not split into a standalone forged metric line: {body:?}"
         );
-        assert!(body.contains("real\\\"}\\nct_edge_forged_metric 1\\n#"), "escaped in place instead: {body:?}");
+        assert!(
+            body.contains("real\\\"}\\nct_edge_forged_metric 1\\n#"),
+            "escaped in place instead: {body:?}"
+        );
     }
 
     #[test]
@@ -1250,9 +1467,18 @@ mod tests {
             None,
         );
         let body = render_edge_metrics(&state, None);
-        assert!(body.contains("ct_edge_agent_key_violations_total{reason=\"unproven\"} 2"), "{body}");
         assert!(
-            !body.contains(&token(5).0.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            body.contains("ct_edge_agent_key_violations_total{reason=\"unproven\"} 2"),
+            "{body}"
+        );
+        assert!(
+            !body.contains(
+                &token(5)
+                    .0
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
             "no per-tunnel identifier leaks into the export"
         );
     }

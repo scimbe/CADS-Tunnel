@@ -2682,6 +2682,7 @@ impl<H: Clone> EdgeState<H> {
             }
         }
         let id = self.register_locked(token.clone(), handle);
+        eprintln!("DEBUG register_with_candidate_checked id={id} proves_pin={proves_pin}");
         self.candidates
             .write_safe()
             .insert(token.clone(), candidate);
@@ -2871,10 +2872,12 @@ impl<H: Clone> EdgeState<H> {
             issuers,
         };
         let newly = self.swap_agent_key_policy_locked(next);
+        eprintln!("DEBUG set_agent_key_policy newly={}", newly.len());
         let mut removed: Vec<H> = Vec::new();
         for token in &newly {
             removed.extend(self.enforce_tunnel_locked(token));
         }
+        eprintln!("DEBUG set_agent_key_policy removed.len()={}", removed.len());
         removed
     }
 
@@ -2916,6 +2919,7 @@ impl<H: Clone> EdgeState<H> {
             .lock_safe()
             .get(token)
             .map_or_else(HashSet::new, |pin| pin.proven_ids.clone());
+        eprintln!("DEBUG enforce_tunnel_locked proven={:?}", proven);
         let mut removed: Vec<H> = Vec::new();
         {
             let mut agents = self.agents.write_safe();
@@ -2929,6 +2933,7 @@ impl<H: Clone> EdgeState<H> {
                     }
                 }
                 let evicted = before - v.len();
+                eprintln!("DEBUG enforce_tunnel_locked before={before} evicted={evicted} removed_len={}", removed.len());
                 // #359: the gauges move with the real removal, exactly like
                 // `remove_registration`'s own correction.
                 self.total_registrations_gauge
