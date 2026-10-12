@@ -2,6 +2,8 @@
 //! ciphertext only as fallback; never in the trust path. See ADR-0004/0015.
 
 pub mod admin;
+/// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+pub mod agent_key;
 pub mod audit_log;
 pub mod auth;
 pub mod channel_authorize;
