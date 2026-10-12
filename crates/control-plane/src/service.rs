@@ -3771,6 +3771,10 @@ struct GrantRevokeReq {
 struct GrantRevokeResp {
     revoked: bool,
     already: bool,
+    /// Present (and `true`) only when the grant was already past its expiry: no entry was
+    /// kept because none is needed. Older clients ignore the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired: bool,
 }
 
 /// `POST /me/channels/:channel/grants/revoke`: revoke one signed grant, owner-scoped.
@@ -3825,7 +3829,10 @@ async fn record_grant_revocation(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match stored {
         None => Err((StatusCode::NOT_FOUND, "unknown channel".to_string())),
-        Some(new) => Ok(GrantRevokeResp { revoked: true, already: !new }),
+        // Already past its expiry: the store keeps no entry, so do not claim one
+        // (`already` stays false: this call is the one that settled it).
+        Some(_) if expires_at <= now => Ok(GrantRevokeResp { revoked: true, already: false, expired: true }),
+        Some(new) => Ok(GrantRevokeResp { revoked: true, already: !new, expired: false }),
     }
 }
 
@@ -12637,6 +12644,16 @@ mod tests {
         let again = revoke(&op_sk, digest, now + 3_600).await.unwrap();
         let b = to_bytes(again.into_body(), 1 << 16).await.unwrap();
         assert!(serde_json::from_slice::<GrantRevokeResp>(&b).unwrap().already, "replay is idempotent");
+        // A grant that is already past its expiry is accepted, not kept, and says so.
+        let past = revoke(&op_sk, [0x77; 32], now - 10).await.unwrap();
+        assert_eq!(past.status(), StatusCode::OK);
+        let b = to_bytes(past.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!((v["revoked"].as_bool(), v["already"].as_bool(), v["expired"].as_bool()), (Some(true), Some(false), Some(true)));
+        assert!(!channels.is_grant_revoked(&ch, &[0x77; 32]).unwrap(), "no entry is kept for an expired grant");
+        let normal = revoke(&op_sk, digest, now + 3_600).await.unwrap();
+        let normal: serde_json::Value = serde_json::from_slice(&to_bytes(normal.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert!(normal.get("expired").is_none(), "the field is absent on a normal answer");
 
         // Status now reports revoked for that digest only; the holder stays a member.
         let r = status(&asker_sk, digest, now).await.unwrap();
