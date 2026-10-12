@@ -99,6 +99,16 @@ door: `-f compose.selfhost.yml -f compose.frontdoor.yml -f compose.sso.yml`. See
 the [Keycloak SSO runbook](../deploy/keycloak-sso.md). The base stack runs
 unchanged without either overlay.
 
+**Optional edge address pin** — `docker/deploy/compose.edge-pin.yml` keeps the edge on
+fixed container addresses when it is re-created. Without it, a re-created edge may get a
+new address on the default network, and agents that resolve the edge only once at start
+(ct-agent before 0.7.37) lose it silently. Use it only on a host that runs
+`compose.relay.yml` (it pins the `relay_internal` address too), and load it with `-f`
+alongside the base files; it is never loaded by default and `deploy-selfhost.sh` does not
+use it. Set both `CT_EDGE_IPV4_DEFAULT` and `CT_EDGE_IPV4_RELAY` (no defaults; copy them
+from `docker inspect` of the running edge before the first use). Both networks must already
+exist with a subnet that contains these addresses.
+
 ### Hosted (Kubernetes)
 
 Before `apply`, create the two out-of-band Secrets the base needs (never
