@@ -824,7 +824,7 @@ async fn both_sides_closing_tears_both_legs_down() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_half_closed_pair_is_torn_down_after_the_linger_bound() {
+async fn a_half_closed_pair_gets_torn_down_after_the_linger_bound() {
     // b never closes its side: the open direction must not keep the legs alive forever.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (client_a, mut client_b) = spliced_pair(false);
