@@ -1453,6 +1453,11 @@ mod tests {
         (client, server, client_conn)
     }
 
+    // trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
+    fn agent_key_admin_049_cand(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
     fn agent_key_admin_049_temp_path() -> std::path::PathBuf {
         use rand::RngCore;
         let mut b = [0u8; 8];
@@ -1483,14 +1488,24 @@ mod tests {
             .register_with_candidate_checked(
                 t.clone(),
                 proven_conn,
-                cand(1),
+                agent_key_admin_049_cand(1),
                 AgentKeyMode::Log,
-                Some(crate::state::ProvenKey { key: [9u8; 32], issued_at: 10 }),
+                Some(crate::state::ProvenKey {
+                    key: [9u8; 32],
+                    issued_at: 10,
+                }),
                 None,
             )
             .expect("proven registration admitted on Log");
         state
-            .register_with_candidate_checked(t.clone(), unproven_conn, cand(2), AgentKeyMode::Log, None, None)
+            .register_with_candidate_checked(
+                t.clone(),
+                unproven_conn,
+                agent_key_admin_049_cand(2),
+                AgentKeyMode::Log,
+                None,
+                None,
+            )
             .expect("unproven registration admitted on Log");
 
         let reload = |auth: Option<String>| {
