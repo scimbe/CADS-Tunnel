@@ -2029,6 +2029,19 @@ mod tests {
             .expect("the enforced tunnel shows up in the status rows, by hash prefix only");
         assert!(!row.hash_prefix.is_empty());
         assert!(row.proofs_admitted >= 1, "the proven registration counted");
-        assert!(row.ready_for_enforce, "a proven admission makes it ready");
+        assert!(
+            !row.ready_for_enforce,
+            "`t` saw an unproven_beside_proven violation, which keeps it out of Enforce readiness for good"
+        );
+        let clean = parsed
+            .tunnels
+            .iter()
+            .find(|r| r.mode == "Log")
+            .expect("the untouched tunnel stays on Log");
+        assert!(clean.proofs_admitted >= 1, "its proven admission counted");
+        assert!(
+            clean.ready_for_enforce,
+            "a lone proven admission makes the untouched tunnel ready"
+        );
     }
 }
