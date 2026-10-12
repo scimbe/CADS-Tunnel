@@ -663,3 +663,296 @@ async fn park_pump_far_leg_sees_eof_when_up_leg_is_blocked_in_write_256k_auf002(
         "die gestauten Bytes muessen a's Muster tragen"
     );
 }
+
+// Half-close semantics of the park pump. A write half-close from one side must reach the
+// peer as EOF, while the opposite direction stays open until it ends on its own or the
+// linger bound fires. Only a hard error, or a keepalive leg's EOF while still parked,
+// tears the whole leg down at once.
+
+/// Two pumped legs joined the way the broker splices a pair; returns the client ends. Each
+/// leg first receives its ack chunk, so both are past the parked phase, as in a real pairing.
+async fn spliced_pair(keepalive: bool) -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut client_a, real_a) = tokio::io::duplex(128 * 1024);
+    let (mut client_b, real_b) = tokio::io::duplex(128 * 1024);
+    let (_la, dead_a) = ParkLiveness::monitored();
+    let (_lb, dead_b) = ParkLiveness::monitored();
+    let mut leg_a = spawn_park_keepalive_pump(Box::pin(real_a), keepalive, dead_a);
+    let mut leg_b = spawn_park_keepalive_pump(Box::pin(real_b), keepalive, dead_b);
+    for (leg, client) in [(&mut leg_a, &mut client_a), (&mut leg_b, &mut client_b)] {
+        leg.write_all(b"OK").await.expect("ack");
+        leg.flush().await.expect("flush");
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.expect("client reads the ack");
+    }
+    tokio::spawn(async move { crate::relay::relay_streams(leg_a, leg_b, "half_close").await });
+    (client_a, client_b)
+}
+
+const SHORT: std::time::Duration = std::time::Duration::from_secs(3);
+
+// Half-close semantics of the park pump. A write half-close from one side must reach the
+// peer as EOF, while the opposite direction stays open until it ends on its own or the
+// idle bound fires. Only a hard error, or a keepalive leg's EOF while still parked, tears
+// the whole leg down at once.
+
+#[tokio::test]
+async fn half_close_on_a_plain_leg_reaches_the_peer_and_keeps_the_return_path() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_a, mut client_b) = spliced_pair(false).await;
+    let (mut a_r, mut a_w) = tokio::io::split(client_a);
+
+    // Data right before the EOF must arrive complete, followed by the EOF.
+    let upstream = vec![0x17u8; 64 * 1024];
+    a_w.write_all(&upstream).await.expect("a write");
+    a_w.shutdown().await.expect("a half-closes its write side");
+
+    let mut got_up = Vec::new();
+    tokio::time::timeout(SHORT, client_b.read_to_end(&mut got_up))
+        .await
+        .expect("b must see EOF within 3s after a closed its write side")
+        .expect("read");
+    assert_eq!(got_up, upstream, "b must receive everything a sent before closing");
+
+    let payload = vec![0xc3u8; 64 * 1024];
+    client_b.write_all(&payload).await.expect("b writes 64 KiB back");
+    client_b.flush().await.expect("b flush");
+
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(SHORT, a_r.read_exact(&mut got))
+        .await
+        .expect("a must still receive the full 64 KiB within 3s")
+        .expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn a_peer_close_first_keeps_the_clients_upstream_flowing() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_a, client_b) = spliced_pair(false).await;
+    let (mut a_r, mut a_w) = tokio::io::split(client_a);
+    let (mut b_r, mut b_w) = tokio::io::split(client_b);
+
+    // b closes first: a sees EOF, but a can still send to b.
+    b_w.shutdown().await.expect("b half-closes");
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(SHORT, a_r.read(&mut byte))
+        .await
+        .expect("a must see EOF within 3s")
+        .expect("read");
+    assert_eq!(n, 0);
+
+    let payload = vec![0x42u8; 64 * 1024];
+    a_w.write_all(&payload).await.expect("a still writes");
+    a_w.flush().await.expect("flush");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(SHORT, b_r.read_exact(&mut got))
+        .await
+        .expect("b must still receive the full 64 KiB within 3s")
+        .expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn a_half_close_while_parked_reaches_the_far_end_only_after_the_first_chunk() {
+    // The pairer never reads a parked member, so a half-close seen while parked must not
+    // surface on the far end before the leg has been acked.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_end, real) = tokio::io::duplex(128 * 1024);
+    let (lv, dead) = ParkLiveness::monitored();
+    let mut parked_end = spawn_park_keepalive_pump(Box::pin(real), false, dead);
+    let (mut client_r, mut client_w) = tokio::io::split(client_end);
+
+    client_w.shutdown().await.expect("client half-closes while parked");
+
+    let mut byte = [0u8; 1];
+    let early = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        parked_end.read(&mut byte),
+    )
+    .await;
+    assert!(early.is_err(), "no EOF may reach the far end while the leg is parked");
+    assert!(!lv.is_dead(), "a legacy half-close must not flag death");
+
+    let payload = vec![0xc3u8; 64 * 1024];
+    parked_end.write_all(&payload).await.expect("far end writes");
+    parked_end.flush().await.expect("flush");
+
+    let n = tokio::time::timeout(SHORT, parked_end.read(&mut byte))
+        .await
+        .expect("the far end must see EOF within 3s once the leg is acked")
+        .expect("read");
+    assert_eq!(n, 0);
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(SHORT, client_r.read_exact(&mut got))
+        .await
+        .expect("the client must still receive the full 64 KiB within 3s")
+        .expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn half_close_on_a_keepalive_leg_after_the_ack_keeps_the_return_path() {
+    // Once the first chunk has gone to the client the leg is no longer parked, so a
+    // client EOF is an ordinary half-close and not the death signal it is while parked.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_end, real) = tokio::io::duplex(128 * 1024);
+    let (lv, dead) = ParkLiveness::monitored();
+    let mut parked_end = spawn_park_keepalive_pump(Box::pin(real), true, dead);
+    let (mut client_r, mut client_w) = tokio::io::split(client_end);
+
+    parked_end.write_all(b"OK").await.expect("ack");
+    parked_end.flush().await.expect("flush");
+    let mut ack = [0u8; 2];
+    client_r.read_exact(&mut ack).await.expect("client reads the ack");
+
+    client_w.shutdown().await.expect("client half-closes");
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(SHORT, parked_end.read(&mut byte))
+        .await
+        .expect("the far end must see EOF within 3s")
+        .expect("read");
+    assert_eq!(n, 0);
+    assert!(!lv.is_dead(), "EOF after the ack must not flag death");
+
+    let payload = vec![0x5au8; 64 * 1024];
+    parked_end.write_all(&payload).await.expect("far end writes");
+    parked_end.flush().await.expect("flush");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(SHORT, client_r.read_exact(&mut got))
+        .await
+        .expect("the client must still receive the full 64 KiB within 3s")
+        .expect("read");
+    assert_eq!(got, payload);
+}
+
+#[tokio::test]
+async fn both_sides_closing_tears_both_legs_down() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_a, client_b) = spliced_pair(false).await;
+    let (mut a_r, mut a_w) = tokio::io::split(client_a);
+    let (mut b_r, mut b_w) = tokio::io::split(client_b);
+
+    a_w.shutdown().await.expect("a closes");
+    b_w.shutdown().await.expect("b closes");
+
+    // Each side sees EOF in the end, without any timer having to fire.
+    for r in [&mut a_r, &mut b_r] {
+        let mut rest = Vec::new();
+        tokio::time::timeout(SHORT, r.read_to_end(&mut rest))
+            .await
+            .expect("both directions must end once both sides have closed")
+            .expect("read to EOF");
+    }
+}
+
+/// A stream whose reads fail like a reset connection and whose writes are swallowed.
+struct ResetStream;
+
+impl tokio::io::AsyncRead for ResetStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+    }
+}
+
+impl tokio::io::AsyncWrite for ResetStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn a_read_error_tears_the_leg_down_at_once_instead_of_lingering() {
+    use tokio::io::AsyncReadExt;
+    let (mut client_b, real_b) = tokio::io::duplex(128 * 1024);
+    let (_la, dead_a) = ParkLiveness::monitored();
+    let (_lb, dead_b) = ParkLiveness::monitored();
+    let leg_a = spawn_park_keepalive_pump(Box::pin(ResetStream), false, dead_a);
+    let leg_b = spawn_park_keepalive_pump(Box::pin(real_b), false, dead_b);
+    tokio::spawn(async move { crate::relay::relay_streams(leg_a, leg_b, "reset").await });
+
+    // Real clock: far below the idle bound, b must see its leg end.
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(SHORT, client_b.read_to_end(&mut rest))
+        .await
+        .expect("b's leg must end within 3s after a's connection was reset");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_half_closed_pair_gets_torn_down_after_the_idle_bound() {
+    // b never closes its side and never sends: the open direction must not keep the legs
+    // alive forever.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_a, mut client_b) = spliced_pair(false).await;
+    let (mut a_r, mut a_w) = tokio::io::split(client_a);
+
+    a_w.shutdown().await.expect("a half-closes");
+    let mut one = [0u8; 1];
+    let n = tokio::time::timeout(SHORT, client_b.read(&mut one))
+        .await
+        .expect("b must see EOF within 3s after a closed its write side")
+        .expect("b read");
+    assert_eq!(n, 0);
+
+    let slack = std::time::Duration::from_secs(5);
+    let mut rest = Vec::new();
+    tokio::time::timeout(PARK_HALF_CLOSE_LINGER + slack, a_r.read_to_end(&mut rest))
+        .await
+        .expect("a must see its leg closed within the idle bound")
+        .expect("read to EOF");
+    assert!(rest.is_empty());
+    assert!(
+        client_b.write_all(b"late").await.is_err() || client_b.flush().await.is_err(),
+        "b's leg must be gone after the idle bound"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_half_closed_pair_that_keeps_moving_data_stays_up() {
+    // The open direction delivers a chunk every 100 s for 600 s -- twice the idle bound --
+    // and the connection must survive; only silence tears it down.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (client_a, mut client_b) = spliced_pair(false).await;
+    let (mut a_r, mut a_w) = tokio::io::split(client_a);
+
+    a_w.shutdown().await.expect("a half-closes");
+    let mut one = [0u8; 1];
+    assert_eq!(client_b.read(&mut one).await.expect("b read"), 0);
+
+    for round in 0..6u8 {
+        tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+        client_b.write_all(&[round; 1024]).await.expect("b still writes");
+        client_b.flush().await.expect("flush");
+        let mut got = vec![0u8; 1024];
+        a_r.read_exact(&mut got).await.expect("a still receives");
+        assert!(got.iter().all(|&x| x == round));
+    }
+
+    // Then silence: torn down after the idle bound.
+    let slack = std::time::Duration::from_secs(5);
+    let mut rest = Vec::new();
+    tokio::time::timeout(PARK_HALF_CLOSE_LINGER + slack, a_r.read_to_end(&mut rest))
+        .await
+        .expect("a must see its leg closed after 300 s without data")
+        .expect("read to EOF");
+}
