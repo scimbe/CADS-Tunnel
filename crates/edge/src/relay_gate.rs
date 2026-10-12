@@ -236,7 +236,7 @@ async fn admit_relay_gate<S>(
     resolver: &RelayGateResolver,
     relay_node_peer: &str,
     now: u64,
-) -> Result<S, BoxError>
+) -> Result<(S, SignedChannelGrant), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -260,6 +260,15 @@ where
         if let Err(e) = verify_stateless(&operator, &grant, now) {
             return Err(refuse(&mut stream, "grant-verify", &ctx, format!("grant rejected: {e}").into()).await);
         }
+        match crate::grant_revocation::admission_verdict(&channel, grant.digest()).await {
+            crate::grant_revocation::AdmissionVerdict::Allowed => {}
+            crate::grant_revocation::AdmissionVerdict::Revoked => {
+                return Err(refuse(&mut stream, "grant-revoked", &ctx, "this grant has been revoked".into()).await);
+            }
+            crate::grant_revocation::AdmissionVerdict::Unreadable => {
+                return Err(refuse(&mut stream, "grant-status", &ctx, "grant revocation state unreadable".into()).await);
+            }
+        }
 
         // ct-agent#36: sibling of channel_broker.rs's QUIC-path challenge -- same
         // fresh-and-unpredictable requirement, see the comment there for why.
@@ -282,7 +291,7 @@ where
             .write_all(&ok)
             .await
             .map_err(|e| { eprintln!("ct-edge: relay-gate NO [io-ok]: {e}"); e })?;
-        Ok(stream)
+        Ok((stream, grant))
     };
     tokio::time::timeout(RELAY_GATE_TIMEOUT, read)
         .await
@@ -312,7 +321,14 @@ where
             "relay-gate: TLS handshake not completed within the timeout (#422)".into()
         })?
         .map_err(|e| { eprintln!("ct-edge: relay-gate NO [tls-accept]: {e}"); e })?;
-    let mut admitted = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
+    let (mut admitted, grant) = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
+    // Registered like the channel-broker splices so the revocation sweep can cut this
+    // leg when the holder is removed or this exact grant is revoked.
+    let guard = crate::channel_broker::register_live_splice_with_digest(
+        &grant.grant.channel,
+        &grant.grant.holder,
+        grant.digest(),
+    );
     let mut upstream = tokio::time::timeout(
         RELAY_UPSTREAM_CONNECT_TIMEOUT,
         tokio::net::TcpStream::connect(ctx.relay_upstream),
@@ -325,7 +341,10 @@ where
         "relay-gate: relay-node connect not completed within the timeout (#616)".into()
     })?
     .map_err(|e| { eprintln!("ct-edge: relay-gate NO [upstream-connect]: {e}"); e })?;
-    copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream, RELAY_IDLE_TIMEOUT).await?;
+    tokio::select! {
+        r = copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream, RELAY_IDLE_TIMEOUT) => { r?; }
+        _ = guard.cut() => return Err(crate::channel_broker::SPLICE_CUT_BY_REMOVAL.into()),
+    }
     Ok(())
 }
 

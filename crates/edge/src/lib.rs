@@ -7,6 +7,7 @@ pub mod agent_key;
 pub mod audit_log;
 pub mod auth;
 pub mod channel_authorize;
+pub mod grant_revocation;
 pub mod channel_broker;
 pub mod config;
 pub mod edge_mesh_client;
