@@ -73,7 +73,7 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// the front door's connection cap the way #422 already showed an unbounded step can.
 const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// trace: REQ-0006 AUF-20261005-015 -- the error [`copy_bidirectional_with_idle_timeout`]
+/// the error [`copy_bidirectional_with_idle_timeout`]
 /// returns when a forwarded write cannot be handed over within the caller's idle window.
 /// Kept as one function so both directions report the identical condition.
 fn write_stall_error(idle: Duration) -> BoxError {
@@ -87,7 +87,7 @@ fn write_stall_error(idle: Duration) -> BoxError {
 /// the other (like `copy_bidirectional`), so a response still in flight after a
 /// client's FIN is delivered rather than dropped.
 ///
-/// trace: REQ-0006 AUF-20261005-007 -- `write_all` only guarantees the bytes were
+/// `write_all` only guarantees the bytes were
 /// handed to the writer, not that they reached the peer: `tokio_rustls`'s `poll_write`
 /// (the `a` side on the front-door `Proxy` arm, `crate::serve::serve_front_door`) can
 /// return `Ready(Ok(n))` for the full `n` plaintext bytes while ciphertext for the tail
@@ -105,7 +105,7 @@ fn write_stall_error(idle: Duration) -> BoxError {
 /// which is a no-op once the writer has nothing left queued (plain `TcpStream`'s
 /// `poll_flush` is a no-op already, so the `b` side pays nothing extra).
 ///
-/// trace: REQ-0006 AUF-20261005-015 -- every write-side step of a branch body
+/// every write-side step of a branch body
 /// (`write_all`, `flush`, `shutdown`) runs under [`tokio::time::timeout`] with the
 /// caller's own `idle` as its bound, in BOTH directions. Awaiting inside a branch body
 /// means the `tokio::time::sleep(idle)` branch next to it is not polled, so a peer that
@@ -236,7 +236,7 @@ async fn admit_relay_gate<S>(
     resolver: &RelayGateResolver,
     relay_node_peer: &str,
     now: u64,
-) -> Result<S, BoxError>
+) -> Result<(S, SignedChannelGrant), BoxError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -260,6 +260,15 @@ where
         if let Err(e) = verify_stateless(&operator, &grant, now) {
             return Err(refuse(&mut stream, "grant-verify", &ctx, format!("grant rejected: {e}").into()).await);
         }
+        match crate::grant_revocation::admission_verdict(&channel, grant.digest()).await {
+            crate::grant_revocation::AdmissionVerdict::Allowed => {}
+            crate::grant_revocation::AdmissionVerdict::Revoked => {
+                return Err(refuse(&mut stream, "grant-revoked", &ctx, "this grant has been revoked".into()).await);
+            }
+            crate::grant_revocation::AdmissionVerdict::Unreadable => {
+                return Err(refuse(&mut stream, "grant-status", &ctx, "grant revocation state unreadable".into()).await);
+            }
+        }
 
         // ct-agent#36: sibling of channel_broker.rs's QUIC-path challenge -- same
         // fresh-and-unpredictable requirement, see the comment there for why.
@@ -282,7 +291,7 @@ where
             .write_all(&ok)
             .await
             .map_err(|e| { eprintln!("ct-edge: relay-gate NO [io-ok]: {e}"); e })?;
-        Ok(stream)
+        Ok((stream, grant))
     };
     tokio::time::timeout(RELAY_GATE_TIMEOUT, read)
         .await
@@ -312,7 +321,14 @@ where
             "relay-gate: TLS handshake not completed within the timeout (#422)".into()
         })?
         .map_err(|e| { eprintln!("ct-edge: relay-gate NO [tls-accept]: {e}"); e })?;
-    let mut admitted = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
+    let (mut admitted, grant) = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
+    // Registered like the channel-broker splices so the revocation sweep can cut this
+    // leg when the holder is removed or this exact grant is revoked.
+    let guard = crate::channel_broker::register_live_splice_with_digest(
+        &grant.grant.channel,
+        &grant.grant.holder,
+        grant.digest(),
+    );
     let mut upstream = tokio::time::timeout(
         RELAY_UPSTREAM_CONNECT_TIMEOUT,
         tokio::net::TcpStream::connect(ctx.relay_upstream),
@@ -325,7 +341,10 @@ where
         "relay-gate: relay-node connect not completed within the timeout (#616)".into()
     })?
     .map_err(|e| { eprintln!("ct-edge: relay-gate NO [upstream-connect]: {e}"); e })?;
-    copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream, RELAY_IDLE_TIMEOUT).await?;
+    tokio::select! {
+        r = copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream, RELAY_IDLE_TIMEOUT) => { r?; }
+        _ = guard.cut() => return Err(crate::channel_broker::SPLICE_CUT_BY_REMOVAL.into()),
+    }
     Ok(())
 }
 
@@ -732,10 +751,8 @@ mod tests {
             "a live, listening upstream must connect and relay well within the timeout, not near it"
         );
     }
-
-    /// trace: REQ-0006 AUF-20261005-007
     ///
-    /// Reproduces the field report behind AUF-20261005-007 for the front-door
+    /// Reproduces a field report for the front-door
     /// `Proxy` arm (`crate::serve::serve_front_door`, calls at serve.rs:1763/1772):
     /// a browser reuses one TLS connection for two sequential HTTP/1.1 requests;
     /// the upstream answers both on the SAME persistent connection, the second
@@ -904,8 +921,6 @@ mod tests {
         let _upstream = body_write_task.await.unwrap();
         relay_task.abort();
     }
-
-    /// trace: REQ-0006 AUF-20261005-015
     ///
     /// The sibling of the flush test above, for the failure mode an unconditional
     /// flush opens: a peer that never reads. `a` is a real `tokio_rustls` stream (the

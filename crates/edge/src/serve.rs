@@ -4604,6 +4604,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         (Some(cp_url), Some(admin_tok)) => {
                             let authorizer =
                                 crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                            crate::grant_revocation::install_control_plane(&cp_url, &admin_tok);
                             // #555: start the membership re-check exactly once. A splice is
                             // authorized at admission and then never again, so removing a
                             // member had no effect on their live connection (measured). This
@@ -4686,6 +4687,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                 Ok(upstream) => {
                                     let authorizer =
                                         crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                                    crate::grant_revocation::install_control_plane(&cp_url, &admin_tok);
                                     let relay_acceptor = crate::pki::build_relay_gate_front_door_acceptor(
                                         &ca,
                                         vec!["localhost".to_string()],
@@ -4940,6 +4942,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                     Ok((chan_ep, _root)) => {
                         let authorizer =
                             crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
+                        crate::grant_revocation::install_control_plane(&cp_url, &admin_tok);
 
                         // #105 / #72 AF4-relay: also mount the RELAY on a second endpoint
                         // (default channel port + 1, or CT_EDGE_CHANNEL_RELAY_LISTEN). Two
@@ -5131,6 +5134,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     ) {
         match ws_listen.parse::<std::net::SocketAddr>() {
             Ok(ws_addr) => {
+                crate::grant_revocation::install_control_plane(&cp_url, &admin_tok);
                 let resolver: std::sync::Arc<dyn ChannelMemberResolver> = std::sync::Arc::new(
                     crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok),
                 );

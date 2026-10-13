@@ -877,6 +877,19 @@ where
     if let Err(e) = verify_stateless(&operator, &req.grant, now) {
         return Err(refuse(&mut send, "grant-verify", &grant_ctx, format!("channel grant rejected: {e}").into(), observed).await);
     }
+    // Per-grant revocation list. Fail-closed: an unreadable list refuses the join (the
+    // agent retries), a revoked digest is a definitive refusal.
+    match crate::grant_revocation::admission_verdict(&req.grant.grant.channel, req.grant.digest()).await {
+        crate::grant_revocation::AdmissionVerdict::Allowed => {}
+        crate::grant_revocation::AdmissionVerdict::Revoked => {
+            return Err(DefinitiveJoinRefusal::boxed(
+                refuse(&mut send, "grant-revoked", &grant_ctx, "this grant has been revoked".into(), observed).await,
+            ));
+        }
+        crate::grant_revocation::AdmissionVerdict::Unreadable => {
+            return Err(refuse(&mut send, "grant-status", &grant_ctx, "grant revocation state unreadable".into(), observed).await);
+        }
+    }
     // #81 gap 1: a signed grant is bearer bytes until the presenter proves it holds
     // the `holder` private key. The edge picks a fresh single-use challenge; the
     // presenter must return an ed25519 signature over it under `holder`. A stolen
@@ -1353,7 +1366,7 @@ type SpliceKey = ([u8; 32], [u8; 32]);
 #[derive(Default)]
 struct LiveSplices {
     next_id: u64,
-    entries: std::collections::HashMap<SpliceKey, Vec<(u64, tokio::sync::watch::Sender<bool>)>>,
+    entries: std::collections::HashMap<SpliceKey, Vec<(u64, Option<[u8; 32]>, tokio::sync::watch::Sender<bool>)>>,
 }
 
 /// Registration handle for one member's leg of a live splice. Deregisters on drop, so a
@@ -1384,7 +1397,7 @@ impl Drop for SpliceGuard {
         let mut g = LIVE_SPLICES.lock_safe();
         if let Some(live) = g.as_mut() {
             if let Some(v) = live.entries.get_mut(&self.key) {
-                v.retain(|(id, _)| *id != self.id);
+                v.retain(|(id, _, _)| *id != self.id);
                 if v.is_empty() {
                     live.entries.remove(&self.key);
                 }
@@ -1394,14 +1407,29 @@ impl Drop for SpliceGuard {
 }
 
 /// #555: register one member of a splice that is about to start carrying bytes.
+#[cfg(test)]
 pub(crate) fn register_live_splice(channel: &ChannelId, holder: &[u8; 32]) -> SpliceGuard {
+    register_live_splice_inner(channel, holder, None)
+}
+
+/// Like [`register_live_splice`], but remembers the digest of the grant the leg was
+/// admitted with, so a per-grant revocation can cut exactly that leg.
+pub(crate) fn register_live_splice_with_digest(
+    channel: &ChannelId,
+    holder: &[u8; 32],
+    grant_digest: [u8; 32],
+) -> SpliceGuard {
+    register_live_splice_inner(channel, holder, Some(grant_digest))
+}
+
+fn register_live_splice_inner(channel: &ChannelId, holder: &[u8; 32], digest: Option<[u8; 32]>) -> SpliceGuard {
     let (tx, rx) = tokio::sync::watch::channel(false);
     let key = (channel.0, *holder);
     let mut g = LIVE_SPLICES.lock_safe();
     let live = g.get_or_insert_with(LiveSplices::default);
     live.next_id += 1;
     let id = live.next_id;
-    live.entries.entry(key).or_default().push((id, tx));
+    live.entries.entry(key).or_default().push((id, digest, tx));
     SpliceGuard { key, id, rx }
 }
 
@@ -1418,13 +1446,53 @@ pub(crate) fn cut_live_splices(channel: &[u8; 32], holder: &[u8; 32]) -> usize {
     let g = LIVE_SPLICES.lock_safe();
     match g.as_ref().and_then(|l| l.entries.get(&(*channel, *holder))) {
         Some(v) => {
-            for (_, tx) in v {
+            for (_, _, tx) in v {
                 let _ = tx.send(true);
             }
             v.len()
         }
         None => 0,
     }
+}
+
+/// Per channel, the grant digests of the legs that are currently live (legs registered
+/// without a digest are not listed: only membership can cut them).
+pub(crate) fn live_splice_digests() -> std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> {
+    let g = LIVE_SPLICES.lock_safe();
+    let mut out: std::collections::HashMap<[u8; 32], Vec<[u8; 32]>> = std::collections::HashMap::new();
+    if let Some(l) = g.as_ref() {
+        for ((channel, _), legs) in &l.entries {
+            for (_, d, _) in legs {
+                if let Some(d) = d {
+                    let v = out.entry(*channel).or_default();
+                    if !v.contains(d) {
+                        v.push(*d);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Cut every live leg on `channel` that was admitted with the grant `digest`.
+pub(crate) fn cut_live_splices_by_digest(channel: &[u8; 32], digest: &[u8; 32]) -> usize {
+    let g = LIVE_SPLICES.lock_safe();
+    let mut n = 0;
+    if let Some(l) = g.as_ref() {
+        for ((c, _), legs) in &l.entries {
+            if c != channel {
+                continue;
+            }
+            for (_, d, tx) in legs {
+                if d.as_ref() == Some(digest) {
+                    let _ = tx.send(true);
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 /// #555: first four bytes as hex -- the channel/holder fields are public identifiers, the
@@ -1434,7 +1502,8 @@ fn short_hex(bytes: &[u8]) -> String {
 }
 
 /// #555: one sweep — ask the resolver about every `(channel, holder)` that currently has a
-/// live splice, and cut the ones it no longer authorizes. Returns the number of legs cut.
+/// live splice, and cut the ones it no longer authorizes. Returns the number of legs cut
+/// for a removed membership (legs cut for a revoked grant digest are logged, not counted).
 ///
 /// Split out from the spawning loop so the decision is testable without a timer: the whole
 /// risk here is the OVER-firing direction (cutting a healthy call), and that must be provable
@@ -1460,6 +1529,19 @@ pub(crate) async fn sweep_live_splice_memberships(
                     );
                 }
             cut += n;
+        }
+    }
+    // Per-grant revocation: a leg admitted with a grant that has since been revoked ends
+    // even though its holder is still a member. An unreadable list never cuts.
+    for (channel, digests) in live_splice_digests() {
+        for d in crate::grant_revocation::revoked_for_sweep(&ChannelId(channel), digests).await {
+            let n = cut_live_splices_by_digest(&channel, &d);
+            if n > 0 {
+                eprintln!(
+                    "ct-edge: cutting {n} live splice leg(s) on channel {} -- the grant was revoked",
+                    short_hex(&channel)
+                );
+            }
         }
     }
     cut
@@ -1841,8 +1923,8 @@ async fn finish_quic_pair_inner(
                     // pair: removing one participant must end that participant's session,
                     // and since a splice has exactly two ends, ending either ends both --
                     // which is correct, the remaining side is no longer talking to anyone.
-                    let _ga = register_live_splice(&a.req.grant.grant.channel, &a.req.grant.grant.holder);
-                    let _gb = register_live_splice(&b.req.grant.grant.channel, &b.req.grant.grant.holder);
+                    let _ga = register_live_splice_with_digest(&a.req.grant.grant.channel, &a.req.grant.grant.holder, a.req.grant.digest());
+                    let _gb = register_live_splice_with_digest(&b.req.grant.grant.channel, &b.req.grant.grant.holder, b.req.grant.digest());
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
                     let bytes = tokio::select! {
@@ -2709,8 +2791,8 @@ where
                     // because a membership removal that ends the session on one transport and
                     // not the other is worse than one that ends it nowhere -- an operator
                     // cannot tell which transport a given participant arrived on.
-                    let _ga = register_live_splice(&a.req.grant.grant.channel, &a.req.grant.grant.holder);
-                    let _gb = register_live_splice(&b.req.grant.grant.channel, &b.req.grant.grant.holder);
+                    let _ga = register_live_splice_with_digest(&a.req.grant.grant.channel, &a.req.grant.grant.holder, a.req.grant.digest());
+                    let _gb = register_live_splice_with_digest(&b.req.grant.grant.channel, &b.req.grant.grant.holder, b.req.grant.digest());
                     // #591: resolve each side's SESSION leg on its own -- the admission stream
                     // for a SameStream member, a fresh bi-stream for a QuicNextBiStream one --
                     // in the QUIC-native order (initiator's `accept_bi` first, then the
@@ -6633,6 +6715,77 @@ mod tests {
         let ack2 = present_join(&conn2, &expired.encode(), &holder_sk(0x0c)).await;
         assert_ne!(ack2, b"OK", "an expired grant must be refused");
         let _ = server2_task.await;
+    }
+
+    /// Shared in-process revocation list for the tests below. The source is process-wide, so
+    /// every test uses digests nobody else uses and one shared, idempotently installed mock.
+    struct TestRevocations;
+    static TEST_REVOKED: std::sync::Mutex<Vec<[u8; 32]>> = std::sync::Mutex::new(Vec::new());
+    impl crate::grant_revocation::RevocationSource for TestRevocations {
+        fn revoked_among<'a>(&'a self, _c: ChannelId, digests: Vec<[u8; 32]>) -> crate::grant_revocation::RevocationFuture<'a> {
+            let set = TEST_REVOKED.lock().unwrap().clone();
+            Box::pin(async move { Ok(digests.into_iter().filter(|d| set.contains(d)).collect()) })
+        }
+    }
+    fn revoke_in_tests(d: [u8; 32]) {
+        crate::grant_revocation::install(std::sync::Arc::new(TestRevocations));
+        TEST_REVOKED.lock().unwrap().push(d);
+    }
+
+    /// A revoked grant digest ends exactly the legs admitted with that grant, even though
+    /// the holder is still a member; a sibling grant of the same holder and a leg without a
+    /// digest keep running.
+    #[tokio::test]
+    async fn a_revoked_grant_digest_cuts_only_that_leg() {
+        struct StillMember;
+        impl crate::serve::ChannelMemberResolver for StillMember {
+            fn resolve_member<'a>(
+                &'a self,
+                _c: ChannelId,
+                _h: [u8; 32],
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<([u8; 32], Option<[u8; 32]>, Option<[u8; 64]>)>> + Send + 'a>> {
+                Box::pin(async { None })
+            }
+        }
+        let chan = ChannelId([0x77; 32]);
+        let holder = [0x78; 32];
+        let (revoked, kept) = ([0xd1; 32], [0xd2; 32]);
+        let g_revoked = register_live_splice_with_digest(&chan, &holder, revoked);
+        let g_kept = register_live_splice_with_digest(&chan, &holder, kept);
+        let g_nodigest = register_live_splice(&chan, &holder);
+        revoke_in_tests(revoked);
+
+        let resolver: std::sync::Arc<dyn crate::serve::ChannelMemberResolver> = std::sync::Arc::new(StillMember);
+        sweep_live_splice_memberships(&resolver).await;
+        async fn ended(g: &SpliceGuard) -> bool {
+            tokio::time::timeout(std::time::Duration::from_millis(200), g.cut()).await.is_ok()
+        }
+        assert!(ended(&g_revoked).await, "the revoked grant's leg is cut");
+        assert!(!ended(&g_kept).await, "another grant of the same holder keeps running");
+        assert!(!ended(&g_nodigest).await, "a leg without a digest is only cut by membership");
+    }
+
+    /// Admission refuses a revoked grant definitively, before the possession challenge.
+    #[tokio::test]
+    async fn edge_refuses_a_revoked_grant_at_admission() {
+        let pk = operator_pubkey();
+        let channel = [0xC8u8; 32];
+        let req = join_request(channel, 0x0d, "203.0.113.9:6004");
+        revoke_in_tests(req.grant.digest());
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            resolve_channel_join(&server, 500, move |c, _h| async move { (c.0 == channel).then_some((pk, None, None)) })
+                .await
+                .map(|_| ())
+        });
+        let client = build_client_endpoint(cert).expect("client");
+        let conn = client.connect(addr, "localhost").expect("cfg").await.expect("conn");
+        let ack = present_join(&conn, &req.encode(), &holder_sk(0x0d)).await;
+        assert_ne!(ack, b"OK", "a revoked grant must be refused");
+        let err = server_task.await.expect("task").expect_err("admission must fail");
+        assert!(err.to_string().contains("revoked"), "refusal names the cause: {err}");
+        assert!(err.downcast_ref::<DefinitiveJoinRefusal>().is_some(), "and is definitive, not retried blindly");
     }
 
     /// #555: the registry cuts exactly the removed member's legs and nothing else.

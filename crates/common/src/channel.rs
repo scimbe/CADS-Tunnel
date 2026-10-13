@@ -439,6 +439,8 @@ pub const CHANNEL_REFUSAL_CATEGORIES: &[&str] = &[
     "not-member",   // unknown channel, or holder not currently a member
     "grant-verify", // grant signature/expiry verification failed
     "possession",   // holder-possession proof failed (wrong holder private key)
+    "grant-revoked", // this exact grant was revoked (per-grant revocation list)
+    "grant-status",  // the revocation state could not be read; retry later
     "pairing",      // admitted, but pairing the two members was refused
 ];
 
