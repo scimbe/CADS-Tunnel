@@ -50,9 +50,11 @@
 # a Docker build -- this way a plain `docker build` produces a fully self-contained image with
 # no separate pre-build step required. A SEPARATE stage (not folded into `builder` below) so
 # BuildKit can build it in parallel and cache it independently of the much-larger native
-# workspace compile. Bump CT_AGENT_REF here AND in scripts/build-ct-agent-wasm.sh together.
+# workspace compile. The version comes from CT_AGENT_RELEASE; nothing to bump here.
 FROM rust:1-slim-bookworm AS wasm-builder
-ARG CT_AGENT_REF=v0.7.22
+# Default comes from the repo-root CT_AGENT_RELEASE file; --build-arg CT_AGENT_REF=... overrides.
+ARG CT_AGENT_REF=
+COPY CT_AGENT_RELEASE /pin/CT_AGENT_RELEASE
 RUN apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -63,8 +65,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # "fatal: expected flush after ref listing" on a bare `git clone`, even though the URL
 # and tag are fine (confirmed: a newer git, e.g. Alpine's 2.54.0, clones the identical
 # URL successfully). Forcing HTTP/1.1 avoids the mishandled response entirely.
-RUN git -c http.version=HTTP/1.1 clone https://github.com/scimbe/ct-agent /agent-src \
-    && git -C /agent-src checkout "$CT_AGENT_REF"
+RUN ref="${CT_AGENT_REF:-$(tr -d '[:space:]' < /pin/CT_AGENT_RELEASE)}" \
+    && git -c http.version=HTTP/1.1 clone https://github.com/scimbe/ct-agent /agent-src \
+    && git -C /agent-src checkout "$ref"
 WORKDIR /agent-src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/agent-src/target \
@@ -75,10 +78,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # workspace was locked. Refuse to ship the browser bundle from any other commit.
 # (Copied after the build so a lockfile change doesn't invalidate the wasm build cache.)
 COPY Cargo.lock /pin/Cargo.lock
-RUN locked="$(grep -o "ct-agent?tag=${CT_AGENT_REF}#[0-9a-f]*" /pin/Cargo.lock | head -n1 | cut -d'#' -f2)" \
+RUN ref="${CT_AGENT_REF:-$(tr -d '[:space:]' < /pin/CT_AGENT_RELEASE)}" \
+    && locked="$(grep -o "ct-agent?tag=${ref}#[0-9a-f]*" /pin/Cargo.lock | head -n1 | cut -d'#' -f2)" \
     && actual="$(git -C /agent-src rev-parse HEAD)" \
     && if [ -n "$locked" ] && [ "$actual" != "$locked" ]; then \
-         echo "ct-agent $CT_AGENT_REF is $actual, Cargo.lock pins $locked -- tag moved?" >&2; exit 1; \
+         echo "ct-agent $ref is $actual, Cargo.lock pins $locked -- tag moved?" >&2; exit 1; \
        fi
 
 FROM rust:1-slim-bookworm AS builder

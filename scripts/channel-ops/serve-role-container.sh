@@ -13,7 +13,8 @@
 # POSIX/portable: no GNU-only flags, works under bash on Linux or macOS (paths must
 # resolve — on macOS `readlink -f` needs coreutils or an equivalent `greadlink -f`).
 #
-# Usage:
+# Usage (ct-agent >= 0.7.40 also needs OPERATOR_PUBKEY=<64-hex operator public key>;
+# the peer-grant check is on by default, see REQUIRE_PEER_GRANT below):
 #   IMAGE=cads-flappy-demo-flappy-agent:latest \
 #   CLAUDE_BIN_PATH="$(command -v claude)" \
 #   CLAUDE_HOME="$HOME/.claude" CLAUDE_JSON="$HOME/.claude.json" \
@@ -65,6 +66,11 @@ fi
 : "${NOISE_KEY:?set NOISE_KEY (64-hex, the serving noise PRIVATE key)}"
 : "${GRANT:?set GRANT (hex signed grant for this role, accept direction)}"
 : "${SERVICE:?set SERVICE (text_generation | safety_check | code_generation | security_review)}"
+: "${OPERATOR_PUBKEY:?set OPERATOR_PUBKEY (64-hex operator PUBLIC key; ct-agent >= 0.7.40 needs it as CT_CHANNEL_OPERATOR_PUBKEY to verify the peer grant)}"
+# ct-agent >= 0.7.40: the accept side only presents its grant to the peer when
+# CT_CHANNEL_REQUIRE_PEER_GRANT is on. It must be on for BOTH members of a channel (the
+# initiator needs it too); default 1, set REQUIRE_PEER_GRANT=0 only for a legacy pairing.
+REQUIRE_PEER_GRANT="${REQUIRE_PEER_GRANT:-1}"
 
 [ -n "$CLAUDE_BIN_PATH" ] || die "claude CLI not resolvable — set CLAUDE_BIN_PATH"
 CLAUDE_REAL_BIN="$(resolve_real_path "$CLAUDE_BIN_PATH")"
@@ -108,6 +114,8 @@ trap 'rm -f "$RUNTIME_ENV"' EXIT
   printf 'CT_CHANNEL_HOLDER_KEY=%s\n' "$HOLDER_KEY"
   printf 'CT_CHANNEL_NOISE_KEY=%s\n' "$NOISE_KEY"
   printf 'CT_CHANNEL_GRANT=%s\n' "$GRANT"
+  printf 'CT_CHANNEL_OPERATOR_PUBKEY=%s\n' "$OPERATOR_PUBKEY"
+  printf 'CT_CHANNEL_REQUIRE_PEER_GRANT=%s\n' "$REQUIRE_PEER_GRANT"
   printf 'CT_AGENT_SERVICE_HANDLER_CMD=%s\n' "$HANDLER_CMD_IN_CONTAINER"
   printf 'CT_AGENT_SERVICES=%s\n' "$SERVICE"
   printf 'HOME=%s\n' "$RUNTIME_HOME"

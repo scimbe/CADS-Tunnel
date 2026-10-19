@@ -40,7 +40,7 @@ cd "$REPO_ROOT"
 # Which scimbe/ct-agent commit to build ct-agent-wasm from -- the workspace
 # restructure that moved ct-agent-wasm in as a sibling of the native binary
 # (before this, ct-agent had no wasm/ member at all). Bump deliberately.
-CT_AGENT_REF="${CT_AGENT_REF:-v0.7.22}"
+CT_AGENT_REF="${CT_AGENT_REF:-$(tr -d '[:space:]' < "$REPO_ROOT/CT_AGENT_RELEASE")}"
 
 docker run --rm -m 3g --cpus 2 \
   -v "$REPO_ROOT":/work -w /work \

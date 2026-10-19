@@ -29,16 +29,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 # See ct-agent's own `nat-lab` feature doc comment -- required to build `natlab`.
 nat-lab = ["ct-agent/nat-lab"]
 
+# Version: root Cargo.toml [workspace.dependencies] (single source). natlab's
+# nat_lab_relay/listen/dial live here and nowhere else.
 [dependencies.ct-agent]
-# #507: pinned by TAG since 2026-08-17. The old note here said no tagged release
-# existed -- that stopped being true long ago, and the rev it pinned (86ab198) was
-# from the v0.3.0 era, i.e. two majors behind what this project actually deploys.
-# The point of the pin is that these tests exercise the agent side of the wire; a
-# stale one means they were exercising a peer nobody runs. Bump in lockstep with
-# ct-client's dev-dependency. natlab's nat_lab_relay/listen/dial live here and
-# nowhere else.
-git = "https://github.com/scimbe/ct-agent"
-tag = "v0.7.22"
+workspace = true
 optional = true
 
 # #782: the `verify_receipts` bin's tests verify the fixture chain ct-common's own

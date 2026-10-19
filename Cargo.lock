@@ -515,8 +515,8 @@ dependencies = [
 
 [[package]]
 name = "ct-agent"
-version = "0.7.22"
-source = "git+https://github.com/scimbe/ct-agent?tag=v0.7.22#a3d33f8b68aeafc3b53646a7ccd183c4ba807585"
+version = "0.7.40"
+source = "git+https://github.com/scimbe/ct-agent?tag=v0.7.40#825171b40e9735bf73283a4aceb6c42a9affda88"
 dependencies = [
  "axum",
  "base64",
@@ -529,6 +529,8 @@ dependencies = [
  "harness-core",
  "hickory-resolver 0.26.1",
  "http",
+ "hyper",
+ "hyper-util",
  "installer-engine",
  "libc",
  "libp2p",
@@ -547,10 +549,10 @@ dependencies = [
  "socket2 0.5.10",
  "tokio",
  "tokio-rustls",
- "tokio-stream",
  "tokio-util",
  "tracing-subscriber",
  "webpki-roots 0.26.11",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1141,8 +1143,8 @@ dependencies = [
 
 [[package]]
 name = "harness-core"
-version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.2-phase5#76d934475452832822e1e25e55971f7ec9708564"
+version = "0.1.1"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.4-phase5#ca8d641048c04a9d94f2648cb9c59b1217fa6bf7"
 dependencies = [
  "installer-engine",
  "manifest-core",
@@ -1630,8 +1632,8 @@ dependencies = [
 
 [[package]]
 name = "installer-engine"
-version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.2-phase5#76d934475452832822e1e25e55971f7ec9708564"
+version = "0.1.1"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.4-phase5#ca8d641048c04a9d94f2648cb9c59b1217fa6bf7"
 dependencies = [
  "flate2",
  "libc",
@@ -2229,8 +2231,8 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "manifest-core"
-version = "0.1.0"
-source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.2-phase5#76d934475452832822e1e25e55971f7ec9708564"
+version = "0.1.1"
+source = "git+https://github.com/scimbe/CADS-agent-marketplace?tag=v0.4.4-phase5#ca8d641048c04a9d94f2648cb9c59b1217fa6bf7"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -3782,17 +3784,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
  "tokio",
 ]
 

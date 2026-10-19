@@ -11,80 +11,45 @@
 # (SwarmBuilder::with_new_identity() would otherwise mint a fresh PeerId every boot,
 # breaking every client's pinned CT_EDGE_RELAY_NODE_PEER).
 
-FROM rust:1-slim-bookworm AS builder
+# ct-agent comes from the verified public release asset, not from a source build:
+# no Rust toolchain in this build, and the version is a build argument, so a different
+# ct-agent can be swapped in without touching CADS-Tunnel code
+# (`docker build --build-arg CT_AGENT_REF=vX.Y.Z ...`). The default below must equal the
+# repo-root CT_AGENT_RELEASE file (a repo-wide test enforces that). This build context
+# is docker/deploy, so the file itself is not readable from here.
+#
+# Fail closed: the binary is downloaded together with the `.sha256` file published with
+# the same release; any mismatch, missing file or unknown architecture aborts the build.
+# Pass CT_AGENT_SHA256=<hex> to additionally pin the expected digest out of band.
+FROM debian:bookworm-slim AS fetch
+ARG CT_AGENT_REF=v0.7.40
+ARG CT_AGENT_SHA256=
+ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git pkg-config libssl-dev \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-# Pin to the commit that added the missing Protocol::P2pCircuit to the relay-gate's
-# circuit address (found while E2E-verifying this very relay-node) -- bump deliberately.
-#
-# 2026-08-02 (#248): bumped to 72394eb -- ct-agent main's current tip as of this bump,
-# which carries every #248 fix landed since the d264869 event-logging fix (this relay
-# node's own logging gap), including the real DCUtR-candidate-pool fix
-# (ecf7460/aad49fb), the widened one-shot upgrade grace window (d443d64), the SSRF
-# guard on nat-lab's observed_addr (e366210), the ct-agent-supervisor crash-reason
-# reporting (b7f6f2a), and #276's "prefer direct over relay" behavior (f2506b1) -- the
-# explicit design guidance that a relay/super-peer path should always try direct
-# communication first and treat relay as the last line of defense. Keeping this
-# container current with that same line of fixes matters because it IS the last line
-# of defense CT_CHANNEL_RELAY falls back to.
-#
-# 2026-08-19: bumped to the v0.5.5 tag (4d6f781) -- this pin had drifted over 100
-# commits behind main, predating the whole v0.4.11 -> v0.5.5 line (module splits,
-# the v0.4.13-0.5.0 channel-protocol hardening series, #24's DCUtR loops now obeying
-# the admission retry policy, #40's TLS-handshake-EOF backoff, #36's secret-file
-# permission hardening + hex-decode panic fix, and the h2 RUSTSEC-2026-0258 bump).
-# Using the tag (not another bare commit) from here on: it's a real, CI-gated,
-# version-checked release (ct-agent#29's guard) with published binaries, not just a
-# convenient main-branch snapshot.
-#
-# 2026-08-19: bumped to v0.5.6 -- ct-agent#35 Path B (an external security review):
-# Accept-side channel sessions now enforce Noise-key attestation instead of
-# authenticating nothing at the Noise layer on two of three code paths. This
-# relay-node's own DCUtR path is a documented, still-open THIRD path (#41,
-# "Path A") the fix does not cover -- see that issue before assuming this pin
-# closes the finding for relay-node specifically.
-#
-# 2026-08-19: bumped to v0.5.7 -- ct-agent#41 (#35 "Path A"), closed: this is
-# THE fix that actually applies to relay-node specifically. join_via_relay_dcutr
-# and join_via_relay_gate_dcutr (the two functions this container's own DCUtR
-# path runs) now verify the relayed peer's Noise-key attestation instead of
-# pinning it unconditionally. With this pin, #35's finding is fully closed for
-# this container, not just referenced.
-#
-# 2026-08-19: bumped to v0.5.8 -- CADS-Tunnel#495 U2 (a'): join_via_relay_dcutr/
-# join_via_relay_gate_dcutr (this container's own DCUtR path) now send the
-# QUIC phase-preamble marker (PHASE_MARKER_RELAY). Deliberately a no-op here
-# today -- the edge only TOLERATES the marker so far (#495 U2 (b'), already
-# live); nothing consumes it until U2 Slice 2 (CT_EDGE_UNIFIED_PAIRER) lands.
-# Bumping now avoids a second coordinated release once Slice 2 ships.
-# 2026-08-24: bumped to v0.6.9 -- fleet-wide ct-agent pin bump (7 fixes since
-# v0.5.8, see CT_AGENT_RELEASE), same reasoning as every other pin in this repo.
-# 2026-09-02: bumped to v0.7.22 -- fleet-wide pin had drifted 13 minor releases
-# behind (scimbe flagged it live: "warum ist da noch der alt ct-agent drin?").
-# Repo-wide `every_ct_agent_pin_matches_the_release` re-run clean against the
-# new CT_AGENT_RELEASE across all 9 pin sites (including one blind spot the
-# test's own scan missed, crates/agent-tools/Cargo.toml's `tag = "..."` on a
-# line by itself -- fixed alongside this bump, same value, same reasoning).
-ARG CT_AGENT_REF=v0.7.22
-# 2026-09-02: -c http.version=HTTP/1.1 works around a real, reproduced failure --
-# older git (Debian bookworm's 2.39.5) against github.com's current HTTP/2 responses
-# fails "could not read Username for 'https://github.com': No such device or address" /
-# "fatal: expected flush after ref listing" on a bare `git clone`, even though the URL
-# and tag are fine (confirmed: a newer git, e.g. Alpine's 2.54.0, clones the identical
-# URL successfully). Forcing HTTP/1.1 avoids the mishandled response entirely.
-RUN git -c http.version=HTTP/1.1 clone https://github.com/scimbe/ct-agent.git /build && cd /build && git checkout "${CT_AGENT_REF}"
-WORKDIR /build
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --locked \
-    && cp target/release/ct-agent /tmp/ct-agent
+RUN set -eu; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+      amd64) asset=ct-agent-linux-x86_64 ;; \
+      arm64) asset=ct-agent-linux-aarch64 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH:-unknown}" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/scimbe/ct-agent/releases/download/${CT_AGENT_REF}"; \
+    curl --proto =https --tlsv1.2 -fsSL "$base/$asset" -o /tmp/ct-agent; \
+    curl --proto =https --tlsv1.2 -fsSL "$base/$asset.sha256" -o /tmp/ct-agent.sha256; \
+    want="$(cut -d" " -f1 /tmp/ct-agent.sha256)"; \
+    [ "${#want}" -eq 64 ] || { echo "malformed published digest" >&2; exit 1; }; \
+    if [ -n "$CT_AGENT_SHA256" ] && [ "$CT_AGENT_SHA256" != "$want" ]; then \
+      echo "digest differs from CT_AGENT_SHA256" >&2; exit 1; \
+    fi; \
+    echo "$want  /tmp/ct-agent" | sha256sum -c -; \
+    chmod 0755 /tmp/ct-agent
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /tmp/ct-agent /usr/local/bin/ct-agent
+COPY --from=fetch /tmp/ct-agent /usr/local/bin/ct-agent
 # #667: was the sole deviation from #305's non-root baseline (docker/Dockerfile) --
 # ran as root with a writable rootfs despite terminating protocol bytes from
 # semi-trusted relayed peers (this process's own protocol-level acceptance is
