@@ -519,8 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_bench_measures_iterations() {
-        use ct_agent::serve::serve_noise_bridge;
-        use ct_common::noise::generate_static_keypair;
+        use ct_common::noise::{frame, generate_static_keypair, origin_handshake, read_frame};
         use ct_common::pow::Challenge;
         use ct_common::{OriginIdentity, RoutingToken};
         use ct_edge::serve::serve_connection;
@@ -594,11 +593,34 @@ mod tests {
         rs.finish().unwrap();
         assert_eq!(rr.read_to_end(8).await.unwrap(), b"OK");
         let origin_priv = origin_kp.private;
+        // ct-agent no longer exports the one-shot `serve_noise_bridge` (removed before 0.7.40;
+        // its streaming responder uses a different post-handshake framing), so the one-shot
+        // responder is inlined here, as in noise.rs's own tests.
         let agent_task = tokio::spawn(async move {
             while let Ok((mut s, mut r)) = agent_conn.accept_bi().await {
                 let priv_ = origin_priv;
                 tokio::spawn(async move {
-                    let _ = serve_noise_bridge(&mut s, &mut r, origin_addr, &priv_).await;
+                    let mut hs = origin_handshake(&priv_).unwrap();
+                    let mut buf = vec![0u8; 65535];
+                    let mut tmp = vec![0u8; 65535];
+                    let Ok(m1) = read_frame(&mut r).await else { return };
+                    if hs.read_message(&m1, &mut tmp).is_err() {
+                        return;
+                    }
+                    let n = hs.write_message(&[], &mut buf).unwrap();
+                    let _ = s.write_all(&frame(&buf[..n])).await;
+                    let mut transport = hs.into_transport_mode().unwrap();
+                    let Ok(ct) = read_frame(&mut r).await else { return };
+                    let Ok(n) = transport.read_message(&ct, &mut tmp) else { return };
+                    let request = tmp[..n].to_vec();
+                    let Ok(mut tcp) = tokio::net::TcpStream::connect(origin_addr).await else { return };
+                    let _ = tcp.write_all(&request).await;
+                    let _ = tcp.shutdown().await;
+                    let mut response = Vec::new();
+                    let _ = tcp.read_to_end(&mut response).await;
+                    let n = transport.write_message(&response, &mut buf).unwrap();
+                    let _ = s.write_all(&frame(&buf[..n])).await;
+                    let _ = s.flush().await;
                 });
             }
         });

@@ -135,8 +135,14 @@ CT_AGENT_SERVICES=text_generation \
 CT_CHANNEL_SERVE=1 CT_CHANNEL_ROLE=accept CT_CHANNEL_RELAY_ONLY=1 \
 CT_CHANNEL_BROKER=<edge-host>:4435 CT_CHANNEL_RELAY=<edge-host>:4436 \
 CT_CHANNEL_GRANT=$(cat server-grant.txt) \
+CT_CHANNEL_OPERATOR_PUBKEY=<operator-public-key-hex> CT_CHANNEL_REQUIRE_PEER_GRANT=1 \
   ct-agent channel
 ```
+
+(ct-agent 0.7.40 and later: both members need `CT_CHANNEL_OPERATOR_PUBKEY` (the
+operator's public key, 64 hex, from `ct-agent channel operator-init`), and
+`CT_CHANNEL_REQUIRE_PEER_GRANT=1` must be set on **both** sides, otherwise the
+serving side never presents its grant.)
 
 (Read the real broker/relay ports from `GET <control-plane-url>/network-info` —
 don't hardcode `4433`, that's the tunnel's *other* port. See
@@ -160,6 +166,7 @@ set -a; source client.env; set +a
 CT_CHANNEL_ROLE=initiate CT_CHANNEL_RELAY_ONLY=1 \
 CT_CHANNEL_BROKER=<edge-host>:4435 CT_CHANNEL_RELAY=<edge-host>:4436 \
 CT_CHANNEL_GRANT=$(cat client-grant.txt) \
+CT_CHANNEL_OPERATOR_PUBKEY=<operator-public-key-hex> CT_CHANNEL_REQUIRE_PEER_GRANT=1 \
 CT_CHANNEL_CALL=tools/call \
 CT_CHANNEL_CALL_PARAMS='{"name":"service/text_generation","arguments":{"input":"it works"}}' \
   ct-agent channel
