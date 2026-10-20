@@ -1,0 +1,75 @@
+# Ersetzt die Basis-Policies. default-deny-ingress aus der Basis bleibt.
+# Der ICC-Ingress-Controller ist nicht per Namespace waehlbar (eine
+# namespaceSelector-Regel blockierte den Verkehr), daher Front-Door ohne `from`.
+# NetworkPolicy matcht den Container-Port (8443), nicht den Service-Port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ct-edge
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ct-edge}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 8443}
+        - {protocol: TCP, port: 4433}
+        - {protocol: TCP, port: 4435}
+        - {protocol: TCP, port: 4436}
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: ct-control-plane}
+      ports:
+        - {protocol: TCP, port: 9601}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: ct-control-plane}
+      ports:
+        - {protocol: TCP, port: 8090}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ct-control-plane
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: ct-control-plane}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: ct-edge}
+      ports:
+        - {protocol: TCP, port: 8090}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/name: ct-edge}
+      ports:
+        - {protocol: TCP, port: 9601}
+---
+# HTTP-01-Solver-Pod (cert-manager) muss aus dem Ingress-Controller erreichbar sein.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: acme-http01-solver
+spec:
+  podSelector:
+    matchLabels: {acme.cert-manager.io/http01-solver: "true"}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 8089}
