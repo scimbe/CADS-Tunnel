@@ -58,6 +58,9 @@ patches:
       metadata: {name: ct-edge-config}
       data:
         CT_EDGE_PORTAL_HOST: core.cads.inf.haw-hamburg.de
+        # ct-agent waehlt per CT_CHANNEL_FRONT_DOOR_SNI diesen Namen (SNI-Routing des Ingress)
+        # und prueft ihn gegen die SAN des Edge-Leafs; braucht CT_EDGE_EXTRA_SANS (#871).
+        CT_EDGE_EXTRA_SANS: core.cads.inf.haw-hamburg.de
   - target: {kind: ConfigMap, name: ct-control-plane-config}
     patch: |-
       apiVersion: v1
