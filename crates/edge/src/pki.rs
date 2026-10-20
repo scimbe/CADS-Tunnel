@@ -278,6 +278,77 @@ impl Ca {
     }
 }
 
+/// Name of the env var carrying extra DNS SANs for every leaf the edge presents to
+/// ct-agent clients.
+pub const EXTRA_SANS_ENV: &str = "CT_EDGE_EXTRA_SANS";
+
+/// Parse the value of `CT_EDGE_EXTRA_SANS`: a comma-separated list of DNS names.
+///
+/// `None` or an all-whitespace value means "not configured" and yields an empty list
+/// (so the leaf SANs stay byte-identical to the pre-existing ones). Any empty entry
+/// (`a,,b`, trailing comma), IP literal or malformed DNS name is a hard error naming
+/// the variable -- a typo must fail the startup, not silently produce a leaf that the
+/// agent then rejects with `NotValidForName`.
+pub fn parse_extra_sans(raw: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else { return Ok(Vec::new()) };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (i, part) in raw.split(',').enumerate() {
+        let name = part.trim();
+        if name.is_empty() {
+            return Err(format!("{EXTRA_SANS_ENV}: entry {} is empty (stray comma?)", i + 1));
+        }
+        if name.parse::<std::net::IpAddr>().is_ok() {
+            return Err(format!("{EXTRA_SANS_ENV}: '{name}' is an IP literal, only DNS names are allowed"));
+        }
+        validate_dns_name(name).map_err(|why| format!("{EXTRA_SANS_ENV}: '{name}' is not a valid DNS name ({why})"))?;
+        let lower = name.to_ascii_lowercase();
+        if !out.contains(&lower) {
+            out.push(lower);
+        }
+    }
+    Ok(out)
+}
+
+fn validate_dns_name(name: &str) -> Result<(), &'static str> {
+    if name.len() > 253 {
+        return Err("longer than 253 bytes");
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    for l in &labels {
+        if l.is_empty() {
+            return Err("empty label");
+        }
+        if l.len() > 63 {
+            return Err("label longer than 63 bytes");
+        }
+        if !l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err("only letters, digits and '-' are allowed");
+        }
+        if l.starts_with('-') || l.ends_with('-') {
+            return Err("label starts or ends with '-'");
+        }
+    }
+    // An all-numeric last label would make this look like an (abbreviated) IP literal.
+    if labels.last().is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit())) {
+        return Err("last label is numeric");
+    }
+    Ok(())
+}
+
+/// `base` SANs followed by `extra` (those not already present). With an empty `extra`
+/// the result equals `base` exactly.
+pub fn sans_with_extra(mut base: Vec<String>, extra: &[String]) -> Vec<String> {
+    for e in extra {
+        if !base.iter().any(|b| b.eq_ignore_ascii_case(e)) {
+            base.push(e.clone());
+        }
+    }
+    base
+}
+
 /// Build a QUIC server [`Endpoint`] bound to `addr` using a CA-issued leaf for
 /// `sans`; returns the endpoint and the CA root (which Clients trust). This is
 /// the production replacement for the self-signed `build_server_endpoint_at`.
@@ -470,6 +541,91 @@ mod tests {
         let boot4 = Ca::load_or_create(&key_path, "ct-edge-ca").unwrap();
         assert_eq!(boot3.root_der().as_ref(), boot4.root_der().as_ref());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn leaf_dns_sans(leaf: &CertificateDer<'_>) -> Vec<String> {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::FromDer;
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(leaf.as_ref()).unwrap();
+        let san = cert.subject_alternative_name().unwrap().expect("SAN extension");
+        san.value
+            .general_names
+            .iter()
+            .filter_map(|g| match g {
+                GeneralName::DNSName(d) => Some(d.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extra_sans_parse_accepts_dns_names_and_unset() {
+        assert_eq!(parse_extra_sans(None).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_extra_sans(Some("")).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_extra_sans(Some("  ")).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_extra_sans(Some("core.cads.inf.haw-hamburg.de, Edge.Example.TEST ,core.cads.inf.haw-hamburg.de"))
+                .unwrap(),
+            vec!["core.cads.inf.haw-hamburg.de".to_string(), "edge.example.test".to_string()]
+        );
+    }
+
+    #[test]
+    fn extra_sans_parse_rejects_bad_entries_naming_the_variable() {
+        for bad in [
+            "a.example,,b.example",
+            "a.example,",
+            ",a.example",
+            "192.0.2.1",
+            "::1",
+            "a.example,10.0.0.1",
+            "1.2.3",
+            "*.example.test",
+            "-a.example",
+            "a-.example",
+            "a..example",
+            "a.example.",
+            "under_score.example",
+            "ex ample.test",
+        ] {
+            let err = parse_extra_sans(Some(bad)).expect_err(bad);
+            assert!(err.contains("CT_EDGE_EXTRA_SANS"), "error for {bad:?} must name the variable: {err}");
+        }
+        assert!(parse_extra_sans(Some(&format!("{}.example", "a".repeat(64)))).is_err());
+    }
+
+    #[test]
+    fn issued_leaf_has_exactly_old_sans_by_default_and_extra_sans_when_set() {
+        let ca = Ca::new("ct-edge-ca-sans").unwrap();
+        let base = vec!["localhost".to_string(), crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI.to_string()];
+
+        // Default (no extra SANs): byte-identical SAN list to the pre-existing one.
+        let none = parse_extra_sans(None).unwrap();
+        assert_eq!(sans_with_extra(base.clone(), &none), base);
+        let (leaf, _) = ca.issue(sans_with_extra(base.clone(), &none)).unwrap();
+        assert_eq!(leaf_dns_sans(&leaf), base);
+
+        // With the variable: old SANs first, extra appended, no duplicates.
+        let extra = parse_extra_sans(Some("core.cads.inf.haw-hamburg.de,localhost")).unwrap();
+        let (leaf, _) = ca.issue(sans_with_extra(base.clone(), &extra)).unwrap();
+        let mut want = base.clone();
+        want.push("core.cads.inf.haw-hamburg.de".to_string());
+        assert_eq!(leaf_dns_sans(&leaf), want);
+    }
+
+    #[tokio::test]
+    async fn extra_san_makes_the_handshake_verify_for_that_sni() {
+        let ca = Ca::new("ct-edge-ca-sni").unwrap();
+        let name = "core.cads.inf.haw-hamburg.de";
+        let with = sans_with_extra(vec!["localhost".into()], &parse_extra_sans(Some(name)).unwrap());
+        let acceptor = build_channel_front_door_acceptor(&ca, with).await.expect("acceptor");
+        assert!(handshake_against(acceptor, ca.root_der(), "core.cads.inf.haw-hamburg.de", vec![]).await.is_ok());
+
+        let without = build_channel_front_door_acceptor(&ca, vec!["localhost".into()]).await.expect("acceptor");
+        assert!(
+            handshake_against(without, ca.root_der(), "core.cads.inf.haw-hamburg.de", vec![]).await.is_err(),
+            "without the extra SAN the name must not verify"
+        );
     }
 
     /// A leaf signed by the CA is accepted by a client that trusts the CA root

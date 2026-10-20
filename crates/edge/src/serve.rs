@@ -3866,9 +3866,20 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     // the root under everyone and broke pins with BadSignature (issue #2).
     let ca_key_path = ca_key_path_for(cert_out);
     let ca = Ca::load_or_create(&ca_key_path, "ct-edge-ca")?;
-    let (endpoint, tcp_listener, acceptor, ca_root) =
-        build_dual_edge_from_ca(&ca, config.listen, config.listen, vec!["localhost".to_string()])
-            .await?;
+    // CT_EDGE_EXTRA_SANS: extra DNS names appended to the SANs of every leaf presented
+    // to ct-agent clients (tunnel plane, channel front door, channel QUIC endpoints,
+    // relay gate). Unset -> empty -> SANs exactly as before. A bad value aborts startup.
+    let extra_sans = crate::pki::parse_extra_sans(std::env::var(crate::pki::EXTRA_SANS_ENV).ok().as_deref())?;
+    if !extra_sans.is_empty() {
+        eprintln!("ct-edge: extra leaf SANs from {}: {}", crate::pki::EXTRA_SANS_ENV, extra_sans.join(","));
+    }
+    let (endpoint, tcp_listener, acceptor, ca_root) = build_dual_edge_from_ca(
+        &ca,
+        config.listen,
+        config.listen,
+        crate::pki::sans_with_extra(vec!["localhost".to_string()], &extra_sans),
+    )
+    .await?;
     // Publish the CA *root* (not the leaf): Agents/Clients trust the CA and
     // therefore any Edge leaf it signs, so the cert can rotate without redistribution.
     save_cert(cert_out, &ca_root)?;
@@ -4633,10 +4644,13 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                             // name verification would reject the leaf.
                             let channel_acceptor = crate::pki::build_channel_front_door_acceptor(
                                 &ca,
-                                vec![
-                                    "localhost".to_string(),
-                                    crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI.to_string(),
-                                ],
+                                crate::pki::sans_with_extra(
+                                    vec![
+                                        "localhost".to_string(),
+                                        crate::sni::CT_EDGE_CHANNEL_FALLBACK_SNI.to_string(),
+                                    ],
+                                    &extra_sans,
+                                ),
                             )
                             .await?;
                             eprintln!(
@@ -4690,7 +4704,7 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                                     crate::grant_revocation::install_control_plane(&cp_url, &admin_tok);
                                     let relay_acceptor = crate::pki::build_relay_gate_front_door_acceptor(
                                         &ca,
-                                        vec!["localhost".to_string()],
+                                        crate::pki::sans_with_extra(vec!["localhost".to_string()], &extra_sans),
                                     )
                                     .await?;
                                     eprintln!(
@@ -4938,7 +4952,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
     ) {
         match listen.parse::<std::net::SocketAddr>() {
             Ok(chan_addr) => {
-                match build_server_endpoint_from_ca(&ca, chan_addr, vec!["localhost".to_string()]) {
+                match build_server_endpoint_from_ca(
+                    &ca,
+                    chan_addr,
+                    crate::pki::sans_with_extra(vec!["localhost".to_string()], &extra_sans),
+                ) {
                     Ok((chan_ep, _root)) => {
                         let authorizer =
                             crate::channel_authorize::ChannelAuthorizer::new(&cp_url, &admin_tok);
@@ -4971,7 +4989,11 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         // failure reaches only the `eprintln!` in the Err arm and `/healthz`
                         // keeps answering 200 while both-NAT'd peers cannot pair at all.
                         state.relay_broker_heartbeat().expect_start(unix_now());
-                        match build_server_endpoint_from_ca(&ca, relay_addr, vec!["localhost".to_string()]) {
+                        match build_server_endpoint_from_ca(
+                            &ca,
+                            relay_addr,
+                            crate::pki::sans_with_extra(vec!["localhost".to_string()], &extra_sans),
+                        ) {
                             Ok((relay_ep, _)) => {
                                 let relay_az = authorizer.clone();
                                 let relay_cap = channel_broker_cap.clone();
