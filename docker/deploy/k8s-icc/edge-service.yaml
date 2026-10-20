@@ -1,0 +1,18 @@
+# ICC: kein LoadBalancer/NodePort, kein UDP. Nur TCP, nur ClusterIP.
+# Der Ingress (ssl-passthrough) adressiert den Front-Door-Port 8443.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ct-edge
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ct-edge
+  ports:
+    - {name: front-door, port: 8443, targetPort: front-door, protocol: TCP}
+    - {name: tls-tcp, port: 4433, targetPort: tls-tcp, protocol: TCP}
+    - {name: chan-rndzv-tcp, port: 4435, targetPort: chan-rndzv-tcp, protocol: TCP}
+    - {name: chan-relay-tcp, port: 4436, targetPort: chan-relay-tcp, protocol: TCP}

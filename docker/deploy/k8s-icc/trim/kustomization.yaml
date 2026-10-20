@@ -1,0 +1,111 @@
+# Stufe 1: Basis auf ICC trimmen (Loeschungen, Konfiguration, Haertung).
+# Eigene Ressourcen gleichen Namens (Service, Certificate, NetworkPolicy) liegen
+# eine Ebene hoeher, damit die Loesch-Patches sie nicht treffen.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../k8s
+patches:
+  # Namespace, LoadBalancer-Service, Basis-Certificate (DNS-01), PDBs (bei 1 Replica
+  # blockiert minAvailable:1 jedes Node-Drain) und die Basis-NetworkPolicies entfallen.
+  - target: {kind: Namespace, name: ct-system}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Namespace
+      metadata: {name: ct-system}
+  - target: {kind: Service, name: ct-edge}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata: {name: ct-edge}
+  - target: {kind: Certificate, name: ct-edge-portal-tls}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Certificate
+      metadata: {name: ct-edge-portal-tls}
+  - target: {kind: PodDisruptionBudget, name: ct-edge}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PodDisruptionBudget
+      metadata: {name: ct-edge}
+  - target: {kind: PodDisruptionBudget, name: ct-control-plane}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PodDisruptionBudget
+      metadata: {name: ct-control-plane}
+  - target: {kind: NetworkPolicy, name: ct-edge}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: NetworkPolicy
+      metadata: {name: ct-edge}
+  - target: {kind: NetworkPolicy, name: ct-control-plane}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: NetworkPolicy
+      metadata: {name: ct-control-plane}
+  # Konfiguration Org B
+  - target: {kind: ConfigMap, name: ct-edge-config}
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: {name: ct-edge-config}
+      data:
+        CT_EDGE_PORTAL_HOST: core.cads.inf.haw-hamburg.de
+  - target: {kind: ConfigMap, name: ct-control-plane-config}
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata: {name: ct-control-plane-config}
+      data:
+        # OIDC ist optional: ohne Issuer startet die Control-Plane, nur /me/* ist aus.
+        CT_OIDC_ISSUER: ""
+        CT_PORTAL_BASE_URL: https://core.cads.inf.haw-hamburg.de
+        CT_ADMIN_SUPER_EMAIL: scimbe@gmail.com
+  # Edge: nur TCP-Ports im Pod (kein UDP in/out im ICC), Pull-Secret, Pod-Haertung
+  - target: {kind: Deployment, name: ct-edge}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/ports
+        value:
+          - {name: tls-tcp, containerPort: 4433, protocol: TCP}
+          - {name: front-door, containerPort: 8443, protocol: TCP}
+          - {name: http-redirect, containerPort: 8080, protocol: TCP}
+          - {name: chan-rndzv-tcp, containerPort: 4435, protocol: TCP}
+          - {name: chan-relay-tcp, containerPort: 4436, protocol: TCP}
+          - {name: admin, containerPort: 9601, protocol: TCP}
+          - {name: metrics, containerPort: 9600, protocol: TCP}
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{name: ghcr-read}]
+      - op: add
+        path: /spec/template/spec/securityContext/seccompProfile
+        value: {type: RuntimeDefault}
+      - op: replace
+        path: /spec/template/spec/containers/0/command
+        value: ["ct-edge"]
+  - target: {kind: Deployment, name: ct-control-plane}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/automountServiceAccountToken
+        value: false
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{name: ghcr-read}]
+      - op: add
+        path: /spec/template/spec/securityContext/seccompProfile
+        value: {type: RuntimeDefault}
+  - target: {kind: PersistentVolumeClaim}
+    patch: |-
+      - op: add
+        path: /spec/storageClassName
+        value: rook-ceph-block

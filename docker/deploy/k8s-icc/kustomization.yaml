@@ -1,0 +1,24 @@
+# Org B: eigenstaendige CADS-Tunnel-Organisation im HAW-ICC-Namespace `cads`,
+# Host core.cads.inf.haw-hamburg.de. Org A (bunsenbrenner.org, docker compose)
+# bleibt unberuehrt. Rendern: kubectl kustomize docker/deploy/k8s-icc
+#
+# Vorab von Hand anzulegen (nie committen), nur Namen:
+#   ct-edge-admin-token   (Key `token`, 64-hex, geteilt Edge <-> Control-Plane)
+#   ghcr-read             (docker-registry-Secret fuer das private ghcr.io-Paket)
+# Das Portal-Zertifikat (ct-edge-portal-tls) legt cert-manager per Ingress-Annotation
+# (ingress-shim, ClusterIssuer letsencrypt-production, HTTP-01) an, siehe ingress.yaml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: cads
+resources:
+  - trim
+  - edge-service.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+# Eigene Images je Komponente, Build: .github/workflows/images.yml.
+# Edge und Control-Plane nutzen dasselbe Binary-Image (Stage `production`),
+# die Basis waehlt per `command`; zwei Namen halten die Tags getrennt ausrollbar.
+images:
+  - name: ct-testbed
+    newName: ghcr.io/scimbe/cads-tunnel/ct
+    newTag: main

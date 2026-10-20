@@ -1,0 +1,41 @@
+# EIN Ingress, EIN Host (Kyverno unique-ingress-host). TLS wird per SNI
+# unveraendert zur Edge durchgereicht (ssl-passthrough); die Edge terminiert den
+# Portal-Host selbst mit dem Zertifikat aus Secret ct-edge-portal-tls.
+#
+# Portal-Zertifikat (Org A: acme.sh + deSEC DNS-01, scripts/deploy-selfhost.sh,
+# Mount nach /certs/portal). Im ICC: Nutzer duerfen keine Certificate/Issuer
+# anlegen (Dry-Run: Forbidden), nur ueber die Ingress-Annotation. Gleiches Muster
+# wie die laufenden Ingresses cads-verwaltung-*-praktikum: cert-manager legt das
+# Certificate an, loest HTTP-01 ueber einen temporaeren Solver-Ingress (gleicher
+# Host, Port 80) und schreibt tls.crt/tls.key nach ct-edge-portal-tls. Das Secret
+# traegt dieselben Schluessel, die die Edge liest (CT_EDGE_PORTAL_CERT/_KEY).
+# Beim Passthrough ignoriert nginx die Secret-Daten fuer :443, das Secret dient
+# also nur der Edge. UNGETESTET fuer Passthrough: Solver auf :80 und kein
+# HTTP->HTTPS-Redirect auf den Challenge-Pfad. Erneuerung: Edge neu starten
+# (kein Reload im Code gefunden), z.B. kubectl -n cads rollout restart deploy/ct-edge.
+# Der Edge-Pod bleibt Pending, bis das Secret existiert (Volume-Mount).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ct-edge
+  labels:
+    app.kubernetes.io/name: ct-edge
+    app.kubernetes.io/part-of: CADS-Tunnel
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-production
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [core.cads.inf.haw-hamburg.de]
+      secretName: ct-edge-portal-tls
+  rules:
+    - host: core.cads.inf.haw-hamburg.de
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ct-edge
+                port: {name: front-door}
