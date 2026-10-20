@@ -15,10 +15,26 @@ resources:
   - edge-service.yaml
   - ingress.yaml
   - networkpolicy.yaml
-# Eigene Images je Komponente, Build: .github/workflows/images.yml.
-# Edge und Control-Plane nutzen dasselbe Binary-Image (Stage `production`),
-# die Basis waehlt per `command`; zwei Namen halten die Tags getrennt ausrollbar.
+# Ein Image fuer Edge und Control-Plane, Build: .github/workflows/images.yml
+# (Stage `production`); die Basis waehlt die Rolle per `command`.
+# Betrieb: einen festen Stand setzen, z. B.
+#   kustomize edit set image ct-testbed=ghcr.io/scimbe/cads-tunnel/ct:sha-<kurz>
+# Die Vorgabe `main` ist veraenderlich; deshalb zieht der Pod sie bei jedem Start neu
+# (imagePullPolicy Always, Patch unten), sonst bliebe ein rollout restart beim alten Image.
+#
+# Nicht Teil dieses Overlays: das Relay-Gate (ohne CT_EDGE_RELAY_UPSTREAM aus) und UDP.
+# Hinter ssl-passthrough sieht die Edge als Quell-IP den Ingress-Controller, nicht den
+# Agenten; IP-gebundene Regeln (Agent-Key-Policy, Audit, Verbindungsgrenzen) greifen
+# daher nur je Controller-Adresse.
 images:
   - name: ct-testbed
     newName: ghcr.io/scimbe/cads-tunnel/ct
     newTag: main
+patches:
+  - target: {kind: Deployment, name: ct-edge}
+    patch: &immer-ziehen |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+  - target: {kind: Deployment, name: ct-control-plane}
+    patch: *immer-ziehen
