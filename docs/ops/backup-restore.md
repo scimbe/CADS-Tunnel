@@ -25,6 +25,11 @@ einen einzelnen Commit: verschluesselte Daten lassen sich nicht delta-komprimier
 eine wachsende Historie wuerde das Repository jede Nacht um einen vollen Snapshot
 vergroessern. Die aufbewahrten Snapshots *sind* die Historie.
 
+Lokal bleiben die Kopien in `$CADS_BACKUP_WORK` standardmaessig 14 Tage
+(`CADS_BACKUP_LOCAL_KEEP_DAYS`, vorher fest 2 Tage). Ein zweites Offsite-Ziel ist
+optional: `CADS_BACKUP_EXTRA_TARGET` (rsync-Ziel, Zugang ueber `~/.ssh` des Betreibers).
+Ist es nicht gesetzt, vermerkt `backup-verify.sh` das im Log.
+
 ## Wiederherstellung
 
 ```

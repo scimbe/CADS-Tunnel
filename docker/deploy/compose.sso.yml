@@ -89,6 +89,15 @@
 # actually differs between dev and production mode for this deployment shape.
 name: ct-selfhost
 
+# Log rotation (selfhost operations): Docker's json-file driver has NO size cap by
+# default, so every service that is not given one grows its log without bound on
+# the host's disk. One shared block per file, referenced by every service below.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   # #307: real production Postgres backend for Keycloak, replacing the single-file
   # embedded H2 (`start-dev`'s default, and what plain `start` would still use
@@ -103,6 +112,7 @@ services:
       POSTGRES_PASSWORD: "${KC_DB_PASSWORD:?set KC_DB_PASSWORD in .env -- Keycloak's real production Postgres backend, no default}"
     volumes:
       - keycloak_postgres_data:/var/lib/postgresql/data
+    logging: *default-logging
     mem_limit: 512m
     cpus: 0.5
     healthcheck:
@@ -127,6 +137,7 @@ services:
     # compose.selfhost.yml's control-plane/edge limits for the full rationale) --
     # sized well above Keycloak's real JVM baseline (~560MB observed) for GC/session
     # headroom, not tightly.
+    logging: *default-logging
     mem_limit: 1536m
     mem_reservation: 512m
     cpus: 1.5

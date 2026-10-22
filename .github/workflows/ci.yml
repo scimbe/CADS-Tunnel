@@ -34,6 +34,11 @@ jobs:
       - name: Committed-secret guard
         run: bash scripts/check-no-secrets.sh
 
+      - name: Betriebsskripte - Syntax und Edge-Wächter-Test
+        run: |
+          for f in scripts/edge-watch.sh scripts/edge-watch-test.sh scripts/backup-selfhost.sh scripts/backup-verify.sh; do bash -n "$f"; done
+          bash scripts/edge-watch-test.sh
+
       - name: No new rule without an enforcer
         # #579: four times on 2026-08-18 the same shape turned up -- something built,
         # tested and documented that nothing live calls (#576 the policy consulted in the

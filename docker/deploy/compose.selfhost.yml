@@ -11,6 +11,15 @@
 
 name: ct-selfhost
 
+# Log rotation (selfhost operations): Docker's json-file driver has NO size cap by
+# default, so every service that is not given one grows its log without bound on
+# the host's disk. One shared block per file, referenced by every service below.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   control-plane:
     build:
@@ -30,6 +39,13 @@ services:
     # group-writable for) this uid -- see the operator migration note in #305's
     # closing comment for existing deployments upgrading from a root-owned volume.
     user: "65532:65532"
+    # Measured on core 2026-10-22: this was the only container left on the daemon's
+    # default soft nofile of 1024 (edge: 262144). Same EMFILE class as the 2026-08-15
+    # edge outage (see edge below), for every portal/OIDC connection it accepts.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # #312: bounded, so a runaway/leaking co-located service (edge under PoW/relay
     # load, Keycloak) can't OOM-kill this one on a shared single-host deploy -- this
     # host runs with NO swap, so an unbounded container is one bad spike away from
@@ -38,6 +54,7 @@ services:
     # plain `docker compose up` (Swarm-only), which would make this fix a no-op too.
     # Sized generously above this thin service's real footprint (~10MB idle) rather
     # than tightly, so normal load never trips it.
+    logging: *default-logging
     mem_limit: 512m
     mem_reservation: 128m
     cpus: 1.0
@@ -152,6 +169,7 @@ services:
     # most likely to actually spike (PoW #202 solving under a flood, relay traffic),
     # so this is both the most important service to bound AND the one that most
     # needs its own headroom to not spuriously trip under legitimate load.
+    logging: *default-logging
     mem_limit: 512m
     mem_reservation: 128m
     cpus: 1.5
@@ -206,7 +224,11 @@ services:
       # forwarded it -- setting it in the deploy environment therefore did nothing at all,
       # silently. Found by reading the value back out of the running container instead of
       # trusting the deploy (`docker exec ... echo $CT_EDGE_KA_PARK_TTL_SECS` came back empty).
-      CT_EDGE_KA_PARK_TTL_SECS: "${CT_EDGE_KA_PARK_TTL_SECS:-}"
+      # Default 600 (was empty = the edge's 30 s). Measured on core 2026-10-22: KA-ALPN IS
+      # negotiated (park_legs_total{keepalive="yes"}=117658 vs "no"=9074) yet park_reaped_total=126185
+      # -- the idle re-park cycle runs because the TTL was never raised. Rollout order:
+      # docs/ops/runbook.md (needs ct-agent >= v0.5.0 on the fleet). Set 30 in .env to restore the old behaviour.
+      CT_EDGE_KA_PARK_TTL_SECS: "${CT_EDGE_KA_PARK_TTL_SECS:-600}"
       # Extra DNS SANs on every edge leaf (see docs/ops/runbook.md); empty = unchanged.
       CT_EDGE_EXTRA_SANS: "${CT_EDGE_EXTRA_SANS:-}"
       # #589 follow-up (PR#637): wait window for a TCP-fallback agent to redeliver before
