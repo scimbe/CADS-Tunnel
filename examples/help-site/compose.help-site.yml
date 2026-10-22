@@ -7,6 +7,15 @@
 #
 #   docker compose -f examples/help-site/compose.help-site.yml \
 #     --env-file docker/deploy/.env up --build -d
+# Log rotation (selfhost operations): Docker's json-file driver has NO size cap by
+# default, so every service that is not given one grows its log without bound on
+# the host's disk. One shared block per file, referenced by every service below.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   help-origin:
     # Plain Caddy: terminates TLS with a cert issued CORE-side (#219,
@@ -37,6 +46,7 @@ services:
     # (see `networks` below), so an unbounded container here is one bad spike away
     # from starving them too. Sized generously above a static Caddy origin's real
     # footprint (~5-10MB idle).
+    logging: *default-logging
     mem_limit: 128m
     mem_reservation: 32m
     cpus: 0.5
@@ -90,6 +100,7 @@ services:
     restart: unless-stopped
     # #600: same #312 rationale as help-origin above -- sized generously above a
     # single ct-agent browser-mode process's real footprint.
+    logging: *default-logging
     mem_limit: 128m
     mem_reservation: 32m
     cpus: 0.5

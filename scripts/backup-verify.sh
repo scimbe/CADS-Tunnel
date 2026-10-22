@@ -126,6 +126,7 @@ if [ -z "${ALARM:-}" ]; then
 fi
 
 if [ -z "${ALARM:-}" ]; then
+  [ -n "${CADS_BACKUP_EXTRA_TARGET:-}" ] || log "HINWEIS: kein zweites Offsite-Ziel konfiguriert (CADS_BACKUP_EXTRA_TARGET) -- einzige externe Kopie ist das private GitHub-Repository"
   log "Sicherung ist wiederherstellbar"
   exit 0
 fi
