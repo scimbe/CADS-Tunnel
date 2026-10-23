@@ -199,6 +199,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_AGENT_ONBOARD_TIMEOUT_SECS` | agent | bound the one-shot onboarding flow (#73); **unset ⇒ wait indefinitely** — a spent single-use join token can't re-onboard, so production stays patient. Set for fail-fast (CI/smoke) |
 | `CT_AGENT_EDGE_CERT_WAIT_SECS` | agent | bound the shared-volume edge-cert wait (#73); **unset ⇒ wait indefinitely** (same resilience reason). Set for fail-fast |
 | `CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS` | agent | throttle the "waiting for edge cert" log line (default 5s, #73) — cosmetic; does not affect the wait |
+| `CT_DIRECT_REQUIRE_TOKEN` | agent | only read with `CT_AGENT_DIRECT_ADVERTISE`: a direct-connect handshake **without** the tunnel's routing token is refused. **On by default** since ct-agent#291 (agents up to v0.7.40: off). ct-client sends the token since CADS-Tunnel v0.4.20 (#770); an older ct-client loses the direct path, and its p2p mode then fails instead of falling back to the relay. `0`/`false`/`no`/`off` is the opt-out: the old behaviour, a startup `WARNING`, and every token-less session served counted as `ct_agent_events_total{kind="direct_legacy_served"}` — remove it once that stays at 0. Any other value keeps it on. The relayed path never reads it ([threat model](../security/threat-model.md) residual risk 8) |
 | `CT_CLIENT_EDGE_CERT_WAIT_SECS` | client | bound the edge-cert wait (default 30s, #73); the client is a bench/test tool, so it fails fast rather than hanging |
 | `CT_CLIENT_CAPABILITY_WAIT_SECS` | client | bound the capability wait (default 60s, #73); fail-fast with a precise error instead of an indefinite poll |
 | `CT_CLIENT_TUNNEL_TIMEOUT_SECS` | client | overall deadline (default 10s, issue #2) for the tunnel operation once the edge connection is up, so the client never hangs when the edge accepts the connection but cannot relay (e.g. no agent registered for the token) |
@@ -585,12 +586,18 @@ TCP-fallback arms. A test asserts at build time that no relay call site bypasses
 next one added cannot silently miss it. The mesh leg to a peer edge is deliberately exempt:
 that tunnel belongs to the peer, which applies its own revocation.
 
-**Scope limit: this does NOT cover `ct-agent`'s direct-connect path (ct-agent#45,
-threat-model.md residual risk #8).** `serve_direct` bypasses the Edge entirely and is
-authenticated purely by Noise_IK against the Agent's Origin key — a token revoke here has
-zero effect on it. If an incident might involve a client with direct-connect access
-(`direct_advertise_ip`), revoking the token is not enough: rotate the Origin key too
-(ct-agent#12) so the old Capability stops working on both paths.
+**Scope limit: this does NOT cut `ct-agent`'s direct-connect path (ct-agent#45/#291,
+threat-model.md residual risk 8).** `serve_direct` bypasses the Edge. The Agent refuses direct
+handshakes itself once a re-registration of its token is refused (ct-agent v0.7.26 on), but a
+revoke does not trigger one on QUIC: it leaves the Agent's connection open, and the Agent keeps
+serving direct clients that present the revoked token until that connection drops. If an
+incident might involve a client with direct-connect access (`CT_AGENT_DIRECT_ADVERTISE`),
+revoking the token is therefore not enough: have the agent restarted (its first registration is
+refused, and from then on it refuses every direct handshake) or rotate the Origin key
+(ct-agent#12) so the old Capability stops working on both paths. Rotating the token instead, to
+cut off one holder and keep the tunnel, protects the direct path only on agents that require the
+token (`CT_DIRECT_REQUIRE_TOKEN`, the default since ct-agent#291); with the opt-out, or on an
+older agent, a client that leaves the token out is still served.
 
 **What `/healthz` actually covers (#498/#539/#553).** The endpoint the container healthcheck
 consumes reports 503 when any accept loop the edge *meant* to run has stopped iterating. Since
