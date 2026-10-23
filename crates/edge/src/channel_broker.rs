@@ -1351,6 +1351,41 @@ static LIVE_SPLICES: std::sync::Mutex<Option<LiveSplices>> = std::sync::Mutex::n
 pub(crate) const SPLICE_CUT_BY_REMOVAL: &str =
     "channel splice cut: this member is no longer authorized on the channel (#555)";
 
+/// #866: what a splice cut for a revoked grant reports. Its own text because the remedy is a
+/// different one: the holder is still a member and needs a new grant, not its membership back.
+/// Until this existed the revocation sweep's cut reported [`SPLICE_CUT_BY_REMOVAL`].
+pub(crate) const SPLICE_CUT_BY_REVOCATION: &str =
+    "channel splice cut: the grant this member was admitted with was revoked (#866)";
+
+/// Why a live splice leg was cut. The sweeps signal it through the leg's watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutReason {
+    /// #555: the holder is no longer a member of the channel.
+    Membership,
+    /// #866: the grant the leg was admitted with is on the revocation list.
+    Revoked,
+}
+
+impl CutReason {
+    /// The text a completer returns for a splice cut for this reason.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            CutReason::Membership => SPLICE_CUT_BY_REMOVAL,
+            CutReason::Revoked => SPLICE_CUT_BY_REVOCATION,
+        }
+    }
+}
+
+/// The error a completer returns when one of its legs was cut.
+pub(crate) fn splice_cut_error(reason: CutReason) -> BoxError {
+    reason.message().into()
+}
+
+/// What a leg's watch carries: `SPLICE_LIVE` until a sweep cuts it, then the first cause.
+const SPLICE_LIVE: u8 = 0;
+const SPLICE_CUT_MEMBERSHIP: u8 = 1;
+const SPLICE_CUT_REVOKED: u8 = 2;
+
 /// #555: how often a live splice's membership is re-checked.
 ///
 /// One `CACHE_TTL` (30s, `channel_authorize.rs`). Deliberately equal rather than a multiple:
@@ -1366,7 +1401,7 @@ type SpliceKey = ([u8; 32], [u8; 32]);
 #[derive(Default)]
 struct LiveSplices {
     next_id: u64,
-    entries: std::collections::HashMap<SpliceKey, Vec<(u64, Option<[u8; 32]>, tokio::sync::watch::Sender<bool>)>>,
+    entries: std::collections::HashMap<SpliceKey, Vec<(u64, Option<[u8; 32]>, tokio::sync::watch::Sender<u8>)>>,
 }
 
 /// Registration handle for one member's leg of a live splice. Deregisters on drop, so a
@@ -1374,22 +1409,37 @@ struct LiveSplices {
 pub(crate) struct SpliceGuard {
     key: SpliceKey,
     id: u64,
-    rx: tokio::sync::watch::Receiver<bool>,
+    rx: tokio::sync::watch::Receiver<u8>,
 }
 
 impl SpliceGuard {
-    /// Resolves when this leg has been cut because its membership went away.
-    pub(crate) async fn cut(&self) {
+    /// Resolves when this leg has been cut, with the reason: its membership went away (#555)
+    /// or its grant was revoked (#866).
+    pub(crate) async fn cut(&self) -> CutReason {
         let mut rx = self.rx.clone();
         loop {
-            if *rx.borrow() {
-                return;
+            match *rx.borrow() {
+                SPLICE_CUT_MEMBERSHIP => return CutReason::Membership,
+                SPLICE_CUT_REVOKED => return CutReason::Revoked,
+                _ => {}
             }
             if rx.changed().await.is_err() {
                 std::future::pending::<()>().await;
             }
         }
     }
+}
+
+/// Signal one leg's cut. The first cause stays: a leg cut for its membership is not renamed
+/// a revocation when the same sweep then finds its grant revoked too.
+fn signal_splice_cut(tx: &tokio::sync::watch::Sender<u8>, cause: u8) {
+    tx.send_if_modified(|v| {
+        let live = *v == SPLICE_LIVE;
+        if live {
+            *v = cause;
+        }
+        live
+    });
 }
 
 impl Drop for SpliceGuard {
@@ -1423,7 +1473,7 @@ pub(crate) fn register_live_splice_with_digest(
 }
 
 fn register_live_splice_inner(channel: &ChannelId, holder: &[u8; 32], digest: Option<[u8; 32]>) -> SpliceGuard {
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (tx, rx) = tokio::sync::watch::channel(SPLICE_LIVE);
     let key = (channel.0, *holder);
     let mut g = LIVE_SPLICES.lock_safe();
     let live = g.get_or_insert_with(LiveSplices::default);
@@ -1447,7 +1497,7 @@ pub(crate) fn cut_live_splices(channel: &[u8; 32], holder: &[u8; 32]) -> usize {
     match g.as_ref().and_then(|l| l.entries.get(&(*channel, *holder))) {
         Some(v) => {
             for (_, _, tx) in v {
-                let _ = tx.send(true);
+                signal_splice_cut(tx, SPLICE_CUT_MEMBERSHIP);
             }
             v.len()
         }
@@ -1486,7 +1536,7 @@ pub(crate) fn cut_live_splices_by_digest(channel: &[u8; 32], digest: &[u8; 32]) 
             }
             for (_, d, tx) in legs {
                 if d.as_ref() == Some(digest) {
-                    let _ = tx.send(true);
+                    signal_splice_cut(tx, SPLICE_CUT_REVOKED);
                     n += 1;
                 }
             }
@@ -1933,8 +1983,8 @@ async fn finish_quic_pair_inner(
                                 format!("channel relay splice ended after both sides acked: {e}").into()
                             })?
                         }
-                        _ = _ga.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
-                        _ = _gb.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                        cut = _ga.cut() => return Err(splice_cut_error(cut)),
+                        cut = _gb.cut() => return Err(splice_cut_error(cut)),
                     };
                     note_channel_splice(bytes); // #517 V1
                 }
@@ -2828,8 +2878,8 @@ where
                                 format!("channel relay splice ended after both sides acked: {e}").into()
                             })?
                         }
-                        _ = _ga.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
-                        _ = _gb.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                        cut = _ga.cut() => return Err(splice_cut_error(cut)),
+                        cut = _gb.cut() => return Err(splice_cut_error(cut)),
                     };
                     note_channel_splice(bytes); // #517 V1
                 }
@@ -6911,6 +6961,38 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(200), guard.cut()).await.is_ok(),
             "and the splice actually learns about it"
         );
+    }
+
+    /// #866: a leg cut because its grant was revoked says so. Until the watch carried the
+    /// cause, every cut reported "no longer authorized on the channel" (#555), which sends
+    /// a member whose membership is intact off to the wrong remedy.
+    #[tokio::test]
+    async fn the_splice_cut_names_revocation_apart_from_removal_866() {
+        let chan = ChannelId([0x5a; 32]);
+        let (removed, revoked, both) = ([0x5b; 32], [0x5c; 32], [0x5d; 32]);
+        let (revoked_digest, both_digest) = ([0xd4; 32], [0xd5; 32]);
+        let g_removed = register_live_splice(&chan, &removed);
+        let g_revoked = register_live_splice_with_digest(&chan, &revoked, revoked_digest);
+        let g_both = register_live_splice_with_digest(&chan, &both, both_digest);
+
+        assert_eq!(cut_live_splices(&chan.0, &removed), 1);
+        assert_eq!(cut_live_splices_by_digest(&chan.0, &revoked_digest), 1);
+        // One sweep can find both: the membership is checked first, and that cause stays.
+        assert_eq!(cut_live_splices(&chan.0, &both), 1);
+        assert_eq!(cut_live_splices_by_digest(&chan.0, &both_digest), 1);
+
+        let within = std::time::Duration::from_millis(200);
+        assert_eq!(tokio::time::timeout(within, g_removed.cut()).await.ok(), Some(CutReason::Membership));
+        assert_eq!(tokio::time::timeout(within, g_revoked.cut()).await.ok(), Some(CutReason::Revoked));
+        assert_eq!(tokio::time::timeout(within, g_both.cut()).await.ok(), Some(CutReason::Membership));
+
+        // The removal text is the one operators already grep for (#555); revocation has its own.
+        assert_eq!(
+            splice_cut_error(CutReason::Membership).to_string(),
+            "channel splice cut: this member is no longer authorized on the channel (#555)"
+        );
+        assert_eq!(splice_cut_error(CutReason::Revoked).to_string(), SPLICE_CUT_BY_REVOCATION);
+        assert_ne!(SPLICE_CUT_BY_REVOCATION, SPLICE_CUT_BY_REMOVAL);
     }
 
     #[tokio::test]

@@ -343,7 +343,7 @@ where
     .map_err(|e| { eprintln!("ct-edge: relay-gate NO [upstream-connect]: {e}"); e })?;
     tokio::select! {
         r = copy_bidirectional_with_idle_timeout(&mut admitted, &mut upstream, RELAY_IDLE_TIMEOUT) => { r?; }
-        _ = guard.cut() => return Err(crate::channel_broker::SPLICE_CUT_BY_REMOVAL.into()),
+        cut = guard.cut() => return Err(crate::channel_broker::splice_cut_error(cut)),
     }
     Ok(())
 }
