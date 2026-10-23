@@ -323,12 +323,9 @@ where
         .map_err(|e| { eprintln!("ct-edge: relay-gate NO [tls-accept]: {e}"); e })?;
     let (mut admitted, grant) = admit_relay_gate(tls, &ctx.resolver, &ctx.relay_node_peer, now).await?;
     // Registered like the channel-broker splices so the revocation sweep can cut this
-    // leg when the holder is removed or this exact grant is revoked.
-    let guard = crate::channel_broker::register_live_splice_with_digest(
-        &grant.grant.channel,
-        &grant.grant.holder,
-        grant.digest(),
-    );
+    // leg when the holder is removed or this exact grant is revoked, and so it ends when
+    // the grant expires (ct-agent#308), counted from the `now` it was just verified at.
+    let guard = crate::channel_broker::register_live_splice_for_grant(&grant, now);
     let mut upstream = tokio::time::timeout(
         RELAY_UPSTREAM_CONNECT_TIMEOUT,
         tokio::net::TcpStream::connect(ctx.relay_upstream),
@@ -750,6 +747,93 @@ mod tests {
             start.elapsed() < RELAY_UPSTREAM_CONNECT_TIMEOUT,
             "a live, listening upstream must connect and relay well within the timeout, not near it"
         );
+    }
+
+    /// ct-agent#308: a relay-gate splice ends when the member's grant expires. Admission
+    /// refuses an expired grant, but an admitted splice ran on for as long as it saw traffic.
+    /// Set up in real time over real sockets (as #616's test above), then the clock is paused:
+    /// the grant's last minute runs out long before the 300 s idle bound would end the splice.
+    #[tokio::test]
+    async fn a_relay_gate_splice_is_cut_at_grant_expiry_308() {
+        crate::transport::install_crypto_provider();
+        let certified = rcgen::generate_simple_self_signed(vec!["relay-gate.test".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            certified.key_pair.serialize_der(),
+        ));
+        let scfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+        let op = SigningKey::from_bytes(&[23u8; 32]);
+        let holder_key = SigningKey::from_bytes(&[24u8; 32]);
+        let holder = holder_key.verifying_key().to_bytes();
+        let channel = ChannelId([3u8; 32]);
+        // Verified at `now = 1_000` with one minute left.
+        let grant = grant_for(&op, channel, holder, 1_060);
+        let resolver: RelayGateResolver =
+            std::sync::Arc::new(MockResolver { operator: op.verifying_key().to_bytes(), channel, holder });
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_upstream = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut sock, _) = upstream_listener.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            sock.read_exact(&mut buf).await.unwrap();
+            sock.write_all(b"world").await.unwrap();
+            // The relay-node's side of the splice ends with the cut.
+            let mut rest = Vec::new();
+            let _ = sock.read_to_end(&mut rest).await;
+            rest
+        });
+        let ctx = RelayGateContext::new(resolver, acceptor, relay_upstream, "relay-peer-308".to_string());
+        let front_door_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_door_addr = front_door_listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (server_side, _) = front_door_listener.accept().await.unwrap();
+            serve_relay_gate(server_side, &ctx, 1_000).await
+        });
+
+        let client_side = tokio::net::TcpStream::connect(front_door_addr).await.unwrap();
+        let ccfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let server_name = rustls::pki_types::ServerName::try_from("relay-gate.test").unwrap();
+        let mut client_tls = connector.connect(server_name, client_side).await.unwrap();
+        client_tls.write_all(&grant.encode()).await.unwrap();
+        let mut challenge = [0u8; 32];
+        client_tls.read_exact(&mut challenge).await.unwrap();
+        client_tls.write_all(&holder_key.sign(&challenge).to_bytes()).await.unwrap();
+        let mut ack = [0u8; 4];
+        client_tls.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack[..2], b"OK");
+        let mut peer_id = vec![0u8; u16::from_be_bytes([ack[2], ack[3]]) as usize];
+        client_tls.read_exact(&mut peer_id).await.unwrap();
+        client_tls.write_all(b"hello").await.unwrap();
+        let mut resp = [0u8; 5];
+        client_tls.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"world", "the splice carries bytes while the grant holds");
+
+        tokio::time::pause();
+        let paused_at = tokio::time::Instant::now();
+        let err = server_task.await.unwrap().expect_err("the edge cuts the splice");
+        assert_eq!(err.to_string(), crate::channel_broker::SPLICE_CUT_BY_EXPIRY);
+        // At most the minute left (plus the timer's millisecond rounding), never the 300 s
+        // idle bound.
+        assert!(
+            paused_at.elapsed() < Duration::from_secs(61),
+            "at the grant's end, not at the idle bound: {:?}",
+            paused_at.elapsed()
+        );
+        // Both ends of the splice see it end: the member's TLS stream and the relay-node's socket.
+        let mut rest = Vec::new();
+        let _ = client_tls.read_to_end(&mut rest).await;
+        assert!(rest.is_empty(), "nothing after the cut: {rest:?}");
+        assert!(upstream_task.await.unwrap().is_empty());
     }
     ///
     /// Reproduces a field report for the front-door
