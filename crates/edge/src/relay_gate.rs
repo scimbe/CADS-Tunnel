@@ -785,8 +785,7 @@ mod tests {
             sock.write_all(b"world").await.unwrap();
             // The relay-node's side of the splice ends with the cut.
             let mut rest = Vec::new();
-            let _ = sock.read_to_end(&mut rest).await;
-            rest
+            sock.read_to_end(&mut rest).await.map(|_| rest)
         });
         let ctx = RelayGateContext::new(resolver, acceptor, relay_upstream, "relay-peer-308".to_string());
         let front_door_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -857,7 +856,8 @@ mod tests {
             "{end:?}"
         );
         assert!(rest.is_empty(), "nothing after the cut: {rest:?}");
-        assert!(upstream_task.await.unwrap().is_empty());
+        let upstream_rest = upstream_task.await.unwrap().expect("the relay-node reads a FIN, not a reset");
+        assert!(upstream_rest.is_empty(), "nothing after the cut upstream: {upstream_rest:?}");
     }
     ///
     /// Reproduces a field report for the front-door
