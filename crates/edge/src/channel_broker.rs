@@ -1385,10 +1385,13 @@ impl CutReason {
         }
     }
 
-    /// Its `reason` label in `ct_edge_channel_splice_cuts_total`.
+    /// Its `reason` label in `ct_edge_channel_splice_cuts_total`. The first two are the
+    /// admission refusal categories (`CHANNEL_REFUSAL_CATEGORIES`) with an underscore, so one
+    /// cause keeps one name across the edge's metrics; an expiry is refused as `grant-verify`,
+    /// which says less, hence its own.
     fn label(self) -> &'static str {
         match self {
-            CutReason::Membership => "membership",
+            CutReason::Membership => "not_member",
             CutReason::Revoked => "grant_revoked",
             CutReason::GrantExpired => "grant_expired",
         }
@@ -1440,7 +1443,12 @@ const SPLICE_EXPIRY_CHUNK: std::time::Duration = std::time::Duration::from_secs(
 /// The lifetime left is taken at the pairing's `now`, the clock `authorize_channel_pair` has
 /// just checked both grants against -- the wall clock in production, a caller's clock in tests,
 /// whose grants are dated against it (`now = 500`, expiry `1_000`) -- and from there it runs
-/// on the edge's own clocks.
+/// on the edge's own clocks. In production that `now` is the arriving member's, read after its
+/// admission on QUIC but before it on `:443` (preamble 15 s plus join 15 s on a keepalive leg),
+/// WebSocket (15 s) and the relay gate (TLS 10 s plus pre-auth 15 s). A splice can therefore
+/// outlive its grant by that admission time (plus the part of a second `now` drops), never end
+/// before it: the skew `authorize_channel_pair` already pairs with, and only once per grant,
+/// since admission refuses the grant from then on.
 #[derive(Debug, Clone, Copy)]
 struct SpliceExpiry {
     /// When the leg was registered, on tokio's clock (which a test can pause).
@@ -1449,6 +1457,8 @@ struct SpliceExpiry {
     left: u64,
     /// The same end on the wall clock (unix seconds), to re-anchor a long wait on.
     wall_end: UnixSeconds,
+    /// The grant's own expiry, for the line that names the cut.
+    expires_at: UnixSeconds,
 }
 
 impl SpliceExpiry {
@@ -1456,7 +1466,12 @@ impl SpliceExpiry {
     fn of(expires_at: UnixSeconds, now: UnixSeconds, wall_now: UnixSeconds) -> Option<Self> {
         (expires_at != u64::MAX).then(|| {
             let left = expires_at.saturating_sub(now);
-            Self { registered: tokio::time::Instant::now(), left, wall_end: wall_now.saturating_add(left) }
+            Self {
+                registered: tokio::time::Instant::now(),
+                left,
+                wall_end: wall_now.saturating_add(left),
+                expires_at,
+            }
         })
     }
 
@@ -1508,7 +1523,10 @@ impl SpliceGuard {
     pub(crate) async fn cut(&self) -> CutReason {
         let expired = async {
             match &self.expiry {
-                Some(e) => e.wait(presence_unix_now).await,
+                Some(e) => {
+                    e.wait(presence_unix_now).await;
+                    e.expires_at
+                }
                 None => std::future::pending().await,
             }
         };
@@ -1516,7 +1534,18 @@ impl SpliceGuard {
         tokio::select! {
             biased;
             cut = self.signalled() => cut,
-            () = expired => CutReason::GrantExpired,
+            expires_at = expired => {
+                // No sweep sees an expiry, and the completer's error says why, not whose grant
+                // it was: this is the line that ties the cut to a member. One per splice, as the
+                // completer stops polling the other leg once this one resolved.
+                eprintln!(
+                    "ct-edge: cutting a live splice leg for holder {} on channel {} -- its grant \
+                     expired at {expires_at} (ct-agent#308)",
+                    short_hex(&self.key.1),
+                    short_hex(&self.key.0)
+                );
+                CutReason::GrantExpired
+            }
         }
     }
 
@@ -7110,17 +7139,18 @@ mod tests {
         assert_eq!(tokio::time::timeout(within, g_revoked.cut()).await.ok(), Some(CutReason::Revoked));
         assert_eq!(tokio::time::timeout(within, g_both.cut()).await.ok(), Some(CutReason::Membership));
 
-        // The removal text is the one operators already grep for (#555); revocation has its own,
-        // and each cut is counted under its own reason.
-        let (removals, revocations) = (splice_cuts("membership"), splice_cuts("grant_revoked"));
+        // The removal text is the one operators already grep for (#555); revocation has its own.
+        // `splice_cut_error` is what a completer returns for a cut leg: the deltas below pin the
+        // counter each reason lands in, not a completer's cut (the ct-agent#308 tests count those).
+        let (removals, revocations) = (splice_cuts("not_member"), splice_cuts("grant_revoked"));
         assert_eq!(
             splice_cut_error(CutReason::Membership).to_string(),
             "channel splice cut: this member is no longer authorized on the channel (#555)"
         );
         assert_eq!(splice_cut_error(CutReason::Revoked).to_string(), SPLICE_CUT_BY_REVOCATION);
         assert_ne!(SPLICE_CUT_BY_REVOCATION, SPLICE_CUT_BY_REMOVAL);
-        assert!(splice_cuts("membership") > removals, "a removal counts as membership");
-        assert!(splice_cuts("grant_revoked") > revocations, "a revocation counts as grant_revoked");
+        assert!(splice_cuts("not_member") > removals, "Membership is counted under not_member");
+        assert!(splice_cuts("grant_revoked") > revocations, "Revoked is counted under grant_revoked");
     }
 
     /// The `ct_edge_channel_splice_cuts_total` row for `reason`. Process-wide, so tests assert
