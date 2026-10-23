@@ -1351,6 +1351,143 @@ static LIVE_SPLICES: std::sync::Mutex<Option<LiveSplices>> = std::sync::Mutex::n
 pub(crate) const SPLICE_CUT_BY_REMOVAL: &str =
     "channel splice cut: this member is no longer authorized on the channel (#555)";
 
+/// #866: what a splice cut for a revoked grant reports. Its own text because the remedy is a
+/// different one: the holder is still a member and needs a new grant, not its membership back.
+/// Until this existed the revocation sweep's cut reported [`SPLICE_CUT_BY_REMOVAL`].
+pub(crate) const SPLICE_CUT_BY_REVOCATION: &str =
+    "channel splice cut: the grant this member was admitted with was revoked (#866)";
+
+/// ct-agent#308: what a splice cut at a grant's expiry reports. Admission refuses an expired
+/// grant, but a splice that was admitted before the expiry used to run on for as long as its
+/// members stayed connected: only an agent that watches its own grant ended the session.
+pub(crate) const SPLICE_CUT_BY_EXPIRY: &str = "channel splice cut: a member's grant expired (ct-agent#308)";
+
+/// Why a live splice leg was cut. The sweeps signal the first two through the leg's watch;
+/// the expiry is the leg's own timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CutReason {
+    /// #555: the holder is no longer a member of the channel.
+    Membership,
+    /// #866: the grant the leg was admitted with is on the revocation list.
+    Revoked,
+    /// ct-agent#308: the grant the leg was admitted with expired. Each leg times its own
+    /// grant, so a splice, which races both of its legs, ends at the earlier expiry.
+    GrantExpired,
+}
+
+impl CutReason {
+    /// The text a completer returns for a splice cut for this reason.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            CutReason::Membership => SPLICE_CUT_BY_REMOVAL,
+            CutReason::Revoked => SPLICE_CUT_BY_REVOCATION,
+            CutReason::GrantExpired => SPLICE_CUT_BY_EXPIRY,
+        }
+    }
+
+    /// Its `reason` label in `ct_edge_channel_splice_cuts_total`. The first two are the
+    /// admission refusal categories (`CHANNEL_REFUSAL_CATEGORIES`) with an underscore, so one
+    /// cause keeps one name across the edge's metrics; an expiry is refused as `grant-verify`,
+    /// which says less, hence its own.
+    fn label(self) -> &'static str {
+        match self {
+            CutReason::Membership => "not_member",
+            CutReason::Revoked => "grant_revoked",
+            CutReason::GrantExpired => "grant_expired",
+        }
+    }
+
+    fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
+        match self {
+            CutReason::Membership => &SPLICE_CUTS_MEMBERSHIP,
+            CutReason::Revoked => &SPLICE_CUTS_REVOKED,
+            CutReason::GrantExpired => &SPLICE_CUTS_GRANT_EXPIRED,
+        }
+    }
+}
+
+/// ct-agent#308: live splices the edge cut, by [`CutReason`]: one count per splice, where its
+/// completer (or the relay gate) loses the copy to a cut leg. The sweeps' own log lines count
+/// legs and say nothing about an expiry, which no sweep sees. Static like the splice counters
+/// above: the completers have no `EdgeState`.
+static SPLICE_CUTS_MEMBERSHIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPLICE_CUTS_REVOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPLICE_CUTS_GRANT_EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// ct-agent#308: `(reason, count)` for `ct_edge_channel_splice_cuts_total`, every reason
+/// included, zero or not (#558).
+pub(crate) fn channel_splice_cut_totals() -> [(&'static str, u64); 3] {
+    [CutReason::Membership, CutReason::Revoked, CutReason::GrantExpired]
+        .map(|r| (r.label(), r.counter().load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// The error a completer returns when one of its legs was cut, counted for `/metrics`.
+pub(crate) fn splice_cut_error(reason: CutReason) -> BoxError {
+    reason.counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    reason.message().into()
+}
+
+/// What a leg's watch carries: `SPLICE_LIVE` until a sweep cuts it, then the first cause.
+const SPLICE_LIVE: u8 = 0;
+const SPLICE_CUT_MEMBERSHIP: u8 = 1;
+const SPLICE_CUT_REVOKED: u8 = 2;
+
+/// ct-agent#308: the longest single sleep of a leg's grant-expiry timer. A longer lifetime
+/// (ICC grants run 365 days) is waited out in chunks of this length, and after each one the
+/// rest is re-read from the wall clock: grants are dated on the wall clock, and a monotonic
+/// clock that stood still (a suspended VM) or drifted must not stretch a year-long wait.
+const SPLICE_EXPIRY_CHUNK: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// ct-agent#308: when a live splice leg's grant runs out.
+///
+/// The lifetime left is taken at the pairing's `now`, the clock `authorize_channel_pair` has
+/// just checked both grants against -- the wall clock in production, a caller's clock in tests,
+/// whose grants are dated against it (`now = 500`, expiry `1_000`) -- and from there it runs
+/// on the edge's own clocks. In production that `now` is the arriving member's, read after its
+/// admission on QUIC but before it on `:443` (preamble 15 s plus join 15 s on a keepalive leg),
+/// WebSocket (15 s) and the relay gate (TLS 10 s plus pre-auth 15 s). A splice can therefore
+/// outlive its grant by that admission time (plus the part of a second `now` drops), never end
+/// before it: the skew `authorize_channel_pair` already pairs with, and only once per grant,
+/// since admission refuses the grant from then on.
+#[derive(Debug, Clone, Copy)]
+struct SpliceExpiry {
+    /// When the leg was registered, on tokio's clock (which a test can pause).
+    registered: tokio::time::Instant,
+    /// The grant's lifetime left at the pairing, in seconds.
+    left: u64,
+    /// The same end on the wall clock (unix seconds), to re-anchor a long wait on.
+    wall_end: UnixSeconds,
+    /// The grant's own expiry, for the line that names the cut.
+    expires_at: UnixSeconds,
+}
+
+impl SpliceExpiry {
+    /// `None` for a grant that never expires (`u64::MAX`): nothing is armed for it.
+    fn of(expires_at: UnixSeconds, now: UnixSeconds, wall_now: UnixSeconds) -> Option<Self> {
+        (expires_at != u64::MAX).then(|| {
+            let left = expires_at.saturating_sub(now);
+            Self {
+                registered: tokio::time::Instant::now(),
+                left,
+                wall_end: wall_now.saturating_add(left),
+                expires_at,
+            }
+        })
+    }
+
+    /// Resolves once the grant has run out. The last stretch, at most one
+    /// [`SPLICE_EXPIRY_CHUNK`], runs on tokio's clock alone; every chunk before it ends by
+    /// re-reading the rest from `wall`.
+    async fn wait(&self, wall: impl Fn() -> UnixSeconds) {
+        let mut left = std::time::Duration::from_secs(self.left).saturating_sub(self.registered.elapsed());
+        while left > SPLICE_EXPIRY_CHUNK {
+            tokio::time::sleep(SPLICE_EXPIRY_CHUNK).await;
+            left = std::time::Duration::from_secs(self.wall_end.saturating_sub(wall()));
+        }
+        tokio::time::sleep(left).await;
+    }
+}
+
 /// #555: how often a live splice's membership is re-checked.
 ///
 /// One `CACHE_TTL` (30s, `channel_authorize.rs`). Deliberately equal rather than a multiple:
@@ -1366,7 +1503,7 @@ type SpliceKey = ([u8; 32], [u8; 32]);
 #[derive(Default)]
 struct LiveSplices {
     next_id: u64,
-    entries: std::collections::HashMap<SpliceKey, Vec<(u64, Option<[u8; 32]>, tokio::sync::watch::Sender<bool>)>>,
+    entries: std::collections::HashMap<SpliceKey, Vec<(u64, Option<[u8; 32]>, tokio::sync::watch::Sender<u8>)>>,
 }
 
 /// Registration handle for one member's leg of a live splice. Deregisters on drop, so a
@@ -1374,22 +1511,70 @@ struct LiveSplices {
 pub(crate) struct SpliceGuard {
     key: SpliceKey,
     id: u64,
-    rx: tokio::sync::watch::Receiver<bool>,
+    rx: tokio::sync::watch::Receiver<u8>,
+    /// ct-agent#308: `None` for a leg registered without a grant, or with one that never
+    /// expires.
+    expiry: Option<SpliceExpiry>,
 }
 
 impl SpliceGuard {
-    /// Resolves when this leg has been cut because its membership went away.
-    pub(crate) async fn cut(&self) {
+    /// Resolves when this leg has been cut, with the reason: its membership went away (#555),
+    /// its grant was revoked (#866) or its grant expired (ct-agent#308).
+    pub(crate) async fn cut(&self) -> CutReason {
+        let expired = async {
+            match &self.expiry {
+                Some(e) => {
+                    e.wait(presence_unix_now).await;
+                    e.expires_at
+                }
+                None => std::future::pending().await,
+            }
+        };
+        // `biased`: a sweep's verdict that lands in the same poll as the expiry keeps its name.
+        tokio::select! {
+            biased;
+            cut = self.signalled() => cut,
+            expires_at = expired => {
+                // No sweep sees an expiry, and the completer's error says why, not whose grant
+                // it was: this is the line that ties the cut to a member. One per splice, as the
+                // completer stops polling the other leg once this one resolved.
+                eprintln!(
+                    "ct-edge: cutting a live splice leg for holder {} on channel {} -- its grant \
+                     expired at {expires_at} (ct-agent#308)",
+                    short_hex(&self.key.1),
+                    short_hex(&self.key.0)
+                );
+                CutReason::GrantExpired
+            }
+        }
+    }
+
+    /// The sweeps' verdict on this leg (#555, #866).
+    async fn signalled(&self) -> CutReason {
         let mut rx = self.rx.clone();
         loop {
-            if *rx.borrow() {
-                return;
+            match *rx.borrow() {
+                SPLICE_CUT_MEMBERSHIP => return CutReason::Membership,
+                SPLICE_CUT_REVOKED => return CutReason::Revoked,
+                _ => {}
             }
             if rx.changed().await.is_err() {
                 std::future::pending::<()>().await;
             }
         }
     }
+}
+
+/// Signal one leg's cut. The first cause stays: a leg cut for its membership is not renamed
+/// a revocation when the same sweep then finds its grant revoked too.
+fn signal_splice_cut(tx: &tokio::sync::watch::Sender<u8>, cause: u8) {
+    tx.send_if_modified(|v| {
+        let live = *v == SPLICE_LIVE;
+        if live {
+            *v = cause;
+        }
+        live
+    });
 }
 
 impl Drop for SpliceGuard {
@@ -1409,28 +1594,43 @@ impl Drop for SpliceGuard {
 /// #555: register one member of a splice that is about to start carrying bytes.
 #[cfg(test)]
 pub(crate) fn register_live_splice(channel: &ChannelId, holder: &[u8; 32]) -> SpliceGuard {
-    register_live_splice_inner(channel, holder, None)
+    register_live_splice_inner(channel, holder, None, None)
 }
 
 /// Like [`register_live_splice`], but remembers the digest of the grant the leg was
 /// admitted with, so a per-grant revocation can cut exactly that leg.
+#[cfg(test)]
 pub(crate) fn register_live_splice_with_digest(
     channel: &ChannelId,
     holder: &[u8; 32],
     grant_digest: [u8; 32],
 ) -> SpliceGuard {
-    register_live_splice_inner(channel, holder, Some(grant_digest))
+    register_live_splice_inner(channel, holder, Some(grant_digest), None)
 }
 
-fn register_live_splice_inner(channel: &ChannelId, holder: &[u8; 32], digest: Option<[u8; 32]>) -> SpliceGuard {
-    let (tx, rx) = tokio::sync::watch::channel(false);
+/// ct-agent#308: register one member of a splice that is about to start carrying bytes, for
+/// as long as its grant allows: the leg is cut for its membership (#555) and for its grant's
+/// digest (#866) like before, and now also when the grant expires. `now` is the pairing's
+/// clock, the one both grants were just authorized at (see [`SpliceExpiry`]).
+pub(crate) fn register_live_splice_for_grant(grant: &SignedChannelGrant, now: UnixSeconds) -> SpliceGuard {
+    let expiry = SpliceExpiry::of(grant.grant.expires_at, now, presence_unix_now());
+    register_live_splice_inner(&grant.grant.channel, &grant.grant.holder, Some(grant.digest()), expiry)
+}
+
+fn register_live_splice_inner(
+    channel: &ChannelId,
+    holder: &[u8; 32],
+    digest: Option<[u8; 32]>,
+    expiry: Option<SpliceExpiry>,
+) -> SpliceGuard {
+    let (tx, rx) = tokio::sync::watch::channel(SPLICE_LIVE);
     let key = (channel.0, *holder);
     let mut g = LIVE_SPLICES.lock_safe();
     let live = g.get_or_insert_with(LiveSplices::default);
     live.next_id += 1;
     let id = live.next_id;
     live.entries.entry(key).or_default().push((id, digest, tx));
-    SpliceGuard { key, id, rx }
+    SpliceGuard { key, id, rx, expiry }
 }
 
 /// #555: every `(channel, holder)` with at least one live splice leg — what the membership
@@ -1447,7 +1647,7 @@ pub(crate) fn cut_live_splices(channel: &[u8; 32], holder: &[u8; 32]) -> usize {
     match g.as_ref().and_then(|l| l.entries.get(&(*channel, *holder))) {
         Some(v) => {
             for (_, _, tx) in v {
-                let _ = tx.send(true);
+                signal_splice_cut(tx, SPLICE_CUT_MEMBERSHIP);
             }
             v.len()
         }
@@ -1486,7 +1686,7 @@ pub(crate) fn cut_live_splices_by_digest(channel: &[u8; 32], digest: &[u8; 32]) 
             }
             for (_, d, tx) in legs {
                 if d.as_ref() == Some(digest) {
-                    let _ = tx.send(true);
+                    signal_splice_cut(tx, SPLICE_CUT_REVOKED);
                     n += 1;
                 }
             }
@@ -1923,8 +2123,10 @@ async fn finish_quic_pair_inner(
                     // pair: removing one participant must end that participant's session,
                     // and since a splice has exactly two ends, ending either ends both --
                     // which is correct, the remaining side is no longer talking to anyone.
-                    let _ga = register_live_splice_with_digest(&a.req.grant.grant.channel, &a.req.grant.grant.holder, a.req.grant.digest());
-                    let _gb = register_live_splice_with_digest(&b.req.grant.grant.channel, &b.req.grant.grant.holder, b.req.grant.digest());
+                    // ct-agent#308: each leg also times its own grant, so the copy ends at
+                    // the earlier of the two expiries.
+                    let _ga = register_live_splice_for_grant(&a.req.grant, now);
+                    let _gb = register_live_splice_for_grant(&b.req.grant, now);
                     // Both sides acked cleanly; a failure now is the splice itself, not a
                     // one-sided ack race.
                     let bytes = tokio::select! {
@@ -1933,8 +2135,8 @@ async fn finish_quic_pair_inner(
                                 format!("channel relay splice ended after both sides acked: {e}").into()
                             })?
                         }
-                        _ = _ga.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
-                        _ = _gb.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                        cut = _ga.cut() => return Err(splice_cut_error(cut)),
+                        cut = _gb.cut() => return Err(splice_cut_error(cut)),
                     };
                     note_channel_splice(bytes); // #517 V1
                 }
@@ -2790,9 +2992,10 @@ where
                     // #555: same registration as the QUIC completer. Both families are wired
                     // because a membership removal that ends the session on one transport and
                     // not the other is worse than one that ends it nowhere -- an operator
-                    // cannot tell which transport a given participant arrived on.
-                    let _ga = register_live_splice_with_digest(&a.req.grant.grant.channel, &a.req.grant.grant.holder, a.req.grant.digest());
-                    let _gb = register_live_splice_with_digest(&b.req.grant.grant.channel, &b.req.grant.grant.holder, b.req.grant.digest());
+                    // cannot tell which transport a given participant arrived on. The same
+                    // holds for the grant expiry (ct-agent#308).
+                    let _ga = register_live_splice_for_grant(&a.req.grant, now);
+                    let _gb = register_live_splice_for_grant(&b.req.grant, now);
                     // #591: resolve each side's SESSION leg on its own -- the admission stream
                     // for a SameStream member, a fresh bi-stream for a QuicNextBiStream one --
                     // in the QUIC-native order (initiator's `accept_bi` first, then the
@@ -2828,8 +3031,8 @@ where
                                 format!("channel relay splice ended after both sides acked: {e}").into()
                             })?
                         }
-                        _ = _ga.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
-                        _ = _gb.cut() => return Err(SPLICE_CUT_BY_REMOVAL.into()),
+                        cut = _ga.cut() => return Err(splice_cut_error(cut)),
+                        cut = _gb.cut() => return Err(splice_cut_error(cut)),
                     };
                     note_channel_splice(bytes); // #517 V1
                 }
@@ -6911,6 +7114,291 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(200), guard.cut()).await.is_ok(),
             "and the splice actually learns about it"
         );
+    }
+
+    /// #866: a leg cut because its grant was revoked says so. Until the watch carried the
+    /// cause, every cut reported "no longer authorized on the channel" (#555), which sends
+    /// a member whose membership is intact off to the wrong remedy.
+    #[tokio::test]
+    async fn the_splice_cut_names_revocation_apart_from_removal_866() {
+        let chan = ChannelId([0x5a; 32]);
+        let (removed, revoked, both) = ([0x5b; 32], [0x5c; 32], [0x5d; 32]);
+        let (revoked_digest, both_digest) = ([0xd4; 32], [0xd5; 32]);
+        let g_removed = register_live_splice(&chan, &removed);
+        let g_revoked = register_live_splice_with_digest(&chan, &revoked, revoked_digest);
+        let g_both = register_live_splice_with_digest(&chan, &both, both_digest);
+
+        assert_eq!(cut_live_splices(&chan.0, &removed), 1);
+        assert_eq!(cut_live_splices_by_digest(&chan.0, &revoked_digest), 1);
+        // One sweep can find both: the membership is checked first, and that cause stays.
+        assert_eq!(cut_live_splices(&chan.0, &both), 1);
+        assert_eq!(cut_live_splices_by_digest(&chan.0, &both_digest), 1);
+
+        let within = std::time::Duration::from_millis(200);
+        assert_eq!(tokio::time::timeout(within, g_removed.cut()).await.ok(), Some(CutReason::Membership));
+        assert_eq!(tokio::time::timeout(within, g_revoked.cut()).await.ok(), Some(CutReason::Revoked));
+        assert_eq!(tokio::time::timeout(within, g_both.cut()).await.ok(), Some(CutReason::Membership));
+
+        // The removal text is the one operators already grep for (#555); revocation has its own.
+        // `splice_cut_error` is what a completer returns for a cut leg: the deltas below pin the
+        // counter each reason lands in, not a completer's cut (the ct-agent#308 tests count those).
+        let (removals, revocations) = (splice_cuts("not_member"), splice_cuts("grant_revoked"));
+        assert_eq!(
+            splice_cut_error(CutReason::Membership).to_string(),
+            "channel splice cut: this member is no longer authorized on the channel (#555)"
+        );
+        assert_eq!(splice_cut_error(CutReason::Revoked).to_string(), SPLICE_CUT_BY_REVOCATION);
+        assert_ne!(SPLICE_CUT_BY_REVOCATION, SPLICE_CUT_BY_REMOVAL);
+        assert!(splice_cuts("not_member") > removals, "Membership is counted under not_member");
+        assert!(splice_cuts("grant_revoked") > revocations, "Revoked is counted under grant_revoked");
+    }
+
+    /// The `ct_edge_channel_splice_cuts_total` row for `reason`. Process-wide, so tests assert
+    /// deltas.
+    fn splice_cuts(reason: &str) -> u64 {
+        channel_splice_cut_totals()
+            .into_iter()
+            .find(|(r, _)| *r == reason)
+            .map(|(_, n)| n)
+            .expect("a row per reason")
+    }
+
+    /// A relay-only member admitted over `stream` with a grant expiring at `expires_at`, for
+    /// the ct-agent#308 tests below.
+    fn expiring_stream_member(
+        stream: tokio::io::DuplexStream,
+        channel: [u8; 32],
+        holder: &SigningKey,
+        direction: Direction,
+        expires_at: UnixSeconds,
+    ) -> AdmittedStreamMember<tokio::io::DuplexStream> {
+        AdmittedStreamMember {
+            stream,
+            req: ChannelJoinRequest {
+                grant: grant_h(channel, holder, direction, expires_at),
+                endpoint: "relay-only".to_string(),
+            },
+            operator: operator_pubkey(),
+            noise: None,
+            attest: None,
+            observed: "203.0.113.9:9999".parse().unwrap(),
+            session: SessionSource::SameStream,
+            conn: None,
+            _permit: None,
+        }
+    }
+
+    /// ct-agent#308: a live splice ends when the EARLIER of its two members' grants expires,
+    /// whichever member holds it. Admission refuses an expired grant, but a splice admitted
+    /// before the expiry ran on for as long as both members stayed connected, unless an agent
+    /// ended it itself. Paused clock: the lifetime left is taken at the pairing's `now` and
+    /// then runs on tokio's clock, so no wall-clock time has to pass.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_splice_is_cut_when_the_earlier_grant_expires_308() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x3c; 32];
+        let (holder_a, holder_b) = (holder_sk(0xa5), holder_sk(0xb6));
+        let now = 1_000;
+        let expired_before = splice_cuts("grant_expired");
+        // Five seconds against a year, both ways round: the later grant never ends the splice.
+        for (a_left, b_left) in [(5, 365 * 86_400), (365 * 86_400, 5)] {
+            let (mut end_a, broker_a) = tokio::io::duplex(1024);
+            let (mut end_b, broker_b) = tokio::io::duplex(1024);
+            let a = expiring_stream_member(broker_a, channel, &holder_a, Direction::Initiate, now + a_left);
+            let b = expiring_stream_member(broker_b, channel, &holder_b, Direction::Accept, now + b_left);
+            let started = tokio::time::Instant::now();
+            let splice = tokio::spawn(finish_relay_pair_over_streams(a, b, now));
+            assert!(read_relay_ack_line(&mut end_a).await.starts_with(b"OK"));
+            assert!(read_relay_ack_line(&mut end_b).await.starts_with(b"OK"));
+            end_a.write_all(b"while valid").await.expect("a writes");
+            let mut got = [0u8; 11];
+            end_b.read_exact(&mut got).await.expect("b reads");
+            assert_eq!(&got, b"while valid", "the splice carries bytes while both grants hold");
+
+            let err = tokio::time::timeout(std::time::Duration::from_secs(400 * 86_400), splice)
+                .await
+                .expect("the splice is cut, not left running past both grants")
+                .expect("join")
+                .expect_err("the edge cuts the splice");
+            assert_eq!(err.to_string(), SPLICE_CUT_BY_EXPIRY, "({a_left}, {b_left})");
+            let lived = started.elapsed();
+            assert!(
+                lived >= std::time::Duration::from_secs(5) && lived < std::time::Duration::from_secs(6),
+                "cut at the earlier expiry, 5 s after the pairing ({a_left}, {b_left}): {lived:?}"
+            );
+            // Both members see their stream end.
+            let mut rest = Vec::new();
+            assert_eq!(end_a.read_to_end(&mut rest).await.expect("a reads to EOF"), 0);
+            assert_eq!(end_b.read_to_end(&mut rest).await.expect("b reads to EOF"), 0);
+        }
+        assert!(splice_cuts("grant_expired") >= expired_before + 2, "both cuts are counted as grant_expired");
+    }
+
+    /// ct-agent#308, the QUIC completer: the same cut at the earlier expiry, in real time --
+    /// quinn's own timers do not survive a paused clock. Both ways round, so a completer that
+    /// timed one leg's grant for both legs fails one of the rounds. What the members see is a
+    /// plain application close (code 0, no reason), the end a #555/#866 cut has always
+    /// produced; in particular no `park-expired:` reason, which a client reads as "re-park now".
+    #[tokio::test]
+    async fn a_quic_relay_splice_is_cut_when_the_earlier_grant_expires_308() {
+        let now = 500;
+        // One grant has two seconds left at the pairing, the other never expires.
+        quic_splice_cut_round(now, now + 2, u64::MAX).await;
+        quic_splice_cut_round(now, u64::MAX, now + 2).await;
+    }
+
+    /// One round of the test above: initiator A's grant expires at `a_expires`, acceptor B's
+    /// at `b_expires`, and the earlier one has two seconds left at `now`.
+    async fn quic_splice_cut_round(now: UnixSeconds, a_expires: UnixSeconds, b_expires: UnixSeconds) {
+        let round = format!("A expires at {a_expires}, B at {b_expires}");
+        let pk = operator_pubkey();
+        let channel = [0xE7u8; 32];
+        let holder_a = holder_sk(0xa7);
+        let holder_b = holder_sk(0xb8);
+        let req_a = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_a, Direction::Initiate, a_expires),
+            endpoint: "203.0.113.1:7071".to_string(),
+        };
+        let req_b = ChannelJoinRequest {
+            grant: grant_h(channel, &holder_b, Direction::Accept, b_expires),
+            endpoint: "203.0.113.2:7072".to_string(),
+        };
+
+        let (server, cert) = build_server_endpoint_with_cert().expect("server");
+        let addr = server.local_addr().expect("addr");
+        let expired_before = splice_cuts("grant_expired");
+        let started = std::time::Instant::now();
+        let relay_task = tokio::spawn(async move {
+            broker_channel_relay(&server, now, move |c, _h| async move {
+                (c.0 == channel).then_some((pk, None, None))
+            })
+            .await
+        });
+        let cert_b = cert.clone();
+        let a = tokio::spawn(async move {
+            let c = build_client_endpoint(cert).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_a.encode(), &holder_a).await;
+            assert!(ack.starts_with(b"OK"), "A admitted: {:?}", String::from_utf8_lossy(&ack));
+            let (mut s, mut r) = conn.open_bi().await.expect("a data bi"); // initiator opens
+            s.write_all(b"while valid").await.expect("a write");
+            let mut got = [0u8; 11];
+            r.read_exact(&mut got).await.expect("a read");
+            (got, conn.closed().await)
+        });
+        let b = tokio::spawn(async move {
+            let c = build_client_endpoint(cert_b).expect("client");
+            let conn = c.connect(addr, "localhost").expect("cfg").await.expect("conn");
+            let ack = present_join(&conn, &req_b.encode(), &holder_b).await;
+            assert!(ack.starts_with(b"OK"), "B admitted: {:?}", String::from_utf8_lossy(&ack));
+            let (mut s, mut r) = conn.accept_bi().await.expect("b data bi"); // acceptor accepts
+            let mut got = [0u8; 11];
+            r.read_exact(&mut got).await.expect("b read");
+            s.write_all(b"also valid!").await.expect("b write");
+            (got, conn.closed().await)
+        });
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), relay_task)
+            .await
+            .unwrap_or_else(|_| panic!("cut at the earlier expiry, not left running on the later grant ({round})"))
+            .expect("join")
+            .expect_err("the edge cuts the splice");
+        assert_eq!(err.to_string(), SPLICE_CUT_BY_EXPIRY, "{round}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "not before the earlier grant ran out ({round}): {:?}",
+            started.elapsed()
+        );
+        assert!(splice_cuts("grant_expired") > expired_before, "counted as grant_expired ({round})");
+        let (got_a, closed_a) = a.await.expect("a");
+        let (got_b, closed_b) = b.await.expect("b");
+        assert_eq!(&got_a, b"also valid!", "bytes crossed while both grants held ({round})");
+        assert_eq!(&got_b, b"while valid", "{round}");
+        for closed in [closed_a, closed_b] {
+            match closed {
+                quinn::ConnectionError::ApplicationClosed(close) => {
+                    assert_eq!(close.error_code, quinn::VarInt::from_u32(0), "{close:?} ({round})");
+                    assert!(close.reason.is_empty(), "a plain close, no park-expired reason: {close:?} ({round})");
+                }
+                other => panic!("the member sees a plain application close, got {other:?} ({round})"),
+            }
+        }
+    }
+
+    /// ct-agent#308: a grant that never expires (`u64::MAX`) arms no timer at all -- not a far
+    /// one whose `Instant` arithmetic could overflow -- and its splice runs on. One second
+    /// short of it is a real, if distant, expiry: armed, and not due.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_expiring_grant_never_arms_the_splice_cut_308() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel = [0x3d; 32];
+        let (holder_a, holder_b) = (holder_sk(0xc1), holder_sk(0xc2));
+        let a_while = std::time::Duration::from_secs(400 * 86_400);
+        let forever = register_live_splice_for_grant(&grant_h(channel, &holder_a, Direction::Both, u64::MAX), 1_000);
+        assert!(forever.expiry.is_none(), "u64::MAX arms nothing");
+        assert!(tokio::time::timeout(a_while, forever.cut()).await.is_err(), "and is never cut by time");
+        let distant = register_live_splice_for_grant(&grant_h(channel, &holder_a, Direction::Both, u64::MAX - 1), 0);
+        assert!(distant.expiry.is_some(), "u64::MAX - 1 is an expiry");
+        assert!(tokio::time::timeout(a_while, distant.cut()).await.is_err(), "and not a due one");
+
+        // A whole splice on two such grants still carries bytes 400 days on.
+        let (mut end_a, broker_a) = tokio::io::duplex(1024);
+        let (mut end_b, broker_b) = tokio::io::duplex(1024);
+        let a = expiring_stream_member(broker_a, channel, &holder_a, Direction::Initiate, u64::MAX);
+        let b = expiring_stream_member(broker_b, channel, &holder_b, Direction::Accept, u64::MAX);
+        let splice = tokio::spawn(finish_relay_pair_over_streams(a, b, 1_000));
+        assert!(read_relay_ack_line(&mut end_a).await.starts_with(b"OK"));
+        assert!(read_relay_ack_line(&mut end_b).await.starts_with(b"OK"));
+        tokio::time::sleep(a_while).await;
+        end_a.write_all(b"still here").await.expect("a writes");
+        let mut got = [0u8; 10];
+        end_b.read_exact(&mut got).await.expect("b reads");
+        assert_eq!(&got, b"still here");
+        assert!(!splice.is_finished(), "nothing cut it");
+        splice.abort();
+    }
+
+    /// ct-agent#308: a wait longer than a day sleeps in [`SPLICE_EXPIRY_CHUNK`]s and re-reads
+    /// the rest from the wall clock after each; only the last stretch runs on tokio's clock
+    /// alone. `tokio::time::pause` does not move `SystemTime`, so the wall clock here is one
+    /// that does: the paused clock's elapsed time on top of a base, optionally shifted.
+    #[tokio::test(start_paused = true)]
+    async fn a_splice_expiry_beyond_a_day_waits_in_chunks_re_anchored_on_the_wall_clock_308() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use std::time::Duration;
+
+        const DAY: u64 = 86_400;
+        let base: UnixSeconds = 1_000_000;
+        let expires_at = base + 3 * DAY + 3_600;
+        let about = |d: Duration, secs: u64| d >= Duration::from_secs(secs) && d < Duration::from_secs(secs + 1);
+
+        // In step with tokio's clock: one re-anchor after each full day, then the last hour.
+        let start = tokio::time::Instant::now();
+        let reads = AtomicUsize::new(0);
+        let in_step = || {
+            reads.fetch_add(1, Relaxed);
+            base + start.elapsed().as_secs()
+        };
+        SpliceExpiry::of(expires_at, base, base).expect("armed").wait(in_step).await;
+        assert!(about(start.elapsed(), 3 * DAY + 3_600), "{:?}", start.elapsed());
+        assert_eq!(reads.load(Relaxed), 3);
+
+        // A wall clock a day ahead of tokio's from the first read on (a suspended VM, an NTP
+        // step): the first re-anchor sees it, and the wait ends at the grant's end on the wall
+        // clock -- a day earlier than tokio's clock alone would have ended it.
+        let start = tokio::time::Instant::now();
+        let ahead = || base + DAY + start.elapsed().as_secs();
+        SpliceExpiry::of(expires_at, base, base).expect("armed").wait(ahead).await;
+        assert!(about(start.elapsed(), 2 * DAY + 3_600), "{:?}", start.elapsed());
+
+        // Within a day the wall clock is not read at all; that is what lets a paused-clock test
+        // drive a whole splice to its expiry.
+        let start = tokio::time::Instant::now();
+        let unread = || -> UnixSeconds { panic!("no wall-clock read for a wait within a day") };
+        SpliceExpiry::of(base + 5, base, base).expect("armed").wait(unread).await;
+        assert!(about(start.elapsed(), 5), "{:?}", start.elapsed());
     }
 
     #[tokio::test]
