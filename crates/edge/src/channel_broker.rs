@@ -1384,10 +1384,43 @@ impl CutReason {
             CutReason::GrantExpired => SPLICE_CUT_BY_EXPIRY,
         }
     }
+
+    /// Its `reason` label in `ct_edge_channel_splice_cuts_total`.
+    fn label(self) -> &'static str {
+        match self {
+            CutReason::Membership => "membership",
+            CutReason::Revoked => "grant_revoked",
+            CutReason::GrantExpired => "grant_expired",
+        }
+    }
+
+    fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
+        match self {
+            CutReason::Membership => &SPLICE_CUTS_MEMBERSHIP,
+            CutReason::Revoked => &SPLICE_CUTS_REVOKED,
+            CutReason::GrantExpired => &SPLICE_CUTS_GRANT_EXPIRED,
+        }
+    }
 }
 
-/// The error a completer returns when one of its legs was cut.
+/// ct-agent#308: live splices the edge cut, by [`CutReason`]: one count per splice, where its
+/// completer (or the relay gate) loses the copy to a cut leg. The sweeps' own log lines count
+/// legs and say nothing about an expiry, which no sweep sees. Static like the splice counters
+/// above: the completers have no `EdgeState`.
+static SPLICE_CUTS_MEMBERSHIP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPLICE_CUTS_REVOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SPLICE_CUTS_GRANT_EXPIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// ct-agent#308: `(reason, count)` for `ct_edge_channel_splice_cuts_total`, every reason
+/// included, zero or not (#558).
+pub(crate) fn channel_splice_cut_totals() -> [(&'static str, u64); 3] {
+    [CutReason::Membership, CutReason::Revoked, CutReason::GrantExpired]
+        .map(|r| (r.label(), r.counter().load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+/// The error a completer returns when one of its legs was cut, counted for `/metrics`.
 pub(crate) fn splice_cut_error(reason: CutReason) -> BoxError {
+    reason.counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     reason.message().into()
 }
 
@@ -7077,13 +7110,27 @@ mod tests {
         assert_eq!(tokio::time::timeout(within, g_revoked.cut()).await.ok(), Some(CutReason::Revoked));
         assert_eq!(tokio::time::timeout(within, g_both.cut()).await.ok(), Some(CutReason::Membership));
 
-        // The removal text is the one operators already grep for (#555); revocation has its own.
+        // The removal text is the one operators already grep for (#555); revocation has its own,
+        // and each cut is counted under its own reason.
+        let (removals, revocations) = (splice_cuts("membership"), splice_cuts("grant_revoked"));
         assert_eq!(
             splice_cut_error(CutReason::Membership).to_string(),
             "channel splice cut: this member is no longer authorized on the channel (#555)"
         );
         assert_eq!(splice_cut_error(CutReason::Revoked).to_string(), SPLICE_CUT_BY_REVOCATION);
         assert_ne!(SPLICE_CUT_BY_REVOCATION, SPLICE_CUT_BY_REMOVAL);
+        assert!(splice_cuts("membership") > removals, "a removal counts as membership");
+        assert!(splice_cuts("grant_revoked") > revocations, "a revocation counts as grant_revoked");
+    }
+
+    /// The `ct_edge_channel_splice_cuts_total` row for `reason`. Process-wide, so tests assert
+    /// deltas.
+    fn splice_cuts(reason: &str) -> u64 {
+        channel_splice_cut_totals()
+            .into_iter()
+            .find(|(r, _)| *r == reason)
+            .map(|(_, n)| n)
+            .expect("a row per reason")
     }
 
     /// A relay-only member admitted over `stream` with a grant expiring at `expires_at`, for
@@ -7123,6 +7170,7 @@ mod tests {
         let channel = [0x3c; 32];
         let (holder_a, holder_b) = (holder_sk(0xa5), holder_sk(0xb6));
         let now = 1_000;
+        let expired_before = splice_cuts("grant_expired");
         // Five seconds against a year, both ways round: the later grant never ends the splice.
         for (a_left, b_left) in [(5, 365 * 86_400), (365 * 86_400, 5)] {
             let (mut end_a, broker_a) = tokio::io::duplex(1024);
@@ -7154,6 +7202,7 @@ mod tests {
             assert_eq!(end_a.read_to_end(&mut rest).await.expect("a reads to EOF"), 0);
             assert_eq!(end_b.read_to_end(&mut rest).await.expect("b reads to EOF"), 0);
         }
+        assert!(splice_cuts("grant_expired") >= expired_before + 2, "both cuts are counted as grant_expired");
     }
 
     /// ct-agent#308, the QUIC completer: the same cut at the earlier expiry, in real time --
@@ -7179,6 +7228,7 @@ mod tests {
 
         let (server, cert) = build_server_endpoint_with_cert().expect("server");
         let addr = server.local_addr().expect("addr");
+        let expired_before = splice_cuts("grant_expired");
         let started = std::time::Instant::now();
         let relay_task = tokio::spawn(async move {
             broker_channel_relay(&server, now, move |c, _h| async move {
@@ -7217,6 +7267,7 @@ mod tests {
             .expect_err("the edge cuts the splice");
         assert_eq!(err.to_string(), SPLICE_CUT_BY_EXPIRY);
         assert!(started.elapsed() >= std::time::Duration::from_secs(2), "not before A's grant ran out");
+        assert!(splice_cuts("grant_expired") > expired_before, "counted as grant_expired");
         let (got_a, closed_a) = a.await.expect("a");
         let (got_b, closed_b) = b.await.expect("b");
         assert_eq!(&got_a, b"also valid!", "bytes crossed while both grants held");

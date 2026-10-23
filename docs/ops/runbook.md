@@ -541,6 +541,7 @@ Exposed series (metadata only — the edge stays provider-blind):
 | `ct_edge_channel_join_penalty_sheds_total` | counter | channel-join connections shed pre-handshake because their source IP burned its definitive-refusal budget (#414/#542/#547). Zero means the penalty has never engaged — which is the normal state, not a fault |
 | `ct_edge_channel_join_penalty_tracked_ips` | gauge | distinct source IPs the penalty currently tracks. **Read against the max below, never alone** — see the warning under this table |
 | `ct_edge_channel_join_penalty_tracked_ips_max` | gauge | capacity of that table, exported so an alert can use the ratio instead of a hard-coded bound |
+| `ct_edge_channel_splice_cuts_total{reason=…}` | counter | live channel splices the edge cut because an authorization ended: `membership` (member removed, #555), `grant_revoked` (#866), `grant_expired` (the earlier of the two grants expired, ct-agent#308). Every row exists from the first scrape |
 | `ct_edge_registrations_total` | counter | agent registrations accepted since start |
 | `ct_edge_relays_total` | counter | client relays served |
 | `ct_edge_relay_bytes_total` | counter | bytes relayed (both directions) |
@@ -570,6 +571,23 @@ the cut asks a separate question that only a resolver able to tell the two apart
 yes to — and the default answer is no. Cost: one control-plane round trip per distinct
 `(channel, holder)` with a live splice per interval, i.e. proportional to concurrent calls,
 not to traffic; an edge with no channel traffic makes none.
+
+**A live splice also ends when a grant expires (ct-agent#308).** Admission refuses an expired
+grant, but a splice admitted before the expiry used to run for as long as both members stayed
+connected — only an agent that checks its own grant ended the session. Every splice leg now
+times its own grant, so a splice ends at the **earlier** of its two members' expiries (a
+relay-gate splice at its one member's), counted from the moment the pairing was authorized; a
+grant with `expires_at = u64::MAX` arms nothing. The edge's line for that splice then ends in
+`channel splice cut: a member's grant expired (ct-agent#308)`, and a per-grant revocation
+(#866) now says `channel splice cut: the grant this member was admitted with was revoked (#866)`
+instead of the removal text above. `ct_edge_channel_splice_cuts_total{reason=…}` counts the
+cut splices by `membership`, `grant_revoked` and `grant_expired`. The members see an ordinary
+close, exactly as for a #555 cut; nothing on the wire changes.
+
+**Before rolling this out, check the grant lifetimes of the members on the edge**: a session
+whose grant expires mid-session now ends at that moment instead of outliving it. `expires_at`
+is the last 8 bytes, little-endian, of the 139-byte grant (`SignedChannelGrant::encode`), e.g.
+`python3 -c 'import sys; print(int.from_bytes(bytes.fromhex(sys.argv[1])[131:139], "little"))' "$CT_CHANNEL_GRANT"`.
 
 **Revoking a tunnel now cuts live sessions too (#554).** `POST /admin/revoke/:token` always
 dropped the registration and blocked re-registration; it did **not** stop a relay that was

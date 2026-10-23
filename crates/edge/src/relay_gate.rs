@@ -818,10 +818,19 @@ mod tests {
         client_tls.read_exact(&mut resp).await.unwrap();
         assert_eq!(&resp, b"world", "the splice carries bytes while the grant holds");
 
+        let expired = || {
+            crate::channel_broker::channel_splice_cut_totals()
+                .into_iter()
+                .find(|(reason, _)| *reason == "grant_expired")
+                .map(|(_, n)| n)
+                .unwrap()
+        };
+        let expired_before = expired();
         tokio::time::pause();
         let paused_at = tokio::time::Instant::now();
         let err = server_task.await.unwrap().expect_err("the edge cuts the splice");
         assert_eq!(err.to_string(), crate::channel_broker::SPLICE_CUT_BY_EXPIRY);
+        assert!(expired() > expired_before, "counted as grant_expired");
         // At most the minute left (plus the timer's millisecond rounding), never the 300 s
         // idle bound.
         assert!(

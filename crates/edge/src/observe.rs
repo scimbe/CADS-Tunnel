@@ -240,6 +240,19 @@ its own. `cross_family` is ordinary dual-stack.\n\
          ct_edge_channel_endpoint_attestation_total{{result=\"unobservable\"}} {un}\n",
         ));
     }
+    // ct-agent#308: live splices the edge cut because an authorization ended. Every reason has
+    // its row from the first scrape (#558): a missing `grant_expired` row would read as "this
+    // edge does not cut at expiry", where a zero says "no grant has expired mid-splice yet".
+    out.push_str(
+        "# HELP ct_edge_channel_splice_cuts_total Live channel splices the edge cut because an \
+         authorization ended: the member was removed from the channel (membership, #555), its \
+         grant was revoked (grant_revoked, #866) or the earlier of the two grants expired \
+         (grant_expired, ct-agent#308).\n\
+         # TYPE ct_edge_channel_splice_cuts_total counter\n",
+    );
+    for (reason, n) in crate::channel_broker::channel_splice_cut_totals() {
+        out.push_str(&format!("ct_edge_channel_splice_cuts_total{{reason=\"{reason}\"}} {n}\n"));
+    }
     // #539: the companion gauge, without which the one above is ambiguous at 0 -- a loop the
     // edge never meant to run and one that was meant to run and never came up both read as 0.
     // Alert on `expected_since > 0 AND last_seen == 0` for longer than a boot; that is a loop
@@ -1255,6 +1268,21 @@ mod tests {
             body.contains("Read this BEFORE raising"),
             "the HELP text must carry the reading, or the number gets used the wrong way round"
         );
+    }
+
+    /// ct-agent#308: every splice-cut reason has its row from the first scrape (#558). A
+    /// missing `grant_expired` row reads as an edge that does not cut at expiry at all.
+    #[test]
+    fn splice_cut_rows_are_emitted_even_at_zero_308() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let body = render_edge_metrics(&state, None);
+        assert!(body.contains("# TYPE ct_edge_channel_splice_cuts_total counter"), "{body}");
+        for reason in ["membership", "grant_revoked", "grant_expired"] {
+            assert!(
+                body.contains(&format!("ct_edge_channel_splice_cuts_total{{reason=\"{reason}\"}} ")),
+                "the {reason} row must exist before any splice is cut: {body}"
+            );
+        }
     }
 
     /// #553 follow-up: a registered listener must be VISIBLE, and an edge with none must be
