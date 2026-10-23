@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use snow::TransportState;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use crate::delivery::SessionCaps;
 use crate::noise::{client_handshake, frame, origin_handshake, read_frame};
 
 /// Noise's plaintext ceiling per message (65535 − 16-byte tag). Callers that need to
@@ -67,11 +68,56 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    initiate_with_payload(send, recv, own_noise_private, peer_noise_pubkey, &[])
+        .await
+        .map(|(transport, _answer)| transport)
+}
+
+/// [`a2a_initiate`] that also offers `offer` to the responder and returns what both ends
+/// agreed (protocol v2, ct-agent#299; see [`crate::delivery`]). The offer rides as the
+/// payload of handshake message 1 and the answer as the payload of message 2. Both are
+/// encrypted and bound into the handshake hash, so a relay can neither read nor strip them
+/// without the handshake failing -- no silent downgrade. A responder from before v2 reads
+/// the offer, ignores it and answers with an empty payload, exactly as [`a2a_respond`] always
+/// did; that, or any answer that is not a capability payload, means [`SessionCaps::NONE`]:
+/// run the legacy [`crate::noise::noise_pump`]. An empty `offer` sends the empty payload, so
+/// `a2a_initiate_with_caps(.., SessionCaps::NONE)` is byte-identical to [`a2a_initiate`].
+pub async fn a2a_initiate_with_caps<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    own_noise_private: &[u8; 32],
+    peer_noise_pubkey: &[u8; 32],
+    offer: SessionCaps,
+) -> io::Result<(TransportState, SessionCaps)>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let (transport, answer) =
+        initiate_with_payload(send, recv, own_noise_private, peer_noise_pubkey, &offer.to_payload()).await?;
+    // Intersected again here: a responder cannot switch on anything this side did not offer.
+    let agreed = SessionCaps::from_payload(&answer).map_or(SessionCaps::NONE, |a| a.intersect(offer));
+    Ok((transport, agreed))
+}
+
+/// The initiator handshake with `payload` in message 1, returning the transport and the
+/// payload the responder put into message 2.
+async fn initiate_with_payload<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    own_noise_private: &[u8; 32],
+    peer_noise_pubkey: &[u8; 32],
+    payload: &[u8],
+) -> io::Result<(TransportState, Vec<u8>)>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     let debug = debug_a2a_timing_enabled();
     let mut hs = client_handshake(own_noise_private, peer_noise_pubkey).map_err(noise_io)?;
     let mut buf = [0u8; 1024];
     let mut tmp = [0u8; 1024];
-    let n = hs.write_message(&[], &mut buf).map_err(noise_io)?;
+    let n = hs.write_message(payload, &mut buf).map_err(noise_io)?;
     send.write_all(&frame(&buf[..n])).await?;
     if debug {
         eprintln!("ct-a2a-timing: initiator sent handshake message 1, waiting for the peer's message 2...");
@@ -91,8 +137,9 @@ where
             return Err(e);
         }
     };
-    hs.read_message(&m2, &mut tmp).map_err(noise_io)?;
-    hs.into_transport_mode().map_err(noise_io)
+    let answer_len = hs.read_message(&m2, &mut tmp).map_err(noise_io)?;
+    let answer = tmp[..answer_len].to_vec();
+    Ok((hs.into_transport_mode().map_err(noise_io)?, answer))
 }
 
 /// Responder half: read the initiator's first message (learning its static key), reply
@@ -135,6 +182,52 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
+    // Whatever message 1 carries is read and dropped, and message 2 carries nothing: the
+    // pre-v2 responder, byte for byte (ct-agent#299 relies on exactly that for its fallback).
+    respond_with_answer(send, recv, own_noise_private, |_offer| Vec::new()).await
+}
+
+/// [`a2a_respond_verified`] that also answers the initiator's capability offer (protocol v2,
+/// ct-agent#299; see [`a2a_initiate_with_caps`] and [`crate::delivery`]) and returns what both
+/// ends agreed: the offer intersected with `own`. An initiator from before v2 sends no offer;
+/// then nothing is agreed and message 2 carries an empty payload, exactly as before. The same
+/// holds when nothing intersects, so an initiator can never be told about a capability this
+/// side does not run. The peer's key is checked after message 2, as in
+/// [`a2a_respond_verified`].
+pub async fn a2a_respond_verified_with_caps<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    own_noise_private: &[u8; 32],
+    expected_peer_noise_pubkey: &[u8; 32],
+    own: SessionCaps,
+) -> io::Result<(TransportState, SessionCaps)>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let mut agreed = SessionCaps::NONE;
+    let (transport, peer_static) = respond_with_answer(send, recv, own_noise_private, |offer| {
+        agreed = SessionCaps::from_payload(offer).map_or(SessionCaps::NONE, |o| o.intersect(own));
+        agreed.to_payload()
+    })
+    .await?;
+    check_expected_peer(&peer_static, expected_peer_noise_pubkey)?;
+    Ok((transport, agreed))
+}
+
+/// The responder handshake: read message 1, let `answer` turn its payload into the payload of
+/// message 2, send that, and return the transport and the initiator's learned static key.
+async fn respond_with_answer<W, R, A>(
+    send: &mut W,
+    recv: &mut R,
+    own_noise_private: &[u8; 32],
+    answer: A,
+) -> io::Result<(TransportState, [u8; 32])>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    A: FnOnce(&[u8]) -> Vec<u8>,
+{
     let debug = debug_a2a_timing_enabled();
     let mut hs = origin_handshake(own_noise_private).map_err(noise_io)?;
     let mut buf = [0u8; 1024];
@@ -157,7 +250,7 @@ where
             return Err(e);
         }
     };
-    hs.read_message(&m1, &mut tmp).map_err(noise_io)?;
+    let offer_len = hs.read_message(&m1, &mut tmp).map_err(noise_io)?;
     // Captured before `write_message`'s second call below only touches the send-cipher
     // state, and before `into_transport_mode()` consumes `hs` -- `get_remote_static()` is
     // `None` only pre-message-1 (already past that) or for a pattern with no remote static
@@ -166,9 +259,23 @@ where
         .get_remote_static()
         .and_then(|k| k.try_into().ok())
         .expect("Noise_IK responder always learns a 32-byte remote static from message 1");
-    let n = hs.write_message(&[], &mut buf).map_err(noise_io)?;
+    let reply = answer(&tmp[..offer_len]);
+    let n = hs.write_message(&reply, &mut buf).map_err(noise_io)?;
     send.write_all(&frame(&buf[..n])).await?;
     Ok((hs.into_transport_mode().map_err(noise_io)?, peer_static))
+}
+
+/// The #416 check shared by both verified responders: the key the initiator actually
+/// handshaked with must be the channel-attested one.
+fn check_expected_peer(peer_static: &[u8; 32], expected_peer_noise_pubkey: &[u8; 32]) -> io::Result<()> {
+    if peer_static != expected_peer_noise_pubkey {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a2a: peer completed the handshake with a static key that doesn't match the \
+             channel-attested member key (#416)",
+        ));
+    }
+    Ok(())
 }
 
 /// [`a2a_respond`], plus the check its own doc says most callers actually need: the learned
@@ -187,13 +294,7 @@ where
     R: AsyncRead + Unpin,
 {
     let (transport, peer_static) = a2a_respond_with_peer_key(send, recv, own_noise_private).await?;
-    if &peer_static != expected_peer_noise_pubkey {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a2a: peer completed the handshake with a static key that doesn't match the \
-             channel-attested member key (#416)",
-        ));
-    }
+    check_expected_peer(&peer_static, expected_peer_noise_pubkey)?;
     Ok(transport)
 }
 
