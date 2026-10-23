@@ -807,6 +807,8 @@ mod tests {
         client_tls.write_all(&grant.encode()).await.unwrap();
         let mut challenge = [0u8; 32];
         client_tls.read_exact(&mut challenge).await.unwrap();
+        // The gate registers the splice only after this proof, so its minute starts later.
+        let proved = tokio::time::Instant::now();
         client_tls.write_all(&holder_key.sign(&challenge).to_bytes()).await.unwrap();
         let mut ack = [0u8; 4];
         client_tls.read_exact(&mut ack).await.unwrap();
@@ -831,16 +833,29 @@ mod tests {
         let err = server_task.await.unwrap().expect_err("the edge cuts the splice");
         assert_eq!(err.to_string(), crate::channel_broker::SPLICE_CUT_BY_EXPIRY);
         assert!(expired() > expired_before, "counted as grant_expired");
-        // At most the minute left (plus the timer's millisecond rounding), never the 300 s
-        // idle bound.
+        // Not before the minute left at `now` ran out, counted from no earlier than the proof;
+        // and at most that minute (plus the timer's millisecond rounding) after the pause,
+        // never the 300 s idle bound.
+        assert!(
+            proved.elapsed() >= Duration::from_secs(60),
+            "not before the grant's last minute ran out: {:?}",
+            proved.elapsed()
+        );
         assert!(
             paused_at.elapsed() < Duration::from_secs(61),
             "at the grant's end, not at the idle bound: {:?}",
             paused_at.elapsed()
         );
-        // Both ends of the splice see it end: the member's TLS stream and the relay-node's socket.
+        // Both ends of the splice see it end. The gate drops the member's TLS stream without a
+        // close_notify, so the member reads an unexpected EOF rather than a clean end of the
+        // session; the relay-node's socket gets a plain FIN.
         let mut rest = Vec::new();
-        let _ = client_tls.read_to_end(&mut rest).await;
+        let end = client_tls.read_to_end(&mut rest).await;
+        assert_eq!(
+            end.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof),
+            "{end:?}"
+        );
         assert!(rest.is_empty(), "nothing after the cut: {rest:?}");
         assert!(upstream_task.await.unwrap().is_empty());
     }

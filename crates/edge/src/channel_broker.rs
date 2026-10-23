@@ -7236,23 +7236,32 @@ mod tests {
     }
 
     /// ct-agent#308, the QUIC completer: the same cut at the earlier expiry, in real time --
-    /// quinn's own timers do not survive a paused clock. What the members see is a plain
-    /// application close (code 0, no reason), the end a #555/#866 cut has always produced;
-    /// in particular no `park-expired:` reason, which a client reads as "re-park now".
+    /// quinn's own timers do not survive a paused clock. Both ways round, so a completer that
+    /// timed one leg's grant for both legs fails one of the rounds. What the members see is a
+    /// plain application close (code 0, no reason), the end a #555/#866 cut has always
+    /// produced; in particular no `park-expired:` reason, which a client reads as "re-park now".
     #[tokio::test]
     async fn a_quic_relay_splice_is_cut_when_the_earlier_grant_expires_308() {
+        let now = 500;
+        // One grant has two seconds left at the pairing, the other never expires.
+        quic_splice_cut_round(now, now + 2, u64::MAX).await;
+        quic_splice_cut_round(now, u64::MAX, now + 2).await;
+    }
+
+    /// One round of the test above: initiator A's grant expires at `a_expires`, acceptor B's
+    /// at `b_expires`, and the earlier one has two seconds left at `now`.
+    async fn quic_splice_cut_round(now: UnixSeconds, a_expires: UnixSeconds, b_expires: UnixSeconds) {
+        let round = format!("A expires at {a_expires}, B at {b_expires}");
         let pk = operator_pubkey();
         let channel = [0xE7u8; 32];
         let holder_a = holder_sk(0xa7);
         let holder_b = holder_sk(0xb8);
-        let now = 500;
-        // A's grant has two seconds left at the pairing; B's never expires.
         let req_a = ChannelJoinRequest {
-            grant: grant_h(channel, &holder_a, Direction::Initiate, now + 2),
+            grant: grant_h(channel, &holder_a, Direction::Initiate, a_expires),
             endpoint: "203.0.113.1:7071".to_string(),
         };
         let req_b = ChannelJoinRequest {
-            grant: grant_h(channel, &holder_b, Direction::Accept, u64::MAX),
+            grant: grant_h(channel, &holder_b, Direction::Accept, b_expires),
             endpoint: "203.0.113.2:7072".to_string(),
         };
 
@@ -7292,23 +7301,27 @@ mod tests {
 
         let err = tokio::time::timeout(std::time::Duration::from_secs(10), relay_task)
             .await
-            .expect("cut at A's expiry, not left running on B's grant that never expires")
+            .unwrap_or_else(|_| panic!("cut at the earlier expiry, not left running on the later grant ({round})"))
             .expect("join")
             .expect_err("the edge cuts the splice");
-        assert_eq!(err.to_string(), SPLICE_CUT_BY_EXPIRY);
-        assert!(started.elapsed() >= std::time::Duration::from_secs(2), "not before A's grant ran out");
-        assert!(splice_cuts("grant_expired") > expired_before, "counted as grant_expired");
+        assert_eq!(err.to_string(), SPLICE_CUT_BY_EXPIRY, "{round}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "not before the earlier grant ran out ({round}): {:?}",
+            started.elapsed()
+        );
+        assert!(splice_cuts("grant_expired") > expired_before, "counted as grant_expired ({round})");
         let (got_a, closed_a) = a.await.expect("a");
         let (got_b, closed_b) = b.await.expect("b");
-        assert_eq!(&got_a, b"also valid!", "bytes crossed while both grants held");
-        assert_eq!(&got_b, b"while valid");
+        assert_eq!(&got_a, b"also valid!", "bytes crossed while both grants held ({round})");
+        assert_eq!(&got_b, b"while valid", "{round}");
         for closed in [closed_a, closed_b] {
             match closed {
                 quinn::ConnectionError::ApplicationClosed(close) => {
-                    assert_eq!(close.error_code, quinn::VarInt::from_u32(0), "{close:?}");
-                    assert!(close.reason.is_empty(), "a plain close, no park-expired reason: {close:?}");
+                    assert_eq!(close.error_code, quinn::VarInt::from_u32(0), "{close:?} ({round})");
+                    assert!(close.reason.is_empty(), "a plain close, no park-expired reason: {close:?} ({round})");
                 }
-                other => panic!("the member sees a plain application close, got {other:?}"),
+                other => panic!("the member sees a plain application close, got {other:?} ({round})"),
             }
         }
     }
