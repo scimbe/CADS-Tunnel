@@ -14,11 +14,12 @@
 //!
 //! **Records.** Under v2 every Noise transport message carries exactly one record, `tag | body`:
 //!
-//! | tag    | record  | body                         | meaning                                           |
-//! |--------|---------|------------------------------|---------------------------------------------------|
-//! | `0x00` | DATA    | application bytes            |                                                   |
-//! | `0x01` | FIN     | `sent: u64 BE`, `reason: u8` | "I sent `sent` bytes and send no more"            |
-//! | `0x02` | FIN_ACK | `received: u64 BE`           | "your FIN arrived; `received` bytes are delivered" |
+//! | tag    | record   | body                         | meaning                                            |
+//! |--------|----------|------------------------------|----------------------------------------------------|
+//! | `0x00` | DATA     | application bytes            |                                                    |
+//! | `0x01` | FIN      | `sent: u64 BE`, `reason: u8` | "I sent `sent` bytes and send no more"             |
+//! | `0x02` | FIN_ACK  | `received: u64 BE`           | "your FIN arrived; `received` bytes are delivered" |
+//! | `0x03` | PROGRESS | `delivered: u64 BE`          | "`delivered` of your bytes are delivered so far"   |
 //!
 //! A side whose local input ends sends FIN; it does **not** half-close the transport. The
 //! transport stays fully open until both directions are confirmed, so a session no longer
@@ -32,8 +33,30 @@
 //! it sent and the peer's FIN arrived with exactly the count received (and was acknowledged).
 //! Anything else is an error that names what is missing ([`DeliveryError`]). The wait for the
 //! FIN_ACK is bounded by progress: it fails after `fin_ack_idle` without a single record from
-//! the peer, and every record restarts that clock. Waiting for the peer's own FIN has no bound,
-//! as before: a peer may keep its direction open as long as it likes.
+//! the peer, and every record restarts that clock. A receiver whose own input has ended sends
+//! nothing else while it delivers into a slow local consumer -- in #299's own shape (a member
+//! with stdin at EOF receiving a file) the sender would hear nothing until the very end. So a
+//! side that delivered more of the peer's bytes since its last PROGRESS sends one, at most every
+//! `min(fin_ack_idle / 4, 15 s)`: a slow consumer keeps the sender waiting, a stuck one (no
+//! progress at all) still ends the session after `fin_ack_idle`. Waiting for the peer's own FIN
+//! has no bound, as before: a peer may keep its direction open as long as it likes.
+//!
+//! **Extending the protocol.** A pump rejects a record tag it does not know as a protocol
+//! violation, so a new record type -- or a changed meaning of an existing one -- needs its own
+//! capability flag bit (the next one is `0x0002`), negotiated like [`CAP_DELIVERY_ACK`].
+//! [`CAPS_VERSION`] only describes the layout of the capability payload; raising it does not
+//! tell a peer anything about the records.
+//!
+//! **The reason is a claim.** The FIN reason is what the authenticated peer says about itself
+//! and cannot be checked here: it is meant for the operator reading the log. It must never by
+//! itself drive an authorization or exit decision (e.g. "your grant was revoked" stopping a
+//! member for good); that needs the control plane.
+//!
+//! **What a relay sees.** The records are inside the Noise transport messages, so a relay that
+//! terminates TLS (the edge's `:443` front door) learns no content. It can tell a v2 session from
+//! the sizes, though: the handshake messages are 6 bytes longer, and FIN, FIN_ACK and PROGRESS
+//! are small fixed-size frames (28, 27 and 27 bytes) -- so it can guess when each direction
+//! ends, which a legacy session shows it outright through the transport half-close.
 //!
 //! **Negotiation.** Both ends must speak v2, so it is negotiated inside the A2A handshake
 //! ([`crate::a2a::a2a_initiate_with_caps`], [`crate::a2a::a2a_respond_verified_with_caps`]):
@@ -127,8 +150,11 @@ impl SessionCaps {
 }
 
 /// Why a side ended its direction, carried in its FIN record. Anything but [`FinReason::Normal`]
-/// ends the whole session and is reported to the peer as the cause.
+/// ends the whole session and is reported to the peer as the cause -- informational only, see
+/// the module doc. Non-exhaustive so a later named reason is not a breaking change downstream
+/// (the wire already carries any byte as [`FinReason::Unknown`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FinReason {
     /// The local input ended; the other direction stays open.
     Normal,
@@ -211,8 +237,10 @@ impl FinReason {
     }
 }
 
-/// What a successful [`noise_pump_v2`] confirmed.
+/// What a successful [`noise_pump_v2`] confirmed. Non-exhaustive so a later field is not a
+/// breaking change downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeliveryReport {
     /// Bytes this side sent, all confirmed by the peer's FIN_ACK.
     pub sent: u64,
@@ -257,28 +285,47 @@ pub enum DeliveryError {
 impl std::fmt::Display for DeliveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // Worded by what was actually due: "delivery not confirmed" only where this side's
+            // FIN was out and its confirmation is what is missing. A session cut while a
+            // direction was still open (an interactive member, a forward) had nothing due yet,
+            // and a sender whose bytes were confirmed must not read that they were not.
             DeliveryError::TransportEnded { received, peer_fin, sent, fin_sent, confirmed, cause } => {
-                let mut missing = Vec::new();
-                if !peer_fin {
-                    missing.push(format!("the end of the peer's stream ({received} bytes received, then nothing)"));
-                }
-                if !confirmed {
-                    if *fin_sent {
-                        missing.push(format!("the peer's confirmation of our {sent} bytes"));
-                    } else {
-                        missing.push(format!(
-                            "the peer's confirmation of our {sent} bytes (our input was still open)"
-                        ));
-                    }
-                }
-                if missing.is_empty() {
-                    write!(f, "delivery not confirmed: the transport ended early ({cause})")
-                } else {
-                    write!(
+                match (*fin_sent, *confirmed, *peer_fin) {
+                    (false, _, false) => write!(
                         f,
-                        "delivery not confirmed: the transport ended ({cause}) before {}",
-                        missing.join(" and before ")
-                    )
+                        "session cut: the transport ended ({cause}) while both directions were still \
+                         open ({sent} bytes sent, {received} received; a direction is confirmed only \
+                         when it ends)"
+                    ),
+                    (false, _, true) => write!(
+                        f,
+                        "session cut: the transport ended ({cause}) while our direction was still open \
+                         ({sent} bytes sent, none of them confirmed yet; the peer's stream ended \
+                         complete after {received} bytes)"
+                    ),
+                    (true, false, false) => write!(
+                        f,
+                        "delivery not confirmed: the transport ended ({cause}) before the peer's \
+                         confirmation of our {sent} bytes and before the end of the peer's stream \
+                         ({received} bytes received, then nothing)"
+                    ),
+                    (true, false, true) => write!(
+                        f,
+                        "delivery not confirmed: the transport ended ({cause}) before the peer's \
+                         confirmation of our {sent} bytes (the peer's stream ended complete after \
+                         {received} bytes)"
+                    ),
+                    (true, true, false) => write!(
+                        f,
+                        "the peer's stream is incomplete: the transport ended ({cause}) before the end \
+                         of the peer's stream ({received} bytes received, then nothing); our {sent} \
+                         bytes were confirmed"
+                    ),
+                    (true, true, true) => write!(
+                        f,
+                        "the transport ended ({cause}) before our confirmation of the peer's \
+                         {received} bytes was out; our {sent} bytes were confirmed"
+                    ),
                 }
             }
             DeliveryError::Truncated { announced, received } => write!(
@@ -291,8 +338,8 @@ impl std::fmt::Display for DeliveryError {
             ),
             DeliveryError::AckTimeout { sent, idle } => write!(
                 f,
-                "delivery not confirmed: no word from the peer for {}s while waiting for its \
-                 confirmation of our {sent} bytes",
+                "delivery not confirmed: no word from the peer for {}s (no data, no progress \
+                 report) while waiting for its confirmation of our {sent} bytes",
                 idle.as_secs()
             ),
             DeliveryError::PeerEnded { reason, announced, received } => write!(
@@ -325,9 +372,16 @@ pub fn delivery_error(err: &io::Error) -> Option<&DeliveryError> {
 }
 
 /// A sensible bound for the FIN_ACK wait (see [`noise_pump_v2`]): a minute without a single
-/// record from a peer that still owes the confirmation. Generous because the peer only confirms
-/// after it has flushed everything into its local side, which may be a slow consumer.
+/// record from a peer that still owes the confirmation. The peer only confirms after it has
+/// flushed everything into its local side, which may be a slow consumer; while it still delivers
+/// it reports progress (PROGRESS, see the module doc), so this bounds a stuck peer, not a slow one.
 pub const DEFAULT_FIN_ACK_IDLE: Duration = Duration::from_secs(60);
+
+/// The longest a side waits before it reports that it delivered more of the peer's bytes
+/// (PROGRESS). A side reports every `min(fin_ack_idle / 4, PROGRESS_EVERY_MAX)` of its own, so a
+/// peer whose `fin_ack_idle` is at least 4 x this ([`DEFAULT_FIN_ACK_IDLE`]) hears in time from
+/// every v2 peer, whatever that peer's own setting.
+const PROGRESS_EVERY_MAX: Duration = Duration::from_secs(15);
 
 /// How long an abort may take to put its FIN on the wire, and the local close behind it. An
 /// abort ends the session either way; this only keeps a stuck transport from holding it.
@@ -336,6 +390,7 @@ const ABORT_GRACE: Duration = Duration::from_secs(2);
 const REC_DATA: u8 = 0x00;
 const REC_FIN: u8 = 0x01;
 const REC_FIN_ACK: u8 = 0x02;
+const REC_PROGRESS: u8 = 0x03;
 
 /// Work the inbound direction hands to the outbound one, which owns the transport's write side.
 enum ToOutbound {
@@ -358,8 +413,9 @@ fn u64_at(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(b)
 }
 
-/// Encrypt `tag | body` into `ct` and write it as one frame. `msg` is the caller's reused
-/// plaintext scratch buffer (#364: no allocation per record).
+/// Encrypt `tag | body` into `ct` and write it as one frame -- for the small control records.
+/// `msg` is the caller's reused plaintext scratch buffer (#364: no allocation per record); DATA
+/// records skip it and are sealed straight from the read buffer (#114: no extra copy in bulk).
 async fn write_record<W: AsyncWrite + Unpin>(
     w: &mut W,
     ts: &Mutex<TransportState>,
@@ -384,11 +440,13 @@ async fn write_record<W: AsyncWrite + Unpin>(
 ///   peer's FIN arrived with exactly the count received and was acknowledged. The transport's
 ///   write side is shut down only then.
 /// * `Err`: anything else, with a [`DeliveryError`] inside ([`delivery_error`]) that names what
-///   is missing. Every error ends the session promptly; nothing waits for a silent peer except
-///   the bounded FIN_ACK wait.
+///   is missing. After an error nothing waits for the peer any more.
 ///
-/// `fin_ack_idle` bounds the wait for the FIN_ACK after this side's FIN: the session fails after
-/// that long without any record from the peer, and every record restarts the clock
+/// Without an error, two waits remain. The wait for the peer's own FIN has no bound: a peer may
+/// keep its direction open as long as it likes (an interactive member). The wait for the FIN_ACK
+/// after this side's FIN is bounded by progress: `fin_ack_idle` bounds it -- the session fails
+/// after that long without any record from the peer, every record restarts the clock, and a
+/// peer that is still delivering our bytes sends PROGRESS records to say so
 /// ([`DEFAULT_FIN_ACK_IDLE`] is a sensible value). `local_end` names the reason for the FIN when
 /// the local side ends: it is called with `None` when the local input reaches its end and with
 /// the error when reading from or writing to the local side fails. Return
@@ -450,15 +508,25 @@ where
     };
     let protocol = |what: String| DeliveryError::Protocol(what).into_io(io::ErrorKind::InvalidData);
 
-    // plaintext -> DATA records, then FIN; plus the FIN_ACK the inbound side asks for.
+    // How often this side reports that it delivered more of the peer's bytes (PROGRESS; see the
+    // module doc). Never zero: `interval` would panic on it.
+    let progress_every = (fin_ack_idle / 4).min(PROGRESS_EVERY_MAX).max(Duration::from_millis(10));
+
+    // plaintext -> DATA records, then FIN; plus the FIN_ACK the inbound side asks for and the
+    // PROGRESS reports while it delivers.
     let outbound = async {
-        let mut buf = vec![0u8; CHUNK];
-        let mut msg = Vec::with_capacity(1 + CHUNK);
+        // `tag | data` in one buffer, so a DATA record is sealed straight from where it was read.
+        let mut buf = vec![0u8; 1 + CHUNK];
+        buf[0] = REC_DATA;
+        let mut msg = Vec::with_capacity(16);
         let mut ct = vec![0u8; 2 + 1 + CHUNK + 256];
         let mut sent: u64 = 0;
         let mut local_open = true;
         let mut fin_ack_out = false;
         let mut inbound_open = true;
+        let mut progress = tokio::time::interval_at(tokio::time::Instant::now() + progress_every, progress_every);
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reported: u64 = 0;
         while local_open || !fin_ack_out {
             tokio::select! {
                 biased;
@@ -480,7 +548,21 @@ where
                     }
                     None => inbound_open = false,
                 },
-                r = p_read.read(&mut buf), if local_open => match r {
+                // #299 review: a receiver whose input has ended sends nothing else while it
+                // delivers into a slow consumer, so without this its peer, waiting for the
+                // FIN_ACK, would give up on a transfer that is still being delivered. Only
+                // growth is reported: a stuck consumer goes quiet and still runs into the bound.
+                // Not after our FIN_ACK, which carries the final count.
+                _ = progress.tick(), if !fin_ack_out => {
+                    let delivered = received_total.load(Ordering::SeqCst);
+                    if delivered > reported {
+                        write_record(&mut c_write, &ts, &mut msg, &mut ct, REC_PROGRESS, &delivered.to_be_bytes())
+                            .await
+                            .map_err(|e| transport_ended(&e))?;
+                        reported = delivered;
+                    }
+                }
+                r = p_read.read(&mut buf[1..]), if local_open => match r {
                     Ok(0) => {
                         let reason = local_end(None);
                         if reason != FinReason::Normal {
@@ -511,9 +593,12 @@ where
                         local_open = false;
                     }
                     Ok(n) => {
-                        write_record(&mut c_write, &ts, &mut msg, &mut ct, REC_DATA, &buf[..n])
-                            .await
-                            .map_err(|e| transport_ended(&e))?;
+                        let total = seal_frame(&ts, &buf[..1 + n], &mut ct)?;
+                        let written = async {
+                            c_write.write_all(&ct[..total]).await?;
+                            c_write.flush().await
+                        };
+                        written.await.map_err(|e| transport_ended(&e))?;
                         sent += n as u64;
                         sent_total.store(sent, Ordering::SeqCst);
                     }
@@ -658,12 +743,23 @@ where
                     confirmed.store(true, Ordering::SeqCst);
                     acked.notify_one();
                 }
+                REC_PROGRESS => {
+                    // A sign of life from a peer still delivering our bytes; the arrival above
+                    // already restarted the FIN_ACK clock. The count is advisory -- the FIN_ACK
+                    // carries the binding one -- so it is not checked against `sent_total`, which
+                    // the outbound side may not have updated yet for its very last write.
+                    if len != 1 + 8 {
+                        return Err(protocol(format!("a PROGRESS record of {len} bytes")));
+                    }
+                }
                 other => return Err(protocol(format!("an unknown record tag 0x{other:02x}"))),
             }
         }
     };
 
     // The bound on the FIN_ACK wait: from our FIN on, fail after `fin_ack_idle` without a record.
+    // Any record counts, not only a growing PROGRESS: the peer's FIN_ACK may be queued behind its
+    // own data on a slow return path, and that data arriving is the sign that it is coming.
     let watchdog = async {
         fin_out.notified().await;
         loop {
@@ -847,6 +943,70 @@ mod tests {
             // Dropping the halves closes both legs in both directions.
         });
         (a_end, b_end)
+    }
+
+    /// A relay like the edge since CADS-Tunnel#856, with room for `to_a_capacity` bytes in flight
+    /// towards A (socket buffers on both hops plus the edge's own hold several MiB on a real TCP
+    /// path): each direction is copied on its own, the end of a source is passed on as a
+    /// half-close, and a failed write towards one side does not take the other direction down.
+    fn edge_like_relay(to_a_capacity: usize) -> (DuplexStream, DuplexStream) {
+        let (a_end, relay_a) = duplex(to_a_capacity);
+        let (b_end, relay_b) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            let (mut ra_r, mut ra_w) = split(relay_a);
+            let (mut rb_r, mut rb_w) = split(relay_b);
+            let b_to_a = async {
+                let _ = tokio::io::copy(&mut rb_r, &mut ra_w).await;
+                let _ = ra_w.shutdown().await;
+            };
+            let a_to_b = async {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match ra_r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        // B gone: swallow, as the edge's other leg does after a reset.
+                        Ok(n) => {
+                            let _ = rb_w.write_all(&buf[..n]).await;
+                        }
+                    }
+                }
+                let _ = rb_w.shutdown().await;
+            };
+            tokio::join!(b_to_a, a_to_b);
+        });
+        (a_end, b_end)
+    }
+
+    #[test]
+    fn a_transport_end_is_worded_by_what_was_due_299() {
+        // #299 review: "delivery not confirmed" only where this side's FIN was out and the
+        // confirmation is what is missing -- not for a session cut while a direction was still
+        // open, and never for a sender whose bytes WERE confirmed.
+        let end = |fin_sent: bool, confirmed: bool, peer_fin: bool| {
+            DeliveryError::TransportEnded {
+                received: 7,
+                peer_fin,
+                sent: 5,
+                fin_sent,
+                confirmed,
+                cause: "end of stream".to_string(),
+            }
+            .to_string()
+        };
+        for peer_fin in [false, true] {
+            let msg = end(false, false, peer_fin);
+            assert!(msg.starts_with("session cut:") && msg.contains("5 bytes sent"), "{msg}");
+        }
+        let msg = end(true, false, false);
+        assert!(msg.starts_with("delivery not confirmed:"), "{msg}");
+        assert!(msg.contains("our 5 bytes") && msg.contains("end of the peer's stream (7 bytes received"), "{msg}");
+        let msg = end(true, false, true);
+        assert!(msg.starts_with("delivery not confirmed:") && msg.contains("our 5 bytes"), "{msg}");
+        let msg = end(true, true, false);
+        assert!(!msg.contains("not confirmed") && msg.contains("our 5 bytes were confirmed"), "{msg}");
+        assert!(msg.contains("end of the peer's stream (7 bytes received"), "{msg}");
+        let msg = end(true, true, true);
+        assert!(!msg.contains("not confirmed") && msg.contains("our 5 bytes were confirmed"), "{msg}");
     }
 
     #[test]
@@ -1062,7 +1222,10 @@ mod tests {
         }
         assert!(ea.to_string().contains("end of the peer's stream"), "{ea}");
         let eb = rb.expect_err("B's data was not confirmed, so B must not report success either");
-        assert!(eb.to_string().contains("confirmation"), "{eb}");
+        assert!(
+            matches!(delivery_error(&eb), Some(DeliveryError::TransportEnded { confirmed: false, .. })),
+            "B names its unconfirmed bytes: {eb}"
+        );
 
         // The legacy pump over the same relay: a clean Ok with a truncated stream.
         let (mut a_t, mut b_t) = relay(Cut::Never, Cut::CleanEofAfter(1 + 3));
@@ -1096,7 +1259,12 @@ mod tests {
         let (a_t, b_t) = relay(Cut::Never, Cut::SwallowAfter(1));
         let idle = Duration::from_secs(30);
         let started = tokio::time::Instant::now();
-        let (ra, rb, a_got, _) = run_pair(a_t, b_t, Some(Vec::new()), Some(data.clone()), idle).await;
+        // Bounded on the test side too: if the watchdog ever stops firing, this fails instead of
+        // hanging the test binary.
+        let (ra, rb, a_got, _) =
+            tokio::time::timeout(idle * 3, run_pair(a_t, b_t, Some(Vec::new()), Some(data.clone()), idle))
+                .await
+                .expect("both pumps end within the FIN_ACK bound, not never");
         assert!(a_got.is_empty(), "nothing of B's reached A");
         let eb = rb.expect_err("B must not report success for bytes nobody confirmed");
         assert_eq!(eb.kind(), io::ErrorKind::TimedOut);
@@ -1156,10 +1324,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delivery_ack_v2_a_slow_local_consumer_is_not_the_peers_silence_299() {
-        // A's FIN is out at once, then A's own local consumer stalls for several times the
-        // FIN_ACK bound while B's data (and B's FIN_ACK behind it) waits in the pipe. The stall is
-        // on A's side, so A must not give up on B: once A's consumer reads again, everything is
-        // delivered and confirmed.
+        // B fills the path first, so its outbound is stuck in a DATA write when A's FIN(0)
+        // arrives: B's FIN_ACK then queues behind data that A's stalled consumer holds back, for
+        // several times the FIN_ACK bound. The stall is on A's side, so A must not give up on B:
+        // once A's consumer reads again, everything is delivered and confirmed. (#299 review:
+        // with A's FIN out before B's data, B's FIN_ACK overtook that data and the test passed
+        // without the logic it is meant to guard.)
         let idle = Duration::from_secs(10);
         let data = payload(200_000);
         let (mut a_t, mut b_t) = duplex(64 * 1024);
@@ -1169,7 +1339,6 @@ mod tests {
         let pa = tokio::spawn(noise_pump_v2(ta, a_t, a_plain, idle, normal_end));
         let pb = tokio::spawn(noise_pump_v2(tb, b_t, b_plain, idle, normal_end));
         let (mut a_r, mut a_w) = split(a_app);
-        a_w.shutdown().await.unwrap(); // A: FIN(0) at once
         let (_b_r, mut b_w) = split(b_app);
         let sent = data.clone();
         let writer = tokio::spawn(async move {
@@ -1177,6 +1346,8 @@ mod tests {
             b_w.shutdown().await.unwrap();
             b_w
         });
+        tokio::time::sleep(Duration::from_millis(10)).await; // B fills the path
+        a_w.shutdown().await.unwrap(); // A: FIN(0) only now
         tokio::time::sleep(idle * 4).await; // A's consumer does not read meanwhile
         assert!(!pa.is_finished(), "A must not have timed out on its own slow consumer");
         let mut got = Vec::new();
@@ -1287,6 +1458,105 @@ mod tests {
         assert_eq!(b_got, a_data);
         assert_eq!(ra.unwrap(), DeliveryReport { sent: 300_000, received: 250_000 });
         assert_eq!(rb.unwrap(), DeliveryReport { sent: 250_000, received: 300_000 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_ack_v2_a_slow_consumer_behind_an_idle_receiver_keeps_the_sender_waiting_299() {
+        // #299's own shape -- A, its input at EOF, receives a file from B -- with a consumer behind
+        // A that takes 16 KiB a second and a path that holds 8 MiB in flight. B's FIN is out long
+        // before A has delivered the 2 MiB, and A, its input ended, has nothing of its own to
+        // send. Without PROGRESS B heard nothing for the whole FIN_ACK bound and failed although
+        // every byte arrived (#299 review); with it both ends confirm.
+        let data = payload(2 * 1024 * 1024);
+        let (mut a_t, mut b_t) = edge_like_relay(8 * 1024 * 1024);
+        let (ta, _, tb, _) = v2_handshake(&mut a_t, &mut b_t).await;
+        let (a_plain, a_app) = duplex(64 * 1024);
+        let (b_plain, b_app) = duplex(64 * 1024);
+        let started = tokio::time::Instant::now();
+        let pa = tokio::spawn(noise_pump_v2(ta, a_t, a_plain, DEFAULT_FIN_ACK_IDLE, normal_end));
+        let pb = tokio::spawn(noise_pump_v2(tb, b_t, b_plain, DEFAULT_FIN_ACK_IDLE, normal_end));
+        let (mut a_r, mut a_w) = split(a_app);
+        a_w.shutdown().await.unwrap(); // A: input at EOF from the start
+        let consumer = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match a_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        got.extend_from_slice(&buf[..n]);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            (got, a_w)
+        });
+        let (_b_r, mut b_w) = split(b_app);
+        let sent = data.clone();
+        let writer = tokio::spawn(async move {
+            b_w.write_all(&sent).await.unwrap();
+            b_w.shutdown().await.unwrap();
+            b_w
+        });
+        let rb = pb.await.expect("B's pump task");
+        let ra = pa.await.expect("A's pump task");
+        let (got, _a_w) = consumer.await.expect("A's consumer");
+        drop(writer.await.expect("B's writer"));
+        assert_eq!(got.len(), data.len(), "A's consumer got every byte");
+        assert_eq!(got, data);
+        let took = started.elapsed();
+        assert!(took > DEFAULT_FIN_ACK_IDLE * 2, "the delivery really outlasted the bound: {took:?}");
+        assert_eq!(
+            rb.expect("every byte was delivered, so B must not report a failure"),
+            DeliveryReport { sent: data.len() as u64, received: 0 }
+        );
+        assert_eq!(ra.expect("A confirmed"), DeliveryReport { sent: 0, received: data.len() as u64 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_ack_v2_a_stuck_consumer_behind_an_idle_receiver_still_ends_the_sender_299() {
+        // The other half of PROGRESS: only growth is reported. A consumer that stops reading for
+        // good makes A go quiet once its buffers are full, and B still gives up after the FIN_ACK
+        // bound -- naming its unconfirmed bytes -- instead of waiting for ever.
+        let data = payload(1024 * 1024);
+        let (mut a_t, mut b_t) = edge_like_relay(8 * 1024 * 1024);
+        let (ta, _, tb, _) = v2_handshake(&mut a_t, &mut b_t).await;
+        let (a_plain, a_app) = duplex(64 * 1024);
+        let (b_plain, b_app) = duplex(64 * 1024);
+        let started = tokio::time::Instant::now();
+        let pa = tokio::spawn(noise_pump_v2(ta, a_t, a_plain, DEFAULT_FIN_ACK_IDLE, normal_end));
+        let pb = tokio::spawn(noise_pump_v2(tb, b_t, b_plain, DEFAULT_FIN_ACK_IDLE, normal_end));
+        let (a_r, mut a_w) = split(a_app);
+        a_w.shutdown().await.unwrap(); // A: input at EOF; A's consumer never reads
+        let (_b_r, mut b_w) = split(b_app);
+        let sent = data.clone();
+        let writer = tokio::spawn(async move {
+            b_w.write_all(&sent).await.unwrap();
+            b_w.shutdown().await.unwrap();
+            b_w
+        });
+        let eb = tokio::time::timeout(DEFAULT_FIN_ACK_IDLE * 3, pb)
+            .await
+            .expect("B ends within the bound, not never")
+            .expect("B's pump task")
+            .expect_err("nothing past A's buffers was delivered, so B must not report success");
+        assert_eq!(
+            delivery_error(&eb),
+            Some(&DeliveryError::AckTimeout { sent: data.len() as u64, idle: DEFAULT_FIN_ACK_IDLE }),
+            "{eb}"
+        );
+        let waited = started.elapsed();
+        assert!(waited >= DEFAULT_FIN_ACK_IDLE, "{waited:?}");
+        assert!(waited < DEFAULT_FIN_ACK_IDLE + 2 * PROGRESS_EVERY_MAX, "one report at most: {waited:?}");
+        // A is held by its consumer; letting go of the consumer ends A too.
+        drop(a_r);
+        drop(a_w);
+        let ra = tokio::time::timeout(Duration::from_secs(10), pa)
+            .await
+            .expect("A ends once its consumer is gone")
+            .expect("A's pump task");
+        assert!(ra.is_err(), "A could not deliver B's stream either");
+        drop(writer.await.expect("B's writer"));
     }
 
     #[tokio::test(start_paused = true)]
