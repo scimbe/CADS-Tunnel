@@ -184,13 +184,14 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    v0.4.20 (#770). Before it sends message 2, the Agent (since v0.7.26, ct-agent#159/#162):
    - refuses a presented token that is not its own (constant-time compare);
    - refuses every direct handshake while its cached revocation flag is set. The flag is set
-     when the Edge answers one of the Agent's own registration attempts with `NO`;
-   - refuses a handshake that carries **no** token, by default from the first ct-agent release
-     with ct-agent#291 on (up to v0.7.40 it was served, because clients did not send the token
-     yet). Older agents, and agents started with the opt-out `CT_DIRECT_REQUIRE_TOKEN=0`, still
-     serve it.
+     when the Edge answers the Agent's own registration with `NO`: over QUIC the first such
+     answer, over the TLS-TCP fallback the third in a row (per pool worker);
+   - refuses a handshake that carries **no** token, by default from the ct-agent release that
+     flips this default (ct-agent#291). Every earlier release serves it (clients did not send
+     the token yet), and so does an agent started with the opt-out `CT_DIRECT_REQUIRE_TOKEN=0`.
 
-   A refused client gets QUIC close code 1 and never reaches the Origin.
+   A refused client gets QUIC close code 1 and never reaches the Origin. All three checks run
+   once per connection, in the handshake.
 
    **Residual risk.**
    - **A revoke does not reach a QUIC-registered Agent.** Its flag only moves on a registration
@@ -200,8 +201,21 @@ silently forces this same rotation-and-re-pin path on every reschedule).
      for another reason (edge restart, network loss, agent restart). Measured for ct-agent#291
      against the ct-edge code: still served 1, 6 and 26 s after the revoke. An Agent on the
      TLS-TCP fallback re-registers after a revoke and flips after three refusals (read, not
-     measured). The fix belongs in the Edge (close the token's agent connections on revoke) and
-     is open.
+     measured).
+   - **Open direct sessions are not cut.** A direct session established before the flag sets
+     runs on until the client or the Origin closes it: nothing on the direct path re-checks a
+     live session the way #554 does for relays. Measured for ct-agent#291: a session opened
+     before the flip was still carried 12 s after it, while a new handshake with the same token
+     was refused. On the Agent's side only a restart ends it. Closing the revoke gap therefore
+     takes both halves: the Edge closes the token's agent connections on revoke, and the Agent
+     closes its open direct sessions when the flag sets. Both are open.
+   - **The flag starts clear and fails open.** Every Agent process starts with a clear flag,
+     its direct listener serves before the first registration verdict, and a transient failure
+     (edge unreachable, dial error, timeout) never sets the flag. A restarted Agent therefore
+     serves direct clients that present the revoked token until that verdict, and for as long
+     as it cannot reach the Edge. The Edge no longer hands out a revoked token's direct
+     endpoint (#665), and the restarted listener has a new ephemeral port, so such a client has
+     to find the port on its own.
    - **Token-less handshakes** on agents without the ct-agent#291 default, or with the opt-out:
      whoever knows the Origin Identity gets past the check by leaving the token out, so a token
      rotation does not cut a former capability holder off the direct path; only an Origin-key
@@ -220,5 +234,7 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    key, so a party without a valid Capability learns nothing. What is exposed is continued
    *access* for a party whose Capability was meant to be cut off, and only on Agents that run
    the opt-in direct listener. **Status: token-less handshakes are refused by default from the
-   ct-agent#291 release on; the revoke gap on QUIC is open; the rest is accepted residual.** The
-   runbook's #554 section states the scope for incident response.
+   ct-agent release that flips the default (ct-agent#291). Open, pending an operator decision:
+   the revoke gap on QUIC, open direct sessions, the fail-open start, the shared token (the
+   "Ex-grantee" row above) and the p2p fallback of old clients. The opt-out is the operator's
+   own, logged choice.** The runbook's #554 section states the scope for incident response.

@@ -199,7 +199,7 @@ browser login. A follow-up should add a Keycloak k8s Deployment (mirroring
 | `CT_AGENT_ONBOARD_TIMEOUT_SECS` | agent | bound the one-shot onboarding flow (#73); **unset ⇒ wait indefinitely** — a spent single-use join token can't re-onboard, so production stays patient. Set for fail-fast (CI/smoke) |
 | `CT_AGENT_EDGE_CERT_WAIT_SECS` | agent | bound the shared-volume edge-cert wait (#73); **unset ⇒ wait indefinitely** (same resilience reason). Set for fail-fast |
 | `CT_AGENT_EDGE_CERT_LOG_INTERVAL_SECS` | agent | throttle the "waiting for edge cert" log line (default 5s, #73) — cosmetic; does not affect the wait |
-| `CT_DIRECT_REQUIRE_TOKEN` | agent | only read with `CT_AGENT_DIRECT_ADVERTISE`: a direct-connect handshake **without** the tunnel's routing token is refused. **On by default** since ct-agent#291 (agents up to v0.7.40: off). ct-client sends the token since CADS-Tunnel v0.4.20 (#770); an older ct-client loses the direct path, and its p2p mode then fails instead of falling back to the relay. `0`/`false`/`no`/`off` is the opt-out: the old behaviour, a startup `WARNING`, and every token-less session served counted as `ct_agent_events_total{kind="direct_legacy_served"}` — remove it once that stays at 0. Any other value keeps it on. The relayed path never reads it ([threat model](../security/threat-model.md) residual risk 8) |
+| `CT_DIRECT_REQUIRE_TOKEN` | agent | only read with `CT_AGENT_DIRECT_ADVERTISE`: a direct-connect handshake **without** the tunnel's routing token is refused. **On by default** from the ct-agent release that flips it (ct-agent#291); every earlier release serves such a handshake. ct-client sends the token since CADS-Tunnel v0.4.20 (#770); an older ct-client loses the direct path, and its p2p mode then fails instead of falling back to the relay. `0`/`false`/`no`/`off` is the opt-out: the old behaviour, a startup `WARNING`, and every token-less session served counted as `ct_agent_events_total{kind="direct_legacy_served"}` on `/metrics` (needs `CT_AGENT_METRICS_LISTEN`; without it only the rate-limited `ct-agent event: direct_legacy_served` lines on stderr and in the event ring that `ct-agent status` prints show them) — remove the opt-out once that stays at 0. Any other value keeps it on. The relayed path never reads it ([threat model](../security/threat-model.md) residual risk 8) |
 | `CT_CLIENT_EDGE_CERT_WAIT_SECS` | client | bound the edge-cert wait (default 30s, #73); the client is a bench/test tool, so it fails fast rather than hanging |
 | `CT_CLIENT_CAPABILITY_WAIT_SECS` | client | bound the capability wait (default 60s, #73); fail-fast with a precise error instead of an indefinite poll |
 | `CT_CLIENT_TUNNEL_TIMEOUT_SECS` | client | overall deadline (default 10s, issue #2) for the tunnel operation once the edge connection is up, so the client never hangs when the edge accepts the connection but cannot relay (e.g. no agent registered for the token) |
@@ -587,17 +587,23 @@ next one added cannot silently miss it. The mesh leg to a peer edge is deliberat
 that tunnel belongs to the peer, which applies its own revocation.
 
 **Scope limit: this does NOT cut `ct-agent`'s direct-connect path (ct-agent#45/#291,
-threat-model.md residual risk 8).** `serve_direct` bypasses the Edge. The Agent refuses direct
-handshakes itself once a re-registration of its token is refused (ct-agent v0.7.26 on), but a
-revoke does not trigger one on QUIC: it leaves the Agent's connection open, and the Agent keeps
-serving direct clients that present the revoked token until that connection drops. If an
-incident might involve a client with direct-connect access (`CT_AGENT_DIRECT_ADVERTISE`),
-revoking the token is therefore not enough: have the agent restarted (its first registration is
-refused, and from then on it refuses every direct handshake) or rotate the Origin key
-(ct-agent#12) so the old Capability stops working on both paths. Rotating the token instead, to
-cut off one holder and keep the tunnel, protects the direct path only on agents that require the
-token (`CT_DIRECT_REQUIRE_TOKEN`, the default since ct-agent#291); with the opt-out, or on an
-older agent, a client that leaves the token out is still served.
+threat-model.md residual risk 8).** `serve_direct` bypasses the Edge. The Agent refuses new
+direct handshakes itself once a registration of its token is refused (ct-agent v0.7.26 on), but
+a revoke does not trigger one on QUIC: it leaves the Agent's connection open, and the Agent keeps
+serving direct clients that present the revoked token until that connection drops. A direct
+session that is already open is never re-checked, not even after the Agent has noticed the
+revoke. If an incident might involve a client with direct-connect access
+(`CT_AGENT_DIRECT_ADVERTISE`), revoking the token is therefore not enough: have the agent
+restarted, which also ends its open direct sessions, or rotate the Origin key (ct-agent#12; it
+takes effect with a restart, and cuts the old identity once the retired key is removed) so the
+old Capability stops working on both paths. A restarted agent still serves direct clients that
+present the revoked token until it logs `this tunnel's routing token is REVOKED` (over QUIC
+after its first refused registration, over the TLS-TCP fallback after the third), and for as
+long as it cannot reach the edge: check for that line before closing the incident. Rotating the
+token instead, to cut off one holder and keep the tunnel, protects the direct path only on
+agents that require the token (`CT_DIRECT_REQUIRE_TOKEN`, on by default from the ct-agent
+release that flips it, ct-agent#291); with the opt-out, or on an older agent, a client that
+leaves the token out is still served.
 
 **What `/healthz` actually covers (#498/#539/#553).** The endpoint the container healthcheck
 consumes reports 503 when any accept loop the edge *meant* to run has stopped iterating. Since
