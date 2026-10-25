@@ -545,10 +545,43 @@ Exposed series (metadata only — the edge stays provider-blind):
 | `ct_edge_relays_total` | counter | client relays served |
 | `ct_edge_relay_bytes_total` | counter | bytes relayed (both directions) |
 | `ct_edge_failovers_total` | counter | relays that failed over to a non-primary agent (#8) |
+| `ct_edge_tcp_fallback_deliver_waits_total{outcome=…}` | counter | Clients that found a tunnel's TLS-TCP fallback pool empty and no working QUIC registration, and therefore waited up to `CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS` (default 3000 ms) for a parked registration (ct-agent#329). `delivered` = one arrived in time; `timed_out` = none arrived, the Client got an error; `raced` = one arrived but a concurrent Client took it or it was dead, the Client got an error. All three rows exist from the first scrape on |
+| `ct_edge_tcp_fallback_deliver_wait_seconds_total{outcome=…}` | counter | seconds those Clients waited, summed per outcome. Divided by the row above it is the mean wait; for `delivered` that is how long a Client was held before it was served |
 
 The compose overlay `docker/docker-compose.metrics.yml` sets it for the testbed
 (edge on `:9101`, agent on `:9100`). With redundant agents (#8) up you'll see
 `ct_edge_active_agents` exceed `ct_edge_active_tunnels`.
+
+**Alert on the TCP-fallback deliver wait (ct-agent#329).** A Client of an agent that
+serves through the TLS-TCP fallback (UDP blocked) is held while the agent's pool is
+empty, and gets an error once `CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS` runs out. Before
+these two rows the edge measured neither: the deliveries counter counts a Client held
+for 2.9 s exactly like one served at once, a Client that gave up left at most a generic
+error line, and ct-agent#329 had to be found with parallel `curl` runs against the
+hostnames. Alert when either condition holds for 30 minutes:
+
+- `increase(ct_edge_tcp_fallback_deliver_waits_total{outcome="timed_out"}[10m]) > 0` —
+  Clients fail because no registration came in time;
+- the mean `delivered` wait,
+  `rate(ct_edge_tcp_fallback_deliver_wait_seconds_total{outcome="delivered"}[10m]) / rate(ct_edge_tcp_fallback_deliver_waits_total{outcome="delivered"}[10m])`,
+  stays above half the bound (1.5 s at the default) — Clients are served, but late.
+  #589 sized the bound to fit one re-park round trip with margin; the ct-agent#329 waits
+  were 2.6–2.9 s.
+
+The rows carry no host label on purpose. The edge log names the host, once per host per
+10-minute window, and summarizes the repeats:
+
+```
+ct-edge: tcp-fallback: no parked registration for host '<h>' (token <8 hex>) within 3000 ms (last agent activity 2s ago) -- ...
+```
+
+Recent agent activity means the pool is alive but does not refill within the bound. That
+is ct-agent#329: ct-agent releases since v0.7.33 run the QUIC reprobe (every 30 s) inline
+in the pool loop, so with UDP blocked the pool does not refill for up to 5 s. Set
+`CT_AGENT_REGISTER_TCP_ONLY=1` on that agent until it runs a release with the fix. Old or
+no activity means the agent is gone while its hostname still routes. A rising `raced`
+rate means bursts larger than the agent's pool (`CT_AGENT_TCP_FALLBACK_POOL_SIZE`) or dead
+parks; `timed_out` and the mean wait remain the primary signals.
 
 **Removing a channel member now ends their live call too (#555).** Membership used to be
 checked once, at admission; after that the splice copied bytes and consulted nothing, so
