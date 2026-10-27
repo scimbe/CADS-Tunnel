@@ -9,8 +9,10 @@
 //!   ([`SqliteLedger::account_for_subject`]); every row carries that account and every
 //!   query filters on it. A record of another account is indistinguishable from a
 //!   missing one (`404`, never `403`), so ids cannot be enumerated.
-//! * **No secrets.** `values` is customer input that gets stored, so credential-looking
-//!   keys and values are refused with `422` ([`scan_for_secrets`]).
+//! * **No secrets (best effort).** `values` is customer input that gets stored, so credential-looking
+//!   keys and values are refused with `422` ([`scan_for_secrets`]). The filter catches accidents (names such as `token`,
+//!   `password`, `api_key`, `ssh_key`; JWTs, well-known key prefixes, PEM blocks, random
+//!   key material); it cannot stop someone who disguises a secret, and says so in its 422.
 //! * **Optimistic concurrency.** `PUT` needs `If-Match: <revision>`; each update archives
 //!   the superseded state in `installation_revisions` (the last [`MAX_REVISIONS`]).
 //! * **Soft delete.** `DELETE` sets `status = removed`; the newest [`KEEP_REMOVED`]
@@ -31,15 +33,16 @@
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{CONTENT_DISPOSITION, ETAG, LOCATION};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ct_common::sync::MutexExt;
 use ct_common::time::now_secs;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -164,30 +167,164 @@ pub struct RevisionEntry {
 // Validation
 // ---------------------------------------------------------------------------
 
-/// Is `key` a name that holds a secret (`token|secret|password|api_key|key$`, case-insensitive)?
-fn secret_like_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    k.contains("token")
-        || k.contains("secret")
-        || k.contains("password")
-        || k.contains("api_key")
-        || k.ends_with("key")
+fn nfkc(text: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfkc()
+        .normalize(text)
+        .into_owned()
 }
 
-/// Does `text` contain a word that starts like a well-known credential, or a PEM block?
-/// Credential prefixes only count on words of 10+ characters, so ordinary short words
-/// (`"sk-SK"`, `"xoxo"`) do not trip it.
+/// Lowercase word segments of a key: NFKC first (fullwidth and other lookalikes become
+/// ASCII), then split on every non-alphanumeric character and on camelCase boundaries
+/// (`apiKey` and `APIKey` both give `api`, `key`).
+fn key_segments(key: &str) -> Vec<String> {
+    let chars: Vec<char> = nfkc(key).chars().collect();
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                segments.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if let Some(&prev) = i.checked_sub(1).and_then(|j| chars.get(j)) {
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            let boundary = c.is_uppercase()
+                && prev.is_alphanumeric()
+                && (prev.is_lowercase()
+                    || prev.is_numeric()
+                    || (prev.is_uppercase() && next_lower));
+            if boundary && !cur.is_empty() {
+                segments.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        segments.push(cur);
+    }
+    segments
+}
+
+/// Is `key` a name that holds a secret? Best effort: after normalisation, the key must not
+/// contain `token`, `secret`, `password`, `passwd`, `credential`, `bearer`, `apikey`,
+/// `privatekey`, `accesskey`, `sshkey`, `signingkey` or `authkey` (separators and case
+/// ignored), have a segment `pwd`, `auth` or `authorization`, or end in a segment `key`
+/// (`ssh_key`, `sshKey`, `key`). Words that merely end in the letters (`monkey`, `hotkey`,
+/// `keyboard_layout`) pass.
+fn secret_like_key(key: &str) -> bool {
+    const CONTAINS: [&str; 11] = [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "bearer",
+        "apikey",
+        "privatekey",
+        "accesskey",
+        "sshkey",
+        "signingkey",
+    ];
+    let segments = key_segments(key);
+    let compact: String = segments.concat();
+    CONTAINS.iter().any(|w| compact.contains(w))
+        || compact.contains("authkey")
+        || segments
+            .iter()
+            .any(|s| matches!(s.as_str(), "pwd" | "auth" | "authorization"))
+        || segments.last().is_some_and(|s| s == "key")
+}
+
+fn shannon_entropy(s: &str) -> f64 {
+    let mut counts = std::collections::HashMap::new();
+    let mut n = 0f64;
+    for c in s.chars() {
+        *counts.entry(c).or_insert(0f64) += 1.0;
+        n += 1.0;
+    }
+    counts
+        .values()
+        .map(|c| {
+            let p = c / n;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// A 32+ character token of the base64/hex alphabet that mixes upper case, lower case and
+/// digits and has more than 4.0 bits of Shannon entropy per character: random key material.
+/// Hex digests (at most 4.0 bits), UUIDs, paths and prose do not qualify.
+fn high_entropy_token(w: &str) -> bool {
+    w.chars().count() >= 32
+        && w.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
+        && w.chars().any(|c| c.is_ascii_uppercase())
+        && w.chars().any(|c| c.is_ascii_lowercase())
+        && w.chars().any(|c| c.is_ascii_digit())
+        && shannon_entropy(w) > 4.0
+}
+
+/// `eyJ...` with three base64url segments (a JWT).
+fn jwt_shaped(w: &str) -> bool {
+    let parts: Vec<&str> = w.split('.').collect();
+    let b64url = |p: &str| {
+        p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    };
+    parts.len() == 3
+        && parts[0].starts_with("eyJ")
+        && parts[0].len() >= 4
+        && parts[1].len() >= 4
+        && parts.iter().all(|p| b64url(p))
+}
+
+/// Does `text` look like a credential? Best effort, aimed at accidents, not at someone who
+/// disguises a secret on purpose: PEM blocks; words of 10+ characters starting `sk-`,
+/// `ghp_` (and `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`), `xox`, `AKIA`, `AIza`,
+/// `glpat-`; JWT-shaped words (`eyJ.x.y`); `Bearer <8+ chars>`; and 32+ character
+/// high-entropy base64/hex tokens. Short words (`"sk-SK"`, `"xoxo"`) pass.
 fn credential_like_text(text: &str) -> bool {
+    let text = nfkc(text);
     if text.contains("-----BEGIN") {
         return true;
     }
-    text.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '=' | ':'))
-        .any(|w| {
-            w.chars().count() >= 10
-                && ["sk-", "ghp_", "xox", "AKIA"]
-                    .iter()
-                    .any(|p| w.starts_with(p))
-        })
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '=' | ':'))
+        .collect();
+    const PREFIXES: [&str; 11] = [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xox",
+        "AKIA",
+        "AIza",
+        "glpat-",
+    ];
+    if words.iter().any(|w| {
+        (w.chars().count() >= 10 && PREFIXES.iter().any(|p| w.starts_with(p))) || jwt_shaped(w)
+    }) {
+        return true;
+    }
+    let spaced: Vec<&str> = text.split_whitespace().collect();
+    if spaced
+        .windows(2)
+        .any(|w| w[0].eq_ignore_ascii_case("bearer") && w[1].chars().count() >= 8)
+    {
+        return true;
+    }
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    })
+    .any(high_entropy_token)
 }
 
 fn clip(s: &str) -> String {
@@ -213,8 +350,9 @@ fn scan_for_secrets(v: &Value, path: &str, depth: usize) -> Result<(), String> {
                 let child_path = format!("{path}.{}", clip(k));
                 if secret_like_key(k) {
                     return Err(format!(
-                        "{child_path}: key looks like a secret (token, secret, password, api_key or *key); \
-                         secrets are never stored, enter them on the target device instead"
+                        "{child_path}: key looks like a secret (token, secret, password, credential, auth, bearer, api/private/ssh key ...); \
+                         secrets are never stored, enter them on the target device instead. \
+                         This filter is best-effort: do not put secrets in any field"
                     ));
                 }
                 scan_for_secrets(child, &child_path, depth + 1)?;
@@ -227,8 +365,9 @@ fn scan_for_secrets(v: &Value, path: &str, depth: usize) -> Result<(), String> {
         }
         Value::String(s) if credential_like_text(s) => {
             return Err(format!(
-                "{path}: value looks like a credential (sk-, ghp_, xox, AKIA or a PEM block); \
-                 secrets are never stored, enter them on the target device instead"
+                "{path}: value looks like a credential (API key prefix, JWT, Bearer header, PEM block or random key material); \
+                 secrets are never stored, enter them on the target device instead. \
+                 This filter is best-effort: do not put secrets in any field"
             ));
         }
         _ => {}
@@ -556,6 +695,15 @@ impl SqliteInstallationStore {
         })
     }
 
+    /// Test hook: make every later purge fail, to prove callers do not claim success.
+    #[cfg(test)]
+    pub(crate) fn break_for_test(&self) {
+        self.conn
+            .lock_safe()
+            .execute_batch("DROP TABLE installation_revisions")
+            .unwrap();
+    }
+
     /// Insert a new installation (count check and insert under one lock and transaction).
     pub fn create(
         &self,
@@ -564,7 +712,7 @@ impl SqliteInstallationStore {
         now: i64,
     ) -> rusqlite::Result<CreateOutcome> {
         let mut guard = self.conn.lock_safe();
-        let tx = guard.transaction()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if active_count(&tx, account)? >= MAX_INSTALLATIONS_PER_ACCOUNT {
             return Ok(CreateOutcome::LimitReached);
         }
@@ -626,7 +774,7 @@ impl SqliteInstallationStore {
         now: i64,
     ) -> rusqlite::Result<UpdateOutcome> {
         let mut guard = self.conn.lock_safe();
-        let tx = guard.transaction()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(cur) = fetch(&tx, account, id)? else {
             return Ok(UpdateOutcome::NotFound);
         };
@@ -680,7 +828,7 @@ impl SqliteInstallationStore {
         now: i64,
     ) -> rusqlite::Result<DeleteOutcome> {
         let mut guard = self.conn.lock_safe();
-        let tx = guard.transaction()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(cur) = fetch(&tx, account, id)? else {
             return Ok(DeleteOutcome::NotFound);
         };
@@ -732,7 +880,7 @@ impl SqliteInstallationStore {
         now: i64,
     ) -> rusqlite::Result<Option<CreateOutcome>> {
         let mut guard = self.conn.lock_safe();
-        let tx = guard.transaction()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(src) = fetch(&tx, account, id)? else {
             return Ok(None);
         };
@@ -767,7 +915,7 @@ impl SqliteInstallationStore {
     /// deletion). Returns the number of installations removed.
     pub fn delete_all_for_account(&self, account: &AccountId) -> rusqlite::Result<usize> {
         let mut guard = self.conn.lock_safe();
-        let tx = guard.transaction()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM installation_revisions WHERE account = ?1",
             params![&account.0[..]],
@@ -799,7 +947,7 @@ impl SqliteInstallationStore {
         now: i64,
     ) -> rusqlite::Result<Option<Vec<Installation>>> {
         let mut guard = self.conn.lock_safe();
-        let tx = guard.transaction()?;
+        let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if active_count(&tx, account)? + inputs.len() > MAX_INSTALLATIONS_PER_ACCOUNT {
             return Ok(None);
         }
@@ -881,12 +1029,42 @@ pub fn authed_installations_router(
         )
         .route("/me/installations/:id/revisions", get(revisions))
         .route("/me/installations/:id/duplicate", post(duplicate))
+        .layer(axum::middleware::from_fn(csrf_guard))
         .with_state(AuthedInstallationState {
             store,
             ledger,
             verifier,
             session_key,
         })
+}
+
+/// CSRF guard for the state-changing routes. A request that carries an `Authorization`
+/// header cannot be forged cross-site (no CORS), so bearer callers pass. Anything else is
+/// cookie-authenticated and must be same-origin: `Sec-Fetch-Site` must be `same-origin` or
+/// `none` (`same-site` is refused: tunnel origins on the shared zone are same-site), and an
+/// `Origin`, when present, must equal the portal's own host. `SameSite=Lax` alone is not enough.
+async fn csrf_guard(req: Request, next: Next) -> Response {
+    let mutating = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if mutating
+        && !req
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+        && !same_origin_strict(req.headers())
+    {
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    next.run(req).await
+}
+
+fn same_origin_strict(headers: &HeaderMap) -> bool {
+    if !crate::service::is_same_origin_request(headers) {
+        return false;
+    }
+    // `Sec-Fetch-Site: same-origin` short-circuits that helper; still compare a present
+    // `Origin` with `Host` by evaluating the header-only branch.
+    let mut without_fetch_site = headers.clone();
+    without_fetch_site.remove("sec-fetch-site");
+    crate::service::is_same_origin_request(&without_fetch_site)
 }
 
 type ApiError = (StatusCode, String);
@@ -1116,6 +1294,20 @@ async fn duplicate(
     let req: DuplicateReq = if body.iter().all(u8::is_ascii_whitespace) {
         DuplicateReq { name: None }
     } else {
+        let is_json = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.trim()
+                    .to_ascii_lowercase()
+                    .starts_with("application/json")
+            });
+        if !is_json {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Content-Type: application/json is required".to_string(),
+            ));
+        }
         serde_json::from_slice(&body).map_err(|e| unprocessable(format!("invalid body: {e}")))?
     };
     if let Some(name) = &req.name {
@@ -2451,6 +2643,362 @@ mod tests {
             acct,
             "existing tables untouched"
         );
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_s}{suffix}"));
+        }
+    }
+
+    // ---- review fixes -----------------------------------------------------
+
+    fn jwt_like() -> String {
+        [
+            "eyJhbGciOiJIUzI1NiJ9",
+            "eyJzdWIiOiJ4In0",
+            "c2lnbmF0dXJlMTIz",
+        ]
+        .join(".")
+    }
+
+    #[test]
+    fn secret_key_names_match_on_word_segments() {
+        for k in [
+            "token",
+            "auth_token",
+            "client_SECRET",
+            "Password",
+            "passwd",
+            "pwd",
+            "db_pwd",
+            "credentials",
+            "credential",
+            "auth",
+            "Authorization",
+            "bearer",
+            "api_key",
+            "API_KEY",
+            "apikey",
+            "ApiKey",
+            "APIKey",
+            "api-key",
+            "secret_key",
+            "secretKey",
+            "private_key",
+            "privateKey",
+            "privatekey",
+            "ssh_key",
+            "key",
+            "access.key",
+            "to\u{200b}ken",
+            "\u{ff54}\u{ff4f}\u{ff4b}\u{ff45}\u{ff4e}", // fullwidth "token"
+            "\u{ff21}\u{ff30}\u{ff29}_\u{ff2b}\u{ff25}\u{ff39}", // fullwidth "API_KEY"
+        ] {
+            assert!(secret_like_key(k), "{k:?} must be refused");
+        }
+        for k in [
+            "monkey",
+            "hotkey",
+            "turkey",
+            "keyboard_layout",
+            "keyword",
+            "author",
+            "authority",
+            "region",
+            "port",
+            "labels",
+            "device_label",
+            "hostname",
+            "cwd",
+        ] {
+            assert!(!secret_like_key(k), "{k:?} must pass");
+        }
+    }
+
+    #[test]
+    fn credential_values_are_caught_and_ordinary_text_passes() {
+        let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        let google = ["AIza", "SyA-0123456789abcdefghijklmnopqrstu"].concat();
+        let gitlab = ["glpat-", "abcdefghij0123456789"].concat();
+        let high = "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bD1fG3hJ5kL7n".to_string();
+        let fullwidth_sk = "\u{ff53}\u{ff4b}-proj0123456789abcdef".to_string();
+        for v in [
+            jwt_like(),
+            format!("Authorization: Bearer {}", "abcdefgh12345678"),
+            "bearer abcdefgh".to_string(),
+            google,
+            gitlab,
+            aws,
+            pem(),
+            high.clone(),
+            format!("key={high}"),
+            fullwidth_sk,
+            ["gho_", "0123456789abcdefghijklmnop"].concat(),
+        ] {
+            assert!(credential_like_text(&v), "{v:?} must be refused");
+        }
+        for v in [
+            "hello world",
+            "sk-SK",
+            "xoxo",
+            "eyJ is a prefix",
+            "eyJhbGci.short",
+            "Bearer",
+            "bearer of good news",
+            "https://example.com/some/long/path/segment/that/goes/on/and/on",
+            "/usr/local/share/applications/some-application-name.desktop",
+            "11111111-2222-4333-8444-555555555555",
+            &"ab".repeat(32),              // sha256-style hex digest
+            &"0123456789abcdef".repeat(4), // hex, 4.0 bits at most
+            "the-quick-brown-fox-jumps-over-the-lazy-dog-1234567890",
+            "Europe/Berlin",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!credential_like_text(v), "{v:?} must pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn new_secret_rules_apply_over_http_and_the_422_says_best_effort() {
+        let e = env();
+        for (k, v) in [
+            ("db_pwd", json!("x")),
+            ("credential", json!("x")),
+            ("private_key", json!("x")),
+            ("note", json!(jwt_like())),
+            ("note", json!("aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bD1fG3hJ5kL7n")),
+        ] {
+            let mut p = payload("x");
+            p["values"] = json!({ k: v });
+            let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+            assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{k}");
+            assert!(r.text.contains("best-effort"), "{}", r.text);
+        }
+        let mut p = payload("ok");
+        p["values"] = json!({
+            "monkey": "business", "hotkey": "ctrl+k", "digest": "ab".repeat(32), "tz": "Europe/Berlin",
+            "uuid": "11111111-2222-4333-8444-555555555555",
+        });
+        let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
+    }
+
+    /// Request as a browser would send it with the portal session cookie (no bearer).
+    async fn cookie_send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        sub: &str,
+        extra: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> StatusCode {
+        let cookie = crate::portal::sign_session_for_test(SESSION_KEY, sub);
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "portal.example.test")
+            .header("cookie", format!("ct_portal_session={cookie}"));
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn cookie_authenticated_writes_must_be_same_origin() {
+        let e = env();
+        let id = create_as(&e.app, "alice", "mine").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let item = format!("/me/installations/{id}");
+        let dup = format!("{item}/duplicate");
+        let writes: Vec<(&str, String, Option<Value>)> = vec![
+            (
+                "POST",
+                "/me/installations".to_string(),
+                Some(payload("csrf")),
+            ),
+            ("PUT", item.clone(), Some(payload("csrf"))),
+            ("DELETE", item.clone(), None),
+            ("POST", dup.clone(), None),
+            (
+                "POST",
+                "/me/installations/import".to_string(),
+                Some(json!({ "installations": [] })),
+            ),
+        ];
+        let foreign: [&[(&str, &str)]; 5] = [
+            &[("origin", "https://evil.example")],
+            &[("origin", "https://tunnel.portal.example.test")], // same site, other origin
+            &[("sec-fetch-site", "cross-site")],
+            &[("sec-fetch-site", "same-site")],
+            &[
+                ("sec-fetch-site", "same-origin"),
+                ("origin", "https://evil.example"),
+            ],
+        ];
+        for (m, u, b) in &writes {
+            for hdrs in foreign {
+                let mut h = hdrs.to_vec();
+                if *m == "PUT" {
+                    h.push(("if-match", "1"));
+                }
+                assert_eq!(
+                    cookie_send(&e.app, m, u, "alice", &h, b.clone()).await,
+                    StatusCode::FORBIDDEN,
+                    "{m} {u} {hdrs:?}"
+                );
+            }
+        }
+        // Nothing happened.
+        let r = send(&e.app, "GET", &item, "alice", None, None).await;
+        assert_eq!(
+            (r.body["revision"].as_i64(), r.body["status"].as_str()),
+            (Some(1), Some("draft"))
+        );
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "alice", None, None)
+                .await
+                .body["total"],
+            1
+        );
+
+        // Same-origin cookie requests, and cookie-less tools, still work.
+        let ok = cookie_send(
+            &e.app,
+            "POST",
+            &dup,
+            "alice",
+            &[
+                ("origin", "https://portal.example.test"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(ok, StatusCode::CREATED);
+        let ok = cookie_send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            &[],
+            Some(payload("no browser headers")),
+        )
+        .await;
+        assert_eq!(ok, StatusCode::CREATED);
+        // Cookie GET with a foreign origin is a read and stays allowed (CORS blocks reading it).
+        assert_eq!(
+            cookie_send(
+                &e.app,
+                "GET",
+                &item,
+                "alice",
+                &[("origin", "https://evil.example")],
+                None
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // Bearer callers are exempt: they cannot be forged cross-site.
+        let mut req = Request::post("/me/installations")
+            .header("authorization", format!("Bearer {}", jwt("alice")))
+            .header("origin", "https://evil.example")
+            .header("content-type", "application/json")
+            .body(Body::from(payload("bearer").to_string()))
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "portal.example.test".parse().unwrap());
+        assert_eq!(
+            e.app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_requires_a_json_content_type_for_a_body() {
+        let e = env();
+        let id = create_as(&e.app, "alice", "src").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let url = format!("/me/installations/{id}/duplicate");
+        for ct in [
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+        ] {
+            let req = Request::post(&url)
+                .header("authorization", format!("Bearer {}", jwt("alice")))
+                .header("content-type", ct)
+                .body(Body::from(r#"{"name":"x"}"#))
+                .unwrap();
+            assert_eq!(
+                e.app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{ct}"
+            );
+        }
+        let req = Request::post(&url)
+            .header("authorization", format!("Bearer {}", jwt("alice")))
+            .body(Body::from(r#"{"name":"x"}"#))
+            .unwrap();
+        assert_eq!(
+            e.app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "no content type"
+        );
+        let req = Request::post(&url)
+            .header("authorization", format!("Bearer {}", jwt("alice")))
+            .header("content-type", "application/json; charset=utf-8")
+            .body(Body::from(r#"{"name":"x"}"#))
+            .unwrap();
+        assert_eq!(
+            e.app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "alice", None, None)
+                .await
+                .body["total"],
+            2,
+            "refused calls created nothing"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_on_one_database_file_never_hit_a_busy_upgrade() {
+        let path = std::env::temp_dir().join(format!("ct-installations-conc-{}.db", new_uuid()));
+        let path_s = path.to_str().unwrap().to_string();
+        let acct = AccountId([9; 32]);
+        SqliteInstallationStore::open(&path_s).unwrap();
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let path_s = path_s.clone();
+                std::thread::spawn(move || {
+                    let acct = AccountId([9; 32]);
+                    let store = SqliteInstallationStore::open(&path_s).unwrap();
+                    for i in 0..25 {
+                        let out = store
+                            .create(&acct, &input(&format!("t{t}-{i}")), 1)
+                            .unwrap();
+                        assert!(matches!(out, CreateOutcome::Created(_)));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let store = SqliteInstallationStore::open(&path_s).unwrap();
+        assert_eq!(store.list(&acct, None, 1, 0).unwrap().1, 100);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{path_s}{suffix}"));
         }

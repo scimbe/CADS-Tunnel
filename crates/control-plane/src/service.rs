@@ -6414,7 +6414,7 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-fn is_same_origin_request(headers: &HeaderMap) -> bool {
+pub(crate) fn is_same_origin_request(headers: &HeaderMap) -> bool {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(site) = header("sec-fetch-site") {
         return matches!(site, "same-origin" | "none");
