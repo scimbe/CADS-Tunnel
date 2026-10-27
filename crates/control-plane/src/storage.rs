@@ -2265,6 +2265,33 @@ pub enum CreateTunnelOutcome {
     HostnameTaken,
 }
 
+/// How [`SqliteTunnelStore::transfer_tunnel`] resolved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransferTunnelOutcome {
+    /// Ownership moved `from_subject` -> `to_subject` in one transaction.
+    Transferred(TransferReport),
+    /// Idempotent re-run: the tunnel is already owned by `to_subject`. Nothing written.
+    AlreadyOwnedByTarget(SubjectTunnel),
+    /// No tunnel with that id.
+    NotFound,
+    /// The tunnel exists but its current owner is not `from_subject` (and not the
+    /// target either). Nothing written. The actual owner is deliberately not returned.
+    OwnerMismatch,
+}
+
+/// What a successful [`SqliteTunnelStore::transfer_tunnel`] changed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TransferReport {
+    /// The tunnel after the transfer (hostname and routing token unchanged).
+    pub tunnel: SubjectTunnel,
+    /// The old owner's topology link that was cleared (the topology stays with the old
+    /// owner), if the tunnel had one.
+    pub cleared_topology_id: Option<String>,
+    /// How many tunnels `to_subject` owns after the transfer (the target's limit is
+    /// deliberately NOT enforced for an admin transfer; callers may surface this).
+    pub target_owned_after: u32,
+}
+
 /// How [`SqliteChannelStore::register_channel_if_under_owned_limit`] resolved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisterChannelOutcome {
@@ -3102,6 +3129,105 @@ impl SqliteTunnelStore {
         }
         tx.commit()?;
         Ok(token)
+    }
+
+    /// Operator/admin: move ownership of tunnel `tunnel_id` from `from_subject` to
+    /// `to_subject` WITHOUT touching anything the data plane keys on -- `id`, `hostname`
+    /// and `routing_token` stay as they are, so the edge registration, DNS, certificates
+    /// and the running agent are unaffected (the edge keys on the routing token only and
+    /// holds no subject).
+    ///
+    /// One `IMMEDIATE` transaction (the write lock is taken up front, so a concurrent
+    /// transfer/revoke on the same file serialises instead of failing at commit). The
+    /// owner check (`from_subject`) happens inside it.
+    ///
+    /// Per-table decisions (all keyed on `tunnel_id`, never on hostname alone):
+    /// * `subject_tunnels.subject` -- the transfer itself; `topology_id` is cleared
+    ///   (the topology is the old owner's; leaving the link would point the new owner's
+    ///   tunnel at someone else's topology and `tunnels_linked_to_topology` is
+    ///   subject-scoped anyway). The cleared value is returned for the audit trail.
+    /// * `tunnel_alerts.subject`, `tunnel_badges.subject`, `share_links.subject`,
+    ///   `tunnel_access_policies.subject`, `bridge_probe_cache.subject` -- follow the
+    ///   tunnel (owner-scoped reads/writes would otherwise orphan them: the new owner
+    ///   could not see, edit or delete them; the old owner still could). Alert
+    ///   deliveries are keyed by tunnel only. Public badge ids and share-link tokens
+    ///   keep working.
+    /// * `tunnel_grants` -- stay (they belong to the tunnel); only a grant naming the new
+    ///   owner is dropped (redundant now). Grants naming the old owner are not added.
+    /// * `tunnel_login_allowlist` / `gate_access_requests` -- hostname-keyed gate state
+    ///   of the tunnel, stays; `added_by` is history and is NOT rewritten.
+    /// * `subject_tunnels` flags (`require_login`, `rest_bridge_mode`, `bridge_grant`,
+    ///   status/cert/direct columns) -- unchanged; the bridge grant admits the
+    ///   deployment's shared bridge identity, not the owner.
+    /// * `mesh_ownership` (edge_mesh) -- keyed by token/hostname/edge, no subject: nothing
+    ///   to do. The target's owned-tunnel limit is NOT enforced (admin override, same as
+    ///   `admin_provision_tunnel`); the target's existence in the ledger is checked by the
+    ///   caller (this store has no ledger).
+    ///
+    /// Idempotent: when the tunnel is already owned by `to_subject` the call is a no-op
+    /// ([`TransferTunnelOutcome::AlreadyOwnedByTarget`]), so a retried request is safe.
+    pub fn transfer_tunnel(
+        &self,
+        tunnel_id: &str,
+        from_subject: &str,
+        to_subject: &str,
+    ) -> rusqlite::Result<TransferTunnelOutcome> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, SubjectTunnel, Option<String>)> = tx
+            .query_row(
+                "SELECT subject, id, name, hostname, created_at, routing_token, topology_id
+                 FROM subject_tunnels WHERE id = ?1",
+                params![tunnel_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        SubjectTunnel {
+                            id: r.get(1)?,
+                            name: r.get(2)?,
+                            hostname: r.get(3)?,
+                            created_at: r.get(4)?,
+                            routing_token: r.get(5)?,
+                        },
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner, tunnel, topology_id)) = row else {
+            return Ok(TransferTunnelOutcome::NotFound);
+        };
+        if owner == to_subject {
+            return Ok(TransferTunnelOutcome::AlreadyOwnedByTarget(tunnel));
+        }
+        if owner != from_subject {
+            return Ok(TransferTunnelOutcome::OwnerMismatch);
+        }
+        tx.execute(
+            "UPDATE subject_tunnels SET subject = ?1, topology_id = NULL WHERE id = ?2 AND subject = ?3",
+            params![to_subject, tunnel_id, from_subject],
+        )?;
+        for sql in [
+            "UPDATE tunnel_alerts SET subject = ?1 WHERE tunnel_id = ?2",
+            "UPDATE tunnel_badges SET subject = ?1 WHERE tunnel_id = ?2",
+            "UPDATE share_links SET subject = ?1 WHERE tunnel_id = ?2",
+            "UPDATE tunnel_access_policies SET subject = ?1 WHERE tunnel_id = ?2",
+            "UPDATE bridge_probe_cache SET subject = ?1 WHERE tunnel_id = ?2",
+            "DELETE FROM tunnel_grants WHERE grantee = ?1 AND tunnel_id = ?2",
+        ] {
+            tx.execute(sql, params![to_subject, tunnel_id])?;
+        }
+        let target_owned_after: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM subject_tunnels WHERE subject = ?1",
+            params![to_subject],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(TransferTunnelOutcome::Transferred(TransferReport {
+            tunnel,
+            cleared_topology_id: topology_id,
+            target_owned_after,
+        }))
     }
 
     /// Every routing token ever revoked (#327): the durable record an Edge
@@ -12717,5 +12843,132 @@ mod tests {
         // Deleted with the tunnel.
         assert!(store.revoke("alice", &t.id, 6_000).unwrap().is_some());
         assert_eq!(store.bridge_probe("alice", &t.id).unwrap(), None, "the cache row goes with the tunnel");
+    }
+
+    // ===== admin tunnel transfer =====
+
+    fn transferred(o: TransferTunnelOutcome) -> TransferReport {
+        match o {
+            TransferTunnelOutcome::Transferred(r) => r,
+            other => panic!("expected Transferred, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transfer_tunnel_moves_ownership_and_everything_owner_scoped_but_keeps_hostname_and_token() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
+        let other = store.create("alice", "other", Some("other.example.org")).unwrap().created().unwrap();
+        store.set_require_login("alice", &t.id, true).unwrap();
+        store.set_topology_link("alice", &t.id, Some("alice-topo")).unwrap();
+        store.login_allowlist_add("alice", &t.id, "friend@example.org", 100).unwrap();
+        let badge = store.enable_badge("alice", &t.id).unwrap().expect("badge");
+        store.upsert_alert("alice", &t.id, "https://hooks.example.org/x", 300, 100).unwrap();
+        store.grant("alice", &t.id, "carol").unwrap();
+        store.grant("alice", &t.id, "bob").unwrap();
+        store.record_bridge_probe("alice", &t.id, "bridge/status", &serde_json::json!({ "version": "1" }), 100).unwrap();
+        let link = store.mint_share_link("alice", &t.id, Some("l"), 3600, false, 100).unwrap();
+        assert!(matches!(link, ShareLinkMint::Minted { .. }), "{link:?}");
+
+        let report = transferred(store.transfer_tunnel(&t.id, "alice", "bob").unwrap());
+        assert_eq!(report.tunnel.routing_token, t.routing_token, "routing token unchanged");
+        assert_eq!(report.tunnel.hostname, t.hostname, "hostname unchanged");
+        assert_eq!(report.cleared_topology_id.as_deref(), Some("alice-topo"));
+        assert_eq!(report.target_owned_after, 1);
+
+        // Appears for bob, gone for alice (her other tunnel stays).
+        let bob: Vec<_> = store.list_for_subject("bob").unwrap().into_iter().map(|x| x.id).collect();
+        assert_eq!(bob, vec![t.id.clone()]);
+        let alice: Vec<_> = store.list_for_subject("alice").unwrap().into_iter().map(|x| x.id).collect();
+        assert_eq!(alice, vec![other.id.clone()]);
+        assert_eq!(store.routing_token("bob", &t.id).unwrap().as_deref(), Some(t.routing_token.as_str()));
+        assert_eq!(store.routing_token("alice", &t.id).unwrap(), None);
+        assert_eq!(store.routing_token_for_hostname("demo.example.org").unwrap().as_deref(), Some(t.routing_token.as_str()));
+
+        // Owner-scoped satellites follow the tunnel.
+        assert_eq!(store.badge_public_id("bob", &t.id).unwrap().as_deref(), Some(badge.as_str()));
+        assert_eq!(store.badge_public_id("alice", &t.id).unwrap(), None);
+        assert!(store.alert_for("bob", &t.id).unwrap().is_some());
+        assert!(store.alert_for("alice", &t.id).unwrap().is_none());
+        assert!(store.bridge_probe("bob", &t.id).unwrap().is_some());
+        assert_eq!(store.share_links_for("bob", &t.id).unwrap().len(), 1);
+        assert!(store.share_links_for("alice", &t.id).unwrap().is_empty());
+
+        // Tunnel-owned config stays; topology link cleared; redundant grant to the new owner dropped.
+        assert_eq!(store.require_login("bob", &t.id).unwrap(), Some(true));
+        assert_eq!(store.topology_link("bob", &t.id).unwrap(), None);
+        assert_eq!(store.login_allowlist_list("bob", &t.id).unwrap(), Some(vec!["friend@example.org".to_string()]));
+        assert!(store.is_authorized("carol", &t.id).unwrap(), "other grantees keep access");
+        assert_eq!(store.list_authorized_for_subject("bob").unwrap().len(), 1, "no duplicate row from the dropped grant");
+
+        // The alert is deletable by the NEW owner only, i.e. it is not orphaned.
+        assert!(!store.delete_alert("alice", &t.id).unwrap());
+        assert!(store.delete_alert("bob", &t.id).unwrap());
+    }
+
+    #[test]
+    fn transfer_tunnel_wrong_owner_unknown_id_and_repeat_are_distinguished_and_write_nothing() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
+
+        assert_eq!(store.transfer_tunnel(&t.id, "mallory", "bob").unwrap(), TransferTunnelOutcome::OwnerMismatch);
+        assert_eq!(store.transfer_tunnel("nope", "alice", "bob").unwrap(), TransferTunnelOutcome::NotFound);
+        assert!(store.owns("alice", &t.id).unwrap(), "refusals changed nothing");
+
+        transferred(store.transfer_tunnel(&t.id, "alice", "bob").unwrap());
+        // Repeating the same request is a no-op, not an error and not a second move.
+        match store.transfer_tunnel(&t.id, "alice", "bob").unwrap() {
+            TransferTunnelOutcome::AlreadyOwnedByTarget(x) => assert_eq!(x.routing_token, t.routing_token),
+            other => panic!("{other:?}"),
+        }
+        // A DIFFERENT stale request (old owner -> third party) is still refused.
+        assert_eq!(store.transfer_tunnel(&t.id, "alice", "carol").unwrap(), TransferTunnelOutcome::OwnerMismatch);
+        assert!(store.owns("bob", &t.id).unwrap());
+    }
+
+    #[test]
+    fn transfer_tunnel_ignores_the_targets_owned_tunnel_limit() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let mine = store.create_if_under_owned_limit("bob", "mine", Some("mine.example.org"), 1).unwrap();
+        assert!(matches!(mine, CreateTunnelOutcome::Created(_)));
+        let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
+        let r = transferred(store.transfer_tunnel(&t.id, "alice", "bob").unwrap());
+        assert_eq!(r.target_owned_after, 2, "admin override: bob is now above his limit of 1");
+        assert!(matches!(
+            store.create_if_under_owned_limit("bob", "x", Some("x.example.org"), 1).unwrap(),
+            CreateTunnelOutcome::OverLimit
+        ));
+    }
+
+    #[test]
+    fn concurrent_transfers_of_one_tunnel_have_exactly_one_winner() {
+        let dir = std::env::temp_dir().join(format!("ct-transfer-{}-{:x}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let store = std::sync::Arc::new(SqliteTunnelStore::open(path.to_str().unwrap()).unwrap());
+        let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
+        let targets = ["bob", "carol", "dave", "erin"];
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|to| {
+                let (store, id, to) = (store.clone(), t.id.clone(), to.to_string());
+                std::thread::spawn(move || (to.clone(), store.transfer_tunnel(&id, "alice", &to).unwrap()))
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, o)| matches!(o, TransferTunnelOutcome::Transferred(_)))
+            .map(|(to, _)| to.clone())
+            .collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert!(results
+            .iter()
+            .filter(|(to, _)| *to != winners[0])
+            .all(|(_, o)| *o == TransferTunnelOutcome::OwnerMismatch));
+        assert!(store.owns(&winners[0], &t.id).unwrap());
+        let owners: usize = targets.iter().filter(|s| store.owns(s, &t.id).unwrap()).count();
+        assert_eq!(owners, 1, "exactly one owner afterwards");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

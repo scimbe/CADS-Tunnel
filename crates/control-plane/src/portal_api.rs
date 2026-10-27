@@ -323,6 +323,7 @@ pub fn portal_api_router_with_verifier(
         .route("/admin/provision-tunnel", post(admin_provision_tunnel))
         .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
         .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
+        .route("/admin/tunnels/:id/transfer", post(admin_transfer_tunnel))
         // #778/#783: uptime page, badge routes, usage page + CSV (see `uptime.rs`).
         .merge(uptime::routes())
         .merge(fleet::routes())
@@ -526,6 +527,113 @@ async fn admin_set_max_channels(
         return internal_error("admin_set_max_channels/set", e).into_response();
     }
     StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct TransferTunnelReq {
+    /// The owner the operator expects right now. Required: the transfer is refused
+    /// (409) unless it matches, so a stale tunnel id can never move the wrong tunnel.
+    from_subject: String,
+    /// The new owner's OIDC `sub`. Must already have an account in the ledger (i.e. have
+    /// logged in to the portal once).
+    #[serde(default)]
+    to_subject: Option<String>,
+    /// Not supported: there is no email -> subject lookup in this crate (only
+    /// `keycloak_admin::get_user_email`, the other direction). Answered with a 400 that
+    /// says so, instead of being silently ignored.
+    #[serde(default)]
+    to_email: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TransferTunnelResp {
+    tunnel_id: String,
+    hostname: Option<String>,
+    from_subject: String,
+    to_subject: String,
+    /// `true` when the tunnel already belonged to `to_subject` (idempotent re-run).
+    already_transferred: bool,
+    /// Topology link that was cleared (the topology stays with the old owner).
+    cleared_topology_id: Option<String>,
+    /// Tunnels `to_subject` owns afterwards (its limit is not enforced here).
+    target_owned_after: Option<u32>,
+}
+
+/// `POST /admin/tunnels/:id/transfer {from_subject, to_subject}` (operator-only, same
+/// `x-ct-admin-token` gate as every `/admin/*` route here): move one tunnel to another
+/// account without touching its hostname, routing token or edge registration, so the
+/// running agent keeps serving. See [`SqliteTunnelStore::transfer_tunnel`] for the
+/// per-table decisions. 401 bad token, 404 unknown tunnel, 409 `from_subject` is not the
+/// current owner, 400 malformed/`to_email`, 422 target subject has no account yet.
+/// Repeating a completed transfer answers 200 with `already_transferred: true`.
+/// Audited as `tunnel_transferred` once per subject (actor `admin-token`: this route
+/// carries no admin identity).
+async fn admin_transfer_tunnel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<TransferTunnelReq>,
+) -> Response {
+    if let Err(code) = admin_authed(&headers, st.admin_token) {
+        return code.into_response();
+    }
+    if req.to_email.is_some() {
+        return (StatusCode::BAD_REQUEST, "to_email is not supported; pass to_subject (the OIDC sub)").into_response();
+    }
+    let from = req.from_subject.trim();
+    let Some(to) = req.to_subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "to_subject is required").into_response();
+    };
+    if from.is_empty() || from == to {
+        return (StatusCode::BAD_REQUEST, "from_subject must be set and differ from to_subject").into_response();
+    }
+    match st.ledger.account_if_exists(to) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "to_subject has no account yet (it must log in to the portal once)")
+                .into_response()
+        }
+        Err(e) => return internal_error("admin_transfer_tunnel/account_if_exists", e).into_response(),
+    }
+    use crate::storage::TransferTunnelOutcome as Out;
+    let (tunnel, already, cleared, owned_after) = match st.tunnels.transfer_tunnel(&id, from, to) {
+        Ok(Out::Transferred(r)) => (r.tunnel, false, r.cleared_topology_id, Some(r.target_owned_after)),
+        Ok(Out::AlreadyOwnedByTarget(t)) => (t, true, None, None),
+        Ok(Out::NotFound) => return (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
+        Ok(Out::OwnerMismatch) => {
+            return (StatusCode::CONFLICT, "from_subject is not the current owner of this tunnel").into_response()
+        }
+        Err(e) => return internal_error("admin_transfer_tunnel/transfer", e).into_response(),
+    };
+    if !already {
+        let host = tunnel.hostname.as_deref().unwrap_or("-");
+        let cleared_note = cleared.as_deref().unwrap_or("-");
+        eprintln!("ct-cp: admin transfer tunnel {id} ({host}) {from} -> {to}");
+        if let Some(audit) = &st.audit {
+            let _ = audit.record(
+                "admin-token",
+                "tunnel_transferred",
+                Some(from),
+                Some(&format!("tunnel={id} host={host} direction=out to={to} cleared_topology={cleared_note}")),
+            );
+            let _ = audit.record(
+                "admin-token",
+                "tunnel_transferred",
+                Some(to),
+                Some(&format!("tunnel={id} host={host} direction=in from={from}")),
+            );
+        }
+    }
+    Json(TransferTunnelResp {
+        tunnel_id: tunnel.id,
+        hostname: tunnel.hostname,
+        from_subject: from.to_string(),
+        to_subject: to.to_string(),
+        already_transferred: already,
+        cleared_topology_id: cleared,
+        target_owned_after: owned_after,
+    })
+    .into_response()
 }
 
 /// Resolve the caller's account from the session, or an early response
@@ -11126,6 +11234,101 @@ mod tests {
         let created = &tunnels.list_for_subject("flappy-demo-maintainer").unwrap()[0];
         assert_eq!(created.hostname.as_deref(), Some("flappy-demo.bunsenbrenner.org"));
         assert_eq!(created.routing_token, routing_token);
+    }
+
+    #[tokio::test]
+    async fn admin_transfer_tunnel_is_gated_moves_the_tunnel_and_audits_both_subjects() {
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x55u8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let build = |admin: Option<[u8; 32]>| {
+            portal_api_router_with_verifier(
+                KEY,
+                ledger.clone(),
+                tunnels.clone(),
+                Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+                Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+                "https://portal.example",
+                None,
+                None,
+                None,
+                None,
+                test_edge_mesh(),
+                admin,
+                None,
+                Some(audit.clone()),
+                None,
+                Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            )
+        };
+        let app = build(Some(secret));
+        let t = tunnels.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
+        tunnels.enable_badge("alice", &t.id).unwrap().unwrap();
+        tunnels.upsert_alert("alice", &t.id, "https://hooks.example.org/x", 300, 1).unwrap();
+        ledger.account_for_subject("bob").unwrap(); // bob has logged in once
+
+        let post = |app: Router, id: String, token: Option<String>, body: String| async move {
+            let mut req = Request::post(format!("/admin/tunnels/{id}/transfer")).header("content-type", "application/json");
+            if let Some(t) = token {
+                req = req.header("x-ct-admin-token", t);
+            }
+            let resp = app.oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        };
+        let ok_body = r#"{"from_subject":"alice","to_subject":"bob"}"#.to_string();
+
+        // Auth: no token / wrong token -> 401; admin route unconfigured -> 404.
+        assert_eq!(post(app.clone(), t.id.clone(), None, ok_body.clone()).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(post(app.clone(), t.id.clone(), Some(hex(&[1u8; 32])), ok_body.clone()).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(post(build(None), t.id.clone(), Some(hex(&secret)), ok_body.clone()).await.0, StatusCode::NOT_FOUND);
+        assert!(tunnels.owns("alice", &t.id).unwrap(), "refused calls changed nothing");
+
+        let tok = Some(hex(&secret));
+        // Validation / refusals.
+        assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), r#"{"from_subject":"alice","to_email":"b@x.org"}"#.into()).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), r#"{"from_subject":"alice"}"#.into()).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), r#"{"from_subject":"alice","to_subject":"alice"}"#.into()).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), r#"{"from_subject":"alice","to_subject":"never-logged-in"}"#.into()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), r#"{"from_subject":"mallory","to_subject":"bob"}"#.into()).await.0, StatusCode::CONFLICT);
+        assert_eq!(post(app.clone(), "nope".into(), tok.clone(), ok_body.clone()).await.0, StatusCode::NOT_FOUND);
+        assert!(audit.recent(10).unwrap().is_empty(), "no audit entry for refused calls");
+        assert!(tunnels.owns("alice", &t.id).unwrap());
+
+        // Happy path.
+        let (status, body) = post(app.clone(), t.id.clone(), tok.clone(), ok_body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["already_transferred"], false);
+        assert_eq!(v["hostname"], "demo.example.org");
+        assert!(!body.contains(&t.routing_token), "the routing token is never echoed");
+        assert_eq!(tunnels.list_for_subject("bob").unwrap()[0].routing_token, t.routing_token);
+        assert!(tunnels.list_for_subject("alice").unwrap().is_empty());
+        assert!(tunnels.alert_for("bob", &t.id).unwrap().is_some());
+        assert!(tunnels.badge_public_id("bob", &t.id).unwrap().is_some());
+
+        // The portal of both accounts reflects it on the very next request (no cache).
+        let (_, alice_html) = get(&app, "/portal/tunnels", Some("alice")).await;
+        assert!(!alice_html.contains("demo.example.org"));
+        let (_, bob_html) = get(&app, "/portal/tunnels", Some("bob")).await;
+        assert!(bob_html.contains("demo.example.org"));
+
+        // Audit: one entry per subject.
+        let entries = audit.recent(10).unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries.iter().all(|e| e.action == "tunnel_transferred"));
+        let targets: Vec<_> = entries.iter().filter_map(|e| e.target.clone()).collect();
+        assert!(targets.contains(&"alice".to_string()) && targets.contains(&"bob".to_string()));
+
+        // Idempotent repeat: 200, flagged, no new audit rows; a stale different move is 409.
+        let (status, body) = post(app.clone(), t.id.clone(), tok.clone(), ok_body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["already_transferred"], true);
+        assert_eq!(audit.recent(10).unwrap().len(), 2);
+        assert_eq!(post(app.clone(), t.id.clone(), tok, r#"{"from_subject":"alice","to_subject":"bob2"}"#.into()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// ADR-0025 "flag needs an enforcer" fail-first proof: a hostname an admin
