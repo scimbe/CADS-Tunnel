@@ -26,7 +26,7 @@ license-file = "LICENSE"
 # the CT_AGENT_RELEASE file; the test `every_ct_agent_pin_matches_the_release` fails CI
 # if any pin in the repo disagrees). Used only by ct-agent-tools (optional) and ct-client
 # (dev-dependency) via `workspace = true`.
-ct-agent = { git = "https://github.com/scimbe/ct-agent", tag = "v0.7.40" }
+ct-agent = { git = "https://github.com/scimbe/ct-agent", tag = "v0.8.0" }
 # libp2p connectivity substrate (#121 B2-libp2p-seam / B2-libp2p-tcp / C-circuit-relay /
 # B2-dcutr / D-kademlia). Minimal feature set: tokio runtime, noise (connection security) +
 # yamux (muxer), the stream protocol for raw substreams, `tcp` for the real loopback-TCP

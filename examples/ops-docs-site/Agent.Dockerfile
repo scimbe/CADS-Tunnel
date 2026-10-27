@@ -10,7 +10,7 @@ RUN apt-get update \
 # (every_ct_agent_pin_matches_the_release) scans every Agent.Dockerfile, not just
 # help-site's, and fails the gate if any of them disagree. Bump this file only
 # together with CT_AGENT_RELEASE and every other pin, never on its own.
-ARG CT_AGENT_REF=v0.7.40
+ARG CT_AGENT_REF=v0.8.0
 # 2026-09-02: -c http.version=HTTP/1.1 works around a real, reproduced failure --
 # older git (Debian bookworm's 2.39.5) against github.com's current HTTP/2 responses
 # fails "could not read Username for 'https://github.com': No such device or address" /

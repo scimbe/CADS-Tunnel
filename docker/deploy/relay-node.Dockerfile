@@ -22,7 +22,7 @@
 # the same release; any mismatch, missing file or unknown architecture aborts the build.
 # Pass CT_AGENT_SHA256=<hex> to additionally pin the expected digest out of band.
 FROM debian:bookworm-slim AS fetch
-ARG CT_AGENT_REF=v0.7.40
+ARG CT_AGENT_REF=v0.8.0
 ARG CT_AGENT_SHA256=
 ARG TARGETARCH
 RUN apt-get update \
