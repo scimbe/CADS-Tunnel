@@ -31,6 +31,7 @@ pub mod host_info;
 /// `rendezvous.rs`).
 #[cfg(any(test, feature = "test-support"))]
 pub mod http;
+pub mod installations;
 pub mod installer;
 pub mod issuance;
 pub mod keycloak_admin;

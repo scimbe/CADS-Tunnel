@@ -53,6 +53,9 @@ futures = "0.3"
 # Browser-Plane login gate (#382-follow): keycloak_admin.rs's temporary-password
 # generation for a freshly provisioned account.
 base64 = "0.22"
+# WP6 installations: NFKC-normalise value/key text before the secret filter (fullwidth
+# lookalikes). Already resolved in this workspace's Cargo.lock (via idna/url).
+icu_normalizer = "2.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

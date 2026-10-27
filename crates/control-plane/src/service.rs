@@ -4572,7 +4572,7 @@ pub(crate) fn subject_of(
 /// portal session cookie is itself minted only after a real OIDC login (`portal_callback`)
 /// -- accepting it here is accepting the SAME verified identity via its second, browser-
 /// native delivery mechanism, not a weaker check.
-fn subject_of_topology(
+pub(crate) fn subject_of_topology(
     session_key: &[u8],
     verifier: &OidcVerifierHandle,
     headers: &HeaderMap,
@@ -6414,7 +6414,7 @@ fn path_has_prefix(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-fn is_same_origin_request(headers: &HeaderMap) -> bool {
+pub(crate) fn is_same_origin_request(headers: &HeaderMap) -> bool {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(site) = header("sec-fetch-site") {
         return matches!(site, "same-origin" | "none");
@@ -7013,6 +7013,8 @@ pub fn persistent_control_plane_router(
         // Real self-service M2M credentials (2026-08-04): same DB file as every
         // other store here, its own table.
         let service_accounts = Arc::new(SqliteServiceAccountStore::open(db_path)?);
+        // WP6: "Meine Installationen", account-bound (ledger account of the OIDC subject).
+        let installations = Arc::new(crate::installations::SqliteInstallationStore::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -7046,6 +7048,8 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                installations.clone(),
+                ledger.clone(),
                 domain_admin_config.edge_admin.clone(),
                 Some(edge_mesh.clone()),
             ))
@@ -7061,6 +7065,7 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                installations.clone(),
                 managed_domains.clone(),
                 domain_admin_config.clone(),
                 // ADR-0025 Decision 6: read-only observability config -- `edge_mesh`
@@ -7094,6 +7099,12 @@ pub fn persistent_control_plane_router(
                 oidc.clone(),
                 Arc::from(session_key),
                 crate::keycloak_admin::KeycloakAdminConfig::from_env(),
+            ))
+            .merge(crate::installations::authed_installations_router(
+                installations.clone(),
+                ledger.clone(),
+                oidc.clone(),
+                Arc::from(session_key),
             ))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
