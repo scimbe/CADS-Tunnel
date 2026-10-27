@@ -247,12 +247,12 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> io::Result<Vec<u8
 /// poisoned. Deliberately not `lock_safe`: a panic mid-`write_message` may have left
 /// the nonce counter torn, and reusing it risks nonce reuse, so this must fail closed
 /// (#775 item 6) instead of recovering the guard or cascading the panic.
-fn lock_session(ts: &Mutex<snow::TransportState>) -> io::Result<std::sync::MutexGuard<'_, snow::TransportState>> {
+pub(crate) fn lock_session(ts: &Mutex<snow::TransportState>) -> io::Result<std::sync::MutexGuard<'_, snow::TransportState>> {
     ts.lock()
         .map_err(|_| io::Error::other("noise session state poisoned by an earlier panic; closing this session"))
 }
 
-fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8]) -> io::Result<usize> {
     let len = lock_session(ts)?
         .write_message(plaintext, &mut ct[2..])
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -264,7 +264,7 @@ fn seal_frame(ts: &Mutex<snow::TransportState>, plaintext: &[u8], ct: &mut [u8])
 /// plaintext buffer that can decrypt any of them: `snow` refuses to decrypt into a
 /// buffer shorter than the record's plaintext. Our own senders use 16 KiB chunks, but
 /// `a2a_send` peers (e.g. `channel_dial::dial_and_call`) may send up to this size.
-const NOISE_MAX_RECORD: usize = u16::MAX as usize;
+pub(crate) const NOISE_MAX_RECORD: usize = u16::MAX as usize;
 
 /// ct-agent#105: same opt-in switch as `a2a::write_message`'s request/response logging
 /// (`crates/common/src/a2a.rs`) -- kept as a separate check here (rather than importing

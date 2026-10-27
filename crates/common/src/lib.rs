@@ -41,6 +41,11 @@ pub mod channel_quic;
 pub mod credential;
 pub mod ct;
 pub mod crew;
+/// ct-agent#299: protocol v2 for A2A channel sessions -- the capability exchange inside the
+/// Noise handshake and the record pump with FIN/FIN_ACK, so a session can tell "the peer
+/// received everything" from "the transport closed cleanly". Negotiated; old peers stay on
+/// the legacy `noise::noise_pump`.
+pub mod delivery;
 pub mod fallback_framing;
 pub mod hex;
 pub mod mcp;
