@@ -699,6 +699,17 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
         .unwrap_or_default()
         .as_secs();
 
+    // WP6 (GDPR): saved installations + revision history are hard-deleted FIRST and this step
+    // is not best-effort: on failure nothing else is touched and the caller sees an error,
+    // never the "deleted" page. Deletion is idempotent, so retrying is safe.
+    if let Err(e) = crate::installations::purge_subject(&st.installations, &st.ledger, subject) {
+        eprintln!("ct-cp: account deletion for {subject}: deleting installations failed: {e}");
+        let body = r#"<h1>Account deletion failed</h1>
+<p class="help">Your saved installations could not be deleted, so your account data has <strong>not</strong> been deleted. Nothing else was changed. Please try again; if it keeps failing, contact support.</p>
+<a class="btn sec" href="/portal/account">Back to account</a>"#;
+        return (StatusCode::INTERNAL_SERVER_ERROR, Html(page("account deletion failed", body, claims.email.as_deref()))).into_response();
+    }
+
     // Real gap found live 2026-08-24: every step below discarded its Result
     // with a bare `let _ =` and no log line, unlike this same file's own
     // established `eprintln!("ct-cp: {context}: {e}")` convention used for
@@ -735,11 +746,6 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
 
     if let Err(e) = st.topologies.delete_all_owned_by(subject) {
         eprintln!("ct-cp: account deletion for {subject}: deleting owned topologies failed: {e}");
-    }
-
-    // WP6 (GDPR): saved installations + revision history, hard-deleted.
-    if let Err(e) = crate::installations::purge_subject(&st.installations, &st.ledger, subject) {
-        eprintln!("ct-cp: account deletion for {subject}: deleting installations failed: {e}");
     }
 
     if let Ok(owned) = st.networks.list(subject) {
@@ -1560,7 +1566,9 @@ async fn admin_ui_delete_account(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    cascade_delete_account(&st, &subject).await;
+    if let Err(e) = cascade_delete_account(&st, &subject).await {
+        return internal_error("admin_ui_delete_account/installations", e).into_response();
+    }
     let _ = st.audit.record(&session.email, "account_delete", Some(&subject), None);
     StatusCode::OK.into_response()
 }
@@ -1569,7 +1577,13 @@ async fn admin_ui_delete_account(
 /// factored out of [`admin_ui_delete_account`] so [`admin_ui_reconcile_accounts`] (#166,
 /// bulk-deleting accounts whose Keycloak identity is confirmed gone) can reuse the exact
 /// same, already-tested revoke/delete-order instead of a second hand-rolled copy.
-async fn cascade_delete_account(st: &AdminUiState, subject: &str) {
+///
+/// WP6 (GDPR): the installations purge runs FIRST and is not best-effort. If it fails, nothing
+/// else is touched, the ledger row stays (it is the only link from `subject` to the
+/// installations), and the caller must report the failure, not success. Retrying is safe.
+async fn cascade_delete_account(st: &AdminUiState, subject: &str) -> Result<(), String> {
+    crate::installations::purge_subject(&st.installations, &st.ledger, subject)
+        .map_err(|e| format!("deleting installations of {subject} failed: {e}"))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1615,14 +1629,10 @@ async fn cascade_delete_account(st: &AdminUiState, subject: &str) {
             }
         }
     }
-    // WP6 (GDPR): must run BEFORE the ledger row goes, or the subject -> account link is lost
-    // and the installations would be orphaned for good.
-    if let Err(e) = crate::installations::purge_subject(&st.installations, &st.ledger, subject) {
-        eprintln!("ct-cp: admin account deletion for {subject}: deleting installations failed: {e}");
-    }
     if let Err(e) = st.ledger.delete_account_for_subject(subject) {
         eprintln!("ct-cp: admin account deletion for {subject}: removing ledger row failed: {e}");
     }
+    Ok(())
 }
 
 /// `POST /admin-ui/accounts/reconcile` (#166): bulk-delete every ledger account whose
@@ -1677,9 +1687,16 @@ async fn admin_ui_reconcile_accounts(State(st): State<AdminUiState>, headers: He
     for (subject, exists) in verdicts {
         match exists {
             Ok(false) => {
-                cascade_delete_account(&st, &subject).await;
-                let _ = st.audit.record(&session.email, "account_reconcile_delete", Some(&subject), None);
-                deleted.push(subject);
+                match cascade_delete_account(&st, &subject).await {
+                    Ok(()) => {
+                        let _ = st.audit.record(&session.email, "account_reconcile_delete", Some(&subject), None);
+                        deleted.push(subject);
+                    }
+                    Err(e) => {
+                        eprintln!("ct-cp: admin_ui_reconcile_accounts: {e}; account kept");
+                        skipped_errors += 1;
+                    }
+                }
             }
             Ok(true) => {}
             Err(e) => {
@@ -9821,6 +9838,106 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{db_s}{suffix}"));
         }
+    }
+
+    #[tokio::test]
+    async fn delete_account_fails_visibly_when_the_installations_purge_fails() {
+        use crate::installations::{CreateOutcome, SqliteInstallationStore};
+        let installations = Arc::new(SqliteInstallationStore::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let alice = ledger.account_for_subject("kc-alice").unwrap();
+        let CreateOutcome::Created(rec) = installations.create(&alice, &sample_installation("keep"), 1).unwrap() else { panic!() };
+        installations.break_for_test();
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        tunnels.create("kc-alice", "t", None).unwrap();
+        let app = account_delete_router(
+            KEY,
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            installations.clone(),
+            ledger.clone(),
+            None,
+            None,
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("cookie", session_header("kc-alice"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8_lossy(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).into_owned();
+        assert!(body.contains("has <strong>not</strong> been deleted"), "{body}");
+        assert!(!body.contains("has been deleted"), "never claims success");
+        assert_eq!(tunnels.list_for_subject("kc-alice").unwrap().len(), 1, "nothing else was touched");
+        assert!(installations.get(&alice, &rec.id).unwrap().is_some(), "the record is still there, and the user was told");
+    }
+
+    fn admin_app_with_installations() -> (Router, Arc<SqliteLedger>, Arc<crate::installations::SqliteInstallationStore>) {
+        let admin_store = Arc::new(crate::storage::SqliteAdminStore::open_in_memory().unwrap());
+        let admin = Arc::new(crate::admin_identity::AdminIdentity::new(admin_store, SUPER_ADMIN));
+        admin.ensure_super_admin_seeded().unwrap();
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let installations = Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap());
+        let app = admin_ui_router(
+            KEY,
+            admin,
+            Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap()),
+            ledger.clone(),
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            installations.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+            ObservabilityConfig::default(),
+        );
+        (app, ledger, installations)
+    }
+
+    #[tokio::test]
+    async fn admin_delete_purges_installations_before_the_ledger_row_goes() {
+        use crate::installations::{CreateOutcome, UpdateOutcome};
+        let (app, ledger, installations) = admin_app_with_installations();
+        let target = ledger.account_for_subject("kc-target").unwrap();
+        let other = ledger.account_for_subject("kc-other").unwrap();
+        for acct in [&target, &other] {
+            let CreateOutcome::Created(rec) = installations.create(acct, &sample_installation("i"), 1).unwrap() else { panic!() };
+            assert!(matches!(installations.update(acct, &rec.id, 1, &sample_installation("j"), 2).unwrap(), UpdateOutcome::Updated(_)));
+        }
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/delete", &super_session, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(installations.list(&target, None, 10, 0).unwrap().1, 0);
+        assert!(installations.export_all(&target).unwrap().is_empty());
+        let (_, total_removed) = installations.list(&target, Some(crate::installations::Status::Removed), 10, 0).unwrap();
+        assert_eq!(total_removed, 0);
+        assert_eq!(installations.list(&other, None, 10, 0).unwrap().1, 1, "another account is untouched");
+        assert_ne!(ledger.account_for_subject("kc-target").unwrap().0, target.0, "ledger row gone");
+    }
+
+    #[tokio::test]
+    async fn admin_delete_keeps_the_account_and_errors_when_the_installations_purge_fails() {
+        use crate::installations::CreateOutcome;
+        let (app, ledger, installations) = admin_app_with_installations();
+        let target = ledger.account_for_subject("kc-target").unwrap();
+        let CreateOutcome::Created(rec) = installations.create(&target, &sample_installation("i"), 1).unwrap() else { panic!() };
+        installations.break_for_test();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+        let status = admin_ui_req(&app, "POST", "/admin-ui/accounts/kc-target/delete", &super_session, None).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(ledger.account_for_subject("kc-target").unwrap().0, target.0, "ledger row kept: it is the only link to the data");
+        assert!(installations.get(&target, &rec.id).unwrap().is_some());
     }
 
     #[tokio::test]
