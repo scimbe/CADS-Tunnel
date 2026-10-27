@@ -2295,6 +2295,33 @@ pub struct TransferReport {
     pub target_owned_after: u32,
 }
 
+/// How [`SqliteChannelStore::transfer_channel`] resolved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TransferChannelOutcome {
+    /// Ownership moved `from_subject` -> `to_subject` in one transaction.
+    Transferred(ChannelTransferReport),
+    /// Idempotent re-run: the channel is already owned by `to_subject`. Nothing written.
+    AlreadyOwnedByTarget,
+    /// No channel with that id.
+    NotFound,
+    /// The channel exists but its current owner is neither `from_subject` nor the
+    /// target. Nothing written. The actual owner is deliberately not returned.
+    OwnerMismatch,
+    /// The `target_exists` check, evaluated inside the transaction, said the target
+    /// account does not exist. Nothing written.
+    TargetMissing,
+}
+
+/// What a successful [`SqliteChannelStore::transfer_channel`] changed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChannelTransferReport {
+    /// Members of the channel (unchanged by the transfer; reported as evidence).
+    pub member_count: u32,
+    /// Channels `to_subject` owns after the transfer (the target's `max_channels` is
+    /// deliberately NOT enforced for an admin transfer).
+    pub target_owned_after: u32,
+}
+
 /// How [`SqliteChannelStore::register_channel_if_under_owned_limit`] resolved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisterChannelOutcome {
@@ -6106,6 +6133,71 @@ impl SqliteChannelStore {
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    /// Operator/admin: move ownership of `channel` from `from_subject` to `to_subject`.
+    /// The ONLY column that changes is `channels.owner`; `channel` and `operator` (the
+    /// operator PUBLIC key every grant verifies against, and the edge's admission lookup
+    /// via [`Self::authorize_holder`]) are untouched, so live members and every already
+    /// issued grant keep working with no re-registration.
+    ///
+    /// Per-table decisions (every dependent table is keyed on `channel`, none on the
+    /// owner, so none needs a write):
+    /// * `channel_members` -- stays (this is the admission set; it must not drop).
+    /// * `channel_grant_revocations`, `channel_grant_deposits` -- stay (channel-keyed;
+    ///   the deposit/revoke routes gate on `channels.owner`, i.e. on the new owner now).
+    /// * `channel_member_subjects` -- stays (maps a member's own portal subject).
+    /// * `channel_allowlist` -- stays; `added_by` is history and is NOT rewritten.
+    /// * `channel_claim_invites` -- stay; a pending invite remains redeemable (redeem
+    ///   adds the member on behalf of the channel's current owner), `minted_by` is
+    ///   history.
+    /// * per-owner quota: `max_channels` is counted live from `channels.owner`, so it
+    ///   follows implicitly; the target's limit is NOT enforced (admin override, like
+    ///   [`SqliteTunnelStore::transfer_tunnel`]).
+    /// * topologies (`topology_edges.channel_id`) -- live in the tunnel store, keyed by the
+    ///   topology owner and by channel id; they stay with their topology owner.
+    ///
+    /// One `IMMEDIATE` transaction: the owner check and the `target_exists` check (the
+    /// ledger is a separate store, so it cannot join; it runs inside the transaction right
+    /// before the write) cannot race a concurrent transfer/delete. Idempotent: already
+    /// owned by `to_subject` -> [`TransferChannelOutcome::AlreadyOwnedByTarget`].
+    pub fn transfer_channel(
+        &self,
+        channel: &ChannelId,
+        from_subject: &str,
+        to_subject: &str,
+        target_exists: impl FnOnce() -> rusqlite::Result<bool>,
+    ) -> rusqlite::Result<TransferChannelOutcome> {
+        let mut guard = self.writer.lock_safe();
+        let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx
+            .query_row("SELECT owner FROM channels WHERE channel = ?1", params![&channel.0[..]], |r| r.get(0))
+            .optional()?;
+        let Some(owner) = owner else {
+            return Ok(TransferChannelOutcome::NotFound);
+        };
+        if owner == to_subject {
+            return Ok(TransferChannelOutcome::AlreadyOwnedByTarget);
+        }
+        if owner != from_subject {
+            return Ok(TransferChannelOutcome::OwnerMismatch);
+        }
+        if !target_exists()? {
+            return Ok(TransferChannelOutcome::TargetMissing);
+        }
+        tx.execute(
+            "UPDATE channels SET owner = ?1 WHERE channel = ?2 AND owner = ?3",
+            params![to_subject, &channel.0[..], from_subject],
+        )?;
+        let member_count: u32 = tx.query_row(
+            "SELECT COUNT(*) FROM channel_members WHERE channel = ?1",
+            params![&channel.0[..]],
+            |r| r.get(0),
+        )?;
+        let target_owned_after: u32 =
+            tx.query_row("SELECT COUNT(*) FROM channels WHERE owner = ?1", params![to_subject], |r| r.get(0))?;
+        tx.commit()?;
+        Ok(TransferChannelOutcome::Transferred(ChannelTransferReport { member_count, target_owned_after }))
     }
 
     /// Add `holder` as a member of `channel`, pinning its X25519 Noise static key
@@ -12995,6 +13087,135 @@ mod tests {
         assert!(store.owns(&winners[0], &t.id).unwrap());
         let owners: usize = targets.iter().filter(|s| store.owns(s, &t.id).unwrap()).count();
         assert_eq!(owners, 1, "exactly one owner afterwards");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== admin channel transfer =====
+
+    fn channel_rows(s: &SqliteChannelStore, ch: &ChannelId) -> Vec<i64> {
+        CHANNEL_DEPENDENT_TABLES
+            .iter()
+            .map(|t| {
+                s.writer
+                    .lock_safe()
+                    .query_row(&format!("SELECT COUNT(*) FROM {t} WHERE channel = ?1"), params![&ch.0[..]], |r| r.get(0))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transfer_channel_moves_only_the_owner_and_leaves_operator_members_and_grants_working() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x41; 32]);
+        let other = ChannelId([0x42; 32]);
+        let op = [0x51u8; 32];
+        let (m1, m2) = ([0xa1u8; 32], [0xa2u8; 32]);
+        assert!(s.register_channel(&ch, &op, "alice").unwrap());
+        assert!(s.register_channel(&other, &[0x52u8; 32], "alice").unwrap());
+        assert!(s.add_member(&ch, "alice", &m1, &[0xb1u8; 32], &[0u8; 64]).unwrap());
+        assert!(s.allowlist_add(&ch, "alice", "nat@example.com", 1_000).unwrap());
+        assert!(s.claim_via_allowlist(&ch, "nat@example.com", &m2, &[0xb2u8; 32], &[0u8; 64], 2_000, Some("subj-nat")).unwrap().claimed());
+        assert_eq!(s.deposit_grant(&ch, "alice", &m2, "aa", 2_100).unwrap(), GrantDepositOutcome::Deposited);
+        assert_eq!(s.revoke_grant(&ch, &[0x77u8; 32], 9_999_999_999, 2_200).unwrap(), Some(true));
+        let (token, _) = s.mint_claim_invite(&ch, "alice", &[0xa3u8; 32], &[0xb3u8; 32], &[0u8; 64], Some("l"), 2_300).unwrap().unwrap();
+        let before = channel_rows(&s, &ch);
+        assert!(before.iter().all(|n| *n >= 1), "fixture fills every dependent table: {before:?}");
+
+        let out = s.transfer_channel(&ch, "alice", "bob", || Ok(true)).unwrap();
+        assert_eq!(
+            out,
+            TransferChannelOutcome::Transferred(ChannelTransferReport { member_count: 2, target_owned_after: 1 })
+        );
+
+        // Owner flipped; her other channel stays hers.
+        assert_eq!(s.channel_owner(&ch).unwrap().as_deref(), Some("bob"));
+        assert_eq!(s.channels_owned_by("bob").unwrap(), vec![ch.clone()]);
+        assert_eq!(s.channels_owned_by("alice").unwrap(), vec![other]);
+        // Operator key and admission unchanged (the edge's lookup).
+        assert_eq!(s.operator_pubkey(&ch).unwrap(), Some(op));
+        assert_eq!(s.authorize_holder(&ch, &m1).unwrap(), Some(op));
+        assert_eq!(s.authorize_holder(&ch, &m2).unwrap(), Some(op));
+        // Every dependent table byte-for-byte the same row counts; history not rewritten.
+        assert_eq!(channel_rows(&s, &ch), before);
+        assert_eq!(s.deposited_grants_for_subject(&ch, "subj-nat").unwrap(), vec![(m2, Some("aa".to_string()))]);
+        // A pending invite minted by the old owner is still redeemable.
+        assert!(matches!(s.claim_invite(&token, 2_400).unwrap(), ClaimInviteLookup::Valid(_)));
+        // Owner-gated operations moved with the owner.
+        assert!(!s.add_member(&ch, "alice", &[0xa4u8; 32], &[0u8; 32], &[0u8; 64]).unwrap());
+        assert!(s.add_member(&ch, "bob", &[0xa4u8; 32], &[0u8; 32], &[0u8; 64]).unwrap());
+        assert_eq!(s.members_of(&ch, "alice").unwrap(), None);
+        assert_eq!(s.members_of(&ch, "bob").unwrap().map(|m| m.len()), Some(3));
+        assert_eq!(s.deposit_grant(&ch, "alice", &m1, "bb", 3_000).unwrap(), GrantDepositOutcome::NotOwner);
+        assert_eq!(s.deposit_grant(&ch, "bob", &m1, "bb", 3_000).unwrap(), GrantDepositOutcome::Deposited);
+    }
+
+    #[test]
+    fn transfer_channel_wrong_owner_unknown_target_missing_and_repeat_write_nothing() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let ch = ChannelId([0x43; 32]);
+        assert!(s.register_channel(&ch, &[0x53u8; 32], "alice").unwrap());
+        assert_eq!(s.transfer_channel(&ch, "mallory", "bob", || Ok(true)).unwrap(), TransferChannelOutcome::OwnerMismatch);
+        assert_eq!(s.transfer_channel(&ChannelId([9; 32]), "alice", "bob", || Ok(true)).unwrap(), TransferChannelOutcome::NotFound);
+        assert_eq!(s.transfer_channel(&ch, "alice", "ghost", || Ok(false)).unwrap(), TransferChannelOutcome::TargetMissing);
+        assert_eq!(s.channel_owner(&ch).unwrap().as_deref(), Some("alice"), "refusals changed nothing");
+
+        assert!(matches!(s.transfer_channel(&ch, "alice", "bob", || Ok(true)).unwrap(), TransferChannelOutcome::Transferred(_)));
+        assert_eq!(s.transfer_channel(&ch, "alice", "bob", || Ok(true)).unwrap(), TransferChannelOutcome::AlreadyOwnedByTarget);
+        // The target check is not even consulted for an idempotent repeat.
+        assert_eq!(s.transfer_channel(&ch, "alice", "bob", || Ok(false)).unwrap(), TransferChannelOutcome::AlreadyOwnedByTarget);
+        // A different stale request (old owner -> third party) is still refused.
+        assert_eq!(s.transfer_channel(&ch, "alice", "carol", || Ok(true)).unwrap(), TransferChannelOutcome::OwnerMismatch);
+        assert_eq!(s.channel_owner(&ch).unwrap().as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn transfer_channel_ignores_the_targets_owned_channel_limit() {
+        let s = SqliteChannelStore::open_in_memory().unwrap();
+        let mine = ChannelId([0x44; 32]);
+        let ch = ChannelId([0x45; 32]);
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&mine, &[1u8; 32], "bob", 1, false).unwrap(),
+            RegisterChannelOutcome::Registered
+        );
+        assert!(s.register_channel(&ch, &[2u8; 32], "alice").unwrap());
+        match s.transfer_channel(&ch, "alice", "bob", || Ok(true)).unwrap() {
+            TransferChannelOutcome::Transferred(r) => assert_eq!(r.target_owned_after, 2, "admin override above limit 1"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            s.register_channel_if_under_owned_limit(&ChannelId([0x46; 32]), &[3u8; 32], "bob", 1, false).unwrap(),
+            RegisterChannelOutcome::OverLimit
+        );
+    }
+
+    #[test]
+    fn concurrent_transfers_of_one_channel_have_exactly_one_winner() {
+        let dir = std::env::temp_dir().join(format!("ct-chtransfer-{}-{:x}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.db");
+        let store = std::sync::Arc::new(SqliteChannelStore::open(path.to_str().unwrap()).unwrap());
+        let ch = ChannelId([0x47; 32]);
+        assert!(store.register_channel(&ch, &[4u8; 32], "alice").unwrap());
+        assert!(store.add_member(&ch, "alice", &[0xa1u8; 32], &[0u8; 32], &[0u8; 64]).unwrap());
+        let targets = ["bob", "carol", "dave", "erin"];
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|to| {
+                let (store, ch, to) = (store.clone(), ch.clone(), to.to_string());
+                std::thread::spawn(move || (to.clone(), store.transfer_channel(&ch, "alice", &to, || Ok(true)).unwrap()))
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, o)| matches!(o, TransferChannelOutcome::Transferred(_)))
+            .map(|(to, _)| to.clone())
+            .collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert!(results.iter().filter(|(to, _)| *to != winners[0]).all(|(_, o)| *o == TransferChannelOutcome::OwnerMismatch));
+        assert_eq!(store.channel_owner(&ch).unwrap().as_deref(), Some(winners[0].as_str()));
+        assert!(store.is_member(&ch, &[0xa1u8; 32]).unwrap(), "member untouched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

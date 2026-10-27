@@ -324,6 +324,7 @@ pub fn portal_api_router_with_verifier(
         .route("/admin/accounts/:subject/max-tunnels", post(admin_set_max_tunnels))
         .route("/admin/accounts/:subject/max-channels", post(admin_set_max_channels))
         .route("/admin/tunnels/:id/transfer", post(admin_transfer_tunnel))
+        .route("/admin/channels/:channel/transfer", post(admin_transfer_channel))
         // #778/#783: uptime page, badge routes, usage page + CSV (see `uptime.rs`).
         .merge(uptime::routes())
         .merge(fleet::routes())
@@ -663,6 +664,114 @@ async fn admin_transfer_tunnel(
         to_subject: to.to_string(),
         already_transferred: already,
         cleared_topology_id: cleared,
+        target_owned_after: owned_after,
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct TransferChannelReq {
+    /// The owner the operator expects right now. Required: refused (409) unless it
+    /// matches, so a stale channel id can never move the wrong channel.
+    from_subject: String,
+    /// The new owner's OIDC `sub`. Must already have an account in the ledger.
+    to_subject: String,
+    /// Optional operator note (<= 200 chars), written to the audit entries.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TransferChannelResp {
+    channel: String,
+    from_subject: String,
+    to_subject: String,
+    /// `true` when the channel already belonged to `to_subject` (idempotent re-run).
+    already_transferred: bool,
+    /// Members of the channel, untouched by the transfer.
+    member_count: Option<u32>,
+    /// Channels `to_subject` owns afterwards (its limit is not enforced here).
+    target_owned_after: Option<u32>,
+}
+
+/// `POST /admin/channels/:channel/transfer {from_subject, to_subject, reason?}`
+/// (operator-only, same `x-ct-admin-token` gate and semantics as
+/// [`admin_transfer_tunnel`]): move an Agent-Fabric channel to another account. Operator
+/// key, members, grants and revocations are untouched, so live participants keep working.
+/// See [`SqliteChannelStore::transfer_channel`] for the per-table decisions. 401 bad token
+/// (checked before the body is parsed), 404 unknown channel, 409 `from_subject` is not the
+/// current owner, 400 malformed, 422 target subject has no account yet. A repeat answers
+/// 200 with `already_transferred: true`. Audited as `channel_transferred` once per subject.
+async fn admin_transfer_channel(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(channel_hex): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(code) = admin_authed(&headers, st.admin_token) {
+        return code.into_response();
+    }
+    let req: TransferChannelReq = match parse_admin_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let Some(raw) = ct_common::hex::decode_32(&channel_hex) else {
+        return (StatusCode::BAD_REQUEST, "channel must be 64 hex chars").into_response();
+    };
+    let channel = ct_common::channel::ChannelId(raw);
+    let from = req.from_subject.trim();
+    let to = req.to_subject.trim();
+    if from.is_empty() || to.is_empty() || from == to {
+        return (StatusCode::BAD_REQUEST, "from_subject and to_subject must be set and differ").into_response();
+    }
+    use crate::storage::TransferChannelOutcome as Out;
+    let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if reason.is_some_and(|r| r.chars().count() > 200) {
+        return (StatusCode::BAD_REQUEST, "reason must be at most 200 characters").into_response();
+    }
+    let ledger = st.ledger.clone();
+    let target_exists = || {
+        ledger
+            .account_if_exists(to)
+            .map(|a| a.is_some())
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+    };
+    let (already, members, owned_after) = match st.channels.transfer_channel(&channel, from, to, target_exists) {
+        Ok(Out::Transferred(r)) => (false, Some(r.member_count), Some(r.target_owned_after)),
+        Ok(Out::AlreadyOwnedByTarget) => (true, None, None),
+        Ok(Out::NotFound) => return (StatusCode::NOT_FOUND, "unknown channel").into_response(),
+        Ok(Out::OwnerMismatch) => {
+            return (StatusCode::CONFLICT, "from_subject is not the current owner of this channel").into_response()
+        }
+        Ok(Out::TargetMissing) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "to_subject has no account yet (it must log in to the portal once)")
+                .into_response()
+        }
+        Err(e) => return internal_error("admin_transfer_channel/transfer", e).into_response(),
+    };
+    if !already {
+        let reason_note = reason.map(|r| format!(" reason={r:?}")).unwrap_or_default();
+        eprintln!("ct-cp: admin transfer channel {channel_hex} {from} -> {to}{reason_note}");
+        if let Some(audit) = &st.audit {
+            let entries = [
+                (from, format!("channel={channel_hex} direction=out to={to}{reason_note}")),
+                (to, format!("channel={channel_hex} direction=in from={from}{reason_note}")),
+            ];
+            for (target, detail) in entries {
+                if let Err(e) = audit.record("admin-token", "channel_transferred", Some(target), Some(&detail)) {
+                    eprintln!("ct-cp: WARNING -- audit write for channel_transferred (channel {channel_hex}, target {target}) failed: {e}; the transfer itself was applied");
+                }
+            }
+        } else {
+            eprintln!("ct-cp: WARNING -- no audit log configured; channel_transferred for {channel_hex} was not recorded");
+        }
+    }
+    Json(TransferChannelResp {
+        channel: channel_hex,
+        from_subject: from.to_string(),
+        to_subject: to.to_string(),
+        already_transferred: already,
+        member_count: members,
         target_owned_after: owned_after,
     })
     .into_response()
@@ -11394,6 +11503,161 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["already_transferred"], true);
         assert_eq!(audit.recent(10).unwrap().len(), 2);
         assert_eq!(post(app.clone(), t.id.clone(), tok, r#"{"from_subject":"alice","to_subject":"bob2"}"#.into()).await.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn admin_transfer_channel_is_gated_moves_ownership_and_audits_both_subjects() {
+        use crate::oidc::OidcVerifierHandle;
+        use crate::storage::SqliteChannelStore;
+        use ed25519_dalek::{Signer, SigningKey};
+        let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let secret = [0x56u8; 32];
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let audit = Arc::new(crate::audit_log::SqliteAuditLog::open_in_memory().unwrap());
+        let build = |admin: Option<[u8; 32]>| {
+            portal_api_router_with_verifier(
+                KEY,
+                ledger.clone(),
+                Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+                Arc::new(SqliteEnrollment::open_in_memory().unwrap()),
+                Arc::new(SqliteBootstrap::open_in_memory().unwrap()),
+                "https://portal.example",
+                None,
+                None,
+                None,
+                None,
+                test_edge_mesh(),
+                admin,
+                None,
+                Some(audit.clone()),
+                None,
+                channels.clone(),
+            )
+        };
+        let app = build(Some(secret));
+        // The member-facing /me/channels API on the SAME store and session key.
+        let me = crate::service::authed_channel_router(
+            channels.clone(),
+            OidcVerifierHandle::new(None),
+            Arc::from(KEY),
+            ledger.clone(),
+            None,
+        );
+        let me_req = |method: &str, path: String, subject: &str, body: Option<String>| {
+            let req = Request::builder().method(method).uri(path).header("cookie", session_header(subject));
+            let req = if body.is_some() { req.header("content-type", "application/json") } else { req };
+            me.clone().oneshot(req.body(Body::from(body.unwrap_or_default())).unwrap())
+        };
+
+        let ch = "c7".repeat(32);
+        let chan = ct_common::channel::ChannelId(ct_common::hex::decode_32(&ch).unwrap());
+        let op = [0x19u8; 32];
+        assert!(channels.register_channel(&chan, &op, "alice").unwrap());
+        let sk = SigningKey::from_bytes(&[0x3au8; 32]);
+        let holder = sk.verifying_key().to_bytes();
+        let existing_att = sk.sign(&ct_common::channel::member_noise_attest_bytes(&chan, &holder, &[0x6fu8; 32])).to_bytes();
+        assert!(channels.add_member(&chan, "alice", &holder, &[0x6fu8; 32], &existing_att).unwrap());
+        ledger.account_for_subject("bob").unwrap(); // bob has logged in once
+
+        let post = |app: Router, ch: String, token: Option<String>, body: String| async move {
+            let mut req = Request::post(format!("/admin/channels/{ch}/transfer")).header("content-type", "application/json");
+            if let Some(t) = token {
+                req = req.header("x-ct-admin-token", t);
+            }
+            let resp = app.oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        };
+        let ok_body = r#"{"from_subject":"alice","to_subject":"bob"}"#.to_string();
+
+        // Auth: no token / wrong token -> 401; admin route unconfigured -> 404.
+        assert_eq!(post(app.clone(), ch.clone(), None, ok_body.clone()).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(post(app.clone(), ch.clone(), Some(hex(&[1u8; 32])), ok_body.clone()).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(post(build(None), ch.clone(), Some(hex(&secret)), ok_body.clone()).await.0, StatusCode::NOT_FOUND);
+        // Auth runs BEFORE the body is parsed: garbage / empty / wrong content-type -> still 401.
+        for (body, ctype) in [("garbage", None), ("{}", None), ("", Some("application/json")), ("not json", Some("text/plain"))] {
+            for token in [None, Some(hex(&[1u8; 32]))] {
+                let mut req = Request::post(format!("/admin/channels/{ch}/transfer"));
+                if let Some(c) = ctype {
+                    req = req.header("content-type", c);
+                }
+                if let Some(t) = token {
+                    req = req.header("x-ct-admin-token", t);
+                }
+                let resp = app.clone().oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "body={body:?}");
+            }
+        }
+        assert_eq!(channels.channel_owner(&chan).unwrap().as_deref(), Some("alice"), "refused calls changed nothing");
+
+        let tok = Some(hex(&secret));
+        // Validation / refusals.
+        let bad = Request::post(format!("/admin/channels/{ch}/transfer"))
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from("garbage"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), ch.clone(), tok.clone(), r#"{"from_subject":"alice"}"#.into()).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), ch.clone(), tok.clone(), r#"{"from_subject":"alice","to_subject":"alice"}"#.into()).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), "zz".into(), tok.clone(), ok_body.clone()).await.0, StatusCode::BAD_REQUEST);
+        let long = format!(r#"{{"from_subject":"alice","to_subject":"bob","reason":"{}"}}"#, "x".repeat(201));
+        assert_eq!(post(app.clone(), ch.clone(), tok.clone(), long).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(post(app.clone(), ch.clone(), tok.clone(), r#"{"from_subject":"alice","to_subject":"never-logged-in"}"#.into()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(post(app.clone(), ch.clone(), tok.clone(), r#"{"from_subject":"mallory","to_subject":"bob"}"#.into()).await.0, StatusCode::CONFLICT);
+        assert_eq!(post(app.clone(), "ab".repeat(32), tok.clone(), ok_body.clone()).await.0, StatusCode::NOT_FOUND);
+        assert!(audit.recent(10).unwrap().is_empty(), "no audit entry for refused calls");
+        assert_eq!(channels.channel_owner(&chan).unwrap().as_deref(), Some("alice"));
+
+        // Before: alice owns (200 on members list), bob is refused.
+        assert_eq!(me_req("GET", format!("/me/channels/{ch}/members"), "alice", None).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(me_req("GET", format!("/me/channels/{ch}/members"), "bob", None).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        // Happy path.
+        let with_reason = r#"{"from_subject":"alice","to_subject":"bob","reason":"Konto-Umzug 2026-10"}"#.to_string();
+        let (status, body) = post(app.clone(), ch.clone(), tok.clone(), with_reason).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["already_transferred"], false);
+        assert_eq!(v["member_count"], 1);
+        assert_eq!(v["target_owned_after"], 1);
+        assert_eq!(channels.operator_pubkey(&chan).unwrap(), Some(op), "operator key unchanged");
+        assert_eq!(channels.authorize_holder(&chan, &holder).unwrap(), Some(op), "existing member still admitted");
+
+        // New owner lists and adds members; old owner is locked out (403).
+        let list = me_req("GET", format!("/me/channels/{ch}/members"), "bob", None).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(listed["members"].as_array().unwrap().len(), 1, "existing member untouched");
+        assert_eq!(listed["members"][0]["holder"], hex(&holder));
+        let sk2 = SigningKey::from_bytes(&[0x3bu8; 32]);
+        let h2 = sk2.verifying_key().to_bytes();
+        let nk2 = [0x70u8; 32];
+        let att2 = sk2.sign(&ct_common::channel::member_noise_attest_bytes(&chan, &h2, &nk2)).to_bytes();
+        let add_body = format!(r#"{{"holder":"{}","noise_pubkey":"{}","noise_attestation":"{}"}}"#, hex(&h2), hex(&nk2), att2.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        assert_eq!(me_req("POST", format!("/me/channels/{ch}/members"), "alice", Some(add_body.clone())).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(me_req("GET", format!("/me/channels/{ch}/members"), "alice", None).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(me_req("POST", format!("/me/channels/{ch}/members"), "bob", Some(add_body)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(channels.members_of(&chan, "bob").unwrap().map(|m| m.len()), Some(2));
+        let mine = me_req("GET", "/me/channels".into(), "bob", None).await.unwrap();
+        let mine: serde_json::Value = serde_json::from_slice(&to_bytes(mine.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(mine["channels"], serde_json::json!([ch]));
+
+        // Audit: one entry per subject, with the reason.
+        let entries = audit.recent(10).unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries.iter().all(|e| e.action == "channel_transferred"));
+        assert!(entries.iter().all(|e| e.detail.as_deref().unwrap_or("").contains("Konto-Umzug 2026-10")));
+        let targets: Vec<_> = entries.iter().filter_map(|e| e.target.clone()).collect();
+        assert!(targets.contains(&"alice".to_string()) && targets.contains(&"bob".to_string()));
+
+        // Idempotent repeat: 200, flagged, no new audit rows; a stale different move is 409.
+        let (status, body) = post(app.clone(), ch.clone(), tok.clone(), ok_body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["already_transferred"], true);
+        assert_eq!(audit.recent(10).unwrap().len(), 2);
+        assert_eq!(post(app.clone(), ch.clone(), tok, r#"{"from_subject":"alice","to_subject":"bob2"}"#.into()).await.0, StatusCode::CONFLICT);
     }
 
     /// ADR-0025 "flag needs an enforcer" fail-first proof: a hostname an admin
