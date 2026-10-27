@@ -4572,7 +4572,7 @@ pub(crate) fn subject_of(
 /// portal session cookie is itself minted only after a real OIDC login (`portal_callback`)
 /// -- accepting it here is accepting the SAME verified identity via its second, browser-
 /// native delivery mechanism, not a weaker check.
-fn subject_of_topology(
+pub(crate) fn subject_of_topology(
     session_key: &[u8],
     verifier: &OidcVerifierHandle,
     headers: &HeaderMap,
@@ -7013,6 +7013,8 @@ pub fn persistent_control_plane_router(
         // Real self-service M2M credentials (2026-08-04): same DB file as every
         // other store here, its own table.
         let service_accounts = Arc::new(SqliteServiceAccountStore::open(db_path)?);
+        // WP6: "Meine Installationen", account-bound (ledger account of the OIDC subject).
+        let installations = Arc::new(crate::installations::SqliteInstallationStore::open(db_path)?);
         app = app
             .merge(authed_billing_router(
                 ledger.clone(),
@@ -7094,6 +7096,12 @@ pub fn persistent_control_plane_router(
                 oidc.clone(),
                 Arc::from(session_key),
                 crate::keycloak_admin::KeycloakAdminConfig::from_env(),
+            ))
+            .merge(crate::installations::authed_installations_router(
+                installations,
+                ledger.clone(),
+                oidc.clone(),
+                Arc::from(session_key),
             ))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
