@@ -2277,6 +2277,9 @@ pub enum TransferTunnelOutcome {
     /// The tunnel exists but its current owner is not `from_subject` (and not the
     /// target either). Nothing written. The actual owner is deliberately not returned.
     OwnerMismatch,
+    /// The `target_exists` check, evaluated inside the transaction, said the target
+    /// account does not exist. Nothing written.
+    TargetMissing,
 }
 
 /// What a successful [`SqliteTunnelStore::transfer_tunnel`] changed.
@@ -3164,6 +3167,9 @@ impl SqliteTunnelStore {
     ///   `admin_provision_tunnel`); the target's existence in the ledger is checked by the
     ///   caller (this store has no ledger).
     ///
+    /// `target_exists` is called inside the transaction after the owner checks and
+    /// before any write (target-account check; no window between check and move).
+    ///
     /// Idempotent: when the tunnel is already owned by `to_subject` the call is a no-op
     /// ([`TransferTunnelOutcome::AlreadyOwnedByTarget`]), so a retried request is safe.
     pub fn transfer_tunnel(
@@ -3171,6 +3177,7 @@ impl SqliteTunnelStore {
         tunnel_id: &str,
         from_subject: &str,
         to_subject: &str,
+        target_exists: impl FnOnce() -> rusqlite::Result<bool>,
     ) -> rusqlite::Result<TransferTunnelOutcome> {
         let mut guard = self.writer.lock_safe();
         let tx = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -3202,6 +3209,12 @@ impl SqliteTunnelStore {
         }
         if owner != from_subject {
             return Ok(TransferTunnelOutcome::OwnerMismatch);
+        }
+        // Evaluated while the IMMEDIATE write lock is held (the ledger is a separate
+        // store, so it cannot join the transaction; the check runs inside it instead,
+        // right before the write).
+        if !target_exists()? {
+            return Ok(TransferTunnelOutcome::TargetMissing);
         }
         tx.execute(
             "UPDATE subject_tunnels SET subject = ?1, topology_id = NULL WHERE id = ?2 AND subject = ?3",
@@ -12847,6 +12860,10 @@ mod tests {
 
     // ===== admin tunnel transfer =====
 
+    fn ok_target() -> rusqlite::Result<bool> {
+        Ok(true)
+    }
+
     fn transferred(o: TransferTunnelOutcome) -> TransferReport {
         match o {
             TransferTunnelOutcome::Transferred(r) => r,
@@ -12870,7 +12887,7 @@ mod tests {
         let link = store.mint_share_link("alice", &t.id, Some("l"), 3600, false, 100).unwrap();
         assert!(matches!(link, ShareLinkMint::Minted { .. }), "{link:?}");
 
-        let report = transferred(store.transfer_tunnel(&t.id, "alice", "bob").unwrap());
+        let report = transferred(store.transfer_tunnel(&t.id, "alice", "bob", ok_target).unwrap());
         assert_eq!(report.tunnel.routing_token, t.routing_token, "routing token unchanged");
         assert_eq!(report.tunnel.hostname, t.hostname, "hostname unchanged");
         assert_eq!(report.cleared_topology_id.as_deref(), Some("alice-topo"));
@@ -12911,19 +12928,28 @@ mod tests {
         let store = SqliteTunnelStore::open_in_memory().unwrap();
         let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
 
-        assert_eq!(store.transfer_tunnel(&t.id, "mallory", "bob").unwrap(), TransferTunnelOutcome::OwnerMismatch);
-        assert_eq!(store.transfer_tunnel("nope", "alice", "bob").unwrap(), TransferTunnelOutcome::NotFound);
+        assert_eq!(store.transfer_tunnel(&t.id, "mallory", "bob", ok_target).unwrap(), TransferTunnelOutcome::OwnerMismatch);
+        assert_eq!(store.transfer_tunnel("nope", "alice", "bob", ok_target).unwrap(), TransferTunnelOutcome::NotFound);
         assert!(store.owns("alice", &t.id).unwrap(), "refusals changed nothing");
 
-        transferred(store.transfer_tunnel(&t.id, "alice", "bob").unwrap());
+        transferred(store.transfer_tunnel(&t.id, "alice", "bob", ok_target).unwrap());
         // Repeating the same request is a no-op, not an error and not a second move.
-        match store.transfer_tunnel(&t.id, "alice", "bob").unwrap() {
+        match store.transfer_tunnel(&t.id, "alice", "bob", ok_target).unwrap() {
             TransferTunnelOutcome::AlreadyOwnedByTarget(x) => assert_eq!(x.routing_token, t.routing_token),
             other => panic!("{other:?}"),
         }
         // A DIFFERENT stale request (old owner -> third party) is still refused.
-        assert_eq!(store.transfer_tunnel(&t.id, "alice", "carol").unwrap(), TransferTunnelOutcome::OwnerMismatch);
+        assert_eq!(store.transfer_tunnel(&t.id, "alice", "carol", ok_target).unwrap(), TransferTunnelOutcome::OwnerMismatch);
         assert!(store.owns("bob", &t.id).unwrap());
+    }
+
+    #[test]
+    fn transfer_tunnel_refuses_inside_the_transaction_when_the_target_is_gone() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
+        let out = store.transfer_tunnel(&t.id, "alice", "ghost", || Ok(false)).unwrap();
+        assert_eq!(out, TransferTunnelOutcome::TargetMissing);
+        assert!(store.owns("alice", &t.id).unwrap(), "nothing moved");
     }
 
     #[test]
@@ -12932,7 +12958,7 @@ mod tests {
         let mine = store.create_if_under_owned_limit("bob", "mine", Some("mine.example.org"), 1).unwrap();
         assert!(matches!(mine, CreateTunnelOutcome::Created(_)));
         let t = store.create("alice", "demo", Some("demo.example.org")).unwrap().created().unwrap();
-        let r = transferred(store.transfer_tunnel(&t.id, "alice", "bob").unwrap());
+        let r = transferred(store.transfer_tunnel(&t.id, "alice", "bob", ok_target).unwrap());
         assert_eq!(r.target_owned_after, 2, "admin override: bob is now above his limit of 1");
         assert!(matches!(
             store.create_if_under_owned_limit("bob", "x", Some("x.example.org"), 1).unwrap(),
@@ -12952,7 +12978,7 @@ mod tests {
             .iter()
             .map(|to| {
                 let (store, id, to) = (store.clone(), t.id.clone(), to.to_string());
-                std::thread::spawn(move || (to.clone(), store.transfer_tunnel(&id, "alice", &to).unwrap()))
+                std::thread::spawn(move || (to.clone(), store.transfer_tunnel(&id, "alice", &to, ok_target).unwrap()))
             })
             .collect();
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();

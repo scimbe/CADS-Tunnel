@@ -430,14 +430,24 @@ fn admin_authed(headers: &HeaderMap, admin_token: Option<[u8; 32]>) -> Result<()
     }
 }
 
+/// Parse an admin route's JSON body. Called only AFTER [`admin_authed`], so an
+/// unauthenticated caller always sees 401/404 and never a body-extractor 415/422.
+fn parse_admin_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
+    serde_json::from_slice(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response())
+}
+
 async fn admin_provision_tunnel(
     State(st): State<ApiState>,
     headers: HeaderMap,
-    Json(req): Json<ProvisionTunnelReq>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(code) = admin_authed(&headers, st.admin_token) {
         return code.into_response();
     }
+    let req: ProvisionTunnelReq = match parse_admin_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let Some(hostname) = ct_common::normalize_hostname(&req.hostname) else {
         return (StatusCode::BAD_REQUEST, "invalid hostname").into_response();
     };
@@ -487,11 +497,15 @@ async fn admin_set_max_tunnels(
     State(st): State<ApiState>,
     headers: HeaderMap,
     Path(subject): Path<String>,
-    Json(req): Json<SetMaxTunnelsReq>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(code) = admin_authed(&headers, st.admin_token) {
         return code.into_response();
     }
+    let req: SetMaxTunnelsReq = match parse_admin_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let account = match st.ledger.account_for_subject(&subject) {
         Ok(a) => a,
         Err(e) => return internal_error("admin_set_max_tunnels/account_for_subject", e).into_response(),
@@ -514,11 +528,15 @@ async fn admin_set_max_channels(
     State(st): State<ApiState>,
     headers: HeaderMap,
     Path(subject): Path<String>,
-    Json(req): Json<SetMaxChannelsReq>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(code) = admin_authed(&headers, st.admin_token) {
         return code.into_response();
     }
+    let req: SetMaxChannelsReq = match parse_admin_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let account = match st.ledger.account_for_subject(&subject) {
         Ok(a) => a,
         Err(e) => return internal_error("admin_set_max_channels/account_for_subject", e).into_response(),
@@ -543,6 +561,9 @@ struct TransferTunnelReq {
     /// says so, instead of being silently ignored.
     #[serde(default)]
     to_email: Option<String>,
+    /// Optional operator note (<= 200 chars), written to the audit entries.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -572,11 +593,15 @@ async fn admin_transfer_tunnel(
     State(st): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(req): Json<TransferTunnelReq>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(code) = admin_authed(&headers, st.admin_token) {
         return code.into_response();
     }
+    let req: TransferTunnelReq = match parse_admin_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     if req.to_email.is_some() {
         return (StatusCode::BAD_REQUEST, "to_email is not supported; pass to_subject (the OIDC sub)").into_response();
     }
@@ -587,41 +612,48 @@ async fn admin_transfer_tunnel(
     if from.is_empty() || from == to {
         return (StatusCode::BAD_REQUEST, "from_subject must be set and differ from to_subject").into_response();
     }
-    match st.ledger.account_if_exists(to) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return (StatusCode::UNPROCESSABLE_ENTITY, "to_subject has no account yet (it must log in to the portal once)")
-                .into_response()
-        }
-        Err(e) => return internal_error("admin_transfer_tunnel/account_if_exists", e).into_response(),
-    }
     use crate::storage::TransferTunnelOutcome as Out;
-    let (tunnel, already, cleared, owned_after) = match st.tunnels.transfer_tunnel(&id, from, to) {
+    let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if reason.is_some_and(|r| r.chars().count() > 200) {
+        return (StatusCode::BAD_REQUEST, "reason must be at most 200 characters").into_response();
+    }
+    let ledger = st.ledger.clone();
+    let target_exists = || {
+        ledger
+            .account_if_exists(to)
+            .map(|a| a.is_some())
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string()))))
+    };
+    let (tunnel, already, cleared, owned_after) = match st.tunnels.transfer_tunnel(&id, from, to, target_exists) {
         Ok(Out::Transferred(r)) => (r.tunnel, false, r.cleared_topology_id, Some(r.target_owned_after)),
         Ok(Out::AlreadyOwnedByTarget(t)) => (t, true, None, None),
         Ok(Out::NotFound) => return (StatusCode::NOT_FOUND, "unknown tunnel").into_response(),
         Ok(Out::OwnerMismatch) => {
             return (StatusCode::CONFLICT, "from_subject is not the current owner of this tunnel").into_response()
         }
+        Ok(Out::TargetMissing) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "to_subject has no account yet (it must log in to the portal once)")
+                .into_response()
+        }
         Err(e) => return internal_error("admin_transfer_tunnel/transfer", e).into_response(),
     };
     if !already {
         let host = tunnel.hostname.as_deref().unwrap_or("-");
         let cleared_note = cleared.as_deref().unwrap_or("-");
-        eprintln!("ct-cp: admin transfer tunnel {id} ({host}) {from} -> {to}");
+        let reason_note = reason.map(|r| format!(" reason={r:?}")).unwrap_or_default();
+        eprintln!("ct-cp: admin transfer tunnel {id} ({host}) {from} -> {to}{reason_note}");
         if let Some(audit) = &st.audit {
-            let _ = audit.record(
-                "admin-token",
-                "tunnel_transferred",
-                Some(from),
-                Some(&format!("tunnel={id} host={host} direction=out to={to} cleared_topology={cleared_note}")),
-            );
-            let _ = audit.record(
-                "admin-token",
-                "tunnel_transferred",
-                Some(to),
-                Some(&format!("tunnel={id} host={host} direction=in from={from}")),
-            );
+            let entries = [
+                (from, format!("tunnel={id} host={host} direction=out to={to} cleared_topology={cleared_note}{reason_note}")),
+                (to, format!("tunnel={id} host={host} direction=in from={from}{reason_note}")),
+            ];
+            for (target, detail) in entries {
+                if let Err(e) = audit.record("admin-token", "tunnel_transferred", Some(target), Some(&detail)) {
+                    eprintln!("ct-cp: WARNING -- audit write for tunnel_transferred (tunnel {id}, target {target}) failed: {e}; the transfer itself was applied");
+                }
+            }
+        } else {
+            eprintln!("ct-cp: WARNING -- no audit log configured; tunnel_transferred for {id} was not recorded");
         }
     }
     Json(TransferTunnelResp {
@@ -11287,6 +11319,35 @@ mod tests {
         assert_eq!(post(build(None), t.id.clone(), Some(hex(&secret)), ok_body.clone()).await.0, StatusCode::NOT_FOUND);
         assert!(tunnels.owns("alice", &t.id).unwrap(), "refused calls changed nothing");
 
+        // Auth runs BEFORE the body is parsed: unauthenticated callers never see 415/422,
+        // whatever they send (no content-type, garbage, empty) -- on every admin route.
+        for path in [
+            format!("/admin/tunnels/{}/transfer", t.id),
+            "/admin/accounts/bob/max-tunnels".to_string(),
+            "/admin/accounts/bob/max-channels".to_string(),
+            "/admin/provision-tunnel".to_string(),
+        ] {
+            for (body, ctype) in [("garbage", None), ("{}", None), ("", Some("application/json")), ("not json", Some("text/plain"))] {
+                for (token, want) in [(None, StatusCode::UNAUTHORIZED), (Some(hex(&[1u8; 32])), StatusCode::UNAUTHORIZED)] {
+                    let mut req = Request::post(&path);
+                    if let Some(c) = ctype {
+                        req = req.header("content-type", c);
+                    }
+                    if let Some(t) = token {
+                        req = req.header("x-ct-admin-token", t);
+                    }
+                    let resp = app.clone().oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+                    assert_eq!(resp.status(), want, "{path} body={body:?}");
+                }
+            }
+        }
+        // Authenticated but malformed body -> 400 (not an extractor 415/422).
+        let bad = Request::post(format!("/admin/tunnels/{}/transfer", t.id))
+            .header("x-ct-admin-token", hex(&secret))
+            .body(Body::from("garbage"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(bad).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
         let tok = Some(hex(&secret));
         // Validation / refusals.
         assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), r#"{"from_subject":"alice","to_email":"b@x.org"}"#.into()).await.0, StatusCode::BAD_REQUEST);
@@ -11299,8 +11360,12 @@ mod tests {
         assert!(tunnels.owns("alice", &t.id).unwrap());
 
         // Happy path.
-        let (status, body) = post(app.clone(), t.id.clone(), tok.clone(), ok_body.clone()).await;
+        let long = format!(r#"{{"from_subject":"alice","to_subject":"bob","reason":"{}"}}"#, "x".repeat(201));
+        assert_eq!(post(app.clone(), t.id.clone(), tok.clone(), long).await.0, StatusCode::BAD_REQUEST);
+        let with_reason = r#"{"from_subject":"alice","to_subject":"bob","reason":"Konto-Umzug 2026-10"}"#.to_string();
+        let (status, body) = post(app.clone(), t.id.clone(), tok.clone(), with_reason).await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(audit.recent(10).unwrap().iter().all(|e| e.detail.as_deref().unwrap_or("").contains("Konto-Umzug 2026-10")), "reason in both audit entries");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["already_transferred"], false);
         assert_eq!(v["hostname"], "demo.example.org");
@@ -11328,7 +11393,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["already_transferred"], true);
         assert_eq!(audit.recent(10).unwrap().len(), 2);
-        assert_eq!(post(app.clone(), t.id.clone(), tok, r#"{"from_subject":"alice","to_subject":"bob2"}"#.into()).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(post(app.clone(), t.id.clone(), tok, r#"{"from_subject":"alice","to_subject":"bob2"}"#.into()).await.0, StatusCode::CONFLICT);
     }
 
     /// ADR-0025 "flag needs an enforcer" fail-first proof: a hostname an admin
