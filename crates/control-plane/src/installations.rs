@@ -16,6 +16,15 @@
 //! * **Soft delete.** `DELETE` sets `status = removed`; the newest [`KEEP_REMOVED`]
 //!   removed records stay restorable, older ones are purged on the next write.
 //!
+//! * **Bounds.** At most [`MAX_INSTALLATIONS_PER_ACCOUNT`] (200) active installations per
+//!   account (removed ones do not count), [`MAX_REVISIONS`] (50) superseded revisions per
+//!   installation and [`KEEP_REMOVED`] (100) removed records per account; beyond that the
+//!   oldest are hard-deleted on the next write so storage cannot grow without bound.
+//! * **Formats.** `template_id`, `template_digest`, `values_digest`, `components[].sha256`
+//!   and `target.agent_holder_pubkey` are exactly 64 lowercase hex characters.
+//! * **Account deletion.** [`purge_subject`] hard-deletes everything of a subject's account
+//!   (both tables); `/portal/account/delete` and the admin account delete call it.
+//!
 //! Auth, state and error conventions follow `/me/service-accounts` and `/me/topologies`
 //! (portal session cookie or OIDC bearer, plain-text errors).
 
@@ -250,6 +259,17 @@ fn check_label(what: &str, s: &str, max: usize, required: bool) -> Result<(), St
     Ok(())
 }
 
+/// Exactly 64 lowercase hex characters (32 bytes), as manifest-core emits them.
+fn check_hex64(what: &str, s: &str) -> Result<(), String> {
+    if s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} must be exactly 64 lowercase hex characters"
+        ))
+    }
+}
+
 fn check_ident(what: &str, s: &str, required: bool) -> Result<(), String> {
     if required && s.is_empty() {
         return Err(format!("{what} is required"));
@@ -265,9 +285,9 @@ fn check_ident(what: &str, s: &str, required: bool) -> Result<(), String> {
 /// Validate a client-supplied record. `Err` is the `422` message.
 pub fn validate(input: &InstallationInput) -> Result<(), String> {
     check_label("name", &input.name, MAX_NAME_CHARS, true)?;
-    check_ident("template_id", &input.template_id, true)?;
-    check_ident("template_digest", &input.template_digest, false)?;
-    check_ident("values_digest", &input.values_digest, false)?;
+    check_hex64("template_id", &input.template_id)?;
+    check_hex64("template_digest", &input.template_digest)?;
+    check_hex64("values_digest", &input.values_digest)?;
     if !input.values.is_object() {
         return Err("values must be a JSON object".to_string());
     }
@@ -289,9 +309,7 @@ pub fn validate(input: &InstallationInput) -> Result<(), String> {
             MAX_NAME_CHARS,
             true,
         )?;
-        if c.sha256.len() != 64 || !c.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!("components[{i}].sha256 must be 64 hex characters"));
-        }
+        check_hex64(&format!("components[{i}].sha256"), &c.sha256)?;
     }
     if input.manifest_ids.len() > MAX_LIST_ITEMS {
         return Err(format!("manifest_ids: at most {MAX_LIST_ITEMS} entries"));
@@ -307,9 +325,7 @@ pub fn validate(input: &InstallationInput) -> Result<(), String> {
         false,
     )?;
     if let Some(k) = &input.target.agent_holder_pubkey {
-        if k.len() != 64 || !k.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("target.agent_holder_pubkey must be 64 hex characters".to_string());
-        }
+        check_hex64("target.agent_holder_pubkey", k)?;
     }
     Ok(())
 }
@@ -747,6 +763,23 @@ impl SqliteInstallationStore {
         Ok(Some(CreateOutcome::Created(Box::new(rec))))
     }
 
+    /// Hard-delete every installation and all revision history of `account` (account
+    /// deletion). Returns the number of installations removed.
+    pub fn delete_all_for_account(&self, account: &AccountId) -> rusqlite::Result<usize> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        tx.execute(
+            "DELETE FROM installation_revisions WHERE account = ?1",
+            params![&account.0[..]],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM installations WHERE account = ?1",
+            params![&account.0[..]],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Every non-removed installation of `account`, oldest first.
     pub fn export_all(&self, account: &AccountId) -> rusqlite::Result<Vec<Installation>> {
         let conn = self.conn.lock_safe();
@@ -785,6 +818,25 @@ impl SqliteInstallationStore {
         tx.commit()?;
         Ok(Some(out))
     }
+}
+
+/// Account-deletion hook: hard-delete all installations (and history) of the ledger account
+/// bound to `subject`. A subject that never had an account has nothing to delete. Must run
+/// before the ledger row is removed, or the subject -> account link is lost.
+pub fn purge_subject(
+    store: &SqliteInstallationStore,
+    ledger: &SqliteLedger,
+    subject: &str,
+) -> Result<usize, String> {
+    let Some(account) = ledger
+        .account_if_exists(subject)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(0);
+    };
+    store
+        .delete_all_for_account(&account)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,10 +1302,10 @@ mod tests {
     fn payload(name: &str) -> Value {
         json!({
             "name": name,
-            "template_id": "tpl-web-gateway",
-            "template_digest": "sha256:abc123",
+            "template_id": "11".repeat(32),
+            "template_digest": "22".repeat(32),
             "values": { "region": "eu", "port": 8443, "labels": ["a", "b"] },
-            "values_digest": "sha256:def456",
+            "values_digest": "33".repeat(32),
             "components": [{ "name": "agent", "sha256": "ab".repeat(32) }],
             "manifest_ids": ["m-1", "m-2"],
             "target": { "os": "linux", "device_label": "nuc-1" },
@@ -1683,6 +1735,27 @@ mod tests {
         p["values"] = v;
         assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
 
+        for (field, bad) in [
+            ("template_id", "tpl-web-gateway".to_string()),
+            ("template_id", "AB".repeat(32)),
+            ("template_digest", "sha256:abc123".to_string()),
+            ("template_digest", "11".repeat(31)),
+            ("values_digest", "AB".repeat(32)),
+            ("values_digest", String::new()),
+            ("template_id", String::new()),
+        ] {
+            let mut p = payload("fmt");
+            p[field] = json!(bad);
+            let r = post(p).await;
+            assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{field}={bad}");
+            assert!(r.text.contains("64 lowercase hex"), "{}", r.text);
+        }
+        let mut p = payload("upper sha");
+        p["components"] = json!([{ "name": "a", "sha256": "AB".repeat(32) }]);
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut p = payload("upper pk");
+        p["target"]["agent_holder_pubkey"] = json!("CD".repeat(32));
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
         let mut p = payload("sha");
         p["components"] = json!([{ "name": "a", "sha256": "xyz" }]);
         assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);

@@ -1666,6 +1666,26 @@ impl SqliteLedger {
         Ok(AccountId(bytes))
     }
 
+    /// Like [`Self::account_for_subject`], but never creates an account.
+    pub fn account_if_exists(&self, subject: &str) -> Result<Option<AccountId>, LedgerOpError> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .lock_safe()
+            .query_row("SELECT account FROM account_subjects WHERE subject = ?1", params![subject], |r| r.get(0))
+            .optional()?;
+        bytes
+            .map(|b| {
+                <[u8; 32]>::try_from(b.as_slice()).map(AccountId).map_err(|_| {
+                    LedgerOpError::Db(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        "account_subjects.account is not 32 bytes".into(),
+                    ))
+                })
+            })
+            .transpose()
+    }
+
     /// Return the account bound to an OIDC `subject` (e.g. a Keycloak `sub`
     /// claim), creating it with a zero balance on first use (M19.1). Idempotent:
     /// the same subject always maps to the same account, so conventional
