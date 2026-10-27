@@ -11,7 +11,7 @@ RUN apt-get update \
 # Which ct-agent tag/branch/commit to build -- bump deliberately. The default MUST
 # match the repo-root `CT_AGENT_RELEASE` file (#512, the one pin source; a portal
 # test asserts this file agrees with it), so a release bump updates both together.
-ARG CT_AGENT_REF=v0.7.40
+ARG CT_AGENT_REF=v0.8.0
 # 2026-09-02: -c http.version=HTTP/1.1 works around a real, reproduced failure --
 # older git (Debian bookworm's 2.39.5) against github.com's current HTTP/2 responses
 # fails "could not read Username for 'https://github.com': No such device or address" /
