@@ -123,6 +123,51 @@ pub enum RelayKind {
     TcpFallback,
 }
 
+/// ct-agent#329: how one bounded TCP-fallback delivery wait ended -- the `outcome`
+/// label of `ct_edge_tcp_fallback_deliver_waits_total`. A Client only waits when it
+/// found the token's pool empty AND no working QUIC registration, so the three outcomes
+/// partition exactly the Clients that waited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpDeliverWaitOutcome {
+    /// A parked registration turned up within the bound and took the Client.
+    Delivered,
+    /// The bound elapsed with nothing parked for the token; the Client gets an error.
+    TimedOut,
+    /// A registration turned up, but by the time this Client claimed it a concurrent
+    /// Client had taken it or it was dead; the Client gets an error without using
+    /// the rest of its bound. Kept apart from `TimedOut` on purpose: this one says the
+    /// pool DID refill, just not for this Client.
+    Raced,
+}
+
+impl TcpDeliverWaitOutcome {
+    /// Every outcome, in render order. `/metrics` emits a row for each from the first
+    /// scrape on, so "never happened" reads as 0 rather than as absent (#558).
+    pub const ALL: [Self; 3] = [Self::Delivered, Self::TimedOut, Self::Raced];
+
+    /// The stable `outcome` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::TimedOut => "timed_out",
+            Self::Raced => "raced",
+        }
+    }
+}
+
+/// ct-agent#329: how long one deliver-wait timeout log window lasts -- the same 10 min
+/// as the #530/#533 throttles. ct-agent#329's agents ran into the bound every 30 s;
+/// one full line per host per window plus a summary keeps that legible.
+pub(crate) const TCP_DELIVER_TIMEOUT_LOG_WINDOW_SECS: u64 = 600;
+
+/// ct-agent#329: hosts (or token prefixes) tracked per window. Every key is a
+/// hostname that routed or a token that resolved, so the set is bounded by real
+/// tunnels; the cap keeps the throttle's own memory bound true regardless.
+const TCP_DELIVER_TIMEOUT_LOG_MAX_TRACKED: usize = 256;
+
+/// ct-agent#329: how many of the busiest hosts a window summary names.
+const TCP_DELIVER_TIMEOUT_LOG_TOP: usize = 5;
+
 /// #502-follow (#513): WHY a hostname bind was refused. The 'H' arm's operator log
 /// used to collapse "already bound to a different token" and "token revoked" into
 /// one line, leaving exactly the revoke case -- the one an operator can act on
@@ -965,6 +1010,18 @@ pub struct EdgeState<H> {
     /// rate after the #522 fix is the regression signal to watch on `/metrics`.
     tcp_reaped: Counter,
     tcp_parked_gauge: AtomicU64,
+    /// ct-agent#329: Clients that waited up to `CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS`
+    /// for a parked registration, one count and one summed wait (milliseconds) per
+    /// [`TcpDeliverWaitOutcome`], indexed by `outcome as usize`.
+    /// `tcp_deliveries` counts a Client that waited exactly like one that did not, and
+    /// nothing counted one that gave up -- so an agent whose pool stopped refilling for
+    /// seconds at a time (its QUIC reprobe ran inline in the pool loop) left no trace
+    /// in the edge's metrics, and finding it took parallel curl runs against the hostnames.
+    tcp_deliver_waits: [Counter; TcpDeliverWaitOutcome::ALL.len()],
+    tcp_deliver_wait_millis: [Counter; TcpDeliverWaitOutcome::ALL.len()],
+    /// ct-agent#329: throttles the timed-out wait's log line per host (or token prefix,
+    /// for a Client that named no host); the counters above are the complete record.
+    tcp_deliver_timeout_log: Mutex<crate::log_throttle::WindowLogThrottle<String>>,
     /// #775: wall-clock (Unix seconds) of the most recent #522 reaper tick --
     /// updated unconditionally at the START of every tick, whether or not it found
     /// anything to reap. A silent gap here (found live 2026-09-08: gauge=94, reaped
@@ -1129,6 +1186,13 @@ impl<H: Clone> EdgeState<H> {
             tcp_reaped: Counter::default(),
             last_reap_tick: AtomicU64::new(0),
             tcp_parked_gauge: AtomicU64::new(0),
+            tcp_deliver_waits: Default::default(),
+            tcp_deliver_wait_millis: Default::default(),
+            tcp_deliver_timeout_log: Mutex::new(crate::log_throttle::WindowLogThrottle::new(
+                TCP_DELIVER_TIMEOUT_LOG_WINDOW_SECS,
+                TCP_DELIVER_TIMEOUT_LOG_MAX_TRACKED,
+                TCP_DELIVER_TIMEOUT_LOG_TOP,
+            )),
             relay_bytes_browser: AtomicU64::new(0),
             relay_bytes_dataplane: AtomicU64::new(0),
             relay_bytes_tcp_fallback: AtomicU64::new(0),
@@ -1803,6 +1867,19 @@ impl<H: Clone> EdgeState<H> {
     pub fn tcp_deliveries_total(&self) -> u64 {
         self.tcp_deliveries.get()
     }
+    /// ct-agent#329: bounded delivery waits that ended in `outcome` since start.
+    pub fn tcp_deliver_waits_total(&self, outcome: TcpDeliverWaitOutcome) -> u64 {
+        self.tcp_deliver_waits[outcome as usize].get()
+    }
+    /// ct-agent#329: milliseconds those waits took, summed -- divided by the count
+    /// above it is the mean wait per outcome.
+    pub fn tcp_deliver_wait_millis_total(&self, outcome: TcpDeliverWaitOutcome) -> u64 {
+        self.tcp_deliver_wait_millis[outcome as usize].get()
+    }
+    /// ct-agent#329: the throttle behind the timed-out wait's log line.
+    pub(crate) fn tcp_deliver_timeout_log(&self) -> &Mutex<crate::log_throttle::WindowLogThrottle<String>> {
+        &self.tcp_deliver_timeout_log
+    }
     /// TLS-TCP fallback registrations parked right now, across all tokens — the
     /// fallback counterpart to [`active_tunnels`](Self::active_tunnels). Zero here
     /// while requests fail means the pool is momentarily empty (churn), which is a
@@ -2011,6 +2088,36 @@ impl<H: Clone> EdgeState<H> {
             // which is correct if occasionally wasteful.
             let _ = tokio::time::timeout(remaining, self.tcp_agent_parked.notified()).await;
         }
+    }
+
+    /// ct-agent#329: [`wait_for_tcp_agent`](Self::wait_for_tcp_agent) followed by the
+    /// draining delivery -- the step every Client path takes once it found the pool
+    /// empty and no working QUIC registration -- with the outcome and the time spent
+    /// waiting recorded for `/metrics`. One method instead of the two calls at each site, so a
+    /// Client that waits cannot go uncounted. `stream` is consumed either way; no
+    /// caller has a use for it once the wait failed.
+    ///
+    /// Only the wait is timed: the delivery after it is one synchronous hand-off.
+    pub async fn wait_and_deliver_to_tcp_agent(
+        &self,
+        token: &RoutingToken,
+        stream: BoxedStream,
+        timeout: Duration,
+    ) -> TcpDeliverWaitOutcome {
+        let started = tokio::time::Instant::now();
+        let found = self.wait_for_tcp_agent(token, timeout).await;
+        let waited = started.elapsed();
+        let outcome = if !found {
+            TcpDeliverWaitOutcome::TimedOut
+        } else if self.deliver_to_tcp_agent_draining(token, stream).is_ok() {
+            TcpDeliverWaitOutcome::Delivered
+        } else {
+            TcpDeliverWaitOutcome::Raced
+        };
+        self.tcp_deliver_waits[outcome as usize].inc();
+        self.tcp_deliver_wait_millis[outcome as usize]
+            .add(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+        outcome
     }
 
     /// Record the Agent's advertised direct-path listener for `token` (M11.4b):
@@ -4816,6 +4923,82 @@ mod tests {
         .await
         .expect("wait_for_tcp_agent must respect its own timeout");
         assert!(!waited);
+    }
+
+    /// ct-agent#329: a Client that waits and is then served counts as `delivered`, with
+    /// the time it was held -- the number that showed nothing while an agent's pool sat
+    /// empty for seconds. Paused clock, so the agent's 250 ms re-park is exact.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_client_served_by_a_fresh_park_counts_as_delivered_with_its_wait_329() {
+        let state: std::sync::Arc<EdgeState<u32>> = std::sync::Arc::new(EdgeState::new());
+        let s = state.clone();
+        let agent = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            s.park_tcp_agent(token(13)).await
+        });
+
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        let outcome = state
+            .wait_and_deliver_to_tcp_agent(&token(13), client, Duration::from_secs(3))
+            .await;
+
+        assert_eq!(outcome, TcpDeliverWaitOutcome::Delivered);
+        assert!(agent.await.unwrap().is_ok(), "the re-parked agent got the Client's stream");
+        assert_eq!(state.tcp_deliver_waits_total(TcpDeliverWaitOutcome::Delivered), 1);
+        assert_eq!(
+            state.tcp_deliver_wait_millis_total(TcpDeliverWaitOutcome::Delivered),
+            250,
+            "held exactly until the park landed"
+        );
+        for other in [TcpDeliverWaitOutcome::TimedOut, TcpDeliverWaitOutcome::Raced] {
+            assert_eq!(state.tcp_deliver_waits_total(other), 0, "{other:?}");
+            assert_eq!(state.tcp_deliver_wait_millis_total(other), 0, "{other:?}");
+        }
+        assert_eq!(state.tcp_deliveries_total(), 1, "still an ordinary delivery as well");
+    }
+
+    /// ct-agent#329: nothing parks within the bound -> `timed_out`, and the summed wait
+    /// grows by the whole bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_client_nobody_parks_for_counts_as_timed_out_with_the_bound_329() {
+        let state: EdgeState<u32> = EdgeState::new();
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        let outcome = state
+            .wait_and_deliver_to_tcp_agent(&token(14), client, Duration::from_millis(3000))
+            .await;
+
+        assert_eq!(outcome, TcpDeliverWaitOutcome::TimedOut);
+        assert_eq!(state.tcp_deliver_waits_total(TcpDeliverWaitOutcome::TimedOut), 1);
+        assert_eq!(state.tcp_deliver_wait_millis_total(TcpDeliverWaitOutcome::TimedOut), 3000);
+        for other in [TcpDeliverWaitOutcome::Delivered, TcpDeliverWaitOutcome::Raced] {
+            assert_eq!(state.tcp_deliver_waits_total(other), 0, "{other:?}");
+        }
+        assert_eq!(state.tcp_deliveries_total(), 0);
+    }
+
+    /// ct-agent#329: the wait saw a registration, but the delivery found none usable --
+    /// here a dead park (its agent side is gone); a concurrent Client taking the slot
+    /// first ends in the same failed drain. Counted as `raced`, never as `timed_out`:
+    /// the pool did refill, and folding the two together would hide which one happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_registration_gone_by_delivery_counts_as_raced_not_timed_out_329() {
+        let state: EdgeState<u32> = EdgeState::new();
+        drop(state.park_tcp_agent(token(15)));
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        let outcome = state
+            .wait_and_deliver_to_tcp_agent(&token(15), client, Duration::from_secs(3))
+            .await;
+
+        assert_eq!(outcome, TcpDeliverWaitOutcome::Raced);
+        assert_eq!(state.tcp_deliver_waits_total(TcpDeliverWaitOutcome::Raced), 1);
+        assert_eq!(
+            state.tcp_deliver_wait_millis_total(TcpDeliverWaitOutcome::Raced),
+            0,
+            "the registration was already there, so nothing was waited"
+        );
+        assert_eq!(state.tcp_deliver_waits_total(TcpDeliverWaitOutcome::TimedOut), 0);
+        assert_eq!(state.tcp_deliver_waits_total(TcpDeliverWaitOutcome::Delivered), 0);
+        assert!(!state.has_tcp_agent(&token(15)), "the dead slot was drained on the way");
     }
 
     #[test]

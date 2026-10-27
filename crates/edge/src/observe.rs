@@ -194,6 +194,49 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         tcp_reaped = state.tcp_reaped_total(),
         tcp_deliveries = state.tcp_deliveries_total(),
     );
+    // ct-agent#329: the bounded wait a Client takes when it found the pool empty.
+    // ct_edge_tcp_fallback_deliveries_total counts a Client that waited ~3 s exactly like
+    // one served at once, and nothing counted one that gave up -- so an agent whose pool
+    // stopped refilling during its QUIC reprobe was invisible here. Every outcome row
+    // renders from the first scrape on (#558: absent and zero must not look alike).
+    {
+        use crate::state::TcpDeliverWaitOutcome;
+        out.push_str(
+            "# HELP ct_edge_tcp_fallback_deliver_waits_total Clients that found the token's \
+             TLS-TCP fallback pool empty and no working QUIC registration, and so waited \
+             up to CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS for a parked registration, by \
+             how the wait ended (ct-agent#329): delivered = one arrived and took the Client; \
+             timed_out = none arrived within the bound, the Client got an error; raced = one \
+             arrived, but a concurrent Client took it or it was dead, and this Client got an \
+             error. A sustained timed_out rate means an agent's pool does not refill in time, \
+             or the agent is gone -- the edge log names the host.\n\
+             # TYPE ct_edge_tcp_fallback_deliver_waits_total counter\n",
+        );
+        for outcome in TcpDeliverWaitOutcome::ALL {
+            out.push_str(&format!(
+                "ct_edge_tcp_fallback_deliver_waits_total{{outcome=\"{}\"}} {}\n",
+                outcome.label(),
+                state.tcp_deliver_waits_total(outcome)
+            ));
+        }
+        out.push_str(
+            "# HELP ct_edge_tcp_fallback_deliver_wait_seconds_total Seconds those Clients spent \
+             waiting, summed per outcome. Divided by ct_edge_tcp_fallback_deliver_waits_total \
+             it is the mean wait: for delivered, how long a Client was held before it was \
+             served -- near zero while the agent's pool refills promptly, approaching the bound \
+             when it does not (ct-agent#329). timed_out adds about the bound each time.\n\
+             # TYPE ct_edge_tcp_fallback_deliver_wait_seconds_total counter\n",
+        );
+        for outcome in TcpDeliverWaitOutcome::ALL {
+            let ms = state.tcp_deliver_wait_millis_total(outcome);
+            out.push_str(&format!(
+                "ct_edge_tcp_fallback_deliver_wait_seconds_total{{outcome=\"{}\"}} {}.{:03}\n",
+                outcome.label(),
+                ms / 1000,
+                ms % 1000
+            ));
+        }
+    }
     // #779: front-door connections refused because the hostname's tunnel was outside
     // its access window (both the SNI-passthrough and the Gelb leg). Separate from
     // ct_edge_front_door_client_aborts_total on purpose: this is the edge's own decision,
@@ -1255,6 +1298,78 @@ mod tests {
             body.contains("Read this BEFORE raising"),
             "the HELP text must carry the reading, or the number gets used the wrong way round"
         );
+    }
+
+    /// ct-agent#329: the deliver-wait rows reach `GET /metrics` -- one per outcome from the
+    /// first scrape on (an absent `timed_out` row must not read like a quiet one), and the
+    /// summed wait in seconds with millisecond precision. Paused clock: the waits below are
+    /// exact virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn tcp_fallback_deliver_wait_rows_render_per_outcome_in_metrics_329() {
+        use crate::state::{BoxedStream, TcpDeliverWaitOutcome};
+        use std::time::Duration;
+
+        async fn scrape(state: &Arc<EdgeState<Connection>>) -> String {
+            let resp = metrics_router(state.clone(), None)
+                .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let text = scrape(&state).await;
+        for name in [
+            "ct_edge_tcp_fallback_deliver_waits_total",
+            "ct_edge_tcp_fallback_deliver_wait_seconds_total",
+        ] {
+            assert!(text.contains(&format!("# TYPE {name} counter\n")), "{name}: {text}");
+        }
+        for outcome in TcpDeliverWaitOutcome::ALL.map(TcpDeliverWaitOutcome::label) {
+            assert!(
+                text.contains(&format!(
+                    "ct_edge_tcp_fallback_deliver_waits_total{{outcome=\"{outcome}\"}} 0\n"
+                )),
+                "the {outcome} row must exist before anything waited: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "ct_edge_tcp_fallback_deliver_wait_seconds_total{{outcome=\"{outcome}\"}} 0.000\n"
+                )),
+                "{text}"
+            );
+        }
+
+        // Two Clients wait out a 1.5 s bound; a third is served after 1.05 s.
+        for _ in 0..2 {
+            let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+            state
+                .wait_and_deliver_to_tcp_agent(&token(7), client, Duration::from_millis(1500))
+                .await;
+        }
+        let s = state.clone();
+        let agent = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+            s.park_tcp_agent(token(7)).await
+        });
+        let client: BoxedStream = Box::new(tokio::io::duplex(16).0);
+        state
+            .wait_and_deliver_to_tcp_agent(&token(7), client, Duration::from_millis(1500))
+            .await;
+        assert!(agent.await.unwrap().is_ok());
+
+        let text = scrape(&state).await;
+        for row in [
+            "ct_edge_tcp_fallback_deliver_waits_total{outcome=\"timed_out\"} 2\n",
+            "ct_edge_tcp_fallback_deliver_wait_seconds_total{outcome=\"timed_out\"} 3.000\n",
+            "ct_edge_tcp_fallback_deliver_waits_total{outcome=\"delivered\"} 1\n",
+            "ct_edge_tcp_fallback_deliver_wait_seconds_total{outcome=\"delivered\"} 1.050\n",
+            "ct_edge_tcp_fallback_deliver_waits_total{outcome=\"raced\"} 0\n",
+        ] {
+            assert!(text.contains(row), "{row:?} missing: {text}");
+        }
     }
 
     /// #553 follow-up: a registered listener must be VISIBLE, and an edge with none must be

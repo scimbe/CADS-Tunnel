@@ -104,6 +104,111 @@ fn tcp_fallback_deliver_wait() -> Duration {
     ))
 }
 
+/// ct-agent#329: the bounded wait every Client path takes once it found the token's
+/// TLS-TCP fallback pool empty and no working QUIC registration (#229 follow-up,
+/// draining since #510). Returns whether a parked registration took the Client.
+///
+/// The wait is recorded in `ct_edge_tcp_fallback_deliver_waits_total{outcome}` and
+/// `..._deliver_wait_seconds_total{outcome}`, and a timeout is logged once per host per
+/// window. Before this, a Client that waited was invisible on the edge, and one that gave
+/// up left at most its caller's generic error line (none at all on the QUIC rendezvous)
+/// -- which is why an agent whose pool stopped refilling for seconds at a time
+/// (ct-agent#329) showed nothing here and had to be found with parallel curl runs.
+/// `host` is the name the Client asked for where the call site has one (SNI/Gelb legs,
+/// mesh relay); the ct-client rendezvous only has the token, so its line names the token
+/// prefix instead.
+async fn deliver_after_tcp_fallback_wait(
+    state: &EdgeState<Connection>,
+    token: &RoutingToken,
+    stream: crate::state::BoxedStream,
+    host: Option<&str>,
+) -> bool {
+    use crate::state::TcpDeliverWaitOutcome;
+    let bound = tcp_fallback_deliver_wait();
+    match state.wait_and_deliver_to_tcp_agent(token, stream, bound).await {
+        TcpDeliverWaitOutcome::Delivered => true,
+        // Counted, not logged: the pool did refill, so this is not the stall the timeout
+        // line below exists for, and its rate is what says anything.
+        TcpDeliverWaitOutcome::Raced => false,
+        TcpDeliverWaitOutcome::TimedOut => {
+            let now = unix_now();
+            let mut th_buf = [0u8; 8];
+            let th = token_hex(token, &mut th_buf);
+            // Canonical form, so `Foo.Example` and `foo.example.` are one throttle key.
+            // It always exists here: the name has just routed.
+            let host = host.and_then(ct_common::normalize_hostname);
+            let who = match &host {
+                Some(h) => format!("host '{h}' (token {th})"),
+                None => format!("token {th}"),
+            };
+            let last_activity = state.connection_timing(token).1.map(|seen| now.saturating_sub(seen));
+            let line = tcp_deliver_timeout_line(&who, bound, last_activity);
+            let key = host.unwrap_or_else(|| format!("token {th}"));
+            log_tcp_deliver_timeout(state.tcp_deliver_timeout_log(), key, &line, now);
+            false
+        }
+    }
+}
+
+/// ct-agent#329: the full log line for one deliver-wait timeout, built apart from the
+/// throttle so a test can read it without capturing stderr.
+///
+/// The agent's last activity (park, registration or finished relay) is what tells the
+/// two causes apart: recent activity is a live pool that did not refill within the
+/// bound (ct-agent#329), old or none is an agent that is gone while its hostname still
+/// routes -- a TCP-fallback-only tunnel keeps its hostname until a full teardown.
+fn tcp_deliver_timeout_line(who: &str, bound: Duration, last_activity_secs_ago: Option<u64>) -> String {
+    let activity = match last_activity_secs_ago {
+        Some(secs) => format!("last agent activity {secs}s ago"),
+        None => "no agent activity on record".to_string(),
+    };
+    format!(
+        "ct-edge: tcp-fallback: no parked registration for {who} within {} ms ({activity}) -- \
+         recent activity: the agent's fallback pool did not refill in time (ct-agent#329); old \
+         or none: the agent is gone. Further timeouts for it are counted in \
+         ct_edge_tcp_fallback_deliver_waits_total{{outcome=\"timed_out\"}} and summarized \
+         every {}s",
+        bound.as_millis(),
+        crate::state::TCP_DELIVER_TIMEOUT_LOG_WINDOW_SECS,
+    )
+}
+
+/// ct-agent#329: log one deliver-wait timeout through the per-host throttle: the first
+/// per host (or token) per window in full, the repeats in one summary line once the
+/// window has rolled over. Event-driven like #533's front-door throttle, so a quiet edge
+/// carries the last window until the next timeout; the counter is the complete record.
+/// Returns the decision so a test can pin it without capturing stderr.
+fn log_tcp_deliver_timeout(
+    log: &std::sync::Mutex<crate::log_throttle::WindowLogThrottle<String>>,
+    key: String,
+    line: &str,
+    now: ct_common::channel::UnixSeconds,
+) -> crate::log_throttle::LogDecision {
+    let (summary, decision) = {
+        let mut t = log.lock_safe(); // no await under the lock
+        (t.window_summary(now), t.note(now, key))
+    };
+    if let Some(s) = summary {
+        eprintln!(
+            "ct-edge: tcp-fallback deliver-wait timeout summary (ct-agent#329) -- {} timeout(s) \
+             for {} host(s)/token(s) in the last {}s window ({} beyond the tracking cap); top: {}",
+            s.total,
+            s.distinct_keys,
+            crate::state::TCP_DELIVER_TIMEOUT_LOG_WINDOW_SECS,
+            s.untracked,
+            s.top
+                .iter()
+                .map(|(k, n)| format!("{k} x{n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if decision == crate::log_throttle::LogDecision::LogFull {
+        eprintln!("{line}");
+    }
+    decision
+}
+
 /// First 8 hex chars of a token, for correlating an Edge trace line with a
 /// field-supplied token during cross-host diagnosis.
 /// #342: hex-encodes `token`'s first 4 bytes into `buf` (8 hex chars) and
@@ -400,10 +505,8 @@ where
             // open several at once). Give it a brief window to free a slot
             // rather than failing this request outright. Draining too (#510):
             // the freed slot may sit behind stale dead ones.
-            if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await {
-                if state.deliver_to_tcp_agent_draining(&token, stream).is_ok() {
-                    return Ok(());
-                }
+            if deliver_after_tcp_fallback_wait(state, &token, stream, Some(&sni)).await {
+                return Ok(());
             }
             // Name the HOST, not only the token. `open_agent_stream` is a generic routing
             // helper and legitimately knows nothing but the token; this call site does know
@@ -502,10 +605,8 @@ where
         Err(e) => {
             // Same momentarily-exhausted-pool recovery as serve_sni_passthrough
             // (#229 follow-up), draining too (#510).
-            if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await {
-                if state.deliver_to_tcp_agent_draining(&token, stream).is_ok() {
-                    return Ok(());
-                }
+            if deliver_after_tcp_fallback_wait(state, &token, stream, Some(host)).await {
+                return Ok(());
             }
             // Same reason as the SNI leg above: this is the level that knows the host.
             // #589: pool depth at give-up time, same reasoning as the SNI leg's twin.
@@ -2295,11 +2396,7 @@ pub async fn serve_connection(
                     // Same momentarily-exhausted-pool recovery as
                     // serve_sni_passthrough (#229 follow-up): this QUIC client
                     // may be reaching an agent that is TCP-fallback-only.
-                    if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await
-                        && state
-                            .deliver_to_tcp_agent_draining(&token, Box::new(join(recv, send)))
-                            .is_ok()
-                    {
+                    if deliver_after_tcp_fallback_wait(state, &token, Box::new(join(recv, send)), None).await {
                         return Ok(None);
                     }
                     // #589: pool depth at give-up time, same reasoning as the SNI/Gelb legs.
@@ -3405,9 +3502,7 @@ where
                         // Momentarily-exhausted pool recovery (#229 follow-up):
                         // give a burst of parallel browser connections a brief
                         // window to find a freed-up TCP-fallback slot.
-                        if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await
-                            && state.deliver_to_tcp_agent_draining(&token, stream).is_ok()
-                        {
+                        if deliver_after_tcp_fallback_wait(state, &token, stream, None).await {
                             return Ok(());
                         }
                         // #589: pool depth at give-up time, same reasoning as the SNI/Gelb legs.
@@ -3430,7 +3525,9 @@ where
             // other roles -- the reads here happen BEFORE admin_revoke_ok is even
             // checked, so an unauthenticated dripper can still hold the cap permit
             // through this phase.
-            let token = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
+            // ct-agent#329: the hostname comes out too, so a deliver-wait timeout below
+            // can name it like the SNI/Gelb legs do.
+            let (token, host) = tokio::time::timeout(TCP_FALLBACK_ADMISSION_TIMEOUT, async {
                 let mut admin_token = [0u8; 32];
                 stream.read_exact(&mut admin_token).await?;
                 let mut hl = [0u8; 2];
@@ -3464,7 +3561,7 @@ where
                 }
                 stream.write_all(b"OK").await?;
                 stream.flush().await?;
-                Ok::<_, BoxError>(token)
+                Ok::<_, BoxError>((token, host))
             })
             .await
             .map_err(|_| "tcp-fallback: role 'M' admission timed out")??;
@@ -3487,9 +3584,7 @@ where
                     Err(e) => {
                         // Momentarily-exhausted pool recovery (#229 follow-up),
                         // same as the 'C' arm above.
-                        if state.wait_for_tcp_agent(&token, tcp_fallback_deliver_wait()).await
-                            && state.deliver_to_tcp_agent_draining(&token, stream).is_ok()
-                        {
+                        if deliver_after_tcp_fallback_wait(state, &token, stream, Some(&host)).await {
                             return Ok(());
                         }
                         // #589: pool depth at give-up time, same reasoning as the SNI/Gelb legs.
@@ -5886,6 +5981,154 @@ mod tests {
         assert!(
             !state.has_tcp_agent(&token),
             "all parked slots consumed: two dead drained + one live delivered"
+        );
+    }
+
+    /// ct-agent#329: the browser leg records how its deliver wait ended. A pool that is
+    /// empty when the browser arrives and refilled 200 ms later is `delivered` with a
+    /// 200 ms wait -- the case that left no trace before, however long the wait. One that
+    /// is never refilled is `timed_out`, and the caller's error still names the host.
+    /// Paused clock, so neither the agent's re-park nor the bound costs real time.
+    #[tokio::test(start_paused = true)]
+    async fn the_sni_leg_records_how_its_deliver_wait_ended_329() {
+        use crate::state::TcpDeliverWaitOutcome::{Delivered, Raced, TimedOut};
+        use tokio::io::AsyncWriteExt;
+        let token = RoutingToken([0x29; 32]);
+        let hello = crate::sni::synth_client_hello(Some("wait.test"), &[]);
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.register_host("wait.test", token.clone()).unwrap();
+        let (mut browser, edge_end) = tokio::io::duplex(8192);
+        browser.write_all(&hello).await.unwrap();
+        let (s, t) = (state.clone(), token.clone());
+        let agent = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            s.park_tcp_agent(t).await
+        });
+        serve_sni_passthrough(edge_end, &*state)
+            .await
+            .expect("the re-parked agent takes the browser");
+        assert!(agent.await.unwrap().is_ok(), "the agent received the browser stream");
+        assert_eq!(state.tcp_deliver_waits_total(Delivered), 1);
+        assert_eq!(state.tcp_deliver_wait_millis_total(Delivered), 200);
+        assert_eq!(state.tcp_deliver_waits_total(TimedOut), 0);
+        assert_eq!(state.tcp_deliver_waits_total(Raced), 0);
+        drop(browser);
+
+        let state = Arc::new(EdgeState::<Connection>::new());
+        state.register_host("wait.test", token.clone()).unwrap();
+        let (mut browser, edge_end) = tokio::io::duplex(8192);
+        browser.write_all(&hello).await.unwrap();
+        let err = serve_sni_passthrough(edge_end, &*state)
+            .await
+            .expect_err("nothing re-parks within the bound");
+        assert!(err.to_string().contains("host wait.test"), "the caller's line is unchanged: {err}");
+        assert_eq!(state.tcp_deliver_waits_total(TimedOut), 1);
+        // The bound itself comes from CT_EDGE_TCP_FALLBACK_DELIVER_WAIT_MS, which
+        // `tcp_fallback_deliver_wait_reads_the_real_env_var_589` changes while it runs.
+        assert!(state.tcp_deliver_wait_millis_total(TimedOut) > 0);
+        assert_eq!(state.tcp_deliver_waits_total(Delivered), 0);
+        drop(browser);
+    }
+
+    /// ct-agent#329, the ct-client side: a TLS-TCP rendezvous ('C') that finds the pool
+    /// just drained records its wait through the same helper; with no hostname on this
+    /// path the log line falls back to the token prefix.
+    #[tokio::test(start_paused = true)]
+    async fn the_tcp_rendezvous_records_its_deliver_wait_too_329() {
+        use crate::state::TcpDeliverWaitOutcome::{Delivered, TimedOut};
+        use ct_common::pow::build_request;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let token = RoutingToken([0x2a; 32]);
+        let state = Arc::new(EdgeState::<Connection>::new());
+        // A pool a burst has just emptied: one park, consumed. The token stays
+        // resolvable through the #472 grace window, with nothing left to deliver to.
+        let consumed = state.park_tcp_agent(token.clone());
+        assert!(state
+            .deliver_to_tcp_agent_draining(&token, Box::new(tokio::io::duplex(16).0))
+            .is_ok());
+        drop(consumed);
+
+        let (edge_side, mut client) = tokio::io::duplex(4096);
+        let st = state.clone();
+        let edge = tokio::spawn(async move {
+            let challenge = Challenge { nonce: [0u8; 16], difficulty: 0 };
+            serve_tcp_connection(edge_side, &*st, &challenge, None, test_peer_ip()).await
+        });
+        client.write_all(b"C").await.unwrap();
+        let mut chal = [0u8; 17];
+        client.read_exact(&mut chal).await.unwrap();
+        let ch = Challenge { nonce: chal[..16].try_into().unwrap(), difficulty: chal[16] };
+        client.write_all(&build_request(&ch, &token).unwrap()).await.unwrap();
+        client.flush().await.unwrap();
+
+        assert!(edge.await.unwrap().is_err(), "nothing re-parks: the rendezvous fails as before");
+        assert_eq!(state.tcp_deliver_waits_total(TimedOut), 1);
+        assert_eq!(state.tcp_deliver_waits_total(Delivered), 0);
+        drop(client);
+    }
+
+    /// ct-agent#329: the timeout line names the host, the token prefix and the bound, and
+    /// carries the agent's last activity -- the fact that separates "pool too slow" from
+    /// "agent gone", which read the same in the old error line.
+    #[test]
+    fn the_deliver_wait_timeout_line_names_host_bound_and_last_activity_329() {
+        let line = tcp_deliver_timeout_line(
+            "host 'wait.test' (token 29292929)",
+            Duration::from_millis(3000),
+            Some(2),
+        );
+        for needle in [
+            "host 'wait.test'",
+            "token 29292929",
+            "within 3000 ms",
+            "last agent activity 2s ago",
+            "ct-agent#329",
+            "ct_edge_tcp_fallback_deliver_waits_total{outcome=\"timed_out\"}",
+        ] {
+            assert!(line.contains(needle), "{needle:?} missing: {line}");
+        }
+        let gone = tcp_deliver_timeout_line("token 29292929", Duration::from_millis(3000), None);
+        assert!(gone.contains("no agent activity on record"), "{gone}");
+    }
+
+    /// ct-agent#329: rate-limited per host. An agent that runs into the bound every 30 s
+    /// produces one full line per window, not twenty; another host is its own first, and
+    /// the next window speaks again.
+    #[test]
+    fn deliver_wait_timeouts_log_one_full_line_per_host_per_window_329() {
+        use crate::log_throttle::LogDecision::{LogFull, Suppress};
+        let window = crate::state::TCP_DELIVER_TIMEOUT_LOG_WINDOW_SECS;
+        let log = std::sync::Mutex::new(crate::log_throttle::WindowLogThrottle::new(window, 8, 3));
+        assert_eq!(log_tcp_deliver_timeout(&log, "a.test".into(), "line", 1_000), LogFull);
+        for i in 1..20 {
+            assert_eq!(log_tcp_deliver_timeout(&log, "a.test".into(), "line", 1_000 + 30 * i), Suppress);
+        }
+        assert_eq!(log_tcp_deliver_timeout(&log, "token 2a2a2a2a".into(), "line", 1_100), LogFull);
+        assert_eq!(log_tcp_deliver_timeout(&log, "a.test".into(), "line", 1_000 + window), LogFull);
+    }
+
+    /// ct-agent#329 drift guard: every Client path that waits for a parked registration
+    /// goes through `deliver_after_tcp_fallback_wait`, so no wait escapes the metric or
+    /// the log. `wait_for_tcp_agent` has to stay public (ct-agent's tests drive it on a
+    /// real EdgeState), so visibility cannot enforce this the way #528 did for delivery.
+    /// The floor is the five sites of today (SNI, Gelb, QUIC 'C', TCP 'C', TCP 'M'):
+    /// fewer means a site was lost or the pattern stopped matching, and an empty match
+    /// must not read as a pass.
+    #[test]
+    fn every_deliver_wait_goes_through_the_instrumented_helper_329() {
+        let src = include_str!("serve.rs");
+        let prod = src.split("\n#[cfg(test)]\n").next().unwrap();
+        let direct = prod.matches(".wait_for_tcp_agent(").count();
+        assert_eq!(
+            direct, 0,
+            "a production path calls wait_for_tcp_agent directly, so its Clients are missing \
+             from ct_edge_tcp_fallback_deliver_waits_total -- use deliver_after_tcp_fallback_wait"
+        );
+        let sites = prod.matches("deliver_after_tcp_fallback_wait(state, ").count();
+        assert!(
+            sites >= 5,
+            "expected the five deliver-wait sites (SNI, Gelb, QUIC 'C', TCP 'C', TCP 'M'), found {sites}"
         );
     }
 
