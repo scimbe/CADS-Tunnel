@@ -621,6 +621,9 @@ struct AccountDeleteState {
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    /// WP6: saved installations are keyed by the ledger account of the subject.
+    installations: Arc<crate::installations::SqliteInstallationStore>,
+    ledger: Arc<SqliteLedger>,
     /// Edge admin API (`CT_CP_EDGE_ADMIN_URL`/`_TOKEN`), so revoked tunnels are torn
     /// down at the edge too -- see [`teardown_revoked_tunnel`].
     edge_admin: Option<(String, String)>,
@@ -638,6 +641,8 @@ pub fn account_delete_router(
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    installations: Arc<crate::installations::SqliteInstallationStore>,
+    ledger: Arc<SqliteLedger>,
     edge_admin: Option<(String, String)>,
     edge_mesh: Option<EdgeMeshHandle>,
 ) -> Router {
@@ -650,6 +655,8 @@ pub fn account_delete_router(
             topologies,
             networks,
             pipelines,
+            installations,
+            ledger,
             edge_admin,
             edge_mesh,
         })
@@ -730,6 +737,11 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
         eprintln!("ct-cp: account deletion for {subject}: deleting owned topologies failed: {e}");
     }
 
+    // WP6 (GDPR): saved installations + revision history, hard-deleted.
+    if let Err(e) = crate::installations::purge_subject(&st.installations, &st.ledger, subject) {
+        eprintln!("ct-cp: account deletion for {subject}: deleting installations failed: {e}");
+    }
+
     if let Ok(owned) = st.networks.list(subject) {
         for id in owned {
             if let Err(e) = st.networks.delete(subject, &id) {
@@ -758,7 +770,7 @@ async fn delete_account(State(st): State<AccountDeleteState>, headers: HeaderMap
     }
 
     let body = r#"<h1 class="deleted-check">Your account data has been deleted</h1>
-<p class="help">Every tunnel, channel, topology, network and pipeline this account owned is gone,
+<p class="help">Every tunnel, channel, topology, network, pipeline and saved installation this account owned is gone,
 along with your e-mail on anyone else's allow-list or share list. Your sign-in itself is
 managed by Keycloak, not this page -- use <strong>Open Account Console</strong> from the account
 page (while still signed in elsewhere) if you also want to remove your Keycloak login.</p>
@@ -799,6 +811,7 @@ struct AdminUiState {
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    installations: Arc<crate::installations::SqliteInstallationStore>,
     /// ADR-0025 Decision 4: the onboarded-zone registry.
     managed_domains: Arc<crate::storage::SqliteManagedDomains>,
     /// ADR-0025 Decision 4/6: everything else the domain/hostname routes need.
@@ -1318,6 +1331,7 @@ pub fn admin_ui_router(
     topologies: Arc<crate::storage::SqliteTopologyStore>,
     networks: Arc<crate::storage::SqliteNetworkStore>,
     pipelines: Arc<crate::storage::SqlitePipelineRegistry>,
+    installations: Arc<crate::installations::SqliteInstallationStore>,
     managed_domains: Arc<crate::storage::SqliteManagedDomains>,
     domain_admin: DomainAdminConfig,
     observability: ObservabilityConfig,
@@ -1370,6 +1384,7 @@ pub fn admin_ui_router(
             topologies,
             networks,
             pipelines,
+            installations,
             managed_domains,
             domain_admin,
             observability,
@@ -1599,6 +1614,11 @@ async fn cascade_delete_account(st: &AdminUiState, subject: &str) {
                 }
             }
         }
+    }
+    // WP6 (GDPR): must run BEFORE the ledger row goes, or the subject -> account link is lost
+    // and the installations would be orphaned for good.
+    if let Err(e) = crate::installations::purge_subject(&st.installations, &st.ledger, subject) {
+        eprintln!("ct-cp: admin account deletion for {subject}: deleting installations failed: {e}");
     }
     if let Err(e) = st.ledger.delete_account_for_subject(subject) {
         eprintln!("ct-cp: admin account deletion for {subject}: removing ledger row failed: {e}");
@@ -9701,7 +9721,7 @@ mod tests {
             Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
-            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()), Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()), Arc::new(SqliteLedger::open_in_memory().unwrap()),
             Some((format!("http://{addr}"), "edge-secret".to_string())),
             Some(edge_mesh),
         );
@@ -9729,6 +9749,80 @@ mod tests {
         assert_eq!(tunnels.list_for_subject("kc-bob").unwrap().len(), 1);
     }
 
+    fn sample_installation(name: &str) -> crate::installations::InstallationInput {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "template_id": "11".repeat(32),
+            "values": { "region": "eu" },
+            "target": { "os": "linux" },
+        }))
+        .unwrap()
+    }
+
+    /// Row counts of both installation tables for one account, straight from SQLite.
+    fn installation_rows(db: &std::path::Path, account: &crate::accounts::AccountId) -> (i64, i64) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE account = ?1"), [&account.0[..]], |r| r.get(0)).unwrap()
+        };
+        (count("installations"), count("installation_revisions"))
+    }
+
+    #[tokio::test]
+    async fn delete_account_hard_deletes_installations_and_history_of_that_account_only() {
+        use crate::installations::{CreateOutcome, SqliteInstallationStore, UpdateOutcome};
+        let db = std::env::temp_dir().join(format!("ct-acct-del-{}.db", std::process::id()));
+        let db_s = db.to_str().unwrap();
+        let installations = Arc::new(SqliteInstallationStore::open(db_s).unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let alice = ledger.account_for_subject("kc-alice").unwrap();
+        let bob = ledger.account_for_subject("kc-bob").unwrap();
+        for acct in [&alice, &bob] {
+            for i in 0..2 {
+                let CreateOutcome::Created(rec) = installations.create(acct, &sample_installation(&format!("i{i}")), 1).unwrap() else { panic!() };
+                // Two updates -> two archived revisions each, plus a removed record's history.
+                for rev in 1..=2 {
+                    let out = installations.update(acct, &rec.id, rev, &sample_installation("edited"), 2).unwrap();
+                    assert!(matches!(out, UpdateOutcome::Updated(_)));
+                }
+            }
+            let CreateOutcome::Created(gone) = installations.create(acct, &sample_installation("gone"), 1).unwrap() else { panic!() };
+            installations.soft_delete(acct, &gone.id, None, 3).unwrap();
+        }
+        assert_eq!(installation_rows(&db, &alice), (3, 5), "precondition: 3 records, 4 + 1 revisions");
+        assert_eq!(installation_rows(&db, &bob), (3, 5));
+
+        let app = account_delete_router(
+            KEY,
+            Arc::new(SqliteTunnelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            installations.clone(),
+            ledger.clone(),
+            None,
+            None,
+        );
+        let resp = app
+            .oneshot(
+                Request::post("/portal/account/delete")
+                    .header("cookie", session_header("kc-alice"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("confirm=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(installation_rows(&db, &alice), (0, 0), "both tables are empty for the deleted account");
+        assert_eq!(installation_rows(&db, &bob), (3, 5), "another account's data is untouched");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{db_s}{suffix}"));
+        }
+    }
+
     #[tokio::test]
     async fn delete_account_requires_a_session_and_the_literal_confirm_text() {
         let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
@@ -9736,7 +9830,7 @@ mod tests {
         let topologies = Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap());
         let networks = Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap());
         let pipelines = Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap());
-        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines, None, None);
+        let app = account_delete_router(KEY, tunnels, channels, topologies, networks, pipelines, Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()), Arc::new(SqliteLedger::open_in_memory().unwrap()), None, None);
 
         // No session -> bounced, nothing happens.
         let resp = app
@@ -9806,7 +9900,7 @@ mod tests {
         topologies.create_topology("kc-bob", "bob-topo", "u-bob").unwrap();
         topologies.share_add("kc-bob", "bob-topo", "alice@example.com", 1).unwrap();
 
-        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone(), None, None);
+        let app = account_delete_router(KEY, tunnels.clone(), channels.clone(), topologies.clone(), networks.clone(), pipelines.clone(), Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()), Arc::new(SqliteLedger::open_in_memory().unwrap()), None, None);
         let session = format!(
             "ct_portal_session={}",
             crate::portal::sign_session_with_email_for_test(KEY, "kc-alice", "alice@example.com")
@@ -11110,7 +11204,7 @@ mod tests {
             channels,
             topologies,
             networks,
-            pipelines,
+            pipelines, Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
             DomainAdminConfig::default(),
             ObservabilityConfig::default(),
@@ -11320,7 +11414,7 @@ mod tests {
             Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
-            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()), Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
             DomainAdminConfig::default(),
             ObservabilityConfig {
@@ -11476,7 +11570,7 @@ mod tests {
             Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
-            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()), Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
             DomainAdminConfig::default(),
             ObservabilityConfig {
@@ -11535,7 +11629,7 @@ mod tests {
             Arc::new(crate::storage::SqliteChannelStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteTopologyStore::open_in_memory().unwrap()),
             Arc::new(crate::storage::SqliteNetworkStore::open_in_memory().unwrap()),
-            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()),
+            Arc::new(crate::storage::SqlitePipelineRegistry::open_in_memory().unwrap()), Arc::new(crate::installations::SqliteInstallationStore::open_in_memory().unwrap()),
             managed_domains,
             domain_admin,
             ObservabilityConfig::default(),

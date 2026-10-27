@@ -7048,6 +7048,8 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                installations.clone(),
+                ledger.clone(),
                 domain_admin_config.edge_admin.clone(),
                 Some(edge_mesh.clone()),
             ))
@@ -7063,6 +7065,7 @@ pub fn persistent_control_plane_router(
                 topologies.clone(),
                 networks.clone(),
                 pipeline_registry.clone(),
+                installations.clone(),
                 managed_domains.clone(),
                 domain_admin_config.clone(),
                 // ADR-0025 Decision 6: read-only observability config -- `edge_mesh`
@@ -7098,7 +7101,7 @@ pub fn persistent_control_plane_router(
                 crate::keycloak_admin::KeycloakAdminConfig::from_env(),
             ))
             .merge(crate::installations::authed_installations_router(
-                installations,
+                installations.clone(),
                 ledger.clone(),
                 oidc.clone(),
                 Arc::from(session_key),
