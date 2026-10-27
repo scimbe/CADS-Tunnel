@@ -1162,3 +1162,1224 @@ async fn import(
     };
     Ok((StatusCode::CREATED, Json(resp)).into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oidc::OidcVerifier;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    const SECRET: &[u8] = b"realm-secret";
+    const ISSUER: &str = "https://kc/realms/ct";
+    const SESSION_KEY: &[u8] = b"session-key";
+
+    struct Env {
+        app: Router,
+        store: Arc<SqliteInstallationStore>,
+        ledger: Arc<SqliteLedger>,
+    }
+
+    fn env() -> Env {
+        let store = Arc::new(SqliteInstallationStore::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(SECRET, ISSUER));
+        let app = authed_installations_router(
+            store.clone(),
+            ledger.clone(),
+            OidcVerifierHandle::new(Some(verifier)),
+            Arc::from(SESSION_KEY),
+        );
+        Env { app, store, ledger }
+    }
+
+    fn jwt(sub: &str) -> String {
+        let exp = now_secs() + 3600;
+        let claims = json!({ "sub": sub, "iss": ISSUER, "exp": exp });
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap()
+    }
+
+    struct Reply {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Value,
+        text: String,
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        sub: &str,
+        if_match: Option<&str>,
+        body: Option<Value>,
+    ) -> Reply {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {}", jwt(sub)));
+        if let Some(m) = if_match {
+            req = req.header("if-match", m);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let text = String::from_utf8_lossy(&to_bytes(body, usize::MAX).await.unwrap()).into_owned();
+        Reply {
+            status: parts.status,
+            headers: parts.headers,
+            body: serde_json::from_str(&text).unwrap_or(Value::Null),
+            text,
+        }
+    }
+
+    fn payload(name: &str) -> Value {
+        json!({
+            "name": name,
+            "template_id": "tpl-web-gateway",
+            "template_digest": "sha256:abc123",
+            "values": { "region": "eu", "port": 8443, "labels": ["a", "b"] },
+            "values_digest": "sha256:def456",
+            "components": [{ "name": "agent", "sha256": "ab".repeat(32) }],
+            "manifest_ids": ["m-1", "m-2"],
+            "target": { "os": "linux", "device_label": "nuc-1" },
+        })
+    }
+
+    async fn create_as(app: &Router, sub: &str, name: &str) -> Value {
+        let r = send(
+            app,
+            "POST",
+            "/me/installations",
+            sub,
+            None,
+            Some(payload(name)),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
+        r.body
+    }
+
+    fn input(name: &str) -> InstallationInput {
+        serde_json::from_value(payload(name)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn crud_round_trip() {
+        let e = env();
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(payload("Gateway")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED);
+        let rec = r.body.clone();
+        let id = rec["id"].as_str().unwrap().to_string();
+        let b = id.as_bytes();
+        assert_eq!(id.len(), 36);
+        assert!(b[14] == b'4' && b"89ab".contains(&b[19]), "uuid v4: {id}");
+        assert_eq!(rec["status"], "draft");
+        assert_eq!(rec["revision"], 1);
+        assert_eq!(rec["values"]["port"], 8443);
+        assert_eq!(rec["components"][0]["name"], "agent");
+        assert_eq!(rec["target"]["device_label"], "nuc-1");
+        assert_eq!(r.headers[ETAG], "\"1\"");
+        assert_eq!(
+            r.headers[LOCATION],
+            format!("/me/installations/{id}").as_str()
+        );
+
+        let r = send(
+            &e.app,
+            "GET",
+            &format!("/me/installations/{id}"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body, rec);
+
+        let mut upd = payload("Gateway v2");
+        upd["status"] = json!("installed");
+        upd["target"]["agent_holder_pubkey"] = json!("cd".repeat(32));
+        let r = send(
+            &e.app,
+            "PUT",
+            &format!("/me/installations/{id}"),
+            "alice",
+            Some("1"),
+            Some(upd),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        assert_eq!(r.body["revision"], 2);
+        assert_eq!(r.body["name"], "Gateway v2");
+        assert_eq!(r.body["status"], "installed");
+        assert_eq!(r.body["created_at"], rec["created_at"]);
+        assert_eq!(r.headers[ETAG], "\"2\"");
+
+        let r = send(&e.app, "GET", "/me/installations", "alice", None, None).await;
+        assert_eq!(r.body["total"], 1);
+        assert_eq!(r.body["items"][0]["id"], id.as_str());
+
+        let r = send(
+            &e.app,
+            "DELETE",
+            &format!("/me/installations/{id}"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let r = send(&e.app, "GET", "/me/installations", "alice", None, None).await;
+        assert_eq!(
+            r.body["total"], 0,
+            "removed records are hidden from the default list"
+        );
+        let r = send(
+            &e.app,
+            "GET",
+            "/me/installations?status=removed",
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.body["total"], 1);
+        let r = send(
+            &e.app,
+            "GET",
+            &format!("/me/installations/{id}"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.body["status"], "removed");
+        assert_eq!(r.body["revision"], 3, "soft delete is a revision");
+
+        // Deleting again is idempotent; a removed record can be restored with PUT.
+        let r = send(
+            &e.app,
+            "DELETE",
+            &format!("/me/installations/{id}"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let mut back = payload("Gateway v2");
+        back["status"] = json!("draft");
+        let r = send(
+            &e.app,
+            "PUT",
+            &format!("/me/installations/{id}"),
+            "alice",
+            Some("3"),
+            Some(back),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn put_needs_a_matching_if_match() {
+        let e = env();
+        let id = create_as(&e.app, "alice", "A").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let url = format!("/me/installations/{id}");
+
+        let r = send(&e.app, "PUT", &url, "alice", None, Some(payload("x"))).await;
+        assert_eq!(r.status, StatusCode::PRECONDITION_REQUIRED);
+        let r = send(
+            &e.app,
+            "PUT",
+            &url,
+            "alice",
+            Some("abc"),
+            Some(payload("x")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+        // Two writers both read revision 1: the first wins, the second gets 409.
+        let r = send(
+            &e.app,
+            "PUT",
+            &url,
+            "alice",
+            Some("\"1\""),
+            Some(payload("first")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let r = send(
+            &e.app,
+            "PUT",
+            &url,
+            "alice",
+            Some("1"),
+            Some(payload("second")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        assert!(r.text.contains("revision 2"), "{}", r.text);
+        let r = send(&e.app, "GET", &url, "alice", None, None).await;
+        assert_eq!(r.body["name"], "first", "the losing write changed nothing");
+        assert_eq!(r.body["revision"], 2);
+
+        // W/ prefix is accepted; a stale DELETE precondition is refused too.
+        let r = send(
+            &e.app,
+            "PUT",
+            &url,
+            "alice",
+            Some("W/\"2\""),
+            Some(payload("third")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let r = send(&e.app, "DELETE", &url, "alice", Some("2"), None).await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        let r = send(&e.app, "DELETE", &url, "alice", Some("3"), None).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn revision_history_keeps_every_superseded_state() {
+        let e = env();
+        let id = create_as(&e.app, "alice", "v1").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let url = format!("/me/installations/{id}");
+        send(&e.app, "PUT", &url, "alice", Some("1"), Some(payload("v2"))).await;
+        let mut v3 = payload("v3");
+        v3["values"] = json!({ "region": "us" });
+        send(&e.app, "PUT", &url, "alice", Some("2"), Some(v3)).await;
+        send(&e.app, "DELETE", &url, "alice", None, None).await;
+
+        let r = send(
+            &e.app,
+            "GET",
+            &format!("{url}/revisions"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        let items = r.body["items"].as_array().unwrap();
+        let seen: Vec<(i64, &str)> = items
+            .iter()
+            .map(|i| {
+                (
+                    i["revision"].as_i64().unwrap(),
+                    i["installation"]["name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(3, "v3"), (2, "v2"), (1, "v1")],
+            "newest first; current (rev 4, removed) is not in the history"
+        );
+        assert_eq!(items[0]["installation"]["values"]["region"], "us");
+        assert_eq!(items[1]["installation"]["values"]["region"], "eu");
+        assert_eq!(items[0]["installation"]["revision"], 3);
+    }
+
+    #[test]
+    fn revision_history_is_bounded() {
+        let store = SqliteInstallationStore::open_in_memory().unwrap();
+        let acct = AccountId([1; 32]);
+        let CreateOutcome::Created(rec) = store.create(&acct, &input("n"), 100).unwrap() else {
+            panic!()
+        };
+        for rev in 1..=(MAX_REVISIONS + 10) {
+            let out = store
+                .update(&acct, &rec.id, rev, &input("n"), 100 + rev)
+                .unwrap();
+            assert!(matches!(out, UpdateOutcome::Updated(_)));
+        }
+        let revs = store.revisions(&acct, &rec.id).unwrap().unwrap();
+        assert_eq!(revs.len() as i64, MAX_REVISIONS);
+        assert_eq!(revs[0].revision, MAX_REVISIONS + 10);
+        assert_eq!(revs.last().unwrap().revision, 11);
+    }
+
+    fn pem() -> String {
+        format!(
+            "-----BEGIN {} KEY-----\nMIIB\n-----END {} KEY-----",
+            "PRIVATE", "PRIVATE"
+        )
+    }
+
+    #[tokio::test]
+    async fn secrets_are_rejected_with_422_and_never_stored() {
+        let e = env();
+        let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        let gh = ["ghp_", "0123456789abcdefghijklmnop"].concat();
+        let sk = ["sk-", "proj-0123456789abcdef"].concat();
+        let slack = ["xoxb", "-1234567890-abcdefghij"].concat();
+        let bad_keys = [
+            "token",
+            "auth_Token",
+            "client_SECRET",
+            "Password",
+            "db_password",
+            "API_KEY",
+            "ssh_key",
+            "key",
+            "privateKey",
+        ];
+        for k in bad_keys {
+            let mut p = payload("x");
+            p["values"] = json!({ "region": "eu", "nested": { "deep": [ { k: "v" } ] } });
+            let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+            assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "key {k}");
+            assert!(r.text.contains("looks like a secret"), "{}", r.text);
+        }
+        for v in [aws.clone(), gh, sk, slack, pem(), format!("export X={aws}")] {
+            let mut p = payload("x");
+            p["values"] = json!({ "note": "fine", "list": ["ok", v.clone()] });
+            let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+            assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "value {v}");
+            assert!(r.text.contains("looks like a credential"), "{}", r.text);
+            assert!(
+                r.text.contains("values.list[1]") || r.text.contains("values.note"),
+                "{}",
+                r.text
+            );
+            assert!(
+                !r.text.contains(&v),
+                "the error must not echo the credential"
+            );
+        }
+        // Credential-looking free text in other fields is refused too.
+        let mut p = payload(&aws);
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(p.clone()),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        p["name"] = json!("ok");
+        p["target"]["device_label"] = json!(pem());
+        let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Update path too, and the stored record is untouched by the refusal.
+        let id = create_as(&e.app, "alice", "clean").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut p = payload("clean");
+        p["values"] = json!({ "api_key": "x" });
+        let r = send(
+            &e.app,
+            "PUT",
+            &format!("/me/installations/{id}"),
+            "alice",
+            Some("1"),
+            Some(p),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let r = send(
+            &e.app,
+            "GET",
+            &format!("/me/installations/{id}"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.body["revision"], 1);
+        let r = send(&e.app, "GET", "/me/installations", "alice", None, None).await;
+        assert_eq!(r.body["total"], 1, "no refused create left a row");
+
+        // Ordinary values that merely resemble the patterns pass.
+        let mut p = payload("benign");
+        p["values"] = json!({ "keyboard_layout": "de", "tokenizer": "off".to_string().replace("off", "none"), "lang": "sk-SK", "greeting": "xoxo", "ssh_port": 22 });
+        let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tokenizer contains 'token' and is refused, as specified"
+        );
+        let mut p = payload("benign");
+        p["values"] =
+            json!({ "keyboard_layout": "de", "lang": "sk-SK", "greeting": "xoxo", "ssh_port": 22 });
+        let r = send(&e.app, "POST", "/me/installations", "alice", None, Some(p)).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn size_and_shape_limits_are_422() {
+        let e = env();
+        let post = |p: Value| {
+            let app = e.app.clone();
+            async move { send(&app, "POST", "/me/installations", "alice", None, Some(p)).await }
+        };
+        let r = post(payload(&"n".repeat(MAX_NAME_CHARS))).await;
+        assert_eq!(r.status, StatusCode::CREATED, "120 characters are fine");
+        let r = post(payload(&"n".repeat(MAX_NAME_CHARS + 1))).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.text.contains("120"), "{}", r.text);
+        assert_eq!(
+            post(payload("   ")).await.status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let mut p = payload("big");
+        p["values"] = json!({ "blob": "x".repeat(MAX_VALUES_BYTES) });
+        let r = post(p).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.text.contains("32 KiB"), "{}", r.text);
+        let mut p = payload("just under");
+        p["values"] = json!({ "blob": "x".repeat(MAX_VALUES_BYTES - 64) });
+        assert_eq!(post(p).await.status, StatusCode::CREATED);
+
+        for bad in [json!([1]), json!("s"), json!(null)] {
+            let mut p = payload("shape");
+            p["values"] = bad;
+            assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let mut p = payload("deep");
+        let mut v = json!("leaf");
+        for _ in 0..40 {
+            v = json!({ "n": v });
+        }
+        p["values"] = v;
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let mut p = payload("sha");
+        p["components"] = json!([{ "name": "a", "sha256": "xyz" }]);
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut p = payload("pk");
+        p["target"]["agent_holder_pubkey"] = json!("short");
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut p = payload("status");
+        p["status"] = json!("removed");
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut p = payload("status");
+        p["status"] = json!("bogus");
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut p = payload("os");
+        p["target"]["os"] = json!("");
+        assert_eq!(post(p).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn per_account_cap_counts_active_records_only() {
+        let e = env();
+        let acct = e.ledger.account_for_subject("alice").unwrap();
+        for i in 0..MAX_INSTALLATIONS_PER_ACCOUNT {
+            assert!(matches!(
+                e.store.create(&acct, &input(&format!("i{i}")), 1).unwrap(),
+                CreateOutcome::Created(_)
+            ));
+        }
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(payload("one too many")),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.text.contains("200"), "{}", r.text);
+        // Another account is unaffected.
+        create_as(&e.app, "bob", "mine").await;
+
+        let (items, total) = e.store.list(&acct, None, 1, 0).unwrap();
+        assert_eq!(total, MAX_INSTALLATIONS_PER_ACCOUNT);
+        let id = &items[0].id;
+        let r = send(
+            &e.app,
+            "POST",
+            &format!("/me/installations/{id}/duplicate"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "duplicate respects the cap"
+        );
+        let r = send(
+            &e.app,
+            "DELETE",
+            &format!("/me/installations/{id}"),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(payload("fits again")),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::CREATED,
+            "a removed record frees its slot"
+        );
+        // ... and reviving the removed one is now over the cap.
+        let r = send(
+            &e.app,
+            "PUT",
+            &format!("/me/installations/{id}"),
+            "alice",
+            Some("2"),
+            Some(payload("revive")),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::OK,
+            "no status given keeps it removed, which is allowed"
+        );
+        let mut revive = payload("revive");
+        revive["status"] = json!("draft");
+        let r = send(
+            &e.app,
+            "PUT",
+            &format!("/me/installations/{id}"),
+            "alice",
+            Some("3"),
+            Some(revive),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn old_removed_records_are_purged_with_their_history() {
+        let store = SqliteInstallationStore::open_in_memory().unwrap();
+        let acct = AccountId([7; 32]);
+        let mut ids = Vec::new();
+        for i in 0..(KEEP_REMOVED + 5) {
+            let CreateOutcome::Created(rec) = store.create(&acct, &input("r"), 10 + i).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                store.soft_delete(&acct, &rec.id, None, 10 + i).unwrap(),
+                DeleteOutcome::Removed
+            );
+            ids.push(rec.id);
+        }
+        let (_, removed) = store.list(&acct, Some(Status::Removed), 1, 0).unwrap();
+        assert_eq!(removed as i64, KEEP_REMOVED);
+        assert!(
+            store.get(&acct, &ids[0]).unwrap().is_none(),
+            "oldest removed record is gone"
+        );
+        assert!(store.revisions(&acct, &ids[0]).unwrap().is_none());
+        assert!(store.get(&acct, ids.last().unwrap()).unwrap().is_some());
+        let orphans: i64 = store
+            .conn
+            .lock_safe()
+            .query_row("SELECT COUNT(*) FROM installation_revisions WHERE id NOT IN (SELECT id FROM installations)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[tokio::test]
+    async fn account_a_cannot_touch_account_b() {
+        let e = env();
+        let a = create_as(&e.app, "alice", "alice's").await;
+        let id = a["id"].as_str().unwrap();
+        let url = format!("/me/installations/{id}");
+        let before = send(&e.app, "GET", &url, "alice", None, None).await.body;
+
+        let steps: Vec<(&str, String, Option<&str>, Option<Value>)> = vec![
+            ("GET", url.clone(), None, None),
+            ("PUT", url.clone(), Some("1"), Some(payload("hijacked"))),
+            ("PUT", url.clone(), None, Some(payload("hijacked"))),
+            ("PUT", url.clone(), Some("99"), Some(payload("hijacked"))),
+            ("DELETE", url.clone(), None, None),
+            ("DELETE", url.clone(), Some("1"), None),
+            ("GET", format!("{url}/revisions"), None, None),
+            ("POST", format!("{url}/duplicate"), None, None),
+        ];
+        for (m, u, im, body) in steps {
+            let r = send(&e.app, m, &u, "bob", im, body).await;
+            assert_eq!(
+                r.status,
+                StatusCode::NOT_FOUND,
+                "{m} {u} must be 404 (not 403) for a foreign record: {}",
+                r.text
+            );
+        }
+        // An id that never existed answers identically.
+        let ghost = send(
+            &e.app,
+            "GET",
+            "/me/installations/00000000-0000-4000-8000-000000000000",
+            "bob",
+            None,
+            None,
+        )
+        .await;
+        let foreign = send(&e.app, "GET", &url, "bob", None, None).await;
+        assert_eq!(
+            (ghost.status, ghost.text.clone()),
+            (foreign.status, foreign.text.clone())
+        );
+
+        // Listing/exporting shows nothing; nothing of alice's changed or was copied.
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "bob", None, None)
+                .await
+                .body["total"],
+            0
+        );
+        assert_eq!(
+            send(
+                &e.app,
+                "GET",
+                "/me/installations?status=removed",
+                "bob",
+                None,
+                None
+            )
+            .await
+            .body["total"],
+            0
+        );
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations/export", "bob", None, None)
+                .await
+                .body["installations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            send(&e.app, "GET", &url, "alice", None, None).await.body,
+            before
+        );
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "alice", None, None)
+                .await
+                .body["total"],
+            1
+        );
+
+        // Importing alice's exported file (ids included) into bob creates new records only.
+        let exported = send(
+            &e.app,
+            "GET",
+            "/me/installations/export",
+            "alice",
+            None,
+            None,
+        )
+        .await
+        .body;
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "bob",
+            None,
+            Some(exported),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED);
+        assert_ne!(r.body["ids"][0], a["id"]);
+        assert_eq!(
+            send(&e.app, "GET", &url, "bob", None, None).await.status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(&e.app, "GET", &url, "alice", None, None).await.body,
+            before
+        );
+
+        // The binding is the ledger account: a store query with the wrong account sees nothing.
+        let alice_acct = e.ledger.account_for_subject("alice").unwrap();
+        let bob_acct = e.ledger.account_for_subject("bob").unwrap();
+        assert_ne!(alice_acct, bob_acct);
+        assert!(e.store.get(&bob_acct, id).unwrap().is_none());
+        assert!(e.store.get(&alice_acct, id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn requires_authentication() {
+        let e = env();
+        // Bodies are valid for their route, so the 401 is about auth, not parsing.
+        for (m, u, body) in [
+            ("GET", "/me/installations", json!(null)),
+            ("POST", "/me/installations", payload("x")),
+            ("GET", "/me/installations/export", json!(null)),
+            (
+                "POST",
+                "/me/installations/import",
+                json!({ "installations": [] }),
+            ),
+        ] {
+            let req = Request::builder()
+                .method(m)
+                .uri(u)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = e.app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{m} {u}");
+        }
+        let req = Request::get("/me/installations")
+            .header("authorization", "Bearer not-a-jwt")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            e.app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn portal_session_cookie_resolves_to_the_same_account() {
+        let e = env();
+        let id = create_as(&e.app, "alice", "via bearer").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cookie = crate::portal::sign_session_for_test(SESSION_KEY, "alice");
+        let req = Request::get(format!("/me/installations/{id}"))
+            .header("cookie", format!("ct_portal_session={cookie}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = e.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let other = crate::portal::sign_session_for_test(SESSION_KEY, "mallory");
+        let req = Request::get(format!("/me/installations/{id}"))
+            .header("cookie", format!("ct_portal_session={other}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            e.app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn list_is_paginated_newest_first() {
+        let e = env();
+        for i in 0..7 {
+            create_as(&e.app, "alice", &format!("n{i}")).await;
+        }
+        let page = |q: &'static str| {
+            let app = e.app.clone();
+            async move {
+                send(
+                    &app,
+                    "GET",
+                    &format!("/me/installations{q}"),
+                    "alice",
+                    None,
+                    None,
+                )
+                .await
+                .body
+            }
+        };
+        let p1 = page("?limit=3").await;
+        assert_eq!(
+            (
+                p1["total"].as_u64(),
+                p1["limit"].as_u64(),
+                p1["offset"].as_u64()
+            ),
+            (Some(7), Some(3), Some(0))
+        );
+        let names = |p: &Value| {
+            p["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&p1), ["n6", "n5", "n4"]);
+        assert_eq!(names(&page("?limit=3&offset=3").await), ["n3", "n2", "n1"]);
+        assert_eq!(names(&page("?limit=3&offset=6").await), ["n0"]);
+        assert_eq!(names(&page("?limit=3&offset=60").await).len(), 0);
+        assert_eq!(page("?limit=100000").await["limit"], MAX_PAGE);
+        assert_eq!(page("?limit=0").await["limit"], 1);
+        assert_eq!(page("").await["limit"], DEFAULT_PAGE);
+        let r = send(
+            &e.app,
+            "GET",
+            "/me/installations?status=nonsense",
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST);
+        let r = send(
+            &e.app,
+            "GET",
+            "/me/installations?status=draft",
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.body["total"], 7);
+        let r = send(
+            &e.app,
+            "GET",
+            "/me/installations?status=installed",
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.body["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_makes_an_independent_draft() {
+        let e = env();
+        let mut p = payload("Original");
+        p["status"] = json!("installed");
+        let src = send(&e.app, "POST", "/me/installations", "alice", None, Some(p))
+            .await
+            .body;
+        let url = format!(
+            "/me/installations/{}/duplicate",
+            src["id"].as_str().unwrap()
+        );
+
+        let r = send(&e.app, "POST", &url, "alice", None, None).await;
+        assert_eq!(r.status, StatusCode::CREATED);
+        assert_ne!(r.body["id"], src["id"]);
+        assert_eq!(r.body["name"], "Original (copy)");
+        assert_eq!(r.body["status"], "draft");
+        assert_eq!(r.body["revision"], 1);
+        for f in [
+            "template_id",
+            "template_digest",
+            "values",
+            "values_digest",
+            "components",
+            "manifest_ids",
+            "target",
+        ] {
+            assert_eq!(r.body[f], src[f], "{f} is copied");
+        }
+        let r = send(
+            &e.app,
+            "POST",
+            &url,
+            "alice",
+            None,
+            Some(json!({ "name": "Zweitgeraet" })),
+        )
+        .await;
+        assert_eq!(r.body["name"], "Zweitgeraet");
+        let r = send(
+            &e.app,
+            "POST",
+            &url,
+            "alice",
+            None,
+            Some(json!({ "name": "" })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let long = send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(payload(&"n".repeat(MAX_NAME_CHARS))),
+        )
+        .await
+        .body;
+        let r = send(
+            &e.app,
+            "POST",
+            &format!(
+                "/me/installations/{}/duplicate",
+                long["id"].as_str().unwrap()
+            ),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert!(r.body["name"].as_str().unwrap().chars().count() <= MAX_NAME_CHARS);
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "alice", None, None)
+                .await
+                .body["total"],
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn export_import_round_trip() {
+        let e = env();
+        let mut installed = payload("Zwei");
+        installed["status"] = json!("installed");
+        installed["target"]["agent_holder_pubkey"] = json!("ef".repeat(32));
+        send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(payload("Eins")),
+        )
+        .await;
+        send(
+            &e.app,
+            "POST",
+            "/me/installations",
+            "alice",
+            None,
+            Some(installed),
+        )
+        .await;
+        let gone = create_as(&e.app, "alice", "Entfernt").await;
+        send(
+            &e.app,
+            "DELETE",
+            &format!("/me/installations/{}", gone["id"].as_str().unwrap()),
+            "alice",
+            None,
+            None,
+        )
+        .await;
+
+        let r = send(
+            &e.app,
+            "GET",
+            "/me/installations/export",
+            "alice",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.headers[CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .contains("installations.json"));
+        let file = r.body.clone();
+        assert_eq!(file["version"], 1);
+        let exported = file["installations"].as_array().unwrap();
+        assert_eq!(exported.len(), 2, "removed records are not exported");
+
+        // Into a fresh account: same content, new identities.
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "bob",
+            None,
+            Some(file.clone()),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text);
+        assert_eq!(r.body["imported"], 2);
+        let again = send(&e.app, "GET", "/me/installations/export", "bob", None, None)
+            .await
+            .body;
+        let imported = again["installations"].as_array().unwrap();
+        assert_eq!(imported.len(), 2);
+        for (a, b) in exported.iter().zip(imported) {
+            assert_ne!(a["id"], b["id"], "import never reuses ids");
+            assert_eq!(b["revision"], 1);
+            for f in [
+                "name",
+                "template_id",
+                "template_digest",
+                "values",
+                "values_digest",
+                "components",
+                "manifest_ids",
+                "target",
+                "status",
+            ] {
+                assert_eq!(a[f], b[f], "{f} survives the round trip");
+            }
+        }
+        // Importing again into the same account duplicates; the cap is enforced atomically.
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "bob",
+            None,
+            Some(file),
+        )
+        .await;
+        assert_eq!(r.body["imported"], 2);
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "bob", None, None)
+                .await
+                .body["total"],
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn import_is_all_or_nothing() {
+        let e = env();
+        let mut secret = payload("bad");
+        secret["values"] = json!({ "password": "x" });
+        let body = json!({ "version": 1, "installations": [payload("ok"), secret] });
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "alice",
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.text.starts_with("installations[1]:"), "{}", r.text);
+        let mut removed = payload("r");
+        removed["status"] = json!("removed");
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "alice",
+            None,
+            Some(json!({ "installations": [removed] })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "alice",
+            None,
+            Some(json!({ "version": 2, "installations": [] })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "alice", None, None)
+                .await
+                .body["total"],
+            0
+        );
+
+        // Over the cap: nothing at all is imported.
+        for _ in 0..(MAX_INSTALLATIONS_PER_ACCOUNT - 1) {
+            e.store
+                .create(
+                    &e.ledger.account_for_subject("alice").unwrap(),
+                    &input("f"),
+                    1,
+                )
+                .unwrap();
+        }
+        let body = json!({ "installations": [payload("a"), payload("b")] });
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "alice",
+            None,
+            Some(body),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            send(&e.app, "GET", "/me/installations", "alice", None, None)
+                .await
+                .body["total"],
+            MAX_INSTALLATIONS_PER_ACCOUNT - 1
+        );
+        let r = send(
+            &e.app,
+            "POST",
+            "/me/installations/import",
+            "alice",
+            None,
+            Some(json!({ "installations": [payload("last")] })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED);
+    }
+
+    #[test]
+    fn migration_is_additive_and_survives_reopen() {
+        let path = std::env::temp_dir().join(format!("ct-installations-{}.db", new_uuid()));
+        let path_s = path.to_str().unwrap();
+        // The same DB file already holds other stores' tables.
+        let ledger = SqliteLedger::open(path_s).unwrap();
+        let acct = ledger.account_for_subject("alice").unwrap();
+        let rec = {
+            let store = SqliteInstallationStore::open(path_s).unwrap();
+            let CreateOutcome::Created(rec) = store.create(&acct, &input("durable"), 5).unwrap()
+            else {
+                panic!()
+            };
+            rec
+        };
+        let store = SqliteInstallationStore::open(path_s).unwrap();
+        assert_eq!(store.get(&acct, &rec.id).unwrap().unwrap(), *rec);
+        assert_eq!(
+            ledger.account_for_subject("alice").unwrap(),
+            acct,
+            "existing tables untouched"
+        );
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path_s}{suffix}"));
+        }
+    }
+}
