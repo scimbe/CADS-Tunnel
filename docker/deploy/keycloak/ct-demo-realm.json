@@ -165,6 +165,52 @@
       ]
     },
     {
+      "clientId": "cads-mobile",
+      "name": "CADS Marktplatz (Android/iOS)",
+      "description": "Oeffentlicher Client der Mobile-Apps: Authorization Code + PKCE (S256) im System-Browser, kein Client-Secret.",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [
+        "https://bunsenbrenner.org/app/oauth2redirect",
+        "org.bunsenbrenner.cads:/oauth2redirect"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "access.token.lifespan": "300",
+        "post.logout.redirect.uris": "https://bunsenbrenner.org/app/oauth2redirect"
+      },
+      "defaultClientScopes": [
+        "email",
+        "profile"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ],
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "id",
+            "claim.name": "sub",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
       "clientId": "praktikum-creator",
       "name": "RN Praktikum Creator",
       "description": "RN Praktikum relying-party client for praktikum.bunsenbrenner.org (Gelb tunnel, authorized via authorize-pipeline.sh, not portal self-service). Carries gitlab-groups-claim so group gating reads a real claim, not a hardcoded allowlist.",
