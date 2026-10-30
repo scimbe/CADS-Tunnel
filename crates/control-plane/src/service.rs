@@ -7105,6 +7105,8 @@ pub fn persistent_control_plane_router(
                 ledger.clone(),
                 oidc.clone(),
                 Arc::from(session_key),
+                crate::installations::InstallationsDelegate::from_env()
+                    .expect("installations delegate configuration"),
             ))
             // #81 SEC81c-b: authenticated Agent-Fabric channel registry (owner =
             // verified subject), so it carries no unauthenticated write surface.
