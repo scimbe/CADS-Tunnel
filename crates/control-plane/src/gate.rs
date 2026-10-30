@@ -550,7 +550,8 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
                 return resp;
             }
             let now = now_secs();
-            let token = sign_gate_session(&st.session_key, host, &email, now + GATE_SESSION_TTL_SECS);
+            let token =
+                sign_gate_session_for_subject(&st.session_key, host, &email, &identity.subject, now + GATE_SESSION_TTL_SECS);
             let mut resp = Redirect::to(&format!("https://{host}{return_path}")).into_response();
             set_cookie(&mut resp, &gate_session_cookie(&token, domain));
             set_cookie(&mut resp, &cleared_gate_state_cookie());
@@ -1059,17 +1060,39 @@ fn sign_gate_session(key: &[u8], host: &str, email: &str, exp: u64) -> String {
     format!("{payload}.{}", hex(&gate_session_mac(key, payload.as_bytes())))
 }
 
+/// Like [`sign_gate_session`], plus the OIDC subject as an optional fourth payload field. Only the
+/// login path mints it: [`delegated_subject`] needs an account, and an email is not one. Sessions
+/// minted earlier keep working for `/gate/check`; they just cannot be delegated until the next login.
+fn sign_gate_session_for_subject(key: &[u8], host: &str, email: &str, subject: &str, exp: u64) -> String {
+    let payload = format!("{}:{}:{exp}:{}", hex(host.as_bytes()), hex(email.as_bytes()), hex(subject.as_bytes()));
+    format!("{payload}.{}", hex(&gate_session_mac(key, payload.as_bytes())))
+}
+
 struct GateSessionClaims {
     host: String,
     email: String,
+    subject: Option<String>,
+}
+
+/// The account behind a gate session, for a trusted origin acting for its own visitor (see
+/// `installations.rs`). `ct_gate_session` is `Domain=`-scoped, so every tunnel on the zone sees it:
+/// the session alone must never grant anything beyond its host. Hence the caller names the one host
+/// it is configured for, and share-link sessions (no account) and pre-subject sessions yield `None`.
+pub(crate) fn delegated_subject(key: &[u8], token: &str, host: &str, now: u64) -> Option<String> {
+    let claims = verify_gate_session(key, token, now)?;
+    if !claims.host.eq_ignore_ascii_case(host) || claims.email.starts_with(GATE_SHARE_SUBJECT_PREFIX) {
+        return None;
+    }
+    claims.subject.filter(|s| !s.is_empty())
 }
 
 fn verify_gate_session(key: &[u8], token: &str, now: u64) -> Option<GateSessionClaims> {
     let (payload, tag_hex) = token.rsplit_once('.')?;
-    let mut parts = payload.splitn(3, ':');
+    let mut parts = payload.splitn(4, ':');
     let host_hex = parts.next()?;
     let email_hex = parts.next()?;
     let exp_str = parts.next()?;
+    let subject_hex = parts.next();
     if exp_str.parse::<u64>().ok()? <= now {
         return None;
     }
@@ -1078,7 +1101,19 @@ fn verify_gate_session(key: &[u8], token: &str, now: u64) -> Option<GateSessionC
     }
     let host = String::from_utf8(unhex(host_hex)?).ok()?;
     let email = String::from_utf8(unhex(email_hex)?).ok()?;
-    Some(GateSessionClaims { host, email })
+    let subject = match subject_hex {
+        Some(h) => Some(String::from_utf8(unhex(h)?).ok()?),
+        None => None,
+    };
+    Some(GateSessionClaims { host, email, subject })
+}
+
+#[cfg(test)]
+pub(crate) fn sign_gate_session_for_test(key: &[u8], host: &str, email: &str, subject: Option<&str>, exp: u64) -> String {
+    match subject {
+        Some(s) => sign_gate_session_for_subject(key, host, email, s, exp),
+        None => sign_gate_session(key, host, email, exp),
+    }
 }
 
 #[cfg(test)]

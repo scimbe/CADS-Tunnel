@@ -29,6 +29,15 @@
 //!
 //! Auth, state and error conventions follow `/me/service-accounts` and `/me/topologies`
 //! (portal session cookie or OIDC bearer, plain-text errors).
+//!
+//! * **Delegated access.** A gallery behind the login gate knows its visitor only by
+//!   `ct_gate_session`, and a browser cannot call this API from a tunnel origin (no CORS, and
+//!   [`csrf_guard`] refuses `same-site`). [`InstallationsDelegate`] lets exactly one configured
+//!   origin call it server to server. It needs BOTH proofs: the delegate token (this is that
+//!   origin, not any tunnel on the zone, all of which see the `Domain=`-scoped cookie) and the
+//!   visitor's live gate session for that origin's host (this visitor is present, so a leaked
+//!   token alone reads nothing). Off unless `CT_INSTALLATIONS_DELEGATE_SHA256` and
+//!   `CT_INSTALLATIONS_DELEGATE_HOST` are both set.
 
 use std::sync::{Arc, Mutex};
 
@@ -45,6 +54,7 @@ use ct_common::time::now_secs;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::accounts::AccountId;
 use crate::oidc::OidcVerifierHandle;
@@ -997,6 +1007,7 @@ pub struct AuthedInstallationState {
     ledger: Arc<SqliteLedger>,
     verifier: OidcVerifierHandle,
     session_key: Arc<[u8]>,
+    delegate: Option<InstallationsDelegate>,
 }
 
 /// `/me/installations*`, owner = the caller's platform account.
@@ -1015,6 +1026,7 @@ pub fn authed_installations_router(
     ledger: Arc<SqliteLedger>,
     verifier: OidcVerifierHandle,
     session_key: Arc<[u8]>,
+    delegate: Option<InstallationsDelegate>,
 ) -> Router {
     Router::new()
         .route("/me/installations", post(create).get(list))
@@ -1035,7 +1047,42 @@ pub fn authed_installations_router(
             ledger,
             verifier,
             session_key,
+            delegate,
         })
+}
+
+/// The delegate token, as a request header. A browser cannot attach it cross-site without CORS.
+const DELEGATE_HEADER: &str = "x-ct-installations-delegate";
+/// The visitor's `ct_gate_session` value, as the delegate forwards it.
+const DELEGATE_SESSION_HEADER: &str = "x-ct-gate-session";
+
+/// The one origin allowed to act for its gate-authenticated visitors. See the module docs.
+#[derive(Clone)]
+pub struct InstallationsDelegate {
+    token_sha256: [u8; 32],
+    host: String,
+}
+
+impl InstallationsDelegate {
+    pub fn new(token_sha256: [u8; 32], host: impl Into<String>) -> Self {
+        Self { token_sha256, host: host.into() }
+    }
+
+    /// `None` when neither variable is set. One without the other, or a malformed hash, is a
+    /// misconfiguration and refuses to start rather than silently leaving the feature off.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        match (var("CT_INSTALLATIONS_DELEGATE_SHA256"), var("CT_INSTALLATIONS_DELEGATE_HOST")) {
+            (None, None) => Ok(None),
+            (Some(hash), Some(host)) => {
+                let bytes = ct_common::hex::decode(hash.trim())
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or("CT_INSTALLATIONS_DELEGATE_SHA256 must be 64 hex characters")?;
+                Ok(Some(Self::new(bytes, host.trim().to_ascii_lowercase())))
+            }
+            _ => Err("CT_INSTALLATIONS_DELEGATE_SHA256 and CT_INSTALLATIONS_DELEGATE_HOST go together".to_string()),
+        }
+    }
 }
 
 /// CSRF guard for the state-changing routes. A request that carries an `Authorization`
@@ -1049,6 +1096,7 @@ async fn csrf_guard(req: Request, next: Next) -> Response {
         && !req
             .headers()
             .contains_key(axum::http::header::AUTHORIZATION)
+        && !req.headers().contains_key(DELEGATE_HEADER)
         && !same_origin_strict(req.headers())
     {
         return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
@@ -1091,8 +1139,27 @@ fn limit_reached() -> ApiError {
     ))
 }
 
+/// A request naming the delegate header is judged as a delegate only; it never falls through to the
+/// session or bearer path, so a wrong token cannot be mistaken for any other kind of login.
+fn delegated_subject_of(st: &AuthedInstallationState, headers: &HeaderMap, token: &HeaderValue) -> Result<String, ApiError> {
+    let refused = || (StatusCode::UNAUTHORIZED, "delegate refused".to_string());
+    let delegate = st.delegate.as_ref().ok_or_else(refused)?;
+    let presented: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    if !ct_common::ct::eq(&presented, &delegate.token_sha256) {
+        return Err(refused());
+    }
+    let session = headers
+        .get(DELEGATE_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(refused)?;
+    crate::gate::delegated_subject(&st.session_key, session, &delegate.host, now_secs()).ok_or_else(refused)
+}
+
 fn account_of(st: &AuthedInstallationState, headers: &HeaderMap) -> Result<AccountId, ApiError> {
-    let subject = crate::service::subject_of_topology(&st.session_key, &st.verifier, headers)?;
+    let subject = match headers.get(DELEGATE_HEADER) {
+        Some(token) => delegated_subject_of(st, headers, token)?,
+        None => crate::service::subject_of_topology(&st.session_key, &st.verifier, headers)?,
+    };
     st.ledger
         .account_for_subject(&subject)
         .map_err(|e| internal("account_for_subject", e))
@@ -1436,6 +1503,10 @@ mod tests {
             ledger.clone(),
             OidcVerifierHandle::new(Some(verifier)),
             Arc::from(SESSION_KEY),
+            Some(InstallationsDelegate::new(
+                Sha256::digest(DELEGATE_TOKEN).into(),
+                DELEGATE_HOST,
+            )),
         );
         Env { app, store, ledger }
     }
@@ -2244,6 +2315,85 @@ mod tests {
             e.app.clone().oneshot(req).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    const DELEGATE_TOKEN: &[u8] = b"delegate-token-for-tests";
+    const DELEGATE_HOST: &str = "gallery.example";
+
+    fn gate_token(host: &str, email: &str, subject: Option<&str>, exp: u64) -> String {
+        crate::gate::sign_gate_session_for_test(SESSION_KEY, host, email, subject, exp)
+    }
+
+    fn delegated(method: &str, path: &str, token: Option<&[u8]>, session: Option<&str>, body: Body) -> Request<Body> {
+        let mut b = Request::builder().method(method).uri(path).header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header(DELEGATE_HEADER, HeaderValue::from_bytes(t).unwrap());
+        }
+        if let Some(s) = session {
+            b = b.header(DELEGATE_SESSION_HEADER, s);
+        }
+        b.body(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_delegate_acts_for_its_gate_visitor_on_the_same_account_as_the_portal() {
+        let e = env();
+        let id = create_as(&e.app, "alice", "via bearer").await["id"].as_str().unwrap().to_string();
+        let s = gate_token(DELEGATE_HOST, "alice@example.com", Some("alice"), now_secs() + 60);
+        let path = format!("/me/installations/{id}");
+        let get = delegated("GET", &path, Some(DELEGATE_TOKEN), Some(&s), Body::empty());
+        assert_eq!(e.app.clone().oneshot(get).await.unwrap().status(), StatusCode::OK);
+        let body = Body::from(payload("from the gallery").to_string());
+        let post = delegated("POST", "/me/installations", Some(DELEGATE_TOKEN), Some(&s), body);
+        assert_eq!(e.app.clone().oneshot(post).await.unwrap().status(), StatusCode::CREATED);
+        let del = delegated("DELETE", &path, Some(DELEGATE_TOKEN), Some(&s), Body::empty());
+        assert_eq!(e.app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+        let other = gate_token(DELEGATE_HOST, "bob@example.com", Some("bob"), now_secs() + 60);
+        let get = delegated("GET", &path, Some(DELEGATE_TOKEN), Some(&other), Body::empty());
+        assert_eq!(e.app.clone().oneshot(get).await.unwrap().status(), StatusCode::NOT_FOUND, "bob sees nothing of alice");
+    }
+
+    #[tokio::test]
+    async fn a_delegate_needs_both_proofs_and_the_right_session() {
+        let e = env();
+        let now = now_secs();
+        let good = gate_token(DELEGATE_HOST, "alice@example.com", Some("alice"), now + 60);
+        let cases: Vec<(&str, Option<&[u8]>, Option<String>)> = vec![
+            ("cookie alone: any tunnel on the zone sees it", None, Some(good.clone())),
+            ("token alone: a leaked token reads nothing", Some(DELEGATE_TOKEN), None),
+            ("wrong token", Some(b"nope"), Some(good.clone())),
+            ("session of another host", Some(DELEGATE_TOKEN), Some(gate_token("evil.example", "alice@example.com", Some("alice"), now + 60))),
+            ("share-link session", Some(DELEGATE_TOKEN), Some(gate_token(DELEGATE_HOST, "share:abc", Some("alice"), now + 60))),
+            ("session from before the subject field", Some(DELEGATE_TOKEN), Some(gate_token(DELEGATE_HOST, "alice@example.com", None, now + 60))),
+            ("expired session", Some(DELEGATE_TOKEN), Some(gate_token(DELEGATE_HOST, "alice@example.com", Some("alice"), now - 1))),
+            ("forged session", Some(DELEGATE_TOKEN), Some(format!("{good}00"))),
+        ];
+        for (what, token, session) in cases {
+            let req = delegated("GET", "/me/installations", token, session.as_deref(), Body::empty());
+            assert_eq!(e.app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_delegate_token_does_not_fall_through_to_a_valid_bearer() {
+        let e = env();
+        let req = Request::get("/me/installations")
+            .header("authorization", format!("Bearer {}", jwt("alice")))
+            .header(DELEGATE_HEADER, "nope")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(e.app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_delegate_the_header_opens_nothing() {
+        let store = Arc::new(SqliteInstallationStore::open_in_memory().unwrap());
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let verifier = Arc::new(OidcVerifier::from_hs_secret(SECRET, ISSUER));
+        let app = authed_installations_router(store, ledger, OidcVerifierHandle::new(Some(verifier)), Arc::from(SESSION_KEY), None);
+        let s = gate_token(DELEGATE_HOST, "alice@example.com", Some("alice"), now_secs() + 60);
+        let req = delegated("GET", "/me/installations", Some(DELEGATE_TOKEN), Some(&s), Body::empty());
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

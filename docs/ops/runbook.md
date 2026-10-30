@@ -900,6 +900,7 @@ entry rather than inferred from their names:
 | `CT_GATE_REDIRECT_URI` | derived | the gate's OIDC redirect target. Unset, it is the portal's `redirect_uri` with `/portal/callback` swapped for `/gate/callback` — correct whenever both live on the same host, so it usually needs no value at all |
 | `CT_PORTAL_SOCIAL_PROVIDERS` | unset ⇒ **none shown** | comma-separated allowlist (`google`, `github`) of social-login buttons on the logged-out portal |
 | `CT_PORTAL_REQUIRE_VERIFIED_EMAIL` | off | **a distinct variable from `CT_GATE_REQUIRE_VERIFIED_EMAIL`** (see the [threat model](../security/threat-model.md)). Truthy ⇒ the *Portal's* channel-allowlist self-service claim flow additionally requires an `email_verified` id_token claim before an email can claim an allowlist slot. Off by default until a real email-confirmation mechanism exists |
+| `CT_INSTALLATIONS_DELEGATE_SHA256` + `CT_INSTALLATIONS_DELEGATE_HOST` | off | Both or neither (one alone refuses to start). Lets the origin on that host call `/me/installations` for a visitor: SHA-256 hex of its delegate token, plus the visitor's `ct_gate_session` for exactly that host. The token alone reads nothing, the cookie alone neither. Rotate by replacing the hash |
 
 Two things worth knowing before touching them:
 
