@@ -6154,7 +6154,50 @@ const TEMPLATE_GUIDE_HTML: &str = include_str!("../../../docs/landing/template-g
 /// `git clone` required); `/template-guide` explains its structure for the "build it yourself" path.
 /// `/impressum`, `/datenschutz`, `/nutzungsbedingungen` serve the legal pages linked from the footer.
 pub fn landing_router() -> Router {
-    Router::new()
+    landing_router_with_apple_team(
+        std::env::var("CT_APPLE_TEAM_ID").ok().filter(|s| !s.trim().is_empty()),
+    )
+}
+
+/// Android App Links statement for the CADS app. The signing-certificate fingerprint is public by
+/// design (it is what the OS compares against the installed APK), not a secret.
+const ASSETLINKS_JSON: &str = r#"[{"relation":["delegate_permission/common/handle_all_urls"],"target":{"namespace":"android_app","package_name":"org.bunsenbrenner.cads","sha256_cert_fingerprints":["AC:00:28:F0:43:1A:6A:4A:B1:6A:9B:85:20:ED:19:3A:50:CD:26:BF:77:3F:99:21:92:1E:1A:0B:C1:2B:B9:D0"]}}]"#;
+
+/// Destination of `GET /duell`. The redirect deliberately carries no fragment of its own, so a
+/// `#c=...` fragment the browser holds is re-attached to the target by the browser (RFC 9110 §10.2.2).
+const DUELL_TARGET: &str = "https://demos-34a13a96.bunsenbrenner.org/duell";
+
+/// iOS Universal Links statement; `None` (no `CT_APPLE_TEAM_ID`) means the file does not exist.
+fn apple_app_site_association(team_id: &str) -> String {
+    serde_json::json!({
+        "applinks": {"details": [{
+            "appIDs": [format!("{}.org.bunsenbrenner.cads", team_id.trim())],
+            "components": [{"/": "/duell"}, {"/": "/duell/*"}]
+        }]}
+    })
+    .to_string()
+}
+
+/// [`landing_router`] with the Apple team id injected (tests pass it directly instead of mutating
+/// the process environment).
+fn landing_router_with_apple_team(apple_team_id: Option<String>) -> Router {
+    let mut router = Router::new()
+        .route("/duell", get(|| async { axum::response::Redirect::temporary(DUELL_TARGET) }))
+        .route(
+            "/.well-known/assetlinks.json",
+            get(|| async { ([("content-type", "application/json")], ASSETLINKS_JSON) }),
+        );
+    if let Some(team) = apple_team_id {
+        let body = apple_app_site_association(&team);
+        router = router.route(
+            "/.well-known/apple-app-site-association",
+            get(move || {
+                let body = body.clone();
+                async move { ([("content-type", "application/json")], body) }
+            }),
+        );
+    }
+    router
         .route("/", get(landing_handler))
         .route("/llms.txt", get(llms_txt_handler))
         .route(
@@ -6312,6 +6355,70 @@ mod network_info_tests {
         assert_eq!(info.channel_broker_port, 4435);
         assert_eq!(info.channel_relay_port, 4436);
         assert_eq!(info.channel_relay_gate_port, 443);
+    }
+}
+
+#[cfg(test)]
+mod app_links_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn get_plain(app: Router, path: &str) -> Response {
+        // No Authorization header, no cookie: these endpoints must work without a login.
+        app.oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn duell_redirects_to_demos_without_own_fragment_and_without_login() {
+        let resp = get_plain(landing_router_with_apple_team(None), "/duell").await;
+        assert!(resp.status().is_redirection(), "got {}", resp.status());
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(loc, "https://demos-34a13a96.bunsenbrenner.org/duell");
+        assert!(!loc.contains('#'), "Location must not carry a fragment");
+    }
+
+    #[tokio::test]
+    async fn assetlinks_is_served_directly_as_json_without_login() {
+        let resp = get_plain(landing_router_with_apple_team(None), "/.well-known/assetlinks.json").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("location").is_none(), "no redirect");
+        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v[0]["relation"][0], "delegate_permission/common/handle_all_urls");
+        assert_eq!(v[0]["target"]["namespace"], "android_app");
+        assert_eq!(v[0]["target"]["package_name"], "org.bunsenbrenner.cads");
+        assert_eq!(
+            v[0]["target"]["sha256_cert_fingerprints"][0],
+            "AC:00:28:F0:43:1A:6A:4A:B1:6A:9B:85:20:ED:19:3A:50:CD:26:BF:77:3F:99:21:92:1E:1A:0B:C1:2B:B9:D0"
+        );
+    }
+
+    #[tokio::test]
+    async fn aasa_is_404_without_team_id() {
+        let resp = get_plain(landing_router_with_apple_team(None), "/.well-known/apple-app-site-association").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn aasa_is_served_as_json_with_team_id_without_login() {
+        let app = landing_router_with_apple_team(Some("ABCDE12345".into()));
+        let resp = get_plain(app, "/.well-known/apple-app-site-association").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("location").is_none(), "no redirect");
+        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"applinks":{"details":[{
+                "appIDs":["ABCDE12345.org.bunsenbrenner.cads"],
+                "components":[{"/":"/duell"},{"/":"/duell/*"}]
+            }]}})
+        );
     }
 }
 
