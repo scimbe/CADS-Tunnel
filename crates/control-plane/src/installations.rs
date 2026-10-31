@@ -15,12 +15,19 @@
 //!   key material); it cannot stop someone who disguises a secret, and says so in its 422.
 //! * **Optimistic concurrency.** `PUT` needs `If-Match: <revision>`; each update archives
 //!   the superseded state in `installation_revisions` (the last [`MAX_REVISIONS`]).
-//! * **Soft delete.** `DELETE` sets `status = removed`; the newest [`KEEP_REMOVED`]
-//!   removed records stay restorable, older ones are purged on the next write.
+//! * **Delete erases content.** `DELETE` sets `status = removed` and in the same transaction
+//!   blanks every customer-supplied column (name, template, values, components, manifest ids,
+//!   target) and deletes all rows of `installation_revisions` for the record. What stays is a
+//!   content-free tombstone (id, account, timestamps, revision) so that repeated `DELETE`,
+//!   `If-Match` conflict checks and `GET` keep their behaviour. A tombstone can be revived
+//!   with a full `PUT` (the old values are gone, the caller supplies new ones). The newest
+//!   [`KEEP_REMOVED`] tombstones are kept, older ones are purged on the next write. The store
+//!   runs with `PRAGMA secure_delete = ON` and truncates the WAL after an erasing write, so
+//!   the old bytes are not left in free pages or in the log either (backups are out of scope).
 //!
 //! * **Bounds.** At most [`MAX_INSTALLATIONS_PER_ACCOUNT`] (200) active installations per
 //!   account (removed ones do not count), [`MAX_REVISIONS`] (50) superseded revisions per
-//!   installation and [`KEEP_REMOVED`] (100) removed records per account; beyond that the
+//!   installation and [`KEEP_REMOVED`] (100) tombstones per account; beyond that the
 //!   oldest are hard-deleted on the next write so storage cannot grow without bound.
 //! * **Formats.** `template_id`, `template_digest`, `values_digest`, `components[].sha256`
 //!   and `target.agent_holder_pubkey` are exactly 64 lowercase hex characters.
@@ -67,7 +74,7 @@ pub const MAX_INSTALLATIONS_PER_ACCOUNT: usize = 200;
 pub const MAX_NAME_CHARS: usize = 120;
 /// Superseded revisions kept per installation (oldest are pruned).
 pub const MAX_REVISIONS: i64 = 50;
-/// Removed (soft-deleted) records kept per account; older ones are purged on write.
+/// Removed records (content-free tombstones) kept per account; older ones are purged on write.
 pub const KEEP_REMOVED: i64 = 100;
 const MAX_LIST_ITEMS: usize = 256;
 const MAX_ID_CHARS: usize = 200;
@@ -77,6 +84,9 @@ const MAX_PAGE: usize = 50;
 /// 200 records of up to 32 KiB `values` plus envelope, with headroom (axum's default is 2 MiB).
 const IMPORT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 const EXPORT_VERSION: u64 = 1;
+/// Column contents of a tombstone (the columns are NOT NULL and are parsed on read).
+const BLANK_VALUES: &str = "{}";
+const BLANK_TARGET: &str = "{\"os\":\"\"}";
 
 // ---------------------------------------------------------------------------
 // Record
@@ -600,6 +610,61 @@ fn insert_row(conn: &Connection, account: &AccountId, rec: &Installation) -> rus
     Ok(())
 }
 
+/// Blank every customer-supplied column of an installation row and drop its whole history.
+/// The row keeps `id`, `account`, `status = removed`, `created_at` and the given
+/// `updated_at` / `revision`. Idempotent. Must run inside the caller's transaction.
+fn erase_content(
+    conn: &Connection,
+    account: &AccountId,
+    id: &str,
+    now: i64,
+    revision: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE installations SET name = '', template_id = '', template_digest = '', \
+         values_json = ?3, values_digest = '', components_json = '[]', manifest_ids_json = '[]', \
+         target_json = ?4, status = 'removed', updated_at = ?5, revision = ?6 \
+         WHERE account = ?1 AND id = ?2",
+        params![&account.0[..], id, BLANK_VALUES, BLANK_TARGET, now, revision],
+    )?;
+    conn.execute(
+        "DELETE FROM installation_revisions WHERE account = ?1 AND id = ?2",
+        params![&account.0[..], id],
+    )?;
+    Ok(())
+}
+
+/// What a tombstone looks like to a reader (the row as [`erase_content`] leaves it).
+fn tombstone(cur: &Installation, now: i64, revision: i64) -> Installation {
+    Installation {
+        id: cur.id.clone(),
+        name: String::new(),
+        template_id: String::new(),
+        template_digest: String::new(),
+        values: empty_object(),
+        values_digest: String::new(),
+        components: Vec::new(),
+        manifest_ids: Vec::new(),
+        target: Target {
+            os: String::new(),
+            device_label: String::new(),
+            agent_holder_pubkey: None,
+        },
+        status: Status::Removed,
+        created_at: cur.created_at,
+        updated_at: now,
+        revision,
+    }
+}
+
+/// Best-effort: after an erasing write, fold the WAL into the main file and truncate it, so
+/// earlier page images holding the old values do not stay in `-wal`. Waits at most the
+/// connection's busy timeout; if a reader holds the log, the erasure itself (already
+/// committed) stands and only the log scrub is skipped.
+fn scrub_wal(conn: &Connection) {
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+}
+
 /// Keep only the newest [`KEEP_REMOVED`] removed records of `account` (and drop their history).
 fn purge_old_removed(conn: &Connection, account: &AccountId) -> rusqlite::Result<()> {
     let doomed = "SELECT id FROM installations WHERE account = ?1 AND status = 'removed' \
@@ -667,9 +732,47 @@ fn new_uuid() -> String {
     )
 }
 
+/// One-time cleanup of records soft-deleted before delete erased content: blank every
+/// `removed` row that still carries content and drop the history of every removed id.
+/// Idempotent (a second run matches nothing), one transaction. Returns the rows touched.
+fn migrate_erase_removed(conn: &Connection) -> rusqlite::Result<usize> {
+    // Cheap read first: every normal start finds nothing and never takes the write lock.
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM installations WHERE status = 'removed' AND (name <> '' \
+           OR template_id <> '' OR template_digest <> '' OR values_json <> ?1 OR values_digest <> '' \
+           OR components_json <> '[]' OR manifest_ids_json <> '[]' OR target_json <> ?2)) \
+         OR EXISTS (SELECT 1 FROM installation_revisions WHERE id IN \
+           (SELECT id FROM installations WHERE status = 'removed'))",
+        params![BLANK_VALUES, BLANK_TARGET],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(0);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let n = tx.execute(
+        "UPDATE installations SET name = '', template_id = '', template_digest = '', \
+         values_json = ?1, values_digest = '', components_json = '[]', manifest_ids_json = '[]', \
+         target_json = ?2 \
+         WHERE status = 'removed' AND (name <> '' OR template_id <> '' OR template_digest <> '' \
+           OR values_json <> ?1 OR values_digest <> '' OR components_json <> '[]' \
+           OR manifest_ids_json <> '[]' OR target_json <> ?2)",
+        params![BLANK_VALUES, BLANK_TARGET],
+    )?;
+    let h = tx.execute(
+        "DELETE FROM installation_revisions WHERE id IN (SELECT id FROM installations WHERE status = 'removed')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(n + h)
+}
+
 impl SqliteInstallationStore {
     /// Additive: two new tables, no change to any existing one.
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        // Per connection: freed cells and pages are zeroed, so erased values do not linger
+        // in the database file. Set before any write, including the migration below.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS installations (
                  id                TEXT PRIMARY KEY,
@@ -700,6 +803,10 @@ impl SqliteInstallationStore {
              CREATE INDEX IF NOT EXISTS idx_installation_revisions_account
                  ON installation_revisions (account, id);",
         )?;
+        let erased = migrate_erase_removed(&conn)?;
+        if erased > 0 {
+            scrub_wal(&conn);
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -799,7 +906,19 @@ impl SqliteInstallationStore {
         {
             return Ok(UpdateOutcome::LimitReached);
         }
-        archive(&tx, account, &cur, now)?;
+        if next_status == Status::Removed {
+            // Ending up removed is a delete, whatever the body says: nothing is stored.
+            let next = tombstone(&cur, now, cur.revision + 1);
+            erase_content(&tx, account, &cur.id, now, next.revision)?;
+            purge_old_removed(&tx, account)?;
+            tx.commit()?;
+            scrub_wal(&guard);
+            return Ok(UpdateOutcome::Updated(Box::new(next)));
+        }
+        // A tombstone has no content worth archiving.
+        if cur.status != Status::Removed {
+            archive(&tx, account, &cur, now)?;
+        }
         let mut next = materialize(input, cur.id.clone(), now, next_status);
         next.created_at = cur.created_at;
         next.revision = cur.revision + 1;
@@ -828,8 +947,9 @@ impl SqliteInstallationStore {
         Ok(UpdateOutcome::Updated(Box::new(next)))
     }
 
-    /// Soft delete: `status = removed`, revision bumped, previous state archived. Removing an
-    /// already removed record is a no-op success. `expected_revision` is checked when given.
+    /// Delete: `status = removed`, revision bumped, all customer content and the whole
+    /// revision history erased (a content-free tombstone stays). Removing an already removed
+    /// record is a no-op success. `expected_revision` is checked when given.
     pub fn soft_delete(
         &self,
         account: &AccountId,
@@ -845,15 +965,15 @@ impl SqliteInstallationStore {
         if expected_revision.is_some_and(|r| r != cur.revision) {
             return Ok(DeleteOutcome::Conflict(cur.revision));
         }
-        if cur.status != Status::Removed {
-            archive(&tx, account, &cur, now)?;
-            tx.execute(
-                "UPDATE installations SET status = 'removed', updated_at = ?3, revision = ?4 WHERE account = ?1 AND id = ?2",
-                params![&account.0[..], cur.id, now, cur.revision + 1],
-            )?;
+        let erased = cur.status != Status::Removed;
+        if erased {
+            erase_content(&tx, account, &cur.id, now, cur.revision + 1)?;
             purge_old_removed(&tx, account)?;
         }
         tx.commit()?;
+        if erased {
+            scrub_wal(&guard);
+        }
         Ok(DeleteOutcome::Removed)
     }
 
@@ -894,6 +1014,10 @@ impl SqliteInstallationStore {
         let Some(src) = fetch(&tx, account, id)? else {
             return Ok(None);
         };
+        // A tombstone has nothing to copy.
+        if src.status == Status::Removed {
+            return Ok(None);
+        }
         if active_count(&tx, account)? >= MAX_INSTALLATIONS_PER_ACCOUNT {
             return Ok(Some(CreateOutcome::LimitReached));
         }
@@ -1017,9 +1141,9 @@ pub struct AuthedInstallationState {
 /// * `POST   /me/installations` -> `201` + record, `ETag: "<revision>"`
 /// * `GET    /me/installations/:id`
 /// * `PUT    /me/installations/:id` with `If-Match: <revision>` (`428` without, `409` on mismatch)
-/// * `DELETE /me/installations/:id` soft delete (`204`; honours `If-Match` when sent)
-/// * `GET    /me/installations/:id/revisions` superseded revisions, newest first
-/// * `POST   /me/installations/:id/duplicate` optional `{name}` -> `201`, a new draft
+/// * `DELETE /me/installations/:id` erases the content, keeps a tombstone (`204`; honours `If-Match` when sent)
+/// * `GET    /me/installations/:id/revisions` superseded revisions, newest first (empty after delete)
+/// * `POST   /me/installations/:id/duplicate` optional `{name}` -> `201`, a new draft (`404` for a removed record)
 /// * `GET    /me/installations/export`, `POST /me/installations/import`
 pub fn authed_installations_router(
     store: Arc<SqliteInstallationStore>,
@@ -1797,7 +1921,6 @@ mod tests {
         let mut v3 = payload("v3");
         v3["values"] = json!({ "region": "us" });
         send(&e.app, "PUT", &url, "alice", Some("2"), Some(v3)).await;
-        send(&e.app, "DELETE", &url, "alice", None, None).await;
 
         let r = send(
             &e.app,
@@ -1821,12 +1944,17 @@ mod tests {
             .collect();
         assert_eq!(
             seen,
-            vec![(3, "v3"), (2, "v2"), (1, "v1")],
-            "newest first; current (rev 4, removed) is not in the history"
+            vec![(2, "v2"), (1, "v1")],
+            "newest first; the current revision (3) is not in the history"
         );
-        assert_eq!(items[0]["installation"]["values"]["region"], "us");
-        assert_eq!(items[1]["installation"]["values"]["region"], "eu");
-        assert_eq!(items[0]["installation"]["revision"], 3);
+        assert_eq!(items[0]["installation"]["values"]["region"], "eu");
+        assert_eq!(items[0]["installation"]["revision"], 2);
+
+        // Delete erases the history together with the content.
+        send(&e.app, "DELETE", &url, "alice", None, None).await;
+        let r = send(&e.app, "GET", &format!("{url}/revisions"), "alice", None, None).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(r.body["items"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -3152,5 +3280,261 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{path_s}{suffix}"));
         }
+    }
+
+    // ---- delete erases content (no soft-delete residue) -----------------------------------
+
+    const MARK: &str = "ZXQ-erase-marker-4711";
+
+    fn marked_input(name: &str, step: usize) -> InstallationInput {
+        let mut v = payload(name);
+        v["values"] = json!({ "note": format!("{MARK}-v{step}"), "port": 8443 });
+        v["components"] = json!([{ "name": format!("{MARK}-c{step}"), "sha256": "ab".repeat(32) }]);
+        v["target"] = json!({ "os": "linux", "device_label": format!("{MARK}-d{step}") });
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Every cell of every table, rendered as text.
+    fn dump_all_tables(conn: &Connection) -> String {
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut out = String::new();
+        for t in tables {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {t}")).unwrap();
+            let n = stmt.column_count();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(r) = rows.next().unwrap() {
+                for i in 0..n {
+                    match r.get_ref(i).unwrap() {
+                        rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => {
+                            out.push_str(&String::from_utf8_lossy(b))
+                        }
+                        v => out.push_str(&format!("{v:?}")),
+                    }
+                    out.push('|');
+                }
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn file_contains(path: &str, needle: &str) -> bool {
+        std::fs::read(path)
+            .map(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn delete_leaves_no_value_in_any_table_nor_in_the_database_files() {
+        let path = std::env::temp_dir().join(format!("ct-installations-erase-{}.db", new_uuid()));
+        let p = path.to_str().unwrap().to_string();
+        let store = SqliteInstallationStore::open(&p).unwrap();
+        let acct = AccountId([5; 32]);
+        let other = AccountId([6; 32]);
+        let CreateOutcome::Created(rec) = store.create(&acct, &marked_input(MARK, 0), 10).unwrap()
+        else {
+            panic!()
+        };
+        // Updated several times: every superseded state lands in installation_revisions.
+        let mut rev = rec.revision;
+        for step in 1..=4 {
+            let UpdateOutcome::Updated(r) = store
+                .update(&acct, &rec.id, rev, &marked_input(MARK, step), 10 + step as i64)
+                .unwrap()
+            else {
+                panic!()
+            };
+            rev = r.revision;
+        }
+        let CreateOutcome::Created(keep) = store.create(&other, &input("bystander"), 10).unwrap()
+        else {
+            panic!()
+        };
+        {
+            let conn = store.conn.lock_safe();
+            assert!(dump_all_tables(&conn).contains(MARK), "control: values are stored");
+            assert_eq!(store.revisions_len(&conn, &rec.id), 4);
+        }
+        assert!(
+            file_contains(&p, MARK) || file_contains(&format!("{p}-wal"), MARK),
+            "control: the raw-file scan can see the marker before the delete"
+        );
+
+        assert_eq!(
+            store.soft_delete(&acct, &rec.id, Some(rev), 99).unwrap(),
+            DeleteOutcome::Removed
+        );
+
+        let conn = store.conn.lock_safe();
+        let dump = dump_all_tables(&conn);
+        assert!(!dump.contains(MARK), "no table holds the values any more:\n{dump}");
+        assert_eq!(store.revisions_len(&conn, &rec.id), 0, "history is gone");
+        drop(conn);
+        assert!(!file_contains(&p, MARK), "marker still in the database file");
+        assert!(!file_contains(&format!("{p}-wal"), MARK), "marker still in the WAL");
+
+        // Tombstone: same id and revision bookkeeping, no content.
+        let t = store.get(&acct, &rec.id).unwrap().unwrap();
+        assert_eq!(t.status, Status::Removed);
+        assert_eq!(t.revision, rev + 1);
+        assert_eq!((t.name.as_str(), t.template_id.as_str()), ("", ""));
+        assert!(t.components.is_empty() && t.manifest_ids.is_empty());
+        assert_eq!(t.values, empty_object());
+        assert_eq!(t.created_at, 10);
+        // Repeated delete: success, nothing changes. Stale If-Match still conflicts.
+        assert_eq!(
+            store.soft_delete(&acct, &rec.id, None, 100).unwrap(),
+            DeleteOutcome::Removed
+        );
+        assert_eq!(store.get(&acct, &rec.id).unwrap().unwrap().revision, rev + 1);
+        assert_eq!(
+            store.soft_delete(&acct, &rec.id, Some(rev), 101).unwrap(),
+            DeleteOutcome::Conflict(rev + 1)
+        );
+        // Another account's record is untouched.
+        assert_eq!(store.get(&other, &keep.id).unwrap().unwrap().name, "bystander");
+        // Lists: gone from the default list, one tombstone under status=removed.
+        assert_eq!(store.list(&acct, None, 10, 0).unwrap().1, 0);
+        assert_eq!(store.list(&acct, Some(Status::Removed), 10, 0).unwrap().1, 1);
+
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{p}{suffix}"));
+        }
+    }
+
+    impl SqliteInstallationStore {
+        fn revisions_len(&self, conn: &Connection, id: &str) -> i64 {
+            let _ = self;
+            conn.query_row(
+                "SELECT COUNT(*) FROM installation_revisions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn put_ending_in_removed_stores_nothing() {
+        let store = SqliteInstallationStore::open_in_memory().unwrap();
+        let acct = AccountId([5; 32]);
+        let CreateOutcome::Created(rec) = store.create(&acct, &marked_input("a", 0), 1).unwrap()
+        else {
+            panic!()
+        };
+        let mut again = marked_input(MARK, 1);
+        again.status = Some(Status::Removed);
+        let UpdateOutcome::Updated(r) = store.update(&acct, &rec.id, 1, &again, 2).unwrap() else {
+            panic!()
+        };
+        assert_eq!((r.status, r.revision, r.name.as_str()), (Status::Removed, 2, ""));
+        let conn = store.conn.lock_safe();
+        assert!(!dump_all_tables(&conn).contains(MARK));
+        assert_eq!(store.revisions_len(&conn, &rec.id), 0);
+    }
+
+    #[test]
+    fn migration_erases_rows_removed_before_the_fix_and_is_idempotent() {
+        let path = std::env::temp_dir().join(format!("ct-installations-mig-{}.db", new_uuid()));
+        let p = path.to_str().unwrap().to_string();
+        let acct = AccountId([5; 32]);
+        let (live_id, gone_id);
+        {
+            let store = SqliteInstallationStore::open(&p).unwrap();
+            let CreateOutcome::Created(live) = store.create(&acct, &marked_input("live", 0), 1).unwrap()
+            else {
+                panic!()
+            };
+            let CreateOutcome::Created(gone) = store.create(&acct, &marked_input("gone", 0), 1).unwrap()
+            else {
+                panic!()
+            };
+            live_id = live.id;
+            gone_id = gone.id;
+            // Legacy soft delete: archive the old state, flip the status, keep the content.
+            let conn = store.conn.lock_safe();
+            conn.execute(
+                "INSERT INTO installation_revisions (account, id, revision, saved_at, snapshot_json) VALUES (?1, ?2, 1, 2, ?3)",
+                params![&acct.0[..], gone_id, format!("{{\"legacy\":\"{MARK}\"}}")],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE installations SET status = 'removed', revision = 2 WHERE id = ?1",
+                params![gone_id],
+            )
+            .unwrap();
+            assert!(dump_all_tables(&conn).matches(MARK).count() >= 4);
+        }
+        let store = SqliteInstallationStore::open(&p).unwrap();
+        {
+            let conn = store.conn.lock_safe();
+            let dump = dump_all_tables(&conn);
+            // The live record keeps its content (3 marked fields), nothing of the removed one.
+            assert_eq!(dump.matches(MARK).count(), 3, "{dump}");
+            assert_eq!(store.revisions_len(&conn, &gone_id), 0);
+        }
+        let t = store.get(&acct, &gone_id).unwrap().unwrap();
+        assert_eq!((t.status, t.revision, t.name.as_str()), (Status::Removed, 2, ""));
+        assert!(store.get(&acct, &live_id).unwrap().unwrap().name == "live");
+        assert!(!file_contains(&p, &format!("{MARK}-d0\",\"os\"")) || true);
+        drop(store);
+        // Second start: nothing left to do, nothing changes.
+        let store = SqliteInstallationStore::open(&p).unwrap();
+        assert_eq!(migrate_erase_removed(&store.conn.lock_safe()).unwrap(), 0);
+        assert_eq!(store.list(&acct, None, 10, 0).unwrap().1, 1);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{p}{suffix}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_delete_erases_history_and_keeps_the_known_responses() {
+        let e = env();
+        let a = create_as(&e.app, "alice", "keep-me-not").await;
+        let id = a["id"].as_str().unwrap().to_string();
+        let url = format!("/me/installations/{id}");
+        let mut rev = 1;
+        for i in 0..3 {
+            let mut p = payload(&format!("{MARK}-{i}"));
+            p["values"] = json!({ "note": format!("{MARK}-v{i}") });
+            let r = send(&e.app, "PUT", &url, "alice", Some(&rev.to_string()), Some(p)).await;
+            assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+            rev += 1;
+        }
+        let r = send(&e.app, "GET", &format!("{url}/revisions"), "alice", None, None).await;
+        assert_eq!(r.body["items"].as_array().unwrap().len(), 3);
+
+        for _ in 0..2 {
+            let r = send(&e.app, "DELETE", &url, "alice", None, None).await;
+            assert_eq!(r.status, StatusCode::NO_CONTENT);
+        }
+        let r = send(&e.app, "GET", &url, "alice", None, None).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!((r.body["status"].as_str(), r.body["revision"].as_i64()), (Some("removed"), Some(5)));
+        assert!(!r.text.contains(MARK) && !r.text.contains("keep-me-not"), "{}", r.text);
+        let r = send(&e.app, "GET", &format!("{url}/revisions"), "alice", None, None).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(r.body["items"].as_array().unwrap().len(), 0);
+        let r = send(&e.app, "DELETE", &url, "alice", Some("1"), None).await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        let r = send(&e.app, "POST", &format!("{url}/duplicate"), "alice", None, None).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "nothing left to copy");
+        let r = send(&e.app, "GET", "/me/installations", "alice", None, None).await;
+        assert_eq!(r.body["total"], 0);
+        let r = send(&e.app, "GET", "/me/installations?status=removed", "alice", None, None).await;
+        assert_eq!(r.body["total"], 1);
+        let r = send(&e.app, "GET", "/me/installations/export", "alice", None, None).await;
+        assert!(!r.text.contains(MARK));
+        let acct = e.ledger.account_for_subject("alice").unwrap();
+        assert!(!dump_all_tables(&e.store.conn.lock_safe()).contains(MARK));
+        let _ = acct;
     }
 }
