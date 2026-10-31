@@ -6167,12 +6167,29 @@ const ASSETLINKS_JSON: &str = r#"[{"relation":["delegate_permission/common/handl
 /// `#c=...` fragment the browser holds is re-attached to the target by the browser (RFC 9110 §10.2.2).
 const DUELL_TARGET: &str = "https://demos-34a13a96.bunsenbrenner.org/duell";
 
+/// Destination of `GET /s/:id`, the short links of My Daily Idea. The gallery keeps them; the portal only
+/// forwards, so a link keeps the short address and a crawler ends on the page with the preview tags.
+const SHORT_LINK_TARGET: &str = "https://demos-34a13a96.bunsenbrenner.org/s/";
+
+/// Short-link ids: eight characters of the gallery's alphabet (no 0, 1, O, o, I, l). Checked here so that
+/// nothing but such an id can ever land in a `Location` header.
+fn is_short_link_id(id: &str) -> bool {
+    id.len() == 8 && id.bytes().all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'1' | b'O' | b'I' | b'l' | b'o'))
+}
+
+async fn short_link_redirect(axum::extract::Path(id): axum::extract::Path<String>) -> Response {
+    if !is_short_link_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    axum::response::Redirect::temporary(&format!("{SHORT_LINK_TARGET}{id}")).into_response()
+}
+
 /// iOS Universal Links statement; `None` (no `CT_APPLE_TEAM_ID`) means the file does not exist.
 fn apple_app_site_association(team_id: &str) -> String {
     serde_json::json!({
         "applinks": {"details": [{
             "appIDs": [format!("{}.org.bunsenbrenner.cads", team_id.trim())],
-            "components": [{"/": "/duell"}, {"/": "/duell/*"}]
+            "components": [{"/": "/duell"}, {"/": "/duell/*"}, {"/": "/s/*"}]
         }]}
     })
     .to_string()
@@ -6183,6 +6200,7 @@ fn apple_app_site_association(team_id: &str) -> String {
 fn landing_router_with_apple_team(apple_team_id: Option<String>) -> Router {
     let mut router = Router::new()
         .route("/duell", get(|| async { axum::response::Redirect::temporary(DUELL_TARGET) }))
+        .route("/s/:id", get(short_link_redirect))
         .route(
             "/.well-known/assetlinks.json",
             get(|| async { ([("content-type", "application/json")], ASSETLINKS_JSON) }),
@@ -6381,6 +6399,33 @@ mod app_links_tests {
     }
 
     #[tokio::test]
+    async fn short_link_redirects_to_gallery_without_login() {
+        let resp = get_plain(landing_router_with_apple_team(None), "/s/aB3dE5gH").await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get("location").unwrap(),
+            "https://demos-34a13a96.bunsenbrenner.org/s/aB3dE5gH"
+        );
+    }
+
+    #[tokio::test]
+    async fn short_link_answers_head_like_get() {
+        let app = landing_router_with_apple_team(None);
+        let req = Request::head("/s/aB3dE5gH").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+    }
+
+    #[tokio::test]
+    async fn short_link_with_a_foreign_id_is_not_forwarded() {
+        for path in ["/s/short", "/s/aB3dE5gHi", "/s/aB3dE5g0", "/s/aB3dE5gO", "/s/aB3%0d%0aX", "/s/..%2f..%2f", "/s/aB3dE5g%2F", "/s/"] {
+            let resp = get_plain(landing_router_with_apple_team(None), path).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert!(resp.headers().get("location").is_none(), "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn assetlinks_is_served_directly_as_json_without_login() {
         let resp = get_plain(landing_router_with_apple_team(None), "/.well-known/assetlinks.json").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6416,7 +6461,7 @@ mod app_links_tests {
             v,
             serde_json::json!({"applinks":{"details":[{
                 "appIDs":["ABCDE12345.org.bunsenbrenner.cads"],
-                "components":[{"/":"/duell"},{"/":"/duell/*"}]
+                "components":[{"/":"/duell"},{"/":"/duell/*"},{"/":"/s/*"}]
             }]}})
         );
     }
