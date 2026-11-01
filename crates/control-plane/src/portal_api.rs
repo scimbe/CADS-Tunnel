@@ -10055,8 +10055,8 @@ mod tests {
             let CreateOutcome::Created(gone) = installations.create(acct, &sample_installation("gone"), 1).unwrap() else { panic!() };
             installations.soft_delete(acct, &gone.id, None, 3).unwrap();
         }
-        assert_eq!(installation_rows(&db, &alice), (3, 5), "precondition: 3 records, 4 + 1 revisions");
-        assert_eq!(installation_rows(&db, &bob), (3, 5));
+        assert_eq!(installation_rows(&db, &alice), (3, 4), "precondition: 3 records (one a tombstone), 4 revisions (a delete leaves none)");
+        assert_eq!(installation_rows(&db, &bob), (3, 4));
 
         let app = account_delete_router(
             KEY,
@@ -10083,7 +10083,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         assert_eq!(installation_rows(&db, &alice), (0, 0), "both tables are empty for the deleted account");
-        assert_eq!(installation_rows(&db, &bob), (3, 5), "another account's data is untouched");
+        assert_eq!(installation_rows(&db, &bob), (3, 4), "another account's data is untouched");
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{db_s}{suffix}"));
         }
