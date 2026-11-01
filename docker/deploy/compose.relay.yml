@@ -28,6 +28,15 @@
 
 name: ct-selfhost
 
+# Log rotation (selfhost operations): Docker's json-file driver has NO size cap by
+# default, so every service that is not given one grows its log without bound on
+# the host's disk. One shared block per file, referenced by every service below.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   relay-node:
     build:
@@ -42,6 +51,7 @@ services:
     user: "65532:65532"
     # #312: bounded like every other service on this shared, no-swap host (see
     # compose.selfhost.yml's control-plane/edge limits for the full rationale).
+    logging: *default-logging
     mem_limit: 256m
     mem_reservation: 64m
     cpus: 0.5

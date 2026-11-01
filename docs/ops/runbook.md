@@ -917,7 +917,7 @@ Two things worth knowing before touching them:
 |---|---|---|
 | `CT_EDGE_ID` | `primary` | stable per-deployment identifier in the multi-edge ownership registry (which edge owns which token/hostname). The default keeps a single-edge deployment consistent rather than keyed on an empty string; it only starts to matter once a **second** edge reports in |
 | `CT_EDGE_PUBLIC_ADDR` | `unknown` | the address this edge reports for itself in that registry. A single-edge deployment needs no value — rehydration after a restart works off the default id |
-| `CT_EDGE_KA_PARK_TTL_SECS` | `30` (= `CHANNEL_PARK_TTL_SECS`) | park TTL for a **keepalive-negotiated** `:443` leg. See the warning below before raising it |
+| `CT_EDGE_KA_PARK_TTL_SECS` | `30` in the edge binary (= `CHANNEL_PARK_TTL_SECS`); `600` in `compose.selfhost.yml` | park TTL for a **keepalive-negotiated** `:443` leg. See the warning below before raising it |
 | `CT_EDGE_MESH_RELAY_ENABLED` | **off** | ADR-0021 Part 1: on a hostname this edge has no local route for, ask the registry which edge owns it and relay the raw bytes there. Off by default and a no-op until a **second** edge actually exists. See the failure modes below before turning it on |
 | `CT_DNS_STORE_PATH` | — | zone store for the standalone `ct-dns` service (not deployed here; `ct-dns` runs no container in this stack) |
 | `CT_AGENT_SETUP_URL` / `CT_AGENT_SETUP_PS1_URL` | upstream raw URL | where `/install` redirects for the shell and PowerShell setup scripts. Exists so a self-hosting operator can point at their own mirror instead of a single chokepoint on `raw.githubusercontent.com` — the product's own audience should not need to patch the crate for that (#448) |
@@ -997,6 +997,13 @@ ends the idle re-park cycle. But raising it before the deployed agents carry the
 wait contract (**ct-agent ≥ v0.5.0**) makes an older client's 45 s admission bound fire
 first: the pair then cycles at 45 s with stale parks holding cap permits. Roll the fleet
 first, then raise this — the reverse order buys the cycling it was meant to end.
+
+`compose.selfhost.yml` now defaults the variable to `600`. Measured on core on 2026-10-22:
+`park_legs_total{keepalive="yes"}` 117658 against `{keepalive="no"}` 9074 (the KA ALPN *is*
+negotiated) with `park_reaped_total` at 126185 — nearly every park ages out and is re-created.
+After the recreate, `rate(ct_edge_channel_park_reaped_total[5m])` should fall by roughly the
+KA share (about 93 %) while `park_superseded_total` stays flat; if it does not, the TTL is not
+the cause. Setting `CT_EDGE_KA_PARK_TTL_SECS=30` in `.env` restores the old behaviour (an empty value does not: `:-` treats it as unset).
 
 ### A listener that was configured but never bound
 
@@ -1136,6 +1143,13 @@ lässt, schickt in die falsche Richtung und ist schlechter als gar keiner.
 Ein sinkender Neustartzähler gilt als Deploy (der Container wurde neu erzeugt) und setzt nur
 den Bezugspunkt neu. Gleiche Meldungen werden für 6 Stunden nicht erneut gemailt; Logzeile
 und Exit-Code bleiben davon unberührt.
+
+Alarmiert wird bei einem **Zustandswechsel** (ok -> Fehler), nicht bei jedem Lauf: ein
+bekannter Dauerfehler bleibt im Log sichtbar ("bekannte Dauerfehler: N"), mailt aber nur
+alle `CT_EDGE_REMIND_H` Stunden (Standard 24) als Erinnerung; die Rückkehr zu ok kommt als
+Entwarnung. Die Zielliste lässt sich über `CT_WATCH_SITES_FILE` (Zeilen `name=code`, `#` =
+Kommentar) oder `CT_WATCH_SITES` setzen, ohne das Skript zu ändern. Der Test
+`scripts/edge-watch-test.sh` läuft in der CI.
 
     tail /var/tmp/cads-edge-watch/cron.log     # Verlauf
     ./scripts/edge-watch.sh                    # von Hand, Exit 0 = still

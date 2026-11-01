@@ -34,6 +34,10 @@ SRC="${CADS_TUNNEL_SRC:-/home/becke/workspace/CADS-Tunnel}"
 CERT_DIRS="${CADS_CERT_DIRS:-/home/becke/ct-certs}"
 WORK="${CADS_BACKUP_WORK:-/var/tmp/cads-backup}"
 KEEP="${CADS_BACKUP_KEEP:-7}"          # snapshots retained in the repo
+LOCAL_KEEP_DAYS="${CADS_BACKUP_LOCAL_KEEP_DAYS:-14}"  # lokale Kopien in $WORK (vorher fest 2 Tage = ~3 Staende auf derselben Platte)
+# Optionales ZWEITES Offsite-Ziel neben dem privaten Repository (rsync-Ziel, z. B.
+# user@host:/pfad/). Zugangsdaten gehoeren in ~/.ssh des Betreibers, nie hierher.
+EXTRA_TARGET="${CADS_BACKUP_EXTRA_TARGET:-}"
 PUSH=1
 [ "${1:-}" = "--no-push" ] && PUSH=0
 
@@ -187,5 +191,12 @@ git -c user.email=backup@bunsenbrenner.org -c user.name="CADS backup" \
 git push -q --force origin HEAD:main || die "push fehlgeschlagen"
 log "gepusht: snapshots/$STAMP.tar.gz.gpg"
 cd /; rm -rf "$CLONE"
-find "$WORK" -maxdepth 1 -name '*.tar.gz.gpg' -mtime +2 -delete 2>/dev/null || true
+if [ -n "$EXTRA_TARGET" ]; then
+  if command -v rsync >/dev/null && rsync -q "$TAR.gpg" "$EXTRA_TARGET"; then
+    log "zweites Offsite-Ziel beschrieben"
+  else
+    log "WARNUNG: zweites Offsite-Ziel (CADS_BACKUP_EXTRA_TARGET) nicht beschreibbar"
+  fi
+fi
+find "$WORK" -maxdepth 1 -name '*.tar.gz.gpg' -mtime "+$LOCAL_KEEP_DAYS" -delete 2>/dev/null || true
 log "fertig"

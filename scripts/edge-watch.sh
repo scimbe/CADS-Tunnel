@@ -23,6 +23,19 @@
 #                                         und die Tunnel tot)
 #
 # Exit 0 = still, Exit 1 = Alarm (Mail + Logzeile).
+#
+# Zustandswechsel statt Dauerrauschen: Ein Ziel (Dienstadresse) und die Park-Regel
+# werden je EINZELN verfolgt (Zustandsdatei je Schluessel unter $STATE_DIR/state/).
+# Gemeldet wird
+#   ok -> fehler    sofort (Alarm, Mail),
+#   fehler -> ok    einmal als "wieder erreichbar" (Mail, Exit 0),
+#   fehler bleibt   hoechstens einmal je CT_EDGE_REMIND_H (Vorgabe 24) als Erinnerung.
+# Vorher meldete jeder Lauf jeden Dauerfehler erneut (am 2026-10-22: 2.532 ALARM-Zeilen
+# seit 17.08., davon rund 2.300 fuer drei dauerhaft tote Ziele) -- ein neuer, echter
+# Ausfall ging im Dauerton unter.
+#
+# Ziele: CT_WATCH_SITES_FILE (eine Zeile `name=code`, `#` Kommentar) hat Vorrang vor
+# CT_WATCH_SITES; ohne beides gilt die eingebaute Vorgabeliste.
 set -euo pipefail
 
 CONTAINER="${CT_EDGE_CONTAINER:-ct-selfhost-edge-1}"
@@ -36,6 +49,8 @@ BEAT_MAX_AGE="${CT_EDGE_BEAT_MAX_AGE:-60}"
 # Confirmed live in /var/tmp/cads-edge-watch/cron.log (2026-08-19 ~01:00Z run).
 SETTLE="${CT_WATCH_SETTLE_SECS:-90}"
 STATE_DIR="${CT_EDGE_WATCH_STATE:-/var/tmp/cads-edge-watch}"
+REMIND_H="${CT_EDGE_REMIND_H:-24}"       # Erinnerung an einen Dauerfehler höchstens alle N Stunden
+RETRY_SLEEP="${CT_WATCH_RETRY_SLEEP:-30}"  # Abstand zwischen erstem und zweitem Durchgang
 RENOTIFY_H="${CT_EDGE_RENOTIFY_H:-6}"     # gleiche Meldung höchstens alle N Stunden
 SRC="${CADS_TUNNEL_SRC:-/home/becke/workspace/CADS-Tunnel}"
 ENVFILE="$SRC/docker/deploy/.env"
@@ -44,6 +59,44 @@ TO="${CADS_RECOVERY_TO:-scimbe@gmail.com}"
 mkdir -p "$STATE_DIR"
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 ALARMS=()
+RECOVERED=()
+TSTATE_DIR="$STATE_DIR/state"
+mkdir -p "$TSTATE_DIR"
+
+fmt_dur() { # Sekunden -> "3h 05m" / "2d 4h"
+  local d=$1
+  if [ "$d" -ge 86400 ]; then printf '%dd %dh' $((d/86400)) $((d%86400/3600))
+  elif [ "$d" -ge 3600 ]; then printf '%dh %02dm' $((d/3600)) $((d%3600/60))
+  else printf '%dm' $((d/60)); fi
+}
+
+# track_state KEY FAILING(0|1) TEXT
+# Gibt das Ergebnis in TRACK_RESULT zurück: ok | new | remind | known | recovered.
+# Zustandsdatei: "fehler SEIT LETZTE_ERINNERUNG"; fehlende Datei = ok.
+track_state() {
+  local key f now since last
+  key=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'); f="$TSTATE_DIR/$key"; now=$(date +%s)
+  if [ "$2" = "1" ]; then
+    if [ -s "$f" ]; then
+      read -r _ since last < "$f" || true
+      if [ $(( now - ${last:-$now} )) -ge $(( REMIND_H * 3600 )) ]; then
+        printf 'fehler %s %s\n' "${since:-$now}" "$now" > "$f"
+        TRACK_SINCE=$(( now - ${since:-$now} )); TRACK_RESULT=remind
+      else
+        TRACK_RESULT=known
+      fi
+    else
+      printf 'fehler %s %s\n' "$now" "$now" > "$f"; TRACK_RESULT=new
+    fi
+  else
+    if [ -s "$f" ]; then
+      read -r _ since _ < "$f" || true
+      TRACK_SINCE=$(( now - ${since:-$now} )); rm -f "$f"; TRACK_RESULT=recovered
+    else
+      TRACK_RESULT=ok
+    fi
+  fi
+}
 
 command -v docker >/dev/null || { log "FEHLER: docker fehlt -- der Waechter kann nichts pruefen"; exit 1; }
 
@@ -287,22 +340,36 @@ else
     PARK_AGE=$(( $(date +%s) - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER" 2>/dev/null)" +%s 2>/dev/null || date +%s) ))
     REAP_FILE="$STATE_DIR/tcp-reaped"
     REAP_PREV=$(cat "$REAP_FILE" 2>/dev/null || echo "")
+    # PARK_EVAL=1: dieser Lauf hat ein Urteil gefaellt (Alarm ODER entlastet); nur dann
+    # wird der Zustand der Park-Regel fortgeschrieben. PARK_MSG gesetzt = Leichen-Signatur.
+    PARK_EVAL=0; PARK_MSG=""
+    [ -n "${PARK:-}" ] && [ "${PARK%.*}" -le "$PARK_MAX" ] && PARK_EVAL=1
     if [ -n "${PARK:-}" ] && [ "${PARK%.*}" -gt "$PARK_MAX" ]; then
       if [ "$PARK_AGE" -lt "$SETTLE" ]; then
         log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), aber der Edge lief erst ${PARK_AGE}s -- nach einem Neustart parken alle Agenten gleichzeitig neu. NICHT bewertet, kein Freispruch."
       elif [ -n "${REAPER_TICK_AGO:-}" ] && [ "${REAPER_TICK_AGO%.*}" -lt 120 ]; then
         log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), Reap-Zaehler steht still, ABER der Reaper-Heartbeat tickte vor ${REAPER_TICK_AGO%.*}s -- Reaper lebt nachweislich, nur nichts zu raeumen. Keine Leichen (#775)."
+        PARK_EVAL=1
       elif [ -n "$REAP_PREV" ] && [ "${REAPED%.*}" -le "$REAP_PREV" ]; then
         if [ -n "${REAPER_TICK_AGO:-}" ]; then
-          ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) UND der Reaper-Heartbeat selbst ist ${REAPER_TICK_AGO%.*}s alt -- das ist die Leichen-Signatur, jetzt per Heartbeat bestaetigt: der TCP-Park-Reaper raeumt nicht mehr (#522/#775).")
+          PARK_EVAL=1; PARK_MSG="Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) UND der Reaper-Heartbeat selbst ist ${REAPER_TICK_AGO%.*}s alt -- das ist die Leichen-Signatur, jetzt per Heartbeat bestaetigt: der TCP-Park-Reaper raeumt nicht mehr (#522/#775)."
         else
-          ALARMS+=("Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) -- das ist die Leichen-Signatur: der TCP-Park-Reaper raeumt nicht mehr (#522). Kein Heartbeat-Gauge vorhanden (Edge aelter als #775) -- Redeploy wuerde eine sichere Unterscheidung ermoeglichen.")
+          PARK_EVAL=1; PARK_MSG="Park-Gauge bei $PARK (Schwelle $PARK_MAX) UND seit dem letzten Lauf kein einziger Reap ($REAP_PREV -> ${REAPED%.*}) -- das ist die Leichen-Signatur: der TCP-Park-Reaper raeumt nicht mehr (#522). Kein Heartbeat-Gauge vorhanden (Edge aelter als #775) -- Redeploy wuerde eine sichere Unterscheidung ermoeglichen."
         fi
       elif [ -z "$REAP_PREV" ]; then
         log "Park-Gauge bei $PARK (Schwelle $PARK_MAX); ob Reaps fliessen, ist erst ab dem naechsten Lauf entscheidbar (kein Vorwert)."
       else
         log "Park-Gauge bei $PARK (Schwelle $PARK_MAX), aber die Reaps fliessen ($REAP_PREV -> ${REAPED%.*}) -- grosse Flotte, keine Leichen."
+        PARK_EVAL=1
       fi
+    fi
+    if [ "$PARK_EVAL" = "1" ]; then
+      track_state "park-reaper" "$([ -n "${PARK_MSG:-}" ] && echo 1 || echo 0)"
+      case "$TRACK_RESULT" in
+        new) ALARMS+=("$PARK_MSG") ;;
+        remind) ALARMS+=("Erinnerung, Dauerfehler seit $(fmt_dur "$TRACK_SINCE"): $PARK_MSG") ;;
+        recovered) RECOVERED+=("Park-Regel: keine Leichen-Signatur mehr (war $(fmt_dur "$TRACK_SINCE") aktiv).") ;;
+      esac
     fi
     [ -n "${REAPED:-}" ] && printf '%s\n' "${REAPED%.*}" > "$REAP_FILE"
 
@@ -415,7 +482,25 @@ fi
 # Rehydrierung. In all diesen Faellen haette dieser Waechter "Edge in Ordnung"
 # gemeldet, waehrend die Seiten nicht erreichbar waren. Ein Waechter, der nur den
 # Prozess kennt, prueft nicht das, wofuer es die Anlage gibt.
-SITES="${CT_WATCH_SITES:-sort=200 help=200 llm-34a13a96=200 game2048=200 a2a-demo=200 auction-demo=200 cookbook=200 flappy-demo=200 devsystem-demo=302}"
+# Eingebaute Vorgabe -- nur der Rueckfall. Massgeblich ist die Betreiberliste:
+# CT_WATCH_SITES_FILE (eine Zeile `name=code`, `#` Kommentar, Leerzeilen erlaubt) vor
+# CT_WATCH_SITES vor dieser Vorgabe. Die Vorgabe enthaelt Ziele, die auf core dauerhaft
+# tot sind (help, sort, cookbook; Stand 2026-10-22) -- sie wurden bewusst NICHT entfernt,
+# das ist eine Entscheidung des Betreibers; seit dem Zustandswechsel-Alarm kosten sie
+# nur noch eine Meldung je Wechsel und eine Erinnerung je Tag.
+SITES_DEFAULT="sort=200 help=200 llm-34a13a96=200 game2048=200 a2a-demo=200 auction-demo=200 cookbook=200 flappy-demo=200 devsystem-demo=302"
+if [ -n "${CT_WATCH_SITES_FILE:-}" ]; then
+  # Eine gesetzte, aber nicht lesbare Datei darf nicht still auf die Vorgabe zurueckfallen:
+  # das ergaebe eine andere Pruefmenge als vom Betreiber gemeint, ohne dass es auffaellt.
+  if [ -r "$CT_WATCH_SITES_FILE" ]; then
+    SITES=$(sed 's/#.*//' "$CT_WATCH_SITES_FILE" | tr -s ' \t\n' ' ' | sed 's/^ *//; s/ *$//')
+  else
+    SITES=""
+    ALARMS+=("CT_WATCH_SITES_FILE=$CT_WATCH_SITES_FILE ist nicht lesbar -- die Dienstliste ist leer, die Dienstpruefung laeuft NICHT.")
+  fi
+else
+  SITES="${CT_WATCH_SITES:-$SITES_DEFAULT}"
+fi
 ZONE="${CT_WATCH_ZONE:-bunsenbrenner.org}"
 # SETTLE moved to the top config block (#599) -- was here, now defined before its
 # earlier use in the Park-Gauge check.
@@ -478,8 +563,9 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
     # unterscheidet einen Aussetzer nicht von einem Ausfall, und dichtes Nachfassen
     # hat am 15.08. einen 70-Prozent-Ausfall komplett verdeckt. Nur was BEIDE Male
     # faellt, ist ein Alarm.
+    STILL=""
     if [ -n "$DOWN" ]; then
-      sleep 30
+      sleep "$RETRY_SLEEP"
       STILL=""
       for ENTRY in $TARGETS; do
         URL="${ENTRY%=*}"; WANT="${ENTRY##*=}"
@@ -488,41 +574,59 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
         [ -n "$GOT" ] || GOT=000
         [ "$GOT" = "$WANT" ] || STILL="$STILL $URL:$GOT(erwartet $WANT)"
       done
-      if [ -n "$STILL" ]; then
-        # Der Hinweis muss zur Sache passen. Ein ausgefallener Demo-Tunnel und eine
-        # ausgefallene Kernadresse haben nichts miteinander zu tun, und ein Text, der
-        # bei einem Keycloak-Ausfall nach dem Hostname-Anspruch suchen laesst, schickt
-        # den Betreiber in die falsche Richtung -- schlechter als gar kein Hinweis.
-        HINT=""
-        for U in $URLS; do
-          case "$STILL" in *" ${U%=*}:"*) HINT="Betroffen ist eine KERNADRESSE (Portal bzw. Keycloak-Realm), nicht ein Demo-Tunnel: zuerst Keycloak-Start und Realm-Import pruefen (eine unbrauchbare Realm-Datei verhindert den Start).";; esac
-        done
-        # Der Hinweis muss zur ART des Fehlschlags passen, nicht nur zur Adresse.
-        # Am 17.08. schlug der Waechter zum ersten Mal echt an (llm-34a13a96 lieferte
-        # zweimal 500) und riet zu "verlorener Hostname-Anspruch / veraltete Edge-IP /
-        # fehlgeschlagene Rehydrierung" -- lauter Ursachen, die eine 000 erzeugen und
-        # niemals eine 500. Eine 5xx heisst das Gegenteil: der Tunnel HAT zugestellt,
-        # und der Origin dahinter hat mit einem Fehler geantwortet. Wer daraufhin am
-        # Tunnel sucht, sucht an der falschen Stelle.
-        case "$STILL" in
-          *":000("*)
-            HINT="$HINT${HINT:+ }Mindestens ein Ziel antwortet gar nicht (000): das ist die Transportebene — verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, oder eine fehlgeschlagene Rehydrierung." ;;
-        esac
-        case "$STILL" in
-          *":5"[0-9][0-9]"("*)
-            HINT="$HINT${HINT:+ }Mindestens ein Ziel antwortet mit 5xx: der Tunnel hat ZUGESTELLT und der Origin dahinter meldet einen Fehler. Nicht am Tunnel suchen, sondern beim Dienst hinter dem Agenten (er gehoert oft einem Peer, nicht diesem Host)." ;;
-        esac
-        # Alles andere (z. B. 302 statt 200) ist weder Transport noch Origin-Fehler,
-        # sondern meist eine Gate-/Weiterleitungsaenderung.
-        case "$STILL" in
-          *":000("*|*":5"[0-9][0-9]"("*) ;;
-          *) HINT="$HINT${HINT:+ }Der Code weicht ab, ist aber weder 000 noch 5xx — meist eine geaenderte Weiterleitung oder ein Login-Gate; erwarteten Wert in CT_WATCH_SITES pruefen." ;;
-        esac
-        ALARMS+=("Dienste nicht erreichbar (zweimal im Abstand von 30s geprueft):$STILL. ${HINT:-Der Edge selbst laeuft.}")
-      else
+      if [ -z "$STILL" ]; then
         log "voruebergehender Aussetzer, beim zweiten Durchgang wieder erreichbar:$DOWN"
       fi
     fi
+    # Zustandswechsel je Ziel (siehe Kopf): nur ok->fehler alarmiert, fehler->ok wird
+    # einmal als "wieder erreichbar" gemeldet, ein Dauerfehler einmal je REMIND_H erinnert.
+    NEWLY=""; REMINDS=""
+    for ENTRY in $TARGETS; do
+      URL="${ENTRY%=*}"
+      DETAIL=""
+      # Ein Eintrag in $STILL heisst "URL:CODE(erwartet N)" -- mit Leerzeichen, daher
+      # per Teilstring-Ausschnitt statt Wortzerlegung.
+      case "$STILL" in *" $URL:"*) DETAIL="${STILL#*" $URL:"}"; DETAIL="$URL:${DETAIL%%\)*})";; esac
+      track_state "ziel-$URL" "$([ -n "$DETAIL" ] && echo 1 || echo 0)"
+      case "$TRACK_RESULT" in
+        new) NEWLY="$NEWLY $DETAIL" ;;
+        remind) REMINDS="$REMINDS $DETAIL (seit $(fmt_dur "$TRACK_SINCE"))" ;;
+        recovered) RECOVERED+=("$URL wieder erreichbar (war $(fmt_dur "$TRACK_SINCE") gestoert).") ;;
+      esac
+    done
+    if [ -n "$NEWLY" ]; then
+      # Der Hinweis muss zur Sache passen. Ein ausgefallener Demo-Tunnel und eine
+      # ausgefallene Kernadresse haben nichts miteinander zu tun, und ein Text, der
+      # bei einem Keycloak-Ausfall nach dem Hostname-Anspruch suchen laesst, schickt
+      # den Betreiber in die falsche Richtung -- schlechter als gar kein Hinweis.
+      HINT=""
+      for U in $URLS; do
+        case "$NEWLY" in *" ${U%=*}:"*) HINT="Betroffen ist eine KERNADRESSE (Portal bzw. Keycloak-Realm), nicht ein Demo-Tunnel: zuerst Keycloak-Start und Realm-Import pruefen (eine unbrauchbare Realm-Datei verhindert den Start).";; esac
+      done
+      # Der Hinweis muss zur ART des Fehlschlags passen, nicht nur zur Adresse.
+      # Am 17.08. schlug der Waechter zum ersten Mal echt an (llm-34a13a96 lieferte
+      # zweimal 500) und riet zu "verlorener Hostname-Anspruch / veraltete Edge-IP /
+      # fehlgeschlagene Rehydrierung" -- lauter Ursachen, die eine 000 erzeugen und
+      # niemals eine 500. Eine 5xx heisst das Gegenteil: der Tunnel HAT zugestellt,
+      # und der Origin dahinter hat mit einem Fehler geantwortet. Wer daraufhin am
+      # Tunnel sucht, sucht an der falschen Stelle.
+      case "$NEWLY" in
+        *":000("*)
+          HINT="$HINT${HINT:+ }Mindestens ein Ziel antwortet gar nicht (000): das ist die Transportebene — verlorener Hostname-Anspruch, ein Agent mit veralteter Edge-IP, oder eine fehlgeschlagene Rehydrierung." ;;
+      esac
+      case "$NEWLY" in
+        *":5"[0-9][0-9]"("*)
+          HINT="$HINT${HINT:+ }Mindestens ein Ziel antwortet mit 5xx: der Tunnel hat ZUGESTELLT und der Origin dahinter meldet einen Fehler. Nicht am Tunnel suchen, sondern beim Dienst hinter dem Agenten (er gehoert oft einem Peer, nicht diesem Host)." ;;
+      esac
+      # Alles andere (z. B. 302 statt 200) ist weder Transport noch Origin-Fehler,
+      # sondern meist eine Gate-/Weiterleitungsaenderung.
+      case "$NEWLY" in
+        *":000("*|*":5"[0-9][0-9]"("*) ;;
+        *) HINT="$HINT${HINT:+ }Der Code weicht ab, ist aber weder 000 noch 5xx — meist eine geaenderte Weiterleitung oder ein Login-Gate; erwarteten Wert in CT_WATCH_SITES pruefen." ;;
+      esac
+      ALARMS+=("Dienste nicht erreichbar (zweimal im Abstand von ${RETRY_SLEEP}s geprueft, neu):$NEWLY. ${HINT:-Der Edge selbst laeuft.}")
+    fi
+    [ -z "$REMINDS" ] || ALARMS+=("Erinnerung, Dauerfehler (hoechstens alle ${REMIND_H}h wiederholt):$REMINDS. Aendern oder entfernen: CT_WATCH_SITES_FILE / CT_WATCH_SITES.")
     # Die Deckungspruefung: hat der Durchlauf ueberhaupt das geprueft, was er
     # pruefen sollte? Das Ergebnis "alles in Ordnung" ist nur so viel wert wie die
     # Zahl der Adressen dahinter.
@@ -534,13 +638,68 @@ if [ -n "${RUNNING:-}" ] && [ "$RUNNING" = "true" ]; then
   fi
 fi
 
+# Bekannte Dauerfehler bleiben SICHTBAR (Logzeile), auch wenn sie nicht mehr jeden Lauf
+# alarmieren: Schweigen darf sich nicht wie "alles in Ordnung" lesen.
+# `|| true`: unter `set -e` + pipefail bricht sonst schon der LEERE Fall (kein Dauerfehler)
+# das ganze Skript still ab -- beim ersten Probelauf des Tests aufgefallen.
+KNOWN_COUNT=$(find "$TSTATE_DIR" -type f 2>/dev/null | wc -l | tr -d ' ' || true)
+KNOWN_LIST=$(ls -1 "$TSTATE_DIR" 2>/dev/null | tr '\n' ' ' || true)
+
+# Eine Mail senden (Zugangsdaten nur aus der .env des Betreibers, nie aus dem Repo).
+# CT_EDGE_WATCH_NO_MAIL=1 unterdrueckt den Versand (Tests).
+send_mail() { # $1 Betreff, $2 Text
+  [ "${CT_EDGE_WATCH_NO_MAIL:-0}" = "1" ] && return 0
+  [ -r "$ENVFILE" ] || return 0
+  SMTP_HOST=$(grep -E '^KC_SMTP_HOST=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
+  SMTP_PORT=$(grep -E '^KC_SMTP_PORT=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
+  SMTP_USER=$(grep -E '^KC_SMTP_USER=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
+  SMTP_PASS=$(grep -E '^KC_SMTP_PASSWORD=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
+  SMTP_FROM=$(grep -E '^KC_SMTP_FROM=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
+  export SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_FROM TO
+  MAIL_SUBJECT="$1" MAIL_BODY="$2" python3 - <<'PY' || log "Warnung: Mailversand fehlgeschlagen"
+import os, smtplib, ssl
+from email.message import EmailMessage
+m = EmailMessage()
+m["From"] = os.environ["SMTP_FROM"]; m["To"] = os.environ["TO"]
+m["Subject"] = os.environ["MAIL_SUBJECT"]
+m.set_content(
+    os.environ["MAIL_BODY"] + "\n\n"
+    "Geprueft wird der laufende Edge (Containerzustand, /healthz, Messwerte, Log-Signaturen).\n"
+    "Gemeldet werden Zustandswechsel; ein Dauerfehler wird nur einmal je Erinnerungsintervall wiederholt.\n\n"
+    "Nachsehen:\n"
+    "  docker logs --tail 200 ct-selfhost-edge-1\n"
+    "  docker exec ct-selfhost-edge-1 curl -s localhost:9600/healthz\n"
+    "  tail /var/tmp/cads-edge-watch/cron.log\n"
+)
+port = int(os.environ.get("SMTP_PORT") or 465)
+ctx = ssl.create_default_context()
+s = smtplib.SMTP_SSL(os.environ["SMTP_HOST"], port, context=ctx, timeout=30) if port == 465 else smtplib.SMTP(os.environ["SMTP_HOST"], port, timeout=30)
+if port != 465: s.starttls(context=ctx)
+s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"]); s.send_message(m); s.quit()
+print("Mail gesendet")
+PY
+}
+
+if [ "${#RECOVERED[@]}" -gt 0 ]; then
+  for R in "${RECOVERED[@]}"; do log "ENTWARNUNG: $R"; done
+fi
+
 if [ "${#ALARMS[@]}" -eq 0 ]; then
-  log "Edge in Ordnung (Dienste geprueft: $SITES_CHECKED)"
+  if [ "${KNOWN_COUNT:-0}" -gt 0 ]; then
+    log "Keine neue Stoerung (Dienste geprueft: $SITES_CHECKED); bekannte Dauerfehler: $KNOWN_COUNT -- $KNOWN_LIST"
+  else
+    log "Edge in Ordnung (Dienste geprueft: $SITES_CHECKED)"
+  fi
   rm -f "$STATE_DIR/last-alarm"
+  # Eine Entwarnung ist selbst eine Nachricht: einmal je Wechsel, ohne Dämpfung.
+  if [ "${#RECOVERED[@]}" -gt 0 ]; then
+    send_mail "CADS-Tunnel: wieder erreichbar" "$(printf '%s\n' "${RECOVERED[@]}")"
+  fi
   exit 0
 fi
 
 BODY=$(printf '%s\n' "${ALARMS[@]}")
+[ "${#RECOVERED[@]}" -eq 0 ] || BODY="$BODY"$'\n'"$(printf '%s\n' "${RECOVERED[@]}")"
 log "ALARM: $(printf '%s' "$BODY" | tr '\n' ' ')"
 
 # Wiederholungen dämpfen: dieselbe Meldung nicht alle 10 Minuten erneut senden.
@@ -556,34 +715,5 @@ if [ -r "$LAST_FILE" ]; then
 fi
 echo "$SIG $(date +%s)" > "$LAST_FILE"
 
-if [ -r "$ENVFILE" ]; then
-  SMTP_HOST=$(grep -E '^KC_SMTP_HOST=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
-  SMTP_PORT=$(grep -E '^KC_SMTP_PORT=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
-  SMTP_USER=$(grep -E '^KC_SMTP_USER=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
-  SMTP_PASS=$(grep -E '^KC_SMTP_PASSWORD=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
-  SMTP_FROM=$(grep -E '^KC_SMTP_FROM=' "$ENVFILE" | cut -d= -f2- | tr -d '"')
-  export SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS SMTP_FROM TO BODY
-  python3 - <<'PY' || log "Warnung: Mailversand fehlgeschlagen"
-import os, smtplib, ssl
-from email.message import EmailMessage
-m = EmailMessage()
-m["From"] = os.environ["SMTP_FROM"]; m["To"] = os.environ["TO"]
-m["Subject"] = "CADS-Tunnel: Edge meldet eine Stoerung"
-m.set_content(
-    os.environ["BODY"] + "\n\n"
-    "Geprueft wird der laufende Edge (Containerzustand, /healthz, Messwerte, Log-Signaturen).\n"
-    "Diese Meldung wiederholt sich fruehestens nach 6 Stunden, solange sich nichts aendert.\n\n"
-    "Nachsehen:\n"
-    "  docker logs --tail 200 ct-selfhost-edge-1\n"
-    "  docker exec ct-selfhost-edge-1 curl -s localhost:9600/healthz\n"
-    "  tail /var/tmp/cads-edge-watch/cron.log\n"
-)
-port = int(os.environ.get("SMTP_PORT") or 465)
-ctx = ssl.create_default_context()
-s = smtplib.SMTP_SSL(os.environ["SMTP_HOST"], port, context=ctx, timeout=30) if port == 465 else smtplib.SMTP(os.environ["SMTP_HOST"], port, timeout=30)
-if port != 465: s.starttls(context=ctx)
-s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"]); s.send_message(m); s.quit()
-print("Alarm-Mail gesendet")
-PY
-fi
+send_mail "CADS-Tunnel: Edge meldet eine Stoerung" "$BODY"
 exit 1

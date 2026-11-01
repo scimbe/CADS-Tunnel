@@ -16,6 +16,15 @@
 #
 #   docker compose -f examples/ops-docs-site/compose.ops-docs-site.yml \
 #     --env-file docker/deploy/.env up --build -d
+# Log rotation (selfhost operations): Docker's json-file driver has NO size cap by
+# default, so every service that is not given one grows its log without bound on
+# the host's disk. One shared block per file, referenced by every service below.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   ops-origin:
     build:
@@ -34,6 +43,7 @@ services:
     restart: unless-stopped
     # Same #312/#600 rationale as every other origin on this shared host --
     # sized generously above a static Caddy origin's real footprint.
+    logging: *default-logging
     mem_limit: 128m
     mem_reservation: 32m
     cpus: 0.5
@@ -66,6 +76,7 @@ services:
     depends_on:
       - ops-origin
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 128m
     mem_reservation: 32m
     cpus: 0.5
