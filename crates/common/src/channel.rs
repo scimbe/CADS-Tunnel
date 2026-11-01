@@ -2911,6 +2911,18 @@ pub fn grant_revoke_signing_bytes(channel: &ChannelId, grant_digest: &[u8; 32], 
     out
 }
 
+/// Bytes a channel member signs with its holder key to leave `channel` on its own. `ts` bounds
+/// replay; a leave is restrictive and idempotent, so a replay inside the window changes nothing.
+pub fn channel_leave_signing_bytes(channel: &ChannelId, holder: &[u8; 32], ts: u64) -> Vec<u8> {
+    let mut out = b"ct-channel-leave:v1|".to_vec();
+    out.extend_from_slice(&channel.0);
+    out.push(b'|');
+    out.extend_from_slice(holder);
+    out.push(b'|');
+    out.extend_from_slice(&ts.to_le_bytes());
+    out
+}
+
 /// Bytes a channel member signs with its holder key to ask whether `peer`'s grant
 /// (`grant_digest`) is still valid on `channel`. `ts` bounds replay.
 pub fn grant_status_signing_bytes(channel: &ChannelId, peer: &[u8; 32], grant_digest: &[u8; 32], ts: u64) -> Vec<u8> {

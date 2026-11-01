@@ -3851,6 +3851,7 @@ fn grant_signed_router(channels: Arc<SqliteChannelStore>, topologies: Arc<Sqlite
     Router::new()
         .route("/channel/grant-status", post(channel_grant_status))
         .route("/channel/:channel/grant-revoke", post(channel_grant_revoke_signed))
+        .route("/channel/:channel/leave", post(channel_leave_signed))
         .with_state(GrantSignedState { channels, topologies })
 }
 
@@ -3968,6 +3969,58 @@ async fn channel_grant_revoke_signed(
         return Err((StatusCode::FORBIDDEN, "bad operator signature".to_string()));
     }
     Ok(Json(record_grant_revocation(&state.channels, &channel, &digest, req.expires_at).await?))
+}
+
+#[derive(Deserialize)]
+struct ChannelLeaveReq {
+    /// The leaving member's holder key (hex).
+    holder: String,
+    ts: u64,
+    /// Holder signature over `channel_leave_signing_bytes` (hex).
+    sig: String,
+}
+
+/// `POST /channel/:channel/leave`: a member ends its own membership on the strength of its
+/// holder signature. For a member without an account, such as the recipient of a phone
+/// invitation: it holds no session, and the owner may be offline for days, so without this
+/// the owner would see the contact as connected for good. The same complete removal as the
+/// owner's route, on the owner's behalf: the member can only ever remove itself.
+/// Unknown channel, non-member and a bad signature all answer `403`, so the route is no
+/// membership oracle. Leaving twice inside the replay window is refused the same way and
+/// changes nothing.
+async fn channel_leave_signed(
+    State(state): State<GrantSignedState>,
+    Path(channel_hex): Path<String>,
+    Json(req): Json<ChannelLeaveReq>,
+) -> Result<StatusCode, StatusCode> {
+    let channel = ChannelId(hex_decode_32(&channel_hex).ok_or(StatusCode::BAD_REQUEST)?);
+    let holder = hex_decode_32(&req.holder).ok_or(StatusCode::BAD_REQUEST)?;
+    let sig = hex_decode_64(&req.sig).ok_or(StatusCode::BAD_REQUEST)?;
+    if now_secs().abs_diff(req.ts) > GRANT_STATUS_SKEW_SECS {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let msg = ct_common::channel::channel_leave_signing_bytes(&channel, &holder, req.ts);
+    if !ct_common::channel::verify_holder_possession(&holder, &msg, &sig) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let channels = state.channels.clone();
+    let left = tokio::task::spawn_blocking(move || {
+        if channels.authorize_holder(&channel, &holder)?.is_none() {
+            return Ok::<_, rusqlite::Error>(false);
+        }
+        match channels.channel_owner(&channel)? {
+            Some(owner) => channels.remove_member(&channel, &owner, &holder),
+            None => Ok(false),
+        }
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if left {
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 #[derive(Deserialize)]
@@ -8218,6 +8271,61 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(r2.status(), StatusCode::NOT_FOUND, "redeem stays mounted with no admin token");
+    }
+
+    #[tokio::test]
+    async fn a_member_leaves_on_its_own_signature_and_only_itself() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use ct_common::channel::{channel_leave_signing_bytes, member_noise_attest_bytes};
+        use ed25519_dalek::{Signer, SigningKey};
+        use tower::ServiceExt;
+
+        let channels = Arc::new(SqliteChannelStore::open_in_memory().unwrap());
+        let topologies = Arc::new(SqliteTopologyStore::open_in_memory().unwrap());
+        let chan = ChannelId([0xb1u8; 32]);
+        channels.register_channel(&chan, &[0x51u8; 32], "alice").unwrap();
+        let (member, other) = (SigningKey::from_bytes(&[0x62u8; 32]), SigningKey::from_bytes(&[0x63u8; 32]));
+        let nk = [0xd4u8; 32];
+        for k in [&member, &other] {
+            let h = k.verifying_key().to_bytes();
+            let att = k.sign(&member_noise_attest_bytes(&chan, &h, &nk)).to_bytes();
+            assert!(channels.add_member(&chan, "alice", &h, &nk, &att).unwrap());
+        }
+        let (holder, bystander) = (member.verifying_key().to_bytes(), other.verifying_key().to_bytes());
+        let app = grant_signed_router(channels.clone(), topologies);
+        let url = format!("/channel/{}/leave", hex_encode(&chan.0));
+        let post = |holder: [u8; 32], ts: u64, sig: [u8; 64]| {
+            let body = format!(
+                r#"{{"holder":"{}","ts":{ts},"sig":"{}"}}"#,
+                hex_encode(&holder),
+                hex_encode(&sig)
+            );
+            app.clone().oneshot(
+                Request::post(url.as_str()).header("content-type", "application/json").body(Body::from(body)).unwrap(),
+            )
+        };
+        let now = now_secs();
+        let good = member.sign(&channel_leave_signing_bytes(&chan, &holder, now)).to_bytes();
+
+        // Somebody else's key cannot remove a member.
+        let forged = other.sign(&channel_leave_signing_bytes(&chan, &holder, now)).to_bytes();
+        assert_eq!(post(holder, now, forged).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // A signature for another channel does not carry over.
+        let elsewhere = member.sign(&channel_leave_signing_bytes(&ChannelId([0xb2u8; 32]), &holder, now)).to_bytes();
+        assert_eq!(post(holder, now, elsewhere).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // A stale signature is refused.
+        let old = now - GRANT_STATUS_SKEW_SECS - 10;
+        let stale = member.sign(&channel_leave_signing_bytes(&chan, &holder, old)).to_bytes();
+        assert_eq!(post(holder, old, stale).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert!(channels.authorize_holder(&chan, &holder).unwrap().is_some(), "nothing changed so far");
+
+        assert_eq!(post(holder, now, good).await.unwrap().status(), StatusCode::OK);
+        assert!(channels.authorize_holder(&chan, &holder).unwrap().is_none(), "the member is gone");
+        assert!(channels.authorize_holder(&chan, &bystander).unwrap().is_some(), "the other member stays");
+
+        // A replay of the same signature changes nothing and tells nothing new.
+        assert_eq!(post(holder, now, good).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
