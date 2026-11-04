@@ -140,7 +140,7 @@ html[data-look="daily"] .pf-c-form-control[aria-invalid="true"] {
 }
 html[data-look="daily"] .pf-c-form-control:disabled,
 html[data-look="daily"] .pf-c-form-control[readonly] {
-  background: #efe6cc !important;   /* ink on it: 15.4:1 */
+  background: #efe6cc !important;   /* ink on it: 15.2:1 */
   color: var(--d-ink) !important;
 }
 /* show-password eye next to the field */
@@ -195,7 +195,7 @@ html[data-look="daily"] .pf-c-button.pf-m-primary:active {
 html[data-look="daily"] .pf-c-button.pf-m-primary:disabled,
 html[data-look="daily"] .pf-c-button.pf-m-primary.pf-m-disabled,
 html[data-look="daily"] .pf-c-button.pf-m-primary[aria-disabled="true"] {
-  background-color: #4a4234 !important;   /* paper text on it: 9.0:1 */
+  background-color: #4a4234 !important;   /* paper text on it: 9.5:1 */
   border-color: #4a4234 !important;
   color: #fffaf0 !important;
   box-shadow: none;
