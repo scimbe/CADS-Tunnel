@@ -152,3 +152,42 @@ jobs:
       - name: Realm-Importdatei validieren
         if: steps.changed.outputs.run == 'true'
         run: ./scripts/validate-realm-import.sh
+
+  # Ein Login-Theme, das Keycloak nicht findet (Tippfehler im Namen, falscher
+  # Parent, fehlender Mount), faellt STILL auf das Standard-Theme zurueck -- die
+  # Anmeldung geht weiter, sieht aber fremd aus. Dieser Job startet Keycloak mit
+  # den Theme-Ordnern und fragt die Login- und Registrierungsseite von ct-portal
+  # ab (scripts/check-keycloak-theme.sh). Gleiche Aenderungserkennung wie oben.
+  keycloak-theme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Nur bei Aenderung an Theme, Realm-Datei oder Pruefer
+        id: changed
+        run: |
+          set -u
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          pattern='docker/deploy/keycloak/|docker/deploy/compose\.sso\.yml|scripts/check-keycloak-theme\.sh'
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "unbestimmbare Basis -> pruefen"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! files=$(git diff --name-only "$base" "${{ github.sha }}" 2>&1); then
+            echo "git diff fehlgeschlagen ($files) -> pruefen"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if printf '%s\n' "$files" | grep -qE "$pattern"; then
+            echo "relevante Aenderung -> pruefen"; echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "keine relevante Aenderung -> ueberspringen"; echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Ergebnis in der Zusammenfassung vermerken
+        run: |
+          if [ "${{ steps.changed.outputs.run }}" = "true" ]; then
+            echo "Keycloak-Theme: **wird geladen und geprueft**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Keycloak-Theme: **nicht geprueft** -- keine Aenderung unter \`docker/deploy/keycloak/\`. Das ist kein Freispruch, nur eine ausgelassene Pruefung." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Login-Theme ct-daily laedt
+        if: steps.changed.outputs.run == 'true'
+        run: ./scripts/check-keycloak-theme.sh

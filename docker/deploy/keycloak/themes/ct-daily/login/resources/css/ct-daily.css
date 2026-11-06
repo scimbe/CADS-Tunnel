@@ -1,0 +1,426 @@
+/* ct-daily: the My Daily Idea look for the ct-portal sign-in (login, register,
+   reset, terms, errors). Layered after the stock keycloak login.css; replaces
+   ct-bunsenbrenner's dark ct-login.css (not loaded, see ../../theme.properties).
+   Same tokens as My Daily Idea (CADS-agent-marketplace apps/duell-web/src/style.css)
+   and the webconference "daily" look (CADS-webconference-demo theme-daily.css):
+   yellow page, a cream calendar sheet with a 3px ink border and a hard shadow,
+   red accent, Anton display type. Fixed colours only -- no URL parameters.
+   No DOM/id changes: #username/#password/#kc-login/#kc-register-form are stock.
+
+   Anton, Copyright 2020 The Anton Project Authors
+   (https://github.com/googlefonts/AntonFont.git), SIL Open Font License 1.1,
+   see ../fonts/Anton-OFL.txt. */
+@font-face {
+  font-family: "Anton";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url(../fonts/anton-latin-400-normal.woff2) format("woff2");
+}
+
+:root {
+  --d-a: #ffd400;      /* page */
+  --d-b: #ff3b1d;      /* accent: shadows, focus, under-sheet -- never as text on paper (3.3:1) */
+  --d-btn: #ffd400;    /* button text on ink */
+  --ink: #111;
+  --paper: #fff6dc;
+  --muted: #4a4234;    /* 8.6:1 on paper */
+  --danger: #b3140a;   /* 6.4:1 on paper */
+  --disp: Anton, Impact, "Avenir Next Condensed", "Roboto Condensed", "Arial Black", system-ui, sans-serif;
+  --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+}
+
+html,
+body,
+.login-pf body {
+  background-color: var(--d-a) !important;
+  color: var(--ink);
+  font-family: var(--ui);
+  -webkit-font-smoothing: antialiased;
+}
+/* the sun rays behind the sheet, as on the app's home screen (static here) */
+body {
+  background-image: repeating-conic-gradient(from 0deg at 50% 38%, rgba(0, 0, 0, .05) 0 15deg, transparent 0 30deg) !important;
+  background-attachment: fixed !important;
+  min-height: 100vh;
+}
+
+/* own stacking context: the red under-sheet (.card-pf::after, z-index -1) sits
+   behind the sheet but in front of the page */
+.login-pf-page {
+  position: relative;
+  isolation: isolate;
+  background: transparent !important;
+  padding: 28px 16px 48px !important;
+}
+
+/* header: the stamped title. The realm has no display name, so Keycloak shows
+   its id ("ct-demo"); the visible text is set here instead (CSS only). */
+#kc-header {
+  margin-bottom: 18px;
+}
+#kc-header-wrapper {
+  font-size: 0 !important;
+  padding: 0 !important;
+  text-align: center;
+  color: var(--ink);
+  line-height: 1;
+}
+#kc-header-wrapper::before {
+  content: "bunsenbrenner.org";
+  display: inline-block;
+  font: 400 clamp(2rem, 8vw, 2.9rem)/1 var(--disp);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  transform: rotate(-1.5deg);
+  text-shadow: .035em .035em 0 var(--d-b);
+}
+
+/* the sheet */
+.card-pf {
+  position: relative;
+  max-width: 480px !important;
+  margin: 0 auto !important;
+  padding: 34px 22px 18px !important;
+  background: var(--paper) !important;
+  color: var(--ink);
+  border: 3px solid var(--ink) !important;
+  border-radius: 6px;
+  box-shadow: 5px 6px 0 var(--ink) !important;
+}
+/* binding holes along the top edge, like a tear-off calendar */
+.card-pf::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 7px;
+  height: 13px;
+  background: radial-gradient(circle at 50% 50%, var(--d-a) 0 5px, var(--ink) 5px 6.5px, transparent 7px) 50% 0/25px 13px repeat-x;
+  pointer-events: none;
+}
+/* the next sheet underneath, in the accent colour */
+.card-pf::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  z-index: -1;
+  background: var(--d-b);
+  border: 3px solid var(--ink);
+  border-radius: 6px;
+  transform: rotate(-2.2deg) translate(-2px, 8px);
+  pointer-events: none;
+}
+
+.login-pf-header {
+  margin-bottom: 14px !important;
+}
+#kc-page-title,
+.login-pf-page .login-pf-header h1,
+h1, h2 {
+  font: 400 clamp(1.6rem, 6vw, 2.1rem)/1.05 var(--disp) !important;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--ink);
+  text-align: left;
+}
+
+/* register page: the title sits in a bootstrap column (extra 15px inset) and the
+   "* required fields" note is base grey #909090 (2.9:1 on paper) */
+.login-pf-header .col-md-10 {
+  padding-left: 0;
+  padding-right: 0;
+}
+.login-pf-header .subtitle {
+  color: var(--muted) !important;
+  font: 700 .85rem/1.2 var(--ui);
+}
+
+label,
+.pf-c-form__label,
+.pf-c-form__label-text,
+#kc-content-wrapper,
+#kc-form-options,
+.login-pf-page .login-pf-settings,
+.instruction,
+#kc-registration-container {
+  color: var(--ink) !important;
+}
+.pf-c-form__label-text {
+  font: 800 .95rem/1.2 var(--ui);
+}
+.required,
+#kc-form .required,
+label .required {
+  color: var(--danger) !important;
+  font-weight: 900;
+}
+
+/* fields: white, thick ink */
+.pf-c-form-control,
+input.pf-c-form-control,
+select.pf-c-form-control,
+textarea.pf-c-form-control {
+  min-height: 48px;
+  background: #fff !important;
+  color: var(--ink) !important;
+  border: 2px solid var(--ink) !important;
+  border-radius: 6px;
+  font: 600 1rem/1.3 var(--ui);
+  padding: 8px 12px;
+  box-shadow: none !important;
+}
+.pf-c-form-control:focus,
+.pf-c-form-control:focus-visible {
+  outline: 3px solid var(--d-b) !important;
+  outline-offset: 1px;
+}
+.pf-c-form-control[aria-invalid="true"] {
+  border-color: var(--danger) !important;
+  border-width: 3px !important;
+}
+.pf-c-form__helper-text.pf-m-error,
+span[id^="input-error"] {
+  color: var(--danger) !important;
+  font-weight: 800;
+}
+.pf-c-input-group .pf-c-form-control {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+/* show-password eye */
+.pf-c-button.pf-m-control {
+  min-width: 48px;
+  background: var(--paper) !important;
+  color: var(--ink) !important;
+  border: 2px solid var(--ink) !important;
+  border-left: 0 !important;
+  border-radius: 0 6px 6px 0;
+}
+.pf-c-button.pf-m-control::after {
+  border: 0 !important;
+}
+
+/* the one big button: ink with yellow letters, pressed-down red shadow */
+.pf-c-button.pf-m-primary,
+input#kc-login,
+#kc-form-buttons input[type="submit"] {
+  min-height: 60px;
+  margin-top: 6px;
+  background: var(--ink) !important;
+  border: 3px solid var(--ink) !important;
+  border-radius: 6px !important;
+  color: var(--d-btn) !important;
+  font: 400 1.6rem/1 var(--disp) !important;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  box-shadow: 0 6px 0 var(--d-b) !important;
+  transition: transform 90ms ease-out, box-shadow 90ms ease-out;
+}
+.pf-c-button.pf-m-primary:hover {
+  background: #000 !important;
+}
+.pf-c-button.pf-m-primary:active,
+input#kc-login:active {
+  transform: translateY(5px);
+  box-shadow: 0 1px 0 var(--d-b) !important;
+}
+.pf-c-button:focus-visible,
+input#kc-login:focus-visible,
+a:focus-visible,
+button:focus-visible {
+  outline: 3px solid var(--ink) !important;
+  outline-offset: 3px;
+}
+.pf-c-button.pf-m-primary:disabled {
+  background: var(--paper) !important;
+  color: var(--muted) !important;
+  border: 3px dashed var(--muted) !important;
+  box-shadow: none !important;
+}
+/* secondary buttons (terms "Decline", "Cancel" ...) */
+.pf-c-button.pf-m-secondary,
+.btn-default {
+  min-height: 48px;
+  background: transparent !important;
+  color: var(--ink) !important;
+  border: 3px solid var(--ink) !important;
+  border-radius: 6px !important;
+  font: 800 1rem/1 var(--ui) !important;
+}
+.pf-c-button.pf-m-secondary::after {
+  border: 0 !important;
+}
+
+/* links: ink, underlined in red -- red as text would fail contrast on paper */
+a,
+.login-pf-page a {
+  color: var(--ink) !important;
+  font-weight: 800;
+  text-decoration: underline;
+  text-decoration-color: var(--d-b);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+a:hover {
+  text-decoration-thickness: 3px;
+}
+
+/* "New user? Register" -- the second way in, as an outlined pill */
+#kc-info,
+#kc-info-wrapper,
+#kc-registration-container,
+.login-pf-signup {
+  background: transparent !important;
+  color: var(--ink) !important;
+  border-top: 0 !important;
+}
+/* login.css pulls this block out of the card (negative margins, built for a
+   full-bleed grey footer); on the sheet it stays inside */
+#kc-info,
+.login-pf-page .login-pf-signup {
+  margin: 16px 0 0 !important;
+  padding: 0 !important;
+}
+#kc-info-wrapper {
+  margin-top: 6px;
+  padding: 14px 0 4px !important;
+  border-top: 2px dashed rgba(0, 0, 0, .35) !important;
+}
+#kc-registration {
+  font: 800 1rem/1.2 var(--ui);
+  text-align: center;
+}
+#kc-registration a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  margin-left: 6px;
+  padding: 0 18px;
+  border: 2px solid var(--ink);
+  border-radius: 22px;
+  background: #fff;
+  text-decoration: none;
+}
+
+/* social sign-in (Google, GitHub, GitLab ...) */
+#kc-social-providers hr {
+  border-top: 2px dashed rgba(0, 0, 0, .35);
+}
+#kc-social-providers h2,
+#kc-social-providers h4 {
+  font: 800 1rem/1.2 var(--ui) !important;
+  text-transform: none;
+  color: var(--ink);
+}
+#kc-social-providers .pf-c-button,
+#kc-social-providers a.pf-c-button {
+  min-height: 48px;
+  background: #fff !important;
+  color: var(--ink) !important;
+  border: 2px solid var(--ink) !important;
+  border-radius: 6px !important;
+  box-shadow: 3px 4px 0 var(--ink);
+  font: 800 1rem/1 var(--ui);
+  text-decoration: none;
+}
+#kc-social-providers .pf-c-button::after {
+  border: 0 !important;
+}
+#kc-social-providers .pf-c-button:active {
+  transform: translate(2px, 3px);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
+/* messages */
+.alert,
+.pf-c-alert {
+  background: #fff !important;
+  color: var(--ink) !important;
+  border: 3px solid var(--ink) !important;
+  border-left: 10px solid var(--d-b) !important;
+  border-radius: 6px;
+  box-shadow: 3px 4px 0 var(--ink) !important;
+}
+.pf-c-alert.pf-m-success,
+.alert-success {
+  border-left-color: #1f8a3b !important;
+}
+.pf-c-alert.pf-m-info,
+.alert-info {
+  border-left-color: var(--ink) !important;
+}
+.pf-c-alert__title,
+.kc-feedback-text,
+.pf-c-alert__icon,
+.pf-c-alert__icon i {
+  color: var(--ink) !important;
+}
+.pf-c-alert__title,
+.kc-feedback-text {
+  font-weight: 800;
+}
+
+/* language switch: its own line above the title (login.css floats/positions it
+   over the title, which collides with the large Anton heading on a phone) */
+#kc-locale {
+  position: static !important;
+  float: none !important;
+  width: auto !important;
+  display: flex !important;
+  justify-content: flex-end;
+  margin: -8px 0 2px !important;
+}
+#kc-locale-wrapper,
+#kc-locale-dropdown {
+  position: relative !important;
+  float: none !important;
+}
+#kc-locale-dropdown button,
+#kc-locale-dropdown button#kc-current-locale-link {
+  color: var(--ink) !important;
+  font: 800 .9rem/1 var(--ui);
+  min-height: 44px;
+}
+#kc-locale .pf-c-dropdown__menu,
+#kc-locale-dropdown ul {
+  background: var(--paper) !important;
+  border: 2px solid var(--ink) !important;
+  border-radius: 6px;
+  box-shadow: 3px 4px 0 var(--ink);
+}
+#kc-locale .pf-c-dropdown__menu-item,
+#kc-locale-dropdown a {
+  color: var(--ink) !important;
+  background: transparent;
+  text-decoration: none;
+}
+#kc-locale .pf-c-dropdown__menu-item:hover,
+#kc-locale .pf-c-dropdown__menu-item:focus {
+  background: var(--d-a) !important;
+}
+
+/* terms (terms.ftl) and other long texts stay readable */
+#kc-terms-text {
+  color: var(--ink);
+  font: 600 .95rem/1.45 var(--ui);
+}
+input[type="checkbox"] {
+  accent-color: var(--ink);
+  width: 20px;
+  height: 20px;
+}
+
+@media (max-width: 520px) {
+  .login-pf-page {
+    padding: 18px 16px 40px !important;
+  }
+  .card-pf {
+    padding: 32px 16px 16px !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

@@ -86,7 +86,8 @@
       "attributes": {
         "access.token.signed.response.alg": "RS256",
         "id.token.signed.response.alg": "RS256",
-        "post.logout.redirect.uris": "${PORTAL_PUBLIC_URL}/portal##http://localhost:8090/portal"
+        "post.logout.redirect.uris": "${PORTAL_PUBLIC_URL}/portal##http://localhost:8090/portal",
+        "login_theme": "ct-daily"
       },
       "protocolMappers": [
         {

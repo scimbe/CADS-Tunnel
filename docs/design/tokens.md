@@ -12,6 +12,7 @@ four copies against; it does not get imported by anything.
 | Portal pre-login card | `crates/control-plane/src/portal.rs` (`PORTAL_HTML_HEAD`) |
 | Portal dashboard chrome | `crates/control-plane/src/portal_api.rs` (`page()`) |
 | Keycloak login form | `docker/deploy/keycloak/themes/ct-bunsenbrenner/login/resources/css/ct-login.css` |
+| Keycloak login form, ct-portal client (My Daily Idea look, own palette) | `docker/deploy/keycloak/themes/ct-daily/login/resources/css/ct-daily.css` |
 | Keycloak account console | `docker/deploy/keycloak/themes/ct-bunsenbrenner/account/resources/css/ct-account.css` |
 
 ## Colors

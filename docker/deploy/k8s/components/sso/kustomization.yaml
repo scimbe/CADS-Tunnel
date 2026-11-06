@@ -39,7 +39,8 @@
 #   # becomes an env var of the same name; missing keys stay empty.
 #   kubectl -n ct-system create secret generic ct-keycloak-idp --from-env-file=idp.env
 #
-# The realm's login theme (ct-bunsenbrenner) is not shipped here; without it
+# The realm's login themes (ct-bunsenbrenner, and ct-daily for the ct-portal
+# client) are not shipped here; without it
 # Keycloak renders its built-in theme. Bake docker/deploy/keycloak/themes into
 # a derived image under /opt/keycloak/themes for the branded pages.
 #

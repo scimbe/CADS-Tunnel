@@ -216,6 +216,9 @@ services:
       # linking the live Nutzungsbedingungen/Datenschutz/Impressum pages) instead of
       # Keycloak's built-in "Terms and conditions to be defined" placeholder.
       - ./keycloak/themes/ct-bunsenbrenner:/opt/keycloak/themes/ct-bunsenbrenner:ro
+      # ct-daily: My Daily Idea look for the ct-portal sign-in (client attribute
+      # login_theme in the realm JSON); parent is ct-bunsenbrenner, so both mounts are needed.
+      - ./keycloak/themes/ct-daily:/opt/keycloak/themes/ct-daily:ro
     # #48: NO published port — Keycloak is reached only through the edge :443 front
     # door (auth.<zone>) and internally as keycloak:8080. Nothing to open on the host.
     expose:
