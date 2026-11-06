@@ -1,0 +1,288 @@
+/* Optional "My Daily Idea" look of the sign-in pages (login, register, reset, error ...).
+   js/ct-look.js sets html[data-look=daily] and --d-a/--d-b/--d-on/--d-onb/--d-btn only for a
+   valid ct_look cookie. Every rule below is scoped to html[data-look="daily"], so without the
+   cookie the page renders exactly as with login.css + ct-login.css alone.
+   Loaded after ct-login.css; where ct-login.css uses !important this file must too, otherwise
+   the dark skin wins regardless of selector specificity.
+   Reference: CADS-webconference-demo theme-daily.css (same tokens, same card, same button).
+   Anton, Copyright 2020 The Anton Project Authors (https://github.com/googlefonts/AntonFont.git),
+   SIL Open Font License 1.1 (../fonts/Anton-OFL.txt). */
+@font-face {
+  font-family: "Anton";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(../fonts/anton-latin-400-normal.woff2) format("woff2");
+}
+
+html[data-look="daily"] {
+  --d-ink: #111111;
+  --d-paper: #fff6dc;
+  --d-muted: #4a4234;          /* secondary text on paper: 8.9:1 on #fff6dc, 9.7:1 on #fff */
+  --d-error: #a30000;          /* 8.2:1 on #fff6dc, 9.2:1 on #fff */
+  --d-display: Anton, Impact, "Avenir Next Condensed", "Roboto Condensed", "Arial Black", system-ui, sans-serif;
+  color-scheme: light;
+}
+
+/* page background: colour a, text on it in --d-on */
+html[data-look="daily"],
+html[data-look="daily"] body,
+html[data-look="daily"] .login-pf body,
+html[data-look="daily"] .login-pf-page {
+  background: var(--d-a) !important;
+  color: var(--d-on);
+}
+
+/* realm name above the card: stamped Anton on colour a */
+html[data-look="daily"] #kc-header-wrapper {
+  font-family: var(--d-display);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  font-size: clamp(1.9rem, 6vw, 2.6rem);
+  line-height: 1.05;
+  color: var(--d-on);
+  transform: rotate(-1.5deg);
+}
+
+/* the sheet: cream paper, thick ink border, hard shadow */
+html[data-look="daily"] .card-pf {
+  background: var(--d-paper) !important;
+  color: var(--d-ink);
+  border: 3px solid var(--d-ink);
+  border-radius: 6px;
+  box-shadow: 5px 6px 0 var(--d-ink);
+  font-weight: 600;
+}
+html[data-look="daily"] .card-pf h1,
+html[data-look="daily"] .card-pf h2,
+html[data-look="daily"] #kc-page-title {
+  font-family: var(--d-display);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--d-ink);
+}
+html[data-look="daily"] .card-pf label,
+html[data-look="daily"] .card-pf p,
+html[data-look="daily"] .card-pf span,
+html[data-look="daily"] .card-pf li,
+html[data-look="daily"] #kc-content-wrapper,
+html[data-look="daily"] #kc-form-options,
+html[data-look="daily"] #kc-registration-container,
+html[data-look="daily"] .instruction,
+html[data-look="daily"] #kc-terms-text {
+  color: var(--d-ink);
+}
+html[data-look="daily"] #kc-info-wrapper {
+  background: transparent !important;
+  border-top: 2px solid var(--d-ink);
+}
+html[data-look="daily"] #kc-registration-container {
+  background: transparent !important;
+  border-top: 0;
+}
+html[data-look="daily"] #kc-info,
+html[data-look="daily"] .login-pf-signup,
+html[data-look="daily"] .login-pf-page .login-pf-signup,
+html[data-look="daily"] .kc-social-section,
+html[data-look="daily"] .kc-social-section h2,
+html[data-look="daily"] .kc-social-section h4,
+html[data-look="daily"] .pf-c-form__helper-text {
+  color: var(--d-muted) !important;
+}
+
+/* links: ink on paper (accent b is decoration only, it is not guaranteed to read on paper) */
+html[data-look="daily"] .card-pf a,
+html[data-look="daily"] .card-pf a:visited {
+  color: var(--d-ink);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: var(--d-b);
+  text-decoration-thickness: 3px;
+  text-underline-offset: 3px;
+}
+html[data-look="daily"] .card-pf a:hover,
+html[data-look="daily"] .card-pf a:focus {
+  color: var(--d-ink);
+  text-decoration-color: var(--d-ink);
+}
+/* links outside the card sit on colour a */
+html[data-look="daily"] .login-pf-page > a,
+html[data-look="daily"] #kc-header a {
+  color: var(--d-on);
+}
+
+/* inputs: white with a 2px ink border */
+html[data-look="daily"] .pf-c-form-control,
+html[data-look="daily"] input.pf-c-form-control,
+html[data-look="daily"] .card-pf input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]),
+html[data-look="daily"] .card-pf select,
+html[data-look="daily"] .card-pf textarea {
+  background: #fff !important;
+  color: var(--d-ink) !important;
+  border: 2px solid var(--d-ink) !important;
+  border-radius: 6px;
+  font-weight: 600;
+}
+html[data-look="daily"] .pf-c-form-control::placeholder,
+html[data-look="daily"] .card-pf input::placeholder {
+  color: var(--d-muted);
+  opacity: 1;
+}
+html[data-look="daily"] .pf-c-form-control:focus {
+  border-color: var(--d-ink) !important;
+  box-shadow: 0 0 0 3px var(--d-b) !important;
+  outline: none;
+}
+html[data-look="daily"] .pf-c-form-control[aria-invalid="true"] {
+  border-color: var(--d-error) !important;
+}
+html[data-look="daily"] .pf-c-form-control:disabled,
+html[data-look="daily"] .pf-c-form-control[readonly] {
+  background: #efe6cc !important;   /* ink on it: 15.2:1 */
+  color: var(--d-ink) !important;
+}
+/* show-password eye next to the field */
+html[data-look="daily"] .pf-c-input-group .pf-c-button.pf-m-control {
+  background: #fff;
+  color: var(--d-ink);
+  border: 2px solid var(--d-ink);
+  border-left: 0;
+}
+html[data-look="daily"] .pf-c-input-group .pf-c-button.pf-m-control::after { border: 0; }
+
+/* required marker and field errors: dark red on paper (ct-login.css' #ff7b72 is for the dark card) */
+html[data-look="daily"] .required,
+html[data-look="daily"] #kc-form .required,
+html[data-look="daily"] label .required,
+html[data-look="daily"] .pf-c-form__helper-text.pf-m-error,
+html[data-look="daily"] .kc-feedback-text.pf-m-error,
+html[data-look="daily"] #input-error,
+html[data-look="daily"] [id^="input-error"] {
+  color: var(--d-error) !important;
+}
+
+/* primary button (#kc-login, register / reset submit): black, text in --d-btn, colour-b shadow */
+html[data-look="daily"] .pf-c-button.pf-m-primary,
+html[data-look="daily"] #kc-login,
+html[data-look="daily"] #kc-form-buttons input[type="submit"],
+html[data-look="daily"] #kc-form-buttons button[type="submit"] {
+  background-color: var(--d-ink) !important;
+  border: 3px solid var(--d-ink) !important;
+  color: var(--d-btn) !important;
+  border-radius: 6px;
+  font-family: var(--d-display);
+  font-weight: 400;
+  font-size: 1.25rem;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  box-shadow: 0 5px 0 var(--d-b);
+  margin-bottom: 6px;
+  transition: transform 90ms ease-out, box-shadow 90ms ease-out;
+}
+html[data-look="daily"] .pf-c-button.pf-m-primary:hover,
+html[data-look="daily"] .pf-c-button.pf-m-primary:focus {
+  background-color: var(--d-ink) !important;
+  color: var(--d-btn) !important;
+  outline: 3px solid var(--d-b);
+  outline-offset: 2px;
+}
+html[data-look="daily"] .pf-c-button.pf-m-primary:active {
+  transform: translateY(4px);
+  box-shadow: 0 1px 0 var(--d-b);
+}
+html[data-look="daily"] .pf-c-button.pf-m-primary:disabled,
+html[data-look="daily"] .pf-c-button.pf-m-primary.pf-m-disabled,
+html[data-look="daily"] .pf-c-button.pf-m-primary[aria-disabled="true"] {
+  background-color: #4a4234 !important;   /* paper text on it: 9.5:1 */
+  border-color: #4a4234 !important;
+  color: #fffaf0 !important;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+/* the shine sweep of the dark skin does not belong on the stamped button */
+html[data-look="daily"] .pf-c-button.pf-m-primary::before { content: none; }
+
+/* secondary buttons (social login, "cancel" ...): outlined ink on paper */
+html[data-look="daily"] .pf-c-button.pf-m-secondary,
+html[data-look="daily"] .pf-c-button.pf-m-link,
+html[data-look="daily"] .kc-social-item,
+html[data-look="daily"] a.kc-social-item {
+  background: #fff !important;
+  color: var(--d-ink) !important;
+  border: 2px solid var(--d-ink) !important;
+  border-radius: 6px;
+  text-decoration: none !important;
+}
+html[data-look="daily"] .pf-c-button.pf-m-secondary::after,
+html[data-look="daily"] .kc-social-item::after { border: 0; }
+html[data-look="daily"] .kc-social-item:hover,
+html[data-look="daily"] .pf-c-button.pf-m-secondary:hover {
+  background: var(--d-paper) !important;
+}
+html[data-look="daily"] .kc-social-item span,
+html[data-look="daily"] .kc-social-item i { color: var(--d-ink) !important; }
+/* the section around the provider buttons stays on the paper, without a box of its own */
+html[data-look="daily"] .kc-social-section,
+html[data-look="daily"] .kc-social-section.kc-social-gray {
+  background: transparent !important;
+  border: 0 !important;
+}
+html[data-look="daily"] .kc-social-section h2 {
+  font-family: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 700;
+}
+
+/* messages: white slip with an ink border, text in ink, the variant shown by the left bar */
+html[data-look="daily"] .pf-c-alert,
+html[data-look="daily"] .alert {
+  background: #fff !important;
+  border: 2px solid var(--d-ink) !important;
+  border-left-width: 8px !important;
+  border-radius: 6px;
+  box-shadow: none;
+}
+html[data-look="daily"] .pf-c-alert.pf-m-danger,
+html[data-look="daily"] .alert-error { border-left-color: var(--d-error) !important; }
+html[data-look="daily"] .pf-c-alert,
+html[data-look="daily"] .pf-c-alert *,
+html[data-look="daily"] .pf-c-alert__title,
+html[data-look="daily"] .kc-feedback-text {
+  color: var(--d-ink) !important;
+}
+html[data-look="daily"] .pf-c-alert::before { display: none; }
+
+/* language switcher: small text, so it gets its own paper chip instead of sitting on colour a
+   (two fixed inks reach only ~4.25:1 on mid-tone colours; ink on paper is 17:1) */
+html[data-look="daily"] #kc-locale-dropdown button,
+html[data-look="daily"] #kc-locale-dropdown button#kc-current-locale-link {
+  background: var(--d-paper);
+  color: var(--d-ink);
+  border: 2px solid var(--d-ink);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-weight: 700;
+}
+html[data-look="daily"] #kc-locale .pf-c-dropdown__toggle-text,
+html[data-look="daily"] #kc-locale .pf-c-dropdown__toggle {
+  color: var(--d-ink);
+}
+html[data-look="daily"] #kc-locale .pf-c-dropdown__menu {
+  background-color: var(--d-paper);
+  border: 2px solid var(--d-ink);
+}
+html[data-look="daily"] #kc-locale .pf-c-dropdown__menu-item {
+  color: var(--d-ink);
+  background-color: transparent;
+}
+html[data-look="daily"] #kc-locale .pf-c-dropdown__menu-item:hover,
+html[data-look="daily"] #kc-locale .pf-c-dropdown__menu-item:focus {
+  background-color: #fff;
+  color: var(--d-ink);
+}
+
+/* checkboxes ("remember me", terms) */
+html[data-look="daily"] .card-pf input[type="checkbox"] { accent-color: var(--d-ink); }
