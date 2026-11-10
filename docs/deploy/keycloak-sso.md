@@ -188,8 +188,55 @@ derives it from `KC_MYDAILYIDEA_CLIENT_SECRET`. A route without a secret is skip
 Every gate login sends PKCE (S256, verifier derived from the state with the gate key) and
 `ui_locales`: `en` unless `/gate/start` gets `lang=de` from the app.
 
-The compose overlay mounts the theme directory (read-only, like `ct-bunsenbrenner`); for k8s
-bake it into the derived image next to `ct-bunsenbrenner`.
+## Login look per client: `ct-riisc`
+
+`docker/deploy/keycloak/themes/ct-riisc` gives the sign-in pages the look of
+riisc.bunsenbrenner.org (white page, white top bar with olive rule and the navy RIISC mark,
+white card, steel "Praktikumszugang"/"Lab access" badge, navy upper-case button, navy footer
+band; CaDS reference tokens). Built like `ct-mydailyidea`: parent `ct-bunsenbrenner`, only
+`login/resources/css/ct-riisc.css` and `loginAccountTitle` (EN/DE), no template overridden, no
+font file and no external request (headings ask for a locally installed Roboto, else Arial).
+
+It is set on the client `praktikum-creator` (`attributes.login_theme=ct-riisc` in the realm
+JSON). That client serves every redirect URI listed there: `riisc.bunsenbrenner.org`,
+`rn-praktikum.bunsenbrenner.org` and `praktikum.bunsenbrenner.org`. rn-praktikum sends
+`kc_idp_hint=haw-gitlab` and skips the Keycloak sign-in form, but Keycloak pages it still shows
+(errors, first-login profile, terms) carry the RIISC look too. A different look per host needs
+a client per host.
+
+The realm JSON is imported only on first boot, so an existing realm gets the attribute through
+the admin API (theme first, attribute second -- a client naming a theme Keycloak cannot find
+falls back to the stock `keycloak.v2` look):
+
+```bash
+docker compose ... exec -T keycloak sh -c '/opt/keycloak/bin/kcadm.sh config credentials \
+  --config /tmp/kcadm.config --server http://localhost:8080 --realm master \
+  --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"'
+ID=$(docker compose ... exec -T keycloak /opt/keycloak/bin/kcadm.sh get clients -r ct-demo \
+  --config /tmp/kcadm.config -q clientId=praktikum-creator --fields id --format csv --noquotes)
+docker compose ... exec -T keycloak /opt/keycloak/bin/kcadm.sh update "clients/$ID" -r ct-demo \
+  --config /tmp/kcadm.config -s 'attributes.login_theme=ct-riisc'
+```
+
+`update -s` reads the client, changes this one attribute and writes it back; secret, redirect
+URIs and mappers stay as they are. Undo: `-s 'attributes.login_theme='` (Keycloak drops the
+empty attribute, the realm default `ct-bunsenbrenner` applies again).
+
+## Theme files on the host
+
+The compose overlay mounts the whole `keycloak/themes` directory read-only at
+`/opt/keycloak/themes` (the image keeps only a README there). A new theme directory is
+therefore visible to the running container right after `git checkout`, without a new volume
+entry or a restart (checked with Keycloak 26.7.3 in production mode). Keycloak caches an
+existing theme's `theme.properties` in production mode, so a change there (e.g. a new
+`styles=` entry) needs `docker compose ... restart keycloak`. The deploy checkout runs with
+umask 077; after every checkout make the files readable for the container user:
+
+```bash
+chmod -R a+rX docker/deploy/keycloak/themes docker/deploy/keycloak/ct-demo-realm.json
+```
+
+For k8s bake the `themes` directory into the derived image under `/opt/keycloak/themes`.
 
 ## How it verifies (no key export)
 

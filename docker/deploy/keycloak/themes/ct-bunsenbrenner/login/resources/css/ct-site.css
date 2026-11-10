@@ -1,0 +1,367 @@
+/* bunsenbrenner.org sign-in pages, aligned with the live landing page (bunsenbrenner.org,
+   crates/control-plane landing HTML): same tokens, grid-paper hero background, brand with the
+   orange "flame" dot and a muted ".org", mono eyebrow in teal, 6px controls on 12px panels,
+   mono upper-case field labels like the landing page's "GET YOUR TUNNEL" form.
+
+   Loaded only by ct-bunsenbrenner (theme.properties styles=), after ct-login.css and before
+   ct-daily.css. It is a separate file on purpose:
+   - ct-mydailyidea lists its own styles (login.css ct-login.css ct-mydailyidea.css) and so does
+     ct-riisc, so neither sees this file -- their look stays exactly as it was.
+   - Every rule is scoped to html:not([data-look="daily"]): with the ct_look cookie (#890) the
+     page looks exactly as before, ct-daily.css alone decides.
+   - A new file name is a new URL, so no browser keeps an old cached copy.
+   No template and no id changes; CSS only.
+
+   Contrast (WCAG 2.x, computed): text #eef1f7 on panel #141b2c 15.2:1, muted #8a93ad on panel
+   5.6:1 and on page #0c111d 6.2:1, teal #5fb8ab on panel 7.3:1, ink #20130a on orange #d98a4f
+   6.6:1, error #ff7b72 on panel 6.8:1. Field edges use the landing page's line colour like the
+   landing page itself (1.4:1 against the panel, as before this file: #30363d on #161b22). */
+
+html:not([data-look="daily"]) {
+  --bb-bg: #0c111d;
+  --bb-panel: #141b2c;
+  --bb-panel2: #1a2338;
+  --bb-line: #2a3450;
+  --bb-line-soft: #212a41;
+  --bb-text: #eef1f7;
+  --bb-muted: #8a93ad;
+  --bb-muted2: #c3c9db;
+  --bb-accent: #d98a4f;
+  --bb-accent2: #5fb8ab;
+  --bb-bad: #ff7b72;
+  --bb-mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --bb-serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  --bb-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* ---- page: dark navy with the landing page's 34px grid paper. The grid sits on <html> so it
+   also fills the scrollbar gutters ct-login.css reserves on both edges. ---- */
+html:not([data-look="daily"]) {
+  background-color: var(--bb-bg) !important;
+  background-image:
+    linear-gradient(var(--bb-line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--bb-line-soft) 1px, transparent 1px) !important;
+  background-size: 34px 34px !important;
+}
+html:not([data-look="daily"]) body,
+html:not([data-look="daily"]) .login-pf-page {
+  background: transparent !important;
+  color: var(--bb-text);
+  font-family: var(--bb-sans);
+  -webkit-font-smoothing: antialiased;
+}
+html:not([data-look="daily"]) .login-pf-page {
+  padding-top: 0;
+}
+
+/* ---- top bar: brand on the left like the landing page's header ---- */
+html:not([data-look="daily"]) #kc-header {
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+html:not([data-look="daily"]) #kc-header-wrapper {
+  /* block, not flex: ::first-letter (lower-case realm name -> "Bunsenbrenner" as on the landing
+     page) only applies to block containers. The orange dot is a background circle. */
+  display: block;
+  padding: 1.4rem 0 3rem calc(9px + .55rem);
+  background: radial-gradient(circle at 4.5px 50%, var(--bb-accent) 0 4.5px, rgba(217, 138, 79, .22) 5px 7.5px, transparent 8px) no-repeat;
+  /* one line box high (1.24rem * 1.2), placed at the top padding: the dot sits on the text line */
+  background-size: 16px 1.488rem;
+  background-position: 0 1.4rem;
+  text-align: left;
+  font: 700 1.24rem/1.2 var(--bb-serif);
+  letter-spacing: -.01em;
+  color: var(--bb-text);
+  white-space: nowrap;
+}
+html:not([data-look="daily"]) #kc-header-wrapper::first-letter {
+  text-transform: uppercase;
+}
+/* the realm's displayNameHtml colours ".org" inline (#58a6ff); the landing page shows it muted */
+html:not([data-look="daily"]) #kc-header-wrapper span {
+  color: var(--bb-muted) !important;
+  font-weight: 400;
+}
+
+/* ---- the panel ---- */
+html:not([data-look="daily"]) .card-pf {
+  background: var(--bb-panel) !important;
+  border: 1px solid var(--bb-line);
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .3);
+  max-width: 30rem;
+  margin-bottom: 3rem;
+}
+html:not([data-look="daily"]) .login-pf-header {
+  margin-bottom: 1.4rem;
+}
+html:not([data-look="daily"]) #kc-page-title {
+  font: 600 1.75rem/1.2 var(--bb-serif);
+  letter-spacing: -.01em;
+  color: var(--bb-text);
+  text-align: left;
+  margin: 0;
+}
+/* eyebrow above the title, as on the landing page ("SELF-HOSTED · END-TO-END ENCRYPTED") */
+html:not([data-look="daily"]) #kc-page-title::before {
+  content: "Self-hosted \00B7  end-to-end encrypted";
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin: .9rem 0 .9rem;
+  font: 400 .72rem/1.3 var(--bb-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--bb-accent2);
+}
+html[lang="de"]:not([data-look="daily"]) #kc-page-title::before {
+  content: "Selbst gehostet \00B7  Ende-zu-Ende-verschl\00FCsselt";
+}
+html:not([data-look="daily"]) #kc-page-title::after {
+  content: none;
+}
+
+/* ---- form: mono upper-case labels, 6px fields on the page colour ---- */
+html:not([data-look="daily"]) .card-pf label,
+html:not([data-look="daily"]) .card-pf .pf-c-form__label-text {
+  font: 400 .72rem/1.4 var(--bb-mono);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--bb-muted);
+}
+html:not([data-look="daily"]) .card-pf .checkbox label,
+html:not([data-look="daily"]) #kc-form-options label {
+  font: 400 .875rem var(--bb-sans);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--bb-muted2);
+}
+html:not([data-look="daily"]) .pf-c-form-control,
+html:not([data-look="daily"]) input.pf-c-form-control {
+  background: var(--bb-bg) !important;
+  border: 1px solid var(--bb-line) !important;
+  border-radius: 6px;
+  color: var(--bb-text) !important;
+  min-height: 42px;
+  padding: .55rem .8rem;
+  font-size: .94rem;
+}
+html:not([data-look="daily"]) .pf-c-form-control:focus {
+  border-color: var(--bb-accent2) !important;
+  box-shadow: 0 0 0 1px var(--bb-accent2) !important;
+  outline: none;
+}
+html:not([data-look="daily"]) .pf-c-form-control[aria-invalid="true"] {
+  border-color: var(--bb-bad) !important;
+}
+/* password field + eye button as one control (base theme paints the button white) */
+html:not([data-look="daily"]) .pf-c-input-group {
+  background: transparent !important;
+}
+html:not([data-look="daily"]) .pf-c-input-group .pf-c-form-control {
+  border-radius: 6px 0 0 6px;
+}
+html:not([data-look="daily"]) .pf-c-input-group .pf-c-button.pf-m-control {
+  background: var(--bb-bg);
+  color: var(--bb-muted2);
+  border: 1px solid var(--bb-line);
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+  min-width: 46px;
+}
+html:not([data-look="daily"]) .pf-c-input-group .pf-c-button.pf-m-control::after {
+  border: 0;
+}
+html:not([data-look="daily"]) .pf-c-input-group .pf-c-button.pf-m-control:hover {
+  color: var(--bb-text);
+  background: var(--bb-panel2);
+}
+
+html:not([data-look="daily"]) .pf-c-form__helper-text.pf-m-error,
+html:not([data-look="daily"]) .kc-feedback-text.pf-m-error,
+html:not([data-look="daily"]) #input-error,
+html:not([data-look="daily"]) [id^="input-error"] {
+  color: var(--bb-bad) !important;
+}
+
+html:not([data-look="daily"]) .card-pf a {
+  color: var(--bb-accent2);
+}
+html:not([data-look="daily"]) .card-pf a:hover {
+  color: #7cc9bd;
+}
+
+/* ---- buttons: the landing page's .btn (6px, 600, small lift on hover) ---- */
+html:not([data-look="daily"]) .pf-c-button.pf-m-primary {
+  background-color: var(--bb-accent) !important;
+  border-color: var(--bb-accent) !important;
+  color: #20130a !important;
+  border-radius: 6px;
+  font-weight: 600;
+  min-height: 42px;
+  transition: filter .15s ease, transform .15s ease;
+}
+html:not([data-look="daily"]) .pf-c-button.pf-m-primary:hover,
+html:not([data-look="daily"]) .pf-c-button.pf-m-primary:focus {
+  background-color: var(--bb-accent) !important;
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+html:not([data-look="daily"]) .pf-c-button.pf-m-primary:focus-visible {
+  outline: 2px solid var(--bb-accent2);
+  outline-offset: 2px;
+}
+html:not([data-look="daily"]) .pf-c-button.pf-m-primary:active {
+  transform: translateY(0);
+}
+html:not([data-look="daily"]) .pf-c-button.pf-m-primary::before {
+  content: none;
+}
+
+/* social providers: the landing page's .provider buttons */
+html:not([data-look="daily"]) .kc-social-item,
+html:not([data-look="daily"]) a.kc-social-item,
+html:not([data-look="daily"]) .pf-c-button.pf-m-secondary {
+  background: var(--bb-bg) !important;
+  color: var(--bb-text) !important;
+  border: 1px solid var(--bb-line) !important;
+  border-radius: 6px;
+  min-height: 42px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: border-color .15s ease, background .15s ease;
+}
+html:not([data-look="daily"]) .kc-social-item::after,
+html:not([data-look="daily"]) .pf-c-button.pf-m-secondary::after {
+  border: 0;
+}
+html:not([data-look="daily"]) .kc-social-item:hover,
+html:not([data-look="daily"]) .pf-c-button.pf-m-secondary:hover {
+  background: var(--bb-panel2) !important;
+  border-color: var(--bb-muted) !important;
+}
+html:not([data-look="daily"]) .kc-social-item span,
+html:not([data-look="daily"]) .kc-social-item i {
+  color: var(--bb-text) !important;
+}
+html:not([data-look="daily"]) .kc-social-section,
+html:not([data-look="daily"]) .kc-social-section.kc-social-gray {
+  background: transparent !important;
+}
+/* "or sign in with": the landing page's divider (line - OR - line), not a full-width rule */
+html:not([data-look="daily"]) #kc-social-providers hr {
+  display: none;
+}
+html:not([data-look="daily"]) .kc-social-section h2,
+html:not([data-look="daily"]) .kc-social-section h4 {
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  margin: 1.1rem 0 .9rem;
+  font: 400 .72rem/1.3 var(--bb-sans);
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--bb-muted) !important;
+}
+html:not([data-look="daily"]) .kc-social-section h2::before,
+html:not([data-look="daily"]) .kc-social-section h2::after,
+html:not([data-look="daily"]) .kc-social-section h4::before,
+html:not([data-look="daily"]) .kc-social-section h4::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--bb-line);
+}
+
+/* ---- registration strip: like the landing page's "Already have an account?" line ---- */
+html:not([data-look="daily"]) #kc-info-wrapper,
+html:not([data-look="daily"]) #kc-registration-container {
+  background: transparent !important;
+  border-top: 0;
+}
+html:not([data-look="daily"]) #kc-info-wrapper {
+  border-top: 1px solid var(--bb-line);
+}
+html:not([data-look="daily"]) #kc-info,
+html:not([data-look="daily"]) .login-pf-signup,
+html:not([data-look="daily"]) #kc-registration span {
+  color: var(--bb-muted) !important;
+  font-size: .86rem;
+}
+
+/* ---- messages: the landing page's .callout (panel, teal left edge) ---- */
+html:not([data-look="daily"]) .pf-c-alert,
+html:not([data-look="daily"]) .alert {
+  background: var(--bb-panel2) !important;
+  border: 1px solid var(--bb-line) !important;
+  border-left: 2px solid var(--bb-accent2) !important;
+  border-radius: 8px;
+  box-shadow: none;
+}
+html:not([data-look="daily"]) .pf-c-alert.pf-m-danger,
+html:not([data-look="daily"]) .alert-error {
+  border-left-color: var(--bb-bad) !important;
+}
+html:not([data-look="daily"]) .pf-c-alert.pf-m-warning,
+html:not([data-look="daily"]) .alert-warning {
+  border-left-color: var(--bb-accent) !important;
+}
+html:not([data-look="daily"]) .pf-c-alert,
+html:not([data-look="daily"]) .pf-c-alert__title,
+html:not([data-look="daily"]) .kc-feedback-text {
+  color: var(--bb-text) !important;
+}
+html:not([data-look="daily"]) .pf-c-alert::before {
+  display: none;
+}
+
+/* ---- language switcher: the landing page's quiet nav link ---- */
+html:not([data-look="daily"]) #kc-locale-dropdown button,
+html:not([data-look="daily"]) #kc-locale-dropdown button#kc-current-locale-link {
+  color: var(--bb-muted2);
+  font-size: .86rem;
+}
+html:not([data-look="daily"]) #kc-locale-dropdown button:hover {
+  color: var(--bb-text);
+}
+html:not([data-look="daily"]) #kc-locale .pf-c-dropdown__menu {
+  background-color: var(--bb-panel);
+  border: 1px solid var(--bb-line);
+  border-radius: 8px;
+}
+html:not([data-look="daily"]) #kc-locale .pf-c-dropdown__menu-item {
+  color: var(--bb-text);
+}
+html:not([data-look="daily"]) #kc-locale .pf-c-dropdown__menu-item:hover,
+html:not([data-look="daily"]) #kc-locale .pf-c-dropdown__menu-item:focus {
+  background-color: var(--bb-panel2);
+  color: var(--bb-accent2);
+}
+
+/* ---- phone: base login.css puts the card edge to edge below 768px ---- */
+@media (max-width: 767px) {
+  html:not([data-look="daily"]) #kc-header {
+    padding: 0 1rem;
+  }
+  html:not([data-look="daily"]) #kc-header-wrapper {
+    padding-top: 1.1rem;
+    padding-bottom: 1.4rem;
+    background-position: 0 1.1rem;
+  }
+  html:not([data-look="daily"]) .login-pf-page .card-pf {
+    margin: 0 12px 2rem;
+    border: 1px solid var(--bb-line);
+    border-radius: 12px;
+  }
+  html:not([data-look="daily"]) #kc-page-title {
+    font-size: 1.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-look="daily"]) .pf-c-button.pf-m-primary:hover,
+  html:not([data-look="daily"]) .pf-c-button.pf-m-primary:focus {
+    transform: none;
+  }
+}

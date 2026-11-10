@@ -1,0 +1,459 @@
+/* RIISC sign-in pages (theme ct-riisc, parent ct-bunsenbrenner), in the look of
+   riisc.bunsenbrenner.org: white page, white top bar with a 3px olive rule and the navy round
+   mark + "RIISC" + "IT-Security & Cybercrime", white card with hairline edge and a soft navy
+   shadow, a steel "lab access" badge over a navy title, navy upper-case button, navy footer band.
+   Tokens are the CaDS reference tokens the riisc page itself declares (REQ-0011): navy #204C86,
+   olive #9EB247, steel #B0C4DE, ink #2B2F36, muted #4B5563, hairline #E2E7EE.
+
+   CSS only: the DOM and ids are the stock Keycloak ones (#username, #password, #kc-login, social
+   buttons, locale switcher). Loaded after login.css and ct-login.css; where ct-login.css uses
+   !important this file must too. No external resources: headings ask for "Roboto" (the riisc
+   page's heading font) and fall back to Arial/Helvetica, as the riisc page itself does when its
+   font has not loaded -- no font file is shipped or fetched.
+
+   Contrast (WCAG 2.x relative luminance, computed): navy on white 8.6:1, ink on white 13.4:1,
+   muted on white 7.6:1, white on navy 8.6:1, navy on steel 4.8:1, error red #B42318 on white
+   6.6:1, field border #7D8799 on white 3.6:1 (non-text, >= 3:1). Olive is only a rule. */
+
+:root {
+  --r-navy: #204C86;
+  --r-navy-dark: #163a63;
+  --r-olive: #9EB247;
+  --r-steel: #B0C4DE;
+  --r-ink: #2B2F36;
+  --r-muted: #4B5563;
+  --r-hairline: #E2E7EE;
+  --r-field: #7D8799;
+  --r-tint: #F4F7FB;
+  --r-red: #B42318;
+  --r-head: Roboto, Arial, Helvetica, sans-serif;
+  --r-body: Arial, Helvetica, sans-serif;
+}
+
+html {
+  color-scheme: light;
+  /* the top bar and the footer band must reach the window edges (ct-login.css reserves a
+     scrollbar gutter on both edges for the centred dark card) */
+  scrollbar-gutter: auto;
+}
+html,
+body,
+.login-pf body,
+.login-pf-page {
+  background: #fff !important;
+  color: var(--r-ink);
+  font-family: var(--r-body);
+}
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+.login-pf-page {
+  flex: 1 0 auto;
+  padding-top: 0;
+}
+
+/* ---- footer band, as on riisc.bunsenbrenner.org ---- */
+body::after {
+  content: "RIISC \00B7  Research Institute for IT-Security and Cybercrime";
+  display: block;
+  margin-top: auto;
+  padding: .9rem 1rem;
+  background: var(--r-navy);
+  color: #fff;
+  text-align: center;
+  font: 700 .8rem/1.4 var(--r-head);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+/* ---- top bar: mark + RIISC + subtitle on the left, the account provider on the right ---- */
+#kc-header {
+  background: #fff;
+  border-bottom: 3px solid var(--r-olive);
+  padding: 0;
+  margin-bottom: 3.5rem;
+}
+#kc-header-wrapper {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  padding: 1rem 2rem;
+  text-align: left;
+  white-space: nowrap;
+  /* the realm's display name (bunsenbrenner.org): kept, small, as "whose account is this" */
+  font: 700 .8rem/1.2 var(--r-head) !important;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--r-navy);
+}
+#kc-header-wrapper span {
+  color: var(--r-navy) !important;
+}
+#kc-header-wrapper::before {
+  content: "RIISC";
+  order: -2;
+  /* the round navy mark is a background circle left of the word */
+  padding-left: calc(1.8rem + .6rem);
+  min-height: 1.8rem;
+  display: inline-flex;
+  align-items: center;
+  background: radial-gradient(circle at .9rem 50%, var(--r-navy) 0 .9rem, transparent calc(.9rem + .5px)) no-repeat;
+  font: 700 1.3rem/1 var(--r-head);
+  letter-spacing: .02em;
+  text-transform: none;
+  color: var(--r-navy);
+}
+#kc-header-wrapper::after {
+  content: "IT-Security & Cybercrime";
+  order: -1;
+  margin: 0 auto 0 1rem;
+  font: 400 .65rem/1 var(--r-body);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--r-muted);
+}
+
+/* ---- the card ---- */
+.card-pf {
+  background: #fff !important;
+  color: var(--r-ink);
+  border: 1px solid var(--r-hairline) !important;
+  border-radius: .5rem;
+  box-shadow: 0 12px 28px rgba(32, 76, 134, .1) !important;
+  max-width: 28rem;
+  margin-bottom: 3rem;
+  animation: none;
+  color-scheme: light;
+}
+.login-pf-page .card-pf {
+  padding: 2.5rem 2.5rem 1.6rem;
+}
+#kc-info {
+  margin: 1.6rem -2.5rem -1.6rem;
+}
+.login-pf-header {
+  margin-bottom: 1.5rem;
+}
+#kc-page-title,
+.card-pf h1 {
+  font: 700 1.4rem/1.25 var(--r-head);
+  color: var(--r-navy);
+  text-align: left;
+  margin: 0;
+}
+/* badge over the title, like the riisc page's "Praktikumszugang" chip */
+#kc-page-title::before {
+  content: "Lab access";
+  display: table;
+  margin: 0 0 1rem;
+  padding: .3rem .7rem;
+  border-radius: 999px;
+  background: var(--r-steel);
+  color: var(--r-navy);
+  font: 700 .65rem/1.3 var(--r-head);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+html[lang="de"] #kc-page-title::before {
+  content: "Praktikumszugang";
+}
+
+.card-pf label,
+.card-pf p,
+.card-pf li,
+#kc-content-wrapper,
+#kc-form-options,
+.instruction,
+#kc-terms-text {
+  color: var(--r-ink);
+}
+.card-pf label,
+.card-pf .pf-c-form__label-text {
+  font: 700 .85rem/1.4 var(--r-body);
+  color: var(--r-ink);
+}
+.card-pf .checkbox label,
+#kc-form-options label {
+  font-weight: 400;
+}
+
+/* ---- links: navy, underlined ---- */
+.card-pf a,
+.card-pf a:visited {
+  color: var(--r-navy);
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.card-pf a:hover,
+.card-pf a:focus {
+  color: var(--r-navy-dark);
+}
+
+/* ---- inputs ---- */
+.pf-c-form-control,
+input.pf-c-form-control,
+.card-pf input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]),
+.card-pf select,
+.card-pf textarea {
+  background: #fff !important;
+  color: var(--r-ink) !important;
+  border: 1px solid var(--r-field) !important;
+  border-radius: .35rem;
+  min-height: 44px;
+  font: 400 1rem var(--r-body);
+  padding: .55rem .75rem;
+}
+.pf-c-form-control:focus {
+  border-color: var(--r-navy) !important;
+  box-shadow: 0 0 0 2px var(--r-navy) !important;
+  outline: none;
+}
+.pf-c-form-control[aria-invalid="true"] {
+  border-color: var(--r-red) !important;
+}
+.pf-c-input-group {
+  background: transparent !important;
+}
+.pf-c-input-group .pf-c-form-control {
+  border-radius: .35rem 0 0 .35rem;
+}
+.pf-c-input-group .pf-c-button.pf-m-control {
+  background: #fff;
+  color: var(--r-navy);
+  border: 1px solid var(--r-field);
+  border-left: 0;
+  border-radius: 0 .35rem .35rem 0;
+  min-width: 46px;
+}
+.pf-c-input-group .pf-c-button.pf-m-control::after {
+  border: 0;
+}
+.pf-c-input-group .pf-c-button.pf-m-control:hover {
+  background: var(--r-tint);
+}
+
+.required,
+#kc-form .required,
+label .required,
+.pf-c-form__helper-text.pf-m-error,
+.kc-feedback-text.pf-m-error,
+#input-error,
+[id^="input-error"] {
+  color: var(--r-red) !important;
+  font-weight: 700;
+}
+
+/* ---- primary button: the riisc page's navy "ANMELDEN" ---- */
+.pf-c-button.pf-m-primary,
+#kc-login,
+#kc-form-buttons input[type="submit"],
+#kc-form-buttons button[type="submit"] {
+  background-color: var(--r-navy) !important;
+  border: 1px solid var(--r-navy) !important;
+  color: #fff !important;
+  border-radius: .35rem;
+  min-height: 48px;
+  font: 700 1rem/1 var(--r-head);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  transition: background-color .15s ease;
+}
+.pf-c-button.pf-m-primary:hover,
+.pf-c-button.pf-m-primary:focus {
+  background-color: var(--r-navy-dark) !important;
+  border-color: var(--r-navy-dark) !important;
+  color: #fff !important;
+}
+.pf-c-button.pf-m-primary:focus-visible {
+  outline: 2px solid var(--r-navy);
+  outline-offset: 2px;
+}
+.pf-c-button.pf-m-primary:active {
+  transform: none;
+}
+.pf-c-button.pf-m-primary:disabled,
+.pf-c-button.pf-m-primary.pf-m-disabled,
+.pf-c-button.pf-m-primary[aria-disabled="true"] {
+  background-color: var(--r-muted) !important;
+  border-color: var(--r-muted) !important;
+  color: #fff !important;
+  cursor: not-allowed;
+}
+/* no shine sweep from the parent's dark skin */
+.pf-c-button.pf-m-primary::before {
+  content: none;
+}
+
+/* ---- secondary buttons: GitHub, Google, "back", "cancel" ---- */
+.pf-c-button.pf-m-secondary,
+.kc-social-item,
+a.kc-social-item,
+a.kc-social-item:visited {
+  background: #fff !important;
+  color: var(--r-navy) !important;
+  border: 1px solid var(--r-field) !important;
+  border-radius: .35rem;
+  min-height: 44px;
+  margin-bottom: 8px;
+  font-weight: 700;
+  text-decoration: none !important;
+  transition: background .15s ease;
+}
+.pf-c-button.pf-m-secondary::after,
+.kc-social-item::after {
+  border: 0;
+}
+.kc-social-item:hover,
+.pf-c-button.pf-m-secondary:hover {
+  background: var(--r-tint) !important;
+}
+.kc-social-item span,
+.kc-social-item i {
+  color: var(--r-navy) !important;
+}
+.kc-social-section,
+.kc-social-section.kc-social-gray {
+  background: transparent !important;
+  border: 0 !important;
+}
+#kc-social-providers hr {
+  display: none;
+}
+.kc-social-section h2,
+.kc-social-section h4 {
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  margin: 1.2rem 0 .9rem;
+  font: 700 .7rem/1.3 var(--r-head);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--r-muted) !important;
+}
+.kc-social-section h2::before,
+.kc-social-section h2::after,
+.kc-social-section h4::before,
+.kc-social-section h4::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--r-hairline);
+}
+
+/* ---- registration strip ---- */
+#kc-info-wrapper,
+#kc-registration-container {
+  background: var(--r-tint) !important;
+  color: var(--r-muted);
+}
+#kc-info-wrapper {
+  border-top: 1px solid var(--r-hairline);
+  padding: 1rem 1.25rem;
+}
+#kc-registration-container {
+  border-top: 0;
+  padding: 0;
+}
+#kc-info,
+.subtitle,
+.login-pf-signup,
+.login-pf-page .login-pf-signup,
+#kc-registration span,
+.pf-c-form__helper-text {
+  color: var(--r-muted) !important;
+  font-size: .85rem;
+}
+
+/* ---- messages: white slip, hairline edge, variant shown by the left edge ---- */
+.pf-c-alert,
+.alert {
+  background: #fff !important;
+  border: 1px solid var(--r-hairline) !important;
+  border-left: 4px solid var(--r-navy) !important;
+  border-radius: .35rem;
+  box-shadow: none;
+}
+.pf-c-alert.pf-m-danger,
+.alert-error {
+  border-left-color: var(--r-red) !important;
+}
+.pf-c-alert.pf-m-warning,
+.alert-warning {
+  border-left-color: var(--r-olive) !important;
+}
+.pf-c-alert,
+.pf-c-alert *,
+.pf-c-alert__title,
+.kc-feedback-text {
+  color: var(--r-ink) !important;
+}
+.pf-c-alert::before {
+  display: none;
+}
+
+/* ---- language switcher: navy upper-case like the riisc nav link ---- */
+#kc-locale-dropdown button,
+#kc-locale-dropdown button#kc-current-locale-link,
+#kc-locale .pf-c-dropdown__toggle-text {
+  color: var(--r-navy);
+  font: 700 .8rem/1.2 var(--r-head);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+#kc-locale .pf-c-dropdown__menu {
+  background-color: #fff;
+  border: 1px solid var(--r-hairline);
+  border-radius: .35rem;
+  box-shadow: 0 8px 20px rgba(32, 76, 134, .12);
+}
+#kc-locale .pf-c-dropdown__menu-item {
+  color: var(--r-ink);
+  background-color: transparent;
+}
+#kc-locale .pf-c-dropdown__menu-item:hover,
+#kc-locale .pf-c-dropdown__menu-item:focus {
+  background-color: var(--r-tint);
+  color: var(--r-navy);
+}
+
+.card-pf input[type="checkbox"] {
+  accent-color: var(--r-navy);
+}
+
+/* ---- phone: base login.css makes the card edge to edge and pulls the language switcher to
+   the top right of the page, i.e. into the top bar ---- */
+@media (max-width: 767px) {
+  #kc-header {
+    margin-bottom: 1.5rem;
+  }
+  #kc-header-wrapper {
+    padding: 1rem 7rem 1rem 1rem;
+    row-gap: .35rem;
+  }
+  /* no room for the account provider next to the brand and the language switcher */
+  #kc-header-wrapper {
+    font-size: 0 !important;
+  }
+  #kc-header-wrapper span {
+    display: none;
+  }
+  #kc-header-wrapper::after {
+    flex-basis: 100%;
+    margin: 0;
+  }
+  .login-pf-page .card-pf {
+    margin: 0 12px 2rem;
+    padding: 1.5rem 1.25rem 1.25rem;
+    border: 1px solid var(--r-hairline) !important;
+  }
+  #kc-info {
+    margin: 1.25rem -1.25rem -1.25rem;
+  }
+  body::after {
+    font-size: .7rem;
+  }
+}
