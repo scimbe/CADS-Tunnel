@@ -238,6 +238,37 @@ chmod -R a+rX docker/deploy/keycloak/themes docker/deploy/keycloak/ct-demo-realm
 
 For k8s bake the `themes` directory into the derived image under `/opt/keycloak/themes`.
 
+### Changed CSS/JS: purge Keycloak's gzip cache (no restart)
+
+Keycloak 26 compresses theme CSS/JS once and keeps the copy in
+`/opt/keycloak/data/tmp/kc-gzip-cache/<resources-version>/<path>.gz`. It never compares that
+copy with the file again. Browsers always ask for gzip, so after a CSS change on disk they keep
+getting the old content; `curl` without `--compressed` shows the new file and hides the problem.
+`/opt/keycloak/data` is the `keycloak_data` volume, so neither `restart` nor
+`up -d --force-recreate` clears it. The resources version in the URL (`/resources/gnc25/...`) is
+stored in the database, not in the container (locally the tag occurs only in the database
+file; a new container on the same data keeps it, a container on empty data gets a new one).
+With Postgres it therefore survives every restart and recreate -- that is why it stayed `gnc25`.
+
+After a theme deploy, with Keycloak running (checked locally with 26.7.3 in production mode:
+deleting a `.gz` file makes the next request rebuild it from the current file, no restart):
+
+```bash
+scripts/keycloak-theme-cache-check.sh          # read-only; lists every STALE file and its cache path
+docker compose ... exec -T keycloak sh -c 'rm -f /opt/keycloak/data/tmp/kc-gzip-cache/<ver>/login/<theme>/css/<file>.css.gz'
+scripts/keycloak-theme-cache-check.sh          # must end with exit code 0
+```
+
+### Browser caches
+
+Keycloak serves theme resources with `Cache-Control: max-age=2592000` (30 days) under a URL that
+only changes with the resources version. A browser that already loaded a file keeps it for up to
+30 days, whatever is on disk. To force a new download, give the file a new URL in the theme's
+`theme.properties`, preferably a new file name (`css/ct-site.v2.css`); a query string
+(`css/ct-site.css?v=2`) also works (checked: Keycloak emits it as is and serves the file), but
+it shares the old `.gz` cache entry, so purge that too. `theme.properties` is cached in
+production mode, so this needs a Keycloak restart -- plan it for a maintenance window.
+
 ## How it verifies (no key export)
 
 `CT_OIDC_ISSUER` → the control-plane derives `<issuer>/protocol/openid-connect/certs`,
