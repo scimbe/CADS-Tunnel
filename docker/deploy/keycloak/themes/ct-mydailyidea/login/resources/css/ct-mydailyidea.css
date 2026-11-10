@@ -8,9 +8,10 @@
    Anton for display type, hard offset shadows. Anton is the self-hosted copy in the parent
    theme (../fonts/, SIL OFL 1.1) -- no request to Google Fonts.
 
-   Contrast (WCAG 2.x, computed): ink on cream 16.9:1, muted #4A4436 on cream 8.6:1,
-   red #B3321F on cream 5.7:1 and on white 6.3:1, yellow on ink 12.6:1, ink on yellow 13.4:1,
-   cream on #0b0b12 18.2:1. */
+   Contrast (WCAG 2.x relative luminance, computed): ink on cream 16.8:1, muted #4A4436 on
+   cream 8.8:1, red #B3321F on cream 5.7:1 and on white 6.2:1, yellow on ink 13.1:1, cream on
+   #0b0b12 17.9:1. In the browser, scripts/keycloak-contrast-states.mjs finds nothing below
+   4.5:1 (3:1 for large text) on login, open language menu, wrong password, empty submit. */
 @font-face {
   font-family: "Anton";
   font-style: normal;
