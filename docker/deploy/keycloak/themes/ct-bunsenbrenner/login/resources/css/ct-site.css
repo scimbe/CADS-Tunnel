@@ -122,6 +122,29 @@ html:not([data-look="daily"]) #kc-page-title::after {
   content: none;
 }
 
+/* register.ftl, update-user-profile.ftl and other pages with required fields put the title into a
+   second header structure: a <div> holding a ".subtitle" column ("* Required fields") and a
+   ".col-md-10" column with the <h1> (Bootstrap grid: floats and 20px/15px side padding). That
+   indented the title against the fields and, on phones, pushed the title's ::before line out of
+   the card. Stack it like login.ftl: title first, the hint below it, both on the card's left edge. */
+html:not([data-look="daily"]) .login-pf-header > div:not(#kc-locale) {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+html:not([data-look="daily"]) .login-pf-header > div:not(#kc-locale) > [class*="col-"] {
+  float: none;
+  width: auto;
+  min-height: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+html:not([data-look="daily"]) .login-pf-header > div:not(#kc-locale) > .subtitle {
+  order: 2;
+  margin: .6rem 0 0;
+  text-align: left;
+}
+
 /* ---- form: mono upper-case labels, 6px fields on the page colour ---- */
 html:not([data-look="daily"]) .card-pf label,
 html:not([data-look="daily"]) .card-pf .pf-c-form__label-text {
@@ -222,7 +245,8 @@ html:not([data-look="daily"]) .pf-c-button.pf-m-primary::before {
 /* social providers: the landing page's .provider buttons */
 html:not([data-look="daily"]) .kc-social-item,
 html:not([data-look="daily"]) a.kc-social-item,
-html:not([data-look="daily"]) .pf-c-button.pf-m-secondary {
+html:not([data-look="daily"]) .pf-c-button.pf-m-secondary,
+html:not([data-look="daily"]) .pf-c-button.btn-default {
   background: var(--bb-bg) !important;
   color: var(--bb-text) !important;
   border: 1px solid var(--bb-line) !important;
@@ -233,11 +257,13 @@ html:not([data-look="daily"]) .pf-c-button.pf-m-secondary {
   transition: border-color .15s ease, background .15s ease;
 }
 html:not([data-look="daily"]) .kc-social-item::after,
-html:not([data-look="daily"]) .pf-c-button.pf-m-secondary::after {
+html:not([data-look="daily"]) .pf-c-button.pf-m-secondary::after,
+html:not([data-look="daily"]) .pf-c-button.btn-default::after {
   border: 0;
 }
 html:not([data-look="daily"]) .kc-social-item:hover,
-html:not([data-look="daily"]) .pf-c-button.pf-m-secondary:hover {
+html:not([data-look="daily"]) .pf-c-button.pf-m-secondary:hover,
+html:not([data-look="daily"]) .pf-c-button.btn-default:hover {
   background: var(--bb-panel2) !important;
   border-color: var(--bb-muted) !important;
 }
