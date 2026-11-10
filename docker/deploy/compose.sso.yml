@@ -216,13 +216,15 @@ services:
       # recreates -- see the header comment above for why this matters.
       - keycloak_data:/opt/keycloak/data
       - ./keycloak/ct-demo-realm.json:/opt/keycloak/data/import/ct-demo-realm.json:ro
-      # Custom login theme (ct-bunsenbrenner): real Terms-and-Conditions text (EN/DE,
-      # linking the live Nutzungsbedingungen/Datenschutz/Impressum pages) instead of
-      # Keycloak's built-in "Terms and conditions to be defined" placeholder.
-      - ./keycloak/themes/ct-bunsenbrenner:/opt/keycloak/themes/ct-bunsenbrenner:ro
-      # "My Daily Idea" look (parent ct-bunsenbrenner, CSS + two message keys). Only used by a
-      # client that sets the attribute login_theme=ct-mydailyidea; see docs/deploy/keycloak-sso.md.
-      - ./keycloak/themes/ct-mydailyidea:/opt/keycloak/themes/ct-mydailyidea:ro
+      # All login/account themes in ONE read-only mount (the image's /opt/keycloak/themes holds
+      # only a README): ct-bunsenbrenner (realm default: bunsenbrenner.org look, real Terms text
+      # EN/DE), ct-mydailyidea and ct-riisc (per client via the attribute login_theme, see
+      # docs/deploy/keycloak-sso.md). One directory mount instead of one per theme means a NEW
+      # theme directory is visible to the running container after `git checkout` -- no new volume
+      # entry, no container recreate. Changes to an EXISTING theme's theme.properties are cached
+      # by Keycloak (production mode) and still need a restart. After every checkout here:
+      # chmod -R a+rX keycloak/themes keycloak/ct-demo-realm.json (umask 077 -> unreadable).
+      - ./keycloak/themes:/opt/keycloak/themes:ro
     # #48: NO published port — Keycloak is reached only through the edge :443 front
     # door (auth.<zone>) and internally as keycloak:8080. Nothing to open on the host.
     expose:

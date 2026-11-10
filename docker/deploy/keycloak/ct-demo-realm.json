@@ -231,6 +231,9 @@
         "https://rn-praktikum.bunsenbrenner.org",
         "https://riisc.bunsenbrenner.org"
       ],
+      "attributes": {
+        "login_theme": "ct-riisc"
+      },
       "defaultClientScopes": [
         "email",
         "profile"
