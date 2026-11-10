@@ -216,6 +216,9 @@ services:
       # linking the live Nutzungsbedingungen/Datenschutz/Impressum pages) instead of
       # Keycloak's built-in "Terms and conditions to be defined" placeholder.
       - ./keycloak/themes/ct-bunsenbrenner:/opt/keycloak/themes/ct-bunsenbrenner:ro
+      # "My Daily Idea" look (parent ct-bunsenbrenner, CSS + two message keys). Only used by a
+      # client that sets the attribute login_theme=ct-mydailyidea; see docs/deploy/keycloak-sso.md.
+      - ./keycloak/themes/ct-mydailyidea:/opt/keycloak/themes/ct-mydailyidea:ro
     # #48: NO published port — Keycloak is reached only through the edge :443 front
     # door (auth.<zone>) and internally as keycloak:8080. Nothing to open on the host.
     expose:

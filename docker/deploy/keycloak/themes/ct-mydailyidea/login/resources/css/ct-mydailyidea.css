@@ -1,0 +1,426 @@
+/* "My Daily Idea" sign-in pages (theme ct-mydailyidea, parent ct-bunsenbrenner).
+   CSS only: the DOM and ids are the stock Keycloak ones (#username, #password, #kc-login,
+   social buttons, locale switcher), so nothing functional changes. Loaded after login.css and
+   ct-login.css; where ct-login.css uses !important this file must too.
+
+   Tokens are the approved app design (CADS-agent-marketplace apps/duell-web, start-ui.js /
+   style.css): yellow #F9D84A, cream #FBF5DD, ink #17140F, red #B3321F, dark page #0b0b12,
+   Anton for display type, hard offset shadows. Anton is the self-hosted copy in the parent
+   theme (../fonts/, SIL OFL 1.1) -- no request to Google Fonts.
+
+   Contrast (WCAG 2.x, computed): ink on cream 16.9:1, muted #4A4436 on cream 8.6:1,
+   red #B3321F on cream 5.7:1 and on white 6.3:1, yellow on ink 12.6:1, ink on yellow 13.4:1,
+   cream on #0b0b12 18.2:1. */
+@font-face {
+  font-family: "Anton";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(../fonts/anton-latin-400-normal.woff2) format("woff2");
+}
+
+:root {
+  --m-yellow: #F9D84A;
+  --m-cream: #FBF5DD;
+  --m-ink: #17140F;
+  --m-red: #B3321F;
+  --m-red-light: #E0533C;
+  --m-muted: #4A4436;
+  --m-night: #0b0b12;
+  --m-display: Anton, Impact, "Avenir Next Condensed", "Roboto Condensed", "Arial Black", system-ui, sans-serif;
+  --m-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+html,
+body,
+.login-pf body,
+.login-pf-page {
+  background: var(--m-night) !important;
+  color: var(--m-cream);
+  font-family: var(--m-ui);
+}
+.login-pf-page {
+  padding-top: 0;
+}
+/* ct-login.css reserves the scrollbar gutter on both edges to keep the card centred; here the
+   yellow band must reach the window edges, which a reserved gutter would cut off. */
+html {
+  scrollbar-gutter: auto;
+}
+
+/* ---- yellow band with the brand, lower edge punched like the app's calendar block ---- */
+#kc-header {
+  position: relative;
+  background: var(--m-yellow);
+  color: var(--m-ink);
+  padding: 26px 16px 22px;
+  margin-bottom: 44px;
+}
+#kc-header::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -6px;
+  height: 12px;
+  background: radial-gradient(circle at 50% 50%, var(--m-night) 0 5px, transparent 5.5px) 0 0 / 25px 12px repeat-x;
+  pointer-events: none;
+}
+#kc-header-wrapper {
+  /* realm name (bunsenbrenner.org): stays, small, as "whose account is this" */
+  font: 700 .8rem/1.2 var(--m-ui) !important;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--m-ink);
+  padding: 0;
+  white-space: normal;
+}
+#kc-header-wrapper::before {
+  content: "My Daily Idea";
+  display: block;
+  margin-bottom: 6px;
+  font: 400 clamp(2.2rem, 7vw, 3.4rem)/1 var(--m-display);
+  letter-spacing: .3px;
+  text-transform: uppercase;
+  transform: rotate(-1.5deg);
+}
+#kc-header-wrapper * {
+  color: var(--m-ink) !important;
+}
+
+/* ---- the sheet: cream, thick ink edge, hard shadow ---- */
+.card-pf {
+  background: var(--m-cream) !important;
+  color: var(--m-ink);
+  border: 3px solid var(--m-ink) !important;
+  border-radius: 22px;
+  box-shadow: 6px 7px 0 var(--m-yellow) !important;
+  margin-bottom: 40px;
+  overflow: hidden;
+  color-scheme: light;
+}
+/* explicit padding, and the footer strip (#kc-info, which Keycloak pulls out to the card
+   edges with margin 20px -40px -30px for a 40px/30px padding) pulled out by exactly as much,
+   so it neither sticks out nor gets its text cut off by overflow: hidden */
+.login-pf-page .card-pf {
+  padding: 20px 40px 30px;
+}
+#kc-info {
+  margin: 20px -40px -30px;
+}
+#kc-info-wrapper {
+  padding: 16px 20px;
+}
+#kc-page-title,
+.card-pf h1 {
+  font: 400 2rem/1.05 var(--m-display);
+  letter-spacing: .3px;
+  text-transform: uppercase;
+  color: var(--m-ink);
+}
+.card-pf label,
+.card-pf p,
+.card-pf li,
+#kc-content-wrapper,
+#kc-form-options,
+.instruction,
+#kc-terms-text {
+  color: var(--m-ink);
+}
+.card-pf label {
+  font-weight: 700;
+}
+
+/* links: ink, underlined in red */
+.card-pf a,
+.card-pf a:visited {
+  color: var(--m-ink);
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-color: var(--m-red);
+  text-decoration-thickness: 3px;
+  text-underline-offset: 3px;
+}
+.card-pf a:hover,
+.card-pf a:focus {
+  color: var(--m-red);
+}
+
+/* ---- inputs ---- */
+.pf-c-form-control,
+input.pf-c-form-control,
+.card-pf input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]),
+.card-pf select,
+.card-pf textarea {
+  background: #fff !important;
+  color: var(--m-ink) !important;
+  border: 2px solid var(--m-ink) !important;
+  border-radius: 14px;
+  min-height: 46px;
+  font: 600 1rem var(--m-ui);
+  padding: 8px 12px;
+}
+.pf-c-form-control:focus {
+  border-color: var(--m-ink) !important;
+  box-shadow: 0 0 0 3px var(--m-yellow), 0 0 0 5px var(--m-ink) !important;
+  outline: none;
+}
+.pf-c-form-control[aria-invalid="true"] {
+  border-color: var(--m-red) !important;
+}
+/* field + eye button form one pill (the group itself paints white behind the rounded corners) */
+.pf-c-input-group {
+  background: transparent !important;
+}
+.pf-c-input-group .pf-c-form-control {
+  border-radius: 14px 0 0 14px;
+}
+.pf-c-input-group .pf-c-button.pf-m-control {
+  background: #fff;
+  color: var(--m-ink);
+  border: 2px solid var(--m-ink);
+  border-left: 0;
+  border-radius: 0 14px 14px 0;
+  min-width: 48px;
+}
+.pf-c-input-group .pf-c-button.pf-m-control::after {
+  border: 0;
+}
+
+.required,
+#kc-form .required,
+label .required,
+.pf-c-form__helper-text.pf-m-error,
+.kc-feedback-text.pf-m-error,
+#input-error,
+[id^="input-error"] {
+  color: var(--m-red) !important;
+  font-weight: 700;
+}
+
+/* ---- primary button: ink, yellow Anton text, red offset shadow (the app's main button) ---- */
+.pf-c-button.pf-m-primary,
+#kc-login,
+#kc-form-buttons input[type="submit"],
+#kc-form-buttons button[type="submit"] {
+  background-color: var(--m-ink) !important;
+  border: 3px solid var(--m-ink) !important;
+  color: var(--m-yellow) !important;
+  border-radius: 16px;
+  min-height: 54px;
+  font: 400 1.45rem/1 var(--m-display);
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  box-shadow: 0 5px 0 var(--m-red);
+  margin-bottom: 6px;
+  transition: transform 90ms ease-out, box-shadow 90ms ease-out;
+}
+.pf-c-button.pf-m-primary:hover,
+.pf-c-button.pf-m-primary:focus {
+  background-color: var(--m-ink) !important;
+  color: var(--m-yellow) !important;
+}
+.pf-c-button.pf-m-primary:focus-visible {
+  outline: 3px solid var(--m-red);
+  outline-offset: 3px;
+}
+.pf-c-button.pf-m-primary:active {
+  transform: translateY(4px);
+  box-shadow: 0 1px 0 var(--m-red);
+}
+.pf-c-button.pf-m-primary:disabled,
+.pf-c-button.pf-m-primary.pf-m-disabled,
+.pf-c-button.pf-m-primary[aria-disabled="true"] {
+  background-color: var(--m-muted) !important;
+  border-color: var(--m-muted) !important;
+  color: var(--m-cream) !important;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+/* no shine sweep from the dark skin on the stamped button */
+.pf-c-button.pf-m-primary::before {
+  content: none;
+}
+
+/* ---- secondary buttons: GitHub, Google, "back", "cancel" ---- */
+.pf-c-button.pf-m-secondary,
+.kc-social-item,
+a.kc-social-item,
+a.kc-social-item:visited {
+  background: #fff !important;
+  color: var(--m-ink) !important;
+  border: 2px solid var(--m-ink) !important;
+  border-radius: 16px;
+  min-height: 48px;
+  box-shadow: 0 4px 0 var(--m-ink);
+  margin-bottom: 8px;
+  text-decoration: none !important;
+  font-weight: 700;
+  transition: transform 90ms ease-out, box-shadow 90ms ease-out;
+}
+/* provider name centred, logo on the left, both on the vertical middle */
+.kc-social-item {
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.kc-social-item .kc-social-provider-logo {
+  position: absolute;
+  left: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  float: none;
+  height: auto;
+  line-height: 1;
+}
+.kc-social-item .kc-social-provider-name {
+  top: 0;
+}
+.pf-c-button.pf-m-secondary::after,
+.kc-social-item::after {
+  border: 0;
+}
+.kc-social-item:hover,
+.pf-c-button.pf-m-secondary:hover {
+  background: var(--m-yellow) !important;
+}
+.kc-social-item:active,
+.pf-c-button.pf-m-secondary:active {
+  transform: translateY(3px);
+  box-shadow: 0 1px 0 var(--m-ink);
+}
+.kc-social-item span,
+.kc-social-item i {
+  color: var(--m-ink) !important;
+}
+.kc-social-section,
+.kc-social-section.kc-social-gray {
+  background: transparent !important;
+  border: 0 !important;
+}
+.kc-social-section h2,
+.kc-social-section h4 {
+  font: 700 .875rem var(--m-ui);
+  text-transform: none;
+  color: var(--m-muted) !important;
+}
+#kc-social-providers hr,
+.kc-social-section hr {
+  border-color: var(--m-ink);
+  border-top-width: 2px;
+}
+
+/* ---- registration footer ---- */
+#kc-info-wrapper,
+#kc-registration-container {
+  background: transparent !important;
+  border-top: 2px solid var(--m-ink);
+  color: var(--m-ink);
+}
+#kc-registration-container {
+  border-top: 0;
+}
+#kc-info,
+.subtitle,
+.login-pf-signup,
+.login-pf-page .login-pf-signup,
+.pf-c-form__helper-text {
+  color: var(--m-muted) !important;
+  font-weight: 600;
+}
+
+/* ---- messages: white slip, ink edge, variant shown by a thick left bar ---- */
+.pf-c-alert,
+.alert {
+  background: #fff !important;
+  border: 2px solid var(--m-ink) !important;
+  border-left-width: 10px !important;
+  border-radius: 14px;
+  box-shadow: 4px 4px 0 var(--m-ink);
+}
+.pf-c-alert.pf-m-danger,
+.alert-error {
+  border-left-color: var(--m-red) !important;
+}
+.pf-c-alert.pf-m-warning,
+.alert-warning {
+  border-left-color: var(--m-yellow) !important;
+}
+.pf-c-alert,
+.pf-c-alert *,
+.pf-c-alert__title,
+.kc-feedback-text {
+  color: var(--m-ink) !important;
+  font-weight: 700;
+}
+.pf-c-alert::before {
+  display: none;
+}
+
+/* ---- language switcher: a round chip on the sheet ---- */
+#kc-locale-dropdown button,
+#kc-locale-dropdown button#kc-current-locale-link {
+  background: #fff;
+  color: var(--m-ink);
+  border: 2px solid var(--m-ink);
+  border-radius: 999px;
+  min-height: 36px;
+  padding: 4px 14px;
+  font-weight: 700;
+}
+#kc-locale .pf-c-dropdown__toggle-text,
+#kc-locale .pf-c-dropdown__toggle {
+  color: var(--m-ink);
+}
+#kc-locale .pf-c-dropdown__menu {
+  background-color: var(--m-cream);
+  border: 2px solid var(--m-ink);
+  border-radius: 14px;
+}
+#kc-locale .pf-c-dropdown__menu-item {
+  color: var(--m-ink);
+  background-color: transparent;
+}
+#kc-locale .pf-c-dropdown__menu-item:hover,
+#kc-locale .pf-c-dropdown__menu-item:focus {
+  background-color: var(--m-yellow);
+  color: var(--m-ink);
+}
+
+.card-pf input[type="checkbox"] {
+  accent-color: var(--m-ink);
+}
+
+/* ---- phone: base login.css makes the card edge-to-edge and the page white below 768px ---- */
+@media (max-width: 767px) {
+  html,
+  body,
+  .login-pf body {
+    background: var(--m-night) !important;
+  }
+  #kc-header {
+    margin-bottom: 28px;
+    padding: 20px 14px 18px;
+  }
+  .login-pf-page .card-pf {
+    margin: 0 12px 28px;
+    padding: 12px 16px 16px;
+    border: 3px solid var(--m-ink) !important;
+    box-shadow: 4px 5px 0 var(--m-yellow) !important;
+  }
+  #kc-page-title,
+  .card-pf h1 {
+    font-size: 1.7rem;
+  }
+  #kc-info {
+    margin: 20px -16px -16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pf-c-button.pf-m-primary,
+  .kc-social-item {
+    transition: none;
+  }
+}

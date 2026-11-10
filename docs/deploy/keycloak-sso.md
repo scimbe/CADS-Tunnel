@@ -154,6 +154,24 @@ Connect v1.0**, paste the provider's discovery URL (`.../.well-known/openid-conf
 set the client ID/secret, and give the provider the same broker redirect URI above
 with your chosen alias.
 
+## Login look per client: `ct-mydailyidea`
+
+`docker/deploy/keycloak/themes/ct-mydailyidea` is a second login theme with the look of the
+"My Daily Idea" web app (yellow band, cream sheet, ink edges, Anton). Its parent is
+`ct-bunsenbrenner`; it only adds `login/resources/css/ct-mydailyidea.css` and the message key
+`loginAccountTitle` (EN/DE). No template is overridden, so login, registration, password
+reset, error pages and the social buttons (GitHub, Google) work exactly as before.
+
+The realm keeps `loginTheme=ct-bunsenbrenner`. A client opts in with the client attribute
+`login_theme=ct-mydailyidea` (admin console: Clients → *client* → Settings → Login settings →
+Login theme). Do **not** set it on `ct-portal`: that client serves the portal sign-in **and**
+the Browser-Plane login gate (`crates/control-plane/src/gate.rs`, `/gate/start`) for every
+gated tunnel, including the whole demo gallery on `demos-34a13a96.bunsenbrenner.org`, so all
+of them would change look at once. My Daily Idea needs a client of its own for this.
+
+The compose overlay mounts the theme directory (read-only, like `ct-bunsenbrenner`); for k8s
+bake it into the derived image next to `ct-bunsenbrenner`.
+
 ## How it verifies (no key export)
 
 `CT_OIDC_ISSUER` → the control-plane derives `<issuer>/protocol/openid-connect/certs`,
