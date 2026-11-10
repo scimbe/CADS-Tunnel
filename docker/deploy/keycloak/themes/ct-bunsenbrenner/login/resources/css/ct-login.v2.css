@@ -1,0 +1,216 @@
+/* bunsenbrenner.org login skin -- CSS-only reskin of the stock login-pf theme.
+   Same palette as the portal (crates/control-plane/src/portal_api.rs `page()`
+   and portal.rs's PORTAL_HTML_HEAD pre-login card) and the account console
+   (../account/resources/css/ct-account.css), so the sign-in -> account
+   journey reads as one product instead of four. No DOM/id changes --
+   #username/#password/#kc-login are untouched. See docs/design/tokens.md for
+   the canonical values -- these four files each hardcode their own copy (no
+   shared build step across the Rust binary and this static Keycloak theme).
+   Palette is the landing page's own real brand (bunsenbrenner.org's hero/nav):
+   warm orange primary, teal secondary, serif display type -- replacing the
+   generic GitHub-dark blue/green this theme shipped with before. */
+
+:root {
+  --ct-bg: #0e1116;
+  --ct-surface: #161b22;
+  --ct-border: #30363d;
+  --ct-text: #e6edf3;
+  --ct-muted: #8b949e;
+  --ct-serif: ui-serif, Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+  /* --ct-accent (teal) is for links/focus only; the primary CTA button below
+     uses --ct-primary (orange, with dark ink text -- matches the landing
+     page's own button convention) -- the same two-accent split the portal
+     dashboard already uses (`page()`'s nav links vs. its `.btn`). */
+  --ct-accent: #5fb8ab;
+  --ct-accent-hover: #7cc9bd;
+  --ct-primary: #d98a4f;
+  --ct-primary-hover: #e39a63;
+  --ct-primary-ink: #20130a;
+}
+
+#kc-header-wrapper,
+h1, h2, #kc-page-title {
+  font-family: var(--ct-serif);
+}
+
+html,
+body,
+.login-pf,
+.login-pf body {
+  background: var(--ct-bg) !important;
+  color: var(--ct-text);
+}
+
+.login-pf-page {
+  background: var(--ct-bg) !important;
+}
+
+/* Desktop with classic (non-overlay) scrollbars: as soon as the page is taller than the
+   window (small laptop, many social buttons, the register form) a ~15px scrollbar appears on
+   the right only. The card is then centred in the remaining width and the scrollbar track
+   reads as a dark stripe next to it. Reserving the gutter on both edges keeps the card on the
+   window's centre axis whether or not the scrollbar is shown; overlay scrollbars (phones,
+   default macOS) ignore this. color-scheme makes that track dark like the page instead of a
+   light slab (html[data-look=daily] sets light again). */
+html {
+  scrollbar-gutter: stable both-edges;
+  color-scheme: dark;
+}
+/* The header may be drawn rotated (daily look, ct-mydailyidea); its corners then stick out
+   by a pixel or two and give the whole page a horizontal scrollbar. clip, unlike hidden,
+   does not create a scroll container and leaves vertical overflow alone. */
+#kc-header {
+  overflow-x: clip;
+}
+/* Phones: Keycloak's login.css pulls the "New user? Register" strip out by 40px on each side
+   (#kc-info margin 20px -40px -30px) to meet the edges of a card with 40px padding. Below 768px
+   the card has 20px padding, so the strip stuck out 20px on both sides and the whole page
+   scrolled sideways by ~19px at 390px. Match the phone padding. */
+@media (max-width: 767px) {
+  #kc-info {
+    margin-left: -20px;
+    margin-right: -20px;
+  }
+}
+
+#kc-header-wrapper {
+  color: var(--ct-text);
+  font-weight: 600;
+  letter-spacing: .01em;
+  text-transform: none;
+  font-size: 1.5rem;
+}
+
+/* The actual light-grey slab is #kc-info-wrapper (not -container, which was
+   already transparent) -- base login.css leaves it a plain light background
+   meant for a white card, so on our dark card "Neuer Nutzer?"/"noAccount" sat
+   at near-zero contrast. Recolor the wrapper and its text explicitly. */
+#kc-info-wrapper,
+#kc-registration-container {
+  background: var(--ct-surface) !important;
+  border-top: 1px solid var(--ct-border);
+  padding: .9rem 0;
+}
+#kc-info,
+.login-pf-signup,
+.login-pf-page .login-pf-signup {
+  color: var(--ct-muted) !important;
+}
+
+.card-pf {
+  background: var(--ct-surface) !important;
+  border: 1px solid var(--ct-border);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .35);
+  animation: ctCardIn .32s ease-out;
+}
+
+@keyframes ctCardIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+label,
+#kc-content-wrapper,
+#kc-form-options,
+#kc-registration-container {
+  color: var(--ct-text);
+}
+
+.pf-c-form-control,
+input.pf-c-form-control {
+  background: var(--ct-bg) !important;
+  border: 1px solid var(--ct-border) !important;
+  color: var(--ct-text) !important;
+  transition: border-color .15s ease;
+}
+.pf-c-form-control:focus {
+  border-color: var(--ct-accent) !important;
+  box-shadow: 0 0 0 1px var(--ct-accent) !important;
+}
+
+a {
+  color: var(--ct-accent);
+}
+a:hover {
+  color: var(--ct-accent-hover);
+}
+
+.pf-c-button.pf-m-primary {
+  background-color: var(--ct-primary) !important;
+  border-color: var(--ct-primary) !important;
+  color: var(--ct-primary-ink) !important;
+  font-weight: 600;
+  transition: background-color .15s ease, transform .08s ease;
+  position: relative;
+  overflow: hidden;
+}
+.pf-c-button.pf-m-primary:hover {
+  background-color: var(--ct-primary-hover) !important;
+}
+.pf-c-button.pf-m-primary:active {
+  transform: scale(.97);
+}
+/* Same small shine-sweep flourish as the portal's own primary CTA
+   (crates/control-plane/src/portal_api.rs `page()`) -- one deliberate touch of
+   motion on the single most important click on this page. */
+.pf-c-button.pf-m-primary::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(115deg, transparent 20%, rgba(255, 255, 255, .35) 45%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform .5s ease;
+}
+.pf-c-button.pf-m-primary:hover::before {
+  transform: translateX(120%);
+}
+
+.alert,
+.pf-c-alert {
+  border-radius: 8px;
+}
+
+/* The locale switcher inherits PatternFly's light-theme secondary text
+   (#6a6e73), which measures 3.37:1 on this dark card -- below the 4.5:1 the
+   rest of this page clears comfortably. It is the only control on the sign-in
+   page that failed, and it is the one a visitor uses before they can read
+   anything else. The dropdown items get the same treatment: the menu paints
+   itself on a light surface, so its own text must stay dark there. */
+/* Selector mirrors Keycloak's own `#kc-locale-dropdown button` from login.css
+   (ID + element, specificity 1-0-1). A plain `#kc-current-locale-link` is
+   1-0-0 and loses to it -- measured, not assumed: the browser reported both
+   rules matching and theirs winning. This file loads after login.css, so equal
+   specificity is enough. */
+#kc-locale-dropdown button,
+#kc-locale-dropdown button#kc-current-locale-link,
+#kc-locale .pf-c-dropdown__toggle-text {
+  color: var(--ct-text, #e6edf3);
+}
+#kc-locale .pf-c-dropdown__menu {
+  background-color: var(--ct-surface, #161b22);
+  border: 1px solid var(--ct-border, #30363d);
+}
+#kc-locale .pf-c-dropdown__menu-item {
+  color: var(--ct-text, #e6edf3);
+  background-color: transparent;
+}
+#kc-locale .pf-c-dropdown__menu-item:hover,
+#kc-locale .pf-c-dropdown__menu-item:focus {
+  background-color: rgba(95, 184, 171, .12);
+  color: var(--ct-accent, #5fb8ab);
+}
+
+/* Das Pflichtfeld-Sternchen ist die EINZIGE Kennzeichnung eines Pflichtfelds --
+   Keycloaks Rot (#a30000) misst darauf 2.11:1 gegen unsere dunkle Karte, also
+   praktisch unsichtbar. #ff7b72 erreicht 6.86:1 und bleibt als Warnfarbe lesbar.
+   Gemessen am 16.08. im Browser, nicht geschaetzt. */
+.required,
+#kc-form .required,
+label .required {
+  color: #ff7b72;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

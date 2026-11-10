@@ -194,7 +194,7 @@ Every gate login sends PKCE (S256, verifier derived from the state with the gate
 riisc.bunsenbrenner.org (white page, white top bar with olive rule and the navy RIISC mark,
 white card, steel "Praktikumszugang"/"Lab access" badge, navy upper-case button, navy footer
 band; CaDS reference tokens). Built like `ct-mydailyidea`: parent `ct-bunsenbrenner`, only
-`login/resources/css/ct-riisc.css` and `loginAccountTitle` (EN/DE), no template overridden, no
+`login/resources/css/ct-riisc.v2.css` and `loginAccountTitle` (EN/DE), no template overridden, no
 font file and no external request (headings ask for a locally installed Roboto, else Arial).
 
 It is set on the client `praktikum-creator` (`attributes.login_theme=ct-riisc` in the realm
@@ -268,6 +268,13 @@ only changes with the resources version. A browser that already loaded a file ke
 (`css/ct-site.css?v=2`) also works (checked: Keycloak emits it as is and serves the file), but
 it shares the old `.gz` cache entry, so purge that too. `theme.properties` is cached in
 production mode, so this needs a Keycloak restart -- plan it for a maintenance window.
+
+The login themes use such names since the `.v2` switch: `ct-login.v2.css`, `ct-site.v2.css`,
+`ct-riisc.v2.css`. The unversioned files stay in the repo until one release after the restart:
+between `git pull` and the restart Keycloak still serves the cached `theme.properties` with the
+old names, and those must not turn into 404s. Rule for later changes: edit the CSS, give it the
+next number (`.v3.css`), list the new name in every `theme.properties` that uses it, restart in a
+maintenance window, then run `scripts/keycloak-theme-cache-check.sh`.
 
 ## How it verifies (no key export)
 
