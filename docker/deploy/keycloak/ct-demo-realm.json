@@ -112,6 +112,50 @@
       "baseUrl": "/portal/tunnels"
     },
     {
+      "clientId": "mydailyidea",
+      "name": "My Daily Idea",
+      "description": "My Daily Idea login via the gate (gate.rs CT_GATE_CLIENT_ROUTES, demos-34a13a96.bunsenbrenner.org/duell). Own client only for login_theme=ct-mydailyidea; gallery and portal stay on ct-portal.",
+      "secret": "${KC_MYDAILYIDEA_CLIENT_SECRET:}",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": [
+        "${PORTAL_PUBLIC_URL}/gate/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "access.token.signed.response.alg": "RS256",
+        "id.token.signed.response.alg": "RS256",
+        "pkce.code.challenge.method": "S256",
+        "login_theme": "ct-mydailyidea"
+      },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "id",
+            "claim.name": "sub",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "email",
+        "profile"
+      ]
+    },
+    {
       "clientId": "webconference-bridge",
       "name": "webconference-demo bridge (service account)",
       "description": "M2M credential for a downstream demo's bridge process: calls /me/channels via client_credentials instead of a browser cookie a control-plane restart can invalidate. Details in docs/ops/ -- Keycloak caps this column at 255 chars.",

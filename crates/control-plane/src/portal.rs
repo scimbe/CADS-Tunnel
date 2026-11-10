@@ -246,13 +246,26 @@ impl PortalOidc {
     /// ever gets a second caller that legitimately wants silent SSO reuse, that
     /// caller needs its own explicit opt-out, not a shared default that forgets
     /// this bug.
-    pub(crate) fn authorize_redirect_to(&self, state: &str, redirect_uri: &str) -> String {
+    ///
+    /// `ui_locale` is the Keycloak page language (`ui_locales`). The caller passes a
+    /// validated value; the gate's default stays `en` (English-first, 351861b) and
+    /// only an app that names its own language explicitly gets another one.
+    /// `code_challenge` is the PKCE S256 challenge (RFC 7636) for this login.
+    pub(crate) fn authorize_redirect_to(
+        &self,
+        state: &str,
+        redirect_uri: &str,
+        ui_locale: &str,
+        code_challenge: &str,
+    ) -> String {
         format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}&prompt=login&ui_locales=en",
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid&state={}&prompt=login&ui_locales={}&code_challenge={}&code_challenge_method=S256",
             self.authorize_url,
             urlencode(&self.client_id),
             urlencode(redirect_uri),
             urlencode(state),
+            urlencode(ui_locale),
+            urlencode(code_challenge),
         )
     }
 

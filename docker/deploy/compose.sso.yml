@@ -183,6 +183,10 @@ services:
       # actually uses it, not to every self-hoster. Substituted into the realm
       # JSON's webconference-bridge client via ${env.KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET}.
       KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET: "${KC_WEBCONFERENCE_BRIDGE_CLIENT_SECRET:-}"
+      # Same pinning mechanism, optional: the `mydailyidea` client (login of My Daily Idea
+      # through the gate, login_theme=ct-mydailyidea). The control-plane below reads the SAME
+      # var as CT_GATE_CLIENT_SECRET_MYDAILYIDEA, so the two cannot drift.
+      KC_MYDAILYIDEA_CLIENT_SECRET: "${KC_MYDAILYIDEA_CLIENT_SECRET:-}"
       # #310: the ct-portal client's redirectUris/post.logout.redirect.uris were
       # hardcoded to bunsenbrenner.org in the committed realm JSON -- any self-hoster
       # on their own domain got an unregistered-redirect-uri 400 on every login,
@@ -216,6 +220,9 @@ services:
       # linking the live Nutzungsbedingungen/Datenschutz/Impressum pages) instead of
       # Keycloak's built-in "Terms and conditions to be defined" placeholder.
       - ./keycloak/themes/ct-bunsenbrenner:/opt/keycloak/themes/ct-bunsenbrenner:ro
+      # "My Daily Idea" look (parent ct-bunsenbrenner, CSS + two message keys). Only used by a
+      # client that sets the attribute login_theme=ct-mydailyidea; see docs/deploy/keycloak-sso.md.
+      - ./keycloak/themes/ct-mydailyidea:/opt/keycloak/themes/ct-mydailyidea:ro
     # #48: NO published port — Keycloak is reached only through the edge :443 front
     # door (auth.<zone>) and internally as keycloak:8080. Nothing to open on the host.
     expose:
@@ -270,6 +277,12 @@ services:
       # a working SMTP sender — before that, requiring it would have locked out
       # every self-registered user (which is why it shipped defaulting to off).
       CT_GATE_REQUIRE_VERIFIED_EMAIL: "1"
+      # Per host/path Keycloak client for gate logins (gate.rs, parse_client_routes):
+      # `host[/path]=client-id`, e.g. demos-34a13a96.bunsenbrenner.org/duell=mydailyidea.
+      # Empty = every gate login uses ct-portal, as before. A route whose secret is empty is
+      # ignored (logged at startup), so setting only one of the two vars changes nothing.
+      CT_GATE_CLIENT_ROUTES: "${CT_GATE_CLIENT_ROUTES:-}"
+      CT_GATE_CLIENT_SECRET_MYDAILYIDEA: "${KC_MYDAILYIDEA_CLIENT_SECRET:-}"
       # One origin may call /me/installations for its gate visitors. Empty = off.
       CT_INSTALLATIONS_DELEGATE_SHA256: ${CT_INSTALLATIONS_DELEGATE_SHA256:-}
       CT_INSTALLATIONS_DELEGATE_HOST: ${CT_INSTALLATIONS_DELEGATE_HOST:-}

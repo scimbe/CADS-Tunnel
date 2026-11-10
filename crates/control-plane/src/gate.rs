@@ -126,6 +126,10 @@ struct GateState {
     /// #780: where `share_link_redeemed` rows go. `None` on a router built without
     /// an audit log (every existing test); the redemption itself never depends on it.
     audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
+    /// `CT_GATE_CLIENT_ROUTES`: logins for these host/path prefixes use their own
+    /// Keycloak client instead of `oidc.client_id` (so the client can carry its own
+    /// `login_theme`). Empty = every gate login uses `oidc.client_id`, as before.
+    client_routes: Arc<[GateClientRoute]>,
 }
 
 /// Build the Browser-Plane login-gate router: `GET /gate/check` (Caddy
@@ -149,7 +153,23 @@ pub fn gate_router(
         .map(Arc::from);
     let exchange = default_gate_exchanger();
     let require_verified_email = crate::portal::is_truthy_env("CT_GATE_REQUIRE_VERIFIED_EMAIL");
-    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, require_verified_email, audit)
+    let client_routes = parse_client_routes(&std::env::var("CT_GATE_CLIENT_ROUTES").unwrap_or_default(), |k| {
+        std::env::var(k).ok()
+    });
+    for r in client_routes.iter() {
+        eprintln!("ct-cp: gate client route {}{} -> {}", r.host, r.path_prefix, r.client_id);
+    }
+    gate_router_full(
+        tunnels,
+        oidc,
+        session_key,
+        exchange,
+        cookie_domain,
+        verifier,
+        require_verified_email,
+        audit,
+        client_routes.into(),
+    )
 }
 
 /// Test-only 6-arg builder: keeps the pre-`CT_GATE_REQUIRE_VERIFIED_EMAIL` behavior
@@ -165,7 +185,7 @@ fn gate_router_with(
     cookie_domain: Option<Arc<str>>,
     verifier: OidcVerifierHandle,
 ) -> Router {
-    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, false, None)
+    gate_router_full(tunnels, oidc, session_key, exchange, cookie_domain, verifier, false, None, Arc::from(Vec::new()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -178,6 +198,7 @@ fn gate_router_full(
     verifier: OidcVerifierHandle,
     require_verified_email: bool,
     audit: Option<Arc<crate::audit_log::SqliteAuditLog>>,
+    client_routes: Arc<[GateClientRoute]>,
 ) -> Router {
     let state = GateState {
         tunnels,
@@ -188,6 +209,7 @@ fn gate_router_full(
         verifier,
         require_verified_email,
         audit,
+        client_routes,
     };
     Router::new()
         .route("/gate/check", get(gate_check))
@@ -214,18 +236,21 @@ fn default_gate_exchanger() -> GateExchanger {
             // production exchanger is invoked with `code` PRE-FORMATTED by
             // gate_callback to carry the resolved redirect_uri alongside it --
             // see the `\u{0}`-joined encoding below and its matching split.
-            let Some((code, redirect_uri, token_url, jwks_url, client_id, issuer)) = decode_exchange_args(&code)
+            let Some(ExchangeArgs { code, redirect_uri, token_url, jwks_url, client_id, issuer, code_verifier, secret_env }) =
+                decode_exchange_args(&code)
             else {
                 return Err("malformed internal exchange arguments".to_string());
             };
-            let secret =
-                std::env::var("CT_OIDC_CLIENT_SECRET").map_err(|_| "missing CT_OIDC_CLIENT_SECRET".to_string())?;
+            // The secret is resolved here, by the NAME of its variable, so it never travels
+            // through the packed argument string (and never into a log line).
+            let secret = std::env::var(&secret_env).map_err(|_| format!("missing {secret_env}"))?;
             let form = [
                 ("grant_type", "authorization_code"),
                 ("code", code.as_str()),
                 ("redirect_uri", redirect_uri.as_str()),
                 ("client_id", client_id.as_str()),
                 ("client_secret", secret.as_str()),
+                ("code_verifier", code_verifier.as_str()),
             ];
             let resp = oidc_http_client()
                 .post(&token_url)
@@ -259,20 +284,177 @@ fn default_gate_exchanger() -> GateExchanger {
 /// via the `code` string) -- see [`encode_exchange_args`]/[`decode_exchange_args`].
 /// A `\u{0}`-joined encoding is safe here: neither an OAuth authorization code
 /// nor any of these URLs/ids can contain a NUL byte.
-fn encode_exchange_args(code: &str, redirect_uri: &str, cfg: &PortalOidc) -> String {
-    format!("{code}\u{0}{redirect_uri}\u{0}{}\u{0}{}\u{0}{}\u{0}{}", cfg.token_url, cfg.jwks_url(), cfg.client_id, cfg.issuer())
+fn encode_exchange_args(code: &str, redirect_uri: &str, client: &GateClient, code_verifier: &str) -> String {
+    let cfg = &client.cfg;
+    format!(
+        "{code}\u{0}{redirect_uri}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{code_verifier}\u{0}{}",
+        cfg.token_url,
+        cfg.jwks_url(),
+        cfg.client_id,
+        cfg.issuer(),
+        client.secret_env
+    )
 }
 
-fn decode_exchange_args(packed: &str) -> Option<(String, String, String, String, String, String)> {
-    let mut parts = packed.splitn(6, '\u{0}');
-    Some((
-        parts.next()?.to_string(),
-        parts.next()?.to_string(),
-        parts.next()?.to_string(),
-        parts.next()?.to_string(),
-        parts.next()?.to_string(),
-        parts.next()?.to_string(),
-    ))
+/// What the production exchanger needs for one code->token exchange. `secret_env` is the
+/// NAME of the variable holding the client secret, not the secret.
+#[derive(Debug, PartialEq, Eq)]
+struct ExchangeArgs {
+    code: String,
+    redirect_uri: String,
+    token_url: String,
+    jwks_url: String,
+    client_id: String,
+    issuer: String,
+    code_verifier: String,
+    secret_env: String,
+}
+
+fn decode_exchange_args(packed: &str) -> Option<ExchangeArgs> {
+    let mut parts = packed.splitn(8, '\u{0}').map(str::to_string);
+    let args = ExchangeArgs {
+        code: parts.next()?,
+        redirect_uri: parts.next()?,
+        token_url: parts.next()?,
+        jwks_url: parts.next()?,
+        client_id: parts.next()?,
+        issuer: parts.next()?,
+        code_verifier: parts.next()?,
+        secret_env: parts.next()?,
+    };
+    Some(args)
+}
+
+/// Default gate client: the portal's own (`CT_OIDC_CLIENT_ID`, secret in `CT_OIDC_CLIENT_SECRET`).
+const DEFAULT_CLIENT_SECRET_ENV: &str = "CT_OIDC_CLIENT_SECRET";
+
+/// One entry of `CT_GATE_CLIENT_ROUTES`: logins whose target is `host` and whose return path
+/// is `path_prefix` or below it use Keycloak client `client_id` (secret in `secret_env`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GateClientRoute {
+    host: String,
+    /// `""` (the whole host) or `/segment[/segment...]` without a trailing slash.
+    path_prefix: String,
+    client_id: String,
+    secret_env: String,
+}
+
+/// The client a single gate login runs with: the portal config with `client_id` swapped,
+/// plus where its secret lives.
+struct GateClient {
+    cfg: PortalOidc,
+    secret_env: String,
+}
+
+/// `CT_GATE_CLIENT_SECRET_<CLIENT ID>`, upper case, anything but `[A-Z0-9]` as `_`:
+/// `mydailyidea` -> `CT_GATE_CLIENT_SECRET_MYDAILYIDEA`.
+fn client_secret_env(client_id: &str) -> String {
+    let id: String = client_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    format!("CT_GATE_CLIENT_SECRET_{id}")
+}
+
+/// Parse `CT_GATE_CLIENT_ROUTES`: entries `host[/path/prefix]=client-id`, separated by commas
+/// or whitespace, e.g. `demos-34a13a96.bunsenbrenner.org/duell=mydailyidea`. An entry that
+/// does not parse, or whose secret variable is unset or empty, is skipped with a log line --
+/// that login then keeps using the default client, which still works, instead of breaking.
+fn parse_client_routes(spec: &str, get: impl Fn(&str) -> Option<String>) -> Vec<GateClientRoute> {
+    let valid_host = |h: &str| {
+        !h.is_empty() && h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    };
+    let valid_prefix = |p: &str| {
+        p.is_empty()
+            || (p.starts_with('/')
+                && !p.contains("//")
+                && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'-' || b == b'_'))
+    };
+    let valid_client = |c: &str| {
+        !c.is_empty() && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    let mut out = Vec::new();
+    for entry in spec.split(|c: char| c == ',' || c.is_whitespace()).filter(|e| !e.is_empty()) {
+        let Some((target, client_id)) = entry.split_once('=') else {
+            eprintln!("ct-cp: CT_GATE_CLIENT_ROUTES: ignoring {entry:?} (expected host[/path]=client-id)");
+            continue;
+        };
+        let target = target.to_ascii_lowercase();
+        let (host, path_prefix) = match target.find('/') {
+            Some(i) => (target[..i].to_string(), target[i..].trim_end_matches('/').to_string()),
+            None => (target.clone(), String::new()),
+        };
+        if !valid_host(&host) || !valid_prefix(&path_prefix) || !valid_client(client_id) {
+            eprintln!("ct-cp: CT_GATE_CLIENT_ROUTES: ignoring {entry:?} (invalid host, path or client id)");
+            continue;
+        }
+        let secret_env = client_secret_env(client_id);
+        if get(&secret_env).map(|s| s.trim().is_empty()).unwrap_or(true) {
+            eprintln!("ct-cp: CT_GATE_CLIENT_ROUTES: ignoring {entry:?} ({secret_env} is not set)");
+            continue;
+        }
+        out.push(GateClientRoute { host, path_prefix, client_id: client_id.to_string(), secret_env });
+    }
+    out
+}
+
+/// The route for a login to `host` returning to `return_path`: the longest matching path
+/// prefix wins; a prefix matches itself and anything below it (`/duell`, `/duell/x`,
+/// `/duell?x`), never a sibling that merely starts with the same letters (`/duellx`).
+fn route_for<'a>(routes: &'a [GateClientRoute], host: &str, return_path: &str) -> Option<&'a GateClientRoute> {
+    let under = |prefix: &str| {
+        prefix.is_empty()
+            || return_path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '#']))
+    };
+    routes
+        .iter()
+        .filter(|r| r.host == host && under(&r.path_prefix))
+        .max_by_key(|r| r.path_prefix.len())
+}
+
+fn gate_client(cfg: &PortalOidc, routes: &[GateClientRoute], host: &str, return_path: &str) -> GateClient {
+    match route_for(routes, host, return_path) {
+        Some(r) => GateClient {
+            cfg: PortalOidc { client_id: r.client_id.clone(), ..cfg.clone() },
+            secret_env: r.secret_env.clone(),
+        },
+        None => GateClient { cfg: cfg.clone(), secret_env: DEFAULT_CLIENT_SECRET_ENV.to_string() },
+    }
+}
+
+/// Keycloak page language for a gate login: `lang` from `/gate/start` when it names one of
+/// the realm's locales (`de`, `en`, also as `de-DE`/`de_AT`), otherwise `en` -- the
+/// English-first default every gate login had before, so apps that send nothing see no change.
+fn gate_ui_locale(lang: Option<&str>) -> &'static str {
+    let base = lang.unwrap_or("").trim().to_ascii_lowercase();
+    let base = base.split(['-', '_']).next().unwrap_or("");
+    match base {
+        "de" => "de",
+        _ => "en",
+    }
+}
+
+const GATE_PKCE_CTX: &[u8] = b"ct-gate-pkce-v1";
+
+/// PKCE code_verifier (RFC 7636) for the login with this `state`: a MAC over the state, so
+/// it needs no cookie or server-side store of its own, is never sent to the browser, and
+/// cannot be computed without the gate's key even by someone who knows the state.
+/// 32 bytes base64url without padding = 43 characters, the RFC's minimum length.
+fn pkce_verifier(key: &[u8], state: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    m.update(GATE_PKCE_CTX);
+    m.update(state.as_bytes());
+    URL_SAFE_NO_PAD.encode(m.finalize().into_bytes())
+}
+
+/// S256 challenge: base64url(SHA-256(verifier)) without padding.
+fn pkce_challenge(verifier: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use sha2::Digest;
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
 fn gate_unconfigured() -> Response {
@@ -451,6 +633,8 @@ struct StartQuery {
     host: String,
     #[serde(rename = "return")]
     return_path: Option<String>,
+    /// Optional page language of the app that sent the visitor here (`de`, `en`).
+    lang: Option<String>,
 }
 
 /// `GET /gate/start?host=X&return=Y`: begins the Keycloak login for the gate.
@@ -477,7 +661,10 @@ async fn gate_start(State(st): State<GateState>, Query(q): Query<StartQuery>) ->
     let return_path = safe_return_path(q.return_path);
     let target = format!("{host}|{return_path}");
     let state = bound_state(&st.session_key, &target);
-    let authorize_url = cfg.authorize_redirect_to(&state, &redirect_uri);
+    let client = gate_client(cfg, &st.client_routes, &host, &return_path);
+    let challenge = pkce_challenge(&pkce_verifier(&st.session_key, &state));
+    let authorize_url =
+        client.cfg.authorize_redirect_to(&state, &redirect_uri, gate_ui_locale(q.lang.as_deref()), &challenge);
     let mut resp = Redirect::to(&authorize_url).into_response();
     set_cookie(&mut resp, &gate_state_cookie(&state));
     set_cookie(&mut resp, &gate_target_cookie(&target));
@@ -525,7 +712,10 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
         return gate_unconfigured();
     };
 
-    let packed = encode_exchange_args(code, &redirect_uri, cfg);
+    // Same host + return path as at /gate/start (both bound into the state), so the same
+    // client; the verifier is re-derived from the state that was just checked above.
+    let client = gate_client(cfg, &st.client_routes, host, return_path);
+    let packed = encode_exchange_args(code, &redirect_uri, &client, &pkce_verifier(&st.session_key, state));
     match (st.exchange)(packed).await {
         Ok(identity) => {
             let email = identity.email.unwrap_or_default();
@@ -1739,6 +1929,7 @@ mod tests {
                 OidcVerifierHandle::empty(),
                 require_verified,
                 None,
+                Arc::from(Vec::new()),
             );
             app.oneshot(
                 Request::get(callback_uri("demo.bunsenbrenner.org|/join.html"))
@@ -2512,4 +2703,204 @@ mod tests {
     }
 
     // ===== #780 share links (end) =====
+
+    // ---- per-host/path client (CT_GATE_CLIENT_ROUTES), PKCE, page language ----
+
+    fn mdi_routes() -> Arc<[GateClientRoute]> {
+        parse_client_routes("demos-34a13a96.bunsenbrenner.org/duell=mydailyidea", |k| {
+            (k == "CT_GATE_CLIENT_SECRET_MYDAILYIDEA").then(|| "s3cret".to_string())
+        })
+        .into()
+    }
+
+    fn gallery_router(exchange: GateExchanger) -> Router {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels
+            .create("alice", "gallery", Some("demos-34a13a96.bunsenbrenner.org"))
+            .unwrap()
+            .created()
+            .expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.set_allow_any_login("alice", &t.id, true).unwrap());
+        gate_router_full(
+            tunnels,
+            Some(cfg()),
+            TEST_KEY,
+            exchange,
+            Some(Arc::from(".bunsenbrenner.org")),
+            OidcVerifierHandle::empty(),
+            false,
+            None,
+            mdi_routes(),
+        )
+    }
+
+    fn query_param(url: &str, name: &str) -> Option<String> {
+        url.split_once('?')?.1.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == name).then(|| v.to_string())
+        })
+    }
+
+    async fn start_location(app: Router, uri: &str) -> (String, String) {
+        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{uri}");
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap().to_string();
+        let state = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|c| c.to_str().ok())
+            .find_map(|c| c.strip_prefix(&format!("{GATE_STATE_COOKIE}=")).map(|v| v.split(';').next().unwrap().to_string()))
+            .expect("state cookie");
+        (loc, state)
+    }
+
+    #[test]
+    fn client_routes_parse_host_path_and_client_and_skip_what_cannot_work() {
+        let secret = |k: &str| (k == "CT_GATE_CLIENT_SECRET_MYDAILYIDEA" || k == "CT_GATE_CLIENT_SECRET_OTHER_APP").then(|| "x".to_string());
+        let r = parse_client_routes(
+            " Demos-34a13a96.bunsenbrenner.org/duell/=mydailyidea,demo.example.org=other-app  no-equals-sign \
+             bad_host/x=mydailyidea x.example.org/../etc=mydailyidea y.example.org=missing-secret z.example.org=bad!id",
+            secret,
+        );
+        assert_eq!(
+            r,
+            vec![
+                GateClientRoute {
+                    host: "demos-34a13a96.bunsenbrenner.org".into(),
+                    path_prefix: "/duell".into(),
+                    client_id: "mydailyidea".into(),
+                    secret_env: "CT_GATE_CLIENT_SECRET_MYDAILYIDEA".into(),
+                },
+                GateClientRoute {
+                    host: "demo.example.org".into(),
+                    path_prefix: "".into(),
+                    client_id: "other-app".into(),
+                    secret_env: "CT_GATE_CLIENT_SECRET_OTHER_APP".into(),
+                },
+            ]
+        );
+        assert!(parse_client_routes("", secret).is_empty(), "unset = no routes = everything on the default client");
+        assert!(
+            parse_client_routes("demo.example.org=mydailyidea", |_| Some("  ".to_string())).is_empty(),
+            "a blank secret is as good as none: keep the default client instead of a login that 502s"
+        );
+    }
+
+    #[test]
+    fn route_for_matches_the_prefix_and_below_never_a_sibling_or_another_host() {
+        let routes = mdi_routes();
+        let host = "demos-34a13a96.bunsenbrenner.org";
+        for p in ["/duell", "/duell/", "/duell/feier", "/duell?x=1", "/duell#a"] {
+            assert_eq!(route_for(&routes, host, p).map(|r| r.client_id.as_str()), Some("mydailyidea"), "{p}");
+        }
+        for p in ["/", "/duellx", "/d/travel", "/api/duell", "/Duell"] {
+            assert!(route_for(&routes, host, p).is_none(), "{p} is the rest of the gallery: stays on ct-portal");
+        }
+        assert!(route_for(&routes, "demo.bunsenbrenner.org", "/duell").is_none(), "other hosts are untouched");
+
+        let nested = parse_client_routes("h.example=whole-host h.example/a=a h.example/a/b=ab", |_| Some("x".into()));
+        assert_eq!(route_for(&nested, "h.example", "/a/b/c").unwrap().client_id, "ab", "longest prefix wins");
+        assert_eq!(route_for(&nested, "h.example", "/a/c").unwrap().client_id, "a");
+        assert_eq!(route_for(&nested, "h.example", "/z").unwrap().client_id, "whole-host");
+    }
+
+    #[test]
+    fn gate_ui_locale_takes_only_a_known_language_and_defaults_to_english() {
+        for (input, want) in [
+            (None, "en"),
+            (Some(""), "en"),
+            (Some("en"), "en"),
+            (Some("de"), "de"),
+            (Some("DE"), "de"),
+            (Some("de-DE"), "de"),
+            (Some("de_AT"), "de"),
+            (Some("fr"), "en"),
+            (Some("de&prompt=none"), "en"),
+            (Some("<script>"), "en"),
+        ] {
+            assert_eq!(gate_ui_locale(input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn pkce_verifier_is_rfc_shaped_bound_to_state_and_key_and_its_challenge_is_s256() {
+        let v = pkce_verifier(TEST_KEY, "nonce.tag");
+        assert_eq!(v.len(), 43, "RFC 7636 minimum length");
+        assert!(v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "unreserved characters only: {v}");
+        assert_eq!(v, pkce_verifier(TEST_KEY, "nonce.tag"), "re-derivable at the callback");
+        assert_ne!(v, pkce_verifier(TEST_KEY, "other.tag"));
+        assert_ne!(v, pkce_verifier(b"another-key", "nonce.tag"), "not computable from the state alone");
+        // Expected value computed independently: base64url(sha256(v)) without padding (Python hashlib).
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mJ92K1qUdtOWBpb8kJ27E5A3a7lDw0"),
+            "dSeDqO-ArYvvvE6Sm4EGDvhjVnM849vxLB2Yx2gw4dI"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_start_uses_the_routed_client_only_for_its_path_and_passes_lang_and_pkce() {
+        let (loc, state) = start_location(
+            gallery_router(stub_exchanger("a@example.com")),
+            "/gate/start?host=demos-34a13a96.bunsenbrenner.org&return=/duell&lang=de",
+        )
+        .await;
+        assert_eq!(query_param(&loc, "client_id").as_deref(), Some("mydailyidea"), "{loc}");
+        assert_eq!(query_param(&loc, "ui_locales").as_deref(), Some("de"), "{loc}");
+        assert_eq!(query_param(&loc, "code_challenge_method").as_deref(), Some("S256"));
+        let state = urldecode_for_test(&state);
+        assert_eq!(
+            query_param(&loc, "code_challenge").as_deref(),
+            Some(pkce_challenge(&pkce_verifier(TEST_KEY, &state)).as_str())
+        );
+        assert!(loc.contains("&prompt=login&"), "devsystem#20 still holds on the routed client: {loc}");
+
+        let (loc, _) = start_location(
+            gallery_router(stub_exchanger("a@example.com")),
+            "/gate/start?host=demos-34a13a96.bunsenbrenner.org&return=/d/travel",
+        )
+        .await;
+        assert_eq!(query_param(&loc, "client_id").as_deref(), Some("ct-portal"), "rest of the gallery: {loc}");
+        assert_eq!(query_param(&loc, "ui_locales").as_deref(), Some("en"), "no lang = English, as before: {loc}");
+        assert_eq!(query_param(&loc, "code_challenge_method").as_deref(), Some("S256"));
+    }
+
+    fn urldecode_for_test(s: &str) -> String {
+        // the state is nonce.hex -- nothing in it is percent-encoded, but stay honest if it ever is
+        s.replace("%2E", ".")
+    }
+
+    fn recording_exchanger(seen: Arc<std::sync::Mutex<Vec<String>>>) -> GateExchanger {
+        Arc::new(move |packed: String| {
+            seen.lock().unwrap().push(packed);
+            Box::pin(async move {
+                Ok(ExchangedIdentity { subject: "s".into(), email: Some("a@example.com".into()), email_verified: true })
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn gate_callback_exchanges_with_the_same_client_its_secret_variable_and_the_pkce_verifier() {
+        for (target, want_client, want_secret_env) in [
+            ("demos-34a13a96.bunsenbrenner.org|/duell", "mydailyidea", "CT_GATE_CLIENT_SECRET_MYDAILYIDEA"),
+            ("demos-34a13a96.bunsenbrenner.org|/d/travel", "ct-portal", "CT_OIDC_CLIENT_SECRET"),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let resp = gallery_router(recording_exchanger(seen.clone()))
+                .oneshot(
+                    Request::get(callback_uri(target)).header("cookie", callback_cookie(target)).body(Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER, "{target}");
+            let packed = seen.lock().unwrap().pop().expect("exchanger called");
+            let args = decode_exchange_args(&packed).expect("well-formed");
+            assert_eq!(args.client_id, want_client, "{target}");
+            assert_eq!(args.secret_env, want_secret_env, "{target}");
+            assert_eq!(args.code, "abc");
+            assert_eq!(args.code_verifier, pkce_verifier(TEST_KEY, &test_state(target)), "{target}");
+            assert!(!packed.contains("s3cret"), "the secret itself never travels in the packed arguments");
+        }
+    }
 }

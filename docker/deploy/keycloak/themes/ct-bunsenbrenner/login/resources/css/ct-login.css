@@ -45,6 +45,34 @@ body,
   background: var(--ct-bg) !important;
 }
 
+/* Desktop with classic (non-overlay) scrollbars: as soon as the page is taller than the
+   window (small laptop, many social buttons, the register form) a ~15px scrollbar appears on
+   the right only. The card is then centred in the remaining width and the scrollbar track
+   reads as a dark stripe next to it. Reserving the gutter on both edges keeps the card on the
+   window's centre axis whether or not the scrollbar is shown; overlay scrollbars (phones,
+   default macOS) ignore this. color-scheme makes that track dark like the page instead of a
+   light slab (html[data-look=daily] sets light again). */
+html {
+  scrollbar-gutter: stable both-edges;
+  color-scheme: dark;
+}
+/* The header may be drawn rotated (daily look, ct-mydailyidea); its corners then stick out
+   by a pixel or two and give the whole page a horizontal scrollbar. clip, unlike hidden,
+   does not create a scroll container and leaves vertical overflow alone. */
+#kc-header {
+  overflow-x: clip;
+}
+/* Phones: Keycloak's login.css pulls the "New user? Register" strip out by 40px on each side
+   (#kc-info margin 20px -40px -30px) to meet the edges of a card with 40px padding. Below 768px
+   the card has 20px padding, so the strip stuck out 20px on both sides and the whole page
+   scrolled sideways by ~19px at 390px. Match the phone padding. */
+@media (max-width: 767px) {
+  #kc-info {
+    margin-left: -20px;
+    margin-right: -20px;
+  }
+}
+
 #kc-header-wrapper {
   color: var(--ct-text);
   font-weight: 600;
