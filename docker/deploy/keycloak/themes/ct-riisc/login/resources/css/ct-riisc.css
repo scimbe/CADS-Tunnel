@@ -161,6 +161,29 @@ html[lang="de"] #kc-page-title::before {
   content: "Praktikumszugang";
 }
 
+/* register.ftl, update-user-profile.ftl and other pages with required fields put the title into a
+   second header structure: a <div> holding a ".subtitle" column ("* Required fields") and a
+   ".col-md-10" column with the <h1> (Bootstrap grid: floats and 20px/15px side padding). That
+   indented the title against the fields and, on phones, pushed the title's ::before line out of
+   the card. Stack it like login.ftl: title first, the hint below it, both on the card's left edge. */
+.login-pf-header > div:not(#kc-locale) {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+.login-pf-header > div:not(#kc-locale) > [class*="col-"] {
+  float: none;
+  width: auto;
+  min-height: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+.login-pf-header > div:not(#kc-locale) > .subtitle {
+  order: 2;
+  margin: .6rem 0 0;
+  text-align: left;
+}
+
 .card-pf label,
 .card-pf p,
 .card-pf li,
@@ -290,6 +313,7 @@ label .required,
 
 /* ---- secondary buttons: GitHub, Google, "back", "cancel" ---- */
 .pf-c-button.pf-m-secondary,
+.pf-c-button.btn-default,
 .kc-social-item,
 a.kc-social-item,
 a.kc-social-item:visited {
@@ -304,11 +328,13 @@ a.kc-social-item:visited {
   transition: background .15s ease;
 }
 .pf-c-button.pf-m-secondary::after,
+.pf-c-button.btn-default::after,
 .kc-social-item::after {
   border: 0;
 }
 .kc-social-item:hover,
-.pf-c-button.pf-m-secondary:hover {
+.pf-c-button.pf-m-secondary:hover,
+.pf-c-button.btn-default:hover {
   background: var(--r-tint) !important;
 }
 .kc-social-item span,
