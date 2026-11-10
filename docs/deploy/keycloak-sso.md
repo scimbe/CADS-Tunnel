@@ -167,7 +167,26 @@ The realm keeps `loginTheme=ct-bunsenbrenner`. A client opts in with the client 
 Login theme). Do **not** set it on `ct-portal`: that client serves the portal sign-in **and**
 the Browser-Plane login gate (`crates/control-plane/src/gate.rs`, `/gate/start`) for every
 gated tunnel, including the whole demo gallery on `demos-34a13a96.bunsenbrenner.org`, so all
-of them would change look at once. My Daily Idea needs a client of its own for this.
+of them would change look at once. My Daily Idea therefore has a client of its own,
+`mydailyidea` (confidential, PKCE S256 required, only `${PORTAL_PUBLIC_URL}/gate/callback` as
+redirect URI, secret pinned to `${KC_MYDAILYIDEA_CLIENT_SECRET}` like `ct-portal`'s).
+
+The gate picks it per login from `CT_GATE_CLIENT_ROUTES` (control-plane): entries
+`host[/path]=client-id`, matched against the gated host and the login's return path (the
+path and everything below it, longest prefix wins). For My Daily Idea:
+
+```
+KC_MYDAILYIDEA_CLIENT_SECRET=<random hex, e.g. openssl rand -hex 32>
+CT_GATE_CLIENT_ROUTES=demos-34a13a96.bunsenbrenner.org/duell=mydailyidea
+```
+
+Logins returning to `/duell...` on that host use `mydailyidea`; every other path on the same
+host (the rest of the demo gallery) and every other host stay on `ct-portal`. The secret is
+read from `CT_GATE_CLIENT_SECRET_<CLIENT ID>` (upper case, other characters as `_`); compose
+derives it from `KC_MYDAILYIDEA_CLIENT_SECRET`. A route without a secret is skipped.
+
+Every gate login sends PKCE (S256, verifier derived from the state with the gate key) and
+`ui_locales`: `en` unless `/gate/start` gets `lang=de` from the app.
 
 The compose overlay mounts the theme directory (read-only, like `ct-bunsenbrenner`); for k8s
 bake it into the derived image next to `ct-bunsenbrenner`.
