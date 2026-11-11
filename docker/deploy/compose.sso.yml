@@ -263,6 +263,8 @@ services:
     environment:
       CT_OIDC_ISSUER: "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL=https://<AUTH_PUBLIC_HOST>}/realms/ct-demo"
       CT_OIDC_CLIENT_ID: "ct-portal"
+      # Mobile app tokens must name this service (one token per resource server; see docs/ops/runbook.md).
+      CT_OIDC_CLIENT_AUD: "${CT_OIDC_CLIENT_AUD:-cads-mobile=ct-api}"
       CT_OIDC_REDIRECT_URI: "${PORTAL_PUBLIC_URL:?set PORTAL_PUBLIC_URL=https://<zone>}/portal/callback"
       # #65: the code→token exchange secret is DERIVED from the same single .env var
       # that pins Keycloak's client secret above — so the two can never drift apart

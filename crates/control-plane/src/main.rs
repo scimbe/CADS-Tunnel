@@ -67,7 +67,8 @@ async fn fetch_jwks(url: String) -> Option<serde_json::Value> {
 }
 
 /// #82 SEC82b: apply the opt-in bearer-token audience requirement, if configured.
-fn apply_access_aud(v: OidcVerifier, access_aud: Option<&str>) -> Arc<OidcVerifier> {
+fn apply_access_aud(v: OidcVerifier, access_aud: Option<&str>, client_aud: &[(String, String)]) -> Arc<OidcVerifier> {
+    let v = v.require_client_audiences(client_aud.to_vec());
     match access_aud {
         Some(aud) => Arc::new(v.require_audience(aud)),
         None => Arc::new(v),
@@ -195,7 +196,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(aud) = &access_aud {
         eprintln!("ct-control-plane: /me/* access-token audience enforced (aud={aud})");
     }
-    let oidc_handle = OidcVerifierHandle::new(oidc.map(|v| apply_access_aud(v, access_aud.as_deref())));
+    // Per-client audience rules (on by default for the mobile app's client, `cads-mobile=ct-api`): the app holds
+    // one access token per resource server, and a token minted for another service (e.g. the My Daily Idea
+    // wrapper's `mydailyidea-api`) is refused here. `CT_OIDC_CLIENT_AUD=off` disables; a malformed value stops boot.
+    let client_aud = ct_control_plane::oidc::parse_client_aud(
+        &std::env::var("CT_OIDC_CLIENT_AUD").unwrap_or_else(|_| ct_control_plane::oidc::DEFAULT_CLIENT_AUD.to_string()),
+    )?;
+    for (c, a) in &client_aud {
+        eprintln!("ct-control-plane: /me/* tokens of client {c} must carry aud={a}");
+    }
+    let oidc_handle = OidcVerifierHandle::new(oidc.map(|v| apply_access_aud(v, access_aud.as_deref(), &client_aud)));
 
     // #328/#430: self-heals a failed boot-time JWKS fetch (permanently disabled
     // /me/* used to need an operator restart to recover) AND periodically re-fetches
@@ -209,6 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(issuer) = jwks_issuer {
         let handle = oidc_handle.clone();
         let access_aud = access_aud.clone();
+        let client_aud = client_aud.clone();
         tokio::spawn(async move {
             const PERIODIC_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
             const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
@@ -226,7 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         eprintln!(
                             "ct-control-plane: OIDC verifier refreshed (issuer={issuer}, key=JWKS) — /me/* available (#328/#430)"
                         );
-                        handle.set(apply_access_aud(v, access_aud.as_deref()));
+                        handle.set(apply_access_aud(v, access_aud.as_deref(), &client_aud));
                         delay = PERIODIC_REFRESH;
                     }
                     None => {
