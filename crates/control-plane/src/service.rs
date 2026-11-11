@@ -6214,7 +6214,7 @@ pub fn landing_router() -> Router {
 
 /// Android App Links statement for the CADS app. The signing-certificate fingerprint is public by
 /// design (it is what the OS compares against the installed APK), not a secret.
-const ASSETLINKS_JSON: &str = r#"[{"relation":["delegate_permission/common/handle_all_urls"],"target":{"namespace":"android_app","package_name":"org.bunsenbrenner.cads","sha256_cert_fingerprints":["AC:00:28:F0:43:1A:6A:4A:B1:6A:9B:85:20:ED:19:3A:50:CD:26:BF:77:3F:99:21:92:1E:1A:0B:C1:2B:B9:D0"]}}]"#;
+const ASSETLINKS_JSON: &str = r#"[{"relation":["delegate_permission/common.handle_all_urls"],"target":{"namespace":"android_app","package_name":"org.bunsenbrenner.cads","sha256_cert_fingerprints":["AC:00:28:F0:43:1A:6A:4A:B1:6A:9B:85:20:ED:19:3A:50:CD:26:BF:77:3F:99:21:92:1E:1A:0B:C1:2B:B9:D0"]}}]"#;
 
 /// Destination of `GET /duell`. The redirect deliberately carries no fragment of its own, so a
 /// `#c=...` fragment the browser holds is re-attached to the target by the browser (RFC 9110 §10.2.2).
@@ -6486,7 +6486,7 @@ mod app_links_tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v[0]["relation"][0], "delegate_permission/common/handle_all_urls");
+        assert_eq!(v[0]["relation"][0], "delegate_permission/common.handle_all_urls");
         assert_eq!(v[0]["target"]["namespace"], "android_app");
         assert_eq!(v[0]["target"]["package_name"], "org.bunsenbrenner.cads");
         assert_eq!(
