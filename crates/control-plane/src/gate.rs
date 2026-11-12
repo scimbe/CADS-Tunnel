@@ -488,6 +488,15 @@ struct CheckQuery {
 /// actual request via `forward_auth`'s `copy_headers`, so the origin/bridge can
 /// read who's really signed in instead of trusting anything client-supplied.
 const GATE_EMAIL_HEADER: &str = "x-gate-email";
+/// The OIDC subject (`sub` of the id_token) of the login behind a gate session, next to `X-Gate-Email`.
+/// An origin that already trusts `X-Gate-Email` (it called `/gate/check` itself, or Caddy copied the
+/// header from this response) can bind an account to the subject instead of the e-mail alone, so an
+/// address re-used at an identity provider cannot take over the account (CADS-DEMO-wrapper #137,
+/// security review M3). Same contract as the email header: present on EVERY 200, and EXPLICITLY EMPTY
+/// whenever there is no login subject -- not gated, a session minted before sessions carried the
+/// subject, a share-link session, a bearer service account -- so a client-supplied value is always
+/// overwritten and absence never means anything.
+const GATE_SUB_HEADER: &str = "x-gate-sub";
 
 /// `GET /gate/check`: Caddy's `forward_auth` target. `X-Forwarded-Host` (Caddy
 /// sets this automatically) or a `?host=` query param names the hostname being
@@ -495,8 +504,8 @@ const GATE_EMAIL_HEADER: &str = "x-gate-email";
 /// toggle lives entirely server-side (the tunnel owner's `require_login`
 /// setting), not in Caddy's own config -- so: `200` immediately when the host
 /// doesn't have the gate enabled at all; `200` (with the verified email in
-/// `X-Gate-Email`) when it does AND a valid, unexpired `ct_gate_session` cookie
-/// for exactly that host is present.
+/// `X-Gate-Email`, and the login's OIDC subject in `X-Gate-Sub`) when it does AND a valid,
+/// unexpired `ct_gate_session` cookie for exactly that host is present.
 ///
 /// Otherwise a `302` straight to `/gate/start` -- **not** a bare `401` for
 /// Caddy's `handle_errors` to convert. Confirmed against Caddy's own docs:
@@ -540,7 +549,13 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
         // here means any client-supplied value is always overwritten with a
         // definite "no identity", never silently left as whatever the client
         // sent, regardless of how the reverse proxy's copy semantics work.
-        Ok(false) => return (StatusCode::OK, [(GATE_EMAIL_HEADER, HeaderValue::from_static(""))]).into_response(),
+        Ok(false) => {
+            return (
+                StatusCode::OK,
+                [(GATE_EMAIL_HEADER, HeaderValue::from_static("")), (GATE_SUB_HEADER, HeaderValue::from_static(""))],
+            )
+                .into_response()
+        }
         Ok(true) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -566,7 +581,16 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
         };
         if claims.host == host && still_authorized() {
             if let Ok(v) = HeaderValue::from_str(&claims.email) {
-                return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
+                // The subject only for a login session (share links have none); a subject that cannot
+                // ride in a header value is reported as empty -- never a guess, never the email.
+                let login = !claims.email.starts_with(GATE_SHARE_SUBJECT_PREFIX);
+                let sub = claims
+                    .subject
+                    .as_deref()
+                    .filter(|s| login && !s.is_empty())
+                    .and_then(|s| HeaderValue::from_str(s).ok())
+                    .unwrap_or_else(|| HeaderValue::from_static(""));
+                return (StatusCode::OK, [(GATE_EMAIL_HEADER, v), (GATE_SUB_HEADER, sub)]).into_response();
             }
             // A malformed/non-ASCII email can't ride in a header value -- fall
             // through to the redirect below (no identity to report is worse
@@ -594,7 +618,9 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
             || matches!(st.tunnels.email_allowed_for_hostname(&host, &subject), Ok(true))
         {
             if let Ok(v) = HeaderValue::from_str(&subject) {
-                return (StatusCode::OK, [(GATE_EMAIL_HEADER, v)]).into_response();
+                // A service account is no person's login: its client id already rides in X-Gate-Email,
+                // X-Gate-Sub stays explicitly empty (no account binding for M2M callers).
+                return (StatusCode::OK, [(GATE_EMAIL_HEADER, v), (GATE_SUB_HEADER, HeaderValue::from_static(""))]).into_response();
             }
         }
     }
@@ -1580,6 +1606,7 @@ mod tests {
                     // header itself -- this must never survive as a non-empty
                     // value on the response Caddy would copy from.
                     .header(GATE_EMAIL_HEADER, "attacker@evil.example")
+                    .header(GATE_SUB_HEADER, "attacker-subject")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1591,6 +1618,61 @@ mod tests {
             Some(""),
             "must be explicitly empty, not absent and not the client-supplied value"
         );
+        assert_eq!(
+            resp.headers().get(GATE_SUB_HEADER).map(|v| v.to_str().unwrap()),
+            Some(""),
+            "X-Gate-Sub follows the same contract: explicitly empty, never the client-supplied value"
+        );
+    }
+
+    /// CADS-DEMO-wrapper #137 (security review M3): a login session carries the OIDC subject; /gate/check hands it to
+    /// the origin in X-Gate-Sub next to X-Gate-Email, so the origin can bind the account to the subject. A session
+    /// minted before sessions carried the subject reports it EXPLICITLY EMPTY (never absent, never the email).
+    #[tokio::test]
+    async fn gate_check_reports_the_login_subject_in_x_gate_sub_and_empty_for_a_session_without_one() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "demo", Some("demo.bunsenbrenner.org")).unwrap().created().expect("hostname is free in this test");
+        assert!(tunnels.set_require_login("alice", &t.id, true).unwrap());
+        assert!(tunnels.login_allowlist_add("alice", &t.id, "alice@example.com", now_secs()).unwrap());
+        let app =
+            gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("alice@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let now = now_secs();
+        let get = |token: String, spoof: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut r = Request::get("/gate/check")
+                    .header("x-forwarded-host", "demo.bunsenbrenner.org")
+                    .header("cookie", format!("{GATE_SESSION_COOKIE}={token}"));
+                if let Some(v) = spoof {
+                    r = r.header(GATE_SUB_HEADER, v);
+                }
+                app.oneshot(r.body(Body::empty()).unwrap()).await.unwrap()
+            }
+        };
+
+        // a login session with its subject: both headers, the subject exactly as the id_token's sub
+        let with_sub = sign_gate_session_for_subject(TEST_KEY, "demo.bunsenbrenner.org", "alice@example.com", "f3a1c2d4-5b6e-4f70-8a91-b2c3d4e5f607", now + 3600);
+        let ok = get(with_sub, Some("attacker-subject")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get(GATE_EMAIL_HEADER).unwrap(), "alice@example.com");
+        assert_eq!(ok.headers().get(GATE_SUB_HEADER).unwrap(), "f3a1c2d4-5b6e-4f70-8a91-b2c3d4e5f607", "the session's subject, not the client's");
+        assert_eq!(ok.headers().get_all(GATE_SUB_HEADER).iter().count(), 1, "exactly one X-Gate-Sub");
+
+        // a session minted before sessions carried the subject: still admitted, X-Gate-Sub explicitly empty
+        let pre = sign_gate_session(TEST_KEY, "demo.bunsenbrenner.org", "alice@example.com", now + 3600);
+        let old = get(pre, Some("attacker-subject")).await;
+        assert_eq!(old.status(), StatusCode::OK);
+        assert_eq!(old.headers().get(GATE_EMAIL_HEADER).unwrap(), "alice@example.com");
+        assert_eq!(old.headers().get(GATE_SUB_HEADER).map(|v| v.to_str().unwrap()), Some(""));
+
+        // the subject is covered by the session MAC: changing it in the cookie is a forged session -> redirect
+        let forged = sign_gate_session_for_subject(TEST_KEY, "demo.bunsenbrenner.org", "alice@example.com", "victim-subject", now + 3600);
+        let (payload, tag) = forged.rsplit_once('.').unwrap();
+        let mut parts: Vec<&str> = payload.split(':').collect();
+        let other = hex(b"attacker-subject");
+        parts[3] = &other;
+        let tampered = format!("{}.{tag}", parts.join(":"));
+        assert_eq!(get(tampered, None).await.status(), StatusCode::FOUND, "a session with a swapped subject is not a session");
     }
 
     /// #382-follow (M2M): a headless caller with no browser session (e.g.
@@ -1638,6 +1720,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "an allow-listed service-account token clears the gate");
         assert_eq!(resp.headers().get(GATE_EMAIL_HEADER).unwrap(), "svc-android-build@clients");
+        assert_eq!(
+            resp.headers().get(GATE_SUB_HEADER).map(|v| v.to_str().unwrap()),
+            Some(""),
+            "a service account is no person's login: no subject for account binding"
+        );
     }
 
     /// A valid, correctly-signed bearer token whose subject the owner never
@@ -2601,6 +2688,7 @@ mod tests {
         let ok = check(&app, DEMO, &cookie).await;
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(ok.headers().get(GATE_EMAIL_HEADER).unwrap(), &format!("share:{link_id}"));
+        assert_eq!(ok.headers().get(GATE_SUB_HEADER).map(|v| v.to_str().unwrap()), Some(""), "a share link is no account: no subject");
         // ... and is refused for another gated host, even one whose allow-list is empty
         // (no cross-host replay -- the allow-list is never consulted for a share session).
         let other = check(&app, OTHER, &cookie).await;
