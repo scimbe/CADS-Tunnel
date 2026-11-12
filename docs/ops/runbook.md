@@ -911,6 +911,35 @@ Two things worth knowing before touching them:
   502 because the realm's `google`/`github` entries were absent — the allowlist advertised a
   login path that did not exist. Add the provider in the realm first, then to this list.
 
+### What `/gate/check` tells an origin
+
+On every `200`, `/gate/check` sets both identity headers, so a reverse proxy that copies them always overwrites a
+client-supplied value (#433). An origin trusts them only from the gate's own response: either it calls `/gate/check`
+itself (CADS-DEMO-wrapper `lib/auth.mjs`), or Caddy's `forward_auth` copies them after stripping the client's copies.
+
+| situation | `X-Gate-Email` | `X-Gate-Sub` |
+|---|---|---|
+| hostname not gated | empty | empty |
+| login session (minted at `/gate/callback`) | the login's email | the id_token's `sub` |
+| login session minted before sessions carried the subject | the login's email | empty, until the next login (session TTL) |
+| share-link session (#780) | `share:<link id>` | empty: a share link is no account |
+| allow-listed bearer service account (M2M) | the token's subject (client id) | empty: no person's login |
+
+`X-Gate-Sub` lets an origin bind an account to the subject rather than to the email alone, so an address re-used or
+re-assigned at an identity provider cannot take over the account there (CADS-DEMO-wrapper #137, security review M3).
+Nothing changes in Keycloak or in the session format for it: the subject has been part of every login session since
+`sign_gate_session_for_subject`.
+
+- **A Caddy origin that wants the subject** must treat it exactly like the email: `request_header -X-Gate-Sub` before
+  `forward_auth`, and `copy_headers X-Gate-Email X-Gate-Sub`. Without the strip, a client could send its own
+  `X-Gate-Sub` to an origin that reads it. Existing Caddyfiles copy only `X-Gate-Email`, so nothing reaches them.
+- **The same subject as an app token** only while no client in the realm has a pairwise subject mapper; with one, the
+  gate client and `cads-mobile` see different `sub` values for the same person and an origin that compares them refuses
+  the app. Check (read-only, `kcadm.sh` as in the identity runbooks):
+  `$K get clients -r ct-demo --fields clientId,protocolMappers | grep -c oidc-sha256-pairwise-sub-mapper` → `0`.
+- **Deploying this** changes the control plane on core: separate approval, the usual warning to the sessions using
+  the gate, never during a lab session.
+
 ### The remaining edge/mesh knobs
 
 | variable | default | meaning |
