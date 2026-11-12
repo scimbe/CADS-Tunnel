@@ -40,12 +40,54 @@ struct Claims {
     exp: usize,
     #[allow(dead_code)]
     iss: String,
+    /// The client the token was issued to (Keycloak sets it on access tokens).
+    #[serde(default)]
+    azp: Option<String>,
+    /// String or array; only read by the per-client audience rules.
+    #[serde(default)]
+    aud: Option<serde_json::Value>,
+}
+
+impl Claims {
+    fn aud_contains(&self, want: &str) -> bool {
+        match &self.aud {
+            Some(serde_json::Value::String(a)) => a == want,
+            Some(serde_json::Value::Array(v)) => v.iter().any(|a| a.as_str() == Some(want)),
+            _ => false,
+        }
+    }
+}
+
+/// Default per-client audience rules (`CT_OIDC_CLIENT_AUD`): the mobile app's token must name this service.
+/// The app gets one access token per resource server (scope `ct-api` here, `mdi-api` for the My Daily Idea
+/// wrapper), so a token leaked at one service cannot be replayed at the other (RFC 9700 §2.3).
+pub const DEFAULT_CLIENT_AUD: &str = "cads-mobile=ct-api";
+
+/// Parses `client=audience[,client=audience...]`; `off` (or empty) means no rules. Malformed entries are an error,
+/// so a typo cannot silently switch enforcement off.
+pub fn parse_client_aud(spec: &str) -> Result<Vec<(String, String)>, OidcError> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("off") {
+        return Ok(Vec::new());
+    }
+    spec.split(',')
+        .map(|e| {
+            let (c, a) = e.split_once('=').ok_or_else(|| OidcError(format!("CT_OIDC_CLIENT_AUD entry without '=': {e}")))?;
+            let (c, a) = (c.trim(), a.trim());
+            if c.is_empty() || a.is_empty() {
+                return Err(OidcError(format!("CT_OIDC_CLIENT_AUD entry incomplete: {e}")));
+            }
+            Ok((c.to_string(), a.to_string()))
+        })
+        .collect()
 }
 
 /// Verifies bearer tokens against a fixed key + expected issuer.
 pub struct OidcVerifier {
     key: DecodingKey,
     validation: Validation,
+    /// `(azp, audience)`: a token issued to `azp` must carry `audience` in `aud`.
+    client_aud: Vec<(String, String)>,
 }
 
 impl OidcVerifier {
@@ -56,7 +98,7 @@ impl OidcVerifier {
         // Keycloak access-token audiences vary by client; the account binding
         // relies on `sub` + `iss`, so audience is not required here.
         validation.validate_aud = false;
-        Self { key, validation }
+        Self { key, validation, client_aud: Vec::new() }
     }
 
     /// Build a verifier for RS256 tokens from the realm's RSA **public** key
@@ -101,10 +143,26 @@ impl OidcVerifier {
         self
     }
 
+    /// Per-client audience rules (env `CT_OIDC_CLIENT_AUD`, default [`DEFAULT_CLIENT_AUD`]): a token whose
+    /// `azp` names a listed client must carry that client's audience for this service. Tokens of other
+    /// clients are unaffected (their audience shape is the operator's `CT_OIDC_ACCESS_AUD` decision).
+    #[must_use]
+    pub fn require_client_audiences(mut self, rules: Vec<(String, String)>) -> Self {
+        self.client_aud = rules;
+        self
+    }
+
     /// Verify `token` and return its subject (`sub`). Fails on a bad signature,
-    /// an expired token, or a mismatched issuer.
+    /// an expired token, a mismatched issuer, or a per-client audience rule.
     pub fn subject(&self, token: &str) -> Result<String, OidcError> {
         let data = decode::<Claims>(token, &self.key, &self.validation)?;
+        if let Some(azp) = data.claims.azp.as_deref() {
+            for (client, aud) in &self.client_aud {
+                if client == azp && !data.claims.aud_contains(aud) {
+                    return Err(OidcError(format!("token of client {azp} lacks audience {aud}")));
+                }
+            }
+        }
         Ok(data.claims.sub)
     }
 }
@@ -354,6 +412,40 @@ mod tests {
         let default = OidcVerifier::from_hs_secret(SECRET, ISSUER);
         assert_eq!(default.subject(&wrong).unwrap(), "user-42", "aud ignored by default");
         assert_eq!(default.subject(&no_aud).unwrap(), "user-42", "no aud is fine by default");
+    }
+
+    fn make_token_claims(secret: &[u8], claims: serde_json::Value) -> String {
+        encode(&Header::new(Algorithm::HS256), &claims, &EncodingKey::from_secret(secret)).unwrap()
+    }
+
+    #[test]
+    fn client_audience_rules_keep_per_resource_tokens_apart() {
+        // RFC 9700 §2.3: the app's token for the My Daily Idea wrapper (aud mydailyidea-api) must not work here,
+        // the token for this service (aud ct-api) must; other clients are not affected by the rule.
+        let rules = parse_client_aud(DEFAULT_CLIENT_AUD).unwrap();
+        let v = OidcVerifier::from_hs_secret(SECRET, ISSUER).require_client_audiences(rules);
+        let tok = |azp: &str, aud: serde_json::Value| {
+            make_token_claims(SECRET, serde_json::json!({ "sub": "u1", "iss": ISSUER, "exp": now() + 3600, "azp": azp, "aud": aud }))
+        };
+        assert_eq!(v.subject(&tok("cads-mobile", serde_json::json!("ct-api"))).unwrap(), "u1");
+        assert_eq!(v.subject(&tok("cads-mobile", serde_json::json!(["account", "ct-api"]))).unwrap(), "u1");
+        assert!(v.subject(&tok("cads-mobile", serde_json::json!("mydailyidea-api"))).is_err(), "wrapper token refused here");
+        assert!(v.subject(&tok("cads-mobile", serde_json::json!(["account"]))).is_err());
+        let no_aud = make_token_claims(SECRET, serde_json::json!({ "sub": "u1", "iss": ISSUER, "exp": now() + 3600, "azp": "cads-mobile" }));
+        assert!(v.subject(&no_aud).is_err(), "no aud at all refused for the listed client");
+        assert_eq!(v.subject(&tok("ct-agent-cli", serde_json::json!("account"))).unwrap(), "u1", "other clients unaffected");
+        assert_eq!(v.subject(&make_token(SECRET, "u2", ISSUER, now() + 3600)).unwrap(), "u2", "no azp: rule does not apply");
+    }
+
+    #[test]
+    fn client_audience_spec_parsing() {
+        assert_eq!(parse_client_aud("cads-mobile=ct-api").unwrap(), vec![("cads-mobile".into(), "ct-api".into())]);
+        assert_eq!(parse_client_aud(" a=x , b=y ").unwrap().len(), 2);
+        assert!(parse_client_aud("off").unwrap().is_empty());
+        assert!(parse_client_aud("").unwrap().is_empty());
+        assert!(parse_client_aud("cads-mobile").is_err(), "typo does not switch enforcement off");
+        assert!(parse_client_aud("=x").is_err());
+        assert!(parse_client_aud("a=").is_err());
     }
 
     #[test]
