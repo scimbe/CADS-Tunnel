@@ -170,45 +170,71 @@ silently forces this same rotation-and-re-pin path on every reschedule).
    decision (#540)** — documented here rather than left as a gap the model silently implies
    is covered.
 
-8. **Token revocation does not reach ct-agent's direct-connect path (ct-agent#45)** — the
-   runbook's #554 fix (below, "Revoking a tunnel now cuts live sessions too") is scoped to
-   the Edge: every token-carrying relay in `crates/edge/src/serve.rs` re-checks the token and
-   cuts on revocation. `ct-agent`'s **direct-connect** listener (`serve_direct`,
-   `native/src/serve.rs`) never touches the Edge at all — it accepts a QUIC connection with
-   `with_no_client_auth()` and terminates the session purely on `origin_handshake_any`
-   matching one of the Agent's own `origin_keys`. Noise_IK only proves the *responder's*
-   (Origin's) identity to the initiator by default; nothing here checks the initiator's
-   static key, so **any party that has ever learned the Origin Identity** — exactly what
-   every Capability distributes out of band (`ct-agent/native/src/origin.rs`) — retains
-   direct access indefinitely, independent of the Routing Token's revocation state.
+8. **Revocation on ct-agent's direct-connect path (ct-agent#45, ct-agent#291) — partly
+   closed; residual below.** The runbook's #554 fix ("Revoking a tunnel now cuts live
+   sessions too") is scoped to the Edge. `ct-agent`'s **direct-connect** listener
+   (`serve_direct`, `native/src/serve.rs`, only with `CT_AGENT_DIRECT_ADVERTISE`) never touches
+   the Edge: it terminates Noise_IK with the Agent's own `origin_keys`, and every Capability
+   distributes the Origin Identity out of band. Before ct-agent v0.7.26 nothing else was
+   checked there, so any party that had ever learned the Origin Identity kept direct access,
+   whatever the Routing Token's state.
 
-   **This is not a code bug in isolation — it is a genuine second, separate revocation
-   mechanism** that already exists and works: `ct-agent`'s Origin-key rotation (#12) mints a
-   fresh `OriginIdentity` and re-issues the Capability with the *same* token, so once the
-   rotation window closes and the old key is dropped from `origin_keys`, direct access
-   (and relayed access) both stop working for holders of the old Capability. The gap is
-   **operational, not architectural**: an incident responder who reaches for the fast,
-   well-tested, Edge-side action (`POST /admin/revoke/:token`) reasonably believes — per the
-   runbook's own, now over-broad "cuts live sessions too" claim — that access is fully cut.
-   For any client that also has (or could reach) the Agent's direct listener, it is not:
-   only an Origin-key rotation actually revokes it, and nothing surfaces that distinction
-   at the moment of the decision.
+   **What is in place now.** The client carries the Routing Token inside Noise message 1
+   (`0x01 ‖ token(32)`, encrypted to the Origin key); ct-client does so since CADS-Tunnel
+   v0.4.20 (#770). Before it sends message 2, the Agent (since v0.7.26, ct-agent#159/#162):
+   - refuses a presented token that is not its own (constant-time compare);
+   - refuses every direct handshake while its cached revocation flag is set. The flag is set
+     when the Edge answers the Agent's own registration with `NO`: over QUIC the first such
+     answer, over the TLS-TCP fallback the third in a row (per pool worker);
+   - refuses a handshake that carries **no** token, by default from the ct-agent release that
+     flips this default (ct-agent#291). Every earlier release serves it (clients did not send
+     the token yet), and so does an agent started with the opt-out `CT_DIRECT_REQUIRE_TOKEN=0`.
 
-   **Bounded**: confidentiality is unaffected the same way #540's is — Noise_IK still
-   requires the Origin's real private key to terminate a session, so a party without a valid
-   Capability learns nothing. What's exposed is continued *access* for a party whose
-   Capability was meant to be revoked. The direct-connect feature is opt-in
-   (`direct_advertise_ip`) and its own client-side documentation already states plainly that
-   it trades the Edge's token/PoW gate for the Noise handshake alone
-   (`crates/client/src/transport.rs`) — so the trust model itself is a deliberate, documented
-   choice; what was missing was the runbook cross-reference making the scope of #554's
-   guarantee honest.
+   A refused client gets QUIC close code 1 and never reaches the Origin. All three checks run
+   once per connection, in the handshake.
 
-   **The real fix, if pursued, is agent-side**: have the direct-connect handshake also carry
-   the Routing Token (e.g. in the Noise payload) and let the Agent check it against a
-   periodically-refreshed local copy of the token's live/revoked state — closing the loop
-   without requiring every direct-connect byte to round-trip the Edge, which would defeat the
-   feature's own purpose. Not a quick fix: it changes the direct-connect wire contract and
-   needs a rollout story for already-deployed agents, so it's an operator decision, not
-   something to implement speculatively. **Open, pending an operator decision (ct-agent#45)**
-   — the runbook's #554 section now cross-references this scope limit directly.
+   **Residual risk.**
+   - **A revoke does not reach a QUIC-registered Agent.** Its flag only moves on a registration
+     attempt. `revoke_token` removes the registration and cuts live relays, but leaves the
+     Agent's QUIC connection open, so the Agent never re-registers, never hears the `NO`, and
+     keeps serving direct clients that present the revoked token until that connection drops
+     for another reason (edge restart, network loss, agent restart). Measured for ct-agent#291
+     against the ct-edge code: still served 1, 6 and 26 s after the revoke. An Agent on the
+     TLS-TCP fallback re-registers after a revoke and flips after three refusals (read, not
+     measured).
+   - **Open direct sessions are not cut.** A direct session established before the flag sets
+     runs on until the client or the Origin closes it: nothing on the direct path re-checks a
+     live session the way #554 does for relays. Measured for ct-agent#291: a session opened
+     before the flip was still carried 12 s after it, while a new handshake with the same token
+     was refused. On the Agent's side only a restart ends it. Closing the revoke gap therefore
+     takes both halves: the Edge closes the token's agent connections on revoke, and the Agent
+     closes its open direct sessions when the flag sets. Both are open.
+   - **The flag starts clear and fails open.** Every Agent process starts with a clear flag,
+     its direct listener serves before the first registration verdict, and a transient failure
+     (edge unreachable, dial error, timeout) never sets the flag. A restarted Agent therefore
+     serves direct clients that present the revoked token until that verdict, and for as long
+     as it cannot reach the Edge. The Edge no longer hands out a revoked token's direct
+     endpoint (#665), and the restarted listener has a new ephemeral port, so such a client has
+     to find the port on its own.
+   - **Token-less handshakes** on agents without the ct-agent#291 default, or with the opt-out:
+     whoever knows the Origin Identity gets past the check by leaving the token out, so a token
+     rotation does not cut a former capability holder off the direct path; only an Origin-key
+     rotation (ct-agent#12) does. The opt-out says so in a startup `WARNING` and counts each such
+     session as `ct_agent_events_total{kind="direct_legacy_served"}`. Agents older than v0.7.26
+     check nothing on this path.
+   - **The token is a shared bearer (ADR-0014).** Every holder of a tunnel's Capability has the
+     same token, so cutting off one of them on either path means rotating the token for all of
+     them (see "Ex-grantee keeps a tunnel's routing token" above).
+   - **Old clients pay in availability.** A ct-client built before CADS-Tunnel v0.4.20 loses the
+     direct path to an Agent that requires the token. In p2p mode it then fails instead of
+     falling back to the relay: its fallback reuses the edge connection of its `'P'` query, on
+     which the Edge serves no second stream (a client defect older than ct-agent#291).
+
+   **Bounded**: confidentiality is unaffected — Noise_IK still requires the Origin's private
+   key, so a party without a valid Capability learns nothing. What is exposed is continued
+   *access* for a party whose Capability was meant to be cut off, and only on Agents that run
+   the opt-in direct listener. **Status: token-less handshakes are refused by default from the
+   ct-agent release that flips the default (ct-agent#291). Open, pending an operator decision:
+   the revoke gap on QUIC, open direct sessions, the fail-open start, the shared token (the
+   "Ex-grantee" row above) and the p2p fallback of old clients. The opt-out is the operator's
+   own, logged choice.** The runbook's #554 section states the scope for incident response.
