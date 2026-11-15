@@ -554,6 +554,59 @@ where
     .await
 }
 
+/// Shared scaffold of [`run_upgradable_session_initiator_inner`] and
+/// [`run_upgradable_session_responder_inner`] (#1060): split `local`, wire the pump's
+/// control/data/direct-handoff channels, run `negotiate` as the coordinator's one-shot
+/// work (installing the direct session and firing `Cutover` on success, then parking
+/// forever so `select!` never drops the pump), and race it against the pump. `negotiate`
+/// is the one side-specific piece: driving the coordinator's handshake over `ctl_tx`/
+/// `in_rx` and, on success, establishing the direct session.
+async fn run_with_coordinator<RW, RR, P, DR, DW, N, NFut>(
+    relay_ts: snow::TransportState,
+    relay_send: RW,
+    relay_recv: RR,
+    local: P,
+    negotiate: N,
+) -> io::Result<()>
+where
+    RW: AsyncWrite + Unpin,
+    RR: AsyncRead + Unpin,
+    P: AsyncRead + AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+    N: FnOnce(
+        tokio::sync::mpsc::UnboundedSender<crate::noise::PumpControl>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> NFut,
+    NFut: std::future::Future<Output = Option<(snow::TransportState, DR, DW)>>,
+{
+    let (plain_r, plain_w) = tokio::io::split(local);
+    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
+    let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
+
+    let coordinator = async move {
+        let mut dir_tx = Some(dir_tx);
+        if let Some(session) = negotiate(ctl_tx.clone(), in_rx).await {
+            if let Some(tx) = dir_tx.take() {
+                let _ = tx.send(session);
+            }
+            let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
+        }
+        // Drop an un-sent `dir_tx` so the pump's installer unblocks (stay on relay), then PARK:
+        // the coordinator must never resolve, or `select!` would drop the pump future when it does.
+        drop(dir_tx.take());
+        std::future::pending::<()>().await
+    };
+    let pump = crate::noise::noise_pump_multiplexed(
+        relay_ts, relay_recv, relay_send, plain_r, plain_w, ctl_rx, in_tx, dir_rx,
+    );
+    tokio::select! {
+        res = pump => res,
+        _ = coordinator => unreachable!("the upgrade coordinator parks after its one-shot work"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_upgradable_session_initiator_inner<RW, RR, P, DR, DW, DF, DFut, EF, EFut>(
     mut relay_send: RW,
@@ -580,35 +633,14 @@ where
     let relay_ts =
         crate::a2a::a2a_initiate(&mut relay_send, &mut relay_recv, own_noise_private, peer_noise_public).await?;
     let expected_peer = *peer_noise_public;
-    let (plain_r, plain_w) = tokio::io::split(local);
-    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
-    let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
-
-    let coordinator = async move {
-        let mut dir_tx = Some(dir_tx);
-        if let Ok(Some(_ep)) =
-            drive_initiator_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, discover_direct).await
-        {
-            if let Some(session) = accept_and_establish(expected_peer).await {
-                if let Some(tx) = dir_tx.take() {
-                    let _ = tx.send(session);
-                }
-                let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
-            }
+    run_with_coordinator(relay_ts, relay_send, relay_recv, local, move |ctl_tx, mut in_rx| async move {
+        if let Ok(Some(_ep)) = drive_initiator_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, discover_direct).await {
+            accept_and_establish(expected_peer).await
+        } else {
+            None
         }
-        // Drop an un-sent `dir_tx` so the pump's installer unblocks (stay on relay), then PARK:
-        // the coordinator must never resolve, or `select!` would drop the pump future when it does.
-        drop(dir_tx.take());
-        std::future::pending::<()>().await
-    };
-    let pump = crate::noise::noise_pump_multiplexed(
-        relay_ts, relay_recv, relay_send, plain_r, plain_w, ctl_rx, in_tx, dir_rx,
-    );
-    tokio::select! {
-        res = pump => res,
-        _ = coordinator => unreachable!("the upgrade coordinator parks after its one-shot work"),
-    }
+    })
+    .await
 }
 
 /// **#104 direct-P2P orchestration (responder side).** The mirror of
@@ -742,34 +774,15 @@ where
         }
         None => crate::a2a::a2a_respond(&mut relay_send, &mut relay_recv, own_noise_private).await?,
     };
-    let (plain_r, plain_w) = tokio::io::split(local);
-    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::noise::CONTROL_IN_CHANNEL_BOUND);
-    let (dir_tx, dir_rx) = tokio::sync::oneshot::channel();
-
-    let coordinator = async move {
-        let mut dir_tx = Some(dir_tx);
-        if let Ok(Some(ep)) =
-            drive_responder_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, dial_probe).await
-        {
+    run_with_coordinator(relay_ts, relay_send, relay_recv, local, move |ctl_tx, mut in_rx| async move {
+        if let Ok(Some(ep)) = drive_responder_upgrade(&mut coord, now, &ctl_tx, &mut in_rx, dial_probe).await {
             // drive_responder_upgrade only returns an endpoint that passed #480's check.
-            if let Some(session) = dial_and_establish(ep).await {
-                if let Some(tx) = dir_tx.take() {
-                    let _ = tx.send(session);
-                }
-                let _ = ctl_tx.send(crate::noise::PumpControl::Cutover);
-            }
+            dial_and_establish(ep).await
+        } else {
+            None
         }
-        drop(dir_tx.take());
-        std::future::pending::<()>().await
-    };
-    let pump = crate::noise::noise_pump_multiplexed(
-        relay_ts, relay_recv, relay_send, plain_r, plain_w, ctl_rx, in_tx, dir_rx,
-    );
-    tokio::select! {
-        res = pump => res,
-        _ = coordinator => unreachable!("the upgrade coordinator parks after its one-shot work"),
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
