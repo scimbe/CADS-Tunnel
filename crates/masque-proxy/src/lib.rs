@@ -139,6 +139,17 @@ pub struct Config {
 /// the process, same as the edge's own long-running listeners).
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(config.listen).await?;
+    run_with_listener(listener, config).await
+}
+
+/// Like [`run`], but accepts on an already-bound `listener` instead of binding
+/// `config.listen` itself (#1040). Lets a caller -- chiefly an integration test --
+/// bind to an OS-assigned port and start accepting on it atomically, with no
+/// probe-bind-drop-rebind gap for a client to race.
+pub async fn run_with_listener(
+    listener: TcpListener,
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let expected_path = Arc::new(expected_connect_udp_path(config.target));
     // #662: this semaphore now gates admitted TUNNELS (authenticated CONNECT-UDP
     // streams), not raw TCP connections -- see handle_request. A max_concurrent_streams
