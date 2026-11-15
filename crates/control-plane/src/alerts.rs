@@ -78,7 +78,11 @@ const MIN_THRESHOLD_MINUTES: i64 = 1;
 const MAX_THRESHOLD_MINUTES: i64 = 7 * 24 * 60;
 /// Delivery rows the tunnel card shows.
 const CARD_DELIVERIES: u32 = 5;
-const RATE_LIMIT_DETAIL: &str = "rate limit: at most 20 deliveries per hour per account";
+/// The delivery-log detail / 429 body for a rate-limited delivery, derived from
+/// [`MAX_DELIVERIES_PER_HOUR`] so the number cannot drift from the actual budget.
+fn rate_limit_detail() -> String {
+    format!("rate limit: at most {MAX_DELIVERIES_PER_HOUR} deliveries per hour per account")
+}
 
 /// What a delivery announces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,7 +487,7 @@ fn record_skipped_once(store: &SqliteTunnelStore, row: &AlertRow, event: AlertEv
     if last.map(|d| d.status == "skipped" && d.event == event.wire()).unwrap_or(false) {
         return;
     }
-    let _ = store.record_delivery(&row.alert.tunnel_id, now, event.wire(), "skipped", Some(RATE_LIMIT_DETAIL));
+    let _ = store.record_delivery(&row.alert.tunnel_id, now, event.wire(), "skipped", Some(rate_limit_detail().as_str()));
 }
 
 /// `scheme://host[:port]` of a webhook URL -- the only part of it that ever appears in
@@ -611,7 +615,7 @@ pub(crate) async fn test_alert(
     let now = unix_now();
     if rate_limited(store, &claims.subject, now) {
         record_skipped_once(store, &row, AlertEvent::Test, now);
-        return (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_DETAIL).into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, rate_limit_detail()).into_response();
     }
     let payload = AlertPayload::new(AlertEvent::Test, &row, row.alert.state_since, now);
     let outcome = deliver(shared_delivery_http_client(), &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
@@ -741,7 +745,7 @@ fn card_html(tunnel_id: &str, alert: Option<&TunnelAlert>, deliveries: &[AlertDe
 {actions}
 {log}
 <p class="help">Sends a signed <code>tunnel.down</code> once this tunnel has been unreachable for the threshold, and
-<code>tunnel.up</code> when it is back. Checked once a minute; at most 20 deliveries per hour per account.</p>
+<code>tunnel.up</code> when it is back. Checked once a minute; at most {MAX_DELIVERIES_PER_HOUR} deliveries per hour per account.</p>
 </details>"#
     )
 }
@@ -930,7 +934,7 @@ mod tests {
         let a = store.alert_for("alice", &id).unwrap().unwrap();
         assert_eq!(a.failures, 0, "a success resets the streak");
         assert_eq!(a.last_delivery_at, Some(100));
-        store.record_delivery(&id, 101, "tunnel.up", "skipped", Some(RATE_LIMIT_DETAIL)).unwrap();
+        store.record_delivery(&id, 101, "tunnel.up", "skipped", Some(rate_limit_detail().as_str())).unwrap();
         assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().failures, 0, "skipped leaves the streak alone");
     }
 
@@ -1108,7 +1112,7 @@ mod tests {
         assert_eq!(a.state, "unknown", "left un-transitioned to catch up once the window frees");
         let log = store.deliveries_for("alice", &id, 100).unwrap();
         assert_eq!(log.iter().filter(|d| d.status == "skipped").count(), 1);
-        assert_eq!(log[0].detail.as_deref(), Some(RATE_LIMIT_DETAIL));
+        assert_eq!(log[0].detail.as_deref(), Some(rate_limit_detail().as_str()));
         assert!(rate_limited(&store, "alice", now), "a skipped row does not extend the budget");
 
         // An hour later the window has freed and the alert fires.
