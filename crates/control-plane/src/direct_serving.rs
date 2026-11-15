@@ -177,10 +177,7 @@ pub async fn sweep_probes(
 /// observable before it ever touches a live record.
 pub async fn run_probe_loop(tunnels: std::sync::Arc<crate::storage::SqliteTunnelStore>, tick: std::time::Duration) -> ! {
     loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = ct_common::time::now_secs();
         for (tunnel_id, hostname, action) in sweep_probes(&tunnels, now).await {
             eprintln!("ct-cp: direct-serving: {action:?} for {hostname} (tunnel {tunnel_id}) — DNS wiring pending (slice 4)");
         }
