@@ -62,6 +62,9 @@ pub fn render_edge_metrics<H: Clone>(
         }
         s
     };
+    let (relay_bytes_browser, relay_bytes_dataplane, relay_bytes_tcp_fallback) =
+        state.relay_bytes_by_kind();
+    let (channel_relay_bytes, channel_splices) = crate::channel_broker::channel_relay_totals();
     let mut out = format!(
         "# HELP ct_edge_active_tunnels Distinct routing tokens with at least one live agent.\n\
          # TYPE ct_edge_active_tunnels gauge\n\
@@ -162,11 +165,11 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         agent_key_violations = agent_key_violations,
         relays = state.relays_total(),
         relay_bytes = state.relay_bytes_total(),
-        relay_bytes_browser = state.relay_bytes_by_kind().0,
-        relay_bytes_dataplane = state.relay_bytes_by_kind().1,
-        relay_bytes_tcp_fallback = state.relay_bytes_by_kind().2,
-        channel_relay_bytes = crate::channel_broker::channel_relay_totals().0,
-        channel_splices = crate::channel_broker::channel_relay_totals().1,
+        relay_bytes_browser = relay_bytes_browser,
+        relay_bytes_dataplane = relay_bytes_dataplane,
+        relay_bytes_tcp_fallback = relay_bytes_tcp_fallback,
+        channel_relay_bytes = channel_relay_bytes,
+        channel_splices = channel_splices,
         channel_pairs = crate::channel_broker::channel_rendezvous_pairs_total(),
         channel_park_reaped = crate::channel_broker::channel_park_reaped_total(),
         channel_park_superseded = crate::channel_broker::channel_park_superseded_total(),
