@@ -7835,7 +7835,7 @@ impl SqliteTopologyStore {
     /// End `agent`'s current sharing (the owner reclaims, or the current topology
     /// releases), returning it to its owner's control. Persisted so exclusivity survives
     /// a restart. [`crate::topology::AssignError::NotAssigned`] if it is not in a topology.
-    pub fn revoke(&self, by: &str, agent: &str) -> Result<(), TopologyError> {
+    pub fn revoke(&self, by: crate::topology::Revoker<'_>, agent: &str) -> Result<(), TopologyError> {
         let conn = self.writer.lock_safe();
         let mut a = Self::load(&conn, agent)?.ok_or(crate::topology::AssignError::NotAssigned)?;
         a.revoke(by)?;
@@ -8952,7 +8952,7 @@ mod tests {
                 Err(TopologyError::Assign(AssignError::NotAuthorized))
             ));
             assert!(matches!(
-                store.revoke("mallory", "agent-1"),
+                store.revoke(crate::topology::Revoker::Owner("mallory"), "agent-1"),
                 Err(TopologyError::Assign(AssignError::NotAuthorized))
             ));
             // A second agent joins net-1 too.
@@ -8971,15 +8971,15 @@ mod tests {
             ));
 
             // Revoke returns control to the owner; only then can it be reassigned.
-            store.revoke("net-1", "agent-1").unwrap(); // the topology releases it
+            store.revoke(crate::topology::Revoker::Topology("net-1"), "agent-1").unwrap(); // the topology releases it
             assert!(!store.assignment("agent-1").unwrap().unwrap().is_assigned());
             store.assign("alice", "agent-1", "net-2").unwrap();
             assert_eq!(store.assignment("agent-1").unwrap().unwrap().topology(), Some("net-2"));
 
             // Revoking an unassigned agent errors.
-            store.revoke("alice", "agent-2").unwrap();
+            store.revoke(crate::topology::Revoker::Owner("alice"), "agent-2").unwrap();
             assert!(matches!(
-                store.revoke("alice", "agent-2"),
+                store.revoke(crate::topology::Revoker::Owner("alice"), "agent-2"),
                 Err(TopologyError::Assign(AssignError::NotAssigned))
             ));
         }
@@ -9017,7 +9017,7 @@ mod tests {
 
         // A label survives a revoke/reassign cycle -- agent-scoped like `kind`, not
         // topology-scoped (persist()'s ON CONFLICT never touches this column).
-        store.revoke("alice", "agent-1").unwrap();
+        store.revoke(crate::topology::Revoker::Owner("alice"), "agent-1").unwrap();
         store.assign("alice", "agent-1", "net-2").unwrap();
         assert_eq!(store.agents_with_kind("net-2").unwrap()[0].2.as_deref(), Some(&"x".repeat(40)[..]));
     }
