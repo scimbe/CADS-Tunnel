@@ -23,4 +23,33 @@ ignore = [
     # (crates/control-plane/src/portal.rs) — the Marvin attack targets RSA PRIVATE-key operations,
     # which this service never performs in production.
     "RUSTSEC-2023-0071",
+
+    # Added 2026-11-15, cargo-audit remediation pass (session_017HJqFBnMi3BvS8x5aFyMJ6).
+    # EXPIRES 2027-02-13 -- re-run `cargo audit` and `cargo tree -i hickory-proto@0.25.2 -e normal`
+    # / `cargo tree -i hickory-resolver@0.25.2 -e normal` before this date; if either now prints a
+    # real dependent, remove this block and fix for real instead of renewing the expiry.
+    #
+    # The real, compiled hickory-proto/hickory-resolver line (0.26.1 at the time of the original
+    # 0118/0119 ignores above) was upgraded to 0.26.3 in this same pass, which is why 0490, 0491,
+    # 0487, 0489, 0488, 0514, 0513, 0516 and 0515 no longer appear for that line. What's left below
+    # all affect ONLY the second, still-resolved 0.25.2 copy -- the exact same inert optional
+    # dependency the 0118/0119 comment above already documents: `libp2p-dns`/`libp2p-mdns`
+    # (optional deps of the `libp2p` facade crate's own "dns"/"mdns" features), pulled in only
+    # because this workspace's root Cargo.toml enables `libp2p`'s "tokio" feature, whose weak
+    # `libp2p-dns?/tokio` / `libp2p-mdns?/tokio` forwarding keeps a resolver entry for them in
+    # Cargo.lock even though neither "dns" nor "mdns" is itself ever turned on. Confirmed inert the
+    # same way as 0118/0119: `cargo tree -i hickory-proto@0.25.2 -e normal` (and the hickory-resolver
+    # equivalent) print nothing, including after a from-scratch `cargo generate-lockfile`.
+    "RUSTSEC-2026-0490",  # hickory-proto 0.25.2 zone-file lexer panic -- inert libp2p-dns/mdns copy
+    "RUSTSEC-2026-0491",  # hickory-proto 0.25.2 record-count memory amplification -- inert, same copy
+    "RUSTSEC-2026-0532",  # hickory-proto 0.25.2 parent-side NSEC3 zone-cut -- inert, same copy
+    "RUSTSEC-2026-0512",  # hickory-proto 0.25.2 DNSSEC unrelated-RRset accepted -- inert, same copy
+    "RUSTSEC-2026-0505",  # hickory-proto 0.25.2 NSEC3 owner-name not checked -- inert, same copy
+    "RUSTSEC-2026-0531",  # hickory-proto 0.25.2 child-side NSEC/NSEC3 no-DS -- inert, same copy
+    "RUSTSEC-2026-0511",  # hickory-proto 0.25.2 NXDOMAIN for empty non-terminal -- inert, same copy
+    "RUSTSEC-2026-0487",  # hickory-proto 0.25.2 SVCB/HTTPS alpn parse panic -- inert, same copy
+    "RUSTSEC-2026-0504",  # hickory-proto 0.25.2 inverted NSEC3 comparison -- inert, same copy
+    "RUSTSEC-2026-0530",  # hickory-proto 0.25.2 parent-side NSEC zone-cut -- inert, same copy
+    "RUSTSEC-2026-0489",  # hickory-proto 0.25.2 SVCB/HTTPS quote-char panic -- inert, same copy
+    "RUSTSEC-2026-0514",  # hickory-resolver 0.25.2 DNSSEC-failed records returned -- inert, same copy
 ]

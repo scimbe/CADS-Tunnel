@@ -215,9 +215,12 @@ fn tick(s: &RetentionStores, now: u64) {
 fn maintain_db(path: &str) {
     let result = Connection::open(path).and_then(|conn| {
         conn.busy_timeout(Duration::from_secs(5))?;
+        // `optimize` runs first: it can itself write (refreshed planner stats), and that
+        // write has to land in the WAL before the TRUNCATE checkpoint below, or the sidecar
+        // is left non-empty even on a fully successful (non-busy) checkpoint.
+        conn.execute_batch("PRAGMA optimize;")?;
         let (busy, log, checkpointed): (i64, i64, i64) =
             conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        conn.execute_batch("PRAGMA optimize;")?;
         Ok((busy, log, checkpointed))
     });
     match result {
