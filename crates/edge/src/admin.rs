@@ -642,9 +642,18 @@ async fn tunnel_history(
         eprintln!("ct-edge: tunnel history read failed: {e} (#776)");
         StatusCode::INTERNAL_SERVER_ERROR
     };
-    let open = history.open_session_exists(&hex).map_err(store_error)?;
-    let uptime = history.uptime_summary(&hex, now).map_err(store_error)?;
-    let sessions = history.sessions_for(&hex, limit).map_err(store_error)?;
+    // #1037: the three store reads are blocking SQLite calls -- run them on a
+    // blocking-pool thread so a slow disk or a long uptime aggregation can't
+    // stall a Tokio worker that also serves the edge's relays.
+    let (open, uptime, sessions) = tokio::task::spawn_blocking(move || {
+        let open = history.open_session_exists(&hex)?;
+        let uptime = history.uptime_summary(&hex, now)?;
+        let sessions = history.sessions_for(&hex, limit)?;
+        Ok::<_, rusqlite::Error>((open, uptime, sessions))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(store_error)?;
     Ok(Json(TunnelHistoryResp {
         open,
         uptime,
@@ -739,21 +748,27 @@ async fn tunnel_receipts(
     else {
         return Err(StatusCode::NOT_FOUND);
     };
+    // Own the borrow out of `history` before it moves into the blocking closure below.
+    let edge_id = edge_id.to_string();
     let limit = q
         .limit
         .filter(|&l| l > 0)
         .unwrap_or(RECEIPTS_DEFAULT_LIMIT)
         .min(crate::tunnel_history::RECEIPTS_MAX_LIMIT);
     let token_hash = ct_common::receipt::routing_token_hash(&t);
-    let receipts = history
-        .receipts_for(&token_hash, q.since.unwrap_or(0), limit)
+    let since = q.since.unwrap_or(0);
+    // #1037: up to `limit` (cap 1000) rows is a blocking SQLite read; move it off
+    // the Tokio worker the same way `tunnel_history` does.
+    let receipts = tokio::task::spawn_blocking(move || history.receipts_for(&token_hash, since, limit))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|e| {
             eprintln!("ct-edge: receipts read failed: {e} (#782)");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(Json(TunnelReceiptsResp {
         pubkey,
-        edge_id: edge_id.to_string(),
+        edge_id,
         receipts,
     }))
 }
