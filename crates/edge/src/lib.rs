@@ -5,6 +5,11 @@ pub mod admin;
 /// trace: INC-20261011-305, INC-20261011-004, AUF-20261011-049
 pub mod agent_key;
 pub mod audit_log;
+/// #1064: no caller anywhere in the workspace, no timeout on its accept/read path, and
+/// `verify_stateless` gives it no replay protection -- gated out of the public API surface
+/// rather than deleted, so a future admission path's design decisions (timeouts, who owns
+/// the `ReplayCache` for `ct_common::credential::verify_fresh`) aren't made by omission.
+#[cfg(test)]
 pub mod auth;
 pub mod channel_authorize;
 pub mod grant_revocation;
