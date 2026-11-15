@@ -851,15 +851,17 @@ async fn gate_share(State(st): State<GateState>, Query(q): Query<ShareQuery>) ->
     }
 }
 
-/// The share-link denial page (#780): the specific line is what a recipient
-/// needs ("ask for a new link"), and the normal sign-in is offered as the
-/// alternative for someone who does have an account on the access list.
-fn share_denied_html(host: &str) -> String {
+/// Shared `<!doctype html>...<style>...<div class="card">...</div>` shell for the gate's
+/// small set of static pages (#...): only the title and the card's inner HTML differ page
+/// to page; `extra_style` appends further CSS rules inside the same `<style>` block (e.g.
+/// the request-access form's input/label/button rules, or the CSRF page's `.retry` button)
+/// for the one or two pages that need them, `""` for the rest.
+fn gate_page(title: &str, inner_html: &str, extra_style: &str) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Share link not valid</title>
+<title>{title}</title>
 <style>
  :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
        --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
@@ -870,18 +872,28 @@ fn share_denied_html(host: &str) -> String {
  p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
  a{{color:var(--accent)}}
  code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
-</style></head><body>
+{extra_style}</style></head><body>
 <div class="card">
- <h1>This share link is no longer valid</h1>
+{inner_html}
+</div>
+</body></html>"#
+    )
+}
+
+/// The share-link denial page (#780): the specific line is what a recipient
+/// needs ("ask for a new link"), and the normal sign-in is offered as the
+/// alternative for someone who does have an account on the access list.
+fn share_denied_html(host: &str) -> String {
+    let inner = format!(
+        r#" <h1>This share link is no longer valid</h1>
  <p>This share link has expired or was already used. Ask whoever shared
     <code>{host}</code> with you for a new one.</p>
  <p>Have an account on its access list?
-    <a href="/gate/start?host={host_q}&amp;return=%2F">Sign in instead</a>.</p>
-</div>
-</body></html>"#,
+    <a href="/gate/start?host={host_q}&amp;return=%2F">Sign in instead</a>.</p>"#,
         host = crate::portal::escape(host),
         host_q = urlencode(host),
-    )
+    );
+    gate_page("Share link not valid", &inner, "")
 }
 
 /// The CSRF-state cookie is a single slot per browser/host: a second
@@ -975,63 +987,32 @@ async fn gate_logout(State(st): State<GateState>, Query(q): Query<LogoutQuery>) 
 /// [`gate_csrf_mismatch_response`] entirely from `urlencode`-escaped pieces of
 /// our own previously-set `ct_gate_target` cookie, so it's safe to embed as-is.
 fn csrf_expired_html(retry_url: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign-in session expired</title>
-<style>
- :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
-       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
- body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
-      display:flex;min-height:100vh;align-items:center;justify-content:center}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
- h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
- p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
- a.retry{{display:inline-block;margin-top:1rem;background:var(--accent);color:var(--accent-ink);
-      font-weight:600;text-decoration:none;padding:.6rem 1.1rem;border-radius:8px}}
- a.retry:hover{{filter:brightness(1.05)}}
-</style></head><body>
-<div class="card">
- <h1>Sign-in session expired</h1>
+    let inner = format!(
+        r#" <h1>Sign-in session expired</h1>
  <p>This usually happens when sign-in was started twice at once &mdash; a second
     tab, a page reload, or going back and trying again. Just start over below;
     it only takes a moment.</p>
- <a class="retry" href="{retry_url}">Try signing in again</a>
-</div>
-</body></html>"#
-    )
+ <a class="retry" href="{retry_url}">Try signing in again</a>"#
+    );
+    let extra_style = r#" a.retry{display:inline-block;margin-top:1rem;background:var(--accent);color:var(--accent-ink);
+      font-weight:600;text-decoration:none;padding:.6rem 1.1rem;border-radius:8px}
+ a.retry:hover{filter:brightness(1.05)}
+"#;
+    gate_page("Sign-in session expired", &inner, extra_style)
 }
 
 fn access_denied_html(host: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Not on the access list</title>
-<style>
- :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
-       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
- body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
-      display:flex;min-height:100vh;align-items:center;justify-content:center}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
- h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
- p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
- a{{color:var(--accent)}}
- code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
-</style></head><body>
-<div class="card">
- <h1>You're not on the access list</h1>
+    let inner = format!(
+        r#" <h1>You're not on the access list</h1>
  <p>Your sign-in succeeded, but your email isn't on the list of people invited to
     <code>{host}</code>. If you think this is a mistake, contact whoever shared
     this link with you.</p>
  <p>New here and don't know who to ask?
-    <a href="/gate/request-access?host={host_q}">Request access</a> instead.</p>
-</div>
-</body></html>"#,
+    <a href="/gate/request-access?host={host_q}">Request access</a> instead.</p>"#,
         host = crate::portal::escape(host),
         host_q = urlencode(host),
-    )
+    );
+    gate_page("Not on the access list", &inner, "")
 }
 
 /// `GET /gate/request-access?host=...` (#382-follow, issue #18): the real
@@ -1089,29 +1070,8 @@ fn request_access_form_html(host: &str, error: Option<&str>) -> String {
     let error_html = error
         .map(|e| format!(r#"<p class="err">{}</p>"#, crate::portal::escape(e)))
         .unwrap_or_default();
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Request access</title>
-<style>
- :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
-       --accent:#d98a4f;--accent-ink:#20130a;--serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
- body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
-      display:flex;min-height:100vh;align-items:center;justify-content:center}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
- h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
- p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
- p.err{{color:#f0883e}}
- label{{display:block;margin-top:1rem;font-size:.9rem;color:var(--text)}}
- input,textarea{{width:100%;box-sizing:border-box;margin-top:.3rem;background:#0d1117;border:1px solid var(--border);
-       border-radius:6px;color:var(--text);padding:.5rem;font:inherit}}
- button{{margin-top:1.4rem;background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;
-       padding:.55rem 1.1rem;font-weight:600;cursor:pointer}}
- code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
-</style></head><body>
-<div class="card">
- <h1>Request access</h1>
+    let inner = format!(
+        r#" <h1>Request access</h1>
  <p>Ask the owner of <code>{host_escaped}</code> to add you to its access list.</p>
  {error_html}
  <form method="post" action="/gate/request-access">
@@ -1123,36 +1083,26 @@ fn request_access_form_html(host: &str, error: Option<&str>) -> String {
    <textarea name="note" maxlength="500" rows="3" placeholder="Who you are / why you're asking"></textarea>
   </label>
   <button type="submit">Send request</button>
- </form>
-</div>
-</body></html>"#
-    )
+ </form>"#
+    );
+    let extra_style = r#" p.err{color:#f0883e}
+ label{display:block;margin-top:1rem;font-size:.9rem;color:var(--text)}
+ input,textarea{width:100%;box-sizing:border-box;margin-top:.3rem;background:#0d1117;border:1px solid var(--border);
+       border-radius:6px;color:var(--text);padding:.5rem;font:inherit}
+ button{margin-top:1.4rem;background:var(--accent);color:var(--accent-ink);border:0;border-radius:8px;
+       padding:.55rem 1.1rem;font-weight:600;cursor:pointer}
+"#;
+    gate_page("Request access", &inner, extra_style)
 }
 
 fn request_recorded_html(host: &str) -> String {
     let host_escaped = crate::portal::escape(host);
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Request recorded</title>
-<style>
- :root{{--bg:#0e1116;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
-       --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",serif}}
- body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;background:var(--bg);color:var(--text);
-      display:flex;min-height:100vh;align-items:center;justify-content:center}}
- .card{{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:2.5rem;max-width:480px}}
- h1{{font-family:var(--serif);font-weight:600;font-size:1.4rem;margin:.2rem 0 1rem}}
- p{{color:var(--muted);font-size:.95rem;line-height:1.5}}
- code{{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:.1rem .35rem}}
-</style></head><body>
-<div class="card">
- <h1>Request recorded</h1>
+    let inner = format!(
+        r#" <h1>Request recorded</h1>
  <p>The owner of <code>{host_escaped}</code> can see your request and grant access from their
-    dashboard. No automatic notification is sent -- if it's urgent, reach them another way too.</p>
-</div>
-</body></html>"#
-    )
+    dashboard. No automatic notification is sent -- if it's urgent, reach them another way too.</p>"#
+    );
+    gate_page("Request recorded", &inner, "")
 }
 
 /// The in-host path to return to after login. It ends up in a `Set-Cookie` value and a
