@@ -190,6 +190,13 @@ pub(crate) fn delivery_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The shared client for one-off deliveries outside the loop (the portal's Test
+/// button), built once instead of per request.
+fn shared_delivery_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(delivery_http_client)
+}
+
 /// POST `payload` to `url`, signed with `secret`, up to `attempts` times with
 /// [`BACKOFF`] between attempts. The signed timestamp is `payload.sent_at`.
 pub(crate) async fn deliver(
@@ -607,7 +614,7 @@ pub(crate) async fn test_alert(
         return (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_DETAIL).into_response();
     }
     let payload = AlertPayload::new(AlertEvent::Test, &row, row.alert.state_since, now);
-    let outcome = deliver(&delivery_http_client(), &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
+    let outcome = deliver(shared_delivery_http_client(), &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
     let recorded =
         store.record_delivery(tunnel_id, now, AlertEvent::Test.wire(), outcome.status(), Some(&outcome.detail));
     if let Err(e) = recorded {
