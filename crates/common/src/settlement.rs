@@ -333,22 +333,63 @@ impl Chain {
         Ok(())
     }
 
+    /// Seed overlay `(balances, nonces)` maps with ONLY the accounts `transfers` names (`from`/`to`),
+    /// copied from `state` — #1055: `append`/`accept_block` otherwise cloned every account's balance
+    /// and nonce just to validate one block's handful of transfers, which is O(total accounts) under
+    /// the ledger lock regardless of how small the block is.
+    fn seed_overlay(
+        state: &(BTreeMap<Account, Amount>, BTreeMap<Account, u64>),
+        transfers: &[Transfer],
+    ) -> (BTreeMap<Account, Amount>, BTreeMap<Account, u64>) {
+        let mut balances = BTreeMap::new();
+        let mut nonces = BTreeMap::new();
+        for t in transfers {
+            for acc in [t.from, t.to] {
+                balances.entry(acc).or_insert_with(|| state.0.get(&acc).copied().unwrap_or(0));
+                nonces.entry(acc).or_insert_with(|| state.1.get(&acc).copied().unwrap_or(0));
+            }
+        }
+        (balances, nonces)
+    }
+
+    /// Validate `transfers` in sequence against an overlay seeded only from the accounts they touch
+    /// (via [`seed_overlay`](Self::seed_overlay)), not the whole cached state. On success returns the
+    /// touched accounts' new balances/nonces, to be merged into the real cache by the caller; on the
+    /// first invalid transfer, returns the error having never touched the real cache at all — no
+    /// full-chain copy was ever made to roll back.
+    fn validate_overlay(
+        state: &(BTreeMap<Account, Amount>, BTreeMap<Account, u64>),
+        transfers: &[Transfer],
+    ) -> Result<(BTreeMap<Account, Amount>, BTreeMap<Account, u64>), ChainError> {
+        let (mut balances, mut nonces) = Self::seed_overlay(state, transfers);
+        for t in transfers {
+            Self::validate_and_apply(&mut balances, &mut nonces, t)?;
+        }
+        Ok((balances, nonces))
+    }
+
+    /// Fold a validated overlay's touched-account entries back into the real cached state.
+    fn merge_overlay(
+        state: &mut (BTreeMap<Account, Amount>, BTreeMap<Account, u64>),
+        overlay: (BTreeMap<Account, Amount>, BTreeMap<Account, u64>),
+    ) {
+        state.0.extend(overlay.0);
+        state.1.extend(overlay.1);
+    }
+
     /// Append a block of `transfers`, committing them only if ALL validate (signatures, nonces, no
     /// overdraft) against the current state applied in order. Rejects the whole block on the first bad
     /// transfer — the chain is never left in a partially-applied state.
     pub fn append(&mut self, transfers: Vec<Transfer>) -> Result<(), ChainError> {
-        let (mut balances, mut nonces) = self.state().clone();
-        for t in &transfers {
-            Self::validate_and_apply(&mut balances, &mut nonces, t)?;
-        }
+        let overlay = Self::validate_overlay(self.state(), &transfers)?;
         let height = self.height() + 1;
         let prev_hash = self.tip_hash();
         let hash = block_hash(height, &prev_hash, &transfers);
         self.blocks.push(Block { height, prev_hash, transfers, hash });
-        // #270: `balances`/`nonces` above already reflect this block (validate_and_apply mutated
-        // them in place) — cache that directly instead of merely invalidating, so the next read
-        // doesn't re-replay the whole (now one block longer) chain.
-        self.cached_state = Some((balances, nonces));
+        // #270/#1055: merge just the touched accounts' new values into the warm cache instead
+        // of re-cloning or re-deriving the whole thing.
+        let state = self.cached_state.as_mut().expect("state() just populated it");
+        Self::merge_overlay(state, overlay);
         Ok(())
     }
 
@@ -384,13 +425,12 @@ impl Chain {
         {
             return Err(ChainError::BrokenChain { height: expected_height });
         }
-        let (mut balances, mut nonces) = self.state().clone();
-        for t in &block.transfers {
-            Self::validate_and_apply(&mut balances, &mut nonces, t)?;
-        }
+        let overlay = Self::validate_overlay(self.state(), &block.transfers)?;
         self.blocks.push(block);
-        // #270: same as append -- cache the post-accept state directly rather than invalidating.
-        self.cached_state = Some((balances, nonces));
+        // #270/#1055: same as append -- merge just the touched accounts rather than cloning
+        // or re-deriving the whole cache.
+        let state = self.cached_state.as_mut().expect("state() just populated it");
+        Self::merge_overlay(state, overlay);
         Ok(())
     }
 
