@@ -237,7 +237,7 @@ async fn host_auth_dump(
         .into_iter()
         .map(|(hostname, token)| HostAuthEntry {
             hostname,
-            token: token.0.iter().map(|b| format!("{b:02x}")).collect(),
+            token: ct_common::hex::encode(&token.0),
         })
         .collect();
     Ok(Json(entries))
@@ -529,7 +529,7 @@ async fn channel_presence_list(
     )
     .into_iter()
     .map(|(holder, ago)| ChannelPresenceHolder {
-        holder: holder.iter().map(|b| format!("{b:02x}")).collect(),
+        holder: ct_common::hex::encode(&holder),
         parked_now: crate::channel_broker::presence_is_serving(ago),
         last_seen_secs_ago: ago,
     })
@@ -814,11 +814,11 @@ async fn set_access_policy(
 /// #779: first / last two bytes of a routing token as hex, for a log line that names
 /// the tunnel without printing the whole bearer credential.
 fn hex_prefix(t: &[u8; 32]) -> String {
-    t[..2].iter().map(|b| format!("{b:02x}")).collect()
+    ct_common::hex::encode(&t[..2])
 }
 
 fn hex_suffix(t: &[u8; 32]) -> String {
-    t[30..].iter().map(|b| format!("{b:02x}")).collect()
+    ct_common::hex::encode(&t[30..])
 }
 
 /// A 64-hex routing token from a path segment (surrounding whitespace ignored), or `None`.
