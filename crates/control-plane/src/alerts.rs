@@ -292,6 +292,11 @@ impl EdgeProbe {
     /// could be asked neither way (never treated as "down" by the caller).
     pub(crate) async fn tunnel_up(&self, routing_token_hex: &str) -> Option<bool> {
         let status = self.get_json::<EdgeStatusResp>(&format!("/admin/tunnel-status/{routing_token_hex}"), &[]).await;
+        if status.as_ref().map(|s| s.connected) == Some(true) {
+            // Already up per the cheaper check -- the history lookup can only confirm
+            // the same answer, so skip it.
+            return Some(true);
+        }
         let history = self
             .get_json::<EdgeHistoryResp>(&format!("/internal/tunnel/history/{routing_token_hex}"), &[("limit", 1)])
             .await;
