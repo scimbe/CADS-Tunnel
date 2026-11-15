@@ -42,6 +42,9 @@ index.html` (`4a47a11`), verified live via Playwright — not just read-checked 
 fixed two real bugs in the process (a `null`-vs-`undefined` pause guard blanking the whole
 canvas, and a clipped score readout). **Done**: playable, tested, committed, pushed.
 
+2026-11-15: the game was removed from the repository (`#908`); it was a collaboration exercise, not
+part of CADS Tunnel. It stays reachable in the history at `4a47a11`.
+
 2026-07-24 (discovery layer, spun off from this exercise): `#144`'s directory turned out to
 need an M2M write path (`#161`, fixed) and — a false alarm corrected by the maintainer — I
 briefly thought it also needed a non-`https` `card_url` variant for NAT'd agents (`#162`,
