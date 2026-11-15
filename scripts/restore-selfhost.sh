@@ -18,6 +18,9 @@ set -euo pipefail
 # longer still under --dry-run. Mirrors the backup-side fix.
 umask 077
 
+# shellcheck source=./lib-backup.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib-backup.sh"
+
 BACKUP_REPO="${CADS_BACKUP_REPO:-https://github.com/scimbe/CADS-Tunnel-backups.git}"
 SRC_REPO="${CADS_SRC_REPO:-https://github.com/scimbe/CADS-Tunnel.git}"
 PASSFILE="${CADS_BACKUP_PASSFILE:-/home/becke/.config/cads-backup/passphrase}"
@@ -56,6 +59,15 @@ log "Snapshot: $(basename "$SNAP")"
 mkdir -p "$WORK/state"
 gpg --batch --quiet --decrypt --passphrase-file "$PASSFILE" "$SNAP" \
   | tar xz -C "$WORK/state" || die "Entschlüsselung fehlgeschlagen (falsche Passphrase?)"
+
+# The same required-member list backup-verify.sh checks against
+# (scripts/lib-backup.sh) -- a snapshot verify declared "wiederherstellbar"
+# must never then fail restore partway through on a member verify never
+# actually looked for.
+for f in "${CADS_BACKUP_REQUIRED_MEMBERS[@]}"; do
+  [ -f "$WORK/state/$f" ] || die "$f fehlt im Snapshot ($WORK/state/$f) -- siehe scripts/lib-backup.sh fuer die Pflichtliste"
+done
+
 COMMIT=$(python3 -c "import json;print(json.load(open('$WORK/state/MANIFEST.json'))['cads_tunnel_commit'])" 2>/dev/null || echo "")
 log "Snapshot gehört zu Quell-Commit ${COMMIT:0:12}"
 
@@ -85,19 +97,18 @@ docker compose -f "$SRC/docker/deploy/compose.selfhost.yml" \
   --env-file "$SRC/docker/deploy/.env" down 2>/dev/null || true
 
 log "Secrets und Zertifikate zurückspielen"
-# Same silent-gap shape as #624 (backup-selfhost.sh), mirrored here: a bare
-# `[ -f X ] && action` does not trip `set -e` when the guard itself is false,
-# so a snapshot missing deploy.env or certs.tar.gz used to let this continue
-# silently -- and here the consequence is worse than on the backup side: the
-# restore would go on to call deploy-selfhost.sh below with NO deploy.env in
-# place, which can auto-generate a FRESH one with brand-new secrets. The
-# restore would then report success (readyz 200) while actually being a
-# differently-keyed deployment than the one being restored -- indistinguishable
-# from a real restore until something downstream (an OIDC client secret, a
-# pinned cert) mismatches. Guard failures are now fatal, matching #624.
-[ -f "$WORK/state/deploy.env" ] || die "deploy.env fehlt im Snapshot ($WORK/state/deploy.env) -- Wiederherstellung wuerde ohne die Original-Secrets weiterlaufen"
+# #624: a bare `[ -f X ] && action` does not trip `set -e` when the guard itself
+# is false, so a snapshot missing deploy.env or certs.tar.gz used to let this
+# continue silently -- and here the consequence is worse than on the backup
+# side: the restore would go on to call deploy-selfhost.sh below with NO
+# deploy.env in place, which can auto-generate a FRESH one with brand-new
+# secrets. The restore would then report success (readyz 200) while actually
+# being a differently-keyed deployment than the one being restored --
+# indistinguishable from a real restore until something downstream (an OIDC
+# client secret, a pinned cert) mismatches. Both files are now covered by the
+# required-member check right after decryption above, so by the time we get
+# here they are guaranteed present.
 install -m 600 "$WORK/state/deploy.env" "$SRC/docker/deploy/.env"
-[ -f "$WORK/state/certs.tar.gz" ] || die "certs.tar.gz fehlt im Snapshot ($WORK/state/certs.tar.gz) -- Wiederherstellung waere ohne die BYO-Zertifikate unvollstaendig"
 tar xzf "$WORK/state/certs.tar.gz" -C "$CERT_PARENT"
 
 log "Volumes zurückspielen"
