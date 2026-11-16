@@ -47,11 +47,12 @@ fn noise_io(e: snow::Error) -> io::Error {
 /// [`a2a_respond`] has any internal timeout of its own on the peer's handshake response --
 /// they rely entirely on whatever the caller wraps them in, and until now gave no visibility
 /// into whether/how long that read was actually blocked. Silent unless `CT_DEBUG_A2A_TIMING`
-/// is set (any value), so normal operation is unaffected; the env check only runs once per
-/// handshake, not a hot path. Callers needing this in a long-running process (not a one-shot
-/// CLI process like ct-agent) should cache the env lookup themselves.
+/// is set (any value), so normal operation is unaffected; the result is cached after the
+/// first check since this is read on every message of a long-running session, not just
+/// once per handshake.
 fn debug_a2a_timing_enabled() -> bool {
-    std::env::var_os("CT_DEBUG_A2A_TIMING").is_some()
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CT_DEBUG_A2A_TIMING").is_some())
 }
 
 /// Initiator half of the A2A handshake: run `Noise_IK` over `(send, recv)` pinning the
