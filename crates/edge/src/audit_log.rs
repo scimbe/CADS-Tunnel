@@ -127,6 +127,25 @@ impl SqliteAuditLog {
             .execute("DELETE FROM conn_audit WHERE ts < ?1", params![cutoff])
     }
 
+    /// #1065: like [`Self::prune_older_than`], but deletes at most `batch` rows per
+    /// statement, releasing the connection mutex between batches -- a large backlog
+    /// (after a long downtime, or a shortened retention window) no longer holds the
+    /// mutex `record` also takes for one unbounded `DELETE`. Returns the total count
+    /// removed.
+    fn prune_older_than_batched(&self, cutoff: i64, batch: usize) -> rusqlite::Result<usize> {
+        let mut total = 0;
+        loop {
+            let n = self.conn.lock_safe().execute(
+                "DELETE FROM conn_audit WHERE id IN (SELECT id FROM conn_audit WHERE ts < ?1 LIMIT ?2)",
+                params![cutoff, batch as i64],
+            )?;
+            total += n;
+            if n < batch {
+                return Ok(total);
+            }
+        }
+    }
+
     #[cfg(test)]
     fn row_count(&self) -> rusqlite::Result<i64> {
         self.conn
@@ -135,6 +154,10 @@ impl SqliteAuditLog {
     }
 }
 
+/// #1065: rows deleted per statement by the retention sweep's batched prune --
+/// bounds how long any single `DELETE` holds [`SqliteAuditLog`]'s connection mutex.
+const PRUNE_BATCH_SIZE: usize = 5000;
+
 /// #603: periodic retention sweep, deleting `conn_audit` rows older than
 /// `window_secs`. No scheduled prune/retention job exists anywhere else in this
 /// codebase's production code today (the one prune function that does,
@@ -142,6 +165,12 @@ impl SqliteAuditLog {
 /// test) -- this is genuinely new infrastructure, though its shape (interval ticker
 /// + delete, raced against shutdown) matches the reap loops already spawned in
 /// `serve::run_edge`.
+///
+/// #1065: the batched delete runs on `spawn_blocking` rather than directly on this
+/// async task -- the DELETE is a blocking SQLite call sharing a mutex with `record`
+/// on the accept path, and a large first sweep (after a long downtime, or a
+/// shortened window) deleting its whole backlog in one statement would otherwise
+/// stall a Tokio worker and every concurrent `record` call for the duration.
 pub async fn run_audit_retention_loop(
     log: Arc<SqliteAuditLog>,
     window_secs: i64,
@@ -154,10 +183,13 @@ pub async fn run_audit_retention_loop(
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {
                 let cutoff = now_secs().saturating_sub(window_secs);
-                match log.prune_older_than(cutoff) {
-                    Ok(n) if n > 0 => eprintln!("ct-edge: audit-log retention pruned {n} row(s) older than {window_secs}s (#603)"),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("ct-edge: audit-log retention sweep failed: {e} (#603)"),
+                let log = log.clone();
+                let result = tokio::task::spawn_blocking(move || log.prune_older_than_batched(cutoff, PRUNE_BATCH_SIZE)).await;
+                match result {
+                    Ok(Ok(n)) if n > 0 => eprintln!("ct-edge: audit-log retention pruned {n} row(s) older than {window_secs}s (#603)"),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("ct-edge: audit-log retention sweep failed: {e} (#603)"),
+                    Err(e) => eprintln!("ct-edge: audit-log retention sweep task panicked: {e} (#603)"),
                 }
             }
         }
@@ -225,6 +257,24 @@ mod tests {
 
         // A second prune with the same cutoff finds nothing new to remove.
         assert_eq!(s.prune_older_than(1_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_older_than_batched_spans_multiple_batches_and_keeps_newer_rows() {
+        let s = store();
+        let batch = 3usize;
+        for i in 0..10 {
+            s.record(ConnTransport::FrontDoorTls, ip(10, 0, 0, 1), 500, Some(&format!("old-{i}")), None, None).unwrap();
+        }
+        s.record(ConnTransport::FrontDoorTls, ip(10, 0, 0, 2), 1_500, Some("new"), None, None).unwrap();
+
+        assert_eq!(
+            s.prune_older_than_batched(1_000, batch).unwrap(),
+            10,
+            "every old row is removed across multiple batches smaller than the total"
+        );
+        assert_eq!(s.row_count().unwrap(), 1, "the newer row survives");
+        assert_eq!(s.prune_older_than_batched(1_000, batch).unwrap(), 0, "nothing left to prune");
     }
 
     #[cfg(unix)]
