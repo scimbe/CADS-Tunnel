@@ -557,6 +557,26 @@ pub enum AgentKeyReason {
 }
 
 impl AgentKeyReason {
+    /// Every reason, in render order. A reason added here can no longer be
+    /// silently missing from `/metrics` (same pattern as
+    /// [`TcpDeliverWaitOutcome::ALL`]).
+    pub const ALL: [Self; 14] = [
+        Self::Unproven,
+        Self::UnprovenBesideProven,
+        Self::SecondUnproven,
+        Self::UnprovenTcp,
+        Self::ForeignKey,
+        Self::StaleBinding,
+        Self::BindingToken,
+        Self::BadBinding,
+        Self::BadProof,
+        Self::Expired,
+        Self::Timeout,
+        Self::Oversize,
+        Self::EvictedOnEnforce,
+        Self::Revoked,
+    ];
+
     /// Stable snake_case wire name for the log line and the snapshot.
     pub fn as_str(self) -> &'static str {
         match self {

@@ -47,29 +47,13 @@ pub fn render_edge_metrics<H: Clone>(
     // One line per `AgentKeyReason`, summed across every tracked tunnel --
     // never a per-tunnel identifier (the hash prefix stays admin-only).
     let agent_key_violations = {
-        use crate::state::AgentKeyReason::*;
-        let reasons = [
-            Unproven,
-            UnprovenBesideProven,
-            SecondUnproven,
-            UnprovenTcp,
-            ForeignKey,
-            StaleBinding,
-            BindingToken,
-            BadBinding,
-            BadProof,
-            Expired,
-            Timeout,
-            Oversize,
-            EvictedOnEnforce,
-            Revoked,
-        ];
+        use crate::state::AgentKeyReason;
         let mut s = String::from(
             "# HELP ct_edge_agent_key_violations_total Agent-key policy observations since \
              start, by reason, summed across every tracked tunnel.\n\
              # TYPE ct_edge_agent_key_violations_total counter\n",
         );
-        for reason in reasons {
+        for reason in AgentKeyReason::ALL {
             s.push_str(&format!(
                 "ct_edge_agent_key_violations_total{{reason=\"{}\"}} {}\n",
                 reason.as_str(),
@@ -1596,5 +1580,19 @@ mod tests {
             ),
             "no per-tunnel identifier leaks into the export"
         );
+    }
+
+    // trace: #1036 -- a reason added to `AgentKeyReason` can no longer be
+    // silently missing from the renderer, since both read the same `ALL`.
+    #[test]
+    fn agent_key_violations_metric_renders_one_row_per_all_reason() {
+        use crate::state::AgentKeyReason;
+        let state: EdgeState<u32> = EdgeState::new();
+        let body = render_edge_metrics(&state, None);
+        let row_count = body
+            .lines()
+            .filter(|line| line.starts_with("ct_edge_agent_key_violations_total{"))
+            .count();
+        assert_eq!(row_count, AgentKeyReason::ALL.len());
     }
 }
