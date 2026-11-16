@@ -655,10 +655,6 @@ mod tests {
         let _ = srv.await;
     }
 
-    /// #500 K2: the channel acceptor's ALPN preference order IS the keepalive
-    /// negotiation -- prove all four old/new x plain/boring combinations against a REAL
-    /// TLS handshake: a KA-capable plain client lands on `-ka`, an old plain client on
-    /// the bare id; a KA-capable boring client's [h2, http/1.1] offer is deliberately
     /// Wire-Probe (#495 U2): ALPN taugt auf dem QUIC-Kanal-Pfad NICHT als Faehigkeits-Traeger.
     ///
     /// Der Server (`build_server_endpoint_from_ca`) setzt heute KEINE `alpn_protocols`. Die
@@ -670,7 +666,10 @@ mod tests {
     #[tokio::test]
     async fn quic_channel_endpoint_and_an_alpn_offering_client_495_u2() {
         use quinn::{ClientConfig, Endpoint};
-        let ca = Ca::load_or_create(&format!("{}/probe-ca.key", std::env::temp_dir().display()), "probe-ca").expect("ca");
+        let dir = std::env::temp_dir().join(format!("probe-ca-495-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("probe-ca.key").to_string_lossy().into_owned();
+        let ca = Ca::load_or_create(&key_path, "probe-ca").expect("ca");
         let (server, cert) = build_server_endpoint_from_ca(&ca, "127.0.0.1:0".parse().unwrap(), vec!["localhost".to_string()]).expect("server");
         let addr = server.local_addr().expect("addr");
         // Die eingehende Verbindung muss ANGENOMMEN werden -- ein verworfenes `Incoming`
@@ -751,7 +750,13 @@ mod tests {
              Faehigkeits-Traeger fuer #495 U2 wieder im Spiel: {:?}",
             rb.ok().map(|_| "verbunden")
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// #500 K2: the channel acceptor's ALPN preference order IS the keepalive
+    /// negotiation -- prove all four old/new x plain/boring combinations against a REAL
+    /// TLS handshake: a KA-capable plain client lands on `-ka`, an old plain client on
+    /// the bare id; a KA-capable boring client's [h2, http/1.1] offer is deliberately
     /// answered with `http/1.1` (the camouflage-preserving KA signal), an old boring
     /// client's [h2]-only offer stays on `h2`.
     #[tokio::test]
