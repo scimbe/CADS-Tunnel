@@ -90,6 +90,7 @@ mod tests {
     use super::*;
     use ct_common::noise::{direct_handshake_payload, generate_static_keypair, origin_handshake};
     use ct_common::{OriginIdentity, RoutingToken};
+    use tokio::io::AsyncReadExt;
 
     /// Origin responder over the server half of a duplex: terminate Noise_IK,
     /// echo one encrypted frame back, and return the **message-1 payload** it
