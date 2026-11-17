@@ -135,23 +135,11 @@ async fn read_exact_timed<S: AsyncReadExt + Unpin>(stream: &mut S, buf: &mut [u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{CLASS_IN, TYPE_TXT};
+    use crate::message::TYPE_TXT;
 
     /// Minimal raw TXT query for `name`.
     fn txt_query(id: u16, name: &str) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&id.to_be_bytes());
-        b.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD
-        b.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-        b.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        for label in name.split('.') {
-            b.push(label.len() as u8);
-            b.extend_from_slice(label.as_bytes());
-        }
-        b.push(0);
-        b.extend_from_slice(&TYPE_TXT.to_be_bytes());
-        b.extend_from_slice(&CLASS_IN.to_be_bytes());
-        b
+        message::build_query(id, name, TYPE_TXT)
     }
 
     #[test]

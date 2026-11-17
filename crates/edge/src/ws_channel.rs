@@ -289,10 +289,7 @@ impl WsChannelState {
             );
             loop {
                 tick.tick().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now = ct_common::time::now_secs();
                 let expired = reaper_pairer.lock_safe().drain_expired(now); // #497: poison-resilient
                 // Same per-member identification as the front-door reaper (serve.rs):
                 // channel/holder hex are public grant fields, and a repeated lone-member
@@ -434,10 +431,7 @@ async fn handle_ws_channel_join(
     // correlates through the SAME pairer a `:443`/QUIC member offers itself to --
     // either can now be the partner.
     let stream: crate::channel_broker::BoxedChannelStream = Box::pin(WsByteStream::new(socket));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = ct_common::time::now_secs();
     // `observed` (the member's reflexive source address) has no meaning for a browser
     // leg the same way it does for a dialable UDP/TCP peer -- a browser is always
     // relay-only from the edge's perspective (WebSocket, always via the server), so a
@@ -486,10 +480,7 @@ async fn handle_ws_channel_join(
             // legitimate peer's budget, only "this can never succeed by retrying".
             if let (Some(p), Some(ip)) = (&state.penalty, peer_ip) {
                 if crate::channel_broker::is_definitive_join_refusal(&e) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
+                    let now = ct_common::time::now_secs();
                     if p.note_definitive_refusal(ip, now) {
                         eprintln!(
                             "ct-edge: channel-join penalty engaged for {ip} (ws) — definitive-refusal budget exhausted; shedding its joins pre-handshake for the rest of the window"
@@ -573,10 +564,7 @@ async fn serve_with_optional_tls(
             // a shed costs the edge almost nothing. Until this existed, :4437 was the one
             // publicly reachable channel-join transport with no per-IP budget at all.
             if let Some(p) = &penalty {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now = ct_common::time::now_secs();
                 if p.penalized(addr.ip(), now) {
                     let total = p.note_shed();
                     if total.is_power_of_two() || total % 1000 == 0 {
@@ -1079,10 +1067,7 @@ mod tests {
         // budget works, not that this listener consults it.
         let penalty = Arc::new(crate::state::JoinRefusalPenalty::new());
         let ip: std::net::IpAddr = [127, 0, 0, 1].into();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = ct_common::time::now_secs();
         // Exhaust the budget the way real refusals would, then confirm the precondition --
         // otherwise a gate that never fires would look like a gate that works.
         for _ in 0..64 {

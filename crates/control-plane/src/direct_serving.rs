@@ -114,6 +114,11 @@ pub async fn probe_reachable(endpoint: &str) -> bool {
     )
 }
 
+/// #1061: how many endpoints [`sweep_probes`] probes concurrently. Bounded so a sweep
+/// over a large fleet still has a predictable worst-case number of in-flight TCP
+/// connect attempts, rather than one per candidate at once.
+const PROBE_FANOUT: usize = 16;
+
 /// #517 V3 slice 3: one probe sweep. For every direct-serving-enabled tunnel,
 /// probe its endpoint, fold the result through the hysteresis machine, and persist
 /// the new state -- returning the (tunnel_id, hostname, action) list so the caller
@@ -122,10 +127,18 @@ pub async fn probe_reachable(endpoint: &str) -> bool {
 /// production behind its env gate with no live-routing effect. `now` is injected
 /// for deterministic tests. Best-effort per tunnel -- a probe or a DB write for
 /// one tunnel never aborts the sweep for the rest.
+///
+/// #1061: probes run concurrently (bounded by [`PROBE_FANOUT`]) instead of one at a
+/// time -- sequential probing of N dead endpoints cost `N * PROBE_CONNECT_TIMEOUT`,
+/// which could exceed the tick interval for a large fleet. Persistence (and the
+/// returned action order) stays in candidate order regardless of probe completion
+/// order.
 pub async fn sweep_probes(
     tunnels: &crate::storage::SqliteTunnelStore,
     now: u64,
 ) -> Vec<(String, String, DirectServingAction)> {
+    use futures::stream::{self, StreamExt};
+
     let candidates = match tunnels.direct_serving_candidates() {
         Ok(c) => c,
         Err(e) => {
@@ -133,9 +146,18 @@ pub async fn sweep_probes(
             return Vec::new();
         }
     };
+    let mut probed: Vec<_> = stream::iter(candidates.into_iter().enumerate())
+        .map(|(idx, (tunnel_id, hostname, endpoint, state))| async move {
+            let reachable = probe_reachable(&endpoint).await;
+            (idx, tunnel_id, hostname, state, reachable)
+        })
+        .buffer_unordered(PROBE_FANOUT)
+        .collect()
+        .await;
+    probed.sort_by_key(|(idx, ..)| *idx);
+
     let mut actions = Vec::new();
-    for (tunnel_id, hostname, endpoint, state) in candidates {
-        let reachable = probe_reachable(&endpoint).await;
+    for (_, tunnel_id, hostname, state, reachable) in probed {
         let (next, action) = fold_probe(state, reachable);
         if let Err(e) = tunnels.record_direct_probe(&tunnel_id, next, now) {
             eprintln!("ct-cp: direct-serving: persisting probe for {tunnel_id} failed: {e}");
@@ -155,10 +177,7 @@ pub async fn sweep_probes(
 /// observable before it ever touches a live record.
 pub async fn run_probe_loop(tunnels: std::sync::Arc<crate::storage::SqliteTunnelStore>, tick: std::time::Duration) -> ! {
     loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = ct_common::time::now_secs();
         for (tunnel_id, hostname, action) in sweep_probes(&tunnels, now).await {
             eprintln!("ct-cp: direct-serving: {action:?} for {hostname} (tunnel {tunnel_id}) — DNS wiring pending (slice 4)");
         }
