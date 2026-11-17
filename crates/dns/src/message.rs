@@ -232,22 +232,24 @@ fn encode_name(out: &mut Vec<u8>, name: &str) {
 mod tests {
     use super::*;
 
-    /// Build a raw query datagram for `name` / `qtype`.
-    fn query_bytes(id: u16, name: &str, qtype: u16) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&id.to_be_bytes());
-        b.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD
-        b.extend_from_slice(&1u16.to_be_bytes()); // qdcount
-        b.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // an/ns/ar counts
-        encode_name(&mut b, name);
-        b.extend_from_slice(&qtype.to_be_bytes());
-        b.extend_from_slice(&CLASS_IN.to_be_bytes());
-        b
-    }
-
+    /// Independent of `encode_name`/`build_query`: a literal, hand-laid-out query
+    /// datagram for "_acme-challenge.Example.Org"/TXT, so a symmetric bug in the shared
+    /// encoder can't hide from the parser test.
     #[test]
     fn parse_query_reads_the_question() {
-        let q = parse_query(&query_bytes(0x1234, "_acme-challenge.Example.Org", TYPE_TXT)).unwrap();
+        let raw: &[u8] = &[
+            0x12, 0x34, // id
+            0x01, 0x00, // flags: RD
+            0x00, 0x01, // qdcount
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // an/ns/ar counts
+            15, b'_', b'a', b'c', b'm', b'e', b'-', b'c', b'h', b'a', b'l', b'l', b'e', b'n', b'g', b'e',
+            7, b'E', b'x', b'a', b'm', b'p', b'l', b'e',
+            3, b'O', b'r', b'g',
+            0, // name terminator
+            0x00, 0x10, // qtype: TXT
+            0x00, 0x01, // qclass: IN
+        ];
+        let q = parse_query(raw).unwrap();
         assert_eq!(q.id, 0x1234);
         assert_eq!(q.name, "_acme-challenge.example.org", "lowercased");
         assert_eq!(q.qtype, TYPE_TXT);
@@ -259,14 +261,14 @@ mod tests {
         assert!(parse_query(b"").is_none());
         assert!(parse_query(&[0u8; 8]).is_none(), "shorter than a header");
         // A compression pointer where the qname must start is rejected.
-        let mut b = query_bytes(1, "x.test", TYPE_TXT);
+        let mut b = build_query(1, "x.test", TYPE_TXT);
         b[12] = 0xC0;
         assert!(parse_query(&b).is_none());
     }
 
     #[test]
     fn build_response_carries_the_txt_answer() {
-        let q = parse_query(&query_bytes(0xABCD, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let q = parse_query(&build_query(0xABCD, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
         let resp = build_response(&q, &["token-value-123".to_string()]);
         // Header: echoed id, QR+AA set, one answer.
         assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0xABCD);
@@ -291,7 +293,7 @@ mod tests {
         // #299: many/large TXT answers must not produce an oversized UDP datagram with
         // TC=0 -- resolvers that strictly honor TC never retry over TCP for one, and a
         // plain IP layer can fragment/drop it outright, both breaking DNS-01 validation.
-        let q = parse_query(&query_bytes(0x1234, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let q = parse_query(&build_query(0x1234, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
         // Twenty ~200-byte TXT values -- the full set is far over 512 bytes.
         let txts: Vec<String> = (0..20).map(|i| format!("{i:03}-{}", "x".repeat(200))).collect();
         let resp = build_response(&q, &txts);
@@ -312,7 +314,7 @@ mod tests {
     fn build_response_does_not_truncate_when_the_answer_set_fits_299() {
         // The common case (a handful of small TXT values, the actual ACME DNS-01 shape)
         // must be completely unaffected by the truncation logic.
-        let q = parse_query(&query_bytes(1, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let q = parse_query(&build_query(1, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
         let resp = build_response(&q, &["a-normal-challenge-token".to_string()]);
         assert_eq!(resp[2] & 0x02, 0, "TC bit NOT set");
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "the one answer is present");
@@ -325,7 +327,7 @@ mod tests {
         // straight into `rr` with a backpatched length instead of via a separate `rdata`
         // Vec). A 300-byte value must split into two DNS character-strings (255 + 45)
         // with a correctly backpatched rdlength spanning both, and round-trip intact.
-        let q = parse_query(&query_bytes(0x42, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let q = parse_query(&build_query(0x42, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
         let long_value = "y".repeat(300);
         let resp = build_response(&q, &[long_value.clone()]);
 
@@ -359,12 +361,12 @@ mod tests {
 
     #[test]
     fn build_response_is_empty_for_a_non_txt_or_unknown_name() {
-        let q = parse_query(&query_bytes(1, "host.test", TYPE_TXT)).unwrap();
+        let q = parse_query(&build_query(1, "host.test", TYPE_TXT)).unwrap();
         // Unknown name -> NOERROR with zero answers.
         let resp = build_response(&q, &[]);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "no answers");
         // Non-TXT question -> no answers even if TXT values exist.
-        let a = parse_query(&query_bytes(1, "host.test", 1 /* A */)).unwrap();
+        let a = parse_query(&build_query(1, "host.test", 1 /* A */)).unwrap();
         let resp = build_response(&a, &["ignored".to_string()]);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "TXT not served for an A query");
     }

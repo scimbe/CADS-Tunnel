@@ -199,10 +199,7 @@ async fn serve_listener_with_tick<F, Fut>(
     loop {
         if let Some(hb) = &heartbeat {
             hb.beat(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                ct_common::time::now_secs(),
             );
         }
         let (stream, addr) = tokio::select! {
