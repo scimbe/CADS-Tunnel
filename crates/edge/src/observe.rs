@@ -47,29 +47,13 @@ pub fn render_edge_metrics<H: Clone>(
     // One line per `AgentKeyReason`, summed across every tracked tunnel --
     // never a per-tunnel identifier (the hash prefix stays admin-only).
     let agent_key_violations = {
-        use crate::state::AgentKeyReason::*;
-        let reasons = [
-            Unproven,
-            UnprovenBesideProven,
-            SecondUnproven,
-            UnprovenTcp,
-            ForeignKey,
-            StaleBinding,
-            BindingToken,
-            BadBinding,
-            BadProof,
-            Expired,
-            Timeout,
-            Oversize,
-            EvictedOnEnforce,
-            Revoked,
-        ];
+        use crate::state::AgentKeyReason;
         let mut s = String::from(
             "# HELP ct_edge_agent_key_violations_total Agent-key policy observations since \
              start, by reason, summed across every tracked tunnel.\n\
              # TYPE ct_edge_agent_key_violations_total counter\n",
         );
-        for reason in reasons {
+        for reason in AgentKeyReason::ALL {
             s.push_str(&format!(
                 "ct_edge_agent_key_violations_total{{reason=\"{}\"}} {}\n",
                 reason.as_str(),
@@ -78,6 +62,9 @@ pub fn render_edge_metrics<H: Clone>(
         }
         s
     };
+    let (relay_bytes_browser, relay_bytes_dataplane, relay_bytes_tcp_fallback) =
+        state.relay_bytes_by_kind();
+    let (channel_relay_bytes, channel_splices) = crate::channel_broker::channel_relay_totals();
     let mut out = format!(
         "# HELP ct_edge_active_tunnels Distinct routing tokens with at least one live agent.\n\
          # TYPE ct_edge_active_tunnels gauge\n\
@@ -178,11 +165,11 @@ completely, while both at 0 means nothing was measured, not that offload succeed
         agent_key_violations = agent_key_violations,
         relays = state.relays_total(),
         relay_bytes = state.relay_bytes_total(),
-        relay_bytes_browser = state.relay_bytes_by_kind().0,
-        relay_bytes_dataplane = state.relay_bytes_by_kind().1,
-        relay_bytes_tcp_fallback = state.relay_bytes_by_kind().2,
-        channel_relay_bytes = crate::channel_broker::channel_relay_totals().0,
-        channel_splices = crate::channel_broker::channel_relay_totals().1,
+        relay_bytes_browser = relay_bytes_browser,
+        relay_bytes_dataplane = relay_bytes_dataplane,
+        relay_bytes_tcp_fallback = relay_bytes_tcp_fallback,
+        channel_relay_bytes = channel_relay_bytes,
+        channel_splices = channel_splices,
         channel_pairs = crate::channel_broker::channel_rendezvous_pairs_total(),
         channel_park_reaped = crate::channel_broker::channel_park_reaped_total(),
         channel_park_superseded = crate::channel_broker::channel_park_superseded_total(),
@@ -1596,5 +1583,19 @@ mod tests {
             ),
             "no per-tunnel identifier leaks into the export"
         );
+    }
+
+    // trace: #1036 -- a reason added to `AgentKeyReason` can no longer be
+    // silently missing from the renderer, since both read the same `ALL`.
+    #[test]
+    fn agent_key_violations_metric_renders_one_row_per_all_reason() {
+        use crate::state::AgentKeyReason;
+        let state: EdgeState<u32> = EdgeState::new();
+        let body = render_edge_metrics(&state, None);
+        let row_count = body
+            .lines()
+            .filter(|line| line.starts_with("ct_edge_agent_key_violations_total{"))
+            .count();
+        assert_eq!(row_count, AgentKeyReason::ALL.len());
     }
 }

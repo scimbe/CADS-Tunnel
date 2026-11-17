@@ -48,7 +48,7 @@ serde = { version = "1", features = ["derive"] }
 # persistence. Same version/features as control-plane's own rusqlite pin
 # (crates/control-plane/Cargo.toml) for consistency, even though the two crates share
 # no DB file (separate processes, each opens its own).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 # JA4 TLS ClientHello fingerprinting (ja4.rs): JA4_b/JA4_c are truncated SHA256
 # hashes per the FoxIO spec. Already resolved in the workspace lockfile as a
 # transitive dependency via ct-common (crates/common/Cargo.toml pins the same

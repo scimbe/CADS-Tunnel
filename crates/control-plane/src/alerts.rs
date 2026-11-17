@@ -78,7 +78,11 @@ const MIN_THRESHOLD_MINUTES: i64 = 1;
 const MAX_THRESHOLD_MINUTES: i64 = 7 * 24 * 60;
 /// Delivery rows the tunnel card shows.
 const CARD_DELIVERIES: u32 = 5;
-const RATE_LIMIT_DETAIL: &str = "rate limit: at most 20 deliveries per hour per account";
+/// The delivery-log detail / 429 body for a rate-limited delivery, derived from
+/// [`MAX_DELIVERIES_PER_HOUR`] so the number cannot drift from the actual budget.
+fn rate_limit_detail() -> String {
+    format!("rate limit: at most {MAX_DELIVERIES_PER_HOUR} deliveries per hour per account")
+}
 
 /// What a delivery announces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +194,13 @@ pub(crate) fn delivery_http_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The shared client for one-off deliveries outside the loop (the portal's Test
+/// button), built once instead of per request.
+fn shared_delivery_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(delivery_http_client)
+}
+
 /// POST `payload` to `url`, signed with `secret`, up to `attempts` times with
 /// [`BACKOFF`] between attempts. The signed timestamp is `payload.sent_at`.
 pub(crate) async fn deliver(
@@ -292,6 +303,11 @@ impl EdgeProbe {
     /// could be asked neither way (never treated as "down" by the caller).
     pub(crate) async fn tunnel_up(&self, routing_token_hex: &str) -> Option<bool> {
         let status = self.get_json::<EdgeStatusResp>(&format!("/admin/tunnel-status/{routing_token_hex}"), &[]).await;
+        if status.as_ref().map(|s| s.connected) == Some(true) {
+            // Already up per the cheaper check -- the history lookup can only confirm
+            // the same answer, so skip it.
+            return Some(true);
+        }
         let history = self
             .get_json::<EdgeHistoryResp>(&format!("/internal/tunnel/history/{routing_token_hex}"), &[("limit", 1)])
             .await;
@@ -471,7 +487,7 @@ fn record_skipped_once(store: &SqliteTunnelStore, row: &AlertRow, event: AlertEv
     if last.map(|d| d.status == "skipped" && d.event == event.wire()).unwrap_or(false) {
         return;
     }
-    let _ = store.record_delivery(&row.alert.tunnel_id, now, event.wire(), "skipped", Some(RATE_LIMIT_DETAIL));
+    let _ = store.record_delivery(&row.alert.tunnel_id, now, event.wire(), "skipped", Some(rate_limit_detail().as_str()));
 }
 
 /// `scheme://host[:port]` of a webhook URL -- the only part of it that ever appears in
@@ -599,10 +615,10 @@ pub(crate) async fn test_alert(
     let now = unix_now();
     if rate_limited(store, &claims.subject, now) {
         record_skipped_once(store, &row, AlertEvent::Test, now);
-        return (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_DETAIL).into_response();
+        return (StatusCode::TOO_MANY_REQUESTS, rate_limit_detail()).into_response();
     }
     let payload = AlertPayload::new(AlertEvent::Test, &row, row.alert.state_since, now);
-    let outcome = deliver(&delivery_http_client(), &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
+    let outcome = deliver(shared_delivery_http_client(), &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
     let recorded =
         store.record_delivery(tunnel_id, now, AlertEvent::Test.wire(), outcome.status(), Some(&outcome.detail));
     if let Err(e) = recorded {
@@ -729,7 +745,7 @@ fn card_html(tunnel_id: &str, alert: Option<&TunnelAlert>, deliveries: &[AlertDe
 {actions}
 {log}
 <p class="help">Sends a signed <code>tunnel.down</code> once this tunnel has been unreachable for the threshold, and
-<code>tunnel.up</code> when it is back. Checked once a minute; at most 20 deliveries per hour per account.</p>
+<code>tunnel.up</code> when it is back. Checked once a minute; at most {MAX_DELIVERIES_PER_HOUR} deliveries per hour per account.</p>
 </details>"#
     )
 }
@@ -918,7 +934,7 @@ mod tests {
         let a = store.alert_for("alice", &id).unwrap().unwrap();
         assert_eq!(a.failures, 0, "a success resets the streak");
         assert_eq!(a.last_delivery_at, Some(100));
-        store.record_delivery(&id, 101, "tunnel.up", "skipped", Some(RATE_LIMIT_DETAIL)).unwrap();
+        store.record_delivery(&id, 101, "tunnel.up", "skipped", Some(rate_limit_detail().as_str())).unwrap();
         assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().failures, 0, "skipped leaves the streak alone");
     }
 
@@ -1096,7 +1112,7 @@ mod tests {
         assert_eq!(a.state, "unknown", "left un-transitioned to catch up once the window frees");
         let log = store.deliveries_for("alice", &id, 100).unwrap();
         assert_eq!(log.iter().filter(|d| d.status == "skipped").count(), 1);
-        assert_eq!(log[0].detail.as_deref(), Some(RATE_LIMIT_DETAIL));
+        assert_eq!(log[0].detail.as_deref(), Some(rate_limit_detail().as_str()));
         assert!(rate_limited(&store, "alice", now), "a skipped row does not extend the budget");
 
         // An hour later the window has freed and the alert fires.
