@@ -626,6 +626,7 @@ dependencies = [
  "hickory-resolver 0.26.3",
  "http-body-util",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
