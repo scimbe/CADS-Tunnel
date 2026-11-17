@@ -37,7 +37,7 @@ async fn h2_client(proxy_addr: SocketAddr) -> h2::client::SendRequest<Bytes> {
     let (send_request, connection) = h2::client::handshake(client_io).await.unwrap();
     tokio::spawn(connection);
 
-    let mut send_request = send_request.ready().await.unwrap();
+    let send_request = send_request.ready().await.unwrap();
     for _ in 0..50 {
         if send_request.is_extended_connect_protocol_enabled() {
             break;
