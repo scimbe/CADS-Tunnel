@@ -1,0 +1,8 @@
+# Pin the toolchain so CI does not depend on whatever rustc the ubuntu runner image ships.
+# Runner image 20261116 brought a newer rustc that broke -D warnings builds in ct-agent
+# (ct-agent#486). Bump deliberately, together with any lint fixes.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"
