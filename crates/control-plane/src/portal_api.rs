@@ -12556,6 +12556,7 @@ mod tests {
                         acme_home: dir.join("acme-home").to_string_lossy().into_owned(),
                         acme_email: "acme-test@example.com".to_string(),
                         desec_token: Some("t".to_string()),
+                        timeout: std::time::Duration::from_secs(5),
                     },
                     cert_base_dir: dir.join("certs").to_string_lossy().into_owned(),
                 }),
