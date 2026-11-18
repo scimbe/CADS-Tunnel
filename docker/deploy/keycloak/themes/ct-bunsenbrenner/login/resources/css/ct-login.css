@@ -51,7 +51,7 @@ body,
    reads as a dark stripe next to it. Reserving the gutter on both edges keeps the card on the
    window's centre axis whether or not the scrollbar is shown; overlay scrollbars (phones,
    default macOS) ignore this. color-scheme makes that track dark like the page instead of a
-   light slab (html[data-look=daily] sets light again). */
+   light slab. */
 html {
   scrollbar-gutter: stable both-edges;
   color-scheme: dark;
