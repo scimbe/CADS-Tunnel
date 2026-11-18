@@ -385,12 +385,16 @@ pub fn register_auction_tools(
             }
             match crate::channel::match_offer(&offer, &bid, now) {
                 Some(m) => {
-                    // #158: reserve the matched units against the offer's running capacity; refuse the
-                    // match if the offer is already fully booked, so it can't be oversold.
+                    // #158/#966: reserve the matched units against the offer's running capacity,
+                    // releasing automatically once the winning bid's own expiry passes (so a buyer
+                    // that never locks escrow can't book this offer's whole capacity forever); refuse
+                    // the match if the offer is already fully (live-)booked, so it can't be oversold.
+                    // Keyed by match_ref, so resubmitting the identical signed bid is idempotent
+                    // rather than committing the same units a second time.
                     if !commitments
                         .lock()
                         .map_err(|_| "auction commitments lock poisoned")?
-                        .commit(&offer, m.units)
+                        .commit(&offer, m.match_ref, m.units, bid.expires_at, now)
                     {
                         return Err(
                             "offer capacity already committed to prior matches — not enough units remain"
