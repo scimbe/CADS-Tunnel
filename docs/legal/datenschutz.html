@@ -73,6 +73,18 @@ Rechtsverfolgung erforderlich, sowie für die Wetterkarte nach Punkt 12.
 Konto- und Betriebsmetadaten werden gespeichert, solange ein Konto besteht bzw. eine gesetzliche
 Aufbewahrungspflicht besteht; Server-Logfiles werden nach angemessener Zeit gelöscht.
 </p>
+<p>
+Sofern der Betreiber dies aktiviert hat, führt der Tunnel-Edge zusätzlich ein minimales, ausschließlich
+lokal auf dem Host vorhandenes Protokoll der angenommenen Verbindungen — Zeitstempel, Quell-IP-Adresse,
+Transportart sowie das an anderer Stelle bereits zur Autorisierung verwendete Routing-Token bzw. die
+Kanal-Kennung — zu eigenen Beweiszwecken des Betreibers (zum Beispiel, um gegenüber einer zuständigen
+Behörde nachzuweisen, dass eine weitergeleitete Sitzung von einem echten Client stammt und nicht von der
+Adresse des Edge selbst). Inhalte von Anfragen, Header-Daten oder User-Agent-Informationen werden dabei
+nicht erfasst. Dieses Protokoll ist über keine netzwerkseitig erreichbare Schnittstelle zugänglich; der
+Zugriff ist ausschließlich durch direkten, lokalen Zugang zum Server des Betreibers möglich. Einträge
+werden standardmäßig nach 7 Tagen automatisch gelöscht, sofern der Betreiber keine abweichende
+Aufbewahrungsfrist konfiguriert hat.
+</p>
 
 <h2>10. Ihre Rechte</h2>
 <p>
