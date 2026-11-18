@@ -108,6 +108,14 @@ pub async fn probe_reachable(endpoint: &str) -> bool {
         Ok(a) => a,
         Err(_) => return false, // a malformed endpoint can never be reachable
     };
+    // #970: without this, a loopback/RFC1918/link-local endpoint is dialed from the
+    // control plane like any other -- the probe itself becomes an internal
+    // port-scan oracle for whoever controls the tunnel's configured endpoint.
+    // upgrade.rs's offered_endpoint_is_safe already guards the same class of
+    // peer-supplied endpoint; same check, same reasoning.
+    if !ct_common::channel::is_global_unicast(addr) {
+        return false;
+    }
     matches!(
         tokio::time::timeout(PROBE_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await,
         Ok(Ok(_))
@@ -190,45 +198,67 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn sweep_probes_folds_reachability_into_actions_and_persists() {
+    async fn sweep_probes_calls_the_real_prober_and_persists_its_verdict_970() {
+        // #970 changed what this test can prove through a real socket: loopback --
+        // the only kind of "genuinely reachable" address this sandbox can bind to --
+        // is now refused by probe_reachable's own global-unicast guard regardless
+        // of whether anything is listening (see
+        // probe_reachable_refuses_a_loopback_endpoint_even_though_it_is_genuinely_listening_970
+        // and storage::tests::set_direct_serving_refuses_a_non_global_unicast_endpoint_970
+        // for that guard's own dedicated coverage). fold_probe's own tests already
+        // cover every reachable/unreachable state transition with a synthetic bool;
+        // what's left to prove here is that sweep_probes really calls into
+        // probe_reachable (a real socket attempt, not a stub) and persists exactly
+        // what it returns through fold_probe + record_direct_probe -- using the
+        // test-only storage bypass (see its own doc) to get a loopback endpoint
+        // into storage at all, since the real set_direct_serving API now refuses it.
         use crate::storage::{CreateTunnelOutcome, SqliteTunnelStore};
         let store = SqliteTunnelStore::open_in_memory().unwrap();
         let t = match store.create_if_under_owned_limit("s", "svc", Some("svc.example"), 1).unwrap() {
             CreateTunnelOutcome::Created(t) => t,
             other => panic!("{other:?}"),
         };
-        // A live listener as the direct endpoint.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        store.set_direct_serving("s", &t.id, true, Some(&addr.to_string())).unwrap();
+        store.set_direct_serving_endpoint_unchecked_for_test(&t.id, &addr.to_string()).unwrap();
 
-        // First sweep: reachable -> Publish, and the advertised state persists.
-        let actions = sweep_probes(&store, 1_000).await;
-        assert_eq!(actions, vec![(t.id.clone(), "svc.example".to_string(), DirectServingAction::Publish)]);
-        assert_eq!(store.direct_serving("s", &t.id).unwrap(), Some((true, Some(addr.to_string()), true)));
-        // Second sweep still reachable -> Hold (no action emitted).
-        assert!(sweep_probes(&store, 1_030).await.is_empty(), "a steady reachable endpoint emits no action");
-
-        // Endpoint dies: two sweeps to withdraw (hysteresis).
-        drop(listener);
-        assert!(sweep_probes(&store, 1_060).await.is_empty(), "first failure holds");
-        let actions = sweep_probes(&store, 1_090).await;
-        assert_eq!(actions, vec![(t.id.clone(), "svc.example".to_string(), DirectServingAction::Withdraw)]);
-        assert_eq!(store.direct_serving("s", &t.id).unwrap().unwrap().2, false, "no longer advertised");
+        // Never having been advertised, a refused (always-unreachable-via-guard)
+        // probe produces no action yet -- fold_probe's own "never advertised"
+        // rule -- but the real probe really ran and the failure streak persisted.
+        assert!(sweep_probes(&store, 1_000).await.is_empty(), "never-advertised + unreachable emits no action yet");
+        assert_eq!(
+            store.direct_serving_candidates().unwrap()[0].3,
+            DirectServingState { advertised: false, consecutive_failures: 1 },
+            "the real probe's unreachable verdict was folded and persisted"
+        );
+        drop(listener); // the guard refuses it either way -- this changes nothing
+        assert!(sweep_probes(&store, 1_030).await.is_empty());
+        assert_eq!(store.direct_serving_candidates().unwrap()[0].3.consecutive_failures, 2, "the streak keeps advancing across real sweeps");
     }
 
     #[tokio::test]
-    async fn probe_reachable_true_for_a_live_listener_false_for_a_dead_port() {
-        // A live listener accepts -> reachable.
+    async fn probe_reachable_refuses_a_loopback_endpoint_even_though_it_is_genuinely_listening_970() {
+        // #970: without the global-unicast guard, this would otherwise be the
+        // "an accepting port probes reachable" case -- a REAL live listener on
+        // loopback, which the old code would happily dial from the control
+        // plane, turning the probe into an internal port-scan oracle. It must
+        // now be refused outright, which this test proves by using a genuinely
+        // listening port (if the refusal were instead "dead port", this would
+        // still fail the same way for the wrong reason -- the live listener
+        // rules that out).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        assert!(probe_reachable(&addr.to_string()).await, "an accepting port probes reachable");
-        // Its port after close -> connection refused -> unreachable.
+        assert!(!probe_reachable(&addr.to_string()).await, "a loopback endpoint must be refused outright, even though something is genuinely listening there");
         drop(listener);
-        assert!(!probe_reachable(&addr.to_string()).await, "a dead port probes unreachable");
+        // Dead port, same (loopback) address: still refused, same reason either way.
+        assert!(!probe_reachable(&addr.to_string()).await);
         // A malformed endpoint is never reachable (and never panics).
         assert!(!probe_reachable("not-an-addr").await);
         assert!(!probe_reachable("").await);
+        // RFC1918 and link-local are refused the same way as loopback.
+        assert!(!probe_reachable("10.0.0.5:443").await);
+        assert!(!probe_reachable("192.168.1.1:443").await);
+        assert!(!probe_reachable("169.254.169.254:80").await, "cloud metadata address must be refused");
     }
 
     #[test]
