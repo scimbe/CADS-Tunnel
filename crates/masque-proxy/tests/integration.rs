@@ -501,3 +501,51 @@ async fn a_datagram_larger_than_the_clients_flow_control_window_still_arrives_wh
 
     assert_eq!(echoed, udp_payload, "the datagram arrives byte-for-byte even when sent across many capacity-constrained h2 DATA frames");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_completes_the_handshake_and_opens_no_stream_is_closed_after_the_idle_timeout() {
+    // #1009: conn.accept() in serve_connection had no deadline once the h2 handshake
+    // succeeded, so a peer that completed the preface and then opened no stream at
+    // all held the connection -- and this task, and its fd -- open forever. The
+    // admission semaphore (#662, proven above) only gates AUTHENTICATED tunnels, not
+    // this: a caller never even has to present a token to trigger it.
+    let target = spawn_udp_echo_target().await;
+    let idle_timeout = Duration::from_millis(200);
+
+    let listen_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = listen_probe.local_addr().unwrap();
+    drop(listen_probe);
+
+    let config = Config {
+        listen: proxy_addr,
+        target,
+        max_concurrent_tunnels: 4,
+        idle_timeout,
+        shared_token: [0x11u8; 32],
+    };
+    tokio::spawn(masque_proxy::run(config));
+
+    let client_io = 'connect: {
+        for _ in 0..50 {
+            if let Ok(io) = tokio::net::TcpStream::connect(proxy_addr).await {
+                break 'connect io;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("masque-proxy never started accepting on {proxy_addr}");
+    };
+    let (_send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+    // Drive the connection (required for the handshake to actually complete on the
+    // wire) but never open a stream on it.
+    let conn_task = tokio::spawn(connection);
+
+    // Must close on its own within a bounded margin past idle_timeout -- not hang
+    // forever (the pre-fix behavior, which this timeout would otherwise never trip
+    // on and the test would hang rather than fail). Whether the h2 connection driver
+    // itself reports Ok (clean GOAWAY) or Err (abrupt socket close) on the proxy's
+    // side closing it doesn't matter here -- only that it closed at all.
+    let join_result = tokio::time::timeout(idle_timeout * 20, conn_task)
+        .await
+        .expect("the proxy must close an idle, stream-less connection, not hold it open forever");
+    let _ = join_result.unwrap();
+}

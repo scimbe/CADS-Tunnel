@@ -225,11 +225,34 @@ async fn serve_connection(
     // request handler onto its own task lets this loop return to `conn.accept()`
     // immediately, keeping the connection driven continuously for the whole
     // tunnel's lifetime, independent of whatever `handle_request` itself is doing.
-    while let Some(result) = conn.accept().await {
+    // #1009: the handshake above is time-bounded, but conn.accept() itself was not --
+    // a peer that completes the h2 preface and then never opens an authenticated
+    // stream held this task, its TCP connection and fd open indefinitely (the
+    // admission semaphore only gates ADMITTED tunnels, per the #662 comment above,
+    // not raw accepted connections). `active` tracks streams currently being handled
+    // by handle_request; only while it is zero does an accept() wait get a deadline,
+    // so a connection that is genuinely in the middle of a long-lived tunnel (the
+    // common, legitimate case) is never force-closed by this -- only a connection
+    // that accepted and then went completely silent is.
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    loop {
+        let accept = conn.accept();
+        let result = if active.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            match tokio::time::timeout(idle_timeout, accept).await {
+                Ok(r) => r,
+                Err(_) => break, // idle timeout with nothing in flight: close this connection.
+            }
+        } else {
+            accept.await
+        };
+        let Some(result) = result else { break };
         let (req, respond) = result?;
         let expected_path = expected_path.clone();
         let admission = admission.clone();
+        active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let active = active.clone();
         tokio::spawn(async move {
+            let _guard = ActiveGuard(active);
             if let Err(e) =
                 handle_request(req, respond, target, &expected_path, idle_timeout, &shared_token, admission).await
             {
@@ -238,6 +261,18 @@ async fn serve_connection(
         });
     }
     Ok(())
+}
+
+/// Decrements the connection's active-stream count on drop -- covers the handler
+/// task returning early (an error, a panic) as well as the normal path, so a
+/// crashed/short-circuited handler cannot permanently wedge the idle-close check
+/// above into always seeing `active > 0`.
+struct ActiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 async fn handle_request(
