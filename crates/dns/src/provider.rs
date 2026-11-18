@@ -67,12 +67,20 @@ fn http_client_with_timeout(request_timeout: Duration) -> reqwest::Client {
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(request_timeout)
         .build()
-        // `build()` only fails for a malformed static config (e.g. a bad TLS
-        // backend setup) -- never a runtime condition -- so a fixed, always-valid
-        // builder falling back to the crate default is unreachable in practice;
-        // the fallback exists purely so a future config change here can never
-        // panic a whole daemon over client construction.
-        .unwrap_or_default()
+        // #998: `build()` only fails for a malformed static config (e.g. a bad TLS
+        // backend setup) -- never a runtime condition -- so this is unreachable in
+        // practice. It used to fall back to `reqwest::Client::default()` instead of
+        // expect()ing here, on the stated theory that doing so "can never panic a
+        // whole daemon over client construction" -- but `Client::default()` is
+        // `Client::new()`, which itself calls `.build().expect(...)` internally and
+        // panics on the exact same condition that makes THIS build() fail. The
+        // fallback did not avoid a panic in the one case it exists for; it only
+        // replaced a clear, local error message with a less specific one, or, had
+        // `Client::new()` NOT panicked, would have silently reverted to a client
+        // with no connect/request timeout at all -- quietly undoing #486's whole
+        // point. expect() here is no less safe than the fallback ever was, and
+        // fails loudly with the real cause instead of either outcome above.
+        .expect("reqwest::Client::builder() with only connect_timeout/timeout set should never fail to build")
 }
 
 /// A configured DNS-01 backend the ACME client drives via `set_txt`/`clear_txt`.
