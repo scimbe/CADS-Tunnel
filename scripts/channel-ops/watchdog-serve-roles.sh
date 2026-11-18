@@ -27,7 +27,16 @@ log() { printf '[%s] watchdog %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 CT_AGENT="${CT_AGENT:-ct-agent}"
 CT_AGENT_EDGE_BROKER="${CT_AGENT_EDGE_BROKER:-57.131.133.91:4435}"
 CT_AGENT_EDGE_RELAY="${CT_AGENT_EDGE_RELAY:-57.131.133.91:4436}"
-LOG_DIR="${SERVE_LOG_DIR:-/tmp}"
+# #988: a shared /tmp default let any other local user pre-create a symlink or
+# directory at these predictable paths -- a planted log symlink lets them
+# truncate/overwrite a file of the operator's choosing, and a planted pidfile
+# can steer the kill below at another of the operator's processes whose
+# command line happens to contain a `channel` argument (see the kill loop's
+# own #321 safeguard, which this closes the other half of). Defaulting to a
+# per-user directory and refusing to use it unless we own it (same posture
+# backup-selfhost.sh already uses for $WORK) closes both.
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}/ct-serve"
+LOG_DIR="${SERVE_LOG_DIR:-$STATE_HOME/logs}"
 
 if [ "${1:-}" = "--selftest" ] || [ "${WATCHDOG_SELFTEST:-0}" = "1" ]; then
   command -v "$(printf '%s' "$CT_AGENT" | awk '{print $1}')" >/dev/null 2>&1 || die "ct-agent not resolvable"
@@ -63,8 +72,11 @@ log "UNHEALTHY — build did not complete within ${HEALTH_TIMEOUT}s for $DEMO_UR
 # value baked into each process's command line is not visible via ps; instead we track PIDs
 # this script itself started via a pidfile per role, falling back to a best-effort pattern kill
 # if no pidfile exists yet, e.g. on first run).
-PIDFILE_DIR="${WATCHDOG_PIDFILE_DIR:-/tmp/ct-serve-pids}"
-mkdir -p "$PIDFILE_DIR"
+PIDFILE_DIR="${WATCHDOG_PIDFILE_DIR:-$STATE_HOME/pids}"
+mkdir -p "$LOG_DIR" "$PIDFILE_DIR"
+chmod 700 "$LOG_DIR" "$PIDFILE_DIR"
+[ -O "$LOG_DIR" ] || die "$LOG_DIR gehört nicht $(id -un) -- abgebrochen (#988)"
+[ -O "$PIDFILE_DIR" ] || die "$PIDFILE_DIR gehört nicht $(id -un) -- abgebrochen (#988)"
 
 for entry in $ROLES; do
   role="${entry%%:*}"
