@@ -372,6 +372,17 @@ impl PipelineSpec {
         if self.roles.is_empty() {
             return Err(PipelineError::Empty);
         }
+        // #1003: `pick()` mutates `scratch` (round-robin cursor advance, served-count
+        // increment) as each role is decided, one role at a time, in the loop below. If
+        // a LATER role then turns out unfilled, the function returns Err -- but without
+        // this clone/commit-on-success split, the mutations `pick()` already made for
+        // every EARLIER role in this same convene would stay, charging providers that
+        // served nothing and skewing the next convene's load-balancing decision for a
+        // clear that never actually happened. Committing `scratch` back into `*state`
+        // only on the `Ok` path below makes one convene all-or-nothing for state, the
+        // same guarantee #172's cross-role exclusivity already gives the assignments
+        // themselves.
+        let mut scratch = state.clone();
         let mut assignments = Vec::with_capacity(self.roles.len());
         // Cross-role EXCLUSIVITY within one convene (#172): a single provider wins **at most one**
         // role per convene, even if it qualifies for several. Without this, two roles sharing a
@@ -395,7 +406,7 @@ impl PipelineSpec {
             if qualifying.is_empty() {
                 return Err(PipelineError::UnfilledRole { service: role.service.clone() });
             }
-            let o = policy_for(role).pick(&role.tag, &qualifying, state);
+            let o = policy_for(role).pick(&role.tag, &qualifying, &mut scratch);
             assigned.push(o.holder_pubkey);
             assignments.push(RoleAssignment {
                 service: role.service.clone(),
@@ -404,6 +415,7 @@ impl PipelineSpec {
                 price: o.min_price,
             });
         }
+        *state = scratch;
         Ok(assignments)
     }
 
@@ -1048,6 +1060,32 @@ mod tests {
             Err(PipelineError::UnfilledRole { service: TextGeneration }),
             "all offline → unfilled, exactly as before",
         );
+    }
+
+    #[test]
+    fn a_convene_that_fails_on_a_later_role_does_not_keep_the_earlier_roles_state_mutations_1003() {
+        // #1003: two roles sharing TextGeneration (#172 exclusivity), but only ONE online
+        // offer. "physics" (first role) fills and would increment served_counts for its
+        // provider; "art" (second role) then has no qualifying offer left (the only one is
+        // already assigned) and the convene fails. Before this fix, "physics"'s state
+        // mutation stayed despite the overall convene never actually clearing -- charging a
+        // provider that served nothing and skewing the NEXT convene's load-balancing choice.
+        let spec = PipelineSpec {
+            id: "flappy".into(),
+            roles: vec![
+                RequiredRole { service: TextGeneration, units: 1, tag: "physics".into(), selection_policy: None },
+                RequiredRole { service: TextGeneration, units: 1, tag: "art".into(), selection_policy: None },
+            ],
+            operator_pubkey_hex: None,
+            selection_policy: SelectionPolicy::LowestFloor,
+        };
+        let only_offer = offer(1, vec![TextGeneration], 20, 50, 1000);
+        let mut state = SelectionState::default();
+
+        let result = spec.convene_with_policy(&[only_offer], 100, SelectionPolicy::LeastCalls, &mut state);
+
+        assert_eq!(result, Err(PipelineError::UnfilledRole { service: TextGeneration }), "art has no provider left");
+        assert_eq!(state, SelectionState::default(), "a failed convene must leave state exactly as it found it");
     }
 
     #[test]
