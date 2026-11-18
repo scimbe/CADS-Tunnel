@@ -334,6 +334,7 @@ impl ConvergenceCoalescer {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Convergence>,
     {
+      'claim: loop {
         // Atomically check-and-claim under one lock acquisition: whoever inserts the
         // map entry is the poller, everyone else observed an existing entry and
         // subscribes -- no window where two concurrent callers both think they're
@@ -390,7 +391,7 @@ impl ConvergenceCoalescer {
                     _ => Convergence::Saturated,
                 };
                 let _ = tx.send(Some(result.clone()));
-                result
+                return result;
             }
             Err(mut rx) => {
                 // A subscriber: wait for the poller's result. `watch` always retains
@@ -402,13 +403,27 @@ impl ConvergenceCoalescer {
                         return result;
                     }
                     if rx.changed().await.is_err() {
-                        // The poller's sender dropped without ever sending (a panic
-                        // mid-poll) -- fail safe as unreachable rather than hang.
-                        return Convergence::NoNodesReachable;
+                        // #954: the sender dropped WITHOUT ever sending a result --
+                        // either the poller's future panicked mid-poll, or (#418's own
+                        // documented, expected scenario) it was cancelled because ITS
+                        // caller timed out or was itself cancelled. Either way we
+                        // genuinely do not know the answer, so this must not fall back
+                        // to a fail-OPEN variant like the old NoNodesReachable, which
+                        // tells every subscriber "proceed, this isn't a failure" --
+                        // exactly the premature-validation risk #229 exists to
+                        // prevent, and worse here since it is reported to every
+                        // coalesced subscriber, not just the one caller that hit it.
+                        // The dropped poller's RemoveOnDrop guard has already removed
+                        // the stale map entry (#418), so loop back to the claim step:
+                        // either another subscriber already raced ahead and became the
+                        // new poller (subscribe to THAT instead), or this caller claims
+                        // it and runs a real poll itself.
+                        continue 'claim;
                     }
                 }
             }
         }
+      }
     }
 }
 
@@ -886,6 +901,86 @@ mod tests {
             poll_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the aborted poller's one increment, plus a genuine second poll after cleanup -- not stuck at 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_already_waiting_when_its_poller_is_cancelled_becomes_the_new_poller_itself_954() {
+        // #954: a SUBSCRIBER (not the poller itself) already parked on
+        // `rx.changed().await` when the poller's task is cancelled used to get
+        // Convergence::NoNodesReachable from the sender-dropped fail-safe -- a
+        // fail-OPEN result telling its caller "proceed, this isn't a failure",
+        // even though the real situation is "we don't know, the poll never
+        // finished" (#418's own comment names cancellation as a real, expected
+        // scenario). Real proof, distinct from #418's test above (which only
+        // proves a LATER, sequential call gets a fresh poll): a genuine
+        // subscriber, concurrently in flight behind the poller and already
+        // blocked on the channel when the poller is aborted, must itself end up
+        // running (or observing) a real second poll -- not echo the fail-open
+        // fallback. Single-threaded runtime (the default #[tokio::test] flavor)
+        // makes `yield_now` deterministic: it only returns once every other
+        // ready task, including the just-spawned subscriber, has run up to its
+        // own next await point.
+        let coalescer = Arc::new(ConvergenceCoalescer::new());
+        let poll_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let poller_started = Arc::new(tokio::sync::Notify::new());
+
+        let c = coalescer.clone();
+        let pc = poll_count.clone();
+        let s = poller_started.clone();
+        let poller_handle = tokio::spawn(async move {
+            c.coalesce("zone/name/expected", || {
+                let pc = pc.clone();
+                let s = s.clone();
+                async move {
+                    pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    s.notify_one();
+                    // Never resolves on its own -- only abort() ends this poller.
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+            })
+            .await
+        });
+        poller_started.notified().await; // the poller has genuinely started (registered the key)
+
+        // A genuine subscriber for the same key, spawned as its own task so it
+        // can be in flight concurrently with the abort below.
+        let c2 = coalescer.clone();
+        let pc2 = poll_count.clone();
+        let subscriber_handle = tokio::spawn(async move {
+            c2.coalesce("zone/name/expected", || {
+                let pc2 = pc2.clone();
+                async move {
+                    pc2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Distinguishable from the old fail-safe's NoNodesReachable --
+                    // if this ever runs, the subscriber genuinely re-polled.
+                    Convergence::Saturated
+                }
+            })
+            .await
+        });
+        // The map entry already exists (poller_started fired after inserting
+        // it), so the subscriber's own claim step takes the Err(rx) branch
+        // deterministically; it has nothing else to await before
+        // `rx.changed().await`. A couple of yields are enough on a
+        // single-threaded runtime for it to actually park there.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        poller_handle.abort();
+        let _ = poller_handle.await; // reap the aborted task, running its RemoveOnDrop guard
+
+        let subscriber_result = subscriber_handle.await.unwrap();
+        assert_eq!(
+            subscriber_result,
+            Convergence::Saturated,
+            "the subscriber must claim the key and run its OWN real poll, not echo the fail-open NoNodesReachable fallback"
+        );
+        assert_eq!(
+            poll_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the aborted poller's one increment, plus the subscriber's own real poll after re-claiming"
         );
     }
 
