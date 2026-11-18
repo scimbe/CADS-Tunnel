@@ -2597,9 +2597,17 @@ pub fn match_offer(offer: &CapacityOffer, bid: &CapacityBid, now: UnixSeconds) -
 /// escrow/match bookkeeping lives): after a preview clears, [`commit`](Self::commit) atomically checks
 /// remaining capacity and reserves the units, so an offer can never be booked beyond `units_available`.
 /// Keyed by the offer's signature, which uniquely identifies it.
+///
+/// #966: each reservation is further keyed by the match's own `match_ref` and carries the expiry of
+/// the bid that won it. Without this, nothing ever released a reservation when the buyer never locked
+/// escrow or the bid simply expired unused — an authenticated peer could book an offer's whole
+/// capacity with one bid and never pay, making it unavailable to every other buyer until the process
+/// restarted. Resubmitting the identical signed bid is also now idempotent (same inputs ->
+/// [`match_offer`]'s deterministic `match_ref`), rather than committing the same units a second time.
 #[derive(Debug, Default)]
 pub struct OfferCommitments {
-    committed: std::collections::BTreeMap<[u8; 64], u64>,
+    /// offer signature -> (match_ref -> (units, the winning bid's own expiry)).
+    by_offer: std::collections::BTreeMap<[u8; 64], std::collections::BTreeMap<[u8; 32], (u64, UnixSeconds)>>,
 }
 
 impl OfferCommitments {
@@ -2607,25 +2615,47 @@ impl OfferCommitments {
         Self::default()
     }
 
-    /// Units already committed against `offer`.
-    pub fn committed(&self, offer: &CapacityOffer) -> u64 {
-        self.committed.get(&offer.signature).copied().unwrap_or(0)
+    /// Units currently committed against `offer` as of `now` — a reservation whose own `expires_at`
+    /// has already passed with no replacement doesn't count (#966: it was never escrowed, so it must
+    /// not permanently consume capacity).
+    pub fn committed(&self, offer: &CapacityOffer, now: UnixSeconds) -> u64 {
+        self.by_offer
+            .get(&offer.signature)
+            .map(|m| m.values().filter(|(_, expires_at)| *expires_at > now).map(|(units, _)| *units).sum())
+            .unwrap_or(0)
     }
 
-    /// Units still available on `offer` (`units_available - committed`, saturating).
-    pub fn remaining(&self, offer: &CapacityOffer) -> u64 {
-        offer.units_available.saturating_sub(self.committed(offer))
+    /// Units still available on `offer` (`units_available - committed`, saturating) as of `now`.
+    pub fn remaining(&self, offer: &CapacityOffer, now: UnixSeconds) -> u64 {
+        offer.units_available.saturating_sub(self.committed(offer, now))
     }
 
-    /// **Reserve `units` against `offer`**, returning `true` (and recording them) iff the cumulative
-    /// total would not exceed `offer.units_available`, else `false` with no change. This is the check
-    /// that prevents double-booking: the Nth bid fails once prior matches have consumed the capacity.
+    /// **Reserve `units` against `offer` for `match_ref`**, releasing automatically once
+    /// `expires_at` (the winning bid's own expiry) passes, and returning `true` (recording the
+    /// reservation) iff the cumulative *live* total would not exceed `offer.units_available`, else
+    /// `false` with no change. This is the check that prevents double-booking: the Nth bid fails once
+    /// prior *still-live* matches have consumed the capacity — an expired one no longer counts.
+    ///
+    /// #966: idempotent on `match_ref` — resubmitting the identical signed bid recomputes the same
+    /// deterministic `match_ref` and is a no-op success here, not a second reservation of the same
+    /// units (the rate limiter upstream still bounds how often a peer can even reach this call).
     /// `checked_add` so a huge `units` can't wrap the tally.
-    pub fn commit(&mut self, offer: &CapacityOffer, units: u64) -> bool {
-        let already = self.committed(offer);
-        match already.checked_add(units) {
+    pub fn commit(&mut self, offer: &CapacityOffer, match_ref: [u8; 32], units: u64, expires_at: UnixSeconds, now: UnixSeconds) -> bool {
+        let entry = self.by_offer.entry(offer.signature).or_default();
+        // Lazy sweep: drop anything whose own expiry already passed before judging
+        // capacity, so a never-escrowed reservation doesn't permanently occupy it.
+        entry.retain(|_, (_, exp)| *exp > now);
+        if let Some((existing_units, _)) = entry.get(&match_ref) {
+            // Already live for this exact match -- idempotent success. The units
+            // can never legitimately differ for the same match_ref (it's part of
+            // match_ref's own deterministic preimage), but if they somehow did,
+            // refuse rather than silently accept a mismatched replay.
+            return *existing_units == units;
+        }
+        let live_total: u64 = entry.values().map(|(units, _)| *units).sum();
+        match live_total.checked_add(units) {
             Some(total) if total <= offer.units_available => {
-                self.committed.insert(offer.signature, total);
+                entry.insert(match_ref, (units, expires_at));
                 true
             }
             _ => false,
@@ -5086,30 +5116,85 @@ mod tests {
         let offer = CapacityOffer::sign_new(
             &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 1_000, 100, "c".into(), 1_000, 9_000,
         );
+        let now = 1_000;
+        let far_expiry = 1_000_000; // well past `now` for the whole test -- expiry isn't under test here
+        let m = |n: u8| [n; 32]; // a distinct match_ref per logically-distinct bid
         let mut book = OfferCommitments::new();
-        assert_eq!(book.remaining(&offer), 1_000, "nothing committed yet");
+        assert_eq!(book.remaining(&offer, now), 1_000, "nothing committed yet");
 
-        // First full-capacity commit succeeds; a second one can't double-book.
-        assert!(book.commit(&offer, 1_000), "the first 1000-unit match commits");
-        assert_eq!(book.remaining(&offer), 0, "the offer is now fully committed");
-        assert!(!book.commit(&offer, 1), "a second bid can't exceed advertised capacity (#158 fixed)");
+        // First full-capacity commit succeeds; a second (DIFFERENT match_ref) one can't double-book.
+        assert!(book.commit(&offer, m(1), 1_000, far_expiry, now), "the first 1000-unit match commits");
+        assert_eq!(book.remaining(&offer, now), 0, "the offer is now fully committed");
+        assert!(!book.commit(&offer, m(2), 1, far_expiry, now), "a second bid can't exceed advertised capacity (#158 fixed)");
 
         // Partials fill exactly to capacity, never past it.
         let mut book2 = OfferCommitments::new();
-        assert!(book2.commit(&offer, 600), "600 of 1000 commits");
-        assert!(!book2.commit(&offer, 500), "500 more would oversell (only 400 left)");
-        assert_eq!(book2.remaining(&offer), 400);
-        assert!(book2.commit(&offer, 400), "400 fills it exactly");
-        assert!(!book2.commit(&offer, 1), "and not one unit more");
+        assert!(book2.commit(&offer, m(3), 600, far_expiry, now), "600 of 1000 commits");
+        assert!(!book2.commit(&offer, m(4), 500, far_expiry, now), "500 more would oversell (only 400 left)");
+        assert_eq!(book2.remaining(&offer, now), 400);
+        assert!(book2.commit(&offer, m(5), 400, far_expiry, now), "400 fills it exactly");
+        assert!(!book2.commit(&offer, m(6), 1, far_expiry, now), "and not one unit more");
 
         // A different offer (different signature) has its own budget.
         let offer_b = CapacityOffer::sign_new(
             &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 500, 100, "c".into(), 1_000, 9_000,
         );
-        assert_eq!(book.remaining(&offer_b), 500, "a distinct offer is tracked separately");
-        assert!(book.commit(&offer_b, 500), "and has its own full capacity");
+        assert_eq!(book.remaining(&offer_b, now), 500, "a distinct offer is tracked separately");
+        assert!(book.commit(&offer_b, m(7), 500, far_expiry, now), "and has its own full capacity");
 
         // A huge units value can't wrap the tally.
-        assert!(!OfferCommitments::new().commit(&offer, u64::MAX), "an overflowing commit is refused");
+        assert!(!OfferCommitments::new().commit(&offer, m(8), u64::MAX, far_expiry, now), "an overflowing commit is refused");
+    }
+
+    #[test]
+    fn offer_commitments_are_idempotent_on_match_ref_966() {
+        // #966: resubmitting the identical signed bid recomputes the SAME deterministic
+        // match_ref -- it must be a no-op success, not a second reservation that silently
+        // halves the offer's remaining capacity for everyone else.
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x52u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 1_000, 100, "c".into(), 1_000, 9_000,
+        );
+        let now = 1_000;
+        let far_expiry = 1_000_000;
+        let match_ref = [0xAAu8; 32];
+        let mut book = OfferCommitments::new();
+
+        assert!(book.commit(&offer, match_ref, 600, far_expiry, now), "first commit of this match");
+        assert_eq!(book.remaining(&offer, now), 400);
+        // Replaying the IDENTICAL bid (same match_ref, same units): idempotent, not a
+        // second reservation -- remaining capacity must not drop again.
+        assert!(book.commit(&offer, match_ref, 600, far_expiry, now), "replaying the same match is a no-op success");
+        assert_eq!(book.remaining(&offer, now), 400, "a replayed identical bid must not consume capacity twice");
+
+        // The remaining 400 is still bookable by a genuinely different match.
+        assert!(book.commit(&offer, [0xBBu8; 32], 400, far_expiry, now), "the real remaining capacity is still bookable");
+        assert_eq!(book.remaining(&offer, now), 0);
+    }
+
+    #[test]
+    fn offer_commitments_release_an_expired_reservation_966() {
+        // #966: a buyer that never locks escrow, or whose bid simply expires unused, must
+        // not permanently occupy the offer's capacity -- without this, one authenticated
+        // peer could book an offer's whole capacity and never pay, locking out every other
+        // buyer until the process restarts.
+        use ed25519_dalek::SigningKey;
+        let seller = SigningKey::from_bytes(&[0x53u8; 32]);
+        let offer = CapacityOffer::sign_new(
+            &seller, CapacityKind::CloudApiQuota, vec!["m".into()], 1_000, 100, "c".into(), 1_000, 9_000,
+        );
+        let mut book = OfferCommitments::new();
+
+        // Committed at t=1_000 with a bid that expires at t=2_000.
+        assert!(book.commit(&offer, [0xCCu8; 32], 1_000, 2_000, 1_000), "books the whole offer, expiring at 2_000");
+        assert_eq!(book.remaining(&offer, 1_500), 0, "still live before its own expiry");
+
+        // Past the winning bid's own expiry, the reservation is gone -- capacity frees up
+        // without anyone having to explicitly release it.
+        assert_eq!(book.remaining(&offer, 2_001), 1_000, "an unescrowed, expired reservation releases its capacity");
+
+        // A fresh match can now book it for real.
+        assert!(book.commit(&offer, [0xDDu8; 32], 1_000, 999_999, 2_001), "the freed capacity is bookable again");
     }
 }
