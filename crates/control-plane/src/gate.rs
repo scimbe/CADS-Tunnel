@@ -56,7 +56,7 @@ use serde::Deserialize;
 use sha2::Sha256;
 
 use crate::oidc::OidcVerifierHandle;
-use crate::portal::{identity_from_verified_id_token, oidc_http_client, urlencode, ExchangedIdentity, PortalOidc};
+use crate::portal::{exchange_code_for_identity, urlencode, ExchangedIdentity, PortalOidc};
 use crate::storage::SqliteTunnelStore;
 
 /// #429: `__Host-`-prefixed, same reasoning as `portal.rs`'s `STATE_COOKIE` --
@@ -221,12 +221,14 @@ fn gate_router_full(
         .with_state(state)
 }
 
-/// The production code->identity exchanger: structurally identical to
-/// `portal.rs`'s `default_exchanger`, except the token exchange's
-/// `redirect_uri` is resolved per-call from the `PortalOidc` handed to the
-/// closure at call time (the gate's own, via [`gate_redirect_uri`]) rather
-/// than the portal's -- the token endpoint rejects a mismatch against what
-/// was sent in the authorize request.
+/// The production code->identity exchanger: shares its token-exchange + JWKS-
+/// verify body with `portal.rs`'s `default_exchanger` via
+/// [`exchange_code_for_identity`] (#1033). The token exchange's `redirect_uri`
+/// is resolved per-call from the `PortalOidc` handed to the closure at call
+/// time (the gate's own, via [`gate_redirect_uri`]) rather than the portal's --
+/// the token endpoint rejects a mismatch against what was sent in the
+/// authorize request. Also carries PKCE's `code_verifier`, which the portal's
+/// exchanger never needs.
 fn default_gate_exchanger() -> GateExchanger {
     Arc::new(move |code: String| {
         Box::pin(async move {
@@ -244,37 +246,17 @@ fn default_gate_exchanger() -> GateExchanger {
             // The secret is resolved here, by the NAME of its variable, so it never travels
             // through the packed argument string (and never into a log line).
             let secret = std::env::var(&secret_env).map_err(|_| format!("missing {secret_env}"))?;
-            let form = [
-                ("grant_type", "authorization_code"),
-                ("code", code.as_str()),
-                ("redirect_uri", redirect_uri.as_str()),
-                ("client_id", client_id.as_str()),
-                ("client_secret", secret.as_str()),
-                ("code_verifier", code_verifier.as_str()),
-            ];
-            let resp = oidc_http_client()
-                .post(&token_url)
-                .form(&form)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("token endpoint returned {}", resp.status()));
-            }
-            let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            let id_token = body
-                .get("id_token")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "token response has no id_token".to_string())?;
-            let jwks: serde_json::Value = oidc_http_client()
-                .get(&jwks_url)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
-                .json()
-                .await
-                .map_err(|e| e.to_string())?;
-            identity_from_verified_id_token(id_token, &jwks, &issuer, &client_id)
+            exchange_code_for_identity(
+                &token_url,
+                &redirect_uri,
+                &client_id,
+                &secret,
+                &code,
+                Some(&code_verifier),
+                &issuer,
+                &jwks_url,
+            )
+            .await
         })
     })
 }

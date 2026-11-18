@@ -415,42 +415,64 @@ fn default_exchanger(oidc: Option<PortalOidc>) -> Exchanger {
             let cfg = oidc.ok_or_else(|| "SSO not configured".to_string())?;
             let secret = std::env::var("CT_OIDC_CLIENT_SECRET")
                 .map_err(|_| "missing CT_OIDC_CLIENT_SECRET".to_string())?;
-            let form = [
-                ("grant_type", "authorization_code"),
-                ("code", code.as_str()),
-                ("redirect_uri", cfg.redirect_uri.as_str()),
-                ("client_id", cfg.client_id.as_str()),
-                ("client_secret", secret.as_str()),
-            ];
-            let resp = oidc_http_client()
-                .post(&cfg.token_url)
-                .form(&form)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
-            if !resp.status().is_success() {
-                return Err(format!("token endpoint returned {}", resp.status()));
-            }
-            let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            let id_token = body
-                .get("id_token")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "token response has no id_token".to_string())?;
-            // #82: verify the id_token's signature against the realm JWKS (kid-bound),
-            // issuer, audience and expiry BEFORE trusting its sub/email. The TLS
-            // back-channel is not a substitute for verifying the token itself — a
-            // tampered/confused response could otherwise inject an arbitrary subject.
-            let jwks: serde_json::Value = oidc_http_client()
-                .get(cfg.jwks_url())
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
-                .json()
-                .await
-                .map_err(|e| e.to_string())?;
-            identity_from_verified_id_token(id_token, &jwks, cfg.issuer(), &cfg.client_id)
+            exchange_code_for_identity(
+                &cfg.token_url,
+                &cfg.redirect_uri,
+                &cfg.client_id,
+                &secret,
+                &code,
+                None,
+                cfg.issuer(),
+                &cfg.jwks_url(),
+            )
+            .await
         })
     })
+}
+
+/// #1033: the token-exchange + JWKS-verify body shared by `portal.rs`'s
+/// [`default_exchanger`] and `gate.rs`'s `default_gate_exchanger` -- they used to
+/// each inline a near-identical ~40-line copy of this. `code_verifier` is `None`
+/// for the portal (no PKCE) and `Some(..)` for the gate (#382's PKCE flow); the
+/// portal's own client secret is resolved by its caller as before, the gate's by
+/// the NAME of an env var its caller resolves, so this takes the secret VALUE
+/// either way and never sees which case it's in.
+pub(crate) async fn exchange_code_for_identity(
+    token_url: &str,
+    redirect_uri: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    code_verifier: Option<&str>,
+    issuer: &str,
+    jwks_url: &str,
+) -> Result<ExchangedIdentity, String> {
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+    if let Some(cv) = code_verifier {
+        form.push(("code_verifier", cv));
+    }
+    let resp = oidc_http_client().post(token_url).form(&form).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("token endpoint returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let id_token = body
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "token response has no id_token".to_string())?;
+    // #82: verify the id_token's signature against the realm JWKS (kid-bound),
+    // issuer, audience and expiry BEFORE trusting its sub/email. The TLS
+    // back-channel is not a substitute for verifying the token itself — a
+    // tampered/confused response could otherwise inject an arbitrary subject.
+    let jwks: serde_json::Value =
+        oidc_http_client().get(jwks_url).send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
+    identity_from_verified_id_token(id_token, &jwks, issuer, client_id)
 }
 
 /// Verify an id_token against the realm JWKS and extract the `sub` (required) and
