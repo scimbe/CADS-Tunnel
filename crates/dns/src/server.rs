@@ -160,6 +160,22 @@ mod tests {
         assert!(respond(&store, b"\x00\x01").is_none());
     }
 
+    #[test]
+    fn respond_never_answers_its_own_response_fed_back_to_it_956() {
+        // #956: a response has QR=1 and echoes the question -- feeding one back
+        // into respond() used to be answered exactly like a fresh query (QR was
+        // never inspected), which is the shape of a sustained reflection loop
+        // with any other UDP DNS server that also answers responses, off a
+        // single spoofed-source datagram. A response coming back in must now be
+        // dropped, not answered.
+        let store = AcmeDnsStore::new();
+        store.set_txt("_acme-challenge.host.test", "the-token");
+        let query = txt_query(0x21, "_acme-challenge.host.test");
+        let response = respond(&store, &query).unwrap();
+        assert!(response[2] & 0x80 != 0, "sanity: build_response really does set QR");
+        assert!(respond(&store, &response).is_none(), "a response fed back in must be dropped, not answered again");
+    }
+
     #[tokio::test]
     async fn udp_server_round_trips_a_query() {
         let store = Arc::new(AcmeDnsStore::new());
