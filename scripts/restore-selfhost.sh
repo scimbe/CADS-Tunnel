@@ -10,6 +10,7 @@
 #   restore-selfhost.sh 2026-08-16T173917Z
 #   restore-selfhost.sh --list          # what is available
 #   restore-selfhost.sh --dry-run       # decrypt + verify, change nothing
+#   restore-selfhost.sh --keep          # leave $WORK/state decrypted on disk
 set -euo pipefail
 
 # #598: the decrypted snapshot (Keycloak DB, control-plane grants, deploy.env,
@@ -31,13 +32,27 @@ WORK="${CADS_RESTORE_WORK:-/var/tmp/cads-restore}"
 log() { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die() { log "FEHLER: $*"; exit 1; }
 
-WANT=""; DRY=0
-case "${1:-}" in
-  --list) WANT=LIST ;;
-  --dry-run) DRY=1 ;;
-  "") ;;
-  *) WANT="$1" ;;
-esac
+WANT=""; DRY=0; KEEP=0
+for arg in "$@"; do
+  case "$arg" in
+    --list) WANT=LIST ;;
+    --dry-run) DRY=1 ;;
+    --keep) KEEP=1 ;;
+    *) WANT="$arg" ;;
+  esac
+done
+
+# #985: the decrypted snapshot ($WORK/state -- Keycloak dump, control-plane DB,
+# deploy.env, CA/cert material) must not outlive this run, on success, on
+# failure, or under --dry-run, same as backup-selfhost.sh's own staged
+# plaintext. Shredded, not just removed; kept only with an explicit --keep.
+cleanup() {
+  [ "$KEEP" -eq 1 ] && return
+  [ -d "${WORK:-}/state" ] || return
+  find "$WORK/state" -type f -exec shred -u {} + 2>/dev/null || true
+  rm -rf "$WORK/state"
+}
+trap cleanup EXIT
 
 [ -r "$PASSFILE" ] || die "keine Passphrase unter $PASSFILE — ohne sie ist der Snapshot unbrauchbar"
 command -v docker >/dev/null || die "docker fehlt"
