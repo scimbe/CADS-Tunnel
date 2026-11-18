@@ -67,6 +67,8 @@ pub fn admin_router(state: Arc<EdgeState<Connection>>) -> Router {
         // card -- same listener, gate, and `/internal/...` naming as the #763 presence
         // routes above, for the same reason (the CP is its only caller).
         .route("/internal/tunnel/history/:token_hex", get(tunnel_history))
+        // Operator overview (`/admin-ui/agents`): 24 h summaries for many tokens in one call.
+        .route("/admin/tunnel-history/bulk", post(tunnel_history_bulk))
         // #782: signed forensic receipts -- the edge's receipts public key and a token's
         // receipt chain page, for the control plane's `receipts.jsonl` export. Same
         // listener, gate and `/internal/...` naming as the history route above.
@@ -658,6 +660,83 @@ async fn tunnel_history(
         open,
         uptime,
         sessions,
+    }))
+}
+
+/// Upper bound on `tokens` per `POST /admin/tunnel-history/bulk` call.
+const HISTORY_BULK_MAX_TOKENS: usize = 500;
+
+#[derive(serde::Deserialize)]
+struct BulkTunnelHistoryReq {
+    tokens: Vec<String>,
+}
+
+#[derive(Serialize, serde::Deserialize, Debug)]
+struct BulkTunnelHistoryEntry {
+    /// The hex string exactly as the caller sent it.
+    token: String,
+    #[serde(flatten)]
+    summary: crate::tunnel_history::HistorySummary,
+}
+
+#[derive(Serialize, serde::Deserialize, Debug)]
+struct BulkTunnelHistoryResp {
+    /// `false` when the history store is disabled (`CT_EDGE_TUNNEL_HISTORY=off`): an
+    /// explicit marker so the caller never mistakes "no data" for "zero sessions".
+    enabled: bool,
+    entries: Vec<BulkTunnelHistoryEntry>,
+}
+
+/// `POST /admin/tunnel-history/bulk {"tokens": [...]}` (max 500): per token a 24 h
+/// summary (uptime 24 h/7 d, session count, disconnect-reason counts, last disconnect)
+/// from the metadata-only `tunnel_sessions` store. Admin-token gated; `413` above the
+/// bound; malformed tokens are skipped like in `tunnel_status_bulk`. Disabled store ->
+/// `{"enabled":false,"entries":[]}` (200), not zeros.
+async fn tunnel_history_bulk(
+    State(state): State<Arc<EdgeState<Connection>>>,
+    headers: HeaderMap,
+    Json(req): Json<BulkTunnelHistoryReq>,
+) -> Result<Json<BulkTunnelHistoryResp>, StatusCode> {
+    if !admin_authed(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if req.tokens.len() > HISTORY_BULK_MAX_TOKENS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let Some(history) = state.tunnel_history() else {
+        return Ok(Json(BulkTunnelHistoryResp {
+            enabled: false,
+            entries: Vec::new(),
+        }));
+    };
+    let parsed: Vec<(String, String)> = req
+        .tokens
+        .into_iter()
+        .filter_map(|hex| {
+            let t = parse_token_hex(&hex)?;
+            Some((hex, crate::tunnel_history::routing_token_hex(&RoutingToken(t))))
+        })
+        .collect();
+    let now = crate::tunnel_history::now_secs();
+    let entries = tokio::task::spawn_blocking(move || {
+        parsed
+            .into_iter()
+            .map(|(orig, canon)| {
+                history
+                    .summary_for(&canon, now)
+                    .map(|summary| BulkTunnelHistoryEntry { token: orig, summary })
+            })
+            .collect::<Result<Vec<_>, rusqlite::Error>>()
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        eprintln!("ct-edge: tunnel history bulk read failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(BulkTunnelHistoryResp {
+        enabled: true,
+        entries,
     }))
 }
 
@@ -1291,6 +1370,53 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn tunnel_history_bulk_is_gated_bounded_and_marks_disabled_store() {
+        use crate::tunnel_history::{SqliteTunnelHistory, TRANSPORT_QUIC};
+        let state = Arc::new(EdgeState::<Connection>::new());
+        let secret = [0x79u8; 32];
+        state.set_admin_token(secret);
+        let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        let tok_hex = "7c".repeat(32);
+        let post = |auth: Option<String>, tokens: Vec<String>| {
+            let app = admin_router(state.clone());
+            let mut req = Request::post("/admin/tunnel-history/bulk").header("content-type", "application/json");
+            if let Some(a) = auth {
+                req = req.header("x-ct-admin-token", a);
+            }
+            app.oneshot(req.body(Body::from(serde_json::json!({ "tokens": tokens }).to_string())).unwrap())
+        };
+        // No token -> 401.
+        assert_eq!(post(None, vec![tok_hex.clone()]).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        // Disabled store -> 200 with explicit enabled:false marker, no entries.
+        let resp = post(Some(secret_hex.clone()), vec![tok_hex.clone()]).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: BulkTunnelHistoryResp = serde_json::from_slice(&body).unwrap();
+        assert!(!parsed.enabled && parsed.entries.is_empty());
+        // Over the bound -> 413 (checked before anything else is read).
+        let too_many: Vec<String> = (0..=HISTORY_BULK_MAX_TOKENS).map(|_| tok_hex.clone()).collect();
+        assert_eq!(post(Some(secret_hex.clone()), too_many).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Exactly at the bound is accepted.
+        let at_bound: Vec<String> = (0..HISTORY_BULK_MAX_TOKENS).map(|_| tok_hex.clone()).collect();
+        assert_eq!(post(Some(secret_hex.clone()), at_bound).await.unwrap().status(), StatusCode::OK);
+        // Enabled store: summary per valid token, malformed entry skipped, caller's string echoed.
+        let history = Arc::new(SqliteTunnelHistory::open_in_memory().unwrap());
+        state.set_tunnel_history(history.clone());
+        let now = crate::tunnel_history::now_secs();
+        let canon = crate::tunnel_history::routing_token_hex(&RoutingToken([0x7c; 32]));
+        history.open_session(&canon, TRANSPORT_QUIC, now - 600).unwrap();
+        history.close_session(&canon, now - 300, "revoked").unwrap();
+        let resp = post(Some(secret_hex), vec![tok_hex.clone(), "zz".into()]).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let parsed: BulkTunnelHistoryResp = serde_json::from_slice(&body).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].token, tok_hex);
+        assert_eq!(parsed.entries[0].summary.session_count_24h, 1);
+        assert_eq!(parsed.entries[0].summary.disconnect_reasons_24h.get("revoked"), Some(&1));
     }
 
     #[tokio::test]

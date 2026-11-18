@@ -3102,6 +3102,40 @@ impl SqliteTunnelStore {
         rows.collect()
     }
 
+    /// Admin read for the operator agents overview (`/admin-ui/agents`): every tunnel
+    /// paired with its owning subject (which [`Self::all`] deliberately omits), same
+    /// ordering as `all`. Like `all`, never exposed on a customer-facing route.
+    pub fn all_with_subject(&self) -> rusqlite::Result<Vec<(String, SubjectTunnel)>> {
+        let conn = self.read();
+        let mut stmt = conn.prepare(
+            "SELECT subject, id, name, hostname, created_at, routing_token FROM subject_tunnels ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                SubjectTunnel {
+                    id: r.get(1)?,
+                    name: r.get(2)?,
+                    hostname: r.get(3)?,
+                    created_at: r.get(4)?,
+                    routing_token: r.get(5)?,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Admin read: `tunnel_id -> agent_version` for every tunnel whose cached bridge probe
+    /// (#781) recorded one. Tunnels never probed (or probed without a version) are simply
+    /// absent -- the caller shows "unbekannt", it is not an error.
+    pub fn bridge_probe_versions(&self) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let conn = self.read();
+        let mut stmt =
+            conn.prepare("SELECT tunnel_id, agent_version FROM bridge_probe_cache WHERE agent_version IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
     /// Revoke a tunnel by id, but only if it belongs to `subject`. Returns the
     /// removed tunnel's **routing token** (so the caller can invalidate its edge
     /// registration — #27 RB3/RB4), or `None` when the id is unknown or owned by
@@ -12948,6 +12982,32 @@ mod tests {
         // Deleted with the tunnel.
         assert!(store.revoke("alice", &t.id, 6_000).unwrap().is_some());
         assert_eq!(store.bridge_probe("alice", &t.id).unwrap(), None, "the cache row goes with the tunnel");
+    }
+
+    #[test]
+    fn all_with_subject_and_bridge_probe_versions_feed_the_admin_agents_overview() {
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let a = store.create("alice", "agent-a", None).unwrap().created().unwrap();
+        let b = store.create("bob", "agent-b", None).unwrap().created().unwrap();
+        let _c = store.create("bob", "agent-c", None).unwrap().created().unwrap();
+        let all = store.all_with_subject().unwrap();
+        assert_eq!(all.len(), 3);
+        let owner_of = |id: &str| all.iter().find(|(_, t)| t.id == id).map(|(s, _)| s.clone());
+        assert_eq!(owner_of(&a.id).as_deref(), Some("alice"));
+        assert_eq!(owner_of(&b.id).as_deref(), Some("bob"));
+        // Same tunnels as `all()`.
+        assert_eq!(all.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(), store.all().unwrap());
+
+        assert!(store.bridge_probe_versions().unwrap().is_empty(), "nothing probed yet");
+        // Readiness-only probe has no version -> absent; a status probe adds one.
+        let config = serde_json::json!({ "role": "serve" });
+        assert!(store.record_bridge_probe("bob", &b.id, "bridge/config", &config, 1_000).unwrap());
+        assert!(store.bridge_probe_versions().unwrap().is_empty());
+        let status = serde_json::json!({ "version": "0.7.26" });
+        assert!(store.record_bridge_probe("alice", &a.id, "bridge/status", &status, 2_000).unwrap());
+        let v = store.bridge_probe_versions().unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.get(&a.id).map(String::as_str), Some("0.7.26"));
     }
 
     // ===== admin tunnel transfer =====
