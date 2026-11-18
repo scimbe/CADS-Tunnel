@@ -50,9 +50,22 @@ PY
 }
 
 fails=0
+probed=0
 for k in $(seq 0 63); do
   cp "$BAK" "$SRC"
-  mutate "$k" || break                     # exit 2 = every site has been probed
+  mutate "$k"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    break                                  # exit 2 = every site has been probed
+  elif [ "$rc" -ne 0 ]; then
+    # Anything else (missing python3, a crash, the regex/parser breaking) is the
+    # probe itself failing, not "no more sites" -- counting it as a clean stop is
+    # exactly the false "every site is covered" this script exists to prevent.
+    echo "mutate $k: did not run (exit $rc) -- probe itself is broken, not \"no more sites\""
+    fails=$((fails + 1))
+    break
+  fi
+  probed=$((probed + 1))
   out=$(docker run --rm -v "$PWD":/w -w /w -v cads-tunnel-target:/w/target \
         -v cargo-registry:/usr/local/cargo/registry -e CARGO_INCREMENTAL=0 \
         rust:1-slim-bookworm sh -c 'cargo test -p ct-edge --lib every_token_carrying 2>&1')
@@ -74,5 +87,10 @@ done
 # `test <name> ... FAILED` and `test result: FAILED`, so a `== 1` check is wrong for every
 # site at once. The first run of this probe reported 12 blind spots that way -- a false alarm
 # that only looked wrong because 12-out-of-12 is implausible.
+if [ "$probed" -eq 0 ] && [ "$fails" -eq 0 ]; then
+  echo "0 sites were probed -- the site regex matched nothing. That is a probe failure, not full coverage."
+  fails=$((fails + 1))
+fi
+
 [ "$fails" -eq 0 ] && echo "every guarded relay site is covered." || echo "$fails site(s) need attention."
 exit $((fails > 0))
