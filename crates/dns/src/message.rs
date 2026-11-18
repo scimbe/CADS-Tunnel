@@ -78,18 +78,24 @@ pub fn parse_query(buf: &[u8]) -> Option<Query> {
 /// larger advertised buffer to honor) — a response over this must set TC=1 and
 /// drop trailing answers rather than emit an oversized datagram a resolver that
 /// strictly honors TC never retries over TCP for, or that a plain IP layer
-/// fragments/drops outright.
-const MAX_UDP_RESPONSE_BYTES: usize = 512;
+/// fragments/drops outright. This is [`build_response`]'s default caller-facing
+/// name for the UDP transport's own limit; `handle_tcp` passes a much larger
+/// `max_bytes` (#994) since TCP has no such ceiling.
+pub(crate) const MAX_UDP_RESPONSE_BYTES: usize = 512;
 
 /// Build an authoritative response for `query`, carrying one TXT answer per entry
 /// in `txts` (only for a TXT question; other qtypes get an empty NOERROR). Sets
 /// QR + AA and echoes the question. TXT strings longer than 255 bytes are split
 /// into DNS character-strings per the wire format.
 ///
-/// #299: if the full answer set would exceed [`MAX_UDP_RESPONSE_BYTES`], only as
-/// many whole answers as fit are included, TC (truncation) is set, and ancount
-/// reflects the answers actually present — never a partial/corrupt answer record.
-pub fn build_response(query: &Query, txts: &[String]) -> Vec<u8> {
+/// #299/#994: if the full answer set would exceed `max_bytes`, only as many whole
+/// answers as fit are included, TC (truncation) is set, and ancount reflects the
+/// answers actually present — never a partial/corrupt answer record. The caller
+/// picks `max_bytes`: [`MAX_UDP_RESPONSE_BYTES`] for UDP, the TCP message-length
+/// ceiling for TCP — a resolver that retries a truncated UDP answer over TCP must
+/// actually be able to get the full answer set there, not the same 512-byte limit
+/// applied twice.
+pub fn build_response(query: &Query, txts: &[String], max_bytes: usize) -> Vec<u8> {
     // Encode each answer RR independently first so truncation can drop whole
     // answers by byte budget without ever splitting one mid-record.
     let answer_rrs: Vec<Vec<u8>> = if query.qtype == TYPE_TXT {
@@ -120,7 +126,7 @@ pub fn build_response(query: &Query, txts: &[String]) -> Vec<u8> {
 
     let header_and_question_len = 12 + name_wire_len(&query.name) + 4; // qtype + qclass
     let mut included = 0usize;
-    let mut budget = MAX_UDP_RESPONSE_BYTES.saturating_sub(header_and_question_len);
+    let mut budget = max_bytes.saturating_sub(header_and_question_len);
     for rr in &answer_rrs {
         if rr.len() > budget {
             break;
@@ -279,7 +285,7 @@ mod tests {
     #[test]
     fn build_response_carries_the_txt_answer() {
         let q = parse_query(&build_query(0xABCD, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
-        let resp = build_response(&q, &["token-value-123".to_string()]);
+        let resp = build_response(&q, &["token-value-123".to_string()], MAX_UDP_RESPONSE_BYTES);
         // Header: echoed id, QR+AA set, one answer.
         assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0xABCD);
         assert_eq!(resp[2] & 0x80, 0x80, "QR set");
@@ -306,7 +312,7 @@ mod tests {
         let q = parse_query(&build_query(0x1234, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
         // Twenty ~200-byte TXT values -- the full set is far over 512 bytes.
         let txts: Vec<String> = (0..20).map(|i| format!("{i:03}-{}", "x".repeat(200))).collect();
-        let resp = build_response(&q, &txts);
+        let resp = build_response(&q, &txts, MAX_UDP_RESPONSE_BYTES);
 
         assert!(resp.len() <= MAX_UDP_RESPONSE_BYTES, "response fits the UDP ceiling: {} bytes", resp.len());
         assert_eq!(resp[2] & 0x02, 0x02, "TC bit set");
@@ -321,11 +327,29 @@ mod tests {
     }
 
     #[test]
+    fn build_response_with_a_larger_max_bytes_carries_the_full_answer_set_994() {
+        // #994: the same answer set that truncates at the UDP ceiling above must fit
+        // whole, untruncated, when the caller passes a larger max_bytes (what handle_tcp
+        // now does) -- otherwise a resolver retrying a truncated UDP answer over TCP
+        // would get the identical truncated, TC-flagged message and never recover the
+        // full set.
+        let q = parse_query(&build_query(0x1234, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
+        let txts: Vec<String> = (0..20).map(|i| format!("{i:03}-{}", "x".repeat(200))).collect();
+        let resp = build_response(&q, &txts, 65535);
+
+        assert!(resp.len() > MAX_UDP_RESPONSE_BYTES, "sanity: this answer set is over the UDP ceiling");
+        assert_eq!(resp[2] & 0x02, 0, "TC bit NOT set -- nothing was dropped");
+        let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+        assert_eq!(ancount as usize, txts.len(), "every answer included");
+        assert_eq!(parse_txt_answers(&resp), txts, "full answer set round-trips intact");
+    }
+
+    #[test]
     fn build_response_does_not_truncate_when_the_answer_set_fits_299() {
         // The common case (a handful of small TXT values, the actual ACME DNS-01 shape)
         // must be completely unaffected by the truncation logic.
         let q = parse_query(&build_query(1, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
-        let resp = build_response(&q, &["a-normal-challenge-token".to_string()]);
+        let resp = build_response(&q, &["a-normal-challenge-token".to_string()], MAX_UDP_RESPONSE_BYTES);
         assert_eq!(resp[2] & 0x02, 0, "TC bit NOT set");
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "the one answer is present");
     }
@@ -339,7 +363,7 @@ mod tests {
         // with a correctly backpatched rdlength spanning both, and round-trip intact.
         let q = parse_query(&build_query(0x42, "_acme-challenge.host.test", TYPE_TXT)).unwrap();
         let long_value = "y".repeat(300);
-        let resp = build_response(&q, &[long_value.clone()]);
+        let resp = build_response(&q, &[long_value.clone()], MAX_UDP_RESPONSE_BYTES);
 
         assert_eq!(parse_txt_answers(&resp), vec![long_value], "multi-chunk value round-trips intact");
 
@@ -361,11 +385,11 @@ mod tests {
         assert_eq!(q.name, "_acme-challenge.host.test");
         assert_eq!(q.qtype, TYPE_TXT);
 
-        let resp = build_response(&q, &["tok-a".to_string(), "tok-b".to_string()]);
+        let resp = build_response(&q, &["tok-a".to_string(), "tok-b".to_string()], MAX_UDP_RESPONSE_BYTES);
         assert_eq!(parse_txt_answers(&resp), vec!["tok-a".to_string(), "tok-b".to_string()]);
 
         // A response with no answers -> empty; malformed -> empty (no panic).
-        assert!(parse_txt_answers(&build_response(&q, &[])).is_empty());
+        assert!(parse_txt_answers(&build_response(&q, &[], MAX_UDP_RESPONSE_BYTES)).is_empty());
         assert!(parse_txt_answers(b"\x00").is_empty());
     }
 
@@ -373,11 +397,11 @@ mod tests {
     fn build_response_is_empty_for_a_non_txt_or_unknown_name() {
         let q = parse_query(&build_query(1, "host.test", TYPE_TXT)).unwrap();
         // Unknown name -> NOERROR with zero answers.
-        let resp = build_response(&q, &[]);
+        let resp = build_response(&q, &[], MAX_UDP_RESPONSE_BYTES);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "no answers");
         // Non-TXT question -> no answers even if TXT values exist.
         let a = parse_query(&build_query(1, "host.test", 1 /* A */)).unwrap();
-        let resp = build_response(&a, &["ignored".to_string()]);
+        let resp = build_response(&a, &["ignored".to_string()], MAX_UDP_RESPONSE_BYTES);
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "TXT not served for an A query");
     }
 }
