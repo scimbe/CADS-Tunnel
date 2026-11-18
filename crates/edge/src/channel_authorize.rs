@@ -135,6 +135,13 @@ pub struct ChannelAuthorizer {
 enum Outcome {
     Authorized(MemberResolution),
     Refused,
+    /// #967: the CP rejected THIS EDGE's own request (401 on `x-ct-admin-token`) --
+    /// a fact about this edge's credential, not about `holder`. A drifted/rotated
+    /// admin token or a CP/proxy that briefly 401s the route must not be read as
+    /// authoritative revocation of every holder asked about, unlike a genuine 404
+    /// ([`Outcome::Refused`]). Treated as a transport-class failure
+    /// ([`Outcome::Unresolved`]'s fail-static fallback), never as a refusal.
+    Unauthorized,
     Unresolved,
 }
 
@@ -298,7 +305,7 @@ impl ChannelAuthorizer {
         // handled identically by this function today, but a run of 401s (a drifted/
         // misconfigured x-ct-admin-token on this edge) has a very different fix than a
         // run of genuine 404s (this holder really isn't a member).
-        if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
             eprintln!(
                 "ct-edge: channel-authorize REFUSED [status={}] channel={} holder={}",
                 resp.status(),
@@ -306,6 +313,19 @@ impl ChannelAuthorizer {
                 hex(holder)
             );
             return Outcome::Refused;
+        }
+        // #967: a 401 says the CP rejected THIS EDGE's own x-ct-admin-token -- it
+        // says nothing about `holder`. Previously folded into Refused above, so a
+        // drifted/misconfigured token (or a CP/proxy briefly 401ing the route) was
+        // read as authoritative revocation of every holder asked about, cutting
+        // live sessions and defeating #231's fail-static cache for all of them.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            eprintln!(
+                "ct-edge: channel-authorize UNAUTHORIZED [this edge's own admin token, not a holder verdict] channel={} holder={}",
+                hex(&channel.0),
+                hex(holder)
+            );
+            return Outcome::Unauthorized;
         }
         if !resp.status().is_success() {
             eprintln!(
@@ -422,7 +442,11 @@ impl ChannelAuthorizer {
                 }
                 None
             }
-            Outcome::Unresolved => self
+            // #967: Unauthorized is a fact about this edge's own credential, not
+            // about `holder` -- fail-static exactly like Unresolved (fall back to
+            // the last successful resolution if still fresh), never evicting the
+            // positive cache or writing a negative entry the way Refused does.
+            Outcome::Unresolved | Outcome::Unauthorized => self
                 .cache
                 .lock()
                 .ok()
@@ -697,6 +721,70 @@ mod tests {
             auth.resolve(&channel, &[0x44u8; 32]).await.is_none(),
             "definitively_not_a_member's refusal must evict the positive cache entry too, \
              not just the negative one -- a transport failure afterward must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_401_on_this_edges_own_admin_token_is_not_read_as_member_revocation_967() {
+        // #967: a 401 says the CP rejected THIS EDGE's own x-ct-admin-token -- a
+        // drifted/rotated token, or a CP/proxy briefly 401ing the route -- it says
+        // nothing about any specific holder. Must NOT be treated as an
+        // authoritative refusal: definitively_not_a_member must return false (not
+        // "proven revoked"), and resolve must fall back to the fail-static cache
+        // like any other transport-class failure, not evict it.
+        let always_401 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = always_401.clone();
+        async fn maybe_401_authorize(
+            axum::extract::State(flag): axum::extract::State<Arc<std::sync::atomic::AtomicBool>>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Result<Json<Value>, axum::http::StatusCode> {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            if headers.get("x-ct-admin-token").and_then(|v| v.to_str().ok()) != Some(&hex(&[0x7au8; 32])) {
+                return Err(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            let holder = body.get("holder").and_then(|v| v.as_str()).unwrap_or("");
+            if holder == hex(&[0x55u8; 32]) {
+                Ok(Json(serde_json::json!({"operator_pubkey": hex(&[0xEEu8; 32])})))
+            } else {
+                Err(axum::http::StatusCode::NOT_FOUND)
+            }
+        }
+        let app = Router::new()
+            .route("/internal/channel/authorize", post(maybe_401_authorize))
+            .with_state(flag);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let channel = ChannelId([0xC7u8; 32]);
+        let auth = ChannelAuthorizer::with_ttls(
+            &format!("http://{addr}"),
+            &[0x7au8; 32],
+            Duration::from_secs(2),
+            Duration::from_secs(3), // cache_ttl
+            Duration::from_millis(50), // negative_cache_ttl
+        );
+
+        // The member resolves and gets cached while the token is still valid.
+        assert!(auth.resolve(&channel, &[0x55u8; 32]).await.is_some(), "member resolves once (cached)");
+
+        // Now the CP starts 401ing every request -- simulating a drifted admin token.
+        always_401.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Must NOT read as an authoritative revocation of this already-proven member.
+        assert!(
+            !auth.definitively_not_a_member(&channel, &[0x55u8; 32]).await,
+            "a 401 is a fact about this edge's own token, not proof the holder was revoked"
+        );
+        // The fail-static cache must survive -- resolve still returns the cached entry.
+        assert_eq!(
+            auth.resolve(&channel, &[0x55u8; 32]).await.map(|m| m.operator_pubkey),
+            Some([0xEEu8; 32]),
+            "a 401 must fall back to the fail-static cache like any other transport-class failure, not evict it"
         );
     }
 
