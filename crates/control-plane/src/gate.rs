@@ -572,11 +572,17 @@ async fn gate_check(State(st): State<GateState>, headers: HeaderMap, Query(q): Q
         // A login session is re-checked against the hostname's CURRENT allow-list, so
         // removing an email (or turning "any login" off, or the hostname changing hands)
         // takes effect immediately instead of when the 8h cookie expires.
+        // #999: checked against claims.host (the session's own bound host), not
+        // the ambient request `host` -- so this authorization lookup is correct
+        // on its own terms and never depends on running only after the
+        // `claims.host == host` guard below. Before this, a future edit moving
+        // this call outside that guard (or reordering the `&&`) would have
+        // silently checked the WRONG host's allow-list/share-link state.
         let still_authorized = || match claims.email.strip_prefix(GATE_SHARE_SUBJECT_PREFIX) {
-            Some(link_id) => matches!(st.tunnels.share_link_active(link_id, &host, now), Ok(true)),
+            Some(link_id) => matches!(st.tunnels.share_link_active(link_id, &claims.host, now), Ok(true)),
             None => {
-                matches!(st.tunnels.allow_any_login_for_hostname(&host), Ok(true))
-                    || matches!(st.tunnels.email_allowed_for_hostname(&host, &claims.email), Ok(true))
+                matches!(st.tunnels.allow_any_login_for_hostname(&claims.host), Ok(true))
+                    || matches!(st.tunnels.email_allowed_for_hostname(&claims.host, &claims.email), Ok(true))
             }
         };
         if claims.host == host && still_authorized() {
