@@ -4452,9 +4452,49 @@ pub async fn run_edge(config: &EdgeConfig, cert_out: &str) -> Result<(), BoxErro
                         }
                     });
                 }
-                let revoked_count = revoked.len();
-                state.seed_revoked_tokens(revoked.into_iter().map(RoutingToken));
-                eprintln!("ct-edge: replayed {revoked_count} revoked token(s) from {cp_url}");
+                // #973: same unavailable-vs-empty distinction and retry-until-answered
+                // shape as the rehydration branch just above — an Edge boot that starts
+                // with "nothing revoked" because the registry was genuinely unreachable
+                // must not look the same as a genuinely clean revocation list, and must
+                // not give up after one attempt.
+                let revoked_unavailable = match &revoked {
+                    crate::edge_mesh_client::RevocationFetch::Unavailable(why) => Some(why.clone()),
+                    crate::edge_mesh_client::RevocationFetch::Answered(_) => None,
+                };
+                let revoked_count = match &revoked {
+                    crate::edge_mesh_client::RevocationFetch::Answered(t) => t.len(),
+                    crate::edge_mesh_client::RevocationFetch::Unavailable(_) => 0,
+                };
+                state.seed_revoked_tokens(revoked.tokens().into_iter().map(RoutingToken));
+                match &revoked_unavailable {
+                    None => eprintln!("ct-edge: replayed {revoked_count} revoked token(s) from {cp_url}"),
+                    Some(why) => eprintln!(
+                        "ct-edge: #973 REVOKED-TOKEN FETCH FAILED ({why}) -- no revocation was replayed, so \
+                         an already-revoked tunnel could re-register until a retry succeeds. Retrying in \
+                         the background."
+                    ),
+                }
+                if revoked_unavailable.is_some() {
+                    let (rurl, rtok, rstate) = (cp_url.clone(), tok, state.clone());
+                    tokio::spawn(async move {
+                        let mut delay = std::time::Duration::from_secs(5);
+                        loop {
+                            tokio::time::sleep(delay).await;
+                            match crate::edge_mesh_client::fetch_revoked_tokens(&rurl, &rtok).await {
+                                crate::edge_mesh_client::RevocationFetch::Answered(tokens) => {
+                                    let n = tokens.len();
+                                    rstate.seed_revoked_tokens(tokens.into_iter().map(RoutingToken));
+                                    eprintln!("ct-edge: #973 revoked-token fetch recovered -- replayed {n} revoked token(s)");
+                                    return;
+                                }
+                                crate::edge_mesh_client::RevocationFetch::Unavailable(why) => {
+                                    eprintln!("ct-edge: #973 revoked-token fetch retry failed ({why}); next attempt in {delay:?}");
+                                    delay = (delay * 2).min(std::time::Duration::from_secs(60));
+                                }
+                            }
+                        }
+                    });
+                }
                 let hstate_cp_url = cp_url.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(30));
