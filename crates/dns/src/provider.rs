@@ -235,7 +235,29 @@ impl DesecClient {
     /// of an immediate, accurate config error.
     pub async fn set_txt(&self, name: &str, value: &str) -> Result<(), String> {
         self.guard_under_zone(name)?;
+        Self::validate_txt_value(value)?;
         self.patch_rrset(name, "TXT", vec![format!("\"{value}\"")]).await
+    }
+
+    /// #996: `value` is wrapped in bare double quotes with plain string formatting
+    /// before this -- unescaped, a `"` or `\` in it changes the TXT presentation
+    /// format actually sent to deSEC, and on the inbound side `value` can come
+    /// straight from an agent's `/agent/dns01-challenge` request body with no
+    /// validation before reaching this, the last point before the zone-wide
+    /// deSEC token is used. Restricted to the base64url alphabet, which is what
+    /// every real ACME key-authorization digest and this crate's own selftest
+    /// value already are -- nothing legitimate is rejected.
+    fn validate_txt_value(value: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return Err("TXT value must not be empty".to_string());
+        }
+        if value.len() > 255 {
+            return Err(format!("TXT value is {} bytes, over the 255-byte character-string limit", value.len()));
+        }
+        if !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return Err("TXT value must be base64url (letters, digits, '_', '-' only)".to_string());
+        }
+        Ok(())
     }
 
     /// Clear the challenge TXT — an empty `records` list removes the RRset. #459: same zone guard
@@ -493,6 +515,52 @@ mod tests {
         assert!(captured.lock().unwrap().is_none(), "guard fires before any HTTP call for set_txt");
         assert!(client.clear_txt("_acme-challenge.wrong.example").await.is_err());
         assert!(captured.lock().unwrap().is_none(), "guard fires before any HTTP call for clear_txt");
+    }
+
+    #[tokio::test]
+    async fn set_txt_rejects_a_value_that_is_not_base64url_before_any_http_call_996() {
+        // #996: a value containing a quote/backslash would change the TXT
+        // presentation format actually sent; anything outside the base64url
+        // alphabet (what every real ACME digest and the selftest value already
+        // are) must be refused before the zone-wide deSEC token is ever used.
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen = captured.clone();
+        let app = Router::new().route(
+            "/domains/:domain/rrsets/",
+            patch(move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = Some(body);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = DesecClient::from_lookup(|k| match k {
+            "DESEC_TOKEN" => Some("secret-token".into()),
+            "DESEC_DOMAIN" => Some("bunsenbrenner.org".into()),
+            "DESEC_API_BASE" => Some(format!("http://{addr}")),
+            _ => None,
+        })
+        .unwrap();
+
+        let too_long = "x".repeat(256);
+        for bad in ["has a space", "quote\"inside", "back\\slash", "", too_long.as_str()] {
+            *captured.lock().unwrap() = None;
+            assert!(
+                client.set_txt("_acme-challenge.bunsenbrenner.org", bad).await.is_err(),
+                "{bad:?} must be rejected"
+            );
+            assert!(captured.lock().unwrap().is_none(), "{bad:?} must be rejected before any HTTP call");
+        }
+
+        // A real base64url digest and the crate's own selftest-style value both
+        // still work -- the validation must not be stricter than real usage needs.
+        assert!(client.set_txt("_acme-challenge.bunsenbrenner.org", "abc123_-XYZ").await.is_ok());
+        assert!(client.set_txt("_acme-challenge.bunsenbrenner.org", "ct-dns-selftest-12345").await.is_ok());
     }
 
     #[tokio::test]
