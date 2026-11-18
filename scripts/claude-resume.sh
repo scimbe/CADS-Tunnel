@@ -160,7 +160,8 @@ cmd_resume_interactive() {
     echo -e "${GREEN}>>>${NC} Opening session picker..."
     cd "$WORKSPACE_DIR"
     register_session_end_trap
-    exec claude $BASE_FLAGS --resume
+    claude $BASE_FLAGS --resume
+    exit $?
 }
 
 cmd_resume_id() {
@@ -169,7 +170,8 @@ cmd_resume_id() {
     echo -e "${GREEN}>>>${NC} Resuming session: ${BOLD}${session_id}${NC}"
     cd "$WORKSPACE_DIR"
     register_session_end_trap
-    exec claude $BASE_FLAGS --resume "$session_id"
+    claude $BASE_FLAGS --resume "$session_id"
+    exit $?
 }
 
 cmd_new() {
@@ -179,12 +181,14 @@ cmd_new() {
         echo -e "${GREEN}>>>${NC} Starting new session: ${BOLD}${name}${NC}"
         cd "$WORKSPACE_DIR"
         register_session_end_trap
-        exec claude $BASE_FLAGS --name "$name"
+        claude $BASE_FLAGS --name "$name"
+        exit $?
     else
         echo -e "${GREEN}>>>${NC} Starting new session..."
         cd "$WORKSPACE_DIR"
         register_session_end_trap
-        exec claude $BASE_FLAGS
+        claude $BASE_FLAGS
+        exit $?
     fi
 }
 
@@ -193,7 +197,8 @@ cmd_continue() {
     echo -e "${GREEN}>>>${NC} Continuing most recent session..."
     cd "$WORKSPACE_DIR"
     register_session_end_trap
-    exec claude $BASE_FLAGS --continue
+    claude $BASE_FLAGS --continue
+    exit $?
 }
 
 cmd_fork() {
@@ -202,7 +207,8 @@ cmd_fork() {
     echo -e "${GREEN}>>>${NC} Forking session: ${BOLD}${session_id}${NC}"
     cd "$WORKSPACE_DIR"
     register_session_end_trap
-    exec claude $BASE_FLAGS --resume "$session_id" --fork-session
+    claude $BASE_FLAGS --resume "$session_id" --fork-session
+    exit $?
 }
 
 cmd_from_pr() {
@@ -212,10 +218,11 @@ cmd_from_pr() {
     cd "$WORKSPACE_DIR"
     register_session_end_trap
     if [ -n "$pr" ]; then
-        exec claude $BASE_FLAGS --from-pr "$pr"
+        claude $BASE_FLAGS --from-pr "$pr"
     else
-        exec claude $BASE_FLAGS --from-pr
+        claude $BASE_FLAGS --from-pr
     fi
+    exit $?
 }
 
 cmd_list() {
