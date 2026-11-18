@@ -70,9 +70,104 @@ fn parse_client_mode_value(raw: Option<&str>) -> Result<Option<ClientMode>, Stri
     }
 }
 
+/// #977: the client's real, recognized `CT_BENCH_MODE` values, hardened the same
+/// way #489 hardened `CT_CLIENT_MODE` -- an unrecognized value used to silently
+/// fall through to the one-shot bench via the `_` arm instead of erroring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchMode {
+    Stream,
+    Udp,
+    Throughput,
+}
+
+impl std::fmt::Display for BenchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BenchMode::Stream => "stream",
+            BenchMode::Udp => "udp",
+            BenchMode::Throughput => "throughput",
+        })
+    }
+}
+
+fn parse_bench_mode() -> Result<Option<BenchMode>, String> {
+    // The compose files pass `CT_BENCH_MODE: "${BENCH_MODE:-}"`, i.e. an EMPTY string when
+    // unset -- that means "default one-shot bench", not an unrecognized value.
+    let raw = std::env::var("CT_BENCH_MODE").ok().filter(|s| !s.is_empty());
+    parse_bench_mode_value(raw.as_deref())
+}
+
+/// The pure check behind [`parse_bench_mode`] -- see [`parse_client_mode_value`]'s
+/// own doc for why this is split out.
+fn parse_bench_mode_value(raw: Option<&str>) -> Result<Option<BenchMode>, String> {
+    match raw {
+        None => Ok(None),
+        Some("stream") => Ok(Some(BenchMode::Stream)),
+        Some("udp") => Ok(Some(BenchMode::Udp)),
+        Some("throughput") | Some("bulk") => Ok(Some(BenchMode::Throughput)),
+        Some(other) => Err(format!(
+            "unrecognized CT_BENCH_MODE={other:?} -- expected one of \"stream\", \"udp\", \"throughput\", \"bulk\", \
+             or unset for the default one-shot latency bench"
+        )),
+    }
+}
+
+/// #977: `CT_CLIENT_ITERATIONS` used to parse-or-default-to-1 silently -- an
+/// unparsable value (e.g. a typo) ran a single ordinary tunnel round-trip and
+/// exited 0 instead of erroring, the same false-pass class #489 removed for
+/// `CT_CLIENT_MODE`. Unset still defaults to 1; a value that's SET but doesn't
+/// parse as a positive integer is now a real startup error.
+fn parse_iterations_value(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(1),
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| format!("invalid CT_CLIENT_ITERATIONS={s:?} -- expected a positive integer")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_bench_mode_value_accepts_every_real_mode_and_unset_977() {
+        assert_eq!(parse_bench_mode_value(None), Ok(None));
+        assert_eq!(parse_bench_mode_value(Some("stream")), Ok(Some(BenchMode::Stream)));
+        assert_eq!(parse_bench_mode_value(Some("udp")), Ok(Some(BenchMode::Udp)));
+        assert_eq!(parse_bench_mode_value(Some("throughput")), Ok(Some(BenchMode::Throughput)));
+        assert_eq!(parse_bench_mode_value(Some("bulk")), Ok(Some(BenchMode::Throughput)));
+    }
+
+    #[test]
+    fn parse_bench_mode_value_rejects_an_unrecognized_value_instead_of_silently_defaulting_977() {
+        let err = parse_bench_mode_value(Some("streem")).unwrap_err();
+        assert!(err.contains("streem"), "the error names the actual bad value");
+        // An empty string is handled by parse_bench_mode() (compose passes "" when unset),
+        // so the pure parser still treats it as unrecognized.
+        assert!(parse_bench_mode_value(Some("")).is_err());
+        assert!(parse_bench_mode_value(Some("STREAM")).is_err(), "case-sensitive, not a silently-accepted alias");
+    }
+
+    #[test]
+    fn parse_iterations_value_accepts_unset_and_positive_integers_977() {
+        assert_eq!(parse_iterations_value(None), Ok(1), "unset -> default of 1");
+        assert_eq!(parse_iterations_value(Some("1")), Ok(1));
+        assert_eq!(parse_iterations_value(Some("30")), Ok(30));
+    }
+
+    #[test]
+    fn parse_iterations_value_rejects_unparsable_or_zero_instead_of_silently_defaulting_977() {
+        // #977: the issue's own reproduction -- an unparsable value used to
+        // silently become 1 (skipping bench mode entirely) instead of erroring.
+        let err = parse_iterations_value(Some("thirty")).unwrap_err();
+        assert!(err.contains("thirty"), "the error names the actual bad value");
+        assert!(parse_iterations_value(Some("-1")).is_err());
+        assert!(parse_iterations_value(Some("0")).is_err(), "zero iterations is not a meaningful request");
+        assert!(parse_iterations_value(Some("")).is_err());
+    }
 
     #[test]
     fn parse_client_mode_value_accepts_every_real_mode_and_unset_489() {
@@ -103,12 +198,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // #489: validated once, up front -- an unrecognized value is a real startup error,
     // not a silent fall-through to the default mode.
     let client_mode = parse_client_mode()?;
+    // #977: same hardening for the neighbouring bench knobs -- an unrecognized
+    // CT_BENCH_MODE or an unparsable CT_CLIENT_ITERATIONS is now a real startup
+    // error instead of silently running a different mode than requested.
+    let bench_mode = parse_bench_mode()?;
     let config = ClientConfig::from_env();
     let payload = std::env::var("CT_CLIENT_PAYLOAD").unwrap_or_else(|_| "hello-tunnel".to_string());
-    let iterations: usize = std::env::var("CT_CLIENT_ITERATIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let iterations = parse_iterations_value(std::env::var("CT_CLIENT_ITERATIONS").ok().as_deref())?;
+    // #977: CT_BENCH_MODE=stream/udp with iterations of 1 used to silently run the
+    // default single-tunnel path instead of the requested bench (the `if
+    // iterations > 1` gate below never ran). Throughput mode is exempt -- it
+    // already treats iterations=1 as a meaningful "one transfer" request (its own
+    // check runs before the iterations>1 gate and uses `iterations.max(1)`).
+    if matches!(bench_mode, Some(BenchMode::Stream) | Some(BenchMode::Udp)) && iterations <= 1 {
+        return Err(format!(
+            "CT_BENCH_MODE={} requires CT_CLIENT_ITERATIONS > 1 (got {iterations}) -- otherwise this \
+             would silently run the default single-tunnel path instead of the requested bench",
+            bench_mode.expect("matches! above guarantees Some")
+        )
+        .into());
+    }
 
     // Wait for the Edge cert. Cross-host, fetch the published root once with
     // `curl http://<cp>:8090/pki/ca -o edge-cert.der` (#11) and point
@@ -268,10 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // netem rate cap (CT_NETEM_RATE), distinct from the latency modes that report
     // RTT. CT_BENCH_BYTES sizes the payload (default 8 MiB); CT_CLIENT_ITERATIONS
     // (>=1) aggregates that many transfers into a sustained-throughput estimate.
-    if matches!(
-        std::env::var("CT_BENCH_MODE").as_deref(),
-        Ok("throughput") | Ok("bulk")
-    ) {
+    if matches!(bench_mode, Some(BenchMode::Throughput)) {
         let bytes: usize = std::env::var("CT_BENCH_BYTES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -303,9 +409,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // selects the measured path — "stream" for the full-duplex streaming path,
     // otherwise the one-shot path (M16.2b).
     if iterations > 1 {
-        let bench_mode = std::env::var("CT_BENCH_MODE").unwrap_or_default();
-        let samples = match bench_mode.as_str() {
-            "stream" => {
+        let samples = match bench_mode {
+            Some(BenchMode::Stream) => {
                 run_bench_stream(
                     edge_addr,
                     edge_cert,
@@ -316,7 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
             }
-            "udp" => {
+            Some(BenchMode::Udp) => {
                 run_bench_udp(
                     edge_addr,
                     edge_cert,
@@ -327,7 +432,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
             }
-            _ => {
+            // Throughput already returned above; None is the default one-shot
+            // latency bench (M16.2b).
+            None | Some(BenchMode::Throughput) => {
                 run_bench(
                     edge_addr,
                     edge_cert,
