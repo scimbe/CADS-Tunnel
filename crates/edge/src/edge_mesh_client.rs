@@ -160,27 +160,52 @@ struct RevokedTokensResp {
     tokens: Vec<String>,
 }
 
+/// #973: same "0 means two things" ambiguity [`Rehydration`] (#548) already closed for
+/// rehydration — a registry that answered "nothing is revoked" and one that could not
+/// be read at all used to produce the identical empty `Vec`, so the caller could not
+/// tell "genuinely nothing to revoke" apart from "must retry before accepting
+/// registrations". An Edge restart during exactly that gap would silently forget
+/// every revocation, and a still-reconnecting Agent for an already-revoked tunnel
+/// would successfully re-register.
+pub enum RevocationFetch {
+    /// The registry answered. `tokens` may legitimately be empty.
+    Answered(Vec<[u8; 32]>),
+    /// The registry could not be reached or its answer could not be read. `why` is
+    /// for the log line, not for control flow — the caller retries regardless.
+    Unavailable(String),
+}
+
+impl RevocationFetch {
+    /// The tokens to seed; empty when the registry was unavailable. Keeps the call
+    /// site's seed call unchanged — the distinction drives logging and retry, not
+    /// what gets seeded on this particular attempt.
+    pub fn tokens(self) -> Vec<[u8; 32]> {
+        match self {
+            Self::Answered(t) => t,
+            Self::Unavailable(_) => Vec::new(),
+        }
+    }
+}
+
 /// Fetch every routing token the control plane has durably recorded as
 /// revoked (#327), for boot-time replay into the local `revoked` set
 /// (`crate::state::EdgeState`) — without this, an Edge restart silently
 /// forgets every revocation and a still-reconnecting Agent for an
-/// already-revoked tunnel would successfully re-register. Same fail-soft
-/// contract as [`rehydrate`]: any transport/auth/parse failure yields an
-/// empty vec rather than blocking or crashing boot — a fresh/unreachable
-/// registry just means this boot starts with nothing replayed, the same gap
-/// that existed before this feature (not a regression). Malformed individual
-/// token hex strings are skipped, not fatal.
-pub async fn fetch_revoked_tokens(cp_url: &str, admin_token: &[u8; 32]) -> Vec<[u8; 32]> {
+/// already-revoked tunnel would successfully re-register. Malformed individual
+/// token hex strings are skipped, not fatal — only a transport/auth/parse
+/// failure of the WHOLE request yields [`RevocationFetch::Unavailable`].
+pub async fn fetch_revoked_tokens(cp_url: &str, admin_token: &[u8; 32]) -> RevocationFetch {
     let url = format!("{}/internal/revoked-tokens", cp_url.trim_end_matches('/'));
     let resp = match SHARED_CLIENT.get(&url).header("x-ct-admin-token", hex(admin_token)).send().await {
         Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
+        Ok(r) => return RevocationFetch::Unavailable(format!("registry answered {}", r.status())),
+        Err(e) => return RevocationFetch::Unavailable(format!("registry unreachable: {e}")),
     };
     let body: RevokedTokensResp = match resp.json().await {
         Ok(b) => b,
-        Err(_) => return Vec::new(),
+        Err(e) => return RevocationFetch::Unavailable(format!("registry answer unreadable: {e}")),
     };
-    body.tokens.into_iter().filter_map(|t| hex_decode_32(&t)).collect()
+    RevocationFetch::Answered(body.tokens.into_iter().filter_map(|t| hex_decode_32(&t)).collect())
 }
 
 /// Announce this edge (`id`, reachable at `peer_addr`) to the control plane's
@@ -455,6 +480,59 @@ mod tests {
             lookup_owner_by_host("http://127.0.0.1:1", &secret, "app.example.com").await.is_none(),
             "unreachable CP -> None, not a panic"
         );
+    }
+
+    async fn spawn_mock_revoked_tokens(secret: [u8; 32], tokens_json: &'static str) -> String {
+        let app = Router::new().route(
+            "/internal/revoked-tokens",
+            get(move |headers: HeaderMap| async move {
+                if !admin_ok(&headers, &secret) {
+                    return (StatusCode::UNAUTHORIZED, "").into_response();
+                }
+                (StatusCode::OK, tokens_json).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn fetch_revoked_tokens_distinguishes_an_empty_registry_from_an_unavailable_one_973() {
+        // #973: same "0 means two things" ambiguity #548 already closed for rehydrate --
+        // a genuinely clean revocation list and an unreadable registry used to produce
+        // the identical empty Vec, so an Edge restart during a registry hiccup silently
+        // forgot every revocation with no way for the boot path to tell and retry.
+        let secret = [0x77u8; 32];
+        let base = spawn_mock_revoked_tokens(secret, r#"{"tokens": []}"#).await;
+
+        // A registry that answers with nothing revoked: legitimately empty.
+        assert!(
+            matches!(fetch_revoked_tokens(&base, &secret).await, RevocationFetch::Answered(t) if t.is_empty()),
+            "an empty revocation list ANSWERED -- it must not be reported as unavailable"
+        );
+
+        let refused = fetch_revoked_tokens(&base, &[0u8; 32]).await;
+        let RevocationFetch::Unavailable(why) = refused else { panic!("wrong token must be Unavailable") };
+        assert!(why.contains("answered"), "a refusal names the status: {why}");
+
+        let down = fetch_revoked_tokens("http://127.0.0.1:1", &secret).await;
+        let RevocationFetch::Unavailable(why) = down else { panic!("unreachable CP must be Unavailable") };
+        assert!(why.contains("unreachable"), "an unreachable CP says so: {why}");
+    }
+
+    #[tokio::test]
+    async fn fetch_revoked_tokens_decodes_real_tokens_and_skips_malformed_ones_973() {
+        let secret = [0x88u8; 32];
+        let good = [0x11u8; 32];
+        let base = spawn_mock_revoked_tokens(secret, r#"{"tokens": ["1111111111111111111111111111111111111111111111111111111111111111", "not-hex"]}"#).await;
+        let RevocationFetch::Answered(tokens) = fetch_revoked_tokens(&base, &secret).await else {
+            panic!("a real, well-formed response must Answer")
+        };
+        assert_eq!(tokens, vec![good], "the malformed entry is skipped, not fatal");
     }
 
     #[test]
