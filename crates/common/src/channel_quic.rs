@@ -16,7 +16,7 @@
 //! build QUIC connections against the same broker wire protocol, so a drift would be a real
 //! wire-protocol risk, not a style nit).
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 use ed25519_dalek::SigningKey;
@@ -123,7 +123,16 @@ pub fn build_channel_dialer() -> Result<Endpoint, BoxError> {
             cfg
         }
     };
-    let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
+    // #1015: an IPv4-only socket rejects IPv6 remotes with ConnectError::InvalidRemoteAddress,
+    // so any broker/relay/direct-peer endpoint resolved or advertised as IPv6 failed at
+    // connect. Bind dual-stack ([::]:0) where the OS allows it; fall back to 0.0.0.0:0 for a
+    // host with IPv6 disabled or otherwise unavailable. This is the one point of divergence
+    // from the ct-agent v0.7.23 original this function was ported from -- a local bind-address
+    // choice, not a wire-visible change, so it doesn't need to move in lockstep with ct-agent.
+    let mut endpoint = match Endpoint::client(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {
+        Ok(e) => e,
+        Err(_) => Endpoint::client(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?,
+    };
     endpoint.set_default_client_config(cfg);
     Ok(endpoint)
 }
@@ -221,5 +230,19 @@ mod tests {
         let lb = b.local_addr().expect("b is bound");
         assert_ne!(la, lb, "each dialer binds its own socket (endpoints are not shared)");
         assert!(la.port() != 0 && lb.port() != 0, "both endpoints are bound to a real port");
+    }
+
+    #[tokio::test]
+    async fn build_channel_dialer_can_initiate_a_connect_to_an_ipv6_remote() {
+        // #1015: an IPv4-only socket rejects this synchronously with
+        // ConnectError::InvalidRemoteAddress before any packet is ever sent --
+        // this doesn't need a real IPv6 peer to answer, just that the local
+        // socket's address family doesn't reject the attempt outright.
+        let endpoint = build_channel_dialer().expect("dialer builds");
+        let v6_remote = SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), 4433);
+        match endpoint.connect(v6_remote, "localhost") {
+            Ok(connecting) => drop(connecting),
+            Err(e) => panic!("IPv6 remote must not be rejected by the local socket's address family: {e}"),
+        }
     }
 }
