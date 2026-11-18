@@ -73,12 +73,17 @@ fi
 # (This script predated the gate, so a gated CP returned 401 here — #141.)
 say "Minting a join token at $CP_URL/enroll/issue"
 if [ -n "$EDGE_ADMIN_TOKEN" ]; then
+  # #1005: `|| true` on both branches below -- under `set -e`, curl's non-zero exit
+  # (e.g. the 401 this comment above already anticipates) would otherwise end the
+  # script HERE, never reaching the `[ -n "$TOKEN" ] || die ...` check that carries
+  # the actual remediation hint, so the operator only ever saw curl's own bare
+  # "returned error: 401" with no pointer to CT_CP_EDGE_ADMIN_TOKEN.
   TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
             -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" \
-            -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')"
+            -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')" || true
 else
   TOKEN="$(curl -fsS -X POST "$CP_URL/enroll/issue" -H 'content-type: application/json' \
-            -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')"
+            -d "{\"tenant\":\"$TENANT\"}" | sed -n 's/.*"token":"\([0-9a-f]\{64\}\)".*/\1/p')" || true
 fi
 [ -n "$TOKEN" ] || die "could not mint a join token at $CP_URL/enroll/issue (if the CP gates /enroll/issue per #87, set CT_CP_EDGE_ADMIN_TOKEN in $ENV_FILE)"
 echo "   token minted (single-use; not printed)"
