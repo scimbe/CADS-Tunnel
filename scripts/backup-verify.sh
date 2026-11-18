@@ -11,7 +11,9 @@
 # Geprüft wird ohne jeden Eingriff in den laufenden Betrieb:
 #   1. entschlüsseln           (Passphrase passt, Datenstrom unversehrt)
 #   2. Archiv auflisten        (kein abgeschnittener tar-Strom)
-#   3. Pflichtdateien da       (Keycloak-Dump, Control-Plane-DB, Manifest)
+#   3. Pflichtdateien da       (siehe lib-backup.sh -- die gleiche Liste, gegen
+#                               die auch restore-selfhost.sh prueft; certs.tar.gz
+#                               wird zusaetzlich selbst als Archiv gelesen)
 #   4. pg_restore --list       (liest das Inhaltsverzeichnis des Dumps; ein
 #                               abgeschnittener Dump scheitert hier, ohne dass
 #                               irgendetwas eingespielt wird)
@@ -19,6 +21,9 @@
 #
 # Exit 0 = wiederherstellbar. Exit 1 = Alarm (Mail + Logzeile).
 set -euo pipefail
+
+# shellcheck source=./lib-backup.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib-backup.sh"
 
 REPO="${CADS_BACKUP_REPO:-https://github.com/scimbe/CADS-Tunnel-backups.git}"
 PASSFILE="${CADS_BACKUP_PASSFILE:-/home/becke/.config/cads-backup/passphrase}"
@@ -66,16 +71,27 @@ if [ -z "${ALARM:-}" ]; then
     fail "Der entschluesselte Snapshot ($STAMP) ist kein lesbares Archiv: $(tr -d '\n' < "$WORK/tar.err" | head -c 200)."
   else
     MISSING=""
-    for f in ./keycloak.pgdump ./control-plane.db ./MANIFEST.json; do
-      grep -qx -- "$f" "$WORK/list.txt" || MISSING="$MISSING ${f#./}"
+    for f in "${CADS_BACKUP_REQUIRED_MEMBERS[@]}"; do
+      grep -qx -- "./$f" "$WORK/list.txt" || MISSING="$MISSING $f"
     done
     [ -z "$MISSING" ] || fail "Im Snapshot ($STAMP) fehlen Pflichtdateien:$MISSING. Ohne sie ist keine vollstaendige Wiederherstellung moeglich."
   fi
 fi
 
 if [ -z "${ALARM:-}" ]; then
-  tar xzf "$WORK/snap.tar.gz" -C "$WORK" ./keycloak.pgdump ./control-plane.db 2>/dev/null || true
+  tar xzf "$WORK/snap.tar.gz" -C "$WORK" ./keycloak.pgdump ./control-plane.db ./certs.tar.gz 2>/dev/null || true
 
+  # 3b. certs.tar.gz is itself a tar.gz archive (the BYO cert material) -- a
+  # snapshot that merely CONTAINS a member by that name but whose content is
+  # truncated/corrupt must not pass as restorable either; restore-selfhost.sh
+  # extracts it with no further check of its own.
+  if [ -f "$WORK/certs.tar.gz" ]; then
+    tar tzf "$WORK/certs.tar.gz" > /dev/null 2>"$WORK/certs.err" \
+      || fail "certs.tar.gz im Snapshot ($STAMP) ist kein lesbares Archiv: $(tr -d '\n' < "$WORK/certs.err" | head -c 200)."
+  fi
+fi
+
+if [ -z "${ALARM:-}" ]; then
   # 4. Den Keycloak-Dump wirklich parsen lassen. `pg_restore --list` liest das
   #    Inhaltsverzeichnis des custom-format-Archivs -- ein abgeschnittener oder
   #    beschaedigter Dump scheitert hier, und es wird nichts eingespielt.
