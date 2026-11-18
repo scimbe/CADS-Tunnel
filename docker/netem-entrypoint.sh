@@ -10,7 +10,11 @@ if [ -n "${CT_NETEM_DELAY}${CT_NETEM_LOSS}${CT_NETEM_RATE}" ]; then
     [ -n "${CT_NETEM_LOSS}" ] && ARGS="${ARGS} loss ${CT_NETEM_LOSS}"
     [ -n "${CT_NETEM_RATE}" ] && ARGS="${ARGS} rate ${CT_NETEM_RATE}"
     echo "netem: applying${ARGS} on eth0"
-    tc qdisc add dev eth0 root netem ${ARGS} || echo "netem: tc failed (need NET_ADMIN)"
+    # #963: impairment was explicitly requested -- a benchmark run recorded
+    # with these labels must actually BE impaired, or the measured numbers
+    # are silently wrong. Fail loudly (set -e) instead of starting the node
+    # unimpaired with no non-zero exit anywhere to catch it.
+    tc qdisc add dev eth0 root netem ${ARGS}
 fi
 
 exec "$@"
