@@ -132,7 +132,11 @@ impl Capability {
         let mut origin = [0u8; 32];
         origin.copy_from_slice(&bytes[32..64]);
         let addr_len = u32::from_le_bytes(bytes[64..68].try_into().unwrap()) as usize;
-        if bytes.len() != 68 + addr_len {
+        // Compare by subtraction, not `68 + addr_len`: addr_len comes straight from
+        // untrusted wire bytes, and on 32-bit targets (this crate builds for wasm32)
+        // the addition can overflow for addr_len close to u32::MAX. The `bytes.len()
+        // >= 68` guard above makes `bytes.len() - 68` safe.
+        if bytes.len() - 68 != addr_len {
             return Err(MalformedCapability);
         }
         let edge_addr =
@@ -254,6 +258,16 @@ mod tests {
     #[test]
     fn capability_decode_rejects_truncated() {
         assert_eq!(Capability::decode(&[0u8; 10]), Err(MalformedCapability));
+    }
+
+    #[test]
+    fn capability_decode_rejects_a_huge_addr_len_without_overflowing() {
+        // #1017: addr_len is untrusted wire input; `68 + addr_len` can overflow on
+        // a 32-bit target (this crate builds for wasm32) for addr_len near u32::MAX.
+        // The fixed length check must reject this cleanly, not panic or wrap.
+        let mut bytes = vec![0u8; 68];
+        bytes[64..68].copy_from_slice(&(u32::MAX - 10).to_le_bytes());
+        assert_eq!(Capability::decode(&bytes), Err(MalformedCapability));
     }
 
     #[test]
