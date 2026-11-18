@@ -91,7 +91,10 @@ impl std::fmt::Display for BenchMode {
 }
 
 fn parse_bench_mode() -> Result<Option<BenchMode>, String> {
-    parse_bench_mode_value(std::env::var("CT_BENCH_MODE").ok().as_deref())
+    // The compose files pass `CT_BENCH_MODE: "${BENCH_MODE:-}"`, i.e. an EMPTY string when
+    // unset -- that means "default one-shot bench", not an unrecognized value.
+    let raw = std::env::var("CT_BENCH_MODE").ok().filter(|s| !s.is_empty());
+    parse_bench_mode_value(raw.as_deref())
 }
 
 /// The pure check behind [`parse_bench_mode`] -- see [`parse_client_mode_value`]'s
@@ -142,6 +145,8 @@ mod tests {
     fn parse_bench_mode_value_rejects_an_unrecognized_value_instead_of_silently_defaulting_977() {
         let err = parse_bench_mode_value(Some("streem")).unwrap_err();
         assert!(err.contains("streem"), "the error names the actual bad value");
+        // An empty string is handled by parse_bench_mode() (compose passes "" when unset),
+        // so the pure parser still treats it as unrecognized.
         assert!(parse_bench_mode_value(Some("")).is_err());
         assert!(parse_bench_mode_value(Some("STREAM")).is_err(), "case-sensitive, not a silently-accepted alias");
     }
