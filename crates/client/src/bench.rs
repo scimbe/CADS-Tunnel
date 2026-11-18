@@ -87,9 +87,16 @@ pub fn summarize(samples: &[f64]) -> Option<Summary> {
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
+    // #979: true nearest-rank -- rank = ceil(p/100 * n), 1-based, clamped to
+    // 1..=n (p=0 would otherwise compute rank 0). The previous
+    // round(p/100 * (n-1)) formula agrees with this for odd n/some p values
+    // (hence the existing fixed-sample tests not changing), but diverges for
+    // many even-n cases: at p=50 it picked the UPPER middle sample instead of
+    // nearest-rank's lower one, and for n=2 specifically it always returned
+    // the maximum.
     let percentile = |p: f64| -> f64 {
-        let idx = ((p / 100.0) * (n as f64 - 1.0)).round() as usize;
-        sorted[idx]
+        let rank = ((p / 100.0) * n as f64).ceil() as usize;
+        sorted[rank.clamp(1, n) - 1]
     };
 
     Some(Summary {
@@ -463,6 +470,23 @@ mod tests {
     #[test]
     fn empty_is_none() {
         assert!(summarize(&[]).is_none());
+    }
+
+    #[test]
+    fn percentiles_use_true_nearest_rank_for_even_sample_counts_979() {
+        // #979: the previous round(p/100 * (n-1)) formula diverges from nearest-rank
+        // specifically for even n -- n=2 always returned the maximum for p50, which
+        // is not nearest-rank's own 1st-smallest-of-2 answer.
+        let s = summarize(&[10.0, 20.0]).unwrap();
+        assert_eq!(s.p50_ms, 10.0, "nearest-rank median of 2 samples is the LOWER one, not the maximum");
+
+        // A larger even-n case, worked by hand against rank = ceil(p/100 * n):
+        // n=4, samples [10,20,30,40]. p50: ceil(2.0)=2 -> sorted[1]=20.
+        // p95: ceil(3.8)=4 -> sorted[3]=40. p99: ceil(3.96)=4 -> sorted[3]=40.
+        let s4 = summarize(&[40.0, 10.0, 30.0, 20.0]).unwrap();
+        assert_eq!(s4.p50_ms, 20.0);
+        assert_eq!(s4.p95_ms, 40.0);
+        assert_eq!(s4.p99_ms, 40.0);
     }
 
     #[test]
