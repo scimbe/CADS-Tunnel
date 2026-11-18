@@ -6901,6 +6901,17 @@ pub fn persistent_control_plane_router(
                 acme_home: std::env::var("CT_CP_ACME_HOME").unwrap_or_else(|_| "/data/acme".to_string()),
                 acme_email: std::env::var("CT_CP_ACME_EMAIL").unwrap_or_else(|_| "scimbe@gmail.com".to_string()),
                 desec_token: std::env::var("DESEC_TOKEN").ok().filter(|s| !s.is_empty()),
+                // #1011: a hung DNS-01 wait or network stall is killed after this
+                // many seconds instead of pinning a spawn_blocking thread forever.
+                // "tens of seconds" is the expected case (cert_issuer.rs's own doc
+                // comment); 180s gives generous headroom for deSEC anycast
+                // convergence without hanging indefinitely.
+                timeout: std::time::Duration::from_secs(
+                    std::env::var("CT_CP_ACME_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(180),
+                ),
             },
             cert_base_dir: std::env::var("CT_CP_MANAGED_CERT_BASE_DIR")
                 .ok()

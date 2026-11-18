@@ -24,6 +24,7 @@
 //! clear, typed error rather than a mysterious 500.
 
 use std::path::Path;
+use std::time::Duration;
 
 /// Everything [`issue_cert`] needs to run `lib-acme.sh`'s `issue_cert()`
 /// unattended. Every field is a plain value (not read from the environment
@@ -47,6 +48,11 @@ pub struct AcmeConfig {
     /// environment, so [`issue_cert`]'s "missing token" path is provable
     /// without mutating real env state in a test.
     pub desec_token: Option<String>,
+    /// Hard deadline on the whole `issue_cert()` subprocess (`CT_CP_ACME_TIMEOUT_SECS`).
+    /// A hung DNS-01 wait or network stall is killed and reported as
+    /// [`CertIssueError::TimedOut`] instead of pinning the `spawn_blocking`
+    /// thread the caller runs this on indefinitely (#1011).
+    pub timeout: Duration,
 }
 
 /// Why a cert-issuance attempt failed. Every variant carries enough to give
@@ -77,6 +83,10 @@ pub enum CertIssueError {
     /// above), so this is a defensive belt-and-suspenders check, not
     /// expected to trigger in practice.
     CertFilesMissingAfterSuccess,
+    /// The subprocess did not exit within `AcmeConfig::timeout` and was killed.
+    /// A hung DNS-01 wait or network stall no longer pins the caller's
+    /// `spawn_blocking` thread indefinitely (#1011).
+    TimedOut(Duration),
 }
 
 impl std::fmt::Display for CertIssueError {
@@ -94,6 +104,9 @@ impl std::fmt::Display for CertIssueError {
             }
             CertIssueError::CertFilesMissingAfterSuccess => {
                 write!(f, "issuance reported success but the cert files are missing on disk")
+            }
+            CertIssueError::TimedOut(d) => {
+                write!(f, "cert issuance did not finish within {d:?} and was killed")
             }
         }
     }
@@ -135,7 +148,13 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 . "$1"
 issue_cert "$2" "$3" "$4" "$5"
 "#;
-    let output = std::process::Command::new("bash")
+    // stderr goes to a real file, not a pipe: a piped child that outvolumes the
+    // OS pipe buffer while nobody is draining it (we only read after the wait
+    // loop below exits) would block on write and never reach exit, defeating
+    // the whole point of the bounded wait. A file has no such fixed buffer.
+    let stderr_path = cert_dir.join(".issue_cert_stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(CertIssueError::Spawn)?;
+    let mut child = std::process::Command::new("bash")
         .arg("-c")
         .arg(WRAPPER)
         .arg("cert_issuer_wrapper") // $0 (script name, unused by the body above)
@@ -148,15 +167,45 @@ issue_cert "$2" "$3" "$4" "$5"
         // non-fatal on first issuance anyway.
         .arg(":")
         .arg(&cfg.acme_email) // $5
+        // Only pass through what the script actually needs, not this process's
+        // full environment (which includes the session key, webhook secret and
+        // payment API keys this subprocess has no business seeing, #1011). PATH
+        // is required too: `bash` and lib-acme.sh's own `curl`/`openssl`/`dig`
+        // calls resolve through the CHILD's PATH, not the parent's.
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()))
         .env("HOME", &cfg.acme_home)
         .env("DESEC_TOKEN", desec_token)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_file)
+        .spawn()
         .map_err(CertIssueError::Spawn)?;
 
-    if !output.status.success() {
+    // Bounded wait: this function is deliberately synchronous (see the doc
+    // comment above), so a deadline means polling try_wait() rather than an
+    // async timeout. A hung DNS-01 wait or network stall is killed instead of
+    // pinning the caller's spawn_blocking thread forever (#1011).
+    let deadline = std::time::Instant::now() + cfg.timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(CertIssueError::Spawn)? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&stderr_path);
+            return Err(CertIssueError::TimedOut(cfg.timeout));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&stderr_path);
+
+    if !status.success() {
         return Err(CertIssueError::IssuanceFailed {
-            exit_code: output.status.code(),
-            stderr_tail: tail(&String::from_utf8_lossy(&output.stderr), 2000),
+            exit_code: status.code(),
+            stderr_tail: tail(&stderr, 2000),
         });
     }
     let full = cert_dir.join("fullchain.pem");
@@ -201,6 +250,7 @@ mod tests {
             acme_home: acme_home.to_string_lossy().into_owned(),
             acme_email: "acme-test@example.com".to_string(),
             desec_token: Some("test-token".to_string()),
+            timeout: Duration::from_secs(5),
         }
     }
 
@@ -289,6 +339,50 @@ mod tests {
 
         let err = issue_cert(&cfg, "app.example.org", &dir.join("cert")).unwrap_err();
         assert!(matches!(err, CertIssueError::CertFilesMissingAfterSuccess), "got {err:?}");
+    }
+
+    #[test]
+    fn a_hung_issue_cert_is_killed_at_the_deadline_instead_of_blocking_forever() {
+        let dir = temp_dir("timeout");
+        let script = dir.join("lib-acme.sh");
+        // Never returns -- stands in for a stalled network/DNS-01 wait.
+        std::fs::write(&script, "issue_cert() { sleep 60; }\n").unwrap();
+        let mut cfg = base_cfg(script.to_string_lossy().into_owned(), dir.join("home"));
+        cfg.timeout = Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let err = issue_cert(&cfg, "app.example.org", &dir.join("cert")).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}, should have been killed near 200ms", started.elapsed());
+        assert!(matches!(err, CertIssueError::TimedOut(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_subprocess_does_not_inherit_this_processs_full_environment() {
+        let dir = temp_dir("env-clear");
+        let script = dir.join("lib-acme.sh");
+        std::fs::write(
+            &script,
+            r#"issue_cert() {
+  local host="$1" dir="$2"
+  mkdir -p "$dir"
+  echo "cert-for-$host" > "$dir/fullchain.pem"
+  echo "key-for-$host" > "$dir/privkey.pem"
+  echo "SECRET_SEEN=${CT_TEST_UNRELATED_SECRET:-unset}" > "$dir/env-seen.txt"
+}
+"#,
+        )
+        .unwrap();
+        // Simulates the control-plane process holding a secret this subprocess
+        // has no business seeing (#1011) -- it must not leak through env_clear().
+        std::env::set_var("CT_TEST_UNRELATED_SECRET", "super-secret-value");
+        let cfg = base_cfg(script.to_string_lossy().into_owned(), dir.join("home"));
+        let cert_dir = dir.join("cert");
+
+        issue_cert(&cfg, "app.example.org", &cert_dir).unwrap();
+
+        std::env::remove_var("CT_TEST_UNRELATED_SECRET");
+        let env_seen = std::fs::read_to_string(cert_dir.join("env-seen.txt")).unwrap();
+        assert_eq!(env_seen.trim(), "SECRET_SEEN=unset", "got: {env_seen}");
     }
 
     #[test]
