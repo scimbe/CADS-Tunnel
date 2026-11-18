@@ -324,7 +324,19 @@ async fn handle_request(
                 let n = recv?;
                 let datagram_payload = capsule::udp_datagram_payload::encode(&udp_read_buf[..n]);
                 let framed = capsule::encode_datagram(&datagram_payload);
-                send_stream.send_data(Bytes::from(framed), false)?;
+                // #971: `send_data` alone can be called without reserving capacity first --
+                // h2 then buffers the frame and requests the window implicitly, and that
+                // buffering is UNBOUNDED (h2's own doc on `SendStream::send_data`). A
+                // stalled or slow-reading peer on the OTHER end of this tunnel never grants
+                // more send window, so this arm kept pumping `udp.recv()` into an
+                // ever-growing in-memory buffer regardless -- unbounded memory growth
+                // driven entirely by how fast the UDP target emits datagrams, not by
+                // anything the h2 peer does. Reserving and awaiting real capacity makes
+                // this arm (and so this whole select loop) actually block on the peer's
+                // flow control, the backpressure h2 is designed to provide.
+                if !send_with_backpressure(&mut send_stream, Bytes::from(framed)).await? {
+                    break; // peer reset the stream -- nothing further to send
+                }
             }
             _ = tokio::time::sleep(idle_timeout) => {
                 break; // #54-family: no traffic either direction within idle_timeout
@@ -334,4 +346,28 @@ async fn handle_request(
 
     let _ = send_stream.send_data(Bytes::new(), true);
     Ok(())
+}
+
+/// #971: send `data` on `send_stream` honoring real h2 flow control, instead of the unbounded
+/// implicit buffering `SendStream::send_data` falls back to when called without first reserving
+/// capacity (see that function's own doc). Loops in whatever capacity-sized chunks the peer
+/// actually grants, so a slow/stalled peer backpressures the caller (this function simply doesn't
+/// return) rather than letting data pile up in memory regardless of what the peer can accept.
+/// Returns `Ok(false)` if the peer reset the stream before granting enough capacity to finish --
+/// the caller should stop sending, not treat it as a hard error.
+async fn send_with_backpressure(
+    send_stream: &mut h2::SendStream<Bytes>,
+    mut data: Bytes,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    while !data.is_empty() {
+        send_stream.reserve_capacity(data.len());
+        let available = match std::future::poll_fn(|cx| send_stream.poll_capacity(cx)).await {
+            Some(Ok(n)) => n,
+            Some(Err(e)) => return Err(e.into()),
+            None => return Ok(false), // peer reset the stream
+        };
+        let chunk = data.split_to(available.min(data.len()));
+        send_stream.send_data(chunk, false)?;
+    }
+    Ok(true)
 }

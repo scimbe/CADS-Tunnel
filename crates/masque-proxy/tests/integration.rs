@@ -400,3 +400,104 @@ async fn unauthenticated_stalled_connections_do_not_starve_a_legitimate_tunnel()
 
     drop(stalled_attackers); // keep them alive up to this point, not before
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_datagram_larger_than_the_clients_flow_control_window_still_arrives_whole_971() {
+    // #971: the target -> agent send side used to call `send_stream.send_data(...)` without
+    // ever reserving capacity first. h2's own doc on that function: called this way, data is
+    // buffered and the capacity requested implicitly, and "this buffering is unbounded" -- a
+    // slow-reading peer (small flow-control window, never releasing much capacity) made this
+    // proxy buffer an unbounded amount of target traffic in memory regardless of what the peer
+    // could actually accept. The fix reserves capacity and awaits it before every send, so a
+    // payload bigger than the peer's window must now be sent across SEVERAL capacity-sized h2
+    // DATA frames rather than one implicit, unbounded buffer. This proves that still round-trips
+    // correctly: an artificially tiny client window forces the proxy's single large echoed
+    // datagram through multiple reserve/send cycles, and the client (incrementally releasing
+    // capacity as any real h2 peer does) must still receive it byte-for-byte.
+    let target = spawn_udp_echo_target().await;
+    let token = [0x77u8; 32];
+    let config = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        target,
+        max_concurrent_tunnels: 4,
+        idle_timeout: Duration::from_secs(5),
+        shared_token: token,
+    };
+    let listen_probe = std::net::TcpListener::bind(config.listen).unwrap();
+    let proxy_addr = listen_probe.local_addr().unwrap();
+    drop(listen_probe);
+    let mut config = config;
+    config.listen = proxy_addr;
+    tokio::spawn(masque_proxy::run(config));
+
+    let client_io = 'connect: {
+        for _ in 0..50 {
+            if let Ok(io) = tokio::net::TcpStream::connect(proxy_addr).await {
+                break 'connect io;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("masque-proxy never started accepting on {proxy_addr}");
+    };
+
+    // A window far smaller than the datagram below forces the proxy to split its one send
+    // across many `reserve_capacity`/`poll_capacity`/`send_data` cycles instead of one call.
+    let (send_request, connection) = h2::client::Builder::new()
+        .initial_window_size(1_024)
+        .handshake(client_io)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    let mut send_request = send_request.ready().await.unwrap();
+    for _ in 0..50 {
+        if send_request.is_extended_connect_protocol_enabled() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(send_request.is_extended_connect_protocol_enabled());
+
+    let path = format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port());
+    let mut request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("https://{proxy_addr}{path}"))
+        .header("x-ct-masque-token", hex_token(&token))
+        .body(())
+        .unwrap();
+    request.extensions_mut().insert(Protocol::from_static("connect-udp"));
+
+    let (response_fut, mut client_send) = send_request.send_request(request, false).unwrap();
+
+    // Comfortably under this host's real UDP datagram ceiling (macOS's default
+    // net.inet.udp.maxdgram is 9_216, well short of RFC 9298's own 65_527 maximum --
+    // a test environment limit, not this proxy's), but several multiples of the
+    // 1_024-byte h2 window above, forcing many reserve/send cycles.
+    let udp_payload = vec![0xABu8; 8_000];
+    let framed = capsule::encode_datagram(&capsule::udp_datagram_payload::encode(&udp_payload));
+    client_send.send_data(Bytes::from(framed), false).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), response_fut)
+        .await
+        .expect("the tunnel must not hang -- it should keep making progress as capacity is granted")
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let mut body = response.into_body();
+    let mut buf = Vec::new();
+    let echoed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let chunk = body.data().await.unwrap().unwrap();
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            buf.extend_from_slice(&chunk);
+            if let Ok(Some((cap_type, value, _))) = capsule::decode(&buf) {
+                assert_eq!(cap_type, 0x00);
+                return capsule::udp_datagram_payload::decode(value).unwrap().to_vec();
+            }
+        }
+    })
+    .await
+    .expect("the full multi-frame datagram must still arrive, not stall once the window is exhausted once");
+
+    assert_eq!(echoed, udp_payload, "the datagram arrives byte-for-byte even when sent across many capacity-constrained h2 DATA frames");
+}
