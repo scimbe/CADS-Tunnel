@@ -1277,6 +1277,7 @@ Ask the super-admin to add your e-mail, or <a href="/portal">go back to the port
 // -- no separate light/dark icon asset, no extra HTTP request.
 const ICON_DASHBOARD: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>"#;
 const ICON_TRAFFIC: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg>"#;
+const ICON_AGENTS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>"#;
 const ICON_ACCOUNTS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20c1.5-4 5-5.5 7.5-5.5s6 1.5 7.5 5.5"/></svg>"#;
 const ICON_DOMAINS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 4 6 4 9s-1.5 6.3-4 9c-2.5-2.7-4-6-4-9s1.5-6.3 4-9z"/></svg>"#;
 const ICON_ADMINS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/></svg>"#;
@@ -1309,6 +1310,7 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
         match title {
             "dashboard" => "/admin-ui/",
             "traffic" => "/admin-ui/traffic",
+            "agents" => "/admin-ui/agents",
             "accounts" => "/admin-ui/accounts",
             "domains" => "/admin-ui/domains",
             "admins" => "/admin-ui/admins",
@@ -1321,6 +1323,7 @@ fn admin_page(title: &str, session: &crate::admin_identity::AdminSession, body: 
     let nav_links = [
         rail_link("/admin-ui/", "Dashboard", ICON_DASHBOARD),
         rail_link("/admin-ui/traffic", "Traffic", ICON_TRAFFIC),
+        rail_link("/admin-ui/agents", "Agenten", ICON_AGENTS),
         rail_link("/admin-ui/accounts", "Accounts", ICON_ACCOUNTS),
         rail_link("/admin-ui/domains", "Domains", ICON_DOMAINS),
         rail_link("/admin-ui/admins", "Admins", ICON_ADMINS),
@@ -1615,6 +1618,7 @@ pub fn admin_ui_router(
         // no mutation, no audit_log call (see each handler's own doc).
         .route("/admin-ui/traffic", get(admin_ui_traffic))
         .route("/admin-ui/tunnels", get(admin_ui_tunnels))
+        .route("/admin-ui/agents", get(admin_ui_agents))
         .route("/admin-ui/health", get(admin_ui_health))
         .route("/admin-ui/system", get(admin_ui_system))
         // ADR-0025 integration pass: server-rendered HTML pages. `/admin-ui/traffic`,
@@ -3201,6 +3205,438 @@ async fn admin_ui_tunnels(State(st): State<AdminUiState>, headers: HeaderMap) ->
     }
     let rows = build_tunnel_overview_rows(admin_ui_now_secs(), &tunnels, &edge_status, &edge_by_token);
     Json(rows).into_response()
+}
+
+// ===== Operator overview of activated agents: `/admin-ui/agents` =====
+//
+// Principle bound (ADR-0016/0002/0012/0025): only what the control plane and edge
+// structurally already know -- tunnel registry, live status, the metadata-only session
+// history, agent-key policy counters (hash-prefix keyed), the cached bridge-probe
+// version. No new collection, no payload, no client IPs, no edge audit_log. The
+// challenge rules live in `crate::agent_challenges` (pure, unit-tested).
+
+/// Edge `POST /admin/tunnel-history/bulk` accepts at most this many tokens per call.
+const EDGE_HISTORY_BULK_MAX: usize = 500;
+
+#[derive(Deserialize, Clone, Default)]
+struct EdgeHistoryLastDisconnect {
+    reason: String,
+    at: i64,
+}
+
+#[derive(Deserialize, Clone, Default)]
+struct EdgeHistoryEntry {
+    token: String,
+    #[serde(default)]
+    uptime_h24: f64,
+    #[serde(default)]
+    session_count_24h: u64,
+    #[serde(default)]
+    disconnect_reasons_24h: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    last_disconnect: Option<EdgeHistoryLastDisconnect>,
+}
+
+#[derive(Deserialize)]
+struct EdgeHistoryBulkResp {
+    enabled: bool,
+    #[serde(default)]
+    entries: Vec<EdgeHistoryEntry>,
+}
+
+#[derive(Deserialize)]
+struct EdgeAgentKeyTunnel {
+    hash_prefix: String,
+    #[serde(default)]
+    reasons: HashMap<String, u64>,
+}
+
+#[derive(Deserialize)]
+struct EdgeAgentKeyStatus {
+    #[serde(default)]
+    tunnels: Vec<EdgeAgentKeyTunnel>,
+}
+
+/// Fail-loud edge admin call (unlike [`edge_tunnel_status_bulk`], which degrades to an
+/// empty map): returns a German, token-redacted error string the page can show.
+async fn edge_admin_json<T: serde::de::DeserializeOwned>(
+    st: &AdminUiState,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<T, String> {
+    let Some((edge_url, edge_token)) = &st.domain_admin.edge_admin else {
+        return Err("Edge-Admin-API ist nicht konfiguriert (CT_CP_EDGE_ADMIN_URL)".to_string());
+    };
+    let endpoint = format!("{}{}", edge_url.trim_end_matches('/'), path);
+    let client = edge_admin_http_client();
+    let req = match body {
+        Some(b) => client.post(&endpoint).json(&b),
+        None => client.get(&endpoint),
+    };
+    let resp = req
+        .header("x-ct-admin-token", edge_token.as_str())
+        .send()
+        .await
+        .map_err(|e| format!("Edge nicht erreichbar: {}", redact_routing_tokens(&e.to_string())))?;
+    if !resp.status().is_success() {
+        return Err(format!("Edge antwortete mit HTTP {} auf {path}", resp.status().as_u16()));
+    }
+    resp.json::<T>()
+        .await
+        .map_err(|e| format!("Antwort des Edge nicht lesbar ({path}): {}", redact_routing_tokens(&e.to_string())))
+}
+
+/// First 8 hex chars of SHA-256 over the raw routing-token bytes -- the edge's
+/// `agent_key_hash_prefix` -- so agent-key rows can be matched without the edge ever
+/// sending a token.
+fn agent_key_prefix_of(token_hex: &str) -> Option<String> {
+    use sha2::Digest;
+    let raw = ct_common::hex::decode(token_hex)?;
+    let h = sha2::Sha256::digest(&raw);
+    Some(h[..4].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[derive(Serialize)]
+struct AgentLastDisconnect {
+    reason: String,
+    at: i64,
+}
+
+#[derive(Serialize)]
+struct AgentRow {
+    tunnel_id: String,
+    /// Owning account subject (opaque OIDC `sub`).
+    owner: String,
+    name: String,
+    hostname: Option<String>,
+    routing_token_display: String,
+    /// `"online"` | `"offline"` | `"unbekannt"` (edge status unavailable).
+    state: &'static str,
+    /// `"relay"` | `"direct_p2p"` | `"tcp_fallback"`; `None` unless online.
+    transport: Option<&'static str>,
+    edge_id: Option<String>,
+    /// Cached bridge-probe version; `None` renders as "unbekannt".
+    version: Option<String>,
+    last_seen_unix: Option<i64>,
+    uptime_h24: Option<f64>,
+    sessions_24h: Option<u64>,
+    last_disconnect: Option<AgentLastDisconnect>,
+    challenges: Vec<crate::agent_challenges::Challenge>,
+}
+
+/// Pure join -> rows. `edge_status: None` = the edge status could not be read (rows are
+/// `unbekannt`, no live-state challenge). `history: None` = disabled/unavailable.
+#[allow(clippy::too_many_arguments)]
+fn build_agent_rows(
+    now: i64,
+    tunnels: &[(String, SubjectTunnel)],
+    versions: &HashMap<String, String>,
+    edge_status: Option<&HashMap<String, EdgeBulkStatusEntry>>,
+    history: Option<&HashMap<String, EdgeHistoryEntry>>,
+    key_violations_by_prefix: &HashMap<String, u64>,
+    edge_by_token: &HashMap<String, String>,
+) -> Vec<AgentRow> {
+    use crate::agent_challenges::{derive_challenges, ChallengeInput, HistoryInput, LiveInput};
+    tunnels
+        .iter()
+        .map(|(owner, t)| {
+            let status = edge_status.map(|m| m.get(&t.routing_token).cloned().unwrap_or_default());
+            let hist = history.and_then(|m| m.get(&t.routing_token));
+            let key_violations = agent_key_prefix_of(&t.routing_token)
+                .and_then(|p| key_violations_by_prefix.get(&p).copied())
+                .unwrap_or(0);
+            let input = ChallengeInput {
+                live: status.as_ref().map(|s| LiveInput {
+                    connected: s.connected,
+                    registrations: s.registrations,
+                    fallback_parked: s.fallback_parked,
+                    direct: s.direct,
+                    last_seen: s.last_seen,
+                }),
+                history: hist.map(|h| HistoryInput {
+                    uptime_h24: h.uptime_h24,
+                    session_count_24h: h.session_count_24h,
+                    disconnect_reasons_24h: h.disconnect_reasons_24h.clone(),
+                }),
+                key_violations,
+            };
+            let (state, transport) = match &status {
+                None => ("unbekannt", None),
+                Some(s) if !s.connected => ("offline", None),
+                Some(s) if s.registrations == 0 && s.fallback_parked > 0 => ("online", Some("tcp_fallback")),
+                Some(s) => ("online", Some(infer_transport(s.direct))),
+            };
+            AgentRow {
+                tunnel_id: t.id.clone(),
+                owner: owner.clone(),
+                name: t.name.clone(),
+                hostname: t.hostname.clone(),
+                routing_token_display: redact_token_for_display(&t.routing_token),
+                state,
+                transport,
+                edge_id: edge_by_token.get(&t.routing_token).cloned(),
+                version: versions.get(&t.id).cloned(),
+                last_seen_unix: status.as_ref().and_then(|s| s.last_seen),
+                uptime_h24: hist.map(|h| h.uptime_h24),
+                sessions_24h: hist.map(|h| h.session_count_24h),
+                last_disconnect: hist
+                    .and_then(|h| h.last_disconnect.as_ref())
+                    .map(|d| AgentLastDisconnect { reason: d.reason.clone(), at: d.at }),
+                challenges: derive_challenges(now, &input),
+            }
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct AgentsTopChallenge {
+    code: &'static str,
+    label: &'static str,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct AgentsSummary {
+    total: usize,
+    online: usize,
+    offline: usize,
+    unbekannt: usize,
+    with_challenges: usize,
+    top_challenges: Vec<AgentsTopChallenge>,
+}
+
+fn summarize_agents(rows: &[AgentRow]) -> AgentsSummary {
+    let count = |s: &str| rows.iter().filter(|r| r.state == s).count();
+    AgentsSummary {
+        total: rows.len(),
+        online: count("online"),
+        offline: count("offline"),
+        unbekannt: count("unbekannt"),
+        with_challenges: rows.iter().filter(|r| !r.challenges.is_empty()).count(),
+        top_challenges: crate::agent_challenges::top_challenges(rows.iter().flat_map(|r| r.challenges.iter()))
+            .into_iter()
+            .map(|(code, label, count)| AgentsTopChallenge { code, label, count })
+            .collect(),
+    }
+}
+
+#[derive(Serialize)]
+struct AgentsResp {
+    generated_at: i64,
+    /// Set when the edge's live status could not be read: every agent is then
+    /// `unbekannt` -- never silently "offline".
+    edge_error: Option<String>,
+    /// `Some(false)` = the edge's history store is disabled (`CT_EDGE_TUNNEL_HISTORY=off`);
+    /// `None` = not asked (edge error) or the call failed (see `history_error`).
+    history_enabled: Option<bool>,
+    history_error: Option<String>,
+    key_policy_error: Option<String>,
+    summary: AgentsSummary,
+    agents: Vec<AgentRow>,
+}
+
+/// `GET /admin-ui/agents` (admin-identity-gated, read-only). JSON by default; with
+/// `Accept: text/html` the page (which fetches this same path as JSON).
+async fn admin_ui_agents(State(st): State<AdminUiState>, headers: HeaderMap) -> Response {
+    if wants_html(&headers) {
+        let session = match admin_ui_page_authed(&st, &headers) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        return Html(admin_agents_page_html(&session)).into_response();
+    }
+    if let Err(resp) = admin_ui_authed(&st, &headers) {
+        return resp;
+    }
+    let tunnels = match st.tunnels.all_with_subject() {
+        Ok(v) => v,
+        Err(e) => return internal_error("admin_ui_agents/tunnels.all_with_subject", e).into_response(),
+    };
+    let versions = st.tunnels.bridge_probe_versions().unwrap_or_else(|e| {
+        eprintln!("ct-cp: admin_ui_agents: bridge_probe_versions failed: {e}");
+        HashMap::new()
+    });
+    let tokens: Vec<String> = tunnels.iter().map(|(_, t)| t.routing_token.clone()).collect();
+
+    let mut edge_by_token = HashMap::new();
+    if let Some(mesh) = &st.observability.edge_mesh {
+        match mesh.lookup_by_token_bulk(&tokens) {
+            Ok(found) => edge_by_token = found.into_iter().map(|(tok, (edge_id, _))| (tok, edge_id)).collect(),
+            Err(e) => eprintln!("ct-cp: admin_ui_agents: edge_mesh bulk lookup failed: {e}"),
+        }
+    }
+
+    let mut edge_error = None;
+    let mut history_enabled = None;
+    let mut history_error = None;
+    let mut key_policy_error = None;
+    let mut edge_status: Option<HashMap<String, EdgeBulkStatusEntry>> = None;
+    let mut history: Option<HashMap<String, EdgeHistoryEntry>> = None;
+    let mut key_by_prefix: HashMap<String, u64> = HashMap::new();
+
+    if tokens.is_empty() {
+        edge_status = Some(HashMap::new());
+    } else {
+        match edge_admin_json::<Vec<EdgeBulkStatusEntry>>(
+            &st,
+            "/admin/tunnel-status/bulk",
+            Some(serde_json::json!({ "tokens": tokens })),
+        )
+        .await
+        {
+            Ok(v) => edge_status = Some(v.into_iter().map(|e| (e.token.clone(), e)).collect()),
+            Err(e) => edge_error = Some(e),
+        }
+    }
+    if edge_error.is_none() && !tokens.is_empty() {
+        let mut merged = HashMap::new();
+        let mut enabled = true;
+        let mut failure = None;
+        for chunk in tokens.chunks(EDGE_HISTORY_BULK_MAX) {
+            match edge_admin_json::<EdgeHistoryBulkResp>(
+                &st,
+                "/admin/tunnel-history/bulk",
+                Some(serde_json::json!({ "tokens": chunk })),
+            )
+            .await
+            {
+                Ok(r) if r.enabled => merged.extend(r.entries.into_iter().map(|e| (e.token.clone(), e))),
+                Ok(_) => {
+                    enabled = false;
+                    break;
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        match failure {
+            Some(e) => history_error = Some(e),
+            None => {
+                history_enabled = Some(enabled);
+                if enabled {
+                    history = Some(merged);
+                }
+            }
+        }
+        match edge_admin_json::<EdgeAgentKeyStatus>(&st, "/admin/agent-key/status", None).await {
+            Ok(k) => {
+                for t in k.tunnels {
+                    *key_by_prefix.entry(t.hash_prefix).or_default() += t.reasons.values().sum::<u64>();
+                }
+            }
+            Err(e) => key_policy_error = Some(e),
+        }
+    }
+
+    let rows = build_agent_rows(
+        admin_ui_now_secs(),
+        &tunnels,
+        &versions,
+        edge_status.as_ref(),
+        history.as_ref(),
+        &key_by_prefix,
+        &edge_by_token,
+    );
+    Json(AgentsResp {
+        generated_at: admin_ui_now_secs(),
+        edge_error,
+        history_enabled,
+        history_error,
+        key_policy_error,
+        summary: summarize_agents(&rows),
+        agents: rows,
+    })
+    .into_response()
+}
+
+/// HTML for `/admin-ui/agents`: summary bar, "nur mit Herausforderungen" filter, table
+/// and the explicit "Was der Server nicht sieht" note. All values are escaped client-side.
+fn admin_agents_page_html(session: &crate::admin_identity::AdminSession) -> String {
+    let body = r#"<h1>Agenten</h1>
+<p class="help">Alle aktivierten ct-Agenten (Tunnel) samt der Herausforderungen, die der Server
+aus dem ableitet, was Control-Plane und Edge ohnehin strukturell kennen: Live-Status, Sitzungsverlauf
+(Transport, Zeitpunkte, Trennungsgrund), Agent-Key-Zähler und die zwischengespeicherte Agent-Version.
+Es werden keine neuen Daten bei den Agenten erhoben.</p>
+<div class="card" style="margin:1rem 0">
+<strong>Was der Server nicht sieht</strong>
+<ul class="help">
+<li>Bytes und Verbindungen auf dem <strong>Direktpfad</strong> (P2P): der Edge ist dort nicht im Datenpfad.
+&bdquo;Direkt&ldquo; ist nur eine Verfügbarkeitsangabe, keine Messung.</li>
+<li><strong>Agent-lokale Fehler</strong> wie Authentifizierungs-, Uhrenabweichungs- oder Credential-Probleme:
+sie bleiben beim Agenten (ADR-0016) und tauchen hier nur indirekt auf (z.&nbsp;B. als Offline oder häufige Wiederverbindung).</li>
+<li>Payload, Client-IP-Adressen und einzelne Client-Verbindungen &ndash; bewusst nicht Teil dieser Seite.</li>
+<li>Die Agent-Version ist nur bekannt, wenn der Besitzer die Bridge-Sonde schon einmal genutzt hat; sonst &bdquo;unbekannt&ldquo;.</li>
+</ul></div>
+<div id="banners"></div>
+<div id="summary" class="kpis"></div>
+<p><label><input type="checkbox" id="onlyIssues"> nur mit Herausforderungen</label>
+<span id="msg" class="help"></span></p>
+<div id="agentsTable" class="help">Lade…</div>
+<script>
+(function(){
+ function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+ var data = null;
+ function ago(ts){
+  if(!ts) return 'nie';
+  var s = Math.max(0, Math.round(Date.now()/1000 - ts));
+  if(s < 60) return 'vor ' + s + ' s';
+  if(s < 3600) return 'vor ' + Math.floor(s/60) + ' min';
+  if(s < 86400) return 'vor ' + Math.floor(s/3600) + ' h';
+  return 'vor ' + Math.floor(s/86400) + ' d';
+ }
+ var TRANSPORT = {relay:'Relay', direct_p2p:'Direkt (angekündigt)', tcp_fallback:'TCP-Fallback'};
+ function banners(d){
+  var h = '';
+  if(d.edge_error) h += '<p class="badge blocked">Edge nicht lesbar: ' + esc(d.edge_error) + ' &ndash; Status aller Agenten unbekannt (nicht &bdquo;offline&ldquo;).</p> ';
+  if(d.history_error) h += '<p class="badge warn">Sitzungsverlauf nicht lesbar: ' + esc(d.history_error) + '</p> ';
+  if(d.history_enabled === false) h += '<p class="badge warn">Sitzungsverlauf am Edge deaktiviert (CT_EDGE_TUNNEL_HISTORY=off): keine Uptime-, Wiederverbindungs- und Trennungsgrund-Auswertung.</p> ';
+  if(d.key_policy_error) h += '<p class="badge warn">Agent-Key-Zähler nicht lesbar: ' + esc(d.key_policy_error) + '</p> ';
+  document.getElementById('banners').innerHTML = h;
+ }
+ function kpi(label, value){ return '<div class="kpi"><div class="label">' + esc(label) + '</div><div class="value">' + esc(value) + '</div></div>'; }
+ function summary(s){
+  var top = s.top_challenges.length
+   ? s.top_challenges.slice(0,3).map(function(c){ return c.label + ' (' + c.count + ')'; }).join(', ')
+   : 'keine';
+  document.getElementById('summary').innerHTML = kpi('Agenten', s.total) + kpi('Online', s.online) + kpi('Offline', s.offline)
+   + (s.unbekannt ? kpi('Unbekannt', s.unbekannt) : '') + kpi('Mit Herausforderungen', s.with_challenges)
+   + '<div class="kpi"><div class="label">Häufigste Herausforderungen</div><div class="value" style="font-size:.95rem">' + esc(top) + '</div></div>';
+ }
+ function render(){
+  var only = document.getElementById('onlyIssues').checked;
+  var rows = data.agents.filter(function(a){ return !only || a.challenges.length; });
+  if(!rows.length){ document.getElementById('agentsTable').innerHTML = '<p class="help">' + (only ? 'Keine Agenten mit Herausforderungen.' : 'Noch keine Agenten registriert.') + '</p>'; return; }
+  var html = '<div class="tablewrap"><table class="data"><thead><tr><th>Besitzer / Hostname / Name</th><th>Status</th><th>Transport</th>'
+   + '<th>Edge</th><th>Version</th><th>Zuletzt gesehen</th><th class="num">Uptime 24 h</th><th>Herausforderungen</th></tr></thead><tbody>';
+  rows.forEach(function(a){
+   var dot = a.state === 'online' ? 'live' : 'off';
+   var ch = a.challenges.length
+    ? a.challenges.map(function(c){ return '<span class="badge warn" title="' + esc(c.evidence) + '">' + esc(c.label) + '</span> <span class="help">' + esc(c.evidence) + '</span>'; }).join('<br>')
+    : '<span class="help">&ndash;</span>';
+   var up = a.uptime_h24 == null ? '&ndash;' : a.uptime_h24.toFixed(1) + ' %';
+   html += '<tr><td><span class="help">' + esc(a.owner) + '</span><br>' + esc(a.hostname || '–') + ' / ' + esc(a.name) + '</td>'
+    + '<td data-sort="' + esc(a.state) + '"><span class="status-dot ' + dot + '"></span>' + esc(a.state) + '</td>'
+    + '<td>' + (a.transport ? esc(TRANSPORT[a.transport] || a.transport) : '&ndash;') + '</td>'
+    + '<td>' + esc(a.edge_id || '–') + '</td>'
+    + '<td>' + esc(a.version || 'unbekannt') + '</td>'
+    + '<td data-sort="' + (a.last_seen_unix || 0) + '">' + esc(ago(a.last_seen_unix)) + '</td>'
+    + '<td class="num" data-sort="' + (a.uptime_h24 == null ? -1 : a.uptime_h24) + '">' + up + '</td>'
+    + '<td data-sort="' + a.challenges.length + '">' + ch + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  var el = document.getElementById('agentsTable');
+  el.innerHTML = html;
+  window.ctSortableInit(el);
+ }
+ document.getElementById('onlyIssues').addEventListener('change', render);
+ fetch('/admin-ui/agents').then(function(r){ return r.ok ? r.json() : Promise.reject(r.status); })
+  .then(function(d){ data = d; banners(d); summary(d.summary); render(); })
+  .catch(function(s){ document.getElementById('msg').textContent = 'Agentenübersicht konnte nicht geladen werden (' + s + ')'; document.getElementById('agentsTable').innerHTML = ''; });
+})();
+</script>"#;
+    admin_page("agents", session, body)
 }
 
 #[derive(Serialize, Default)]
@@ -11902,6 +12338,7 @@ mod tests {
             // ADR-0025 Decision 6: read-only observability.
             ("GET", "/admin-ui/traffic", None),
             ("GET", "/admin-ui/tunnels", None),
+            ("GET", "/admin-ui/agents", None),
             ("GET", "/admin-ui/health", None),
         ];
         for (method, path, body) in cases {
@@ -12283,6 +12720,230 @@ mod tests {
             domain_admin,
             ObservabilityConfig::default(),
         )
+    }
+
+    // ===== operator agents overview: `/admin-ui/agents` =====
+
+    fn agents_tunnel(owner: &str, id: &str, token_byte: u8) -> (String, SubjectTunnel) {
+        (
+            owner.to_string(),
+            SubjectTunnel {
+                id: id.to_string(),
+                name: format!("name-{id}"),
+                hostname: None,
+                created_at: 1,
+                routing_token: format!("{token_byte:02x}").repeat(32),
+            },
+        )
+    }
+
+    #[test]
+    fn build_agent_rows_joins_sources_and_never_calls_unknown_status_offline() {
+        let tunnels = vec![agents_tunnel("alice", "t1", 0xa1), agents_tunnel("bob", "t2", 0xb2)];
+        let tok1 = tunnels[0].1.routing_token.clone();
+        let tok2 = tunnels[1].1.routing_token.clone();
+        let versions: HashMap<String, String> = [("t1".to_string(), "0.7.26".to_string())].into();
+        let status: HashMap<String, EdgeBulkStatusEntry> = [(
+            tok1.clone(),
+            EdgeBulkStatusEntry { token: tok1.clone(), connected: true, registrations: 1, direct: true, last_seen: Some(990), ..Default::default() },
+        )]
+        .into();
+        let mesh: HashMap<String, String> = [(tok1.clone(), "edge-a".to_string())].into();
+        let mut key: HashMap<String, u64> = HashMap::new();
+        key.insert(agent_key_prefix_of(&tok2).unwrap(), 4);
+
+        let rows = build_agent_rows(1_000, &tunnels, &versions, Some(&status), None, &key, &mesh);
+        assert_eq!((rows[0].state, rows[0].transport), ("online", Some("direct_p2p")));
+        assert_eq!(rows[0].version.as_deref(), Some("0.7.26"));
+        assert_eq!(rows[0].edge_id.as_deref(), Some("edge-a"));
+        assert!(rows[0].challenges.is_empty());
+        // t2 has no status entry although the edge answered -> offline (+ key violations).
+        assert_eq!(rows[1].state, "offline");
+        let codes: Vec<_> = rows[1].challenges.iter().map(|c| c.code).collect();
+        assert_eq!(codes, ["offline", "key_policy"]);
+        assert_eq!(rows[1].version, None, "no probe -> unbekannt in the UI");
+
+        // Edge status unavailable -> unbekannt, no live challenge at all.
+        let rows = build_agent_rows(1_000, &tunnels, &versions, None, None, &HashMap::new(), &mesh);
+        assert!(rows.iter().all(|r| r.state == "unbekannt" && r.challenges.is_empty() && r.transport.is_none()));
+        let s = summarize_agents(&rows);
+        assert_eq!((s.total, s.online, s.offline, s.unbekannt), (2, 0, 0, 2));
+    }
+
+    #[test]
+    fn build_agent_rows_reports_tcp_fallback_transport_and_summary_counts() {
+        let tunnels = vec![agents_tunnel("alice", "t1", 0xc3)];
+        let tok = tunnels[0].1.routing_token.clone();
+        let status: HashMap<String, EdgeBulkStatusEntry> = [(
+            tok.clone(),
+            EdgeBulkStatusEntry { token: tok.clone(), connected: true, registrations: 0, fallback_parked: 2, ..Default::default() },
+        )]
+        .into();
+        let rows = build_agent_rows(1_000, &tunnels, &HashMap::new(), Some(&status), None, &HashMap::new(), &HashMap::new());
+        assert_eq!(rows[0].transport, Some("tcp_fallback"));
+        let s = summarize_agents(&rows);
+        assert_eq!((s.online, s.with_challenges), (1, 1));
+        assert_eq!(s.top_challenges.iter().map(|c| (c.code, c.count)).collect::<Vec<_>>(), [("relay_only", 1), ("tcp_fallback", 1)]);
+    }
+
+    async fn agents_get_json(app: &Router, cookie: &str) -> serde_json::Value {
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/admin-ui/agents").header("cookie", cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_ui_agents_joins_edge_status_history_and_key_counters_end_to_end() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let a = tunnels.create("alice", "online-agent", None).unwrap().created().unwrap();
+        let b = tunnels.create("bob", "flappy-agent", None).unwrap().created().unwrap();
+        let c = tunnels.create("bob", "gone-agent", None).unwrap().created().unwrap();
+        tunnels.record_bridge_probe("alice", &a.id, "bridge/status", &serde_json::json!({ "version": "0.7.26" }), 10).unwrap();
+        let (tok_a, tok_b, tok_c) = (a.routing_token.clone(), b.routing_token.clone(), c.routing_token.clone());
+
+        let (ta, tb) = (tok_a.clone(), tok_b.clone());
+        let status_body = serde_json::json!([
+            { "token": ta, "connected": true, "registrations": 1, "fallback_parked": 0, "direct": true, "last_seen": 5 },
+            { "token": tb, "connected": true, "registrations": 1, "fallback_parked": 0, "direct": true, "last_seen": 6 },
+        ]);
+        let (hb, hc) = (tok_b.clone(), tok_c.clone());
+        let history_body = serde_json::json!({ "enabled": true, "entries": [
+            { "token": hb, "uptime_h24": 80.0, "uptime_d7": 90.0, "session_count_24h": 9,
+              "disconnect_reasons_24h": { "idle-evicted": 2 }, "last_disconnect": { "reason": "idle-evicted", "at": 7 } },
+            { "token": hc, "uptime_h24": 100.0, "uptime_d7": 100.0, "session_count_24h": 0,
+              "disconnect_reasons_24h": {}, "last_disconnect": null },
+        ]});
+        let prefix_c = agent_key_prefix_of(&tok_c).unwrap();
+        let key_body = serde_json::json!({ "observed_since": 1, "note": "x", "tunnels": [
+            { "hash_prefix": prefix_c, "mode": "Observe", "reasons": { "ForeignKey": 3 }, "proofs_admitted": 0, "ready_for_enforce": false }
+        ]});
+        let mock = Router::new()
+            .route("/admin/tunnel-status/bulk", post(move || { let v = status_body.clone(); async move { Json(v) } }))
+            .route("/admin/tunnel-history/bulk", post(move || { let v = history_body.clone(); async move { Json(v) } }))
+            .route("/admin/agent-key/status", axum::routing::get(move || { let v = key_body.clone(); async move { Json(v) } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let app = domain_admin_ui_app(
+            tunnels,
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { edge_admin: Some((format!("http://{addr}"), "edge-secret".to_string())), ..Default::default() },
+        );
+        let v = agents_get_json(&app, &session_header_with_email("kc-super", SUPER_ADMIN)).await;
+        assert!(v["edge_error"].is_null() && v["history_error"].is_null() && v["key_policy_error"].is_null());
+        assert_eq!(v["history_enabled"], true);
+        let agent = |name: &str| v["agents"].as_array().unwrap().iter().find(|r| r["name"] == name).cloned().unwrap();
+        let online = agent("online-agent");
+        assert_eq!((online["state"].as_str(), online["owner"].as_str(), online["version"].as_str()), (Some("online"), Some("alice"), Some("0.7.26")));
+        assert_eq!(online["challenges"].as_array().unwrap().len(), 0);
+        let flappy = agent("flappy-agent");
+        let codes: Vec<_> = flappy["challenges"].as_array().unwrap().iter().map(|c| c["code"].as_str().unwrap().to_string()).collect();
+        assert_eq!(codes, ["flapping", "idle_evicted", "low_uptime"]);
+        assert_eq!(flappy["last_disconnect"]["reason"], "idle-evicted");
+        let gone = agent("gone-agent");
+        let codes: Vec<_> = gone["challenges"].as_array().unwrap().iter().map(|c| c["code"].as_str().unwrap().to_string()).collect();
+        assert_eq!(codes, ["offline", "key_policy"]);
+        assert_eq!(v["summary"]["total"], 3);
+        assert_eq!((v["summary"]["online"].as_u64(), v["summary"]["offline"].as_u64(), v["summary"]["with_challenges"].as_u64()), (Some(2), Some(1), Some(2)));
+        // No token ever leaves in full.
+        assert!(!v.to_string().contains(&tok_a));
+    }
+
+    #[tokio::test]
+    async fn admin_ui_agents_fails_loud_when_the_edge_is_unreachable_or_unconfigured() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        tunnels.create("alice", "some-agent", None).unwrap().created().unwrap();
+        let super_session = session_header_with_email("kc-super", SUPER_ADMIN);
+
+        // Unconfigured edge admin API.
+        let app = domain_admin_ui_app(
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig::default(),
+        );
+        let v = agents_get_json(&app, &super_session).await;
+        assert!(v["edge_error"].as_str().unwrap().contains("nicht konfiguriert"));
+
+        // Configured but the edge answers 500 -> still an explicit error, never "offline".
+        let mock = Router::new().route("/admin/tunnel-status/bulk", post(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let app = domain_admin_ui_app(
+            tunnels.clone(),
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { edge_admin: Some((format!("http://{addr}"), "s".to_string())), ..Default::default() },
+        );
+        let v = agents_get_json(&app, &super_session).await;
+        assert!(v["edge_error"].as_str().unwrap().contains("HTTP 500"));
+        assert_eq!(v["agents"][0]["state"], "unbekannt");
+        assert_eq!(v["agents"][0]["challenges"].as_array().unwrap().len(), 0);
+        assert_eq!((v["summary"]["offline"].as_u64(), v["summary"]["unbekannt"].as_u64()), (Some(0), Some(1)));
+
+        // Port with nothing listening (connection refused) -> error too.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let app = domain_admin_ui_app(
+            tunnels,
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { edge_admin: Some((format!("http://{dead_addr}"), "s".to_string())), ..Default::default() },
+        );
+        let v = agents_get_json(&app, &super_session).await;
+        assert!(v["edge_error"].as_str().unwrap().contains("Edge nicht erreichbar"));
+        assert_eq!(v["agents"][0]["state"], "unbekannt");
+    }
+
+    #[tokio::test]
+    async fn admin_ui_agents_history_disabled_is_an_explicit_marker_not_zeros() {
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let a = tunnels.create("alice", "agent", None).unwrap().created().unwrap();
+        let tok = a.routing_token.clone();
+        let mock = Router::new()
+            .route("/admin/tunnel-status/bulk", post(move || { let t = tok.clone(); async move { Json(serde_json::json!([{ "token": t, "connected": true, "registrations": 1, "direct": true }])) } }))
+            .route("/admin/tunnel-history/bulk", post(|| async { Json(serde_json::json!({ "enabled": false, "entries": [] })) }))
+            .route("/admin/agent-key/status", axum::routing::get(|| async { Json(serde_json::json!({ "observed_since": 0, "note": "", "tunnels": [] })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let app = domain_admin_ui_app(
+            tunnels,
+            Arc::new(crate::storage::SqliteManagedDomains::open_in_memory().unwrap()),
+            DomainAdminConfig { edge_admin: Some((format!("http://{addr}"), "s".to_string())), ..Default::default() },
+        );
+        let v = agents_get_json(&app, &session_header_with_email("kc-super", SUPER_ADMIN)).await;
+        assert_eq!(v["history_enabled"], false);
+        assert!(v["agents"][0]["uptime_h24"].is_null() && v["agents"][0]["sessions_24h"].is_null());
+    }
+
+    #[tokio::test]
+    async fn admin_ui_agents_route_auth_and_html_page() {
+        let (app, ..) = test_admin_ui_app();
+        // JSON: no session 401, verified non-admin 403.
+        let resp = app.clone().oneshot(Request::get("/admin-ui/agents").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let non_admin = session_header_with_email("kc-someone", "not-an-admin@example.com");
+        assert_eq!(admin_ui_req(&app, "GET", "/admin-ui/agents", &non_admin, None).await, StatusCode::FORBIDDEN);
+        // HTML: no session redirects to login, non-admin gets the rendered 403, admin the page.
+        let html_get = |cookie: Option<&str>| {
+            let mut r = Request::get("/admin-ui/agents").header("accept", "text/html");
+            if let Some(c) = cookie {
+                r = r.header("cookie", c);
+            }
+            app.clone().oneshot(r.body(Body::empty()).unwrap())
+        };
+        assert!(html_get(None).await.unwrap().status().is_redirection());
+        assert_eq!(html_get(Some(&non_admin)).await.unwrap().status(), StatusCode::FORBIDDEN);
+        let resp = html_get(Some(&session_header_with_email("kc-super", SUPER_ADMIN))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = String::from_utf8(to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("Was der Server nicht sieht") && html.contains("Direktpfad") && html.contains("nur mit Herausforderungen"));
+        assert!(html.contains(r#"href="/admin-ui/agents""#) && html.contains("Agenten"), "nav-rail entry present");
     }
 
     /// Fail-first proof of both halves of ADR-0025's hostname-disable contract:

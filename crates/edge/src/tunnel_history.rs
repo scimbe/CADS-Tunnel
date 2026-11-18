@@ -99,6 +99,23 @@ pub struct UptimeSummary {
     pub d30: f64,
 }
 
+/// The most recent closed session's end, as disclosed in [`HistorySummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastDisconnect {
+    pub reason: String,
+    pub at: i64,
+}
+
+/// 24 h operator summary of one token's sessions (see [`SqliteTunnelHistory::summary_for`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistorySummary {
+    pub uptime_h24: f64,
+    pub uptime_d7: f64,
+    pub session_count_24h: u64,
+    pub disconnect_reasons_24h: std::collections::BTreeMap<String, u64>,
+    pub last_disconnect: Option<LastDisconnect>,
+}
+
 /// #782: the admin route's page cap for `receipts_for`.
 pub const RECEIPTS_MAX_LIMIT: usize = 1000;
 
@@ -521,6 +538,53 @@ impl SqliteTunnelHistory {
         })
     }
 
+    /// Operator overview (`POST /admin/tunnel-history/bulk`): a compact 24 h summary for
+    /// `token_hex` ending at `now`, derived only from the metadata-only session rows
+    /// (transport/time/reason) -- never bytes, hostnames or source IPs.
+    pub fn summary_for(&self, token_hex: &str, now: i64) -> rusqlite::Result<HistorySummary> {
+        let uptime = self.uptime_summary(token_hex, now)?;
+        let conn = self.conn.lock_safe();
+        let since = now - WINDOW_24H;
+        let session_count_24h: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tunnel_sessions WHERE routing_token = ?1 AND connected_at >= ?2",
+            params![token_hex, since],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT reason, COUNT(*) FROM tunnel_sessions
+             WHERE routing_token = ?1 AND disconnected_at IS NOT NULL AND disconnected_at >= ?2
+             GROUP BY reason",
+        )?;
+        let mut disconnect_reasons_24h = std::collections::BTreeMap::new();
+        for row in stmt.query_map(params![token_hex, since], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (reason, n) = row?;
+            disconnect_reasons_24h.insert(reason.unwrap_or_else(|| "unknown".to_string()), n.max(0) as u64);
+        }
+        let last_disconnect = conn
+            .query_row(
+                "SELECT reason, disconnected_at FROM tunnel_sessions
+                 WHERE routing_token = ?1 AND disconnected_at IS NOT NULL
+                 ORDER BY disconnected_at DESC, id DESC LIMIT 1",
+                params![token_hex],
+                |r| {
+                    Ok(LastDisconnect {
+                        reason: r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "unknown".to_string()),
+                        at: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(HistorySummary {
+            uptime_h24: uptime.h24,
+            uptime_d7: uptime.d7,
+            session_count_24h: session_count_24h.max(0) as u64,
+            disconnect_reasons_24h,
+            last_disconnect,
+        })
+    }
+
     /// Delete CLOSED sessions that ended before `cutoff`; open rows are never pruned
     /// (a still-connected tunnel's streak start must survive however old it is). Returns
     /// the count removed.
@@ -786,6 +850,33 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut b);
         let name: String = b.iter().map(|x| format!("{x:02x}")).collect();
         std::env::temp_dir().join(format!("ct_tunnel_history_{name}.db")).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn summary_for_counts_sessions_reasons_and_last_disconnect_in_24h_window() {
+        let s = store();
+        let t = hex(0x31);
+        let now = 1_000_000;
+        // Outside the 24 h window: counts for last_disconnect only if newest -- it is not.
+        s.open_session(&t, TRANSPORT_QUIC, now - 3 * 86_400).unwrap();
+        s.close_session(&t, now - 3 * 86_400 + 100, "removed").unwrap();
+        // Inside the window: two revoked-free flaps and one idle eviction (newest).
+        s.open_session(&t, TRANSPORT_QUIC, now - 5_000).unwrap();
+        s.close_session(&t, now - 4_000, "registration-closed").unwrap();
+        s.open_session(&t, TRANSPORT_QUIC, now - 3_000).unwrap();
+        s.close_session(&t, now - 2_000, "registration-closed").unwrap();
+        s.open_session(&t, TRANSPORT_TCP_FALLBACK, now - 1_000).unwrap();
+        s.close_session(&t, now - 500, "idle-evicted").unwrap();
+        let sum = s.summary_for(&t, now).unwrap();
+        assert_eq!(sum.session_count_24h, 3);
+        assert_eq!(sum.disconnect_reasons_24h.get("registration-closed"), Some(&2));
+        assert_eq!(sum.disconnect_reasons_24h.get("idle-evicted"), Some(&1));
+        assert_eq!(sum.disconnect_reasons_24h.get("removed"), None, "outside window");
+        assert_eq!(sum.last_disconnect, Some(LastDisconnect { reason: "idle-evicted".into(), at: now - 500 }));
+        assert!(sum.uptime_h24 > 0.0 && sum.uptime_h24 < 100.0);
+        // Unknown token: zero sessions, no last disconnect.
+        let none = s.summary_for(&hex(0x32), now).unwrap();
+        assert_eq!((none.session_count_24h, none.last_disconnect), (0, None));
     }
 
     #[test]

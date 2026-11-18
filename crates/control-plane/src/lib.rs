@@ -17,6 +17,7 @@ pub mod billing;
 pub mod cert_issuer;
 pub mod cert_status;
 pub mod client;
+pub mod agent_challenges;
 pub mod credential;
 pub mod dns01_challenge;
 pub mod direct_serving;
