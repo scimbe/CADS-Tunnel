@@ -898,7 +898,7 @@ mod tests {
         // Lock both holds → the money really moves out of the buyer's available balance into escrow.
         let mut escrow = Escrow::new(BTreeMap::from([(buyer, 1000)]));
         for h in &holds {
-            escrow.lock(h).expect("hold locks against funded buyer");
+            escrow.lock(h, 0).expect("hold locks against funded buyer");
         }
         assert_eq!(escrow.balance(&buyer), 1000 - 90, "90 locked (50 + 40) out of available");
         assert_eq!(escrow.held_amount(&holds[0].match_ref), 50);

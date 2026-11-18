@@ -4997,7 +4997,7 @@ mod tests {
         // End-to-end: the match_ref threads into escrow. The buyer escrows the cleared amount for the
         // provider under the match_ref; a co-signed receipt for the SAME match releases it.
         let mut esc = Escrow::new(BTreeMap::from([(m.consumer, 1_000)]));
-        esc.lock(&Hold::sign_new(&buyer, m.provider, m.total_price, m.match_ref, 0, 9_000)).expect("buyer escrows the cleared amount");
+        esc.lock(&Hold::sign_new(&buyer, m.provider, m.total_price, m.match_ref, 0, 9_000), 0).expect("buyer escrows the cleared amount");
         assert_eq!(esc.held_amount(&m.match_ref), 150, "the cleared amount is held under the match_ref");
         let receipt = UsageReceipt::co_sign(&seller, &buyer, m.kind, m.model.clone(), m.units, m.match_ref, 5_000);
         esc.release(&receipt).expect("the co-signed receipt for this match releases the escrow");
