@@ -21,16 +21,19 @@ set -euo pipefail
 fail=0
 for f in "$@"; do
   [ -f "$f" ] || { echo "error: no such file: $f" >&2; exit 2; }
-  # A `ports:` mapping key at any indent. #318: the old pattern required
-  # `ports:` to end the line (`\s*$`), so it only caught the YAML block form
-  # (`ports:` alone, nested items on following lines) and silently missed the
-  # equally valid inline form (`ports: ["80:80"]`) -- a compose file using
-  # inline syntax to publish a host port sailed straight through this gate.
-  # A `:` starts a YAML mapping value only when followed by whitespace or
-  # end-of-line (compact `key:value` is a plain scalar, not a key), so
-  # matching `ports:` followed by whitespace-or-EOL catches every valid form
-  # of the key without over-matching an unrelated `ports:something` token.
-  hits="$(grep -nE '^\s*ports:(\s|$)' "$f" || true)"
+  # A `ports:` mapping key at any indent, optionally quoted (`"ports":` /
+  # `'ports':`) -- a YAML key never NEEDS quoting here, but a file is free to
+  # quote it anyway, and the old pattern only matched the bare form. #318: the
+  # old pattern required `ports:` to end the line (`\s*$`), so it only caught
+  # the YAML block form (`ports:` alone, nested items on following lines) and
+  # silently missed the equally valid inline form (`ports: ["80:80"]`) -- a
+  # compose file using inline syntax to publish a host port sailed straight
+  # through this gate. A `:` starts a YAML mapping value only when followed by
+  # whitespace or end-of-line (compact `key:value` is a plain scalar, not a
+  # key), so matching `ports:` followed by whitespace-or-EOL catches every
+  # valid form of the key without over-matching an unrelated `ports:something`
+  # token.
+  hits="$(grep -nE '^\s*["'"'"']?ports["'"'"']?:(\s|$)' "$f" || true)"
   if [ -n "$hits" ]; then
     fail=1
     echo "✗ $f publishes a host port (breaks the tunnel-only invariant, #219):"
@@ -39,6 +42,20 @@ for f in "$@"; do
       echo "  line $lineno:"
       sed -n "${lineno},$((lineno + 3))p" "$f" | sed 's/^/    /'
     done <<< "$hits"
+  fi
+
+  # #991: `network_mode: host` publishes every listening port on that service
+  # without ever going through a `ports:` mapping at all -- a service using it
+  # could pass the check above while being directly reachable on the host.
+  net_hits="$(grep -nE '^\s*network_mode:\s*["'"'"']?host["'"'"']?\s*$' "$f" || true)"
+  if [ -n "$net_hits" ]; then
+    fail=1
+    echo "✗ $f uses network_mode: host (breaks the tunnel-only invariant, #219 -- publishes every port without a ports: mapping):"
+    while IFS= read -r line; do
+      lineno="${line%%:*}"
+      echo "  line $lineno:"
+      sed -n "${lineno}p" "$f" | sed 's/^/    /'
+    done <<< "$net_hits"
   fi
 done
 
