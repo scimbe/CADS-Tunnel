@@ -117,15 +117,25 @@ pub fn agent_key_config_with(
 ) -> Result<AgentKeyConfig, String> {
     let mut warnings = Vec::new();
 
-    let mode = match get("CT_EDGE_AGENT_KEY_MODE").as_deref() {
-        None | Some("log") => AgentKeyMode::Log,
-        Some("enforce") => AgentKeyMode::Enforce,
-        Some(other) => {
-            warnings.push(format!(
-                "CT_EDGE_AGENT_KEY_MODE: unbekannter Wert '{other}', verwende log"
-            ));
-            AgentKeyMode::Log
-        }
+    // #1008: an unrecognized value used to warn-and-downgrade to Log, the same as
+    // an unset variable -- an operator's typo in a security control ("Enforce",
+    // "enforced", a value with trailing whitespace) silently left agent-key
+    // possession unenforced while the configuration appeared to request
+    // enforcement. Fail at startup instead, matching parse_extra_sans's posture
+    // for its own typos. Trimmed/lowercased before matching so whitespace/casing
+    // alone isn't itself an error, but the raw value is still shown in the
+    // message so the operator sees exactly what they set.
+    let mode = match get("CT_EDGE_AGENT_KEY_MODE") {
+        None => AgentKeyMode::Log,
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "log" => AgentKeyMode::Log,
+            "enforce" => AgentKeyMode::Enforce,
+            _ => {
+                return Err(format!(
+                    "CT_EDGE_AGENT_KEY_MODE: unbekannter Wert '{raw}' (erwartet 'log' oder 'enforce')"
+                ));
+            }
+        },
     };
 
     let mut issuers = Vec::new();
@@ -427,6 +437,37 @@ mod tests {
             |_| Ok(String::new()),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_key_unrecognized_mode_fails_at_startup_1008() {
+        // #1008: a typo ("Enforce", trailing whitespace, anything not exactly
+        // log/enforce) must fail startup, not silently downgrade to Log while
+        // looking like enforcement was requested.
+        let result = agent_key_config_with(
+            |k| match k {
+                "CT_EDGE_AGENT_KEY_MODE" => Some("Enforce".to_string()),
+                _ => None,
+            },
+            |_| Ok(String::new()),
+        );
+        assert!(result.is_err(), "an unrecognized mode value must fail, not silently become Log");
+    }
+
+    #[test]
+    fn agent_key_mode_is_trimmed_and_case_insensitive_1008() {
+        // Whitespace/casing alone must not be treated as a typo -- only the
+        // actual value matters.
+        let cfg = agent_key_config_with(
+            |k| match k {
+                "CT_EDGE_AGENT_KEY_MODE" => Some(" ENFORCE \n".to_string()),
+                "CT_EDGE_AGENT_BINDING_ISSUER_PUBKEYS" => Some("aa".repeat(32)),
+                _ => None,
+            },
+            |_| Ok(String::new()),
+        )
+        .expect("' ENFORCE \\n' is valid once trimmed/lowercased");
+        assert!(matches!(cfg.mode, AgentKeyMode::Enforce));
     }
 
     #[test]
