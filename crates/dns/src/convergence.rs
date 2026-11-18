@@ -74,8 +74,15 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 /// Outcome of waiting for a record to reach every node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Convergence {
-    /// Every node that answered is serving the expected value.
-    Converged { nodes: usize, took: Duration },
+    /// Every node that answered is serving the expected value. #955: a node
+    /// that never answers anything (firewalled, routing black hole) no longer
+    /// blocks this -- only a node that resolved and responded but simply
+    /// doesn't have the value yet does, since that is the only case this
+    /// module exists to wait out. `unreachable` carries any such nodes so the
+    /// operator-facing reachability fault is still visible, as
+    /// [`DESEC_NODES`]'s own doc promises ("this list going stale degrades the
+    /// check instead of breaking issuance").
+    Converged { nodes: usize, took: Duration, unreachable: Vec<String> },
     /// Ran out of time. #488: split into two separately-tracked sets that used
     /// to be conflated into one ambiguous `lagging` list --
     /// `lagging` is nodes that DID resolve and respond (a TXT miss the node's
@@ -140,23 +147,48 @@ pub async fn wait_for_convergence(
         for (host, ips) in &addrs {
             set.spawn(probe_node(host.clone(), ips.clone(), zone.to_string(), name.to_string(), expected.to_string()));
         }
-        let (answered, mut lagging, mut unreachable) = drain_probe_round(set).await;
-        if answered == 0 {
-            return Convergence::NoNodesReachable;
-        }
-        if lagging.is_empty() && unreachable.is_empty() {
-            return Convergence::Converged { nodes: answered, took: started.elapsed() };
-        }
-        if Instant::now() >= deadline {
-            // Concurrent probes finish in arbitrary order -- sort so the
-            // operator-facing lists are stable/reproducible, not an artifact of
-            // which task happened to resolve first.
-            lagging.sort();
-            unreachable.sort();
-            return Convergence::TimedOut { lagging, unreachable };
+        let (answered, lagging, unreachable) = drain_probe_round(set).await;
+        if let Some(outcome) = round_outcome(answered, lagging, unreachable, started.elapsed(), Instant::now() >= deadline) {
+            return outcome;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Decide one poll round's outcome from [`drain_probe_round`]'s tally --
+/// `None` means keep polling. Pulled out of the loop above so the decision
+/// itself, in particular #955's "a node unreachable from this vantage point
+/// must not block an otherwise-fully-converged round", is unit-testable
+/// without real DNS resolution.
+fn round_outcome(
+    answered: usize,
+    mut lagging: Vec<String>,
+    mut unreachable: Vec<String>,
+    took: Duration,
+    deadline_passed: bool,
+) -> Option<Convergence> {
+    if answered == 0 {
+        return Some(Convergence::NoNodesReachable);
+    }
+    if lagging.is_empty() {
+        // #955: success no longer waits out a node that is unreachable from
+        // this vantage point rather than merely lagging -- that node was
+        // never going to stop being unreachable just because this loop kept
+        // polling it, so doing so only cost the full timeout on every wait
+        // for as long as it stayed down. Still reported, not silently
+        // dropped: see the field's own doc.
+        unreachable.sort();
+        return Some(Convergence::Converged { nodes: answered, took, unreachable });
+    }
+    if deadline_passed {
+        // Concurrent probes finish in arbitrary order -- sort so the
+        // operator-facing lists are stable/reproducible, not an artifact of
+        // which task happened to resolve first.
+        lagging.sort();
+        unreachable.sort();
+        return Some(Convergence::TimedOut { lagging, unreachable });
+    }
+    None
 }
 
 /// #488: the outcome of probing one node, kept as three explicit cases rather
@@ -699,6 +731,46 @@ mod tests {
         assert_eq!(unreachable, vec!["firewalled.desec.io (unreachable on all 2 address(es))".to_string()]);
     }
 
+    #[test]
+    fn round_outcome_converges_despite_an_unreachable_node_955() {
+        // #955: before this fix, a single unreachable (not merely lagging) node
+        // forced every wait to run the full timeout and report TimedOut, even
+        // though every node that actually answered already had the expected
+        // value. Zero lagging nodes must converge regardless of how many are
+        // unreachable, carrying them in the result rather than dropping them.
+        let outcome = round_outcome(11, vec![], vec!["jnb-1.a.desec.io".to_string()], Duration::from_secs(7), false);
+        assert_eq!(
+            outcome,
+            Some(Convergence::Converged { nodes: 11, took: Duration::from_secs(7), unreachable: vec!["jnb-1.a.desec.io".to_string()] })
+        );
+    }
+
+    #[test]
+    fn round_outcome_still_waits_out_a_genuinely_lagging_node_before_the_deadline() {
+        // A node that resolved and answered but doesn't have the value yet is
+        // exactly the ordinary-replication-delay case this module exists to
+        // wait out -- unlike #955's unreachable case, this must NOT converge
+        // early, and must keep polling (None) until the deadline passes.
+        let outcome = round_outcome(11, vec!["slow.desec.io".to_string()], vec![], Duration::from_secs(7), false);
+        assert_eq!(outcome, None, "must keep polling while a node is genuinely lagging and the deadline hasn't passed");
+    }
+
+    #[test]
+    fn round_outcome_times_out_once_the_deadline_passes_with_a_lagging_node() {
+        let outcome = round_outcome(11, vec!["slow.desec.io".to_string()], vec!["jnb-1.a.desec.io".to_string()], Duration::from_secs(300), true);
+        assert_eq!(
+            outcome,
+            Some(Convergence::TimedOut { lagging: vec!["slow.desec.io".to_string()], unreachable: vec!["jnb-1.a.desec.io".to_string()] })
+        );
+    }
+
+    #[test]
+    fn round_outcome_reports_no_nodes_reachable_even_past_the_deadline() {
+        // NoNodesReachable must take priority regardless of deadline_passed --
+        // it says something about our own network, not deSEC's propagation.
+        assert_eq!(round_outcome(0, vec![], vec![], Duration::from_secs(300), true), Some(Convergence::NoNodesReachable));
+    }
+
     #[tokio::test]
     async fn resolve_nodes_builds_one_resolver_per_address_and_polling_never_rebuilds_one_355() {
         // #355: two real claims to prove, not just assert -- (1) resolve_nodes
@@ -775,7 +847,7 @@ mod tests {
                     .coalesce("zone/name/expected", || async move {
                         poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1), unreachable: vec![] }
                     })
                     .await
             }));
@@ -783,7 +855,7 @@ mod tests {
 
         for h in handles {
             let result = h.await.unwrap();
-            assert_eq!(result, Convergence::Converged { nodes: 12, took: Duration::from_millis(1) });
+            assert_eq!(result, Convergence::Converged { nodes: 12, took: Duration::from_millis(1), unreachable: vec![] });
         }
         assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 1, "exactly one poll served all 8 callers");
     }
@@ -913,7 +985,7 @@ mod tests {
                         // the (MAX+1)th caller, which is the scenario under test.
                         tokio::time::sleep(ConvergenceCoalescer::PERMIT_WAIT * 2).await;
                         concurrent.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1), unreachable: vec![] }
                     })
                     .await
             }));
@@ -955,7 +1027,7 @@ mod tests {
                 coalescer
                     .coalesce(&format!("zone/filler-{i}/expected"), || async move {
                         tokio::time::sleep(Duration::from_secs(3600)).await;
-                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                        Convergence::Converged { nodes: 12, took: Duration::from_millis(1), unreachable: vec![] }
                     })
                     .await
             });
@@ -976,7 +1048,7 @@ mod tests {
                         let poll_count = poll_count.clone();
                         async move {
                             poll_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Convergence::Converged { nodes: 12, took: Duration::from_millis(1) }
+                            Convergence::Converged { nodes: 12, took: Duration::from_millis(1), unreachable: vec![] }
                         }
                     })
                     .await

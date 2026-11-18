@@ -154,7 +154,21 @@ async fn publish(
             .wait_for_convergence(&key, DESEC_NODES, client.domain(), &record_name, &req.value, DEFAULT_TIMEOUT)
             .await
         {
-            Convergence::Converged { .. } => {}
+            // #955: a node can be unreachable from this control plane specifically
+            // (firewall rule, routing black hole) without that being a reason to
+            // keep waiting -- see Convergence::Converged's own doc. Still surfaced
+            // here, not silently dropped, same as TimedOut's unreachable list below.
+            Convergence::Converged { unreachable, .. } => {
+                if !unreachable.is_empty() {
+                    eprintln!(
+                        "ct-cp: dns01-challenge: converged for {record_name}, but could not reach \
+                         {} node(s) from this control plane to confirm them specifically (check \
+                         network/firewall to these nodes, not deSEC's own propagation): {}",
+                        unreachable.len(),
+                        unreachable.join(", ")
+                    );
+                }
+            }
             // We could not reach any node ourselves -- a fact about the
             // control plane's own network, not about deSEC. The write did
             // succeed per deSEC's own API; don't fail an otherwise-good
