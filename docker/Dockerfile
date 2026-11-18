@@ -54,6 +54,11 @@
 FROM rust:1-slim-bookworm AS wasm-builder
 # Default comes from the repo-root CT_AGENT_RELEASE file; --build-arg CT_AGENT_REF=... overrides.
 ARG CT_AGENT_REF=
+# #965: local-experiment-only opt-out for the pin check below, for a CT_AGENT_REF/
+# lockfile combination this build genuinely has no recorded commit for (e.g. a ref
+# never vendored into this workspace's Cargo.lock at all). Never set this for an
+# image that ships.
+ARG ALLOW_UNVERIFIED_CT_AGENT_WASM=
 COPY CT_AGENT_RELEASE /pin/CT_AGENT_RELEASE
 RUN apt-get update -qq && apt-get install -y -qq git && rm -rf /var/lib/apt/lists/*
 RUN rustup target add wasm32-unknown-unknown
@@ -81,7 +86,13 @@ COPY Cargo.lock /pin/Cargo.lock
 RUN ref="${CT_AGENT_REF:-$(tr -d '[:space:]' < /pin/CT_AGENT_RELEASE)}" \
     && locked="$(grep -o "ct-agent?tag=${ref}#[0-9a-f]*" /pin/Cargo.lock | head -n1 | cut -d'#' -f2)" \
     && actual="$(git -C /agent-src rev-parse HEAD)" \
-    && if [ -n "$locked" ] && [ "$actual" != "$locked" ]; then \
+    && if [ -z "$locked" ]; then \
+         if [ -n "$ALLOW_UNVERIFIED_CT_AGENT_WASM" ]; then \
+           echo "ct-agent $ref: no matching commit found in Cargo.lock -- shipping $actual UNVERIFIED (ALLOW_UNVERIFIED_CT_AGENT_WASM set)" >&2; \
+         else \
+           echo "ct-agent $ref: no matching 'ct-agent?tag=$ref#<hash>' entry in Cargo.lock, so the commit this tag currently points to ($actual) cannot be verified against anything -- refusing to ship it unverified. Pass --build-arg ALLOW_UNVERIFIED_CT_AGENT_WASM=1 only for local experiments, never for an image that ships." >&2; exit 1; \
+         fi; \
+       elif [ "$actual" != "$locked" ]; then \
          echo "ct-agent $ref is $actual, Cargo.lock pins $locked -- tag moved?" >&2; exit 1; \
        fi
 
