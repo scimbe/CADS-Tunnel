@@ -18,6 +18,55 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// How long a persisted challenge value is kept across a restart (and across any
+/// opportunistic prune during normal operation) before being treated as stale: a
+/// cleanup `clear()` that never arrived (ACME client crash, failed issuance) must
+/// not serve a token forever just because the process happened to restart while
+/// it was still on disk. Generous relative to any real issuance window (minutes),
+/// so a slow but legitimate validation is never cut off by this.
+const MAX_ENTRY_AGE_SECS: u64 = 24 * 3600;
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// One persisted TXT value plus when it was published, so a restart (or an
+/// opportunistic prune) can drop stale entries instead of serving them forever.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Entry {
+    value: String,
+    published_at: u64,
+}
+
+/// Parse the persisted file's bytes as today's `{value, published_at}` shape,
+/// falling back to the pre-existing bare-string shape (`HashMap<String,
+/// Vec<String>>`) for a file written before this format existed -- each
+/// recovered legacy value is stamped with `now` as a fresh baseline, since its
+/// real publish time was never recorded under the old format.
+fn load_entries(bytes: &[u8]) -> serde_json::Result<HashMap<String, Vec<Entry>>> {
+    if let Ok(entries) = serde_json::from_slice::<HashMap<String, Vec<Entry>>>(bytes) {
+        return Ok(entries);
+    }
+    let legacy: HashMap<String, Vec<String>> = serde_json::from_slice(bytes)?;
+    let now = now_secs();
+    Ok(legacy
+        .into_iter()
+        .map(|(name, values)| {
+            (name, values.into_iter().map(|value| Entry { value, published_at: now }).collect())
+        })
+        .collect())
+}
+
+/// Drop any entry older than [`MAX_ENTRY_AGE_SECS`] as of `now`, and any name left
+/// with no entries at all.
+fn prune_stale(txt: &mut HashMap<String, Vec<Entry>>, now: u64) {
+    txt.retain(|_, entries| {
+        entries.retain(|e| now.saturating_sub(e.published_at) < MAX_ENTRY_AGE_SECS);
+        !entries.is_empty()
+    });
+}
 
 /// Thread-safe store of challenge name -> TXT values, with optional crash-safe
 /// persistence to a flat file (#302).
@@ -30,7 +79,7 @@ use std::sync::{PoisonError, RwLock};
 /// all wait on the same lock even though none of them are mutating anything.
 #[derive(Default)]
 pub struct AcmeDnsStore {
-    txt: RwLock<HashMap<String, Vec<String>>>,
+    txt: RwLock<HashMap<String, Vec<Entry>>>,
     persist_path: Option<PathBuf>,
 }
 
@@ -51,13 +100,16 @@ impl AcmeDnsStore {
     /// mid-write leaves either the old complete file or the new one, never a mix).
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let txt = match std::fs::read(&path) {
+        let mut txt = match std::fs::read(&path) {
             Ok(bytes) if bytes.is_empty() => HashMap::new(),
-            Ok(bytes) => serde_json::from_slice(&bytes)
+            Ok(bytes) => load_entries(&bytes)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("corrupt ACME DNS store at {}: {e}", path.display())))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e),
         };
+        // A cleanup that never arrived must not serve a token forever just because
+        // the process restarted while it was still on disk.
+        prune_stale(&mut txt, now_secs());
         let store = Self { txt: RwLock::new(txt), persist_path: Some(path) };
         // Prove the path is actually writable now, at startup, rather than silently
         // discovering it on the first real publish deep into an issuance attempt.
@@ -65,11 +117,11 @@ impl AcmeDnsStore {
         Ok(store)
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<String>>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<Entry>>> {
         self.txt.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Vec<String>>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Vec<Entry>>> {
         self.txt.write().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -79,8 +131,22 @@ impl AcmeDnsStore {
     /// releases its guard within one call). Exposes a way to hold a read guard
     /// open so a test can prove a SECOND concurrent read still succeeds.
     #[cfg(test)]
-    pub(crate) fn hold_read_lock_for_test(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<String>>> {
+    pub(crate) fn hold_read_lock_for_test(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Vec<Entry>>> {
         self.read()
+    }
+
+    /// Back-date every entry currently stored for `name` to `published_at`, so a
+    /// test can simulate a stale entry without waiting [`MAX_ENTRY_AGE_SECS`] or
+    /// going through a real restart (which is the only other way `published_at`
+    /// is ever set to anything but "now").
+    #[cfg(test)]
+    pub(crate) fn backdate_for_test(&self, name: &str, published_at: u64) {
+        let mut guard = self.write();
+        if let Some(entries) = guard.get_mut(&name.to_ascii_lowercase()) {
+            for e in entries {
+                e.published_at = published_at;
+            }
+        }
     }
 
     /// Write `txt` (a snapshot already taken by the caller, under whatever lock
@@ -97,7 +163,7 @@ impl AcmeDnsStore {
     /// earlier, now-stale snapshot is the last one written to disk, silently
     /// dropping the later mutation from the recovery file even though in-memory
     /// state has both.
-    fn persist_locked(&self, txt: &HashMap<String, Vec<String>>) -> std::io::Result<()> {
+    fn persist_locked(&self, txt: &HashMap<String, Vec<Entry>>) -> std::io::Result<()> {
         let Some(path) = &self.persist_path else { return Ok(()) };
         let json = serde_json::to_vec(txt)?;
         let tmp_path = path.with_extension("tmp");
@@ -142,7 +208,9 @@ impl AcmeDnsStore {
     pub fn add_txt(&self, name: &str, value: &str) {
         let result = {
             let mut guard = self.write();
-            guard.entry(name.to_ascii_lowercase()).or_default().push(value.to_string());
+            let now = now_secs();
+            prune_stale(&mut guard, now);
+            guard.entry(name.to_ascii_lowercase()).or_default().push(Entry { value: value.to_string(), published_at: now });
             self.persist_locked(&guard)
         };
         // Fail-soft: the in-memory map (already updated above) stays authoritative
@@ -159,7 +227,9 @@ impl AcmeDnsStore {
     pub fn set_txt(&self, name: &str, value: &str) {
         let result = {
             let mut guard = self.write();
-            guard.insert(name.to_ascii_lowercase(), vec![value.to_string()]);
+            let now = now_secs();
+            prune_stale(&mut guard, now);
+            guard.insert(name.to_ascii_lowercase(), vec![Entry { value: value.to_string(), published_at: now }]);
             self.persist_locked(&guard)
         };
         if let Err(e) = result {
@@ -197,11 +267,12 @@ impl AcmeDnsStore {
     /// ACME publish/cleanup write, not with each other.
     pub fn txt(&self, name: &str) -> Vec<String> {
         let guard = self.read();
-        if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            guard.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default()
+        let entries = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            guard.get(&name.to_ascii_lowercase())
         } else {
-            guard.get(name).cloned().unwrap_or_default()
-        }
+            guard.get(name)
+        };
+        entries.map(|v| v.iter().map(|e| e.value.clone()).collect()).unwrap_or_default()
     }
 }
 
@@ -442,5 +513,63 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         s.add_txt("_acme-challenge.host.test", "tok");
         assert_eq!(s.txt("_acme-challenge.host.test"), vec!["tok".to_string()]);
+    }
+
+    #[test]
+    fn open_loads_a_pre_existing_bare_string_file_and_keeps_it_live() {
+        // A file written before per-entry timestamps existed: bare `HashMap<String,
+        // Vec<String>>`. Must load (not be treated as corrupt) and keep serving the
+        // value -- the legacy entry is stamped with a fresh "now" baseline, not
+        // instantly expired.
+        let path = temp_store_path("legacy-format");
+        let legacy: HashMap<String, Vec<String>> =
+            HashMap::from([("_acme-challenge.host.test".to_string(), vec!["legacy-tok".to_string()])]);
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let s = AcmeDnsStore::open(&path).unwrap();
+        assert_eq!(s.txt("_acme-challenge.host.test"), vec!["legacy-tok".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_drops_an_entry_older_than_the_expiry_bound_but_keeps_a_fresh_one() {
+        // A cleanup `clear()` that never arrived (crashed ACME client, failed
+        // issuance) must not serve its token forever just because the process
+        // restarted while the stale record was still on disk.
+        let path = temp_store_path("expiry-on-open");
+        let now = now_secs();
+        let on_disk: HashMap<String, Vec<Entry>> = HashMap::from([
+            (
+                "_acme-challenge.stale.test".to_string(),
+                vec![Entry { value: "stale-tok".to_string(), published_at: now - MAX_ENTRY_AGE_SECS - 1 }],
+            ),
+            (
+                "_acme-challenge.fresh.test".to_string(),
+                vec![Entry { value: "fresh-tok".to_string(), published_at: now }],
+            ),
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+
+        let s = AcmeDnsStore::open(&path).unwrap();
+        assert!(s.txt("_acme-challenge.stale.test").is_empty(), "the stale entry must not survive open()");
+        assert_eq!(s.txt("_acme-challenge.fresh.test"), vec!["fresh-tok".to_string()], "a fresh entry is unaffected");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_stale_entry_is_pruned_opportunistically_on_the_next_mutation_without_a_restart() {
+        // Even a long-running process (no restart, so `open()`'s own prune never
+        // runs again) must not accumulate stale entries forever -- a later mutation
+        // (anywhere in the store) also prunes.
+        let s = AcmeDnsStore::new();
+        s.add_txt("_acme-challenge.stale.test", "stale-tok");
+        s.backdate_for_test("_acme-challenge.stale.test", now_secs() - MAX_ENTRY_AGE_SECS - 1);
+
+        s.add_txt("_acme-challenge.other.test", "other-tok");
+
+        assert!(s.txt("_acme-challenge.stale.test").is_empty(), "pruned by the mutation above");
+        assert_eq!(s.txt("_acme-challenge.other.test"), vec!["other-tok".to_string()]);
     }
 }
