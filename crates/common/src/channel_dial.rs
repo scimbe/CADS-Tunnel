@@ -74,7 +74,8 @@ use crate::channel::{ChannelId, ChannelJoinRequest, SignedChannelGrant, CHANNEL_
 use crate::channel_quic::build_channel_dialer;
 use crate::channel_wire::io::present_channel_join_on_stream;
 use crate::channel_wire::{
-    error_names_park_expiry, ChannelJoinOutcome, DroppedLegBeforeAck, PHASE_MARKER_RELAY, PHASE_MARKER_RENDEZVOUS,
+    error_names_park_expiry, AdmissionStalled, ChannelJoinOutcome, DroppedLegBeforeAck, PHASE_MARKER_RELAY,
+    PHASE_MARKER_RENDEZVOUS,
 };
 use crate::mcp::encode_request;
 use crate::noise::take_frame;
@@ -172,13 +173,6 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// runs inside an HTTP request handler with its own caller waiting, so it stays short.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The shared exchange's stall error text (`channel_wire::io::present_channel_join_on_stream`,
-/// ct-agent#140) — the one `BoxError` this module classifies by text, exactly as ct-agent's
-/// `channel_run/errors.rs` does. Pinned by `adapter_maps_the_shared_exchanges_stall_to_timed_out`
-/// against the real function, so a reword upstream fails here instead of silently turning a
-/// timeout into `DialError::Session`.
-const ADMISSION_STALLED_TEXT: &str = "channel join admission exchange stalled (#140)";
-
 /// One fresh QUIC connection to `addr` through the shared accept-any-cert channel dialer
 /// ([`crate::channel_quic::build_channel_dialer`] — the QUIC/TLS layer is transport only; the
 /// real authentication is the Noise_IK session pinned to the broker-attested peer key).
@@ -210,12 +204,13 @@ async fn dial_quic(addr: SocketAddr) -> Result<(Endpoint, Connection), DialError
 /// sends the bare length-framed join. Only those two markers may ever be sent: any OTHER
 /// phase byte after the magic is a DEFINITIVE refusal that charges the per-IP penalty (#509).
 ///
-/// Error mapping (the shared function returns `BoxError`, whose texts ct-agent classifies
-/// the same way): a [`DroppedLegBeforeAck`] downcast → [`DialError::DroppedLeg`] with THIS
+/// Error mapping (the shared function returns `BoxError`, which ct-agent classifies by
+/// `Display` text): a [`DroppedLegBeforeAck`] downcast → [`DialError::DroppedLeg`] with THIS
 /// hop's leg name (the shared rendezvous-shaped reader always says `"rendezvous"`; hop 2 is
 /// the relay leg to a bridge operator, exactly as before); an error whose source chain
-/// names the edge's QUIC park-expiry close reason → [`DialError::NoPeer`]; the exchange
-/// stall → [`DialError::TimedOut`]; anything else (malformed pre-challenge response #129,
+/// names the edge's QUIC park-expiry close reason → [`DialError::NoPeer`]; an
+/// [`AdmissionStalled`] downcast (#1035 — this module used to compare `Display` text
+/// instead) → [`DialError::TimedOut`]; anything else (malformed pre-challenge response #129,
 /// oversized ack #23, an I/O failure) → [`DialError::Session`] carrying the text.
 async fn present_join<W, R>(
     send: W,
@@ -244,7 +239,7 @@ fn map_join_error(e: BoxError, leg: &'static str) -> DialError {
     if error_names_park_expiry(e.as_ref()) {
         return DialError::NoPeer;
     }
-    if e.to_string() == ADMISSION_STALLED_TEXT {
+    if e.downcast_ref::<AdmissionStalled>().is_some() {
         return DialError::TimedOut;
     }
     DialError::Session(e.to_string())

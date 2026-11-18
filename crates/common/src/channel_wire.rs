@@ -163,6 +163,26 @@ impl std::fmt::Display for DroppedLegBeforeAck {
 
 impl std::error::Error for DroppedLegBeforeAck {}
 
+/// ct-agent#140: the broker admission exchange (open the stream + send the join
+/// request + the possession challenge/response + read the ack) did not finish within
+/// its deadline. Typed (#1035) so [`crate::channel_dial`]'s classifier can downcast
+/// instead of matching this error's `Display` text, the way `DroppedLegBeforeAck`
+/// above already is -- the `Display` text itself is UNCHANGED and must stay that way:
+/// it is still a cross-process contract, since ct-agent's own `channel_run/errors.rs`
+/// classifies this same shared exchange's stall by matching this exact string (see the
+/// module header's "error STRINGS are contract" note). ct-agent adopting the typed
+/// downcast itself is a separate, coordinated change, not this one.
+#[derive(Debug)]
+pub struct AdmissionStalled;
+
+impl std::fmt::Display for AdmissionStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "channel join admission exchange stalled (#140)")
+    }
+}
+
+impl std::error::Error for AdmissionStalled {}
+
 // ported verbatim from ct-agent native/src/channel.rs:115-128 (doc) + :172-176 @ v0.7.23
 // (the doc below sat on ct-agent's `phase_marker_enabled`, which stays in ct-agent as the
 // operator switch; the wire facts it states belong to the constant, so they travel with it)

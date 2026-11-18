@@ -18,7 +18,7 @@ use crate::channel::ChannelJoinRequest;
 
 use super::{
     decode_refusal_category, error_names_park_expiry, is_refusal_token_shape, parse_channel_ack,
-    ChannelJoinOutcome, DroppedLegBeforeAck, CHANNEL_ACK_MAX_BYTES, PHASE_PREAMBLE_MAGIC,
+    AdmissionStalled, ChannelJoinOutcome, DroppedLegBeforeAck, CHANNEL_ACK_MAX_BYTES, PHASE_PREAMBLE_MAGIC,
     POSSESSION_CHALLENGE_LEN, REFUSAL_CATEGORY_MAX_LEN,
 };
 
@@ -177,7 +177,7 @@ where
         Ok(Ok(None)) => {} // possession complete — proceed to the ack wait
         Ok(Ok(Some(early))) => return Ok(early),
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("channel join admission exchange stalled (#140)".into()),
+        Err(_) => return Err(Box::new(AdmissionStalled) as BoxError),
     }
 
     // This reader implements the module header's ack contract (#23). The #494 history
@@ -213,7 +213,7 @@ where
                 )
                 .into())
             }
-            Err(_) => return Err("channel join admission exchange stalled (#140)".into()),
+            Err(_) => return Err(Box::new(AdmissionStalled) as BoxError),
         };
         match read {
             // EOF: QUIC finish, a NO/EX teardown — or a leg dropped before any ack
