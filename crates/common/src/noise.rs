@@ -334,21 +334,47 @@ where
                     return Ok::<(), io::Error>(());
                 }
             };
-            let len = lock_session(&ts)?.read_message(&fr[..n], &mut pt).map_err(noise_err)?;
+            // #959: any error past this point (AEAD failure, poisoned session,
+            // or a plaintext write/flush failure) used to propagate straight
+            // out of this future via `?` without ever shutting `p_write`
+            // down -- a local application waiting on a reply then sees
+            // neither EOF nor an error, because outbound (the only other
+            // thing touching `p_write`/`c_write`) keeps running until ITS
+            // own side reaches EOF on its own, which `try_join!` below no
+            // longer waits for anyway, but shutting down here is what
+            // actually unblocks a reader parked on `p_read`'s peer end.
+            let len = match lock_session(&ts).and_then(|mut s| s.read_message(&fr[..n], &mut pt).map_err(noise_err)) {
+                Ok(len) => len,
+                Err(e) => {
+                    let _ = p_write.shutdown().await;
+                    return Err(e);
+                }
+            };
             if debug_timing {
                 eprintln!(
                     "ct-a2a-timing: noise_pump inbound plaintext decrypted len={len} head={:?}",
                     String::from_utf8_lossy(&pt[..len.min(96)]),
                 );
             }
-            p_write.write_all(&pt[..len]).await?;
-            p_write.flush().await?;
+            if let Err(e) = p_write.write_all(&pt[..len]).await {
+                let _ = p_write.shutdown().await;
+                return Err(e);
+            }
+            if let Err(e) = p_write.flush().await {
+                let _ = p_write.shutdown().await;
+                return Err(e);
+            }
         }
     };
 
-    let (o, i) = tokio::join!(outbound, inbound);
-    o?;
-    i?;
+    // #959: try_join! (not join!) -- if inbound errors (AEAD failure, poisoned
+    // session, plaintext write error), this must tear the pump down
+    // immediately rather than wait for outbound to ALSO finish, which only
+    // happens once the local plaintext side reaches EOF on its own. A session
+    // whose receive side has failed otherwise stays half-alive indefinitely:
+    // a request/response caller waiting for a reply hangs instead of failing,
+    // which defeats the "fail loudly" intent of surfacing the error at all.
+    tokio::try_join!(outbound, inbound)?;
     Ok(())
 }
 
@@ -446,6 +472,7 @@ where
             let _ = dir_out_tx.send((arc.clone(), dw));
             let _ = dir_in_tx.send((arc, dr));
         }
+        Ok::<(), io::Error>(())
     };
 
     // Encrypt `[tag ‖ payload]` with `ts` and frame it into `ct` (2-byte len prefix reserved at
@@ -551,12 +578,27 @@ where
                     return Ok::<(), io::Error>(());
                 }
             };
-            let len = {
+            // #959: any error past this point (lock_session's poisoned-mutex
+            // case, an AEAD failure, or the #482 unhonourable-CUTOVER error
+            // below) used to propagate straight out via `?` without shutting
+            // `plain_write` down -- the #482 test only passed because its
+            // plaintext side happened to be pre-closed already, not because
+            // this path actually closed it. Shut it down before every such
+            // return so a local caller waiting on a reply gets EOF, not a
+            // silent hang.
+            let decoded = (|| -> io::Result<usize> {
                 let mut ts = match direct.as_ref() {
                     Some((dts, _)) => lock_session(dts)?,
                     None => lock_session(&relay_ts)?,
                 };
-                ts.read_message(&fr[..n], &mut pt).map_err(noise_err)?
+                ts.read_message(&fr[..n], &mut pt).map_err(noise_err)
+            })();
+            let len = match decoded {
+                Ok(len) => len,
+                Err(e) => {
+                    let _ = plain_write.shutdown().await;
+                    return Err(e);
+                }
             };
             if len == 0 {
                 continue; // a frame must carry at least its tag byte
@@ -577,6 +619,7 @@ where
                         Some(rx) => match rx.await {
                             Ok(entry) => direct = Some(entry),
                             Err(_) => {
+                                let _ = plain_write.shutdown().await;
                                 return Err(io::Error::other(
                                     "noise pump: peer signaled CUTOVER but this side's direct \
                                      dial never completed (#482) -- cannot honor the cutover",
@@ -598,16 +641,23 @@ where
                     let _ = control_in.try_send(pt[1..len].to_vec());
                 }
                 _ => {
-                    plain_write.write_all(&pt[1..len]).await?;
-                    plain_write.flush().await?;
+                    if let Err(e) = plain_write.write_all(&pt[1..len]).await {
+                        let _ = plain_write.shutdown().await;
+                        return Err(e);
+                    }
+                    if let Err(e) = plain_write.flush().await {
+                        let _ = plain_write.shutdown().await;
+                        return Err(e);
+                    }
                 }
             }
         }
     };
 
-    let (o, i, ()) = tokio::join!(outbound, inbound, installer);
-    o?;
-    i?;
+    // #959: try_join! -- see noise_pump's own note on the identical fix. A
+    // failed inbound (or outbound) must tear the whole pump down immediately,
+    // not wait for the other two futures to also finish on their own.
+    tokio::try_join!(outbound, inbound, installer)?;
     Ok(())
 }
 
@@ -1204,6 +1254,53 @@ mod tests {
         pb.unwrap();
         assert_eq!(got.len(), expected.len(), "all 200 KB echoed back");
         assert_eq!(got, expected, "payload streams both ways through two Noise pumps");
+    }
+
+    #[tokio::test]
+    async fn noise_pump_tears_down_and_closes_plaintext_on_an_inbound_decrypt_failure_959() {
+        // #959: before this fix, an inbound decrypt failure propagated out of
+        // the `inbound` future via `?` without shutting `plain_write` down,
+        // and `tokio::join!` waited for `outbound` to ALSO finish -- which
+        // only happens once the local plaintext peer reaches EOF on its own.
+        // A local app that's just waiting for a reply (never sends its own
+        // EOF) would see neither: the pump call just hangs. Real proof, not
+        // just "the error type is right": feed a frame that fails to decrypt
+        // under A's transport, with A's plaintext peer never sending EOF, and
+        // confirm (1) the pump call itself returns Err promptly rather than
+        // hanging on outbound, and (2) the plaintext peer sees EOF (proving
+        // plain_write really was shut down), not an indefinite stall.
+        let origin = generate_static_keypair();
+        let client = generate_static_keypair();
+        let mut ini = client_handshake(&client.private, &origin.public).unwrap();
+        let mut resp = origin_handshake(&origin.private).unwrap();
+        let mut b = [0u8; 1024];
+        let mut s = [0u8; 1024];
+        let n = ini.write_message(&[], &mut b).unwrap();
+        resp.read_message(&b[..n], &mut s).unwrap();
+        let n = resp.write_message(&[], &mut b).unwrap();
+        ini.read_message(&b[..n], &mut s).unwrap();
+        let ini_t = ini.into_transport_mode().unwrap();
+
+        let (a_cipher, mut fake_peer_cipher) = tokio::io::duplex(64 * 1024);
+        let (a_plain, a_app) = tokio::io::duplex(1024);
+
+        // A frame that decodes fine as a FRAME (2-byte length prefix + body)
+        // but fails Noise's AEAD check under A's real transport state --
+        // garbage ciphertext, not a byte-for-byte replay of a real message.
+        fake_peer_cipher.write_all(&frame(&[0x42; 32])).await.unwrap();
+
+        let pump = tokio::time::timeout(std::time::Duration::from_secs(5), noise_pump(ini_t, a_cipher, a_plain));
+
+        // The local app's read half: must see EOF (the pump shutting
+        // plain_write down), not hang waiting for a reply that will never
+        // come now that inbound has failed.
+        let (mut app_read, _app_write) = tokio::io::split(a_app);
+        let mut buf = [0u8; 8];
+        let app_sees_eof = tokio::time::timeout(std::time::Duration::from_secs(5), app_read.read(&mut buf));
+
+        let (pump_result, app_result) = tokio::join!(pump, app_sees_eof);
+        assert!(pump_result.unwrap().is_err(), "an inbound decrypt failure must surface as Err, not hang");
+        assert_eq!(app_result.unwrap().unwrap(), 0, "plain_write must be shut down -- the local app peer must see EOF");
     }
 
     #[test]
