@@ -1892,6 +1892,55 @@ impl SqliteLedger {
         Ok(())
     }
 
+    /// #969: **reserve** `worst_case_cost` for a chat/completion request BEFORE the backend call
+    /// is made, instead of only a read-only pre-flight peek. The old peek checked the balance but
+    /// never moved it, so the balance/cap check at commit time (after the expensive upstream call)
+    /// could still fail -- by then the backend had already done the (operator-billed) work for
+    /// free, and the caller could just retry forever. This does the SAME checks as
+    /// [`Self::debit_ai_chat`] (blocked account, free-request cap, balance) but debits
+    /// `worst_case_cost` immediately and atomically, so a concurrent reservation against the same
+    /// account sees the reduced balance. Pair with [`Self::settle_ai_chat_reservation`] once the
+    /// true cost is known, or [`Self::release_ai_chat_reservation`] if the call never completed.
+    pub fn reserve_ai_chat(&self, account: &AccountId, worst_case_cost: u64, free_cap_requests: Option<u32>) -> Result<(), LedgerOpError> {
+        self.debit_ai_chat(account, worst_case_cost, free_cap_requests)
+    }
+
+    /// #969: settle a reservation made by [`Self::reserve_ai_chat`] once the true cost is known.
+    /// Refunds `held - actual` (never more than was held, and never negative, even if `actual`
+    /// somehow exceeds the worst-case estimate the hold was sized for -- the operator eats that
+    /// difference rather than risk a second, un-admission-checked debit). The free-request cap
+    /// counter was already incremented at reservation time and is not touched again here.
+    pub fn settle_ai_chat_reservation(&self, account: &AccountId, held: u64, actual: u64) -> Result<(), LedgerOpError> {
+        let refund = held.saturating_sub(actual);
+        if refund == 0 {
+            return Ok(());
+        }
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        tx.execute("UPDATE accounts SET balance = balance + ?1 WHERE account = ?2", params![refund as i64, &account.0[..]])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// #969: fully undo a reservation made by [`Self::reserve_ai_chat`] when the backend call
+    /// never completed (transport failure, non-success status, unparseable response) -- refunds
+    /// the whole `held` amount AND, for a Free-tier account, decrements the free-request counter
+    /// back by one, since no real usage happened and the slot must not be spent on a failed call.
+    pub fn release_ai_chat_reservation(&self, account: &AccountId, held: u64, was_free_tier: bool) -> Result<(), LedgerOpError> {
+        let mut guard = self.conn.lock_safe();
+        let tx = guard.transaction()?;
+        if was_free_tier {
+            tx.execute(
+                "UPDATE accounts SET balance = balance + ?1, free_ai_requests_used = free_ai_requests_used - 1 WHERE account = ?2",
+                params![held as i64, &account.0[..]],
+            )?;
+        } else {
+            tx.execute("UPDATE accounts SET balance = balance + ?1 WHERE account = ?2", params![held as i64, &account.0[..]])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Like [`Self::debit_ai_chat`], but for Whisper transcription: `duration_seconds`
     /// is a client-reported figure (this MVP trusts it -- see `ai_usage`'s own doc
     /// for why that's a documented, accepted limitation, not an oversight) that

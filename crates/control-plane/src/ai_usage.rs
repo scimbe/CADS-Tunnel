@@ -59,6 +59,17 @@ const PREMIUM_AI_PLANS: &[&str] = &["medium", "pro", "business"];
 const MAX_TOKENS_CEILING: u32 = 2048;
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
+/// #969: hard cap on the serialized `messages` size, so the admission check below has an actual
+/// worst case to reserve against -- without a bound, `total_tokens` (prompt + completion, the
+/// real post-call debit's basis) is unbounded even though `max_tokens` only bounds the completion
+/// half, and a large-prompt request could run the backend for far more than the pre-flight check
+/// ever admitted for.
+const MAX_PROMPT_BYTES: usize = 64 * 1024;
+/// Conservative (deliberately generous) bytes-per-token estimate for bounding the prompt's
+/// worst-case token cost pre-call -- real tokenizers rarely pack MORE than one token per 3 bytes
+/// of UTF-8 text, so dividing by 3 over-, not under-, estimates the reservation.
+const ESTIMATED_BYTES_PER_PROMPT_TOKEN: usize = 3;
+
 #[derive(Clone, Default)]
 pub struct AiBackendConfig {
     pub standard_url: Option<Arc<str>>,
@@ -198,6 +209,20 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     }
 
     let bounded_max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).min(MAX_TOKENS_CEILING);
+    // #969: the real post-call debit is billed against `total_tokens` (prompt + completion), so
+    // the worst-case reservation below must bound the PROMPT half too, not just `max_tokens`
+    // (completion-only) -- otherwise a large-prompt request's true cost can exceed what was ever
+    // admitted for. Reject before even estimating a cost, same as any other oversized-input cap
+    // in this codebase (#183/#476).
+    let prompt_bytes = serde_json::to_vec(&req.messages).map(|b| b.len()).unwrap_or(usize::MAX);
+    if prompt_bytes > MAX_PROMPT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("`messages` too large: {prompt_bytes} bytes exceeds the {MAX_PROMPT_BYTES}-byte cap (#969)"),
+        ));
+    }
+    let estimated_prompt_tokens = (prompt_bytes / ESTIMATED_BYTES_PER_PROMPT_TOKEN) as u64;
+
     let pricing = PricingConfig::from_env();
     let standard_rate = pricing.standard_ai_credits_per_1k_tokens.unwrap_or(0) as u64;
     let rate = if is_premium {
@@ -206,31 +231,38 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     } else {
         standard_rate
     };
-    // Pre-flight admission against the worst-case cost (see this module's doc
-    // on why exact cost is only known post-call): a READ-ONLY peek, refusing
-    // before spending a real backend call on an account that's already broke or
-    // capped. The single real debit (cap increment + balance decrement
-    // together, exactly once) happens after the call, against the true cost.
-    let worst_case_cost = (bounded_max_tokens as u64).saturating_mul(rate) / 1000;
+    // #969: RESERVE the worst-case cost atomically before the backend call, rather than a
+    // read-only pre-flight peek. The old peek checked balance/cap but never moved them, so the
+    // real post-call debit could still fail after the (operator-billed) backend work was already
+    // done for free -- and the caller could just retry indefinitely. Reserving moves the balance
+    // immediately, so a second concurrent request (or a retry) sees the reduced balance too.
+    let worst_case_cost = (bounded_max_tokens as u64).saturating_add(estimated_prompt_tokens).saturating_mul(rate) / 1000;
     let free_cap = if is_premium { None } else { pricing.free_ai_request_cap };
-    let snapshot = st.ledger.ai_usage_for(&account).map_err(|e| internal("ai_chat/ai_usage_for", e))?.ok_or((StatusCode::NOT_FOUND, "unknown account".to_string()))?;
-    if snapshot.plan.is_none() {
-        if let Some(cap) = free_cap {
-            if snapshot.free_requests_used >= cap {
-                // The review's own "cap-boundary upgrade prompt" finding: this is
-                // the single highest-intent conversion moment available, and a
-                // bare error string turned it into a dead end. POST /me/checkout
-                // (crate::paddle, once launched) is the real next step.
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    format!("{} Upgrade to a paid plan (POST /me/checkout) for unlimited Standard-KI requests.", LedgerError::FreeAiCapExceeded),
-                ));
-            }
+    let is_free_tier = st
+        .ledger
+        .ai_usage_for(&account)
+        .map_err(|e| internal("ai_chat/ai_usage_for", e))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown account".to_string()))?
+        .plan
+        .is_none();
+    st.ledger.reserve_ai_chat(&account, worst_case_cost, free_cap).map_err(|e| {
+        // The review's own "cap-boundary upgrade prompt" finding, preserved: a bare
+        // FreeAiCapExceeded error is a dead end at the single highest-intent conversion
+        // moment available. POST /me/checkout (crate::paddle, once launched) is the next step.
+        if matches!(e, LedgerOpError::Ledger(LedgerError::FreeAiCapExceeded)) {
+            (StatusCode::FORBIDDEN, format!("{e} Upgrade to a paid plan (POST /me/checkout) for unlimited Standard-KI requests."))
+        } else {
+            debit_err(e)
         }
-    }
-    if snapshot.balance < worst_case_cost {
-        return Err((StatusCode::PAYMENT_REQUIRED, LedgerError::InsufficientCredit { balance: snapshot.balance, requested: worst_case_cost }.to_string()));
-    }
+    })?;
+
+    // From here on, every early return must release or settle the reservation -- the balance
+    // (and, for Free tier, the request-cap counter) is already moved.
+    let release = |st: &AiUsageState| {
+        if let Err(e) = st.ledger.release_ai_chat_reservation(&account, worst_case_cost, is_free_tier) {
+            eprintln!("ct-cp ai_usage: failed to release AI chat reservation for a failed call: {e}");
+        }
+    };
 
     let client = ai_http_client();
     let mut body = serde_json::json!({ "messages": req.messages, "max_tokens": bounded_max_tokens });
@@ -241,19 +273,32 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     if let Some(key) = &backend_key {
         rb = rb.header("authorization", format!("Bearer {key}"));
     }
-    let resp = rb.send().await.map_err(|e| bad_gateway(format!("AI backend request failed: {e}")))?;
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            release(&st);
+            return Err(bad_gateway(format!("AI backend request failed: {e}")));
+        }
+    };
     if !resp.status().is_success() {
-        return Err(bad_gateway(format!("AI backend returned {}", resp.status())));
+        let status = resp.status();
+        release(&st);
+        return Err(bad_gateway(format!("AI backend returned {status}")));
     }
-    let upstream: serde_json::Value = resp.json().await.map_err(|e| bad_gateway(format!("AI backend returned an unparseable response: {e}")))?;
+    let upstream: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            release(&st);
+            return Err(bad_gateway(format!("AI backend returned an unparseable response: {e}")));
+        }
+    };
 
     let total_tokens = upstream.get("usage").and_then(|u| u.get("total_tokens")).and_then(|v| v.as_u64()).unwrap_or(bounded_max_tokens as u64);
     let credits_spent = total_tokens.saturating_mul(rate) / 1000;
-    // The one real debit for this request: decrements the balance by the true
-    // cost AND (for a Free-tier account) increments the free-request counter,
-    // atomically, exactly once. The pre-flight peek above never mutates state,
-    // so there is no double-count regardless of what the backend actually used.
-    st.ledger.debit_ai_chat(&account, credits_spent, free_cap).map_err(debit_err)?;
+    // Settle the reservation against the true cost: refunds `worst_case_cost - credits_spent`.
+    // The cap counter was already incremented at reservation time (real work happened), so this
+    // never touches it again.
+    st.ledger.settle_ai_chat_reservation(&account, worst_case_cost, credits_spent).map_err(|e| internal("ai_chat/settle", e))?;
 
     Ok(Json(AiChatResp { upstream, credits_spent }))
 }
@@ -446,5 +491,126 @@ mod tests {
         assert_eq!(v["balance"], 450);
         assert_eq!(v["free_requests_used"], 1);
         assert_eq!(v["plan"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn reserve_then_settle_refunds_only_the_unused_difference_969() {
+        // #969: settling must refund worst_case_cost - actual, not re-derive the charge from
+        // scratch -- the balance after settle should reflect exactly the ACTUAL cost, regardless
+        // of how large the worst-case hold was.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let account = ledger.account_for_subject("settle-user").unwrap();
+        ledger.credit(&account, 1000).unwrap();
+        ledger.reserve_ai_chat(&account, 300, None).unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 700, "the full worst-case hold is moved immediately");
+        ledger.settle_ai_chat_reservation(&account, 300, 120).unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 880, "balance reflects the true cost (1000 - 120), not the hold");
+    }
+
+    #[test]
+    fn reserve_then_release_fully_undoes_the_reservation_and_the_free_request_slot_969() {
+        // #969: a reservation for a call that never completed (backend error) must refund in
+        // full AND not burn a free-tier request slot -- no real usage happened.
+        let ledger = SqliteLedger::open_in_memory().unwrap();
+        let account = ledger.account_for_subject("release-user").unwrap();
+        ledger.credit(&account, 1000).unwrap();
+        ledger.reserve_ai_chat(&account, 300, Some(5)).unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 700);
+        assert_eq!(ledger.ai_usage_for(&account).unwrap().unwrap().free_requests_used, 1, "reserving counts the slot immediately");
+        ledger.release_ai_chat_reservation(&account, 300, true).unwrap();
+        assert_eq!(ledger.balance(&account).unwrap(), 1000, "the whole hold is refunded");
+        assert_eq!(ledger.ai_usage_for(&account).unwrap().unwrap().free_requests_used, 0, "the failed call doesn't spend a free-tier slot");
+    }
+
+    #[tokio::test]
+    async fn a_failed_backend_call_releases_the_reservation_969() {
+        // #969: this is the exact bug -- before the fix, a backend failure after admission left
+        // the balance/cap counter wherever the (read-only) pre-flight check found them; now the
+        // reservation it actually made must be fully released on failure.
+        async fn always_500() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = Router::new().route("/v1/chat/completions", post(always_500));
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let account = ledger.account_for_subject("failed-call-user").unwrap();
+        ledger.credit(&account, 1000).unwrap();
+        let backends = AiBackendConfig { standard_url: Some(format!("http://{addr}").into()), ..Default::default() };
+        let (app, secret, issuer) = test_app(ledger.clone(), backends);
+        let jwt = jwt_for(&secret, &issuer, "failed-call-user");
+        let resp = app
+            .oneshot(
+                Request::post("/me/ai/chat")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(ledger.balance(&account).unwrap(), 1000, "the failed call's reservation was fully released");
+        assert_eq!(ledger.ai_usage_for(&account).unwrap().unwrap().free_requests_used, 0, "and didn't burn a free-tier slot");
+    }
+
+    #[tokio::test]
+    async fn a_successful_backend_call_settles_and_counts_exactly_one_free_request_969() {
+        // #969: the happy path still works end-to-end through reserve -> call -> settle, and
+        // only ever counts ONE free-tier request for the one call made.
+        async fn echo_usage() -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({"choices": [], "usage": {"total_tokens": 42}}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = Router::new().route("/v1/chat/completions", post(echo_usage));
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let account = ledger.account_for_subject("ok-call-user").unwrap();
+        ledger.credit(&account, 1000).unwrap();
+        let backends = AiBackendConfig { standard_url: Some(format!("http://{addr}").into()), ..Default::default() };
+        let (app, secret, issuer) = test_app(ledger.clone(), backends);
+        let jwt = jwt_for(&secret, &issuer, "ok-call-user");
+        let resp = app
+            .oneshot(
+                Request::post("/me/ai/chat")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"messages": [{"role": "user", "content": "hi"}]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ledger.ai_usage_for(&account).unwrap().unwrap().free_requests_used, 1, "exactly one slot for the one real call");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prompt_is_refused_before_any_reservation_or_backend_call_969() {
+        // #969: the prompt-size cap is the other half of the fix -- without it, total_tokens
+        // (prompt + completion, the real post-call debit's basis) is unbounded even though
+        // max_tokens only bounds the completion half.
+        let ledger = Arc::new(SqliteLedger::open_in_memory().unwrap());
+        let account = ledger.account_for_subject("oversized-prompt-user").unwrap();
+        ledger.credit(&account, 1000).unwrap();
+        let backends = AiBackendConfig { standard_url: Some("http://127.0.0.1:1".into()), ..Default::default() };
+        let (app, secret, issuer) = test_app(ledger.clone(), backends);
+        let jwt = jwt_for(&secret, &issuer, "oversized-prompt-user");
+        let huge = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let resp = app
+            .oneshot(
+                Request::post("/me/ai/chat")
+                    .header("authorization", format!("Bearer {jwt}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"messages": [{"role": "user", "content": huge}]}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(ledger.balance(&account).unwrap(), 1000, "rejected before any reservation touched the balance");
     }
 }
