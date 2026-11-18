@@ -732,10 +732,21 @@ async fn gate_callback(State(st): State<GateState>, headers: HeaderMap, Query(q)
         return resp;
     }
     let Some((host, return_path)) = target.split_once('|') else {
-        return (StatusCode::BAD_REQUEST, "malformed gate target").into_response();
+        // #1000: clear both cookies on this failure branch too, matching every
+        // other failure branch below -- otherwise a stale target cookie
+        // survives this error until its 600s Max-Age and can feed the
+        // CSRF-mismatch retry page on a later, unrelated callback.
+        let mut resp = (StatusCode::BAD_REQUEST, "malformed gate target").into_response();
+        set_cookie(&mut resp, &cleared_gate_state_cookie());
+        set_cookie(&mut resp, &cleared_gate_target_cookie());
+        return resp;
     };
     let Some(redirect_uri) = gate_redirect_uri(&cfg.redirect_uri) else {
-        return gate_unconfigured();
+        // #1000: same reasoning as the malformed-target branch just above.
+        let mut resp = gate_unconfigured();
+        set_cookie(&mut resp, &cleared_gate_state_cookie());
+        set_cookie(&mut resp, &cleared_gate_target_cookie());
+        return resp;
     };
 
     // Same host + return path as at /gate/start (both bound into the state), so the same
@@ -1531,6 +1542,32 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert!(resp.headers().get_all("set-cookie").iter().all(|c| !c.to_str().unwrap().starts_with(&format!("{GATE_SESSION_COOKIE}="))), "no session minted");
+    }
+
+    #[tokio::test]
+    async fn gate_callback_clears_both_cookies_on_a_malformed_target_1000() {
+        // #1000: a target cookie that round-trips the state MAC correctly (so
+        // state_binds_target passes) but has no '|' separator -- malformed, not
+        // tampered. Before this fix, this branch returned BAD_REQUEST without
+        // clearing either cookie, unlike every other failure branch in this
+        // handler.
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let app = gate_router_with(tunnels, Some(cfg()), TEST_KEY, stub_exchanger("bob@example.com"), Some(Arc::from(".bunsenbrenner.org")), OidcVerifierHandle::empty());
+        let target = "no-pipe-here";
+        let state = test_state(target);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/gate/callback?code=abc&state={state}"))
+                    .header("cookie", format!("{GATE_STATE_COOKIE}={state}; {GATE_TARGET_COOKIE}={target}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let set_cookies: Vec<String> = resp.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect();
+        assert!(set_cookies.contains(&cleared_gate_state_cookie()), "state cookie must be cleared: {set_cookies:?}");
+        assert!(set_cookies.contains(&cleared_gate_target_cookie()), "target cookie must be cleared: {set_cookies:?}");
     }
 
     #[tokio::test]
