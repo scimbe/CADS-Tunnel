@@ -27,9 +27,25 @@ pub struct KeycloakAdminConfig {
     pub admin_password: String,
 }
 
-/// Realm used when `CT_OIDC_REALM` is unset -- the realm this project's own
-/// deploy manifests ship.
+/// Realm used when neither `CT_OIDC_REALM` nor `CT_OIDC_ISSUER` yields one -- the
+/// realm this project's own deploy manifests originally shipped. Kept only as the
+/// last-resort fallback now; see [`default_realm`].
 const DEFAULT_REALM: &str = "ct-demo";
+
+/// #1007: `CT_OIDC_REALM` unset must not mean "ct-demo" when a deployment following
+/// the `.env.example` template has configured `CT_OIDC_ISSUER=https://.../realms/
+/// CADS-Tunnel` and never set `CT_OIDC_REALM` (not documented there at all) --
+/// `ensure_user`/the #535/#536 startup check would then provision/enforce against
+/// `ct-demo`, not the realm the gate's OIDC exchange actually authenticates
+/// against. Derive the default from the issuer URL's last path segment (the realm
+/// name, per the OIDC discovery convention every issuer URL here follows) before
+/// falling back to the historical `ct-demo` constant.
+fn default_realm(get: &impl Fn(&str) -> Option<String>) -> String {
+    get("CT_OIDC_ISSUER")
+        .and_then(|issuer| issuer.trim_end_matches('/').rsplit('/').next().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_REALM.to_string())
+}
 
 impl KeycloakAdminConfig {
     pub fn from_env() -> Option<Self> {
@@ -40,7 +56,7 @@ impl KeycloakAdminConfig {
         let nonempty = |k: &str| get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         Some(Self {
             base_url: nonempty("KEYCLOAK_PUBLIC_URL")?,
-            realm: nonempty("CT_OIDC_REALM").unwrap_or_else(|| DEFAULT_REALM.to_string()),
+            realm: nonempty("CT_OIDC_REALM").unwrap_or_else(|| default_realm(&get)),
             admin_user: nonempty("KC_ADMIN_USER")?,
             admin_password: nonempty("KC_ADMIN_PASSWORD")?,
         })
@@ -869,7 +885,7 @@ pub fn spawn_startup_keycloak_enforcement_check() {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_REALM.to_string());
+            .unwrap_or_else(|| default_realm(&|k| std::env::var(k).ok()));
         let check = RealmEnforcementCheck::NotChecked(
             "no Keycloak admin configuration (KEYCLOAK_PUBLIC_URL / KC_ADMIN_USER / KC_ADMIN_PASSWORD)"
                 .to_string(),
@@ -917,6 +933,43 @@ mod tests {
         assert_eq!(cfg.realm, "ct-demo", "defaults when CT_OIDC_REALM is unset");
         assert_eq!(cfg.admin_user, "admin");
         assert_eq!(cfg.admin_password, "s3cr3t");
+    }
+
+    #[test]
+    fn config_from_lookup_derives_the_realm_from_the_oidc_issuer_when_ct_oidc_realm_is_unset_1007() {
+        // #1007: a deployment following .env.example sets CT_OIDC_ISSUER (e.g.
+        // https://keycloak.example/realms/CADS-Tunnel) and never sets CT_OIDC_REALM
+        // at all -- the default must be the realm the gate's OIDC exchange actually
+        // authenticates against, not the unconditional "ct-demo" constant.
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "KEYCLOAK_PUBLIC_URL" => Some("https://kc.example".to_string()),
+                "KC_ADMIN_USER" => Some("admin".to_string()),
+                "KC_ADMIN_PASSWORD" => Some("s3cr3t".to_string()),
+                "CT_OIDC_ISSUER" => Some("https://keycloak.example/realms/CADS-Tunnel".to_string()),
+                _ => None,
+            }
+        };
+        let cfg = KeycloakAdminConfig::from_lookup(env).unwrap();
+        assert_eq!(cfg.realm, "CADS-Tunnel", "derived from CT_OIDC_ISSUER's last path segment");
+    }
+
+    #[test]
+    fn config_from_lookup_prefers_an_explicit_ct_oidc_realm_over_the_issuer_1007() {
+        // An explicit CT_OIDC_REALM always wins, even when CT_OIDC_ISSUER names a
+        // different realm (e.g. during a realm migration).
+        let env = |k: &str| -> Option<String> {
+            match k {
+                "KEYCLOAK_PUBLIC_URL" => Some("https://kc.example".to_string()),
+                "KC_ADMIN_USER" => Some("admin".to_string()),
+                "KC_ADMIN_PASSWORD" => Some("s3cr3t".to_string()),
+                "CT_OIDC_ISSUER" => Some("https://keycloak.example/realms/CADS-Tunnel".to_string()),
+                "CT_OIDC_REALM" => Some("staging".to_string()),
+                _ => None,
+            }
+        };
+        let cfg = KeycloakAdminConfig::from_lookup(env).unwrap();
+        assert_eq!(cfg.realm, "staging");
     }
 
     #[test]
