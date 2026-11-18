@@ -37,7 +37,14 @@
 //! — which matters, because a reporting agent's host had UDP/53 blocked
 //! entirely and could not run any authoritative check of its own.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// #1031: tokio::time::Instant, not std::time::Instant -- identical to std's in
+// production (tracks real wall-clock when the test-util paused clock is never
+// engaged), but lets tests drive this module's own deadline math through
+// tokio's virtual clock instead of needing the loop to actually block on real
+// wall-clock time for several rounds just to prove a timeout fires.
+use tokio::time::Instant;
 
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -127,6 +134,41 @@ pub async fn wait_for_convergence(
     if addrs.is_empty() {
         return Convergence::NoNodesReachable;
     }
+    let zone = zone.to_string();
+    let name = name.to_string();
+    let expected = expected.to_string();
+    // `started`/`deadline` are passed through from before resolution, not
+    // recomputed: resolution and polling share ONE overall budget (the comment
+    // above), and `took` on a Converged result is the whole wait including
+    // resolution, as it always was -- not just the post-resolution polling phase.
+    poll_until_converged(&addrs, started, deadline, move |host, ips| {
+        probe_node(host, ips, zone.clone(), name.clone(), expected.clone())
+    })
+    .await
+}
+
+/// #1031: the actual poll loop, with the per-node probe injected -- `wait_for_convergence`
+/// passes a closure that calls the real [`probe_node`]; tests can pass a canned one
+/// instead, so the loop's own exit conditions (converged, lagging, unreachable, the
+/// deadline, a round with zero answers) are testable without any network, which is
+/// exactly where #488/#490's unreachable-node and deadline-overshoot findings live.
+/// `probe`'s own `Fn` bound (not `FnOnce`) is why `wait_for_convergence` clones
+/// `zone`/`name`/`expected` into the closure instead of moving them -- it is called
+/// once per node per round, for however many rounds the poll takes. `started`/
+/// `deadline` are taken as params rather than computed here so a caller that did
+/// other work (DNS resolution) before this loop keeps counting that against the
+/// same overall budget/elapsed time, instead of this function silently granting a
+/// fresh one.
+async fn poll_until_converged<P, Fut>(
+    addrs: &[(String, Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>)],
+    started: Instant,
+    deadline: Instant,
+    probe: P,
+) -> Convergence
+where
+    P: Fn(String, Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>) -> Fut,
+    Fut: std::future::Future<Output = ProbeOutcome> + Send + 'static,
+{
     loop {
         // #354: probe every node concurrently (JoinSet), not one after another --
         // a strictly sequential poll round could take up to
@@ -137,8 +179,8 @@ pub async fn wait_for_convergence(
         // IP-fallback (try each of a node's addresses in turn) stays sequential --
         // only the nodes themselves run in parallel.
         let mut set = tokio::task::JoinSet::new();
-        for (host, ips) in &addrs {
-            set.spawn(probe_node(host.clone(), ips.clone(), zone.to_string(), name.to_string(), expected.to_string()));
+        for (host, ips) in addrs {
+            set.spawn(probe(host.clone(), ips.clone()));
         }
         let (answered, mut lagging, mut unreachable) = drain_probe_round(set).await;
         if answered == 0 {
@@ -552,50 +594,120 @@ mod tests {
         }
     }
 
+    /// `addrs` for `poll_until_converged` with no real IPs/resolvers -- #1031's
+    /// injected `probe` closures below never call the real `probe_node`, so the
+    /// per-node `ips` list passed alongside each host is always empty.
+    fn empty_addrs(hosts: &[&str]) -> Vec<(String, Vec<(std::net::IpAddr, std::sync::Arc<Resolver<TokioRuntimeProvider>>)>)> {
+        hosts.iter().map(|h| (h.to_string(), Vec::new())).collect()
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn joinset_based_probing_runs_concurrently_not_sequentially_354() {
-        // #354: the real property being claimed -- N node probes must run
-        // concurrently, not one after another. An earlier version of this test
-        // measured real calls to genuinely unreachable addresses (192.0.2.0/24,
-        // RFC 5737 TEST-NET-1) and was flaky in CI: that environment answers
-        // packets to reserved space with an immediate rejection instead of
-        // silently dropping them (unlike this crate's own dev sandbox), so both
-        // the sequential and concurrent runs finished in ~1ms with nothing real
-        // to compare -- real network timeout behavior is not portable across
-        // environments and isn't a sound basis for a hermetic assertion.
-        //
-        // Prove the actual mechanism instead, deterministically: exercise the
-        // exact same construct wait_for_convergence's poll loop now uses (spawn
-        // one task per node into a tokio::task::JoinSet, join them as they
-        // complete) against a controlled, in-process delay under tokio's paused
-        // virtual clock -- no real time or network involved, so the comparison
-        // is exact rather than a generous-threshold guess. `probe_node`'s own
-        // per-address fallback correctness (unreachable -> lagging, TXT
-        // mismatch -> lagging, TXT match -> converged) is unchanged by this
-        // commit and is exercised by the pre-existing tests around it.
+    async fn poll_until_converged_runs_every_nodes_probe_concurrently_not_sequentially_354() {
+        // #354, now driven through the real function (replaces a prior version of
+        // this test that only exercised a standalone JoinSet, not any code this
+        // crate actually ships): N nodes whose probe each takes DELAY must
+        // converge in ~DELAY overall, not N * DELAY, because poll_until_converged
+        // probes every node concurrently within a round.
         const DELAY: Duration = Duration::from_millis(100);
         const NODES: usize = 4;
+        let hosts: Vec<&str> = (0..NODES).map(|_| "node.desec.io").collect();
+        let addrs = empty_addrs(&hosts);
 
-        let seq_start = tokio::time::Instant::now();
-        for _ in 0..NODES {
+        let start = Instant::now();
+        let result = poll_until_converged(&addrs, start, start + Duration::from_secs(60), |_host, _ips| async {
             tokio::time::sleep(DELAY).await;
-        }
-        let sequential = seq_start.elapsed();
+            ProbeOutcome::Converged
+        })
+        .await;
 
-        let conc_start = tokio::time::Instant::now();
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..NODES {
-            set.spawn(tokio::time::sleep(DELAY));
-        }
-        let mut count = 0;
-        while set.join_next().await.is_some() {
-            count += 1;
-        }
-        let concurrent = conc_start.elapsed();
+        assert_eq!(result, Convergence::Converged { nodes: NODES, took: DELAY }, "all {NODES} probes ran within one DELAY, not summed");
+    }
 
-        assert_eq!(count, NODES);
-        assert_eq!(sequential, DELAY * NODES as u32, "sequential really did sum the delays");
-        assert_eq!(concurrent, DELAY, "concurrent (JoinSet) ran every node's delay in parallel, not summed");
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_converged_reports_converged_once_every_node_agrees() {
+        let addrs = empty_addrs(&["a.desec.io", "b.desec.io", "c.desec.io"]);
+        let start = Instant::now();
+        let result =
+            poll_until_converged(&addrs, start, start + Duration::from_secs(60), |_h, _i| async { ProbeOutcome::Converged }).await;
+        assert_eq!(result, Convergence::Converged { nodes: 3, took: Duration::ZERO });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_converged_retries_a_lagging_node_until_it_catches_up() {
+        // One node reports Lagging for the first two rounds, then Converged --
+        // must poll again (not time out early) and eventually report convergence.
+        let addrs = empty_addrs(&["lagging.desec.io", "fast.desec.io"]);
+        let round = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = round.clone();
+        let start = Instant::now();
+        let result = poll_until_converged(&addrs, start, start + Duration::from_secs(60), move |host, _ips| {
+            let round = r.clone();
+            async move {
+                if host == "fast.desec.io" {
+                    return ProbeOutcome::Converged;
+                }
+                // Only the lagging host's own probes advance the shared counter,
+                // so two nodes probed per round still means "lagging" for exactly
+                // two full rounds.
+                let n = round.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 2 {
+                    ProbeOutcome::Lagging(host)
+                } else {
+                    ProbeOutcome::Converged
+                }
+            }
+        })
+        .await;
+        assert_eq!(result, Convergence::Converged { nodes: 2, took: POLL_INTERVAL * 2 }, "two rounds of lag, then converged on the third");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_converged_times_out_on_a_permanently_unreachable_node() {
+        let addrs = empty_addrs(&["dead.desec.io", "alive.desec.io"]);
+        let start = Instant::now();
+        let result = poll_until_converged(&addrs, start, start + Duration::from_secs(12), |host, _ips| async move {
+            if host == "dead.desec.io" {
+                ProbeOutcome::Unreachable(format!("{host} (unreachable on all 0 address(es))"))
+            } else {
+                ProbeOutcome::Converged
+            }
+        })
+        .await;
+        assert_eq!(
+            result,
+            Convergence::TimedOut {
+                lagging: vec![],
+                unreachable: vec!["dead.desec.io (unreachable on all 0 address(es))".to_string()],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_converged_honors_the_deadline_even_mid_lag() {
+        // A node that is merely lagging (not unreachable) past the deadline must
+        // also time out -- the deadline check must not be skipped just because
+        // every node answered.
+        let addrs = empty_addrs(&["slow.desec.io"]);
+        let start = Instant::now();
+        let result = poll_until_converged(&addrs, start, start + Duration::from_secs(7), |host, _ips| async move {
+            ProbeOutcome::Lagging(host)
+        })
+        .await;
+        assert_eq!(result, Convergence::TimedOut { lagging: vec!["slow.desec.io".to_string()], unreachable: vec![] });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_converged_reports_no_nodes_reachable_when_a_round_answers_zero() {
+        // Every probe panicking (drain_probe_round's #490 handling) folds in as
+        // "unreachable this round", but a round where NOTHING answered at all
+        // must report NoNodesReachable, not an empty TimedOut.
+        let addrs = empty_addrs(&["a.desec.io", "b.desec.io"]);
+        let start = Instant::now();
+        let result = poll_until_converged(&addrs, start, start + Duration::from_secs(60), |_h, _i| async {
+            panic!("every probe fails outright")
+        })
+        .await;
+        assert_eq!(result, Convergence::NoNodesReachable);
     }
 
     #[tokio::test(start_paused = true)]
@@ -613,7 +725,7 @@ mod tests {
         const DELAY: Duration = Duration::from_millis(100);
         let hosts: Vec<&str> = DESEC_NODES.to_vec();
 
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let out = resolve_concurrently(&hosts, |host| async move {
             tokio::time::sleep(DELAY).await;
             Some(host)
