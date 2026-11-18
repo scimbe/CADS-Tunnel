@@ -72,11 +72,17 @@ fn token_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// #299: a real ACME DNS-01 key authorization digest (base64url SHA-256) is exactly
-/// 43 bytes; this is a generous ceiling above any realistic challenge value, chosen
-/// so a stored TXT record can never itself be the reason [`crate::message::build_response`]
-/// has to truncate an otherwise-small answer set.
-const MAX_TXT_VALUE_BYTES: usize = 256;
+/// #299/#994: a real ACME DNS-01 key authorization digest (base64url SHA-256) is
+/// exactly 43 bytes; this is a generous ceiling above any realistic challenge
+/// value, chosen so a stored TXT record can never itself be the reason
+/// [`crate::message::build_response`] has to truncate an otherwise-small answer
+/// set. 255, not 256: a DNS character-string's length prefix is one byte (max
+/// 255), so a value at this cap always fits in a single character-string
+/// instead of splitting into two -- the split itself is correct either way, but
+/// avoiding it needlessly keeps every ordinary single-value answer a few bytes
+/// smaller, which matters most for the UDP ceiling [`crate::message::build_response`]
+/// truncates against.
+const MAX_TXT_VALUE_BYTES: usize = 255;
 
 /// `PUT /txt/:name` — body is the TXT value; replaces any existing value.
 async fn put_txt(

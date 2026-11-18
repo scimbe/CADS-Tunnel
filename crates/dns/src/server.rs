@@ -33,12 +33,22 @@ const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// legitimate here, so refuse it before allocating a buffer for it.
 const MAX_TCP_MESSAGE_BYTES: usize = 512;
 
+/// #994: the response-side ceiling for TCP, as opposed to [`MAX_TCP_MESSAGE_BYTES`]
+/// (the incoming QUERY size cap above). TCP has no 512-byte datagram constraint --
+/// its own length prefix is a 2-byte big-endian count, so this is that field's own
+/// maximum. A resolver that follows TC=1 and retries over TCP must actually be able
+/// to get an untruncated answer there; reusing the UDP ceiling for both transports
+/// would mean it gets back the identical truncated, TC-flagged message.
+const MAX_TCP_RESPONSE_BYTES: usize = 65535;
+
 /// Build the DNS response for a raw query datagram against `store`, or `None` if
-/// the query is malformed (drop it). Pure — the socket loops wrap this.
-pub fn respond(store: &AcmeDnsStore, query: &[u8]) -> Option<Vec<u8>> {
+/// the query is malformed (drop it). Pure — the socket loops wrap this. `max_bytes`
+/// is the transport's own response-size ceiling (#994): [`message::MAX_UDP_RESPONSE_BYTES`]
+/// for UDP, [`MAX_TCP_RESPONSE_BYTES`] for TCP.
+pub fn respond(store: &AcmeDnsStore, query: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
     let q = message::parse_query(query)?;
     let txts = store.txt(&q.name);
-    Some(message::build_response(&q, &txts))
+    Some(message::build_response(&q, &txts, max_bytes))
 }
 
 /// Serve DNS over UDP on `listen` until the process ends.
@@ -62,7 +72,7 @@ pub async fn udp_loop(store: Arc<AcmeDnsStore>, sock: tokio::net::UdpSocket) -> 
                 continue;
             }
         };
-        if let Some(resp) = respond(&store, &buf[..n]) {
+        if let Some(resp) = respond(&store, &buf[..n], message::MAX_UDP_RESPONSE_BYTES) {
             let _ = sock.send_to(&resp, peer).await;
         }
     }
@@ -115,7 +125,7 @@ async fn handle_tcp(store: &AcmeDnsStore, mut stream: tokio::net::TcpStream) -> 
     }
     let mut msg = vec![0u8; len];
     read_exact_timed(&mut stream, &mut msg).await?;
-    if let Some(resp) = respond(store, &msg) {
+    if let Some(resp) = respond(store, &msg, MAX_TCP_RESPONSE_BYTES) {
         stream.write_all(&(resp.len() as u16).to_be_bytes()).await?;
         stream.write_all(&resp).await?;
     }
@@ -147,17 +157,17 @@ mod tests {
         let store = AcmeDnsStore::new();
         store.set_txt("_acme-challenge.host.test", "the-token");
 
-        let resp = respond(&store, &txt_query(0x21, "_acme-challenge.host.test")).unwrap();
+        let resp = respond(&store, &txt_query(0x21, "_acme-challenge.host.test"), message::MAX_UDP_RESPONSE_BYTES).unwrap();
         assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), 0x21, "echoes the id");
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "one answer");
         assert!(resp.windows(9).any(|w| w == b"the-token"), "carries the TXT");
 
         // Unknown name -> valid response, zero answers.
-        let resp = respond(&store, &txt_query(1, "_acme-challenge.other.test")).unwrap();
+        let resp = respond(&store, &txt_query(1, "_acme-challenge.other.test"), message::MAX_UDP_RESPONSE_BYTES).unwrap();
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
 
         // Malformed -> dropped.
-        assert!(respond(&store, b"\x00\x01").is_none());
+        assert!(respond(&store, b"\x00\x01", message::MAX_UDP_RESPONSE_BYTES).is_none());
     }
 
     #[test]
