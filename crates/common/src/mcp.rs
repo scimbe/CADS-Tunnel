@@ -467,6 +467,14 @@ pub fn register_service_tools(
     handler: impl Fn(crate::channel::ServiceType, &str) -> Result<String, String> + Send + Sync + 'static,
 ) {
     let handler = std::sync::Arc::new(handler);
+    // #1004: `service_slug` has no fixed mapping for `Custom` -- two distinct names
+    // (differing only in case or punctuation, e.g. "Static-Analysis" vs
+    // "Static Analysis", or a custom name that happens to match a built-in's slug)
+    // can slugify to the SAME `service/<slug>` tool name. `self.tools.insert` is a
+    // silent overwrite, so without this check the later registration in `services`
+    // replaces the earlier one's handler, and the earlier service becomes
+    // uncallable with no error anywhere.
+    let mut seen_slugs = std::collections::HashSet::new();
     // Found while running clippy across the whole workspace for an unrelated
     // change (#382-follow, gate.rs): clippy's `unnecessary_to_owned` suggestion
     // (iterate by reference instead) doesn't account for `service` being moved
@@ -477,6 +485,17 @@ pub fn register_service_tools(
     #[allow(clippy::unnecessary_to_owned)]
     for service in services.iter().cloned() {
         let slug = service_slug(&service);
+        if slug.is_empty() {
+            eprintln!("ct-common: register_service_tools: a Custom service name slugifies to an empty string -- skipping it (#1004)");
+            continue;
+        }
+        if !seen_slugs.insert(slug.clone().into_owned()) {
+            eprintln!(
+                "ct-common: register_service_tools: two declared services both slug to `service/{slug}` -- \
+                 skipping the later one rather than silently replacing the earlier handler (#1004)"
+            );
+            continue;
+        }
         let h = std::sync::Arc::clone(&handler);
         reg.register(
             format!("service/{slug}"),
@@ -1092,6 +1111,50 @@ mod tests {
             "the refusal names the size cap (#183): {}",
             err.message
         );
+    }
+
+    #[test]
+    fn colliding_custom_service_slugs_keep_the_first_registration_1004() {
+        // #1004: "Static-Analysis" and "Static Analysis" both slugify to
+        // "static_analysis" -- without the collision check, registering the
+        // second would silently replace the first's handler and make it
+        // uncallable with no error anywhere.
+        use crate::channel::ServiceType;
+        let mut reg = default_registry();
+        register_service_tools(
+            &mut reg,
+            &[ServiceType::Custom("Static-Analysis".to_string()), ServiceType::Custom("Static Analysis".to_string())],
+            |service, _input| match service {
+                ServiceType::Custom(name) if name == "Static-Analysis" => Ok("first".to_string()),
+                ServiceType::Custom(name) if name == "Static Analysis" => Ok("second".to_string()),
+                _ => Err("unexpected service".to_string()),
+            },
+        );
+
+        // Exactly one tool was registered for the shared slug, not two (no silent overwrite that
+        // leaves `tools/list` showing one entry while secretly dispatching to the second handler).
+        let listed = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let names: Vec<String> =
+            listed.result.unwrap()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert_eq!(names.iter().filter(|n| n.as_str() == "service/static_analysis").count(), 1);
+
+        // The FIRST declared service's handler is the one that actually runs.
+        let ok = call(&reg, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "service/static_analysis", "arguments": { "input": "x" } } }));
+        assert_eq!(ok.result.unwrap()["output"], json!("first"), "the earlier registration wins, not the later one");
+    }
+
+    #[test]
+    fn an_empty_custom_service_name_registers_no_tool_1004() {
+        // #1004: an empty custom name slugifies to an empty string -- `service/` is not a
+        // meaningful tool name and must not be registered at all.
+        use crate::channel::ServiceType;
+        let mut reg = default_registry();
+        register_service_tools(&mut reg, &[ServiceType::Custom(String::new())], |_s, _i| Ok("x".to_string()));
+        let listed = call(&reg, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let names: Vec<String> =
+            listed.result.unwrap()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        assert!(!names.iter().any(|n| n == "service/"), "no tool is registered for an empty slug: {names:?}");
     }
 
     #[test]
