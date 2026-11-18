@@ -161,14 +161,28 @@ async fn push_channel_tier(
     // #666: routing token via the `x-ct-routing-token` header, not the URL path --
     // mirrors this same module's own `x-ct-agent-token` fix for the agent-facing
     // routes, applied here to the CP->edge admin hop (edge/src/admin.rs's
-    // `:host`-only route).
-    let endpoint = format!(
-        "{}/admin/authorize-host/{hostname}{}",
-        url.trim_end_matches('/'),
-        if gelb { "?channel_tier=gelb" } else { "" }
-    );
+    // `:host`-only route). The hostname is appended as an encoded path segment
+    // (not interpolated into a format string) so a request carrying the admin
+    // token cannot be steered to another admin path or gain extra query
+    // parameters from an unexpected character in a stored hostname.
+    let mut endpoint = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed: bad edge admin URL: {e}");
+            return false;
+        }
+    };
+    if let Ok(mut segments) = endpoint.path_segments_mut() {
+        segments.pop_if_empty().extend(["admin", "authorize-host", hostname]);
+    } else {
+        eprintln!("ct-cp: acme_broker: channel-tier push for {hostname} failed: edge admin URL cannot take path segments");
+        return false;
+    }
+    if gelb {
+        endpoint.query_pairs_mut().append_pair("channel_tier", "gelb");
+    }
     match crate::portal_api::edge_admin_http_client()
-        .post(&endpoint)
+        .post(endpoint.as_str())
         .header("x-ct-admin-token", token.as_str())
         .header("x-ct-routing-token", routing_token.as_str())
         .send()
