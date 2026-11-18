@@ -181,9 +181,9 @@ mod tests {
         let store = AcmeDnsStore::new();
         store.set_txt("_acme-challenge.host.test", "the-token");
         let query = txt_query(0x21, "_acme-challenge.host.test");
-        let response = respond(&store, &query).unwrap();
+        let response = respond(&store, &query, message::MAX_UDP_RESPONSE_BYTES).unwrap();
         assert!(response[2] & 0x80 != 0, "sanity: build_response really does set QR");
-        assert!(respond(&store, &response).is_none(), "a response fed back in must be dropped, not answered again");
+        assert!(respond(&store, &response, message::MAX_UDP_RESPONSE_BYTES).is_none(), "a response fed back in must be dropped, not answered again");
     }
 
     #[tokio::test]
