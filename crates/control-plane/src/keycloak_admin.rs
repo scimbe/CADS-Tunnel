@@ -218,6 +218,17 @@ pub async fn ensure_user(
         });
     }
 
+    // #962: the credential rides in the SAME create request (Keycloak's user
+    // representation accepts a `credentials` array directly) instead of a
+    // second reset-password call after the fact. The two-step form left a
+    // window where the create could succeed and the follow-up credential set
+    // could fail (timeout, 5xx, token revoked between the two calls) -- the
+    // account then existed with no password and nobody retrying ever got
+    // one, since a retry's `already_existed` check short-circuits straight to
+    // `Ok` without ever reaching the credential step again. One request
+    // means there is no such window: either the account is created WITH its
+    // temporary password, or it is not created at all.
+    let temp_password = random_temp_password();
     let create = client
         .post(format!("{realm_url}/users"))
         .bearer_auth(&token)
@@ -227,39 +238,17 @@ pub async fn ensure_user(
             "enabled": true,
             "emailVerified": false,
             "requiredActions": ["UPDATE_PASSWORD"],
+            "credentials": [{
+                "type": "password",
+                "value": temp_password,
+                "temporary": true,
+            }],
         }))
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
     if !create.status().is_success() {
         return Err(KcError::Http(format!("POST users returned {}", create.status())));
-    }
-    // Keycloak's user-create response carries the new id only in `Location`, not
-    // the body -- the documented shape of this endpoint, not an oversight here.
-    let location = create
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| KcError::Http("user create response had no Location header".to_string()))?;
-    let user_id = location
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| KcError::Http("could not parse user id from Location header".to_string()))?;
-
-    let temp_password = random_temp_password();
-    let set_pw = client
-        .put(format!("{realm_url}/users/{user_id}/reset-password"))
-        .bearer_auth(&token)
-        .json(&json!({
-            "type": "password",
-            "value": temp_password,
-            "temporary": true,
-        }))
-        .send()
-        .await
-        .map_err(|e| KcError::Http(e.to_string()))?;
-    if !set_pw.status().is_success() {
-        return Err(KcError::Http(format!("reset-password returned {}", set_pw.status())));
     }
 
     Ok(EnsureUserResult {
@@ -376,8 +365,37 @@ pub async fn create_service_account_client(
         .ok_or_else(|| KcError::Http("could not parse client internal id from Location header".to_string()))?
         .to_string();
 
-    let secret = fetch_client_secret(client, cfg, &token, &realm_url, &internal_id).await?;
-    Ok(CreatedClient { internal_id, secret })
+    match fetch_client_secret(client, cfg, &token, &realm_url, &internal_id).await {
+        Ok(secret) => Ok(CreatedClient { internal_id, secret }),
+        Err(e) => {
+            // #962: unlike ensure_user (fixed by sending the credential in the
+            // SAME create request), Keycloak mints this client's secret
+            // server-side on creation -- there is no single atomic call that
+            // both creates the client and returns a secret this code chose.
+            // Without a rollback, a failure here (timeout, 5xx, token revoked
+            // between the two calls) left an enabled confidential client in
+            // the realm with a secret nobody captured, and its internal id
+            // lost to this caller entirely -- an orphan accumulating in the
+            // realm on every such failure. Best-effort delete it instead of
+            // leaving that orphan behind; the delete's own outcome doesn't
+            // change what's reported to the caller (the real failure is the
+            // secret fetch, not this cleanup).
+            let delete = client.delete(format!("{realm_url}/clients/{internal_id}")).bearer_auth(&token).send().await;
+            match delete {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => eprintln!(
+                    "ct-cp: keycloak_admin: failed to roll back orphaned client {internal_id} after a secret-fetch \
+                     failure (delete returned {}) -- needs manual cleanup",
+                    resp.status()
+                ),
+                Err(delete_err) => eprintln!(
+                    "ct-cp: keycloak_admin: failed to roll back orphaned client {internal_id} after a secret-fetch \
+                     failure (delete request itself failed: {delete_err}) -- needs manual cleanup"
+                ),
+            }
+            Err(e)
+        }
+    }
 }
 
 /// The one field of Keycloak's `UserRepresentation` this needs.
@@ -1047,15 +1065,17 @@ mod tests {
         use axum::{Json, Router};
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
 
         let create_calls = Arc::new(AtomicUsize::new(0));
         let reset_calls = Arc::new(AtomicUsize::new(0));
+        let last_create_body = Arc::new(Mutex::new(None::<serde_json::Value>));
 
         #[derive(Clone)]
         struct St {
             create_calls: Arc<AtomicUsize>,
             reset_calls: Arc<AtomicUsize>,
+            last_create_body: Arc<Mutex<Option<serde_json::Value>>>,
         }
 
         async fn token() -> Json<serde_json::Value> {
@@ -1068,8 +1088,9 @@ mod tests {
                 Json(json!([]))
             }
         }
-        async fn create_user(State(st): State<St>) -> axum::response::Response {
+        async fn create_user(State(st): State<St>, Json(body): Json<serde_json::Value>) -> axum::response::Response {
             st.create_calls.fetch_add(1, Ordering::SeqCst);
+            *st.last_create_body.lock().unwrap() = Some(body);
             axum::response::IntoResponse::into_response((
                 axum::http::StatusCode::CREATED,
                 [(axum::http::header::LOCATION, "http://kc/admin/realms/ct-demo/users/new-id-123")],
@@ -1083,6 +1104,7 @@ mod tests {
         let st = St {
             create_calls: create_calls.clone(),
             reset_calls: reset_calls.clone(),
+            last_create_body: last_create_body.clone(),
         };
         let app = Router::new()
             .route("/realms/master/protocol/openid-connect/token", post(token))
@@ -1109,9 +1131,18 @@ mod tests {
 
         let fresh = ensure_user(&client, &cfg, "brand-new@example.com").await.unwrap();
         assert!(!fresh.already_existed);
-        assert!(fresh.temporary_password.is_some(), "a freshly created account gets a temp password");
+        let temp_password = fresh.temporary_password.expect("a freshly created account gets a temp password");
         assert_eq!(create_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
+        // #962: the credential must ride in the SAME create request -- no
+        // separate reset-password call at all, so there is no window between
+        // the two where a failure could leave an account with no password.
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 0, "the credential rides in the create request, not a second call");
+        let body = last_create_body.lock().unwrap().clone().expect("create_user must have been called");
+        assert_eq!(
+            body["credentials"],
+            json!([{ "type": "password", "value": temp_password, "temporary": true }]),
+            "the create request itself must carry the exact temporary password returned to the caller"
+        );
     }
 
     #[tokio::test]
@@ -1329,6 +1360,73 @@ mod tests {
 
         let err = create_service_account_client(&client, &cfg, "sa-dup", "Test bot").await.unwrap_err();
         assert!(err.to_string().contains("409") || err.to_string().to_lowercase().contains("conflict"), "a real 409 must surface as a real error, not a fabricated success: {err}");
+    }
+
+    #[tokio::test]
+    async fn create_service_account_client_rolls_back_the_client_if_the_secret_fetch_fails_962() {
+        // #962: when fetch_client_secret fails AFTER the client was created, a
+        // confidential client with a secret nobody captured used to stay in the
+        // realm with its internal id lost to the caller entirely -- an orphan on
+        // every such failure. It must now be deleted instead of left behind.
+        use axum::extract::{Path, State};
+        use axum::routing::{delete, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct St {
+            secret_calls: Arc<AtomicUsize>,
+            deleted: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn create_client() -> axum::response::Response {
+            axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::CREATED,
+                [(axum::http::header::LOCATION, "http://kc/admin/realms/ct-demo/clients/internal-xyz-789")],
+            ))
+        }
+        async fn client_secret_fails(State(st): State<St>) -> axum::http::StatusCode {
+            st.secret_calls.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        async fn delete_client_route(State(st): State<St>, Path(id): Path<String>) -> axum::http::StatusCode {
+            st.deleted.lock().unwrap().push(id);
+            axum::http::StatusCode::NO_CONTENT
+        }
+
+        let secret_calls = Arc::new(AtomicUsize::new(0));
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let st = St { secret_calls: secret_calls.clone(), deleted: deleted.clone() };
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/clients", post(create_client))
+            .route("/admin/realms/ct-demo/clients/:id/client-secret", axum::routing::get(client_secret_fails))
+            .route("/admin/realms/ct-demo/clients/:id", delete(delete_client_route))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let client = reqwest::Client::new();
+
+        let err = create_service_account_client(&client, &cfg, "sa-orphan-test", "Test bot").await.unwrap_err();
+        assert!(err.to_string().contains("500"), "the real secret-fetch failure must still surface: {err}");
+        assert_eq!(secret_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            deleted.lock().unwrap().as_slice(),
+            ["internal-xyz-789"],
+            "the orphaned client must be rolled back (deleted) by its real internal id"
+        );
     }
 
     // --- #535 / #536: Keycloak-enforcement startup diagnosis -------------------
