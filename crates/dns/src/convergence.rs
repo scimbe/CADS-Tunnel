@@ -128,6 +128,17 @@ pub async fn wait_for_convergence(
         return Convergence::NoNodesReachable;
     }
     loop {
+        // #995: honour `deadline` strictly -- a round that is itself allowed to run
+        // past it (worst case, all nodes slow/unreachable on their first address:
+        // addrs_per_node * QUERY_TIMEOUT, up to ~12s for a two-address node) plus an
+        // uncapped POLL_INTERVAL sleep afterward is exactly how this call used to
+        // run past a caller's own budget (provider.rs's REMOTE_AGENT_REQUEST_TIMEOUT
+        // margin was sized assuming it wouldn't).
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Convergence::TimedOut { lagging: Vec::new(), unreachable: Vec::new() };
+        }
+
         // #354: probe every node concurrently (JoinSet), not one after another --
         // a strictly sequential poll round could take up to
         // nodes.len() * addrs_per_node * QUERY_TIMEOUT (worst case, all nodes
@@ -140,14 +151,25 @@ pub async fn wait_for_convergence(
         for (host, ips) in &addrs {
             set.spawn(probe_node(host.clone(), ips.clone(), zone.to_string(), name.to_string(), expected.to_string()));
         }
-        let (answered, mut lagging, mut unreachable) = drain_probe_round(set).await;
+        // #995: bound the round itself by the remaining budget. On expiry, `set`
+        // (owned by the cancelled `drain_probe_round` future) is dropped, which
+        // aborts every still-running probe task -- a defined, safe JoinSet
+        // operation, not a resource leak. Per-node attribution for THIS round is
+        // lost either way (we're giving up), so empty lists are reported rather
+        // than guessing at which nodes would have answered.
+        let (answered, mut lagging, mut unreachable) =
+            match tokio::time::timeout(remaining, drain_probe_round(set)).await {
+                Ok(round) => round,
+                Err(_) => return Convergence::TimedOut { lagging: Vec::new(), unreachable: Vec::new() },
+            };
         if answered == 0 {
             return Convergence::NoNodesReachable;
         }
         if lagging.is_empty() && unreachable.is_empty() {
             return Convergence::Converged { nodes: answered, took: started.elapsed() };
         }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             // Concurrent probes finish in arbitrary order -- sort so the
             // operator-facing lists are stable/reproducible, not an artifact of
             // which task happened to resolve first.
@@ -155,7 +177,7 @@ pub async fn wait_for_convergence(
             unreachable.sort();
             return Convergence::TimedOut { lagging, unreachable };
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
     }
 }
 
