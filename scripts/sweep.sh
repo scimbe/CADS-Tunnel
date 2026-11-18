@@ -51,13 +51,27 @@ fi
 # Default output file. The throughput dimension writes a SEPARATE CSV (its rows
 # have a different schema than the latency rows) so it never clobbers or misaligns
 # the latency table; the baseline path likewise defaults to its own file so it
-# never clobbers tunnel rows. SWEEP_APPEND=1 appends into the (existing) file.
+# never clobbers tunnel rows. SWEEP_APPEND=1 appends into the (existing) file --
+# #992: specifically, into the TUNNEL file (latency.csv / throughput.csv), since
+# the whole point of appending (rather than writing the baseline's own separate
+# file) is so tabulate.py's single-file tunnel-vs-baseline diff sees both. Without
+# this, `SWEEP_APPEND=1 ... --baseline` with SWEEP_OUT unset still defaulted to
+# the baseline-only file, appending baseline rows to themselves and leaving
+# latency.csv without the direct-* rows the documented workflow above promises.
 if [ "$THROUGHPUT" = "1" ] && [ "$BASELINE" = "1" ]; then
-    OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/throughput-baseline.csv}"
+    if [ "${SWEEP_APPEND:-0}" = "1" ] && [ -z "${SWEEP_OUT:-}" ]; then
+        OUT="$REPO_ROOT/docs/thesis/data/throughput.csv"
+    else
+        OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/throughput-baseline.csv}"
+    fi
 elif [ "$THROUGHPUT" = "1" ]; then
     OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/throughput.csv}"
 elif [ "$BASELINE" = "1" ]; then
-    OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/latency-baseline.csv}"
+    if [ "${SWEEP_APPEND:-0}" = "1" ] && [ -z "${SWEEP_OUT:-}" ]; then
+        OUT="$REPO_ROOT/docs/thesis/data/latency.csv"
+    else
+        OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/latency-baseline.csv}"
+    fi
 else
     OUT="${SWEEP_OUT:-$REPO_ROOT/docs/thesis/data/latency.csv}"
 fi
