@@ -854,6 +854,11 @@ async fn gate_share(State(st): State<GateState>, Query(q): Query<ShareQuery>) ->
             set_cookie(&mut resp, &gate_session_cookie_with_max_age(&session, domain, exp - now));
             resp
         }
+        // #1001: this denial means only that THIS redeem attempt is refused (an
+        // expired/used/unknown token) -- it does not itself end a session minted
+        // from an earlier, valid redeem of the same (now-revoked) link. Live-session
+        // revocation is enforced separately in gate_check (share_link_active), on
+        // every request; neither path is the sole gate on its own.
         Ok(None) => (StatusCode::FORBIDDEN, Html(share_denied_html(&host))).into_response(),
         Err(e) => {
             eprintln!("ct-cp: gate share-link redeem failed: {e}");
