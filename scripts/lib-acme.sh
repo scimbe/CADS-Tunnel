@@ -5,10 +5,23 @@
 # Not executable on its own — `source` it. Callers must already have
 # log()/ok()/warn()/die() defined. Reads STAGING/SKIP_CERT if set (default 0).
 
+# #1030: pinned release tag for the installer below, instead of piping
+# get.acme.sh into sh. Bump deliberately, not on every run.
+ACME_SH_VERSION="${ACME_SH_VERSION:-3.1.6}"
+
 ensure_acme_sh() {
   local acme_email="${1:?ensure_acme_sh needs an ACME account email}"
   if [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
-    curl -fsS https://get.acme.sh | sh -s email="$acme_email" >/dev/null
+    # #1030: this host and shell also hold the zone-wide DESEC_TOKEN -- a
+    # changed or compromised get.acme.sh endpoint could otherwise run
+    # arbitrary code right next to it. Install from a pinned release tag
+    # instead of piping an unpinned, mutable URL into sh.
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' RETURN
+    git clone --depth 1 --branch "$ACME_SH_VERSION" https://github.com/acmesh-official/acme.sh "$tmp_dir/acme.sh" >/dev/null 2>&1 \
+      || die "could not clone acme.sh $ACME_SH_VERSION"
+    (cd "$tmp_dir/acme.sh" && ./acme.sh --install -m "$acme_email" >/dev/null) || die "acme.sh --install failed"
   fi
   [ -n "${DESEC_TOKEN:-}" ] || die "DESEC_TOKEN not set for acme.sh"
   # acme.sh's dns_desec hook uses the legacy dedyn.io variable name, not DESEC_TOKEN.
