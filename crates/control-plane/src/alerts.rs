@@ -439,6 +439,19 @@ pub(crate) async fn evaluate_one(
                 record_skipped_once(store, row, event, now);
                 return;
             }
+            // Re-read immediately before delivering: `row` may be long stale by now
+            // (earlier alerts' probes/deliveries in this tick, then this delivery's own
+            // up-to-25s wait). If the owner edited or deleted the alert in that window,
+            // its webhook_url/secret have changed underneath `row` -- deliver to what is
+            // configured NOW, or not at all if it is gone.
+            let Ok(Some(fresh)) = store.alert_row_for(&a.subject, &a.tunnel_id) else {
+                eprintln!("ct-cp: alerts: tunnel {} alert disappeared before delivery, skipping", a.tunnel_id);
+                return;
+            };
+            if fresh.alert.webhook_url != a.webhook_url || fresh.secret_hex != row.secret_hex {
+                eprintln!("ct-cp: alerts: tunnel {} alert was reconfigured before delivery, skipping", a.tunnel_id);
+                return;
+            }
             let payload = AlertPayload::new(event, row, since, unix_now());
             let outcome = deliver(http, &a.webhook_url, &row.secret_hex, &payload, LOOP_ATTEMPTS).await;
             let recorded =
@@ -451,7 +464,17 @@ pub(crate) async fn evaluate_one(
                 AlertEvent::Up => "up",
                 AlertEvent::Test => a.state.as_str(),
             };
-            let _ = store.set_alert_state(&a.tunnel_id, new_state, since);
+            // Compare-and-set on the state this decision was computed from: if the row
+            // changed again between the re-read above and now (another reconfiguration,
+            // or a concurrent tick), don't overwrite whatever that change wrote.
+            match store.set_alert_state_cas(&a.tunnel_id, &a.state, a.state_since, new_state, since) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "ct-cp: alerts: tunnel {} state changed concurrently, not overwriting with {new_state}",
+                    a.tunnel_id
+                ),
+                Err(e) => eprintln!("ct-cp: alerts: writing state for tunnel {} failed: {e}", a.tunnel_id),
+            }
             eprintln!(
                 "ct-cp: alerts: {} for tunnel {} -> {} : {} ({})",
                 event.wire(),

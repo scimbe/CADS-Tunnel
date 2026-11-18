@@ -5525,6 +5525,29 @@ impl SqliteTunnelStore {
         Ok(())
     }
 
+    /// Same as [`Self::set_alert_state`], but only writes when the row's current
+    /// `state`/`state_since` still match `expected_state`/`expected_since` -- a
+    /// compare-and-set so a decision made from a row read long ago (before an
+    /// unbounded delivery wait) cannot clobber a state change that landed in the
+    /// meantime (e.g. the owner re-edited or deleted the alert, which
+    /// [`Self::upsert_alert`] resets to `"unknown"`). Returns whether the write
+    /// actually happened.
+    pub fn set_alert_state_cas(
+        &self,
+        tunnel_id: &str,
+        expected_state: &str,
+        expected_since: i64,
+        state: &str,
+        since: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.writer.lock_safe().execute(
+            "UPDATE tunnel_alerts SET state = ?1, state_since = ?2
+             WHERE tunnel_id = ?3 AND state = ?4 AND state_since = ?5",
+            params![state, since, tunnel_id, expected_state, expected_since],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Note that the loop just observed the tunnel up at `seen_at` -- the reference
     /// point a later outage's threshold is measured from.
     pub fn touch_alert_seen(&self, tunnel_id: &str, seen_at: i64) -> rusqlite::Result<()> {
