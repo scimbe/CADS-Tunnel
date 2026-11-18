@@ -52,4 +52,12 @@ ignore = [
     "RUSTSEC-2026-0530",  # hickory-proto 0.25.2 parent-side NSEC zone-cut -- inert, same copy
     "RUSTSEC-2026-0489",  # hickory-proto 0.25.2 SVCB/HTTPS quote-char panic -- inert, same copy
     "RUSTSEC-2026-0514",  # hickory-resolver 0.25.2 DNSSEC-failed records returned -- inert, same copy
+
+    # Added 2026-11-18: three more hickory-proto 0.25.2 DNSSEC advisories, same inert
+    # libp2p-dns/mdns copy as the block above (re-checked: `cargo tree [--target all] -i
+    # hickory-proto@0.25.2 -e normal` prints nothing). Compiled 0.26.3 is unaffected
+    # (fixed in >= 0.26.0-beta.1). Same expiry 2027-02-13 as the block above.
+    "RUSTSEC-2026-0549",  # hickory-proto 0.25.2 NSEC3 NODATA at apex accepted -- inert, same copy
+    "RUSTSEC-2026-0550",  # hickory-proto 0.25.2 unsigned NSEC/NSEC3 in proof -- inert, same copy
+    "RUSTSEC-2026-0551",  # hickory-proto 0.25.2 other-class records marked secure -- inert, same copy
 ]
