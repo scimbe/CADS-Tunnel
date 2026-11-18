@@ -311,9 +311,25 @@ mod tests {
 
         let (ctl, signal) = crate::shutdown::ShutdownController::new();
         let handle = tokio::spawn(run_audit_retention_loop(log.clone(), 5, signal));
-        // Row is 10s old with a 5s retention window -- the loop's first tick (an hour
-        // away in real time) would eventually prune it, but this test only needs to
-        // prove shutdown stops the loop promptly, not wait out a real hourly tick.
+
+        // #1016: tokio::time::interval's FIRST tick fires immediately, not an hour
+        // away -- so with a 10s-old row and a 5s window, the prune must already have
+        // happened well before we trigger shutdown below. Assert that explicitly
+        // (bounded poll, since the prune itself runs on a spawn_blocking thread) so a
+        // regression in the cutoff computation or the prune call is actually caught
+        // here, instead of this test only ever exercising the unbiased select!'s
+        // shutdown arm.
+        let pruned = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if log.row_count().unwrap() == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(pruned.is_ok(), "the loop's immediate first tick must have pruned the stale row by now");
+
         ctl.trigger();
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
