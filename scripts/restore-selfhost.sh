@@ -164,4 +164,10 @@ for i in $(seq 30); do
   sleep 5
 done
 log "control-plane readyz: ${R:-?}"
+# #986: a restore whose control plane can't open the restored database used to
+# end here anyway -- "fertig" and exit 0 regardless of $R. That is exactly the
+# false all-clear backup-verify.sh/this script's own deploy.env/certs.tar.gz
+# guards (#624) exist to avoid. The last-seen code is logged above either way;
+# this only decides whether the run is allowed to claim success.
+[ "$R" = "200" ] || die "control-plane readyz blieb bei ${R:-?} (kein 200 nach 30 Versuchen) -- KEIN erfolgreicher Restore, Logs prüfen (docker logs ct-selfhost-control-plane-1)"
 log "fertig — Hostnamen prüfen und Agenten ggf. neu starten"
