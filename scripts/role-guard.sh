@@ -89,20 +89,25 @@ case "$role" in
   *) exit 0 ;;
 esac
 
-CT_GUARD_INPUT="$(cat)" CT_ROLE="$role" python3 -c '
+if CT_GUARD_INPUT="$(cat)" CT_ROLE="$role" python3 -c '
 import os, sys, json, re
 role = os.environ["CT_ROLE"]
-try:
-    data = json.loads(os.environ.get("CT_GUARD_INPUT") or "{}")
-except Exception:
-    data = {}
-tool = data.get("tool_name", "")
-ti = data.get("tool_input", {}) or {}
-
 def block(msg):
     sys.stderr.write("CT_ROLE=%s: %s — field roles cannot modify the codebase (#77 SEC77b)\n" % (role, msg))
     sys.exit(2)
 
+try:
+    data = json.loads(os.environ.get("CT_GUARD_INPUT") or "{}")
+except Exception as e:
+    # #990: a field role whose hook input the guard cannot even parse must be
+    # BLOCKED, not silently allowed through an empty-dict fallback — an
+    # unparseable input is not evidence the tool call is safe.
+    block("could not parse hook input as JSON (%s)" % e)
+tool = data.get("tool_name", "")
+ti = data.get("tool_input", {}) or {}
+
+if not tool:
+    block("empty/missing tool_name in hook input")
 if tool in {"Edit", "Write", "MultiEdit", "NotebookEdit"}:
     block(tool + " denied")
 if tool == "Bash":
@@ -144,4 +149,14 @@ if tool == "Bash":
     ):
         block("Bash command writes files or mutates git")
 sys.exit(0)
-'
+'; then
+  exit 0
+else
+  # #990: ANY non-zero status here — the python script's own sys.exit(2), but
+  # also python3 being missing entirely (bash reports 127 for that), a crash,
+  # or anything else that is not a clean 0 — must BLOCK for a field role. The
+  # hook's own contract is "exit 2 = block, exit 0 = allow"; an unrelated exit
+  # code such as 127 is neither, and the guard previously let it through.
+  echo "CT_ROLE=$role: role-guard could not run cleanly — blocking (#77 SEC77b)" >&2
+  exit 2
+fi
