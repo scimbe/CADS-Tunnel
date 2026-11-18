@@ -189,6 +189,13 @@ pub fn filtered_ladder(force_tcp: bool, edge_port: u16) -> Vec<Rung> {
 /// never touches a socket at all -- only the fallback path pays this real cost.
 pub async fn network_signature() -> String {
     let override_env = std::env::var("CT_CLIENT_NET_SIG").ok();
+    // #978: the doc above promises the override branch never touches a socket --
+    // keep that true by checking for a real (non-blank-after-trim, matching
+    // network_signature_from's own filter below) override BEFORE spawning the
+    // blocking egress lookup, not after.
+    if override_env.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+        return network_signature_from(override_env, None);
+    }
     let egress = match tokio::task::spawn_blocking(local_egress_ip).await {
         Ok(egress) => egress,
         Err(_) => None, // the blocking task panicked -- treat as "no route", same as a real lookup failure
@@ -340,9 +347,20 @@ mod tests {
         // specific test concurrently with another that reads/sets this same var
         // (grep-confirmed: no other test touches CT_CLIENT_NET_SIG).
         unsafe { std::env::set_var("CT_CLIENT_NET_SIG", "async-wrapper-test-net") };
+        // #978: before this fix, the override branch spawned the real blocking
+        // egress lookup (UdpSocket::bind/connect/local_addr) unconditionally
+        // BEFORE even checking the override -- contradicting this fn's own doc
+        // ("never touches a socket at all"). spawn_blocking's own thread-pool
+        // handoff has real (if normally small) overhead; a tight bound here
+        // would have been flaky against the old code on a loaded machine, so
+        // this is a coarse but real regression guard, not just a correctness
+        // check on the returned value.
+        let started = tokio::time::Instant::now();
         let sig = network_signature().await;
+        let elapsed = started.elapsed();
         unsafe { std::env::remove_var("CT_CLIENT_NET_SIG") };
         assert_eq!(sig, "async-wrapper-test-net");
+        assert!(elapsed < Duration::from_millis(20), "the override path must return without ever touching a socket: {elapsed:?}");
     }
 
     // #367: paused clock so the real 250ms-per-position stagger in
