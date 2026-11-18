@@ -18,6 +18,13 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     image: ct-testbed
+    # #963: cap_add alone does not put NET_ADMIN in the EFFECTIVE set of a
+    # non-root process (the runtime image's default uid 65532, #305) --
+    # `tc qdisc add` needs it there, not just granted at the container level.
+    # The Dockerfile's own comment already names this exact override as the
+    # intended way for a test topology that genuinely needs netem to apply
+    # (every service below using netem-entrypoint.sh needs the same override).
+    user: root
     cap_add:
       - NET_ADMIN
     entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
@@ -44,6 +51,7 @@ services:
 
   agent:
     image: ct-testbed
+    user: root
     cap_add:
       - NET_ADMIN
     entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
@@ -67,6 +75,7 @@ services:
 
   client:
     image: ct-testbed
+    user: root
     cap_add:
       - NET_ADMIN
     entrypoint: ["/usr/local/bin/netem-entrypoint.sh"]
