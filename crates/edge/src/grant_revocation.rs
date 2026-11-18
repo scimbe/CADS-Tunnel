@@ -182,7 +182,12 @@ impl CpRevocationSource {
             return Err(RevocationLookupError::Unreadable);
         }
         let body: RevokedResp = resp.json().await.map_err(|_| RevocationLookupError::Unreadable)?;
-        let got: Vec<[u8; 32]> = body.revoked.iter().filter_map(|h| decode32(h)).collect();
+        let got: Vec<[u8; 32]> = body
+            .revoked
+            .iter()
+            .map(|h| decode32(h))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(RevocationLookupError::Unreadable)?;
         if let Ok(mut c) = self.cache.lock() {
             if c.len() >= MAX_CACHED {
                 c.retain(|_, (r, at)| *r || at.elapsed() < NOT_REVOKED_TTL);
@@ -206,5 +211,45 @@ fn decode32(s: &str) -> Option<[u8; 32]> {
 impl RevocationSource for CpRevocationSource {
     fn revoked_among<'a>(&'a self, channel: ChannelId, digests: Vec<[u8; 32]>) -> RevocationFuture<'a> {
         Box::pin(self.ask(channel, digests))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    /// A reply whose JSON parses but whose `revoked` entries are not valid 64-digit
+    /// hex -- the shape #1012 describes.
+    async fn mock_malformed_revoked() -> Json<serde_json::Value> {
+        Json(serde_json::json!({ "revoked": ["not-hex-at-all"] }))
+    }
+
+    async fn spawn_mock_cp() -> String {
+        let app = Router::new().route("/internal/channel/grant-revoked", post(mock_malformed_revoked));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_unparsable_hex_in_revoked_is_unreadable_not_not_revoked() {
+        // Exercises CpRevocationSource directly (not through the process-wide `install`/
+        // `current` statics) so this test cannot leak a source into unrelated tests
+        // sharing the same test binary -- see #1042 on why that global is test-hostile.
+        let base = spawn_mock_cp().await;
+        let source = CpRevocationSource::new(&base, &[0u8; 32]);
+        let channel = ChannelId([0x11u8; 32]);
+        let digest = [0x22u8; 32];
+
+        let err = source
+            .revoked_among(channel, vec![digest])
+            .await
+            .expect_err("a malformed revoked entry must not be silently treated as an empty, valid answer");
+        assert_eq!(err, RevocationLookupError::Unreadable);
     }
 }
