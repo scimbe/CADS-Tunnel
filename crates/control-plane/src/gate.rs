@@ -1246,7 +1246,15 @@ struct GateSessionClaims {
 /// it is configured for, and share-link sessions (no account) and pre-subject sessions yield `None`.
 pub(crate) fn delegated_subject(key: &[u8], token: &str, host: &str, now: u64) -> Option<String> {
     let claims = verify_gate_session(key, token, now)?;
-    if !claims.host.eq_ignore_ascii_case(host) || claims.email.starts_with(GATE_SHARE_SUBJECT_PREFIX) {
+    // #1002: exact match, not eq_ignore_ascii_case -- gate_check's own cookie-session
+    // comparison (`claims.host == host`) is exact, because both sides are already
+    // lowercased at mint time (gate_start) and at construction (InstallationsDelegate::
+    // from_env's to_ascii_lowercase()). A case-insensitive comparison here was
+    // defensive but redundant given that, and meant this path and gate_check's could
+    // in principle diverge if a session were ever minted outside gate_start's
+    // normalization (e.g. a future code path, or sign_gate_session_for_test). Matching
+    // the comparison style exactly removes that possibility rather than relying on it.
+    if claims.host != host || claims.email.starts_with(GATE_SHARE_SUBJECT_PREFIX) {
         return None;
     }
     claims.subject.filter(|s| !s.is_empty())
