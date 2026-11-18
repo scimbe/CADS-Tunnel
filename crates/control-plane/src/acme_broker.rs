@@ -324,11 +324,21 @@ async fn issuance_complete_inner(
     // hostname straight to `gruen`, reverting the edge to origin-passthrough
     // for a host with no real certificate -- a self-inflicted TLS outage the
     // DB would then falsely record as a successful issuance.
+    //
+    // #957: this used to check `claim_state == "offered"` without comparing
+    // `claim_deadline` to now, unlike `may_issue_now` (the admission poll's
+    // own check for the identical question, "may this hostname issue right
+    // now"). `claim_state` only flips away from `offered` when the
+    // `lapse_expired_claims` sweep actually runs; between the deadline
+    // passing and the next sweep tick, a row with an expired deadline still
+    // reads `claim_state == "offered"`, so completion was accepted for an
+    // offer that had already closed. Reuse `may_issue_now` so this endpoint
+    // and the admission poll can never disagree about the SAME question.
     let eligible = state
         .tunnels
         .cert_admission_for_hostname(&hostname)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .is_some_and(|a| a.status == "gruen" || (a.status == "gelb" && a.claim_state == "offered"));
+        .is_some_and(|a| a.may_issue_now(now_secs()));
     if !eligible {
         return Err((
             StatusCode::CONFLICT,
@@ -1133,6 +1143,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT, "a lapsed offer must not be completable");
+        assert!(calls.lock().unwrap().is_empty(), "refused call must never push a channel-tier revert to the edge");
+    }
+
+    #[tokio::test]
+    async fn issuance_complete_is_refused_for_an_expired_offer_even_before_the_sweep_runs_957() {
+        // #957: narrower still than the #261 test above, which only proves the
+        // POST-sweep state (lapse_expired_claims already flipped claim_state
+        // away from "offered"). claim_state only changes when that sweep
+        // actually runs -- between the deadline passing and the next sweep
+        // tick, a row with an expired claim_deadline still reads
+        // claim_state == "offered". The old eligibility check only looked at
+        // status/claim_state, so it would have accepted this call; it must be
+        // refused on the deadline alone, with no sweep involved at all.
+        let (edge_url, calls) = spawn_mock_edge_admin().await;
+        let edge_admin = Some((edge_url, "sekret".to_string()));
+
+        let edge_mesh = Arc::new(SqliteEdgeMesh::open_in_memory().unwrap());
+        let tunnels = Arc::new(SqliteTunnelStore::open_in_memory().unwrap());
+        let t = tunnels.create("alice", "web", Some("app.example.com")).unwrap().created().expect("hostname is free in this test");
+        edge_mesh.heartbeat("edge-1", "127.0.0.1:1234", None, now_secs()).unwrap();
+        edge_mesh.record_ownership(&t.routing_token, Some("app.example.com"), "edge-1", 0).unwrap();
+        tunnels.enter_gelb_queue("app.example.com", 0).unwrap();
+        // Deadline of 1 (one second after the epoch) is in the past relative to
+        // any real now_secs() this test could ever run at -- no sweep call at
+        // all, so claim_state is still exactly "offered" when the endpoint is hit.
+        tunnels.offer_claim("app.example.com", "letsencrypt", 0, 1).unwrap();
+        let admission = tunnels.cert_admission_for_hostname("app.example.com").unwrap().unwrap();
+        assert_eq!(admission.claim_state, "offered", "sanity: no sweep ran, the row is still in its pre-expiry shape");
+        assert!(!admission.may_issue_now(now_secs()), "sanity: the deadline really has passed");
+
+        let app = acme_broker_router(edge_mesh.clone(), tunnels.clone(), edge_admin.clone());
+        let resp = app
+            .oneshot(
+                Request::post(format!("/agent/acme-issuance-complete/{}/app.example.com", t.routing_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "an expired-but-not-yet-swept offer must not be completable");
         assert!(calls.lock().unwrap().is_empty(), "refused call must never push a channel-tier revert to the edge");
     }
 
