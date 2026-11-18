@@ -32,6 +32,16 @@ pub fn parse_query(buf: &[u8]) -> Option<Query> {
         return None;
     }
     let id = u16::from_be_bytes([buf[0], buf[1]]);
+    // #956: byte 2 is QR(1) OPCODE(4) AA(1) TC(1) RD(1). A datagram with QR set
+    // is a RESPONSE, not a query -- answering it (QR=1 again, echoing the
+    // question) risks a sustained reflection loop with any other UDP DNS
+    // server that also answers responses, off one spoofed-source datagram. A
+    // non-zero OPCODE is some other operation this responder never implements
+    // (e.g. UPDATE); treating it as an ordinary query would answer a request
+    // it was never asked.
+    if buf[2] & 0x80 != 0 || (buf[2] >> 3) & 0x0F != 0 {
+        return None;
+    }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
     if qdcount < 1 {
         return None;
