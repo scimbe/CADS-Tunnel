@@ -32,10 +32,15 @@ done
 [ -n "$PASSWORD" ] || die "--password required"
 
 [ -f "$ENV_FILE" ] || die "$ENV_FILE not found"
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
+# #993: docker/deploy/.env is compose-format (KEY=value), not shell -- a value
+# containing $, backticks, spaces, parens or an unresolved ${VAR} placeholder
+# would be expanded, executed, or abort this script under set -u if sourced
+# directly. Extract only the three keys this script needs, the same way
+# authorize-pipeline.sh already does for its own single-key reads.
+env_get() { grep -E "^$1=" "$ENV_FILE" | tail -1 | cut -d= -f2-; }
+KEYCLOAK_PUBLIC_URL="$(env_get KEYCLOAK_PUBLIC_URL)"
+KC_ADMIN_USER="$(env_get KC_ADMIN_USER)"
+KC_ADMIN_PASSWORD="$(env_get KC_ADMIN_PASSWORD)"
 
 : "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL in $ENV_FILE}"
 : "${KC_ADMIN_USER:?set KC_ADMIN_USER in $ENV_FILE}"
