@@ -57,6 +57,16 @@ HELP_SITE=0
 STAGING=0
 SKIP_CERT=0
 ALLOW_SEC_DOWNGRADE=0
+# Captured before the :-default expansions below collapse the distinction:
+# whether each setting came from the calling shell's environment, so
+# ensure_env() can later prefer a value already persisted in .env over the
+# hard-coded default for anything NOT explicitly exported this run (#951).
+PORTAL_PUBLIC_HOST_SET="${PORTAL_PUBLIC_HOST+1}"
+PORTAL_CERT_DIR_SET="${PORTAL_CERT_DIR+1}"
+AUTH_PUBLIC_HOST_SET="${AUTH_PUBLIC_HOST+1}"
+AUTH_CERT_DIR_SET="${AUTH_CERT_DIR+1}"
+KC_ADMIN_USER_SET="${KC_ADMIN_USER+1}"
+DESEC_DOMAIN_SET="${DESEC_DOMAIN+1}"
 PORTAL_PUBLIC_HOST="${PORTAL_PUBLIC_HOST:-bunsenbrenner.org}"
 PORTAL_CERT_DIR="${PORTAL_CERT_DIR:-$HOME/ct-certs/portal}"
 AUTH_PUBLIC_HOST="${AUTH_PUBLIC_HOST:-auth.$PORTAL_PUBLIC_HOST}"
@@ -205,11 +215,37 @@ env_set() {
   fi
 }
 
+# resolve_persisted VAR IS_SET DEFAULT: if VAR wasn't explicitly exported this
+# run (IS_SET empty), prefer a value already persisted in .env over VAR's
+# current (hard-coded) default; otherwise leave VAR — the shell-provided
+# value — untouched (#951).
+resolve_persisted() {
+  local __name="$1" __is_set="$2" __default="$3"
+  [ -n "$__is_set" ] && return 0
+  local __persisted; __persisted="$(env_get "$__name")"
+  if [ -n "$__persisted" ]; then
+    printf -v "$__name" '%s' "$__persisted"
+  else
+    printf -v "$__name" '%s' "$__default"
+  fi
+}
+
 ensure_env() {
   log "preparing $ENV_FILE"
   [ -f "$ENV_EXAMPLE" ] || die "missing $ENV_EXAMPLE"
   [ -f "$ENV_FILE" ] || cp "$ENV_EXAMPLE" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
+
+  # Shell env wins, then whatever is already persisted in .env, then the
+  # hard-coded default — never the other way around (#951). PORTAL_PUBLIC_HOST
+  # must resolve first since AUTH_PUBLIC_HOST/DESEC_DOMAIN's own defaults
+  # derive from it, same as their original :-default expressions did.
+  resolve_persisted PORTAL_PUBLIC_HOST "$PORTAL_PUBLIC_HOST_SET" "bunsenbrenner.org"
+  resolve_persisted PORTAL_CERT_DIR "$PORTAL_CERT_DIR_SET" "$HOME/ct-certs/portal"
+  resolve_persisted AUTH_PUBLIC_HOST "$AUTH_PUBLIC_HOST_SET" "auth.$PORTAL_PUBLIC_HOST"
+  resolve_persisted AUTH_CERT_DIR "$AUTH_CERT_DIR_SET" "$HOME/ct-certs/auth"
+  resolve_persisted KC_ADMIN_USER "$KC_ADMIN_USER_SET" "admin"
+  resolve_persisted DESEC_DOMAIN "$DESEC_DOMAIN_SET" "$PORTAL_PUBLIC_HOST"
 
   env_set PORTAL_PUBLIC_HOST "$PORTAL_PUBLIC_HOST"
   env_set PORTAL_CERT_DIR "$PORTAL_CERT_DIR"
