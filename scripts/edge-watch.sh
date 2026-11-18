@@ -357,19 +357,24 @@ else
   #    mehr Quellen als die Tabelle fasst, verdraengt sie aelteste zuerst, keine
   #    IP erreicht je ihr Budget, und die Abwehr greift nie. Bis hierher stand
   #    diese Vorschrift nur in der Doku; sie hatte keinen Durchsetzer.
-  TRACKED=$(printf '%s' "$MET" | awk '/^ct_edge_channel_join_penalty_tracked_ips / {print $2}' | head -1)
-  TRACKED_MAX=$(printf '%s' "$MET" | awk '/^ct_edge_channel_join_penalty_tracked_ips_max / {print $2}' | head -1)
-  TRACKED=${TRACKED%.*}; TRACKED_MAX=${TRACKED_MAX%.*}
-  if [ -n "${TRACKED:-}" ] && [ "${TRACKED_MAX:-0}" -gt 0 ]; then
-    # Ganzzahlig gerechnet (kein bc auf diesem Host): 10*belegt >= 9*Kapazitaet.
-    if [ $(( TRACKED * 10 )) -ge $(( TRACKED_MAX * 9 )) ]; then
-      ALARMS+=("Join-Straftabelle zu $(( TRACKED * 100 / TRACKED_MAX ))% belegt ($TRACKED/$TRACKED_MAX) -- an der Obergrenze verdraengt sie aelteste Eintraege, keine Quell-IP erreicht mehr ihr Budget, und die Pro-IP-Strafe greift dann gar nicht. Ein hoher Wert ist hier eine Warnung, keine Beruhigung (#551).")
+  #    (#984: nur bewertet, wenn /metrics ueberhaupt etwas geliefert hat -- sonst
+  #    faellt ein blosses Erreichbarkeits-Problem faelschlich in den "Gauge
+  #    unbekannt, Redeploy"-Zweig statt in die bereits vorhandene Meldung oben.)
+  if [ -n "$MET" ]; then
+    TRACKED=$(printf '%s' "$MET" | awk '/^ct_edge_channel_join_penalty_tracked_ips / {print $2}' | head -1)
+    TRACKED_MAX=$(printf '%s' "$MET" | awk '/^ct_edge_channel_join_penalty_tracked_ips_max / {print $2}' | head -1)
+    TRACKED=${TRACKED%.*}; TRACKED_MAX=${TRACKED_MAX%.*}
+    if [ -n "${TRACKED:-}" ] && [ "${TRACKED_MAX:-0}" -gt 0 ]; then
+      # Ganzzahlig gerechnet (kein bc auf diesem Host): 10*belegt >= 9*Kapazitaet.
+      if [ $(( TRACKED * 10 )) -ge $(( TRACKED_MAX * 9 )) ]; then
+        ALARMS+=("Join-Straftabelle zu $(( TRACKED * 100 / TRACKED_MAX ))% belegt ($TRACKED/$TRACKED_MAX) -- an der Obergrenze verdraengt sie aelteste Eintraege, keine Quell-IP erreicht mehr ihr Budget, und die Pro-IP-Strafe greift dann gar nicht. Ein hoher Wert ist hier eine Warnung, keine Beruhigung (#551).")
+      fi
+    else
+      # Gleiches Muster wie beim #539-Gauge oben: eine Pruefung, die mangels
+      # Kennzahl nicht laufen kann, wird GESAGT und nicht verschwiegen -- sonst
+      # liest sich ihr Schweigen wie ein Bestehen.
+      ALARMS+=("Der laufende Edge kennt 'ct_edge_channel_join_penalty_tracked_ips' nicht (Stand vor #551). Die Saettigung der Join-Straftabelle kann deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
     fi
-  else
-    # Gleiches Muster wie beim #539-Gauge oben: eine Pruefung, die mangels
-    # Kennzahl nicht laufen kann, wird GESAGT und nicht verschwiegen -- sonst
-    # liest sich ihr Schweigen wie ein Bestehen.
-    ALARMS+=("Der laufende Edge kennt 'ct_edge_channel_join_penalty_tracked_ips' nicht (Stand vor #551). Die Saettigung der Join-Straftabelle kann deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
   fi
 
   # 6. Tote Lauscher, die sich NICHT selbst heilen.
@@ -383,27 +388,31 @@ else
   #
   #    Kriterium: erwartet (expected_since>0) und nie gesehen (last_seen==0).
   #    Das ist genau die Signatur eines fehlgeschlagenen Bind.
-  ADVISORY=$(printf '%s' "$MET" | awk '
-    /^ct_edge_listener_loop_health_gating\{/ {
-      # $NF und nicht $2: die Lauscher-Namen enthalten Leerzeichen (":80 redirect"),
-      # damit ist $2 ein Namensfragment und nicht der Wert. Genau daran ist die
-      # erste Fassung dieser Regel still vorbeigelaufen.
-      if ($NF == 0) { match($0, /listener="[^"]*"/); adv[substr($0, RSTART+10, RLENGTH-11)] = 1 }
-    }
-    /^ct_edge_listener_loop_expected_since_seconds\{/ {
-      match($0, /listener="[^"]*"/); exp_[substr($0, RSTART+10, RLENGTH-11)] = $NF
-    }
-    /^ct_edge_listener_loop_last_seen_seconds\{/ {
-      match($0, /listener="[^"]*"/); seen[substr($0, RSTART+10, RLENGTH-11)] = $NF
-    }
-    END { for (l in adv) if (exp_[l] > 0 && seen[l] == 0) print l }')
-  if [ -n "${ADVISORY:-}" ]; then
-    while IFS= read -r l; do
-      [ -n "$l" ] || continue
-      ALARMS+=("Lauscher '$l' wurde erwartet, ist aber nie angelaufen (fehlgeschlagener Bind). Er ist absichtlich NICHT gesundheitsentscheidend, also startet sich der Container deswegen NICHT neu -- diese Mail ist die einzige Meldung, die es dazu gibt.")
-    done <<< "$ADVISORY"
-  elif ! grep -q "^ct_edge_listener_loop_health_gating" <<< "$MET"; then
-    ALARMS+=("Der laufende Edge kennt 'ct_edge_listener_loop_health_gating' nicht. Nicht-gesundheitsentscheidende Lauscher (z.B. der :80-Redirect) koennen deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
+  #    (#984: gleiche Begruendung wie bei Check 5 oben -- nur bewertet, wenn
+  #    $MET ueberhaupt etwas enthaelt.)
+  if [ -n "$MET" ]; then
+    ADVISORY=$(printf '%s' "$MET" | awk '
+      /^ct_edge_listener_loop_health_gating\{/ {
+        # $NF und nicht $2: die Lauscher-Namen enthalten Leerzeichen (":80 redirect"),
+        # damit ist $2 ein Namensfragment und nicht der Wert. Genau daran ist die
+        # erste Fassung dieser Regel still vorbeigelaufen.
+        if ($NF == 0) { match($0, /listener="[^"]*"/); adv[substr($0, RSTART+10, RLENGTH-11)] = 1 }
+      }
+      /^ct_edge_listener_loop_expected_since_seconds\{/ {
+        match($0, /listener="[^"]*"/); exp_[substr($0, RSTART+10, RLENGTH-11)] = $NF
+      }
+      /^ct_edge_listener_loop_last_seen_seconds\{/ {
+        match($0, /listener="[^"]*"/); seen[substr($0, RSTART+10, RLENGTH-11)] = $NF
+      }
+      END { for (l in adv) if (exp_[l] > 0 && seen[l] == 0) print l }')
+    if [ -n "${ADVISORY:-}" ]; then
+      while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        ALARMS+=("Lauscher '$l' wurde erwartet, ist aber nie angelaufen (fehlgeschlagener Bind). Er ist absichtlich NICHT gesundheitsentscheidend, also startet sich der Container deswegen NICHT neu -- diese Mail ist die einzige Meldung, die es dazu gibt.")
+      done <<< "$ADVISORY"
+    elif ! grep -q "^ct_edge_listener_loop_health_gating" <<< "$MET"; then
+      ALARMS+=("Der laufende Edge kennt 'ct_edge_listener_loop_health_gating' nicht. Nicht-gesundheitsentscheidende Lauscher (z.B. der :80-Redirect) koennen deshalb NICHT geprueft werden -- kein Freispruch, sondern eine fehlende Pruefung. Abhilfe: Edge neu ausrollen.")
+    fi
   fi
 fi
 
