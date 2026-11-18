@@ -3,12 +3,13 @@
    orange "flame" dot and a muted ".org", mono eyebrow in teal, 6px controls on 12px panels,
    mono upper-case field labels like the landing page's "GET YOUR TUNNEL" form.
 
-   Loaded only by ct-bunsenbrenner (theme.properties styles=), after ct-login.css and before
-   ct-daily.css. It is a separate file on purpose:
+   Loaded only by ct-bunsenbrenner (theme.properties styles=), after ct-login.css. It is a
+   separate file on purpose:
    - ct-mydailyidea lists its own styles (login.css ct-login.css ct-mydailyidea.css) and so does
      ct-riisc, so neither sees this file -- their look stays exactly as it was.
-   - Every rule is scoped to html:not([data-look="daily"]): with the ct_look cookie (#890) the
-     page looks exactly as before, ct-daily.css alone decides.
+   - The rules still carry html:not([data-look="daily"]) from the former cookie look (#890). No
+     theme sets that attribute any more, so every rule always applies; the selectors are kept
+     unchanged so that specificity, and with it the rendering, stays exactly the same.
    - A new file name is a new URL, so no browser keeps an old cached copy.
    No template and no id changes; CSS only.
 
