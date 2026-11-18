@@ -29,6 +29,11 @@ def test_only_files(roots):
     no marker, so a span scan of it finds nothing and reads it as production. ct-agent's
     `channel_run/tests.rs` is 2000+ lines that way, and its test functions turned up as
     "production callers" of the very functions being surveyed.
+
+    A declaring file that is itself a 2018-edition module file (`channel_broker.rs`, not
+    `mod.rs`/`lib.rs`/`main.rs`) resolves its own submodules inside a same-named sibling
+    directory, not alongside itself -- `channel_broker.rs`'s `mod park_pump_tests;` is
+    `channel_broker/park_pump_tests.rs`, not `park_pump_tests.rs` next to it (#952).
     """
     decl = re.compile(r'#\[cfg\(test\)\]\s*(pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;')
     out = set()
@@ -41,9 +46,13 @@ def test_only_files(roots):
                     continue
                 p = os.path.join(dp, f)
                 txt = open(p, encoding='utf8', errors='replace').read()
+                stem = f[:-3]
                 for m in decl.finditer(txt.replace('\n', ' ')):
                     name = m.group(2)
-                    for cand in (os.path.join(dp, name + '.rs'), os.path.join(dp, name, 'mod.rs')):
+                    cands = [os.path.join(dp, name + '.rs'), os.path.join(dp, name, 'mod.rs')]
+                    if stem not in ('mod', 'lib', 'main'):
+                        cands.append(os.path.join(dp, stem, name + '.rs'))
+                    for cand in cands:
                         if os.path.exists(cand):
                             out.add(os.path.abspath(cand))
     return out
