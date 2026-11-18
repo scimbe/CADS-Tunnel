@@ -184,21 +184,33 @@ fn describe_error(e: &reqwest::Error) -> &'static str {
 
 /// The outbound webhook client: 5 s per attempt, and NO redirect following -- a
 /// redirect would let an owner-supplied URL bounce this process at an address the
-/// URL validation never saw.
-pub(crate) fn delivery_http_client() -> reqwest::Client {
+/// URL validation never saw. On a builder error, the caller must fail closed (no
+/// delivery) rather than fall back to a differently-configured client: a default
+/// `reqwest::Client` has no client-level timeout and follows redirects, which is
+/// exactly the safety property this function exists to enforce.
+pub(crate) fn delivery_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .timeout(DELIVERY_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("ct-control-plane-alerts/1")
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// The shared client for one-off deliveries outside the loop (the portal's Test
-/// button), built once instead of per request.
-fn shared_delivery_http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(delivery_http_client)
+/// button), built once instead of per request. `None` if construction ever failed --
+/// logged once, and every call after that returns the same cached `None` rather than
+/// retrying a build that is unlikely to start succeeding.
+fn shared_delivery_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| match delivery_http_client() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("ct-cp: alerts: building the delivery HTTP client failed, Test deliveries disabled: {e}");
+                None
+            }
+        })
+        .as_ref()
 }
 
 /// POST `payload` to `url`, signed with `secret`, up to `attempts` times with
@@ -366,7 +378,13 @@ pub(crate) async fn run_alert_loop_with(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     period: Duration,
 ) {
-    let http = delivery_http_client();
+    let http = match delivery_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ct-cp: alerts: building the delivery HTTP client failed, dead-man alerts disabled: {e}");
+            return;
+        }
+    };
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -621,8 +639,11 @@ pub(crate) async fn test_alert(
         record_skipped_once(store, &row, AlertEvent::Test, now);
         return (StatusCode::TOO_MANY_REQUESTS, rate_limit_detail()).into_response();
     }
+    let Some(http) = shared_delivery_http_client() else {
+        return internal("test_alert/client", "delivery HTTP client unavailable");
+    };
     let payload = AlertPayload::new(AlertEvent::Test, &row, row.alert.state_since, now);
-    let outcome = deliver(shared_delivery_http_client(), &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
+    let outcome = deliver(http, &row.alert.webhook_url, &row.secret_hex, &payload, 1).await;
     let recorded =
         store.record_delivery(tunnel_id, now, AlertEvent::Test.wire(), outcome.status(), Some(&outcome.detail));
     if let Err(e) = recorded {
@@ -1011,7 +1032,7 @@ mod tests {
             Some(AlertUpsert::Created { secret_hex }) => secret_hex,
             other => panic!("{other:?}"),
         };
-        let http = delivery_http_client();
+        let http = delivery_http_client().unwrap();
 
         // Down from creation, still under the threshold: nothing, state untouched.
         tick(&store, Some(&probe), &http, 100).await;
@@ -1082,11 +1103,11 @@ mod tests {
         let (hook_url, received) = mock_webhook().await;
         let (store, id) = store_with_tunnel();
         store.upsert_alert("alice", &id, &hook_url, 60, 0).unwrap();
-        tick(&store, Some(&probe), &delivery_http_client(), 10_000).await;
+        tick(&store, Some(&probe), &delivery_http_client().unwrap(), 10_000).await;
         assert!(received.lock().unwrap().is_empty());
         assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, "unknown");
         // And with no edge configured at all, likewise.
-        tick(&store, None, &delivery_http_client(), 10_000).await;
+        tick(&store, None, &delivery_http_client().unwrap(), 10_000).await;
         assert!(received.lock().unwrap().is_empty());
     }
 
@@ -1108,7 +1129,7 @@ mod tests {
 
         // The 21st (a real down transition) is refused: nothing sent, state NOT transitioned
         // (so it catches up later), one skipped row -- and only one, however often refused.
-        let http = delivery_http_client();
+        let http = delivery_http_client().unwrap();
         tick(&store, Some(&probe), &http, now).await;
         tick(&store, Some(&probe), &http, now + 60).await;
         assert!(received.lock().unwrap().is_empty(), "no delivery went out");
