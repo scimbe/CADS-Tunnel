@@ -94,12 +94,18 @@ if [ -n "$EDGE_ADMIN_URL" ] && [ -n "$EDGE_ADMIN_TOKEN" ]; then
   # restart rehydrates exclusively recorded pairs. The old direct edge-admin call
   # left the authorization in edge RAM alone: every edge restart silently dropped
   # this hostname and took the demo down until a human re-ran this script.
-  if curl -fsS -X POST "${CP_URL%/}/registry/authorize-host/$HELP_AGENT_TOKEN/$HOSTNAME_FQDN" \
-       -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" >/dev/null 2>&1; then
+  # #1006: the routing token rides in the x-ct-routing-token header on the
+  # `:host`-only route for BOTH calls below, not in the URL path -- a bearer
+  # credential in the path lands in every proxy/LB/access log between here and
+  # the edge (#666's whole point; admin.rs's authorize_host_via_header and
+  # service.rs's authorize_host_proxy_via_header are exactly this fix's edge/CP
+  # halves, already in place and just not used from here).
+  if curl -fsS -X POST "${CP_URL%/}/registry/authorize-host/$HOSTNAME_FQDN" \
+       -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" -H "x-ct-routing-token: $HELP_AGENT_TOKEN" >/dev/null 2>&1; then
     echo "   authorized via the control plane — ownership recorded, survives edge restarts."
   else
-    curl -fsS -X POST "${EDGE_ADMIN_URL%/}/admin/authorize-host/$HELP_AGENT_TOKEN/$HOSTNAME_FQDN" \
-         -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" >/dev/null \
+    curl -fsS -X POST "${EDGE_ADMIN_URL%/}/admin/authorize-host/$HOSTNAME_FQDN" \
+         -H "x-ct-admin-token: $EDGE_ADMIN_TOKEN" -H "x-ct-routing-token: $HELP_AGENT_TOKEN" >/dev/null \
       || die "authorize-host failed (check CT_CP_EDGE_ADMIN_URL / token / that the edge admin listener is up)."
     echo "   ! authorized directly at the edge (CP lacks /registry/authorize-host) —"
     echo "     ownership is NOT recorded: an edge restart drops it until this script re-runs."
