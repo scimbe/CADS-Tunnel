@@ -430,7 +430,9 @@ pub(crate) async fn evaluate_one(
     match next_transition(&a.state, up, reference, now, a.threshold_secs) {
         None => {
             if up && a.state != "up" {
-                let _ = store.set_alert_state(&a.tunnel_id, "up", now);
+                if let Err(e) = store.set_alert_state(&a.tunnel_id, "up", now) {
+                    eprintln!("ct-cp: alerts: writing state for tunnel {} failed: {e}", a.tunnel_id);
+                }
             }
         }
         Some(event) => {
@@ -451,7 +453,9 @@ pub(crate) async fn evaluate_one(
                 AlertEvent::Up => "up",
                 AlertEvent::Test => a.state.as_str(),
             };
-            let _ = store.set_alert_state(&a.tunnel_id, new_state, since);
+            if let Err(e) = store.set_alert_state(&a.tunnel_id, new_state, since) {
+                eprintln!("ct-cp: alerts: writing state for tunnel {} failed: {e}", a.tunnel_id);
+            }
             eprintln!(
                 "ct-cp: alerts: {} for tunnel {} -> {} : {} ({})",
                 event.wire(),
