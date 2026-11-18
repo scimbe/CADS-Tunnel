@@ -78,6 +78,20 @@ def main() -> int:
         )
         return 2
 
+    # Files that are ENTIRELY test code even though an inline #[cfg(test)] span
+    # scan of THEM finds nothing: declared `#[cfg(test)] mod x;` in a parent
+    # (test_only_files), or a crate-level `tests/` integration-test binary
+    # (Cargo convention, no marker of its own either). A predicate declared in
+    # one of these is test-only by construction; counting it as production
+    # code is exactly the "rule nobody applies" case #579 exists to catch
+    # (#952).
+    test_only = survey.test_only_files([str(root)])
+    files = [
+        p
+        for p in files
+        if str(p.resolve()) not in test_only and "tests" not in p.relative_to(REPO).parts
+    ]
+
     decls = {}
     for p in files:
         try:
