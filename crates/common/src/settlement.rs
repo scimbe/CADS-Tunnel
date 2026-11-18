@@ -568,6 +568,18 @@ pub enum EscrowError {
     BadNonce { from: Account, expected: u64, got: u64 },
     /// A hold already exists for this `match_ref` — a match escrows exactly once.
     DuplicateHold { match_ref: [u8; 32] },
+    /// #964: a zero-amount hold is rejected outright. `match_ref` is derived from public data (e.g.
+    /// [`crate::pipeline::role_match_ref`]), so without this check ANY account -- including one with
+    /// no balance at all -- could lock a free hold under a victim's upcoming match_ref and squat it
+    /// via [`DuplicateHold`](Self::DuplicateHold), permanently (combined with an unbounded
+    /// `expires_at`) blocking the real match at zero cost.
+    ZeroAmountHold,
+    /// #964: `expires_at` is further in the future than [`Escrow::MAX_HOLD_HORIZON_SECS`] from `now`.
+    /// Without this, the same zero-cost-squat risk above becomes a bounded-cost-but-still-PERMANENT
+    /// one once amount is required to be nonzero: a `u64::MAX` expiry still locks the match_ref (and
+    /// the squatter's funds) forever, and holds whose provider never shows up would never reach
+    /// [`refund`](Self::refund)'s reconciliation sweep, growing [`Escrow`]'s held map without bound.
+    ExpiryTooFarInFuture { now: u64, max_expires_at: u64, got: u64 },
     /// No held funds for this `match_ref` (never locked, or already released / refunded).
     UnknownHold { match_ref: [u8; 32] },
     /// The consumption proof isn't a valid co-signed receipt, or its `provider`/`consumer` don't
@@ -592,6 +604,10 @@ impl std::fmt::Display for EscrowError {
                 write!(f, "bad nonce: expected {expected}, got {got}")
             }
             EscrowError::DuplicateHold { .. } => write!(f, "a hold already exists for this match"),
+            EscrowError::ZeroAmountHold => write!(f, "a hold must lock a nonzero amount"),
+            EscrowError::ExpiryTooFarInFuture { now, max_expires_at, got } => {
+                write!(f, "hold expires_at {got} is past the max allowed {max_expires_at} ({now} + the hold horizon)")
+            }
             EscrowError::UnknownHold { .. } => write!(f, "no held funds for this match"),
             EscrowError::ReceiptMismatch => {
                 write!(f, "receipt is not a valid co-signed proof for the held record")
@@ -632,6 +648,14 @@ pub struct Escrow {
 }
 
 impl Escrow {
+    /// #964: the furthest into the future [`lock`](Self::lock) accepts `expires_at`, measured from
+    /// the `now` passed to that call. 30 days -- generous for any single capacity-market hold while
+    /// still bounding both how long a squatted match_ref can block the real match, and how long a
+    /// genuinely abandoned (provider never showed) hold can sit in [`Self::held`] before
+    /// [`refund`](Self::refund)'s reconciliation sweep can reclaim it. Tune freely; the point is that
+    /// SOME finite bound exists, not this exact number.
+    pub const MAX_HOLD_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
+
     /// A fresh escrow with genesis account balances (the consumers' spendable funds).
     pub fn new(genesis: BTreeMap<Account, Amount>) -> Self {
         Escrow { balances: genesis, nonces: BTreeMap::new(), held: BTreeMap::new() }
@@ -648,15 +672,24 @@ impl Escrow {
     }
 
     /// **Lock** consumer funds for a match. Verifies the consumer's signature, that `nonce` is its
-    /// next expected value, that no hold already exists for this `match_ref`, and that it has the
-    /// balance — then moves `amount` out of available into escrow. On any error nothing changes.
-    pub fn lock(&mut self, hold: &Hold) -> Result<(), EscrowError> {
+    /// next expected value, that `amount` is nonzero and `expires_at` is within
+    /// [`MAX_HOLD_HORIZON_SECS`](Self::MAX_HOLD_HORIZON_SECS) of `now`, that no hold already exists
+    /// for this `match_ref`, and that it has the balance — then moves `amount` out of available into
+    /// escrow. On any error nothing changes.
+    pub fn lock(&mut self, hold: &Hold, now: u64) -> Result<(), EscrowError> {
         if !hold.verify() {
             return Err(EscrowError::BadSignature);
         }
         let expected = self.nonces.get(&hold.from).copied().unwrap_or(0);
         if hold.nonce != expected {
             return Err(EscrowError::BadNonce { from: hold.from, expected, got: hold.nonce });
+        }
+        if hold.amount == 0 {
+            return Err(EscrowError::ZeroAmountHold);
+        }
+        let max_expires_at = now.saturating_add(Self::MAX_HOLD_HORIZON_SECS);
+        if hold.expires_at > max_expires_at {
+            return Err(EscrowError::ExpiryTooFarInFuture { now, max_expires_at, got: hold.expires_at });
         }
         if self.held.contains_key(&hold.match_ref) {
             return Err(EscrowError::DuplicateHold { match_ref: hold.match_ref });
@@ -1261,7 +1294,7 @@ mod tests {
 
         // LOCK match A: 40 of the consumer's funds move into escrow (out of available).
         let hold_a = Hold::sign_new(&consumer, p, 40, m1, 0, 1_000);
-        esc.lock(&hold_a).expect("a well-signed, funded hold locks");
+        esc.lock(&hold_a, 0).expect("a well-signed, funded hold locks");
         assert_eq!(esc.balance(&c), 60, "locked funds leave available balance");
         assert_eq!(esc.held_amount(&m1), 40, "and sit in escrow for the match");
         assert_eq!(total(&esc), 100, "value conserved on lock");
@@ -1277,7 +1310,7 @@ mod tests {
 
         // LOCK match B, then let it time out and REFUND to the consumer.
         let hold_b = Hold::sign_new(&consumer, p, 25, m2, 1, 2_000);
-        esc.lock(&hold_b).expect("second hold (next nonce) locks");
+        esc.lock(&hold_b, 0).expect("second hold (next nonce) locks");
         assert_eq!(esc.balance(&c), 35, "60 - 25 held for match B");
         // Refund before expiry is refused — the provider still has time to prove.
         assert_eq!(
@@ -1293,26 +1326,78 @@ mod tests {
         // Guard rails on lock.
         let mut esc2 = Escrow::new(BTreeMap::from([(c, 10)]));
         let overdraft = Hold::sign_new(&consumer, p, 999, m1, 0, 1_000);
-        assert!(matches!(esc2.lock(&overdraft), Err(EscrowError::Overdraft { .. })), "can't lock more than balance");
+        assert!(matches!(esc2.lock(&overdraft, 0), Err(EscrowError::Overdraft { .. })), "can't lock more than balance");
         let mut forged = Hold::sign_new(&consumer, p, 5, m1, 0, 1_000);
         forged.amount = 6; // tamper after signing
-        assert_eq!(esc2.lock(&forged), Err(EscrowError::BadSignature), "a tampered hold is rejected");
+        assert_eq!(esc2.lock(&forged, 0), Err(EscrowError::BadSignature), "a tampered hold is rejected");
         // Good lock, then a duplicate match_ref and a stale nonce are both refused.
-        esc2.lock(&Hold::sign_new(&consumer, p, 5, m1, 0, 1_000)).expect("funded hold locks");
+        esc2.lock(&Hold::sign_new(&consumer, p, 5, m1, 0, 1_000), 0).expect("funded hold locks");
         let dup = Hold::sign_new(&consumer, p, 1, m1, 1, 1_000);
-        assert_eq!(esc2.lock(&dup), Err(EscrowError::DuplicateHold { match_ref: m1 }), "one hold per match");
+        assert_eq!(esc2.lock(&dup, 0), Err(EscrowError::DuplicateHold { match_ref: m1 }), "one hold per match");
         let stale = Hold::sign_new(&consumer, p, 1, m2, 0, 1_000);
-        assert!(matches!(esc2.lock(&stale), Err(EscrowError::BadNonce { .. })), "a replayed hold nonce is rejected");
+        assert!(matches!(esc2.lock(&stale, 0), Err(EscrowError::BadNonce { .. })), "a replayed hold nonce is rejected");
 
         // A receipt for the WRONG match, or naming a different provider/consumer, can't release a hold.
         let mut esc3 = Escrow::new(BTreeMap::from([(c, 100)]));
-        esc3.lock(&Hold::sign_new(&consumer, p, 30, m1, 0, 1_000)).unwrap();
+        esc3.lock(&Hold::sign_new(&consumer, p, 30, m1, 0, 1_000), 0).unwrap();
         let wrong_match = UsageReceipt::co_sign(&provider, &consumer, CapacityKind::CloudApiQuota, "m".into(), 30, m2, 1);
         assert_eq!(esc3.release(&wrong_match), Err(EscrowError::UnknownHold { match_ref: m2 }), "receipt for another match doesn't release");
         let stranger = key(9);
         let wrong_provider = UsageReceipt::co_sign(&stranger, &consumer, CapacityKind::CloudApiQuota, "m".into(), 30, m1, 1);
         assert_eq!(esc3.release(&wrong_provider), Err(EscrowError::ReceiptMismatch), "receipt naming a different provider can't drain the hold");
         assert_eq!(esc3.held_amount(&m1), 30, "the mismatched attempts left the escrow untouched");
+    }
+
+    #[test]
+    fn a_zero_amount_hold_cannot_squat_a_victims_match_ref_964() {
+        // #964: match_ref is derived from public data (role_match_ref), so without a nonzero-amount
+        // check, an attacker with NO balance at all could lock a free hold under a victim's upcoming
+        // match_ref and permanently occupy it (DuplicateHold then refuses the real hold forever).
+        let attacker = key(1);
+        let victim_to_be = key(2);
+        let (p,) = (acct(&victim_to_be),);
+        let m1 = [0x55u8; 32]; // the victim's not-yet-locked match_ref, guessed from public data
+        let mut esc = Escrow::new(BTreeMap::from([(acct(&attacker), 0)])); // attacker has NO balance
+        let squat = Hold::sign_new(&attacker, p, 0, m1, 0, 1_000);
+        assert_eq!(esc.lock(&squat, 0), Err(EscrowError::ZeroAmountHold), "a zero-amount hold must be rejected outright");
+        assert_eq!(esc.held_amount(&m1), 0, "the rejected squat must not occupy the match_ref");
+
+        // The real consumer can still lock it afterward.
+        let consumer = key(3);
+        esc.balances.insert(acct(&consumer), 100);
+        esc.lock(&Hold::sign_new(&consumer, p, 40, m1, 0, 1_000), 0).expect("the real hold still locks -- the squat never occupied the match_ref");
+    }
+
+    #[test]
+    fn a_hold_cannot_lock_the_match_ref_forever_with_an_unbounded_expiry_964() {
+        // #964: even with a nonzero amount required, an expires_at of u64::MAX would still occupy a
+        // match_ref (and the locker's own funds) forever, and a hold the provider never shows up for
+        // would never reach refund's reconciliation sweep -- held would grow without bound. Reject an
+        // expiry further than MAX_HOLD_HORIZON_SECS past `now`.
+        let consumer = key(1);
+        let provider = key(2);
+        let p = acct(&provider);
+        let m1 = [0x66u8; 32];
+        let mut esc = Escrow::new(BTreeMap::from([(acct(&consumer), 100)]));
+        let now = 1_000_000;
+        let too_far = Hold::sign_new(&consumer, p, 10, m1, 0, u64::MAX);
+        assert_eq!(
+            esc.lock(&too_far, now),
+            Err(EscrowError::ExpiryTooFarInFuture {
+                now,
+                max_expires_at: now + Escrow::MAX_HOLD_HORIZON_SECS,
+                got: u64::MAX
+            }),
+            "an expiry far beyond the horizon must be rejected"
+        );
+        assert_eq!(esc.held_amount(&m1), 0, "the rejected hold must not occupy the match_ref");
+
+        // Exactly at the horizon boundary is still accepted; one second past it is not.
+        let at_boundary = Hold::sign_new(&consumer, p, 10, m1, 0, now + Escrow::MAX_HOLD_HORIZON_SECS);
+        esc.lock(&at_boundary, now).expect("exactly at the horizon boundary must still be accepted");
+        let m2 = [0x67u8; 32];
+        let one_past = Hold::sign_new(&consumer, p, 10, m2, 1, now + Escrow::MAX_HOLD_HORIZON_SECS + 1);
+        assert!(matches!(esc.lock(&one_past, now), Err(EscrowError::ExpiryTooFarInFuture { .. })), "one second past the horizon must be rejected");
     }
 
     #[test]
@@ -1328,9 +1413,9 @@ mod tests {
         let total = |e: &Escrow| e.balance(&c) + e.balance(&p) + e.held_amount(&m1) + e.held_amount(&m2) + e.held_amount(&m3);
 
         let mut esc = Escrow::new(BTreeMap::from([(c, 100)]));
-        esc.lock(&Hold::sign_new(&consumer, p, 10, m1, 0, 1_000)).unwrap(); // expires 1_000
-        esc.lock(&Hold::sign_new(&consumer, p, 20, m2, 1, 2_000)).unwrap(); // expires 2_000
-        esc.lock(&Hold::sign_new(&consumer, p, 30, m3, 2, 1_000)).unwrap(); // expires 1_000
+        esc.lock(&Hold::sign_new(&consumer, p, 10, m1, 0, 1_000), 0).unwrap(); // expires 1_000
+        esc.lock(&Hold::sign_new(&consumer, p, 20, m2, 1, 2_000), 0).unwrap(); // expires 2_000
+        esc.lock(&Hold::sign_new(&consumer, p, 30, m3, 2, 1_000), 0).unwrap(); // expires 1_000
         assert_eq!(esc.balance(&c), 40, "60 locked across three holds");
         assert_eq!(total(&esc), 100, "genesis value");
 
@@ -1384,7 +1469,7 @@ mod tests {
         // (The provider is pre-funded to u64::MAX in genesis — the receiving side of a real match.)
         let m = [0x33u8; 32];
         let mut esc = Escrow::new(BTreeMap::from([(a, 100), (b, u64::MAX)]));
-        esc.lock(&Hold::sign_new(&alice, b, 40, m, 0, 1_000)).unwrap();
+        esc.lock(&Hold::sign_new(&alice, b, 40, m, 0, 1_000), 0).unwrap();
         let receipt = UsageReceipt::co_sign(&bob, &alice, CapacityKind::CloudApiQuota, "m".into(), 40, m, 1);
         assert_eq!(
             esc.release(&receipt),
