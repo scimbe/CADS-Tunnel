@@ -45,15 +45,23 @@ impl ShutdownSignal {
         match &self.0 {
             Some(rx) => {
                 let mut rx = rx.clone();
-                if *rx.borrow() {
-                    return;
+                loop {
+                    if *rx.borrow() {
+                        return;
+                    }
+                    // #975: `changed()` returning `Err` means the `ShutdownController`
+                    // was dropped without ever triggering -- treat that the same as
+                    // "never", not as an implicit shutdown: the caller keeps running,
+                    // exactly as if no controller existed. Falling off the end of the
+                    // function here (the previous shape) resolved this `async fn`
+                    // regardless, so every accept loop selecting on `cancelled()` quietly
+                    // stopped accepting the moment the last controller clone dropped. In
+                    // production `run_edge` holds the controller for the process's whole
+                    // life, so this path is untaken there.
+                    if rx.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
                 }
-                // An `Err` here means the `ShutdownController` was dropped without ever
-                // triggering — treat that the same as "never", not as an implicit
-                // shutdown: the caller keeps running, exactly as if no controller
-                // existed. In production `run_edge` holds the controller for the
-                // process's whole life, so this path is untaken there.
-                let _ = rx.changed().await;
             }
             None => std::future::pending::<()>().await,
         }
@@ -191,6 +199,22 @@ mod tests {
             .expect("cancelled() resolves promptly after trigger()")
             .expect("task joined");
         assert!(start.elapsed() < Duration::from_millis(250), "no long spurious delay");
+    }
+
+    #[tokio::test]
+    async fn cancelled_does_not_resolve_when_the_controller_is_dropped_without_triggering_975() {
+        // #975: a dropped-without-triggering ShutdownController must be treated as
+        // "never", same as ShutdownSignal::never() -- NOT as an implicit shutdown. Before
+        // this fix, `changed()`'s Err fell off the end of the function and resolved
+        // `cancelled()` anyway, so every accept loop selecting on it quietly stopped
+        // accepting the moment the last controller clone dropped, with is_cancelled()
+        // still reporting false the whole time.
+        let (ctl, sig) = ShutdownController::new();
+        drop(ctl); // dropped WITHOUT ever calling trigger()
+
+        assert!(!sig.is_cancelled(), "is_cancelled() must not report true just because the controller dropped");
+        let raced = tokio::time::timeout(Duration::from_millis(150), sig.cancelled()).await;
+        assert!(raced.is_err(), "cancelled() must not resolve when the controller was dropped without triggering");
     }
 
     // ---- wait_for_drain ---------------------------------------------------------------
