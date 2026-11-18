@@ -9,21 +9,11 @@
 //! so it works over a QUIC stream in the live path and over an in-memory duplex
 //! in tests.
 
-use ct_common::noise::{client_handshake_for, frame};
+use ct_common::noise::{client_handshake_for, frame, read_frame};
 use ct_common::Capability;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Read one length-prefixed frame (2-byte big-endian length + body).
-async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>, BoxError> {
-    let mut len = [0u8; 2];
-    recv.read_exact(&mut len).await?;
-    let n = u16::from_be_bytes(len) as usize;
-    let mut body = vec![0u8; n];
-    recv.read_exact(&mut body).await?;
-    Ok(body)
-}
 
 /// Run the Client (initiator) `Noise_IK` handshake against the Origin responder,
 /// pinning the Origin Identity in `cap`, then send `payload` encrypted and
@@ -100,6 +90,7 @@ mod tests {
     use super::*;
     use ct_common::noise::{direct_handshake_payload, generate_static_keypair, origin_handshake};
     use ct_common::{OriginIdentity, RoutingToken};
+    use tokio::io::AsyncReadExt;
 
     /// Origin responder over the server half of a duplex: terminate Noise_IK,
     /// echo one encrypted frame back, and return the **message-1 payload** it
