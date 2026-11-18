@@ -23,6 +23,12 @@ impl EdgeConfig {
         let pow_difficulty = difficulty
             .parse::<u8>()
             .map_err(|e| format!("invalid CT_EDGE_POW_DIFFICULTY '{difficulty}': {e}"))?;
+        if pow_difficulty > ct_common::pow::MAX_CLIENT_SOLVABLE_DIFFICULTY {
+            return Err(format!(
+                "invalid CT_EDGE_POW_DIFFICULTY '{difficulty}': exceeds the client's max solvable difficulty {} (#413) -- no client could ever pass rendezvous",
+                ct_common::pow::MAX_CLIENT_SOLVABLE_DIFFICULTY
+            ));
+        }
         Ok(EdgeConfig {
             listen,
             pow_difficulty,
@@ -64,6 +70,17 @@ mod tests {
     #[test]
     fn rejects_bad_difficulty() {
         assert!(EdgeConfig::parse("127.0.0.1:4433", "300").is_err());
+    }
+
+    #[test]
+    fn rejects_a_difficulty_no_client_can_ever_solve() {
+        // #1013: 32 is MAX_CLIENT_SOLVABLE_DIFFICULTY and must still be accepted;
+        // 33 is one past it and must be rejected at config-parse time, not left to
+        // surface only as every client's DifficultyTooHigh error at rendezvous.
+        assert!(EdgeConfig::parse("127.0.0.1:4433", "32").is_ok());
+        let err = EdgeConfig::parse("127.0.0.1:4433", "33").unwrap_err();
+        assert!(err.contains("CT_EDGE_POW_DIFFICULTY"), "{err}");
+        assert!(err.contains("32"), "{err}");
     }
 
     // #21 WC2: cover from_env via the from_env_with getter seam (no global-env
