@@ -97,6 +97,7 @@ struct AiUsageState {
     ledger: Arc<SqliteLedger>,
     verifier: crate::oidc::OidcVerifierHandle,
     backends: AiBackendConfig,
+    pricing: Arc<PricingConfig>,
 }
 
 /// Build the `/me/ai/*` router. Always mounted (the individual routes fail soft
@@ -104,11 +105,12 @@ struct AiUsageState {
 /// crate's convention for `/me/*` overall -- see `#328`'s reasoning on
 /// `authed_billing_router`).
 pub fn ai_usage_router(ledger: Arc<SqliteLedger>, verifier: crate::oidc::OidcVerifierHandle, backends: AiBackendConfig) -> Router {
+    let pricing = Arc::new(PricingConfig::from_env());
     Router::new()
         .route("/me/ai/chat", post(ai_chat))
         .route("/me/ai/transcribe", post(ai_transcribe))
         .route("/me/ai/usage", get(ai_usage))
-        .with_state(AiUsageState { ledger, verifier, backends })
+        .with_state(AiUsageState { ledger, verifier, backends, pricing })
 }
 
 fn internal(context: &str, e: impl std::fmt::Display) -> (StatusCode, String) {
@@ -198,7 +200,7 @@ async fn ai_chat(State(st): State<AiUsageState>, headers: HeaderMap, Json(req): 
     }
 
     let bounded_max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).min(MAX_TOKENS_CEILING);
-    let pricing = PricingConfig::from_env();
+    let pricing = &st.pricing;
     let standard_rate = pricing.standard_ai_credits_per_1k_tokens.unwrap_or(0) as u64;
     let rate = if is_premium {
         let margin = pricing.premium_ai_margin_percent.unwrap_or(0) as u64;
@@ -280,7 +282,7 @@ async fn ai_transcribe(State(st): State<AiUsageState>, headers: HeaderMap, Json(
     };
     let account = st.ledger.account_for_subject(&subject).map_err(|e| internal("ai_transcribe/account_for_subject", e))?;
 
-    let pricing = PricingConfig::from_env();
+    let pricing = &st.pricing;
     let rate_per_minute = pricing.standard_stt_credits_per_minute.unwrap_or(0) as u64;
     let credits_cost = (req.duration_seconds as u64).saturating_mul(rate_per_minute) / 60;
 
@@ -323,7 +325,7 @@ async fn ai_usage(State(st): State<AiUsageState>, headers: HeaderMap) -> Result<
     let subject = crate::service::subject_of(&st.verifier, &headers)?;
     let account = st.ledger.account_for_subject(&subject).map_err(|e| internal("ai_usage/account_for_subject", e))?;
     let snapshot = st.ledger.ai_usage_for(&account).map_err(|e| internal("ai_usage/ai_usage_for", e))?.ok_or((StatusCode::NOT_FOUND, "unknown account".to_string()))?;
-    let pricing = PricingConfig::from_env();
+    let pricing = &st.pricing;
     Ok(Json(AiUsageResp {
         balance: snapshot.balance,
         plan: snapshot.plan,

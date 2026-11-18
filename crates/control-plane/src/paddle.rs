@@ -120,17 +120,19 @@ struct PaddleState {
     ledger: Arc<SqliteLedger>,
     verifier: crate::oidc::OidcVerifierHandle,
     config: PaddleConfig,
+    pricing: Arc<PricingConfig>,
 }
 
 /// Always mounts `/webhooks/paddle` (its own gate is the signature, same
 /// posture as the existing generic `/payment/webhook`). `/me/checkout` is
 /// additionally gated behind `checkout_enabled` -- see this module's doc.
 pub fn paddle_router(ledger: Arc<SqliteLedger>, verifier: crate::oidc::OidcVerifierHandle, config: PaddleConfig) -> Router {
+    let pricing = Arc::new(PricingConfig::from_env());
     let mut router = Router::new().route("/webhooks/paddle", post(paddle_webhook));
     if config.checkout_enabled {
         router = router.route("/me/checkout", post(create_checkout));
     }
-    router.with_state(PaddleState { ledger, verifier, config })
+    router.with_state(PaddleState { ledger, verifier, config, pricing })
 }
 
 #[derive(Deserialize)]
@@ -152,7 +154,7 @@ async fn create_checkout(State(st): State<PaddleState>, headers: HeaderMap, Json
     let subject = crate::service::subject_of(&st.verifier, &headers)?;
     let account = st.ledger.account_for_subject(&subject).map_err(|e| internal("create_checkout/account_for_subject", e))?;
 
-    let pricing = PricingConfig::from_env();
+    let pricing = &st.pricing;
     let tier = pricing.tier(&req.plan).ok_or((StatusCode::BAD_REQUEST, "unknown plan".to_string()))?;
     let Some(price_id) = &tier.paddle_price_id else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, format!("the {} plan has no Paddle price configured yet", req.plan)));
@@ -242,7 +244,7 @@ async fn paddle_webhook(State(st): State<PaddleState>, headers: HeaderMap, body:
                 .map_err(|e| internal("paddle_webhook/payment_intent", e))?
                 .ok_or((StatusCode::NOT_FOUND, "unknown payment".to_string()))?;
             let plan = custom_data.and_then(|c| c.get("plan")).and_then(|v| v.as_str()).unwrap_or("");
-            let plan = verify_paid_plan(&event, &PricingConfig::from_env(), plan, intent_credits).map_err(|why| {
+            let plan = verify_paid_plan(&event, &st.pricing, plan, intent_credits).map_err(|why| {
                 crate::service::note_paddle_webhook_rejected(why);
                 (StatusCode::UNPROCESSABLE_ENTITY, why.to_string())
             })?;
