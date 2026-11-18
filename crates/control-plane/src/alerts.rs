@@ -61,7 +61,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit_log::SqliteAuditLog;
 use crate::payment_provider::WebhookVerifier;
 use crate::portal::{escape, SessionClaims};
-use crate::storage::{AlertDelivery, AlertRow, AlertUpsert, SqliteTunnelStore, TunnelAlert};
+use crate::storage::{AlertDelivery, AlertRow, AlertState, AlertUpsert, SqliteTunnelStore, TunnelAlert};
 
 /// How often the loop evaluates every enabled alert.
 pub const ALERT_TICK: Duration = Duration::from_secs(60);
@@ -103,20 +103,20 @@ impl AlertEvent {
     }
 }
 
-/// The pure decision of one evaluation. `state` is the alert's persisted state
-/// (`"unknown"` | `"up"` | `"down"`), `up` the edge's answer this tick, `since` the
-/// reference the outage is measured from (the last time the tunnel was seen up, or the
-/// alert's creation if never), `now`/`threshold_secs` unix seconds.
+/// The pure decision of one evaluation. `state` is the alert's persisted state,
+/// `up` the edge's answer this tick, `since` the reference the outage is measured
+/// from (the last time the tunnel was seen up, or the alert's creation if never),
+/// `now`/`threshold_secs` unix seconds.
 ///
-/// * down, not yet in `down`, and `now - since >= threshold` -> `Down`, exactly once
-///   (the caller then persists `"down"`, after which this returns `None` while down);
+/// * down, not yet in `Down`, and `now - since >= threshold` -> `Down`, exactly once
+///   (the caller then persists `Down`, after which this returns `None` while down);
 /// * down but under the threshold -> `None` (flap suppression, no state change);
-/// * up while in `down` -> `Up`, exactly once;
+/// * up while in `Down` -> `Up`, exactly once;
 /// * up otherwise -> `None`.
-pub fn next_transition(state: &str, up: bool, since: i64, now: i64, threshold_secs: i64) -> Option<AlertEvent> {
+pub fn next_transition(state: AlertState, up: bool, since: i64, now: i64, threshold_secs: i64) -> Option<AlertEvent> {
     match (up, state) {
-        (true, "down") => Some(AlertEvent::Up),
-        (true, _) | (false, "down") => None,
+        (true, AlertState::Down) => Some(AlertEvent::Up),
+        (true, _) | (false, AlertState::Down) => None,
         (false, _) => (now.saturating_sub(since) >= threshold_secs).then_some(AlertEvent::Down),
     }
 }
@@ -427,10 +427,10 @@ pub(crate) async fn evaluate_one(
         }
     }
     let reference = if up { now } else { a.last_seen_hint.unwrap_or(a.state_since) };
-    match next_transition(&a.state, up, reference, now, a.threshold_secs) {
+    match next_transition(a.state, up, reference, now, a.threshold_secs) {
         None => {
-            if up && a.state != "up" {
-                let _ = store.set_alert_state(&a.tunnel_id, "up", now);
+            if up && a.state != AlertState::Up {
+                let _ = store.set_alert_state(&a.tunnel_id, AlertState::Up, now);
             }
         }
         Some(event) => {
@@ -447,9 +447,9 @@ pub(crate) async fn evaluate_one(
                 eprintln!("ct-cp: alerts: recording delivery for tunnel {} failed: {e}", a.tunnel_id);
             }
             let new_state = match event {
-                AlertEvent::Down => "down",
-                AlertEvent::Up => "up",
-                AlertEvent::Test => a.state.as_str(),
+                AlertEvent::Down => AlertState::Down,
+                AlertEvent::Up => AlertState::Up,
+                AlertEvent::Test => a.state,
             };
             let _ = store.set_alert_state(&a.tunnel_id, new_state, since);
             eprintln!(
@@ -661,10 +661,10 @@ pub(crate) fn card_blocks(store: &SqliteTunnelStore, subject: &str, tunnel_ids: 
 }
 
 fn state_label(alert: &TunnelAlert) -> String {
-    match alert.state.as_str() {
-        "up" => format!("up since {} UTC", crate::portal_api::utc_ymd_hm(alert.state_since)),
-        "down" => format!("DOWN since {} UTC", crate::portal_api::utc_ymd_hm(alert.state_since)),
-        _ => "not checked yet".to_string(),
+    match alert.state {
+        AlertState::Up => format!("up since {} UTC", crate::portal_api::utc_ymd_hm(alert.state_since)),
+        AlertState::Down => format!("DOWN since {} UTC", crate::portal_api::utc_ymd_hm(alert.state_since)),
+        AlertState::Unknown => "not checked yet".to_string(),
     }
 }
 
@@ -792,23 +792,23 @@ mod tests {
 
     #[test]
     fn next_transition_holds_while_down_is_under_the_threshold() {
-        assert_eq!(next_transition("up", false, 1_000, 1_100, 300), None);
-        assert_eq!(next_transition("unknown", false, 1_000, 1_299, 300), None);
+        assert_eq!(next_transition(AlertState::Up, false, 1_000, 1_100, 300), None);
+        assert_eq!(next_transition(AlertState::Unknown, false, 1_000, 1_299, 300), None);
     }
 
     #[test]
     fn next_transition_fires_down_once_past_the_threshold_then_stays_quiet() {
-        assert_eq!(next_transition("up", false, 1_000, 1_300, 300), Some(AlertEvent::Down));
-        assert_eq!(next_transition("unknown", false, 1_000, 5_000, 300), Some(AlertEvent::Down));
+        assert_eq!(next_transition(AlertState::Up, false, 1_000, 1_300, 300), Some(AlertEvent::Down));
+        assert_eq!(next_transition(AlertState::Unknown, false, 1_000, 5_000, 300), Some(AlertEvent::Down));
         // Once persisted as "down", the same observation is silent.
-        assert_eq!(next_transition("down", false, 1_000, 9_000, 300), None);
+        assert_eq!(next_transition(AlertState::Down, false, 1_000, 9_000, 300), None);
     }
 
     #[test]
     fn next_transition_fires_up_once_on_recovery_and_never_while_up() {
-        assert_eq!(next_transition("down", true, 1_000, 1_400, 300), Some(AlertEvent::Up));
-        assert_eq!(next_transition("up", true, 1_000, 1_400, 300), None);
-        assert_eq!(next_transition("unknown", true, 1_000, 1_400, 300), None);
+        assert_eq!(next_transition(AlertState::Down, true, 1_000, 1_400, 300), Some(AlertEvent::Up));
+        assert_eq!(next_transition(AlertState::Up, true, 1_000, 1_400, 300), None);
+        assert_eq!(next_transition(AlertState::Unknown, true, 1_000, 1_400, 300), None);
     }
 
     // ----- signing -----
@@ -880,12 +880,12 @@ mod tests {
         let a = store.alert_for("alice", &id).unwrap().expect("stored");
         assert_eq!(a.webhook_url, "https://hooks.example/a");
         assert_eq!(a.threshold_secs, 300);
-        assert_eq!(a.state, "unknown");
+        assert_eq!(a.state, AlertState::Unknown);
         assert_eq!(a.state_since, 1_000);
         assert!(a.enabled);
 
         // Update: URL/threshold replaced, secret untouched, state reset to unknown.
-        store.set_alert_state(&id, "down", 1_500).unwrap();
+        store.set_alert_state(&id, AlertState::Down, 1_500).unwrap();
         assert_eq!(
             store.upsert_alert("alice", &id, "https://hooks.example/b", 600, 2_000).unwrap(),
             Some(AlertUpsert::Updated)
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(row.secret_hex, secret, "the secret survives an update");
         assert_eq!(row.alert.webhook_url, "https://hooks.example/b");
         assert_eq!(row.alert.threshold_secs, 600);
-        assert_eq!(row.alert.state, "unknown");
+        assert_eq!(row.alert.state, AlertState::Unknown);
         assert_eq!(row.name, "web");
         assert!(!row.routing_token.is_empty());
 
@@ -1012,7 +1012,7 @@ mod tests {
         // Down from creation, still under the threshold: nothing, state untouched.
         tick(&store, Some(&probe), &http, 100).await;
         assert!(received.lock().unwrap().is_empty());
-        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, "unknown");
+        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, AlertState::Unknown);
 
         // Past the threshold: exactly one tunnel.down, `since` = the reference (creation).
         tick(&store, Some(&probe), &http, 400).await;
@@ -1028,7 +1028,7 @@ mod tests {
             assert_eq!(p.threshold_secs, 300);
         }
         let a = store.alert_for("alice", &id).unwrap().unwrap();
-        assert_eq!(a.state, "down");
+        assert_eq!(a.state, AlertState::Down);
         assert_eq!(a.state_since, 0);
         assert_eq!(a.last_delivery_status.as_deref(), Some("ok"));
 
@@ -1044,7 +1044,7 @@ mod tests {
             assert_eq!(p.since, 500);
         }
         let a = store.alert_for("alice", &id).unwrap().unwrap();
-        assert_eq!(a.state, "up");
+        assert_eq!(a.state, AlertState::Up);
         assert_eq!(a.state_since, 500);
         assert_eq!(a.last_seen_hint, Some(560));
 
@@ -1052,7 +1052,7 @@ mod tests {
         connected.store(false, Ordering::SeqCst);
         tick(&store, Some(&probe), &http, 700).await;
         assert_eq!(received.lock().unwrap().len(), 2);
-        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, "up");
+        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, AlertState::Up);
         // ...but measured from the last seen-up time (560), 860 crosses it.
         tick(&store, Some(&probe), &http, 860).await;
         let got = received.lock().unwrap();
@@ -1080,7 +1080,7 @@ mod tests {
         store.upsert_alert("alice", &id, &hook_url, 60, 0).unwrap();
         tick(&store, Some(&probe), &delivery_http_client(), 10_000).await;
         assert!(received.lock().unwrap().is_empty());
-        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, "unknown");
+        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, AlertState::Unknown);
         // And with no edge configured at all, likewise.
         tick(&store, None, &delivery_http_client(), 10_000).await;
         assert!(received.lock().unwrap().is_empty());
@@ -1109,7 +1109,7 @@ mod tests {
         tick(&store, Some(&probe), &http, now + 60).await;
         assert!(received.lock().unwrap().is_empty(), "no delivery went out");
         let a = store.alert_for("alice", &id).unwrap().unwrap();
-        assert_eq!(a.state, "unknown", "left un-transitioned to catch up once the window frees");
+        assert_eq!(a.state, AlertState::Unknown, "left un-transitioned to catch up once the window frees");
         let log = store.deliveries_for("alice", &id, 100).unwrap();
         assert_eq!(log.iter().filter(|d| d.status == "skipped").count(), 1);
         assert_eq!(log[0].detail.as_deref(), Some(rate_limit_detail().as_str()));
@@ -1119,7 +1119,7 @@ mod tests {
         assert!(!rate_limited(&store, "alice", now + 3_601));
         tick(&store, Some(&probe), &http, now + 3_601).await;
         assert_eq!(received.lock().unwrap().len(), 1);
-        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, "down");
+        assert_eq!(store.alert_for("alice", &id).unwrap().unwrap().state, AlertState::Down);
     }
 
     #[tokio::test]

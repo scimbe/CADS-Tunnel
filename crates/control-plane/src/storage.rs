@@ -5303,6 +5303,43 @@ impl SqliteTunnelStore {
 /// wants a bit more, nobody needs an unbounded log of a flapping tunnel.
 pub const ALERT_DELIVERY_KEEP: i64 = 50;
 
+/// #1024: the `tunnel_alerts.state` column's three legal values, typed so
+/// `next_transition`/`set_alert_state`/`state_label` match it exhaustively instead of
+/// falling into a silent wildcard arm on a typo or a new state. `as_str()`/`FromStr`
+/// are the ONLY place the on-disk column format (`"unknown"`/`"up"`/`"down"`) is
+/// spelled out — the column itself stays a plain TEXT value, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertState {
+    /// Never evaluated yet (the alert's initial state, and after any owner edit
+    /// that resets it — see `upsert_alert`'s own `'unknown'` literal).
+    Unknown,
+    Up,
+    Down,
+}
+
+impl AlertState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertState::Unknown => "unknown",
+            AlertState::Up => "up",
+            AlertState::Down => "down",
+        }
+    }
+}
+
+impl std::str::FromStr for AlertState {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "unknown" => Ok(AlertState::Unknown),
+            "up" => Ok(AlertState::Up),
+            "down" => Ok(AlertState::Down),
+            _ => Err(()),
+        }
+    }
+}
+
 /// One owner-facing `tunnel_alerts` row (#777). Holds **no secret**: the outbound
 /// signing key is shown once at creation and only ever read again by the delivery
 /// path ([`AlertRow`]), never by a listing.
@@ -5313,8 +5350,7 @@ pub struct TunnelAlert {
     pub webhook_url: String,
     pub threshold_secs: i64,
     pub enabled: bool,
-    /// `"unknown"` (never evaluated) | `"up"` | `"down"`.
-    pub state: String,
+    pub state: AlertState,
     /// Unix seconds the current `state` began -- for `"down"` that is the moment the
     /// tunnel was last known up (the outage start), not when the alert fired.
     pub state_since: i64,
@@ -5454,7 +5490,10 @@ impl SqliteTunnelStore {
             webhook_url: r.get(2)?,
             threshold_secs: r.get(3)?,
             enabled: r.get::<_, i64>(4)? != 0,
-            state: r.get(5)?,
+            // Defensive fallback, not expected in practice: this column is only ever
+            // written through set_alert_state/upsert_alert's own literal, both of
+            // which only ever write one of the three known strings.
+            state: r.get::<_, String>(5)?.parse().unwrap_or(AlertState::Unknown),
             state_since: r.get(6)?,
             last_seen_hint: r.get(7)?,
             last_delivery_at: r.get(8)?,
@@ -5514,13 +5553,13 @@ impl SqliteTunnelStore {
         rows.collect()
     }
 
-    /// Record an observed state transition (`"up"` / `"down"` / `"unknown"`) and when
-    /// that state began. Not owner-scoped: only the loop calls it, on rows it read from
+    /// Record an observed state transition and when that state began. Not
+    /// owner-scoped: only the loop calls it, on rows it read from
     /// [`Self::all_enabled_alerts`].
-    pub fn set_alert_state(&self, tunnel_id: &str, state: &str, since: i64) -> rusqlite::Result<()> {
+    pub fn set_alert_state(&self, tunnel_id: &str, state: AlertState, since: i64) -> rusqlite::Result<()> {
         self.writer.lock_safe().execute(
             "UPDATE tunnel_alerts SET state = ?1, state_since = ?2 WHERE tunnel_id = ?3",
-            params![state, since, tunnel_id],
+            params![state.as_str(), since, tunnel_id],
         )?;
         Ok(())
     }
