@@ -16,9 +16,8 @@ REALM="${REALM:-ct-demo}"
 EMAIL=""
 PASSWORD=""
 
-log()  { printf "\033[1m==>\033[0m %s\n" "$*"; }
-ok()   { printf "\033[32m  ✓\033[0m %s\n" "$*"; }
-die()  { printf "\033[31merror:\033[0m %s\n" "$*" >&2; exit 1; }
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib-keycloak-admin.sh"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -31,28 +30,7 @@ done
 [ -n "$EMAIL" ] || die "--email required"
 [ -n "$PASSWORD" ] || die "--password required"
 
-[ -f "$ENV_FILE" ] || die "$ENV_FILE not found"
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
-
-: "${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL in $ENV_FILE}"
-: "${KC_ADMIN_USER:?set KC_ADMIN_USER in $ENV_FILE}"
-: "${KC_ADMIN_PASSWORD:?set KC_ADMIN_PASSWORD in $ENV_FILE}"
-command -v jq >/dev/null || die "jq is required"
-command -v curl >/dev/null || die "curl is required"
-
-log "Authenticating to Keycloak admin ($KEYCLOAK_PUBLIC_URL, realm master)"
-TOKEN="$(curl -fsS -X POST "$KEYCLOAK_PUBLIC_URL/realms/master/protocol/openid-connect/token" \
-  -H 'content-type: application/x-www-form-urlencoded' \
-  --data-urlencode "username=$KC_ADMIN_USER" \
-  --data-urlencode "password=$KC_ADMIN_PASSWORD" \
-  --data-urlencode 'grant_type=password' \
-  --data-urlencode 'client_id=admin-cli' \
-  | jq -r '.access_token // empty')"
-[ -n "$TOKEN" ] || die "could not obtain an admin token"
-ok "admin token obtained"
+kc_admin_login
 
 log "Checking for an existing account: $EMAIL"
 EXISTING_ID="$(curl -fsS -H "Authorization: Bearer $TOKEN" \
