@@ -265,13 +265,33 @@ struct ClientSecretResp {
     value: String,
 }
 
-async fn fetch_client_secret(client: &reqwest::Client, token: &str, realm_url: &str, internal_id: &str) -> Result<String, KcError> {
-    let resp = client
+async fn fetch_client_secret(
+    client: &reqwest::Client,
+    cfg: &KeycloakAdminConfig,
+    token: &str,
+    realm_url: &str,
+    internal_id: &str,
+) -> Result<String, KcError> {
+    let mut token = token.to_string();
+    let mut resp = client
         .get(format!("{realm_url}/clients/{internal_id}/client-secret"))
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
+    // #1034: same single force-refresh retry as every other admin call in this
+    // file -- without it, this was the one call in create_service_account_client
+    // that didn't get the #434 retry its sibling request (the client create just
+    // above it) already has, for a token that expired in the gap between them.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        resp = client
+            .get(format!("{realm_url}/clients/{internal_id}/client-secret"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| KcError::Http(e.to_string()))?;
+    }
     if !resp.status().is_success() {
         return Err(KcError::Http(format!("GET client-secret returned {}", resp.status())));
     }
@@ -340,7 +360,7 @@ pub async fn create_service_account_client(
         .ok_or_else(|| KcError::Http("could not parse client internal id from Location header".to_string()))?
         .to_string();
 
-    let secret = fetch_client_secret(client, &token, &realm_url, &internal_id).await?;
+    let secret = fetch_client_secret(client, cfg, &token, &realm_url, &internal_id).await?;
     Ok(CreatedClient { internal_id, secret })
 }
 
@@ -787,15 +807,26 @@ impl RealmEnforcement {
 
 async fn admin_get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
+    cfg: &KeycloakAdminConfig,
     token: &str,
     url: &str,
 ) -> Result<T, KcError> {
-    let resp = client
+    let mut token = token.to_string();
+    let mut resp = client
         .get(url)
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await
         .map_err(|e| KcError::Http(e.to_string()))?;
+    // #1034: same single force-refresh retry as every other admin call in this
+    // file -- previously missing here, so the startup enforcement check (the
+    // only caller) behaved differently from every other admin call on an
+    // expired-but-not-yet-TTL-refreshed token, reporting NotChecked instead of
+    // transparently retrying once.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        token = cached_admin_token(client, cfg, true).await?;
+        resp = client.get(url).bearer_auth(&token).send().await.map_err(|e| KcError::Http(e.to_string()))?;
+    }
     if !resp.status().is_success() {
         return Err(KcError::Http(format!("GET {url} returned {}", resp.status())));
     }
@@ -820,11 +851,11 @@ async fn fetch_realm_enforcement(
 ) -> Result<RealmEnforcement, KcError> {
     let token = cached_admin_token(client, cfg, false).await?;
     let realm_url = format!("{}/admin/realms/{}", cfg.base_url.trim_end_matches('/'), cfg.realm);
-    let realm: RealmEmailPolicy = admin_get_json(client, &token, &realm_url).await?;
+    let realm: RealmEmailPolicy = admin_get_json(client, cfg, &token, &realm_url).await?;
     let actions: Vec<RequiredActionProvider> =
-        admin_get_json(client, &token, &format!("{realm_url}/authentication/required-actions")).await?;
+        admin_get_json(client, cfg, &token, &format!("{realm_url}/authentication/required-actions")).await?;
     let idps: Vec<IdentityProviderInstance> =
-        admin_get_json(client, &token, &format!("{realm_url}/identity-provider/instances")).await?;
+        admin_get_json(client, cfg, &token, &format!("{realm_url}/identity-provider/instances")).await?;
     Ok(classify_realm_enforcement(&realm, &actions, &idps))
 }
 
@@ -1093,6 +1124,127 @@ mod tests {
 
         delete_client(&client, &cfg, &created.internal_id).await.unwrap();
         assert_eq!(deleted.lock().unwrap().as_slice(), ["internal-abc-123"], "delete must target the real internal id, not the client_id");
+    }
+
+    #[tokio::test]
+    async fn fetch_client_secret_retries_once_on_a_stale_token_like_every_other_admin_call() {
+        // #1034: before this fix, fetch_client_secret was the one call in
+        // create_service_account_client with no force-refresh retry -- a token that
+        // expired in the gap between the client create and this follow-up request
+        // failed the whole call outright instead of retrying once, like its sibling
+        // create request (and every other admin call in this file) already does.
+        use axum::extract::State;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct St {
+            secret_calls: Arc<AtomicUsize>,
+        }
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn create_client() -> axum::response::Response {
+            axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::CREATED,
+                [(axum::http::header::LOCATION, "http://kc/admin/realms/ct-demo/clients/internal-abc-123")],
+            ))
+        }
+        async fn client_secret(State(st): State<St>) -> axum::response::Response {
+            let n = st.secret_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            axum::response::IntoResponse::into_response(Json(json!({ "type": "secret", "value": "the-real-secret" })))
+        }
+
+        let secret_calls = Arc::new(AtomicUsize::new(0));
+        let st = St { secret_calls: secret_calls.clone() };
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo/clients", post(create_client))
+            .route("/admin/realms/ct-demo/clients/:id/client-secret", axum::routing::get(client_secret))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let client = reqwest::Client::new();
+
+        let created = create_service_account_client(&client, &cfg, "sa-test123", "Test bot").await.unwrap();
+        assert_eq!(created.secret, "the-real-secret", "must retry past the one 401 and return the real secret, not fail the whole call");
+        assert_eq!(secret_calls.load(Ordering::SeqCst), 2, "exactly one retry: the 401, then the successful retry");
+    }
+
+    #[tokio::test]
+    async fn admin_get_json_retries_once_on_a_stale_token_like_every_other_admin_call() {
+        // #1034: before this fix, admin_get_json (and so fetch_realm_enforcement, its
+        // only caller) had no retry at all, unlike every other admin call in this
+        // file -- a token that was valid a moment ago but got invalidated reported
+        // RealmEnforcementCheck::NotChecked instead of transparently retrying once.
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct St {
+            realm_calls: Arc<AtomicUsize>,
+        }
+
+        async fn token() -> Json<serde_json::Value> {
+            Json(json!({ "access_token": "test-admin-token" }))
+        }
+        async fn realm(State(st): State<St>) -> axum::response::Response {
+            let n = st.realm_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED);
+            }
+            axum::response::IntoResponse::into_response(Json(json!({ "verifyEmail": true, "registrationEmailAsUsername": true })))
+        }
+        async fn required_actions() -> Json<serde_json::Value> {
+            Json(json!([]))
+        }
+        async fn idp_instances() -> Json<serde_json::Value> {
+            Json(json!([]))
+        }
+
+        let realm_calls = Arc::new(AtomicUsize::new(0));
+        let st = St { realm_calls: realm_calls.clone() };
+        let app = Router::new()
+            .route("/realms/master/protocol/openid-connect/token", post(token))
+            .route("/admin/realms/ct-demo", get(realm))
+            .route("/admin/realms/ct-demo/authentication/required-actions", get(required_actions))
+            .route("/admin/realms/ct-demo/identity-provider/instances", get(idp_instances))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = KeycloakAdminConfig {
+            base_url: format!("http://{addr}"),
+            realm: "ct-demo".to_string(),
+            admin_user: "admin".to_string(),
+            admin_password: "pw".to_string(),
+        };
+        let client = reqwest::Client::new();
+
+        let result = check_realm_enforcement(&client, &cfg).await;
+        assert!(
+            matches!(result, RealmEnforcementCheck::Checked(_)),
+            "must retry past the one 401 and succeed, not report NotChecked: {result:?}"
+        );
+        assert_eq!(realm_calls.load(Ordering::SeqCst), 2, "exactly one retry: the 401, then the successful retry");
     }
 
     #[tokio::test]
