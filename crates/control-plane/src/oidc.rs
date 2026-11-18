@@ -83,29 +83,41 @@ pub fn parse_client_aud(spec: &str) -> Result<Vec<(String, String)>, OidcError> 
 }
 
 /// Verifies bearer tokens against a fixed key + expected issuer.
+///
+/// #968: holds EVERY usable signing key the realm advertised at fetch time, not
+/// just one. A realm mid-key-rotation publishes two RS256 signing keys in its
+/// JWKS at once (the old one, until every already-issued token under it has
+/// expired, and the new one), and a token can legitimately be signed by
+/// either depending on when it was issued relative to the rotation. A
+/// single-key verifier that only ever kept the first one rejected every valid
+/// token signed by the other for as long as both stayed published.
 pub struct OidcVerifier {
-    key: DecodingKey,
+    /// `(kid, key)` pairs. `kid` is `None` only for the PEM/HS256 constructors,
+    /// which have no JWKS `kid` to go by — [`Self::subject`] falls back to the
+    /// first entry when the token itself carries no `kid` either, preserving
+    /// their original single-key behavior exactly.
+    keys: Vec<(Option<String>, DecodingKey)>,
     validation: Validation,
     /// `(azp, audience)`: a token issued to `azp` must carry `audience` in `aud`.
     client_aud: Vec<(String, String)>,
 }
 
 impl OidcVerifier {
-    fn build(key: DecodingKey, alg: Algorithm, issuer: &str) -> Self {
+    fn build(keys: Vec<(Option<String>, DecodingKey)>, alg: Algorithm, issuer: &str) -> Self {
         let mut validation = Validation::new(alg);
         validation.set_issuer(&[issuer]);
         validation.validate_exp = true;
         // Keycloak access-token audiences vary by client; the account binding
         // relies on `sub` + `iss`, so audience is not required here.
         validation.validate_aud = false;
-        Self { key, validation, client_aud: Vec::new() }
+        Self { keys, validation, client_aud: Vec::new() }
     }
 
     /// Build a verifier for RS256 tokens from the realm's RSA **public** key
     /// (PEM) and the expected issuer (the realm URL). This is the Keycloak path.
     pub fn from_rsa_pem(pem: &[u8], issuer: &str) -> Result<Self, OidcError> {
         let key = DecodingKey::from_rsa_pem(pem).map_err(OidcError::from)?;
-        Ok(Self::build(key, Algorithm::RS256, issuer))
+        Ok(Self::build(vec![(None, key)], Algorithm::RS256, issuer))
     }
 
     /// Build a verifier straight from a JWK's RSA components — the base64url
@@ -113,15 +125,34 @@ impl OidcVerifier {
     /// endpoint (#42 KC2). Lets the control plane fetch the signing key from the
     /// realm rather than requiring a hand-exported PEM file, and skips the
     /// PEM roundtrip. Pair with [`jwks_signing_key`] to pull `(n, e)` from a JWKS.
+    ///
+    /// Single-key — see [`Self::from_rsa_components_multi`] for the #968 fix
+    /// that keeps every usable key from the JWKS, which is what
+    /// [`verifier_from_jwks`] actually uses now.
     pub fn from_rsa_components(n: &str, e: &str, issuer: &str) -> Result<Self, OidcError> {
         let key = DecodingKey::from_rsa_components(n, e).map_err(OidcError::from)?;
-        Ok(Self::build(key, Algorithm::RS256, issuer))
+        Ok(Self::build(vec![(None, key)], Algorithm::RS256, issuer))
+    }
+
+    /// #968: build from every usable `(kid, n, e)` RS256 signing key a JWKS
+    /// advertised — see [`jwks_signing_keys`] — so [`Self::subject`] can select
+    /// the exact key that signed a given token by its header `kid`, correct
+    /// under key rotation rather than only ever trying the first key.
+    pub fn from_rsa_components_multi(keys: &[(String, String, String)], issuer: &str) -> Result<Self, OidcError> {
+        if keys.is_empty() {
+            return Err(OidcError("no usable RS256 signing key in realm JWKS".to_string()));
+        }
+        let decoded = keys
+            .iter()
+            .map(|(kid, n, e)| DecodingKey::from_rsa_components(n, e).map(|k| (Some(kid.clone()), k)).map_err(OidcError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::build(decoded, Algorithm::RS256, issuer))
     }
 
     /// Build a verifier for HS256 tokens from a shared secret and expected
     /// issuer. For local/dev and tests; production uses [`Self::from_rsa_pem`].
     pub fn from_hs_secret(secret: &[u8], issuer: &str) -> Self {
-        Self::build(DecodingKey::from_secret(secret), Algorithm::HS256, issuer)
+        Self::build(vec![(None, DecodingKey::from_secret(secret))], Algorithm::HS256, issuer)
     }
 
     /// Require the token's `aud` to contain `audience` (#82 SEC82b). Keycloak
@@ -154,8 +185,22 @@ impl OidcVerifier {
 
     /// Verify `token` and return its subject (`sub`). Fails on a bad signature,
     /// an expired token, a mismatched issuer, or a per-client audience rule.
+    ///
+    /// #968: selects the key by the token's own header `kid` when it names one of this
+    /// verifier's JWKS keys (correct under rotation). A key without a `kid` (the PEM/HS256
+    /// constructors) matches any token, so single-key verifiers behave exactly as before.
     pub fn subject(&self, token: &str) -> Result<String, OidcError> {
-        let data = decode::<Claims>(token, &self.key, &self.validation)?;
+        let kid = token_kid(token);
+        let key = match &kid {
+            Some(k) => self
+                .keys
+                .iter()
+                .find(|(key_kid, _)| key_kid.as_deref().map_or(true, |kk| kk == k.as_str()))
+                .map(|(_, key)| key)
+                .ok_or_else(|| OidcError(format!("no signing key matches token kid {k:?}")))?,
+            None => &self.keys.first().ok_or_else(|| OidcError("no signing key configured".to_string()))?.1,
+        };
+        let data = decode::<Claims>(token, key, &self.validation)?;
         if let Some(azp) = data.claims.azp.as_deref() {
             for (client, aud) in &self.client_aud {
                 if client == azp && !data.claims.aud_contains(aud) {
@@ -244,8 +289,11 @@ where
     Fut: std::future::Future<Output = Option<serde_json::Value>>,
 {
     let jwks = fetch(jwks_uri_for(issuer)).await?;
-    let (n, e) = jwks_signing_key(&jwks)?;
-    OidcVerifier::from_rsa_components(&n, &e, issuer).ok()
+    // #968: keep EVERY usable key the realm published, not just the first --
+    // see OidcVerifier::from_rsa_components_multi's own doc for why a single
+    // key rejects valid tokens during a realm key rotation.
+    let keys = jwks_signing_keys(&jwks);
+    OidcVerifier::from_rsa_components_multi(&keys, issuer).ok()
 }
 
 /// Like [`verifier_from_jwks`], but retries the fetch+select step on a short backoff
@@ -306,6 +354,34 @@ pub fn jwks_signing_key(jwks: &serde_json::Value) -> Option<(String, String)> {
 /// exact JWKS key that signed a token under key rotation.
 pub fn token_kid(token: &str) -> Option<String> {
     jsonwebtoken::decode_header(token).ok()?.kid
+}
+
+/// #968: like [`jwks_signing_key`] but returns EVERY usable RS256 signing key in
+/// the document as `(kid, n, e)`, not just the first — a realm mid-rotation
+/// publishes more than one at once. A key with no `kid` at all is skipped (there
+/// would be nothing to select it by later); real Keycloak JWKS entries always
+/// carry one in practice.
+pub fn jwks_signing_keys(jwks: &serde_json::Value) -> Vec<(String, String, String)> {
+    let Some(keys) = jwks.get("keys").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    keys.iter()
+        .filter_map(|k| {
+            if k.get("kty").and_then(|v| v.as_str()) != Some("RSA") {
+                return None;
+            }
+            if matches!(k.get("use").and_then(|v| v.as_str()), Some(u) if u != "sig") {
+                return None;
+            }
+            if matches!(k.get("alg").and_then(|v| v.as_str()), Some(a) if a != "RS256") {
+                return None;
+            }
+            let kid = k.get("kid")?.as_str()?.to_string();
+            let n = k.get("n")?.as_str()?.to_string();
+            let e = k.get("e")?.as_str()?.to_string();
+            Some((kid, n, e))
+        })
+        .collect()
 }
 
 /// Like [`jwks_signing_key`] but selects the RS256 signing key whose `kid` matches
@@ -591,6 +667,82 @@ ZQIDAQAB
         )
         .expect("sign RS256");
         (n, e, token)
+    }
+
+    /// Like [`rsa_jwk_and_token`] but the token's own header carries `kid` —
+    /// needed to exercise #968's by-kid key selection under rotation, since the
+    /// plain helper signs with no `kid` at all (exercising only the
+    /// no-kid-on-token fallback to the first configured key).
+    fn rsa_jwk_and_token_with_kid(sub: &str, kid: &str) -> (String, String, String) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+
+        let mut rng = rand::rngs::OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).expect("generate RSA key");
+        let public = RsaPublicKey::from(&private);
+        let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
+        let pem = private.to_pkcs8_pem(LineEnding::LF).expect("pkcs8 pem");
+        let claims = serde_json::json!({ "sub": sub, "iss": ISSUER, "exp": now() + 3600 });
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let token = encode(&header, &claims, &EncodingKey::from_rsa_pem(pem.as_bytes()).expect("signing key")).expect("sign RS256");
+        (n, e, token)
+    }
+
+    #[test]
+    fn a_kidless_key_verifier_still_accepts_a_token_that_carries_a_kid_968() {
+        // The PEM / single-component constructors hold a key with no kid. Keycloak tokens
+        // always carry one, so such a verifier must not reject them for the kid alone.
+        let (n, e, token) = rsa_jwk_and_token_with_kid("user-pem", "any-kid");
+        let v = OidcVerifier::from_rsa_components(&n, &e, ISSUER).expect("verifier");
+        assert_eq!(v.subject(&token).unwrap(), "user-pem");
+    }
+
+    #[test]
+    fn subject_selects_the_key_by_kid_under_a_realm_key_rotation_968() {
+        // #968: during a rotation, a realm's JWKS carries BOTH its old and new
+        // signing keys at once. Before this fix, OidcVerifier only ever kept the
+        // first usable key -- a token signed by the one NOT listed first was
+        // rejected outright, even though the verifier genuinely had that key
+        // available. Put the token's actual signer SECOND in the JWKS array (the
+        // exact shape of the bug) and prove it still verifies.
+        let (n_old, e_old, _) = rsa_jwk_and_token_with_kid("unused", "k-old");
+        let (n_new, e_new, token_new) = rsa_jwk_and_token_with_kid("user-rotated", "k-new");
+        let keys = vec![
+            ("k-old".to_string(), n_old, e_old), // listed first -- NOT the signer
+            ("k-new".to_string(), n_new, e_new), // listed second -- the real signer
+        ];
+        let v = OidcVerifier::from_rsa_components_multi(&keys, ISSUER).expect("verifier from both rotation keys");
+        assert_eq!(
+            v.subject(&token_new).unwrap(),
+            "user-rotated",
+            "a token signed by the key NOT listed first must still verify under rotation"
+        );
+
+        // A token whose kid matches neither currently-published key (e.g. a key
+        // already rotated OUT) must fail, not silently fall back to a wrong key.
+        let (_, _, token_retired) = rsa_jwk_and_token_with_kid("someone-else", "k-retired");
+        assert!(v.subject(&token_retired).is_err(), "an unknown kid must not fall back to a wrong key");
+    }
+
+    #[tokio::test]
+    async fn verifier_from_jwks_keeps_both_rotation_keys_and_verifies_either_968() {
+        // End-to-end version of the test above, through the real fetch -> select
+        // -> build path verifier_from_jwks actually runs at boot/refresh.
+        let (n_old, e_old, token_old) = rsa_jwk_and_token_with_kid("user-old", "k-old");
+        let (n_new, e_new, token_new) = rsa_jwk_and_token_with_kid("user-new", "k-new");
+        let jwks = serde_json::json!({
+            "keys": [
+                { "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k-old", "n": n_old, "e": e_old },
+                { "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "k-new", "n": n_new, "e": e_new },
+            ]
+        });
+        let v = verifier_from_jwks(ISSUER, |_url| async move { Some(jwks) }).await.expect("verifier built from both keys");
+        assert_eq!(v.subject(&token_old).unwrap(), "user-old", "the first-listed key still verifies its own token");
+        assert_eq!(v.subject(&token_new).unwrap(), "user-new", "the second-listed key also verifies its own token");
     }
 
     #[test]
