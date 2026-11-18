@@ -4219,6 +4219,26 @@ impl SqliteTunnelStore {
         enabled: bool,
         endpoint: Option<&str>,
     ) -> rusqlite::Result<bool> {
+        // #970: this endpoint is later dialed FROM the control plane by
+        // probe_reachable, and -- once probed reachable -- published as the
+        // tunnel's advertised direct-serving record. Reject anything that
+        // isn't global-unicast before it's ever persisted, same check (and
+        // same reasoning) as upgrade.rs's offered_endpoint_is_safe: an owner
+        // could otherwise point this at an internal address and use the
+        // probe as a port-scan oracle, or get it published as a public
+        // record pointing at a private address once DNS wiring lands.
+        if enabled {
+            if let Some(ep) = endpoint {
+                let safe = ep.parse::<std::net::SocketAddr>().is_ok_and(ct_common::channel::is_global_unicast);
+                if !safe {
+                    eprintln!(
+                        "ct-cp: storage: set_direct_serving refused a non-global-unicast endpoint \
+                         {ep:?} (#970) for tunnel {tunnel_id}"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
         let conn = self.writer.lock_safe();
         let n = if enabled {
             conn.execute(
@@ -4253,6 +4273,22 @@ impl SqliteTunnelStore {
                 |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, Option<String>>(1)?, r.get::<_, i64>(2)? != 0)),
             )
             .optional()
+    }
+
+    /// #970 (test-only): [`set_direct_serving`](Self::set_direct_serving)'s global-unicast
+    /// guard means a loopback endpoint -- the only kind of "genuinely reachable" address a
+    /// test sandbox can actually bind to -- can no longer reach storage through the real
+    /// API. Tests of [`crate::direct_serving::sweep_probes`]'s own wiring (reachable ->
+    /// Publish, persisted correctly) that need a real live listener bypass the guard
+    /// through here instead, same pattern as other `_for_test` escape hatches in this
+    /// codebase (e.g. `AcmeDnsStore::hold_read_lock_for_test`) -- never compiled into a
+    /// release build.
+    #[cfg(test)]
+    pub(crate) fn set_direct_serving_endpoint_unchecked_for_test(&self, tunnel_id: &str, endpoint: &str) -> rusqlite::Result<()> {
+        self.writer
+            .lock_safe()
+            .execute("UPDATE subject_tunnels SET direct_enabled = 1, direct_endpoint = ?1 WHERE id = ?2", params![endpoint, tunnel_id])?;
+        Ok(())
     }
 
     /// #517 V3: every direct-serving-ENABLED tunnel with an endpoint, as
@@ -9612,6 +9648,31 @@ mod tests {
         assert!(store.set_direct_serving("subj-d", &t.id, false, None).unwrap());
         assert_eq!(store.direct_serving("subj-d", &t.id).unwrap(), Some((false, Some("1.2.3.4:443".to_string()), false)));
         assert!(store.direct_serving_candidates().unwrap().is_empty(), "disabled tunnels aren't probed");
+    }
+
+    #[test]
+    fn set_direct_serving_refuses_a_non_global_unicast_endpoint_970() {
+        // #970: an owner-supplied endpoint is later dialed FROM the control plane
+        // (probe_reachable) and, once probed reachable, published as the tunnel's
+        // advertised direct-serving record -- a private/loopback/link-local
+        // address must never even be PERSISTED, same reasoning as the probe's own
+        // guard.
+        let store = SqliteTunnelStore::open_in_memory().unwrap();
+        let t = match store.create_if_under_owned_limit("subj-e", "svc", Some("svc-y.example"), 2).unwrap() {
+            CreateTunnelOutcome::Created(t) => t,
+            other => panic!("create: {other:?}"),
+        };
+        for bad in ["10.0.0.5:443", "127.0.0.1:443", "169.254.169.254:80", "192.168.1.1:443"] {
+            assert!(!store.set_direct_serving("subj-e", &t.id, true, Some(bad)).unwrap(), "{bad} must be refused");
+            assert_eq!(
+                store.direct_serving("subj-e", &t.id).unwrap(),
+                Some((false, None, false)),
+                "a refused endpoint must not be persisted, not even direct_enabled flipping on, for {bad}"
+            );
+        }
+        // A genuinely global-unicast endpoint still works.
+        assert!(store.set_direct_serving("subj-e", &t.id, true, Some("1.2.3.4:443")).unwrap());
+        assert_eq!(store.direct_serving("subj-e", &t.id).unwrap(), Some((true, Some("1.2.3.4:443".to_string()), false)));
     }
 
     #[test]
