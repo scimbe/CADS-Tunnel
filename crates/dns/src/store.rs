@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 /// Thread-safe store of challenge name -> TXT values, with optional crash-safe
 /// persistence to a flat file (#302).
@@ -32,6 +32,16 @@ use std::sync::{PoisonError, RwLock};
 pub struct AcmeDnsStore {
     txt: RwLock<HashMap<String, Vec<String>>>,
     persist_path: Option<PathBuf>,
+    /// #953: acquired BEFORE the map write lock by every mutator, and held across
+    /// the whole mutate-serialize-persist sequence including the disk I/O --
+    /// `txt`'s write lock itself is only held long enough to mutate and serialize
+    /// a snapshot, not for the fsync/rename that follows. This still preserves
+    /// the #460 ordering guarantee (a snapshot can only be taken, and so only
+    /// written to disk, strictly after the previous mutator's snapshot-and-write
+    /// has fully completed under this mutex), while letting `txt()` -- the real
+    /// DNS hot path, which only ever takes `txt`'s read lock -- run concurrently
+    /// with another mutator's in-flight fsync instead of blocking on it.
+    persist: Mutex<()>,
 }
 
 impl AcmeDnsStore {
@@ -58,7 +68,7 @@ impl AcmeDnsStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
             Err(e) => return Err(e),
         };
-        let store = Self { txt: RwLock::new(txt), persist_path: Some(path) };
+        let store = Self { txt: RwLock::new(txt), persist_path: Some(path), persist: Mutex::new(()) };
         // Prove the path is actually writable now, at startup, rather than silently
         // discovering it on the first real publish deep into an issuance attempt.
         store.persist()?;
@@ -83,26 +93,20 @@ impl AcmeDnsStore {
         self.read()
     }
 
-    /// Write `txt` (a snapshot already taken by the caller, under whatever lock
-    /// the caller is holding) to `persist_path`, if set. Atomic: write to a
-    /// sibling temp file, `fsync` it, then rename over the real path -- an OS-level
-    /// atomic replace, so a crash mid-write can never leave a torn/partial file.
+    /// Write already-serialized `json` bytes to `persist_path`, if set. Atomic:
+    /// write to a sibling temp file, `fsync` it, then rename over the real path --
+    /// an OS-level atomic replace, so a crash mid-write can never leave a
+    /// torn/partial file.
     ///
-    /// #460: takes the map by reference rather than snapshotting it itself, so
-    /// [`add_txt`](Self::add_txt)/[`set_txt`](Self::set_txt)/[`clear`](Self::clear)
-    /// can call this while STILL holding their own write guard -- mutate and
-    /// persist become one critical section, with no window for a second
-    /// concurrent mutator's write lock (acquired after the first releases it,
-    /// before the first gets around to snapshotting) to interleave such that an
-    /// earlier, now-stale snapshot is the last one written to disk, silently
-    /// dropping the later mutation from the recovery file even though in-memory
-    /// state has both.
-    fn persist_locked(&self, txt: &HashMap<String, Vec<String>>) -> std::io::Result<()> {
+    /// #953: callers acquire `self.persist` BEFORE calling this and hold it for
+    /// the whole mutate-serialize-persist sequence; this function itself takes
+    /// no lock and touches only `persist_path` and the filesystem, never `txt`,
+    /// so it never blocks (or is blocked by) a concurrent `txt()` read.
+    fn persist_bytes(&self, json: &[u8]) -> std::io::Result<()> {
         let Some(path) = &self.persist_path else { return Ok(()) };
-        let json = serde_json::to_vec(txt)?;
         let tmp_path = path.with_extension("tmp");
         let mut tmp = std::fs::File::create(&tmp_path)?;
-        tmp.write_all(&json)?;
+        tmp.write_all(json)?;
         tmp.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
         // #460: the rename above is atomic (a crash mid-write leaves either the
@@ -122,29 +126,36 @@ impl AcmeDnsStore {
         Ok(())
     }
 
-    /// [`persist_locked`](Self::persist_locked) using a fresh read-lock snapshot --
-    /// only for [`open`](Self::open)'s one-time startup write-check, which has no
-    /// write guard of its own to reuse.
+    /// Serialize `txt` under `self.persist`'s lock (held for the full duration,
+    /// see [`persist_bytes`](Self::persist_bytes)) and write it out. Only for
+    /// [`open`](Self::open)'s one-time startup write-check, which has no mutation
+    /// of its own to piggyback the snapshot on.
     fn persist(&self) -> std::io::Result<()> {
-        self.persist_locked(&self.read())
+        let _persist_guard = self.persist.lock().unwrap_or_else(PoisonError::into_inner);
+        let json = serde_json::to_vec(&*self.read())?;
+        self.persist_bytes(&json)
     }
 
-    /// Publish a TXT value for `name` (ACME may need two challenges live at once,
-    /// so values accumulate). Names are matched case-insensitively.
+    /// Mutate the map under `mutate`'s write lock, serialize a snapshot while
+    /// still holding both locks, then release the map write lock (so `txt()`
+    /// reads are never blocked by the disk I/O that follows) and persist that
+    /// snapshot while still holding `self.persist`.
     ///
-    /// #460: synchronous disk I/O (create/write/fsync/rename/dir-fsync) runs while
-    /// this call still holds the store's write lock -- see
-    /// [`persist_locked`](Self::persist_locked). Callers on an async runtime (the
-    /// mutation API, [`crate::provider::Dns01Provider::SelfHosted`]) must invoke
-    /// this via `tokio::task::spawn_blocking` rather than directly from an async
-    /// fn, so a slow/contended disk stalls a blocking-pool thread instead of a
-    /// Tokio worker that also serves the public DNS responder.
-    pub fn add_txt(&self, name: &str, value: &str) {
-        let result = {
+    /// #953: `self.persist` is acquired BEFORE the map write lock and held across
+    /// the whole sequence including the fsync/rename, so a snapshot can only be
+    /// taken -- and so only written to disk -- strictly after the previous
+    /// mutator's own snapshot-and-write has fully completed. That preserves the
+    /// #460 guarantee (no stale snapshot can land on disk after a newer one) even
+    /// though the map write lock itself is now held only long enough to mutate
+    /// and serialize, not for the disk I/O.
+    fn mutate_and_persist(&self, mutate: impl FnOnce(&mut HashMap<String, Vec<String>>)) {
+        let _persist_guard = self.persist.lock().unwrap_or_else(PoisonError::into_inner);
+        let json = {
             let mut guard = self.write();
-            guard.entry(name.to_ascii_lowercase()).or_default().push(value.to_string());
-            self.persist_locked(&guard)
+            mutate(&mut *guard);
+            serde_json::to_vec(&*guard).map_err(std::io::Error::from)
         };
+        let result = json.and_then(|json| self.persist_bytes(&json));
         // Fail-soft: the in-memory map (already updated above) stays authoritative
         // for this process's lifetime regardless of persist succeeding -- a
         // transient write failure (e.g. disk full) must not block issuance, only
@@ -154,30 +165,37 @@ impl AcmeDnsStore {
         }
     }
 
-    /// Replace all TXT values for `name` with a single value. See #460 note on
-    /// [`add_txt`](Self::add_txt).
-    pub fn set_txt(&self, name: &str, value: &str) {
-        let result = {
-            let mut guard = self.write();
-            guard.insert(name.to_ascii_lowercase(), vec![value.to_string()]);
-            self.persist_locked(&guard)
-        };
-        if let Err(e) = result {
-            eprintln!("ct-dns: WARNING -- failed to persist ACME challenge store: {e}");
-        }
+    /// Publish a TXT value for `name` (ACME may need two challenges live at once,
+    /// so values accumulate). Names are matched case-insensitively.
+    ///
+    /// #460/#953: synchronous disk I/O (create/write/fsync/rename/dir-fsync) runs
+    /// under `self.persist`, not the store's `txt` write lock -- see
+    /// [`mutate_and_persist`](Self::mutate_and_persist). Callers on an async
+    /// runtime (the mutation API, [`crate::provider::Dns01Provider::SelfHosted`])
+    /// must still invoke this via `tokio::task::spawn_blocking` rather than
+    /// directly from an async fn, so a slow/contended disk stalls a blocking-pool
+    /// thread instead of a Tokio worker that also serves the public DNS responder.
+    pub fn add_txt(&self, name: &str, value: &str) {
+        let name = name.to_ascii_lowercase();
+        self.mutate_and_persist(|txt| txt.entry(name).or_default().push(value.to_string()));
     }
 
-    /// Remove all TXT values for `name` (challenge cleanup). See #460 note on
+    /// Replace all TXT values for `name` with a single value. See #460/#953 note
+    /// on [`add_txt`](Self::add_txt).
+    pub fn set_txt(&self, name: &str, value: &str) {
+        let name = name.to_ascii_lowercase();
+        self.mutate_and_persist(|txt| {
+            txt.insert(name, vec![value.to_string()]);
+        });
+    }
+
+    /// Remove all TXT values for `name` (challenge cleanup). See #460/#953 note on
     /// [`add_txt`](Self::add_txt).
     pub fn clear(&self, name: &str) {
-        let result = {
-            let mut guard = self.write();
-            guard.remove(&name.to_ascii_lowercase());
-            self.persist_locked(&guard)
-        };
-        if let Err(e) = result {
-            eprintln!("ct-dns: WARNING -- failed to persist ACME challenge store: {e}");
-        }
+        let name = name.to_ascii_lowercase();
+        self.mutate_and_persist(|txt| {
+            txt.remove(&name);
+        });
     }
 
     /// The TXT values currently published for `name` (empty if none).
