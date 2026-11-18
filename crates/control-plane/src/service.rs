@@ -7600,17 +7600,7 @@ pub(crate) use ct_common::hex::decode_32 as hex_decode_32;
 
 use ct_common::hex::decode as hex_decode;
 
-pub(crate) fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
-    // #401: same char-boundary hazard as hex_decode_32.
-    if s.len() != 128 || !s.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; 64];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+pub(crate) use ct_common::hex::decode_64 as hex_decode_64;
 
 #[cfg(test)]
 mod tests {

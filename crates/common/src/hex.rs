@@ -37,6 +37,11 @@ pub fn decode_32(s: &str) -> Option<[u8; 32]> {
     decode_array(s)
 }
 
+/// Decode exactly 128 hex digits (a 64-byte signature), or `None`.
+pub fn decode_64(s: &str) -> Option<[u8; 64]> {
+    decode_array(s)
+}
+
 fn nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -80,5 +85,21 @@ mod tests {
         assert_eq!(decode_32(&"ab".repeat(33)), None);
         assert_eq!(decode_array::<2>("0aff"), Some([0x0a, 0xff]));
         assert_eq!(decode_32(&format!("+f{}", "ab".repeat(31))), None);
+    }
+
+    #[test]
+    fn decode_64_checks_length_and_rejects_non_ascii_without_panicking() {
+        let sig = [0xcdu8; 64];
+        assert_eq!(decode_64(&encode(&sig)), Some(sig));
+        assert_eq!(decode_64(&"cd".repeat(63)), None);
+        assert_eq!(decode_64(&"cd".repeat(65)), None);
+        // Same char-boundary hazard decode_32/decode already guard against (and the
+        // #401/#596 hand-rolled hex_decode_32/64 this is replacing needed their own
+        // separate is_ascii() checks to avoid): a multi-byte UTF-8 char ('€' is 3
+        // bytes) can still land at exactly 128 bytes total, so the length guard alone
+        // doesn't rule it out -- must reject, not slice mid-character and panic.
+        let euro_128 = format!("{}{}", '\u{20ac}', "a".repeat(125));
+        assert_eq!(euro_128.len(), 128);
+        assert_eq!(decode_64(&euro_128), None, "must reject, not panic");
     }
 }

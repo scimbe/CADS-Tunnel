@@ -69,18 +69,7 @@ fn verify_heartbeat_proof(pubkey: &[u8; 32], sig: &[u8; 64], id: &str, peer_addr
 use ct_common::hex::encode as hex_encode;
 
 use ct_common::hex::decode_32 as hex_decode_32;
-
-fn hex_decode_64(s: &str) -> Option<[u8; 64]> {
-    // #596: same char-boundary hazard as hex_decode_32.
-    if s.len() != 128 || !s.is_ascii() {
-        return None;
-    }
-    let mut out = [0u8; 64];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
+use ct_common::hex::decode_64 as hex_decode_64;
 
 /// #285: liveness window for [`SqliteEdgeMesh::lookup_by_token`]/[`SqliteEdgeMesh::lookup_by_host`]
 /// -- an edge that hasn't heartbeated within this many seconds is treated as dead for ownership
